@@ -26,6 +26,7 @@ fn main() -> Result<()> {
         .iter()
         .enumerate()
         .filter_map(|(i, p)| {
+            let name = p.name.clone();
             let token = p
                 .credentials
                 .as_ref()?
@@ -33,7 +34,7 @@ fn main() -> Result<()> {
                 .as_ref()?
                 .access_token
                 .clone();
-            Some((i, std::thread::spawn(move || usage::fetch(&token).ok())))
+            Some((i, std::thread::spawn(move || usage::fetch_cached(&name, &token))))
         })
         .collect();
 
