@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use inquire::{Confirm, InquireError, Text};
 
 use crate::claude::{
-    apply_endpoint_to_claude_settings, read_claude_credentials, read_claude_endpoint_config,
-    snapshot_active_credentials, write_claude_credentials,
+    ClaudeEndpoint, apply_endpoint_to_claude_settings, read_claude_credentials,
+    read_claude_endpoint_config, snapshot_active_credentials, write_claude_credentials,
 };
 use crate::profile::{AppConfig, Profile, profile_dir, save_app_state, save_profile};
 
@@ -147,7 +147,7 @@ pub(crate) fn create_blank_profile(config: &mut AppConfig) -> Result<()> {
 
 pub(crate) fn capture_current_profile(config: &mut AppConfig) -> Result<()> {
     let credentials = read_claude_credentials()?;
-    let (base_url, api_key) = read_claude_endpoint_config()?;
+    let ClaudeEndpoint { base_url, api_key } = read_claude_endpoint_config()?;
     let name = prompt_profile_name(&config.names(), None)?;
 
     let mut profile = Profile::new(name.clone(), base_url, api_key);

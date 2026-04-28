@@ -33,18 +33,23 @@ pub(crate) fn write_claude_credentials(credentials: Option<&serde_json::Value>) 
     }
 }
 
-pub(crate) fn read_claude_endpoint_config() -> Result<(Option<String>, Option<String>)> {
+pub(crate) struct ClaudeEndpoint {
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key: Option<String>,
+}
+
+pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
     let path = claude_settings_path()?;
     if !path.exists() {
-        return Ok((None, None));
+        return Ok(ClaudeEndpoint { base_url: None, api_key: None });
     }
     let content = std::fs::read_to_string(&path).context("Failed to read settings.json")?;
     let settings: serde_json::Value =
         serde_json::from_str(&content).context("Failed to parse settings.json")?;
-    Ok((
-        settings["env"]["ANTHROPIC_BASE_URL"].as_str().map(str::to_owned),
-        settings["env"]["ANTHROPIC_AUTH_TOKEN"].as_str().map(str::to_owned),
-    ))
+    Ok(ClaudeEndpoint {
+        base_url: settings["env"]["ANTHROPIC_BASE_URL"].as_str().map(str::to_owned),
+        api_key: settings["env"]["ANTHROPIC_AUTH_TOKEN"].as_str().map(str::to_owned),
+    })
 }
 
 /// Patches only ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN inside the `env`
