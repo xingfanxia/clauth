@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/uwuclxdy/clauth"
 homepage = "https://github.com/uwuclxdy/clauth"
 readme = "README.md"
-keywords = ["claude code", "account switch", "cli", "profiles", "anthropic"]
+keywords = ["claude-code", "account-switch", "cli", "profiles", "anthropic"]
 categories = ["command-line-utilities"]
 
 [dependencies]
