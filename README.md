@@ -11,24 +11,29 @@ A simple Claude Code account switcher. Select a profile, hit enter, done. Suppor
 
 ```
 ? clauth
-  ● work        Claude Pro
-    personal    Claude Pro
+  ● work        Claude Pro   [████████░░] 94%
+    personal    Claude Max   [███░░░░░░░] 28%
     api-dev     https://api.notanthropic.com · API key set
   + New profile
   + New from current profile
     Quit
 ```
 
-Claude Code stores session in two places: `~/.claude/.credentials.json` and the `env` block inside `~/.claude/settings.json` (base URL and API key). Switching accounts means editing both by hand, every time.
+Claude Code stores session state in two places: `~/.claude/.credentials.json` and the `env` block inside `~/.claude/settings.json` (base URL and API key). Switching accounts means editing both by hand, every time.
 
-clauth keeps snapshots of both files for each profile; on change it swaps the `.credentials.json` and changes only the API variables in the `env` block of `.settings.json` - everything else stays intact.
+clauth keeps snapshots of both files for each profile; on switch it swaps `.credentials.json` and updates only the API variables in the `env` block of `.settings.json` — everything else stays intact.
+
+## Features
+
+- **One-key switching** — select a profile, switch, done
+- **5-hour usage bar** — live utilization fetched from the Anthropic API at startup, color-coded by threshold
+- **Subscription type detection** — reads `subscriptionType` from each profile's credentials and displays it (Pro, Max, etc.)
+- **Auto-update** — binary installs silently update themselves in the background
+- **Non-destructive** — only touches the two API-related keys in `settings.json`; all other config is preserved
 
 ## Install
 
-Supported platforms:
-- Linux
-- macOS
-- Windows (Git Bash / MSYS2)
+Supported platforms: Linux · macOS · Windows (Git Bash / MSYS2)
 
 **Via cargo** (recommended):
 
@@ -44,9 +49,7 @@ cargo install clauth
 curl -fsSL https://raw.githubusercontent.com/uwuclxdy/clauth/mommy/install.sh | bash
 ```
 
----
-
-The script detects `cargo` and uses it when available. Pass `--nocargo` to force a binary download instead:
+Pass `--nocargo` to force a binary download even when cargo is available:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/uwuclxdy/clauth/mommy/install.sh | bash -s -- --nocargo
@@ -65,13 +68,13 @@ cargo build --release
 
 ## Updates
 
-Binary installs (non-cargo) check for updates silently in the background each time clauth starts. The updated binary takes effect on the next run. No action needed.
+Binary installs check for updates silently in the background each time clauth starts. The updated binary takes effect on the next run. No action needed.
 
-Cargo updates clauth via `cargo update`.
+Cargo installs: `cargo install clauth` to upgrade.
 
 ## Quickstart
 
-Capture your current Claude Code session:
+Capture your current Claude Code session as a profile:
 
 ```bash
 clauth
@@ -79,22 +82,22 @@ clauth
 # Enter a name, e.g. "work"
 ```
 
-Create a second profile while logged in to a different account, then switch between them with:
+Create a second profile while logged in to a different account, then switch between them:
 
 ```bash
 clauth
 # Select the profile → "Switch to this profile"
 ```
 
-The active profile is marked with `●` in the list.
+The active profile is marked with `●`. The 5-hour usage bar updates on each launch and is cached locally so it stays visible even when the Anthropic API is rate-limited.
 
 ## Profile types
 
-**Claude Pro (OAuth)** -- leave base URL blank. clauth captures the OAuth token from your running session and restores it on switch.
+**Claude Pro / Max (OAuth)** — leave base URL blank. clauth captures the OAuth token from your running session and restores it on switch. The subscription tier is read directly from the token and shown in the list.
 
-**API endpoint** -- set a base URL and (optionally) an API key. Works with the official Anthropic API or any compatible proxy.
+**API endpoint** — set a base URL and (optionally) an API key. Works with the official Anthropic API or any compatible proxy.
 
-You can edit a profile's URL and key at any time without losing its stored credentials. The "Edit" action in the submenu updates `config.toml` only.
+You can edit a profile's URL and key at any time without losing its stored credentials.
 
 ## Storage layout
 
@@ -105,6 +108,7 @@ You can edit a profile's URL and key at any time without losing its stored crede
     work/
       config.toml        # base_url, api_key
       credentials.json   # OAuth token snapshot
+      usage_cache.json   # last known 5-hour utilization
     personal/
       ...
 ```
