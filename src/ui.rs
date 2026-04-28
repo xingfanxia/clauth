@@ -17,14 +17,35 @@ pub(crate) const C_DANGER: &str = "\x1b[38;2;243;139;168m";
 pub(crate) const C_DIM: &str = "\x1b[38;2;166;173;200m";
 pub(crate) const C_FAINT: &str = "\x1b[38;2;127;132;156m";
 
-pub(crate) const ENDPOINT_DEFAULT: &str = "Claude Pro / OAuth";
+fn endpoint_label(profile: &Profile) -> String {
+    if let Some(url) = &profile.base_url {
+        return url.clone();
+    }
+    let sub = profile
+        .credentials
+        .as_ref()
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+        .and_then(|o| o.subscription_type.as_deref())
+        .unwrap_or("pro");
+    let a = sub.split(|c: char| c == '_' || c == ' ')
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+	format!("Claude {a}")
+}
 
 pub(crate) fn format_profile_entry(
     profile: &Profile,
     is_active: bool,
     name_width: usize,
 ) -> String {
-    let endpoint = profile.base_url.as_deref().unwrap_or(ENDPOINT_DEFAULT);
+    let endpoint = endpoint_label(profile);
     let key_hint = if profile.base_url.is_some() && profile.api_key.is_some() {
         format!("{C_FAINT} · API key set{C_RESET}")
     } else {
@@ -48,7 +69,7 @@ pub(crate) fn format_profile_entry(
 
 pub(crate) fn format_submenu_title(profile: &Profile) -> String {
     let name = &profile.name;
-    let url = profile.base_url.as_deref().unwrap_or(ENDPOINT_DEFAULT);
+    let url = endpoint_label(profile);
     let credentials = if profile.credentials.is_none() {
         format!(" · {C_WARNING}no credentials")
     } else {

@@ -11,8 +11,8 @@ A simple Claude Code account switcher. Select a profile, hit enter, done. Suppor
 
 ```
 ? clauth
-  ● work        Claude Pro / OAuth
-    personal    Claude Pro / OAuth
+  ● work        Claude Pro
+    personal    Claude Pro
     api-dev     https://api.notanthropic.com · API key set
   + New profile
   + New from current profile
