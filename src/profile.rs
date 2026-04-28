@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::usage::UsageInfo;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ClaudeCredentials {
     #[serde(rename = "claudeAiOauth", skip_serializing_if = "Option::is_none")]
@@ -28,6 +30,7 @@ pub(crate) struct Profile {
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
     pub(crate) credentials: Option<ClaudeCredentials>,
+    pub(crate) usage: Option<UsageInfo>,
 }
 
 impl Profile {
@@ -37,6 +40,7 @@ impl Profile {
             base_url,
             api_key,
             credentials: None,
+            usage: None,
         }
     }
 }
@@ -166,6 +170,7 @@ fn load_profile(name: &str) -> Result<Profile> {
         base_url: config.base_url,
         api_key: config.api_key,
         credentials,
+        usage: None,
     })
 }
 

@@ -5,6 +5,7 @@ mod platform;
 mod profile;
 mod ui;
 mod update;
+mod usage;
 
 use anyhow::Result;
 use inquire::{InquireError, Select};
@@ -19,6 +20,26 @@ fn main() -> Result<()> {
     update::spawn();
     inquire::set_global_render_config(build_render_config());
     let mut config = load_config()?;
+
+    let usage_handles: Vec<(usize, std::thread::JoinHandle<Option<usage::UsageInfo>>)> = config
+        .profiles
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let token = p
+                .credentials
+                .as_ref()?
+                .claude_ai_oauth
+                .as_ref()?
+                .access_token
+                .clone();
+            Some((i, std::thread::spawn(move || usage::fetch(&token).ok())))
+        })
+        .collect();
+
+    for (i, handle) in usage_handles {
+        config.profiles[i].usage = handle.join().ok().flatten();
+    }
 
     loop {
         let menu = build_main_menu(&config);

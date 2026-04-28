@@ -1,6 +1,7 @@
 use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
 
 use crate::profile::Profile;
+use crate::usage::UsageInfo;
 
 // ── Terminal palette (cloudy-ui CLI) ──────────────────────────────────────────
 
@@ -27,7 +28,8 @@ fn endpoint_label(profile: &Profile) -> String {
         .and_then(|c| c.claude_ai_oauth.as_ref())
         .and_then(|o| o.subscription_type.as_deref())
         .unwrap_or("pro");
-    let a = sub.split(|c: char| c == '_' || c == ' ')
+    let tier = sub
+        .split(|c: char| c == '_' || c == ' ')
         .map(|w| {
             let mut chars = w.chars();
             match chars.next() {
@@ -37,7 +39,24 @@ fn endpoint_label(profile: &Profile) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ");
-	format!("Claude {a}")
+    format!("Claude {tier}")
+}
+
+fn usage_bar(info: &UsageInfo) -> String {
+    let Some(window) = &info.five_hour else {
+        return String::new();
+    };
+    let pct = window.utilization.clamp(0.0, 100.0);
+    let filled = ((pct / 100.0) * 10.0).round() as usize;
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
+    let color = if pct >= 80.0 {
+        C_DANGER
+    } else if pct >= 60.0 {
+        C_WARNING
+    } else {
+        C_DIM
+    };
+    format!("  {color}[{bar}] {pct:.0}%{C_RESET}")
 }
 
 pub(crate) fn format_profile_entry(
@@ -56,14 +75,15 @@ pub(crate) fn format_profile_entry(
     } else {
         String::new()
     };
+    let usage_hint = profile.usage.as_ref().map(usage_bar).unwrap_or_default();
     let name = &profile.name;
 
     if is_active {
         format!(
-            "{C_ACCENT}● {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{C_RESET}{key_hint}{cred_warn}"
+            "{C_ACCENT}● {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{C_RESET}{key_hint}{cred_warn}{usage_hint}"
         )
     } else {
-        format!("  {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{C_RESET}{key_hint}{cred_warn}")
+        format!("  {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{C_RESET}{key_hint}{cred_warn}{usage_hint}")
     }
 }
 
@@ -75,8 +95,9 @@ pub(crate) fn format_submenu_title(profile: &Profile) -> String {
     } else {
         String::new()
     };
+    let usage_hint = profile.usage.as_ref().map(usage_bar).unwrap_or_default();
     format!(
-        "{C_BOLD}{name}{C_RESET}{C_FAINT} · {C_RESET}{C_DIM}{url}{C_FAINT}{credentials}{C_RESET}"
+        "{C_BOLD}{name}{C_RESET}{C_FAINT} · {C_RESET}{C_DIM}{url}{C_FAINT}{credentials}{C_RESET}{usage_hint}"
     )
 }
 
