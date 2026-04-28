@@ -8,90 +8,79 @@ use serde_json::Value;
 const API_URL: &str = "https://api.github.com/repos/uwuclxdy/clauth/releases/latest";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub struct UpdateInfo {
-    pub version: String,
-    pub url: String,
+/// Spawns a background thread that silently checks for and applies an update.
+/// Returns immediately. All errors are discarded — update is best-effort.
+pub fn spawn() {
+    if is_cargo_installed() {
+        return;
+    }
+    std::thread::spawn(|| {
+        let _ = try_update();
+    });
 }
 
-/// Returns Some if a newer release is available and the current binary is not cargo-managed.
-pub fn check() -> Option<UpdateInfo> {
-    if is_cargo_installed() {
-        return None;
-    }
+fn try_update() -> anyhow::Result<()> {
+    let Some(asset) = asset_name() else {
+        return Ok(());
+    };
 
-    let asset = asset_name()?;
-
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(3))
-        .timeout_read(Duration::from_secs(5))
+    let api_agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(10))
         .build();
 
-    let response = agent
+    let text = api_agent
         .get(API_URL)
         .set("User-Agent", "clauth-updater")
         .call()
-        .ok()?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .into_string()?;
 
-    let text = response.into_string().ok()?;
-    let release: Value = serde_json::from_str(&text).ok()?;
+    let release: Value = serde_json::from_str(&text)?;
 
-    let tag = release["tag_name"].as_str()?;
+    let Some(tag) = release["tag_name"].as_str() else {
+        return Ok(());
+    };
+
     if !is_newer(tag, CURRENT_VERSION) {
-        return None;
+        return Ok(());
     }
 
-    let url = release["assets"]
-        .as_array()?
-        .iter()
-        .find(|a| a["name"].as_str() == Some(asset))?["browser_download_url"]
-        .as_str()
-        .map(str::to_owned)?;
+    let Some(url) = asset_url(&release, asset) else {
+        return Ok(());
+    };
 
-    Some(UpdateInfo {
-        version: tag.to_owned(),
-        url,
-    })
+    download_and_replace(&url)
 }
 
-/// Downloads the new binary and replaces the current executable in-place.
-pub fn apply(info: &UpdateInfo) {
-    eprintln!(
-        "Update available: v{} → {}",
-        CURRENT_VERSION, info.version
-    );
-    eprintln!("Downloading...");
-
-    if let Err(e) = download_and_replace(&info.url) {
-        eprintln!("Update failed: {e}");
-        return;
-    }
-
-    eprintln!("Updated to {}. Restarting...", info.version);
-    restart();
+fn asset_url(release: &Value, name: &str) -> Option<String> {
+    release["assets"]
+        .as_array()?
+        .iter()
+        .find(|a| a["name"].as_str() == Some(name))?["browser_download_url"]
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn download_and_replace(url: &str) -> anyhow::Result<()> {
-    let response = ureq::get(url)
-        .set("User-Agent", "clauth-updater")
-        .call()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let tmp_path = env::temp_dir().join("clauth_update.tmp");
+
+    // Remove any leftover partial file from a previous interrupted attempt.
+    let _ = fs::remove_file(&tmp_path);
 
     let mut bytes = Vec::new();
-    response
+    // No timeout on the download body — this runs in a background thread.
+    ureq::get(url)
+        .set("User-Agent", "clauth-updater")
+        .call()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
         .into_reader()
-        .read_to_end(&mut bytes)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let exe_path = env::current_exe()?;
-    let exe_name = exe_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "clauth".to_owned());
-    let tmp_path = exe_path.with_file_name(format!("{exe_name}.new"));
+        .read_to_end(&mut bytes)?;
 
     {
-        let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(&bytes)?;
+        let mut f = fs::File::create(&tmp_path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
     }
 
     #[cfg(unix)]
@@ -100,41 +89,12 @@ fn download_and_replace(url: &str) -> anyhow::Result<()> {
         fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))?;
     }
 
-    // Windows cannot rename a running executable, so try and fall back gracefully
-    #[cfg(windows)]
-    {
-        if fs::rename(&tmp_path, &exe_path).is_err() {
-            eprintln!(
-                "Could not replace running binary. Copy manually:\n  {} → {}",
-                tmp_path.display(),
-                exe_path.display()
-            );
-            return Ok(());
-        }
-    }
-
-    #[cfg(not(windows))]
-    fs::rename(&tmp_path, &exe_path)?;
+    // self_replace handles in-place replacement on all platforms, including
+    // Windows where you cannot directly overwrite a running executable.
+    self_replace::self_replace(&tmp_path)?;
+    let _ = fs::remove_file(&tmp_path);
 
     Ok(())
-}
-
-fn restart() -> ! {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let exe = env::current_exe().unwrap_or_else(|_| "clauth".into());
-        let err = std::process::Command::new(&exe)
-            .args(env::args().skip(1))
-            .exec();
-        eprintln!("Restart failed: {err}");
-        std::process::exit(1);
-    }
-    #[cfg(not(unix))]
-    {
-        eprintln!("Restart clauth to use the updated version.");
-        std::process::exit(0);
-    }
 }
 
 fn is_cargo_installed() -> bool {
@@ -144,7 +104,7 @@ fn is_cargo_installed() -> bool {
     let cargo_bin = dirs::home_dir()
         .map(|h| h.join(".cargo").join("bin"))
         .unwrap_or_default();
-    exe.starts_with(&cargo_bin)
+    exe.starts_with(cargo_bin)
 }
 
 fn asset_name() -> Option<&'static str> {
@@ -163,11 +123,11 @@ fn asset_name() -> Option<&'static str> {
 
 fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     let v = v.trim_start_matches('v');
-    let mut parts = v.splitn(3, '.');
+    let mut it = v.splitn(3, '.');
     Some((
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
     ))
 }
 
