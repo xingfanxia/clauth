@@ -1,7 +1,18 @@
 use anyhow::{Context, Result, bail};
 use inquire::{Confirm, InquireError, Select, Text};
+use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+// ── Terminal color tokens (cloudy-ui CLI palette) ──────────────────────────
+
+const C_RESET:   &str = "\x1b[0m";
+const C_ACCENT:  &str = "\x1b[38;2;67;171;229m";
+const C_SUCCESS: &str = "\x1b[38;2;166;227;161m";
+const C_WARNING: &str = "\x1b[38;2;249;226;175m";
+const C_DIM:     &str = "\x1b[38;2;166;173;200m";
+const C_FAINT:   &str = "\x1b[38;2;127;132;156m";
+const C_BOLD:    &str = "\x1b[1m";
 
 // ── Data model ────────────────────────────────────────────────────────────────
 
@@ -269,7 +280,11 @@ fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
 // ── Display helpers ───────────────────────────────────────────────────────────
 
 fn format_profile_entry(profile: &Profile, is_active: bool, name_width: usize) -> String {
-    let marker = if is_active { "▶" } else { " " };
+    let acc   = C_ACCENT;
+    let dim   = C_DIM;
+    let faint = C_FAINT;
+    let warn  = C_WARNING;
+    let rst   = C_RESET;
 
     let endpoint = match &profile.base_url {
         Some(url) => url.as_str(),
@@ -277,18 +292,30 @@ fn format_profile_entry(profile: &Profile, is_active: bool, name_width: usize) -
     };
 
     let key_hint = if profile.base_url.is_some() && profile.api_key.is_some() {
-        " · API key set"
+        format!("{faint} · API key set{rst}")
     } else {
-        ""
+        String::new()
     };
 
-    let cred_hint = if profile.credentials.is_some() { "" } else { " · no credentials" };
+    let cred_display = if profile.credentials.is_some() {
+        String::new()
+    } else {
+        format!("{warn} · no credentials{rst}")
+    };
 
-    format!(
-        "{marker} {name:<width$}  {endpoint}{key_hint}{cred_hint}",
-        name = profile.name,
-        width = name_width,
-    )
+    if is_active {
+        format!(
+            "{acc}● {name:<width$}{rst}  {dim}{endpoint}{rst}{key_hint}{cred_display}",
+            name = profile.name,
+            width = name_width,
+        )
+    } else {
+        format!(
+            "  {name:<width$}  {dim}{endpoint}{rst}{key_hint}{cred_display}",
+            name = profile.name,
+            width = name_width,
+        )
+    }
 }
 
 // ── Prompts ───────────────────────────────────────────────────────────────────
@@ -473,12 +500,12 @@ fn action_capture_current(config: &mut AppConfig) -> Result<()> {
 
 // ── Profile submenu ───────────────────────────────────────────────────────────
 
-const SUB_SWITCH: &str = "Switch to this profile";
-const SUB_SWITCH_ACTIVE: &str = "Switch to this profile  (already active)";
-const SUB_EDIT: &str = "Edit  (URL / API key)";
-const SUB_RENAME: &str = "Rename";
-const SUB_DELETE: &str = "Delete";
-const SUB_BACK: &str = "← Back";
+const SUB_SWITCH:        &str = "Switch to this profile";
+const SUB_SWITCH_ACTIVE: &str = "Switch to this profile  \x1b[38;2;127;132;156m(already active)\x1b[0m";
+const SUB_EDIT:          &str = "Edit  \x1b[38;2;166;173;200m(URL / API key)\x1b[0m";
+const SUB_RENAME:        &str = "Rename";
+const SUB_DELETE:        &str = "\x1b[38;2;243;139;168mDelete\x1b[0m";
+const SUB_BACK:          &str = "\x1b[38;2;127;132;156m← Back\x1b[0m";
 
 fn profile_submenu(config: &mut AppConfig, profile_name: &str) -> Result<()> {
     loop {
@@ -488,8 +515,20 @@ fn profile_submenu(config: &mut AppConfig, profile_name: &str) -> Result<()> {
                 None => return Ok(()),
             };
             let url = profile.base_url.as_deref().unwrap_or("Claude Pro / OAuth");
-            let creds = if profile.credentials.is_some() { "credentials saved" } else { "no credentials" };
-            (config.is_active(profile_name), format!("{} · {} · {}", profile.name, url, creds))
+            let (cred_color, creds) = if profile.credentials.is_some() {
+                (C_SUCCESS, "credentials saved")
+            } else {
+                (C_WARNING, "no credentials")
+            };
+            let bold  = C_BOLD;
+            let faint = C_FAINT;
+            let dim   = C_DIM;
+            let rst   = C_RESET;
+            let name  = &profile.name;
+            let title = format!(
+                "{bold}{name}{rst}{faint} · {rst}{dim}{url}{faint} · {rst}{cred_color}{creds}{rst}"
+            );
+            (config.is_active(profile_name), title)
         };
 
         let switch_label = if is_active { SUB_SWITCH_ACTIVE } else { SUB_SWITCH };
@@ -528,11 +567,26 @@ fn profile_submenu(config: &mut AppConfig, profile_name: &str) -> Result<()> {
 
 // ── Main menu ─────────────────────────────────────────────────────────────────
 
-const MENU_NEW: &str = "+ New profile";
-const MENU_CAPTURE: &str = "+ New from current profile";
-const MENU_QUIT: &str = "Quit";
+const MENU_NEW:     &str = "\x1b[38;2;217;119;87m+\x1b[0m New profile";
+const MENU_CAPTURE: &str = "\x1b[38;2;217;119;87m+\x1b[0m New from current profile";
+const MENU_QUIT:    &str = "\x1b[38;2;127;132;156mQuit\x1b[0m";
+
+fn build_render_config() -> RenderConfig<'static> {
+    let orange = Color::Rgb { r: 217, g: 119, b: 87 };
+	let blue = Color::Rgb { r: 67, g: 171, b: 229 };
+    let faint  = Color::Rgb { r: 127, g: 132, b: 156 };
+
+    RenderConfig::default()
+        .with_prompt_prefix(Styled::new("?").with_fg(blue))
+        .with_answered_prompt_prefix(Styled::new("?").with_fg(faint))
+        .with_highlighted_option_prefix(Styled::new("▶").with_fg(orange))
+        .with_selected_option(Some(StyleSheet::new().with_attr(Attributes::BOLD)))
+        .with_answer(StyleSheet::new().with_fg(blue))
+        .with_help_message(StyleSheet::new().with_fg(blue))
+}
 
 fn main() -> Result<()> {
+    inquire::set_global_render_config(build_render_config());
     let mut config = load_config()?;
 
     loop {
