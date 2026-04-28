@@ -12,7 +12,6 @@ pub(crate) const C_NOBOLD:  &str = "\x1b[22m"; // normal intensity, keeps curren
 pub(crate) const C_FG_OFF:  &str = "\x1b[39m"; // default foreground, keeps current attrs
 pub(crate) const C_ACCENT:  &str = "\x1b[38;2;67;171;229m";   // sapphire
 pub(crate) const C_ORANGE:  &str = "\x1b[38;2;217;119;87m";   // claude orange
-pub(crate) const C_SUCCESS: &str = "\x1b[38;2;166;227;161m";
 pub(crate) const C_WARNING: &str = "\x1b[38;2;249;226;175m";
 pub(crate) const C_DANGER:  &str = "\x1b[38;2;243;139;168m";
 pub(crate) const C_DIM:     &str = "\x1b[38;2;166;173;200m";
@@ -42,15 +41,15 @@ pub(crate) fn format_profile_entry(profile: &Profile, is_active: bool, name_widt
 }
 
 pub(crate) fn format_submenu_title(profile: &Profile) -> String {
-    let url = profile.base_url.as_deref().unwrap_or(ENDPOINT_DEFAULT);
-    let (cred_color, creds) = if profile.credentials.is_some() {
-        (C_SUCCESS, "credentials saved")
-    } else {
-        (C_WARNING, "no credentials")
-    };
     let name = &profile.name;
+    let url = profile.base_url.as_deref().unwrap_or(ENDPOINT_DEFAULT);
+    let credentials = if !profile.credentials.is_some() {
+        format!(" · {C_WARNING}no credentials")
+    } else {
+        String::new()
+    };
     format!(
-        "{C_BOLD}{name}{C_RESET}{C_FAINT} · {C_RESET}{C_DIM}{url}{C_FAINT} · {C_RESET}{cred_color}{creds}{C_RESET}"
+        "{C_BOLD}{name}{C_RESET}{C_FAINT} · {C_RESET}{C_DIM}{url}{C_FAINT}{credentials}{C_RESET}"
     )
 }
 
@@ -64,6 +63,6 @@ pub(crate) fn build_render_config() -> RenderConfig<'static> {
         .with_answered_prompt_prefix(Styled::new("?").with_fg(faint))
         .with_highlighted_option_prefix(Styled::new("▶").with_fg(orange))
         .with_selected_option(Some(StyleSheet::new().with_attr(Attributes::BOLD)))
-        .with_answer(StyleSheet::new().with_fg(blue))
+        .with_answer(StyleSheet::new().with_attr(Attributes::ITALIC))
         .with_help_message(StyleSheet::new().with_fg(blue))
 }
