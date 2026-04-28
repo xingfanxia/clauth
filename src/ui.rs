@@ -29,7 +29,7 @@ fn endpoint_label(profile: &Profile) -> String {
         .and_then(|o| o.subscription_type.as_deref())
         .unwrap_or("pro");
     let tier = sub
-        .split(|c: char| c == '_' || c == ' ')
+        .split(['_', ' '])
         .map(|w| {
             let mut chars = w.chars();
             match chars.next() {
@@ -83,7 +83,9 @@ pub(crate) fn format_profile_entry(
             "{C_ACCENT}● {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{C_RESET}{key_hint}{cred_warn}{usage_hint}"
         )
     } else {
-        format!("  {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{C_RESET}{key_hint}{cred_warn}{usage_hint}")
+        format!(
+            "  {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{C_RESET}{key_hint}{cred_warn}{usage_hint}"
+        )
     }
 }
 

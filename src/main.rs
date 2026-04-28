@@ -34,7 +34,10 @@ fn main() -> Result<()> {
                 .as_ref()?
                 .access_token
                 .clone();
-            Some((i, std::thread::spawn(move || usage::fetch_cached(&name, &token))))
+            Some((
+                i,
+                std::thread::spawn(move || usage::fetch_cached(&name, &token)),
+            ))
         })
         .collect();
 
