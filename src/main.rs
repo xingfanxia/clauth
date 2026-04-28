@@ -1,18 +1,26 @@
 use anyhow::{Context, Result, bail};
-use inquire::{Confirm, InquireError, Select, Text};
 use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
+use inquire::{Confirm, InquireError, Select, Text};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-// ── Terminal color tokens (cloudy-ui CLI palette) ──────────────────────────
+// ── Terminal palette (cloudy-ui CLI) ──────────────────────────────────────────
 
 const C_RESET:   &str = "\x1b[0m";
-const C_ACCENT:  &str = "\x1b[38;2;67;171;229m";
+const C_BOLD:    &str = "\x1b[1m";
+// Targeted resets — used so inquire's "selected = bold" wrapper does not
+// either leak through the whole label or get killed by an early full reset.
+const C_NOBOLD:  &str = "\x1b[22m"; // normal intensity, keeps current color
+const C_FG_OFF:  &str = "\x1b[39m"; // default foreground, keeps current attrs
+const C_ACCENT:  &str = "\x1b[38;2;67;171;229m";   // sapphire
+const C_ORANGE:  &str = "\x1b[38;2;217;119;87m";   // claude orange
 const C_SUCCESS: &str = "\x1b[38;2;166;227;161m";
 const C_WARNING: &str = "\x1b[38;2;249;226;175m";
+const C_DANGER:  &str = "\x1b[38;2;243;139;168m";
 const C_DIM:     &str = "\x1b[38;2;166;173;200m";
 const C_FAINT:   &str = "\x1b[38;2;127;132;156m";
-const C_BOLD:    &str = "\x1b[1m";
+
+const ENDPOINT_DEFAULT: &str = "Claude Pro / OAuth";
 
 // ── Data model ────────────────────────────────────────────────────────────────
 
@@ -48,12 +56,29 @@ impl AppConfig {
         self.state.active_profile.as_deref() == Some(name)
     }
 
-    fn find_profile(&self, name: &str) -> Option<&Profile> {
+    fn find(&self, name: &str) -> Option<&Profile> {
         self.profiles.iter().find(|p| p.name == name)
     }
 
-    fn find_profile_mut(&mut self, name: &str) -> Option<&mut Profile> {
+    fn find_mut(&mut self, name: &str) -> Option<&mut Profile> {
         self.profiles.iter_mut().find(|p| p.name == name)
+    }
+
+    fn names(&self) -> Vec<&str> {
+        self.profiles.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    fn add(&mut self, profile: Profile) {
+        self.state.profiles.push(profile.name.clone());
+        self.profiles.push(profile);
+    }
+
+    fn remove(&mut self, name: &str) {
+        self.profiles.retain(|p| p.name != name);
+        self.state.profiles.retain(|n| n != name);
+        if self.is_active(name) {
+            self.state.active_profile = None;
+        }
     }
 }
 
@@ -94,16 +119,12 @@ fn profile_credentials_path(name: &str) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join("credentials.json"))
 }
 
-fn claude_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".claude"))
-}
-
 fn claude_credentials_path() -> Result<PathBuf> {
-    Ok(claude_dir()?.join(".credentials.json"))
+    Ok(home_dir()?.join(".claude").join(".credentials.json"))
 }
 
 fn claude_settings_path() -> Result<PathBuf> {
-    Ok(claude_dir()?.join("settings.json"))
+    Ok(home_dir()?.join(".claude").join("settings.json"))
 }
 
 // ── Profile persistence ───────────────────────────────────────────────────────
@@ -118,9 +139,8 @@ fn load_app_state() -> Result<AppState> {
 }
 
 fn save_app_state(state: &AppState) -> Result<()> {
-    let path = app_state_path()?;
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(&path, toml::to_string_pretty(state)?)
+    std::fs::create_dir_all(clauth_dir()?)?;
+    std::fs::write(app_state_path()?, toml::to_string_pretty(state)?)
         .context("Failed to write profiles.toml")
 }
 
@@ -128,9 +148,9 @@ fn load_profile(name: &str) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
     let config: ProfileConfig = if config_path.exists() {
         let content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read {}/config.toml", name))?;
+            .with_context(|| format!("Failed to read {name}/config.toml"))?;
         toml::from_str(&content)
-            .with_context(|| format!("Failed to parse {}/config.toml", name))?
+            .with_context(|| format!("Failed to parse {name}/config.toml"))?
     } else {
         ProfileConfig::default()
     };
@@ -138,21 +158,23 @@ fn load_profile(name: &str) -> Result<Profile> {
     let cred_path = profile_credentials_path(name)?;
     let credentials = if cred_path.exists() {
         let content = std::fs::read_to_string(&cred_path)
-            .with_context(|| format!("Failed to read {}/credentials.json", name))?;
-        Some(
-            serde_json::from_str(&content)
-                .with_context(|| format!("Failed to parse {}/credentials.json", name))?,
-        )
+            .with_context(|| format!("Failed to read {name}/credentials.json"))?;
+        Some(serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {name}/credentials.json"))?)
     } else {
         None
     };
 
-    Ok(Profile { name: name.to_string(), base_url: config.base_url, api_key: config.api_key, credentials })
+    Ok(Profile {
+        name: name.to_string(),
+        base_url: config.base_url,
+        api_key: config.api_key,
+        credentials,
+    })
 }
 
 fn save_profile(profile: &Profile) -> Result<()> {
-    let dir = profile_dir(&profile.name)?;
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(profile_dir(&profile.name)?)?;
 
     let config_toml = toml::to_string_pretty(&ProfileConfig {
         base_url: profile.base_url.clone(),
@@ -163,15 +185,11 @@ fn save_profile(profile: &Profile) -> Result<()> {
 
     let cred_path = profile_credentials_path(&profile.name)?;
     match &profile.credentials {
-        Some(creds) => {
-            std::fs::write(&cred_path, serde_json::to_string_pretty(creds)?)
-                .context("Failed to write credentials.json")?;
-        }
-        None => {
-            if cred_path.exists() {
-                std::fs::remove_file(&cred_path).context("Failed to remove credentials.json")?;
-            }
-        }
+        Some(creds) => std::fs::write(&cred_path, serde_json::to_string_pretty(creds)?)
+            .context("Failed to write credentials.json")?,
+        None if cred_path.exists() => std::fs::remove_file(&cred_path)
+            .context("Failed to remove credentials.json")?,
+        None => {}
     }
 
     Ok(())
@@ -180,10 +198,8 @@ fn save_profile(profile: &Profile) -> Result<()> {
 fn load_config() -> Result<AppConfig> {
     std::fs::create_dir_all(profiles_root()?)?;
     let state = load_app_state()?;
-    let profiles = state
-        .profiles
-        .iter()
-        .map(|name| load_profile(name))
+    let profiles = state.profiles.iter()
+        .map(|n| load_profile(n))
         .collect::<Result<Vec<_>>>()?;
     Ok(AppConfig { state, profiles })
 }
@@ -201,20 +217,15 @@ fn read_claude_credentials() -> Result<Option<serde_json::Value>> {
         .map(Some)
 }
 
-fn write_claude_credentials(credentials: &Option<serde_json::Value>) -> Result<()> {
+fn write_claude_credentials(credentials: Option<&serde_json::Value>) -> Result<()> {
     let path = claude_credentials_path()?;
     match credentials {
-        Some(creds) => {
-            std::fs::write(&path, serde_json::to_string_pretty(creds)?)
-                .context("Failed to write .credentials.json")?;
-        }
-        None => {
-            if path.exists() {
-                std::fs::remove_file(&path).context("Failed to remove .credentials.json")?;
-            }
-        }
+        Some(creds) => std::fs::write(&path, serde_json::to_string_pretty(creds)?)
+            .context("Failed to write .credentials.json"),
+        None if path.exists() => std::fs::remove_file(&path)
+            .context("Failed to remove .credentials.json"),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn read_claude_endpoint_config() -> Result<(Option<String>, Option<String>)> {
@@ -264,13 +275,13 @@ fn apply_endpoint_to_claude_settings(base_url: Option<&str>, api_key: Option<&st
         .context("Failed to write settings.json")
 }
 
-/// Reads the live .credentials.json and saves it to the active profile's directory.
+/// Reads the live .credentials.json and saves it to the active profile.
 fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
-    let Some(active_name) = config.state.active_profile.clone() else {
+    let Some(active) = config.state.active_profile.clone() else {
         return Ok(());
     };
     let credentials = read_claude_credentials()?;
-    if let Some(profile) = config.find_profile_mut(&active_name) {
+    if let Some(profile) = config.find_mut(&active) {
         profile.credentials = credentials;
         save_profile(profile)?;
     }
@@ -280,42 +291,37 @@ fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
 // ── Display helpers ───────────────────────────────────────────────────────────
 
 fn format_profile_entry(profile: &Profile, is_active: bool, name_width: usize) -> String {
-    let acc   = C_ACCENT;
-    let dim   = C_DIM;
-    let faint = C_FAINT;
-    let warn  = C_WARNING;
-    let rst   = C_RESET;
-
-    let endpoint = match &profile.base_url {
-        Some(url) => url.as_str(),
-        None => "Claude Pro / OAuth",
-    };
-
+    let endpoint = profile.base_url.as_deref().unwrap_or(ENDPOINT_DEFAULT);
     let key_hint = if profile.base_url.is_some() && profile.api_key.is_some() {
-        format!("{faint} · API key set{rst}")
+        format!("{C_FAINT} · API key set{C_RESET}")
     } else {
         String::new()
     };
-
-    let cred_display = if profile.credentials.is_some() {
-        String::new()
+    let cred_warn = if profile.credentials.is_none() {
+        format!("{C_WARNING} · no credentials{C_RESET}")
     } else {
-        format!("{warn} · no credentials{rst}")
+        String::new()
     };
+    let name = &profile.name;
 
     if is_active {
-        format!(
-            "{acc}● {name:<width$}{rst}  {dim}{endpoint}{rst}{key_hint}{cred_display}",
-            name = profile.name,
-            width = name_width,
-        )
+        format!("{C_ACCENT}● {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{C_RESET}{key_hint}{cred_warn}")
     } else {
-        format!(
-            "  {name:<width$}  {dim}{endpoint}{rst}{key_hint}{cred_display}",
-            name = profile.name,
-            width = name_width,
-        )
+        format!("  {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{C_RESET}{key_hint}{cred_warn}")
     }
+}
+
+fn format_submenu_title(profile: &Profile) -> String {
+    let url = profile.base_url.as_deref().unwrap_or(ENDPOINT_DEFAULT);
+    let (cred_color, creds) = if profile.credentials.is_some() {
+        (C_SUCCESS, "credentials saved")
+    } else {
+        (C_WARNING, "no credentials")
+    };
+    let name = &profile.name;
+    format!(
+        "{C_BOLD}{name}{C_RESET}{C_FAINT} · {C_RESET}{C_DIM}{url}{C_FAINT} · {C_RESET}{cred_color}{creds}{C_RESET}"
+    )
 }
 
 // ── Prompts ───────────────────────────────────────────────────────────────────
@@ -325,18 +331,16 @@ fn prompt_optional(label: &str, current: Option<&str>) -> Result<Option<String>>
         .with_default(current.unwrap_or(""))
         .with_help_message("Leave empty to unset")
         .prompt()?;
-    Ok(if value.trim().is_empty() { None } else { Some(value) })
+    Ok((!value.trim().is_empty()).then_some(value))
 }
 
-fn prompt_profile_name(existing_names: &[&str], exclude: Option<&str>) -> Result<String> {
-    let name = Text::new("Profile name:").prompt()?;
-    let name = name.trim().to_string();
-
+fn prompt_profile_name(existing: &[&str], exclude: Option<&str>) -> Result<String> {
+    let name = Text::new("Profile name:").prompt()?.trim().to_string();
     if name.is_empty() {
         bail!("Name cannot be empty.");
     }
-    if existing_names.iter().any(|&n| n == name && Some(n) != exclude) {
-        bail!("A profile named '{}' already exists.", name);
+    if existing.iter().any(|&n| n == name && Some(n) != exclude) {
+        bail!("A profile named '{name}' already exists.");
     }
     Ok(name)
 }
@@ -344,10 +348,10 @@ fn prompt_profile_name(existing_names: &[&str], exclude: Option<&str>) -> Result
 // ── Cancellation helpers ──────────────────────────────────────────────────────
 
 fn is_cancelled(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<InquireError>()
-        .map(|e| matches!(e, InquireError::OperationCanceled | InquireError::OperationInterrupted))
-        .unwrap_or(false)
+    matches!(
+        error.downcast_ref::<InquireError>(),
+        Some(InquireError::OperationCanceled | InquireError::OperationInterrupted),
+    )
 }
 
 // ── Individual actions ────────────────────────────────────────────────────────
@@ -359,66 +363,59 @@ fn do_switch(config: &mut AppConfig, name: &str) -> Result<()> {
 
     snapshot_active_credentials(config)?;
 
-    let (target_credentials, target_base_url, target_api_key) = {
-        let profile = config.find_profile(name).context("Profile not found")?;
+    let (creds, base_url, api_key) = {
+        let profile = config.find(name).context("Profile not found")?;
         (profile.credentials.clone(), profile.base_url.clone(), profile.api_key.clone())
     };
 
-    write_claude_credentials(&target_credentials)?;
-    apply_endpoint_to_claude_settings(target_base_url.as_deref(), target_api_key.as_deref())?;
+    write_claude_credentials(creds.as_ref())?;
+    apply_endpoint_to_claude_settings(base_url.as_deref(), api_key.as_deref())?;
     config.state.active_profile = Some(name.to_string());
-    save_app_state(&config.state)?;
-
-    Ok(())
+    save_app_state(&config.state)
 }
 
 fn do_edit(config: &mut AppConfig, name: &str) -> Result<()> {
-    let (current_base_url, current_api_key) = {
-        let profile = config.find_profile(name).context("Profile not found")?;
+    let (current_url, current_key) = {
+        let profile = config.find(name).context("Profile not found")?;
         (profile.base_url.clone(), profile.api_key.clone())
     };
 
-    let base_url = prompt_optional("Base URL:", current_base_url.as_deref())?;
-    let api_key = prompt_optional("API key:", current_api_key.as_deref())?;
+    let base_url = prompt_optional("Base URL:", current_url.as_deref())?;
+    let api_key = prompt_optional("API key:", current_key.as_deref())?;
 
-    {
-        let profile = config.find_profile_mut(name).context("Profile not found")?;
-        profile.base_url = base_url.clone();
-        profile.api_key = api_key.clone();
-        save_profile(profile)?;
-    }
+    let profile = config.find_mut(name).context("Profile not found")?;
+    profile.base_url = base_url.clone();
+    profile.api_key = api_key.clone();
+    save_profile(profile)?;
 
     if config.is_active(name) {
         apply_endpoint_to_claude_settings(base_url.as_deref(), api_key.as_deref())?;
     }
-
     Ok(())
 }
 
 /// Returns true if the profile was renamed (submenu should exit to refresh list).
-fn do_rename(config: &mut AppConfig, old_name: &str) -> Result<bool> {
-    let all_names: Vec<&str> = config.profiles.iter().map(|p| p.name.as_str()).collect();
-    let new_name = match prompt_profile_name(&all_names, Some(old_name)) {
+fn do_rename(config: &mut AppConfig, old: &str) -> Result<bool> {
+    let new = match prompt_profile_name(&config.names(), Some(old)) {
         Ok(n) => n,
         Err(e) if is_cancelled(&e) => return Ok(false),
         Err(e) => return Err(e),
     };
 
-    let old_dir = profile_dir(old_name)?;
-    let new_dir = profile_dir(&new_name)?;
+    let old_dir = profile_dir(old)?;
     if old_dir.exists() {
-        std::fs::rename(&old_dir, &new_dir)
-            .with_context(|| format!("Failed to rename profile directory to '{}'", new_name))?;
+        std::fs::rename(&old_dir, profile_dir(&new)?)
+            .with_context(|| format!("Failed to rename profile directory to '{new}'"))?;
     }
 
-    if let Some(profile) = config.find_profile_mut(old_name) {
-        profile.name = new_name.clone();
+    if let Some(profile) = config.find_mut(old) {
+        profile.name = new.clone();
     }
-    if let Some(slot) = config.state.profiles.iter_mut().find(|n| n.as_str() == old_name) {
-        *slot = new_name.clone();
+    if let Some(slot) = config.state.profiles.iter_mut().find(|n| n.as_str() == old) {
+        *slot = new.clone();
     }
-    if config.state.active_profile.as_deref() == Some(old_name) {
-        config.state.active_profile = Some(new_name.clone());
+    if config.is_active(old) {
+        config.state.active_profile = Some(new);
     }
 
     save_app_state(&config.state)?;
@@ -427,7 +424,7 @@ fn do_rename(config: &mut AppConfig, old_name: &str) -> Result<bool> {
 
 /// Returns true if the profile was deleted (submenu should exit).
 fn do_delete(config: &mut AppConfig, name: &str) -> Result<bool> {
-    let confirmed = match Confirm::new(&format!("Delete '{}'?", name))
+    let confirmed = match Confirm::new(&format!("Delete '{name}'?"))
         .with_default(false)
         .prompt()
     {
@@ -435,7 +432,6 @@ fn do_delete(config: &mut AppConfig, name: &str) -> Result<bool> {
         Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => return Ok(false),
         Err(e) => return Err(e.into()),
     };
-
     if !confirmed {
         return Ok(false);
     }
@@ -443,24 +439,16 @@ fn do_delete(config: &mut AppConfig, name: &str) -> Result<bool> {
     let dir = profile_dir(name)?;
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("Failed to delete profile directory for '{}'", name))?;
+            .with_context(|| format!("Failed to delete profile directory for '{name}'"))?;
     }
 
-    let was_active = config.is_active(name);
-    config.profiles.retain(|p| p.name != name);
-    config.state.profiles.retain(|n| n != name);
-    if was_active {
-        config.state.active_profile = None;
-    }
-
+    config.remove(name);
     save_app_state(&config.state)?;
     Ok(true)
 }
 
 fn action_new_blank(config: &mut AppConfig) -> Result<()> {
-    let all_names: Vec<&str> = config.profiles.iter().map(|p| p.name.as_str()).collect();
-    let name = prompt_profile_name(&all_names, None)?;
-
+    let name = prompt_profile_name(&config.names(), None)?;
     let base_url = prompt_optional("Base URL:", None)?;
     let api_key = if base_url.is_some() {
         prompt_optional("API key:", None)?
@@ -468,92 +456,71 @@ fn action_new_blank(config: &mut AppConfig) -> Result<()> {
         None
     };
 
-    let profile = Profile::new(name.clone(), base_url, api_key);
+    let profile = Profile::new(name, base_url, api_key);
     save_profile(&profile)?;
-    config.profiles.push(profile);
-    config.state.profiles.push(name);
-    save_app_state(&config.state)?;
-
-    Ok(())
+    config.add(profile);
+    save_app_state(&config.state)
 }
 
 fn action_capture_current(config: &mut AppConfig) -> Result<()> {
     let credentials = read_claude_credentials()?;
     let (base_url, api_key) = read_claude_endpoint_config()?;
-
-    let all_names: Vec<&str> = config.profiles.iter().map(|p| p.name.as_str()).collect();
-    let name = prompt_profile_name(&all_names, None)?;
+    let name = prompt_profile_name(&config.names(), None)?;
 
     let mut profile = Profile::new(name.clone(), base_url, api_key);
     profile.credentials = credentials;
     save_profile(&profile)?;
-    config.profiles.push(profile);
-    config.state.profiles.push(name.clone());
+    config.add(profile);
 
     if config.state.active_profile.is_none() {
         config.state.active_profile = Some(name);
     }
-
-    save_app_state(&config.state)?;
-    Ok(())
+    save_app_state(&config.state)
 }
 
 // ── Profile submenu ───────────────────────────────────────────────────────────
 
-const SUB_SWITCH:        &str = "Switch to this profile";
-const SUB_SWITCH_ACTIVE: &str = "Switch to this profile  \x1b[38;2;127;132;156m(already active)\x1b[0m";
-const SUB_EDIT:          &str = "Edit  \x1b[38;2;166;173;200m(URL / API key)\x1b[0m";
-const SUB_RENAME:        &str = "Rename";
-const SUB_DELETE:        &str = "\x1b[38;2;243;139;168mDelete\x1b[0m";
-const SUB_BACK:          &str = "\x1b[38;2;127;132;156m← Back\x1b[0m";
+#[derive(Clone, Copy)]
+enum SubmenuAction { Switch, Edit, Rename, Delete, Back }
+
+impl SubmenuAction {
+    fn label(self, is_active: bool) -> String {
+        match self {
+            Self::Switch if is_active =>
+                format!("Switch to this profile{C_NOBOLD}  {C_FAINT}(already active){C_RESET}"),
+            Self::Switch => "Switch to this profile".to_string(),
+            Self::Edit   => format!("Edit{C_NOBOLD}  {C_DIM}(URL / API key){C_RESET}"),
+            Self::Rename => "Rename".to_string(),
+            Self::Delete => format!("{C_DANGER}Delete{C_RESET}"),
+            Self::Back   => format!("{C_FAINT}← Back{C_RESET}"),
+        }
+    }
+}
 
 fn profile_submenu(config: &mut AppConfig, profile_name: &str) -> Result<()> {
+    use SubmenuAction::*;
+    const ACTIONS: [SubmenuAction; 5] = [Switch, Edit, Rename, Delete, Back];
+
     loop {
-        let (is_active, title) = {
-            let profile = match config.find_profile(profile_name) {
-                Some(p) => p,
-                None => return Ok(()),
-            };
-            let url = profile.base_url.as_deref().unwrap_or("Claude Pro / OAuth");
-            let (cred_color, creds) = if profile.credentials.is_some() {
-                (C_SUCCESS, "credentials saved")
-            } else {
-                (C_WARNING, "no credentials")
-            };
-            let bold  = C_BOLD;
-            let faint = C_FAINT;
-            let dim   = C_DIM;
-            let rst   = C_RESET;
-            let name  = &profile.name;
-            let title = format!(
-                "{bold}{name}{rst}{faint} · {rst}{dim}{url}{faint} · {rst}{cred_color}{creds}{rst}"
-            );
-            (config.is_active(profile_name), title)
+        let (title, is_active) = match config.find(profile_name) {
+            Some(p) => (format_submenu_title(p), config.is_active(profile_name)),
+            None => return Ok(()),
         };
 
-        let switch_label = if is_active { SUB_SWITCH_ACTIVE } else { SUB_SWITCH };
-        let options = vec![switch_label, SUB_EDIT, SUB_RENAME, SUB_DELETE, SUB_BACK];
+        let labels: Vec<String> = ACTIONS.iter().map(|a| a.label(is_active)).collect();
 
-        let choice = match Select::new(&title, options).without_filtering().prompt() {
-            Ok(c) => c,
-            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
-                return Ok(());
-            }
+        let idx = match Select::new(&title, labels).without_filtering().raw_prompt() {
+            Ok(opt) => opt.index,
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
 
-        if choice == SUB_BACK {
-            return Ok(());
-        }
-
-        let result: Result<bool> = if choice == SUB_SWITCH || choice == SUB_SWITCH_ACTIVE {
-            do_switch(config, profile_name).map(|_| true)
-        } else if choice == SUB_EDIT {
-            do_edit(config, profile_name).map(|_| false)
-        } else if choice == SUB_RENAME {
-            do_rename(config, profile_name)
-        } else {
-            do_delete(config, profile_name)
+        let result: Result<bool> = match ACTIONS[idx] {
+            Switch => do_switch(config, profile_name).map(|_| true),
+            Edit   => do_edit(config, profile_name).map(|_| false),
+            Rename => do_rename(config, profile_name),
+            Delete => do_delete(config, profile_name),
+            Back   => return Ok(()),
         };
 
         match result {
@@ -567,13 +534,41 @@ fn profile_submenu(config: &mut AppConfig, profile_name: &str) -> Result<()> {
 
 // ── Main menu ─────────────────────────────────────────────────────────────────
 
-const MENU_NEW:     &str = "\x1b[38;2;217;119;87m+\x1b[0m New profile";
-const MENU_CAPTURE: &str = "\x1b[38;2;217;119;87m+\x1b[0m New from current profile";
-const MENU_QUIT:    &str = "\x1b[38;2;127;132;156mQuit\x1b[0m";
+#[derive(Clone, Copy)]
+enum MainAction {
+    Profile(usize),
+    NewBlank,
+    Capture,
+    Quit,
+}
+
+fn build_main_menu(config: &AppConfig) -> (Vec<String>, Vec<MainAction>) {
+    let name_width = config.profiles.iter()
+        .map(|p| p.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+
+    let mut labels = Vec::with_capacity(config.profiles.len() + 3);
+    let mut actions = Vec::with_capacity(config.profiles.len() + 3);
+
+    for (i, p) in config.profiles.iter().enumerate() {
+        labels.push(format_profile_entry(p, config.is_active(&p.name), name_width));
+        actions.push(MainAction::Profile(i));
+    }
+    labels.push(format!("{C_ORANGE}+{C_FG_OFF} New profile"));
+    actions.push(MainAction::NewBlank);
+    labels.push(format!("{C_ORANGE}+{C_FG_OFF} New from current profile"));
+    actions.push(MainAction::Capture);
+    labels.push(format!("{C_FAINT}Quit{C_RESET}"));
+    actions.push(MainAction::Quit);
+
+    (labels, actions)
+}
 
 fn build_render_config() -> RenderConfig<'static> {
     let orange = Color::Rgb { r: 217, g: 119, b: 87 };
-	let blue = Color::Rgb { r: 67, g: 171, b: 229 };
+    let blue   = Color::Rgb { r: 67,  g: 171, b: 229 };
     let faint  = Color::Rgb { r: 127, g: 132, b: 156 };
 
     RenderConfig::default()
@@ -590,52 +585,28 @@ fn main() -> Result<()> {
     let mut config = load_config()?;
 
     loop {
-        let name_width = config
-            .profiles
-            .iter()
-            .map(|p| p.name.len())
-            .max()
-            .unwrap_or(0)
-            .max(4);
+        let (labels, actions) = build_main_menu(&config);
 
-        let profile_displays: Vec<String> = config
-            .profiles
-            .iter()
-            .map(|p| format_profile_entry(p, config.is_active(&p.name), name_width))
-            .collect();
-
-        let profile_names: Vec<String> = config.profiles.iter().map(|p| p.name.clone()).collect();
-
-        let mut options: Vec<&str> = profile_displays.iter().map(String::as_str).collect();
-        options.push(MENU_NEW);
-        options.push(MENU_CAPTURE);
-        options.push(MENU_QUIT);
-
-        let choice = match Select::new("clauth", options).without_filtering().prompt() {
-            Ok(c) => c,
+        let idx = match Select::new("clauth", labels).without_filtering().raw_prompt() {
+            Ok(opt) => opt.index,
             Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => break,
             Err(e) => return Err(e.into()),
         };
 
-        if choice == MENU_QUIT {
-            break;
-        }
-
-        let result = if choice == MENU_NEW {
-            action_new_blank(&mut config)
-        } else if choice == MENU_CAPTURE {
-            action_capture_current(&mut config)
-        } else if let Some(idx) = profile_displays.iter().position(|d| d == choice) {
-            let name = profile_names[idx].clone();
-            profile_submenu(&mut config, &name)
-        } else {
-            Ok(())
+        let result = match actions[idx] {
+            MainAction::Quit => break,
+            MainAction::NewBlank => action_new_blank(&mut config),
+            MainAction::Capture => action_capture_current(&mut config),
+            MainAction::Profile(i) => {
+                let name = config.profiles[i].name.clone();
+                profile_submenu(&mut config, &name)
+            }
         };
 
-        if let Err(e) = result {
-            if !is_cancelled(&e) {
-                return Err(e);
-            }
+        if let Err(e) = result
+            && !is_cancelled(&e)
+        {
+            return Err(e);
         }
     }
 
