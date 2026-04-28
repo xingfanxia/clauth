@@ -25,6 +25,7 @@ name = "clauth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossterm",
  "dirs",
  "inquire",
  "serde",

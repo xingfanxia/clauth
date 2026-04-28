@@ -1,6 +1,7 @@
 mod actions;
 mod claude;
 mod menu;
+mod platform;
 mod profile;
 mod ui;
 
@@ -13,6 +14,7 @@ use crate::profile::load_config;
 use crate::ui::build_render_config;
 
 fn main() -> Result<()> {
+    platform::init();
     inquire::set_global_render_config(build_render_config());
     let mut config = load_config()?;
 
