@@ -4,6 +4,7 @@ mod menu;
 mod platform;
 mod profile;
 mod ui;
+mod update;
 
 use anyhow::Result;
 use inquire::{InquireError, Select};
@@ -15,8 +16,19 @@ use crate::ui::build_render_config;
 
 fn main() -> Result<()> {
     platform::init();
+
+    let update_rx = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || { let _ = tx.send(update::check()); });
+        rx
+    };
+
     inquire::set_global_render_config(build_render_config());
     let mut config = load_config()?;
+
+    if let Ok(Some(info)) = update_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        update::apply(&info);
+    }
 
     loop {
         let menu = build_main_menu(&config);
