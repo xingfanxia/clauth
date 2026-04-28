@@ -18,11 +18,18 @@ clauth keeps snapshots of both files for each profile; on change it swaps the `.
 
 ## Install
 
+Supported platforms:
+- Linux
+- macOS
+- Windows (Git Bash / MSYS2)
+
 **Via cargo** (recommended):
 
 ```bash
 cargo install clauth
 ```
+
+---
 
 **Via install script** (no Rust toolchain required):
 
@@ -30,13 +37,15 @@ cargo install clauth
 curl -fsSL https://raw.githubusercontent.com/uwuclxdy/clauth/mommy/install.sh | bash
 ```
 
+---
+
 The script detects `cargo` and uses it when available. Pass `--nocargo` to force a binary download instead:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/uwuclxdy/clauth/mommy/install.sh | bash -s -- --nocargo
 ```
 
-Supported platforms: Linux x86\_64, macOS x86\_64, macOS ARM64, Windows x86\_64 (Git Bash / MSYS2).
+---
 
 **Build from source:**
 
@@ -95,7 +104,7 @@ You can edit a profile's URL and key at any time without losing its stored crede
 
 ## Contributing
 
-Bug reports and pull requests welcome. Run tests with `cargo test`.
+Bug reports and pull requests welcome. Run `cargo fmt` before submitting.
 
 ## License
 
