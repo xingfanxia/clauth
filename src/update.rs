@@ -24,17 +24,20 @@ fn try_update() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    let api_agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(10))
-        .build();
+    let api_agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_recv_response(Some(Duration::from_secs(10)))
+        .build()
+        .into();
 
     let text = api_agent
         .get(API_URL)
-        .set("User-Agent", "clauth-updater")
+        .header("User-Agent", "clauth-updater")
         .call()
         .map_err(|e| anyhow::anyhow!("{e}"))?
-        .into_string()?;
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let release: Value = serde_json::from_str(&text)?;
 
@@ -68,12 +71,13 @@ fn download_and_replace(url: &str) -> anyhow::Result<()> {
     // Remove any leftover partial file from a previous interrupted attempt.
     let _ = fs::remove_file(&tmp_path);
 
+    // into_reader() has no size cap, unlike read_to_vec()'s 10 MB default.
     let mut bytes = Vec::new();
-    // No timeout on the download body — this runs in a background thread.
     ureq::get(url)
-        .set("User-Agent", "clauth-updater")
+        .header("User-Agent", "clauth-updater")
         .call()
         .map_err(|e| anyhow::anyhow!("{e}"))?
+        .into_body()
         .into_reader()
         .read_to_end(&mut bytes)?;
 

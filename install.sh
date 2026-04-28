@@ -3,9 +3,17 @@ set -euo pipefail
 
 REPO="uwuclxdy/clauth"
 BINARY="clauth"
+NOCARGO=0
 
-# If cargo is available, prefer it
-if command -v cargo &>/dev/null; then
+for arg in "$@"; do
+    case "${arg}" in
+        --nocargo) NOCARGO=1 ;;
+        *) echo "Unknown argument: ${arg}" >&2; exit 1 ;;
+    esac
+done
+
+# If cargo is available, prefer it (unless --nocargo was passed)
+if [[ "${NOCARGO}" -eq 0 ]] && command -v cargo &>/dev/null; then
     echo "cargo detected — installing via cargo..."
     cargo install clauth
     echo ""
@@ -17,18 +25,18 @@ fi
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 
-case "$OS" in
+case "${OS}" in
     linux)
-        case "$ARCH" in
+        case "${ARCH}" in
             x86_64) ASSET="clauth-linux-x86_64" ;;
-            *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+            *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;;
         esac
         ;;
     darwin)
-        case "$ARCH" in
+        case "${ARCH}" in
             x86_64)        ASSET="clauth-macos-x86_64" ;;
             arm64|aarch64) ASSET="clauth-macos-aarch64" ;;
-            *)             echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+            *)             echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;;
         esac
         ;;
     *mingw*|*msys*|*cygwin*)
@@ -37,49 +45,49 @@ case "$OS" in
         OS="windows"
         ;;
     *)
-        echo "Unsupported OS: $OS" >&2
+        echo "Unsupported OS: ${OS}" >&2
         echo "Install via cargo: cargo install clauth"
         exit 1
         ;;
 esac
 
-URL="https://github.com/$REPO/releases/latest/download/$ASSET"
-echo "Downloading $ASSET..."
+URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+echo "Downloading ${ASSET}..."
 
 TMP=$(mktemp)
-trap 'rm -f "$TMP"' EXIT
+trap 'rm -f "${TMP}"' EXIT
 
 if command -v curl &>/dev/null; then
-    curl -fsSL "$URL" -o "$TMP"
+    curl -fsSL "${URL}" -o "${TMP}"
 elif command -v wget &>/dev/null; then
-    wget -q "$URL" -O "$TMP"
+    wget -q "${URL}" -O "${TMP}"
 else
     echo "Error: curl or wget is required" >&2
     exit 1
 fi
 
-chmod +x "$TMP"
+chmod +x "${TMP}"
 
 # Choose install directory
-if [ "$OS" = "windows" ]; then
-    INSTALL_DIR="$HOME/.local/bin"
-elif [ -w /usr/local/bin ]; then
+if [[ "${OS}" == "windows" ]]; then
+    INSTALL_DIR="${HOME}/.local/bin"
+elif [[ -w /usr/local/bin ]]; then
     INSTALL_DIR="/usr/local/bin"
 else
-    INSTALL_DIR="$HOME/.local/bin"
+    INSTALL_DIR="${HOME}/.local/bin"
 fi
 
-mkdir -p "$INSTALL_DIR"
-mv "$TMP" "$INSTALL_DIR/$BINARY"
+mkdir -p "${INSTALL_DIR}"
+mv "${TMP}" "${INSTALL_DIR}/${BINARY}"
 
-echo "Installed to $INSTALL_DIR/$BINARY"
+echo "Installed to ${INSTALL_DIR}/${BINARY}"
 
 # Warn if install dir is not in PATH
-if ! printf '%s' "$PATH" | grep -q "$INSTALL_DIR"; then
+if ! printf '%s' "${PATH}" | grep -q "${INSTALL_DIR}"; then
     echo ""
-    echo "Note: $INSTALL_DIR is not in your PATH. Add this to your shell profile:"
-    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+    echo "Note: ${INSTALL_DIR} is not in your PATH. Add this to your shell profile:"
+    echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
 fi
 
 echo ""
-echo "To uninstall, run: rm $INSTALL_DIR/$BINARY"
+echo "To uninstall, run: rm ${INSTALL_DIR}/${BINARY}"
