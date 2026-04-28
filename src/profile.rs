@@ -2,12 +2,32 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ClaudeCredentials {
+    #[serde(rename = "claudeAiOauth", skip_serializing_if = "Option::is_none")]
+    pub(crate) claude_ai_oauth: Option<OAuthToken>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct OAuthToken {
+    #[serde(rename = "accessToken")]
+    pub(crate) access_token: String,
+    #[serde(rename = "refreshToken", skip_serializing_if = "Option::is_none")]
+    pub(crate) refresh_token: Option<String>,
+    #[serde(rename = "expiresAt", skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scopes: Option<Vec<String>>,
+    #[serde(rename = "subscriptionType", skip_serializing_if = "Option::is_none")]
+    pub(crate) subscription_type: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Profile {
     pub(crate) name: String,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
-    pub(crate) credentials: Option<serde_json::Value>,
+    pub(crate) credentials: Option<ClaudeCredentials>,
 }
 
 impl Profile {

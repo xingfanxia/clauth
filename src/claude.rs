@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-use crate::profile::{AppConfig, home_dir, save_profile};
+use crate::profile::{AppConfig, ClaudeCredentials, home_dir, save_profile};
 
 fn claude_credentials_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude").join(".credentials.json"))
@@ -11,7 +11,7 @@ fn claude_settings_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude").join("settings.json"))
 }
 
-pub(crate) fn read_claude_credentials() -> Result<Option<serde_json::Value>> {
+pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
     let path = claude_credentials_path()?;
     if !path.exists() {
         return Ok(None);
@@ -22,7 +22,7 @@ pub(crate) fn read_claude_credentials() -> Result<Option<serde_json::Value>> {
         .map(Some)
 }
 
-pub(crate) fn write_claude_credentials(credentials: Option<&serde_json::Value>) -> Result<()> {
+pub(crate) fn write_claude_credentials(credentials: Option<&ClaudeCredentials>) -> Result<()> {
     let path = claude_credentials_path()?;
     match credentials {
         Some(creds) => std::fs::write(&path, serde_json::to_string_pretty(creds)?)
