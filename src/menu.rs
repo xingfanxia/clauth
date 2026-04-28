@@ -74,26 +74,21 @@ pub(crate) enum MainAction {
     Quit,
 }
 
-pub(crate) fn build_main_menu(config: &AppConfig) -> (Vec<String>, Vec<MainAction>) {
+pub(crate) fn build_main_menu(config: &AppConfig) -> Vec<(String, MainAction)> {
     let name_width = config.profiles.iter()
         .map(|p| p.name.len())
         .max()
         .unwrap_or(0)
         .max(4);
 
-    let mut labels = Vec::with_capacity(config.profiles.len() + 3);
-    let mut actions = Vec::with_capacity(config.profiles.len() + 3);
+    let mut items = Vec::with_capacity(config.profiles.len() + 3);
 
     for (i, p) in config.profiles.iter().enumerate() {
-        labels.push(format_profile_entry(p, config.is_active(&p.name), name_width));
-        actions.push(MainAction::Profile(i));
+        items.push((format_profile_entry(p, config.is_active(&p.name), name_width), MainAction::Profile(i)));
     }
-    labels.push(format!("{C_ORANGE}+{C_FG_OFF} New profile"));
-    actions.push(MainAction::NewBlank);
-    labels.push(format!("{C_ORANGE}+{C_FG_OFF} New from current profile"));
-    actions.push(MainAction::Capture);
-    labels.push(format!("{C_FAINT}Quit{C_RESET}"));
-    actions.push(MainAction::Quit);
+    items.push((format!("{C_ORANGE}+{C_FG_OFF} New profile"), MainAction::NewBlank));
+    items.push((format!("{C_ORANGE}+{C_FG_OFF} New from current profile"), MainAction::Capture));
+    items.push((format!("{C_FAINT}Quit{C_RESET}"), MainAction::Quit));
 
-    (labels, actions)
+    items
 }

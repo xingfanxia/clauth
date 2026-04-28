@@ -17,7 +17,8 @@ fn main() -> Result<()> {
     let mut config = load_config()?;
 
     loop {
-        let (labels, actions) = build_main_menu(&config);
+        let menu = build_main_menu(&config);
+        let labels: Vec<String> = menu.iter().map(|(l, _)| l.clone()).collect();
 
         let idx = match Select::new("clauth", labels).without_filtering().raw_prompt() {
             Ok(opt) => opt.index,
@@ -25,7 +26,7 @@ fn main() -> Result<()> {
             Err(e) => return Err(e.into()),
         };
 
-        let result = match actions[idx] {
+        let result = match menu[idx].1 {
             MainAction::Quit => break,
             MainAction::NewBlank => create_blank_profile(&mut config),
             MainAction::Capture => capture_current_profile(&mut config),
