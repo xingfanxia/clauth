@@ -46,7 +46,11 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
 
     let (creds, base_url, api_key) = {
         let profile = config.find(name).context("Profile not found")?;
-        (profile.credentials.clone(), profile.base_url.clone(), profile.api_key.clone())
+        (
+            profile.credentials.clone(),
+            profile.base_url.clone(),
+            profile.api_key.clone(),
+        )
     };
 
     write_claude_credentials(creds.as_ref())?;
@@ -110,7 +114,9 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<bool>
         .prompt()
     {
         Ok(c) => c,
-        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => return Ok(false),
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+            return Ok(false);
+        }
         Err(e) => return Err(e.into()),
     };
     if !confirmed {

@@ -27,8 +27,9 @@ pub(crate) fn write_claude_credentials(credentials: Option<&ClaudeCredentials>) 
     match credentials {
         Some(creds) => std::fs::write(&path, serde_json::to_string_pretty(creds)?)
             .context("Failed to write .credentials.json"),
-        None if path.exists() => std::fs::remove_file(&path)
-            .context("Failed to remove .credentials.json"),
+        None if path.exists() => {
+            std::fs::remove_file(&path).context("Failed to remove .credentials.json")
+        }
         None => Ok(()),
     }
 }
@@ -41,14 +42,21 @@ pub(crate) struct ClaudeEndpoint {
 pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
     let path = claude_settings_path()?;
     if !path.exists() {
-        return Ok(ClaudeEndpoint { base_url: None, api_key: None });
+        return Ok(ClaudeEndpoint {
+            base_url: None,
+            api_key: None,
+        });
     }
     let content = std::fs::read_to_string(&path).context("Failed to read settings.json")?;
     let settings: serde_json::Value =
         serde_json::from_str(&content).context("Failed to parse settings.json")?;
     Ok(ClaudeEndpoint {
-        base_url: settings["env"]["ANTHROPIC_BASE_URL"].as_str().map(str::to_owned),
-        api_key: settings["env"]["ANTHROPIC_AUTH_TOKEN"].as_str().map(str::to_owned),
+        base_url: settings["env"]["ANTHROPIC_BASE_URL"]
+            .as_str()
+            .map(str::to_owned),
+        api_key: settings["env"]["ANTHROPIC_AUTH_TOKEN"]
+            .as_str()
+            .map(str::to_owned),
     })
 }
 
@@ -80,12 +88,20 @@ pub(crate) fn apply_endpoint_to_claude_settings(
         .context("settings.json `env` is not an object")?;
 
     match base_url {
-        Some(url) => { env.insert("ANTHROPIC_BASE_URL".into(), url.into()); }
-        None => { env.remove("ANTHROPIC_BASE_URL"); }
+        Some(url) => {
+            env.insert("ANTHROPIC_BASE_URL".into(), url.into());
+        }
+        None => {
+            env.remove("ANTHROPIC_BASE_URL");
+        }
     }
     match api_key {
-        Some(key) => { env.insert("ANTHROPIC_AUTH_TOKEN".into(), key.into()); }
-        None => { env.remove("ANTHROPIC_AUTH_TOKEN"); }
+        Some(key) => {
+            env.insert("ANTHROPIC_AUTH_TOKEN".into(), key.into());
+        }
+        None => {
+            env.remove("ANTHROPIC_AUTH_TOKEN");
+        }
     }
 
     std::fs::write(&path, serde_json::to_string_pretty(&settings)?)

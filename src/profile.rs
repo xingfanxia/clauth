@@ -32,7 +32,12 @@ pub(crate) struct Profile {
 
 impl Profile {
     pub(crate) fn new(name: String, base_url: Option<String>, api_key: Option<String>) -> Self {
-        Self { name, base_url, api_key, credentials: None }
+        Self {
+            name,
+            base_url,
+            api_key,
+            credentials: None,
+        }
     }
 }
 
@@ -139,8 +144,7 @@ fn load_profile(name: &str) -> Result<Profile> {
     let config: ProfileConfig = if config_path.exists() {
         let content = std::fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read {name}/config.toml"))?;
-        toml::from_str(&content)
-            .with_context(|| format!("Failed to parse {name}/config.toml"))?
+        toml::from_str(&content).with_context(|| format!("Failed to parse {name}/config.toml"))?
     } else {
         ProfileConfig::default()
     };
@@ -149,8 +153,10 @@ fn load_profile(name: &str) -> Result<Profile> {
     let credentials = if cred_path.exists() {
         let content = std::fs::read_to_string(&cred_path)
             .with_context(|| format!("Failed to read {name}/credentials.json"))?;
-        Some(serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {name}/credentials.json"))?)
+        Some(
+            serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {name}/credentials.json"))?,
+        )
     } else {
         None
     };
@@ -177,8 +183,9 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
     match &profile.credentials {
         Some(creds) => std::fs::write(&cred_path, serde_json::to_string_pretty(creds)?)
             .context("Failed to write credentials.json")?,
-        None if cred_path.exists() => std::fs::remove_file(&cred_path)
-            .context("Failed to remove credentials.json")?,
+        None if cred_path.exists() => {
+            std::fs::remove_file(&cred_path).context("Failed to remove credentials.json")?
+        }
         None => {}
     }
 
@@ -188,7 +195,9 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
 pub(crate) fn load_config() -> Result<AppConfig> {
     std::fs::create_dir_all(profiles_root()?)?;
     let state = load_app_state()?;
-    let profiles = state.profiles.iter()
+    let profiles = state
+        .profiles
+        .iter()
         .map(|n| load_profile(n))
         .collect::<Result<Vec<_>>>()?;
     Ok(AppConfig { state, profiles })

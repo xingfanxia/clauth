@@ -24,7 +24,10 @@ fn main() -> Result<()> {
         let menu = build_main_menu(&config);
         let labels: Vec<String> = menu.iter().map(|(l, _)| l.clone()).collect();
 
-        let idx = match Select::new("clauth", labels).without_filtering().raw_prompt() {
+        let idx = match Select::new("clauth", labels)
+            .without_filtering()
+            .raw_prompt()
+        {
             Ok(opt) => opt.index,
             Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => break,
             Err(e) => return Err(e.into()),
