@@ -1,4 +1,11 @@
-# clauth
+<p align="center">
+    <img src="images/clauth_banner.png" alt="clauth" width="480" />
+</p>
+
+[![Release](https://github.com/uwuclxdy/clauth/actions/workflows/release.yml/badge.svg)](https://github.com/uwuclxdy/clauth/actions/workflows/release.yml)
+[![crates.io](https://img.shields.io/crates/v/clauth.svg)](https://crates.io/crates/clauth)
+
+---
 
 A simple Claude Code account switcher. Select a profile, hit enter, done. Supports OAuth Claude Pro/Max accounts and API endpoint profiles.
 
