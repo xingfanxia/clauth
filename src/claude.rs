@@ -55,6 +55,10 @@ pub(crate) fn apply_endpoint_to_claude_settings(
 ) -> Result<()> {
     let path = claude_settings_path()?;
 
+    if base_url.is_none() && api_key.is_none() && !path.exists() {
+        return Ok(());
+    }
+
     let mut settings: serde_json::Value = if path.exists() {
         let content = std::fs::read_to_string(&path).context("Failed to read settings.json")?;
         serde_json::from_str(&content).context("Failed to parse settings.json")?
