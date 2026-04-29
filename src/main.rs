@@ -10,12 +10,30 @@ mod usage;
 use anyhow::Result;
 use inquire::{InquireError, Select};
 
-use crate::actions::{capture_current_profile, create_blank_profile, is_cancelled};
+use crate::actions::{capture_current_profile, create_blank_profile, is_cancelled, switch_profile};
 use crate::menu::{MainAction, build_main_menu, profile_submenu};
 use crate::profile::load_config;
 use crate::ui::build_render_config;
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if let [name] = args.as_slice() {
+        platform::init();
+        let mut config = load_config()?;
+        if config.find(name).is_none() {
+            let available = config.names().join(", ");
+            anyhow::bail!("profile '{name}' not found\navailable: {available}");
+        }
+        switch_profile(&mut config, name)?;
+        println!("switched to '{name}'");
+        return Ok(());
+    }
+
+    if args.len() > 1 {
+        anyhow::bail!("usage: clauth [profile]");
+    }
+
     platform::init();
     update::spawn();
     inquire::set_global_render_config(build_render_config());

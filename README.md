@@ -25,7 +25,7 @@ clauth keeps snapshots of both files for each profile; on switch it swaps `.cred
 
 ## Features
 
-- **One-key switching** — select a profile, switch, done
+- **One-key switching** — select a profile, switch, done; or `clauth <profile>` to switch directly by profile name
 - **5-hour usage bar** — live utilization fetched from the Anthropic API at startup, color-coded by threshold
 - **Subscription type detection** — reads `subscriptionType` from each profile's credentials and displays it (Pro, Max, etc.)
 - **Auto-update** — binary installs silently update themselves in the background
@@ -87,6 +87,13 @@ Create a second profile while logged in to a different account, then switch betw
 ```bash
 clauth
 # Select the profile → "Switch to this profile"
+```
+
+Or switch directly by name — no menu, no prompts:
+
+```bash
+clauth work
+# switched to 'work'
 ```
 
 The active profile is marked with `●`. The 5-hour usage bar updates on each launch and is cached locally so it stays visible even when the Anthropic API is rate-limited.
