@@ -2,8 +2,9 @@ use anyhow::{Context, Result, bail};
 use inquire::{Confirm, InquireError, Text};
 
 use crate::claude::{
-    ClaudeEndpoint, apply_endpoint_to_claude_settings, read_claude_credentials,
-    read_claude_endpoint_config, snapshot_active_credentials, write_claude_credentials,
+    ClaudeEndpoint, apply_endpoint_to_claude_settings, clear_claude_credentials,
+    link_profile_credentials, read_claude_credentials, read_claude_endpoint_config,
+    snapshot_active_credentials,
 };
 use crate::profile::{AppConfig, Profile, profile_dir, save_app_state, save_profile};
 
@@ -44,16 +45,12 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
 
     snapshot_active_credentials(config)?;
 
-    let (creds, base_url, api_key) = {
+    let (base_url, api_key) = {
         let profile = config.find(name).context("Profile not found")?;
-        (
-            profile.credentials.clone(),
-            profile.base_url.clone(),
-            profile.api_key.clone(),
-        )
+        (profile.base_url.clone(), profile.api_key.clone())
     };
 
-    write_claude_credentials(creds.as_ref())?;
+    link_profile_credentials(name)?;
     apply_endpoint_to_claude_settings(base_url.as_deref(), api_key.as_deref())?;
     config.state.active_profile = Some(name.to_string());
     save_app_state(&config.state)
@@ -100,6 +97,7 @@ pub(crate) fn rename_profile(config: &mut AppConfig, old: &str) -> Result<bool> 
         *slot = new.clone();
     }
     if config.is_active(old) {
+        link_profile_credentials(&new)?;
         config.state.active_profile = Some(new);
     }
 
@@ -123,6 +121,7 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<bool>
         return Ok(false);
     }
 
+    let was_active = config.is_active(name);
     let dir = profile_dir(name)?;
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
@@ -130,6 +129,9 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<bool>
     }
 
     config.remove(name);
+    if was_active {
+        clear_claude_credentials()?;
+    }
     save_app_state(&config.state)?;
     Ok(true)
 }
@@ -162,6 +164,7 @@ pub(crate) fn capture_current_profile(config: &mut AppConfig) -> Result<()> {
     config.add(profile);
 
     if config.state.active_profile.is_none() {
+        link_profile_credentials(&name)?;
         config.state.active_profile = Some(name);
     }
     save_app_state(&config.state)

@@ -21,9 +21,10 @@ pub(crate) fn fetch_cached(profile_name: &str, access_token: &str) -> Option<Usa
     match fetch(access_token) {
         Ok(info) => {
             if let Some(ref path) = cache
-                && let Ok(json) = serde_json::to_string(&info) {
-                    let _ = std::fs::write(path, json);
-                }
+                && let Ok(json) = serde_json::to_string(&info)
+            {
+                let _ = std::fs::write(path, json);
+            }
             Some(info)
         }
         Err(_) => cache.and_then(|p| {

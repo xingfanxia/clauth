@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-use crate::profile::{AppConfig, ClaudeCredentials, home_dir, save_profile};
+use crate::profile::{AppConfig, ClaudeCredentials, home_dir, profile_dir, save_profile};
 
 fn claude_credentials_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude").join(".credentials.json"))
@@ -22,16 +22,53 @@ pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
         .map(Some)
 }
 
-pub(crate) fn write_claude_credentials(credentials: Option<&ClaudeCredentials>) -> Result<()> {
-    let path = claude_credentials_path()?;
-    match credentials {
-        Some(creds) => std::fs::write(&path, serde_json::to_string_pretty(creds)?)
-            .context("Failed to write .credentials.json"),
-        None if path.exists() => {
-            std::fs::remove_file(&path).context("Failed to remove .credentials.json")
-        }
-        None => Ok(()),
+#[cfg(unix)]
+fn create_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link).context("Failed to create credential symlink")
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+    match std::os::windows::fs::symlink_file(target, link) {
+        Ok(()) => Ok(()),
+        Err(_) => std::fs::copy(target, link)
+            .map(|_| ())
+            .context("Failed to copy credentials"),
     }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+    std::fs::copy(target, link)
+        .map(|_| ())
+        .context("Failed to copy credentials")
+}
+
+/// Symlinks `~/.claude/.credentials.json` → profile's `credentials.json`; copies on Windows without symlink privilege.
+pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
+    let link = claude_credentials_path()?;
+
+    if link.symlink_metadata().is_ok() {
+        std::fs::remove_file(&link).context("Failed to remove old .credentials.json")?;
+    }
+
+    let target = profile_dir(name)?.join("credentials.json");
+    if target.exists() {
+        if let Some(parent) = link.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        create_symlink(&target, &link)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn clear_claude_credentials() -> Result<()> {
+    let link = claude_credentials_path()?;
+    if link.symlink_metadata().is_ok() {
+        std::fs::remove_file(&link).context("Failed to remove .credentials.json")?;
+    }
+    Ok(())
 }
 
 pub(crate) struct ClaudeEndpoint {
