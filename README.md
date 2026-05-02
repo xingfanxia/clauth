@@ -1,13 +1,13 @@
 <p align="center">
-    <img src="images/clauth_banner.png" alt="clauth" width="480" />
+    <img src="images/clauth.png" alt="clauth" width="480" />
 </p>
 
 [![Release](https://github.com/uwuclxdy/clauth/actions/workflows/release.yml/badge.svg)](https://github.com/uwuclxdy/clauth/actions/workflows/release.yml)
 [![crates.io](https://img.shields.io/crates/v/clauth.svg)](https://crates.io/crates/clauth)
 
----
+# Claude OAuth: clauth
 
-A simple Claude Code account switcher. Select a profile, hit enter, done. Supports OAuth Claude Pro/Max accounts and API endpoint profiles.
+A simple and fast Claude Code account switcher; select a profile, hit enter, done! Supports OAuth Claude Pro/Max accounts and API endpoint profiles.
 
 ```
 ? clauth
@@ -25,15 +25,17 @@ clauth keeps snapshots of both files for each profile; on switch it swaps `.cred
 
 ## Features
 
-- **One-key switching** — select a profile, switch, done; or `clauth <profile>` to switch directly by profile name
-- **5-hour usage bar** — live utilization fetched from the Anthropic API at startup, color-coded by threshold
-- **Subscription type detection** — reads `subscriptionType` from each profile's credentials and displays it (Pro, Max, etc.)
-- **Auto-update** — binary installs silently update themselves in the background
-- **Non-destructive** — only touches the two API-related keys in `settings.json`; all other config is preserved
+- **One-key switching:** select a profile, switch, done; or `clauth <profile>` to switch directly by profile name
+- **Usage bar:** live utilization fetched from the Anthropic API at startup, color-coded by threshold
+- **Subscription type detection:** reads `subscriptionType` from each profile's credentials and displays it (Pro, Max, etc.)
+- **Non-destructive:** only touches the two API-related keys in `settings.json`; all other config is preserved
 
 ## Install
 
-Supported platforms: Linux · macOS · Windows (Git Bash / MSYS2)
+Supported platforms:
+- Linux
+- macOS
+- Windows (Git Bash / MSYS2)
 
 **Via cargo** (recommended):
 
@@ -96,7 +98,7 @@ clauth work
 # switched to 'work'
 ```
 
-The active profile is marked with `●`. The 5-hour usage bar updates on each launch and is cached locally so it stays visible even when the Anthropic API is rate-limited.
+The active profile is marked with `●`. The 5-hour usage bar updates on each launch and is cached locally so it stays visible even if the Anthropic API is rate-limited.
 
 ## Profile types
 
