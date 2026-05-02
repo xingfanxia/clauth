@@ -11,6 +11,7 @@ use anyhow::Result;
 use inquire::{InquireError, Select};
 
 use crate::actions::{capture_current_profile, create_blank_profile, is_cancelled, switch_profile};
+use crate::claude::snapshot_active_credentials;
 use crate::menu::{MainAction, build_main_menu, profile_submenu};
 use crate::profile::load_config;
 use crate::ui::build_render_config;
@@ -43,6 +44,7 @@ fn main() -> Result<()> {
     update::spawn();
     inquire::set_global_render_config(build_render_config());
     let mut config = load_config()?;
+    let _ = snapshot_active_credentials(&mut config);
 
     let usage_handles: Vec<(usize, std::thread::JoinHandle<Option<usage::UsageInfo>>)> = config
         .profiles
