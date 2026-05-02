@@ -21,12 +21,17 @@ fn main() -> Result<()> {
     if let [name] = args.as_slice() {
         platform::init();
         let mut config = load_config()?;
-        if config.find(name).is_none() {
+        let canonical = config
+            .names()
+            .into_iter()
+            .find(|n| n.eq_ignore_ascii_case(name))
+            .map(str::to_string);
+        let Some(canonical) = canonical else {
             let available = config.names().join(", ");
             anyhow::bail!("profile '{name}' not found\navailable: {available}");
-        }
-        switch_profile(&mut config, name)?;
-        println!("switched to '{name}'");
+        };
+        switch_profile(&mut config, &canonical)?;
+        println!("switched to '{canonical}'");
         return Ok(());
     }
 
