@@ -105,12 +105,16 @@ pub(crate) fn rename_profile(config: &mut AppConfig, old: &str) -> Result<bool> 
     if let Some(slot) = config.state.profiles.iter_mut().find(|n| n.as_str() == old) {
         *slot = new.clone();
     }
-    if config.is_active(old) {
-        link_profile_credentials(&new)?;
-        config.state.active_profile = Some(new);
+    let was_active = config.is_active(old);
+    if was_active {
+        config.state.active_profile = Some(new.clone());
     }
 
     save_app_state(&config.state)?;
+
+    if was_active {
+        link_profile_credentials(&new)?;
+    }
     Ok(true)
 }
 
@@ -132,16 +136,17 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<bool>
 
     let was_active = config.is_active(name);
     let dir = profile_dir(name)?;
+
+    config.remove(name);
+    save_app_state(&config.state)?;
+
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
             .with_context(|| format!("Failed to delete profile directory for '{name}'"))?;
     }
-
-    config.remove(name);
     if was_active {
         clear_claude_credentials()?;
     }
-    save_app_state(&config.state)?;
     Ok(true)
 }
 
