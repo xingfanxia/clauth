@@ -7,14 +7,44 @@ mod ui;
 mod update;
 mod usage;
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use inquire::{InquireError, Select};
 
 use crate::actions::{capture_current_profile, create_blank_profile, is_cancelled, switch_profile};
 use crate::claude::snapshot_active_credentials;
 use crate::menu::{MainAction, build_main_menu, profile_submenu};
-use crate::profile::load_config;
+use crate::profile::{Profile, load_config};
 use crate::ui::build_render_config;
+
+fn collect_tokens(profiles: &[Profile]) -> Vec<(String, String)> {
+    profiles
+        .iter()
+        .filter_map(|p| {
+            let token = p
+                .credentials
+                .as_ref()?
+                .claude_ai_oauth
+                .as_ref()?
+                .access_token
+                .clone();
+            Some((p.name.clone(), token))
+        })
+        .collect()
+}
+
+fn apply_usage(profiles: &mut [Profile], store: &usage::UsageStore) {
+    let Ok(s) = store.lock() else {
+        return;
+    };
+    for p in profiles {
+        if let Some(info) = s.get(&p.name) {
+            p.usage = Some(info.clone());
+        }
+    }
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -46,31 +76,17 @@ fn main() -> Result<()> {
     let mut config = load_config()?;
     let _ = snapshot_active_credentials(&mut config);
 
-    let usage_handles: Vec<(usize, std::thread::JoinHandle<Option<usage::UsageInfo>>)> = config
-        .profiles
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| {
-            let name = p.name.clone();
-            let token = p
-                .credentials
-                .as_ref()?
-                .claude_ai_oauth
-                .as_ref()?
-                .access_token
-                .clone();
-            Some((
-                i,
-                std::thread::spawn(move || usage::fetch_cached(&name, &token)),
-            ))
-        })
-        .collect();
+    let usage_store: usage::UsageStore = Arc::new(Mutex::new(HashMap::new()));
+    let usage_tokens: usage::TokenList = Arc::new(Mutex::new(collect_tokens(&config.profiles)));
 
-    for (i, handle) in usage_handles {
-        config.profiles[i].usage = handle.join().ok().flatten();
+    {
+        let snapshot = usage_tokens.lock().unwrap().clone();
+        usage::fetch_all_into(&snapshot, &usage_store);
     }
+    usage::spawn_refresher(Arc::clone(&usage_tokens), Arc::clone(&usage_store));
 
     loop {
+        apply_usage(&mut config.profiles, &usage_store);
         let menu = build_main_menu(&config);
         let labels: Vec<String> = menu.iter().map(|(l, _)| l.clone()).collect();
 
@@ -98,6 +114,8 @@ fn main() -> Result<()> {
         {
             return Err(e);
         }
+
+        *usage_tokens.lock().unwrap() = collect_tokens(&config.profiles);
     }
 
     Ok(())
