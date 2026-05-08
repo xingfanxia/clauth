@@ -23,6 +23,15 @@ pub(crate) fn prompt_profile_name(existing: &[&str], exclude: Option<&str>) -> R
     if name.is_empty() {
         bail!("Name cannot be empty.");
     }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || name.starts_with('.')
+    {
+        bail!(
+            "Name must contain only letters, digits, '-', '_', or '.', and cannot start with '.'."
+        );
+    }
     if existing.iter().any(|&n| n == name && Some(n) != exclude) {
         bail!("A profile named '{name}' already exists.");
     }
