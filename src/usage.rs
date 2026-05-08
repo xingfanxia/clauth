@@ -23,6 +23,9 @@ pub(crate) fn fetch_cached(profile_name: &str, access_token: &str) -> Option<Usa
             if let Some(ref path) = cache
                 && let Ok(json) = serde_json::to_string(&info)
             {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
                 let _ = std::fs::write(path, json);
             }
             Some(info)
