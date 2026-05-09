@@ -1,11 +1,19 @@
+use std::io::{self, Write};
+use std::time::Duration;
+
 use anyhow::Result;
+use crossterm::cursor::{Hide, MoveToColumn, RestorePosition, SavePosition, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::style::Print;
+use crossterm::terminal::{self, Clear, ClearType};
+use crossterm::{execute, queue};
 use inquire::{InquireError, Select};
 
 use crate::actions::{delete_profile, edit_profile, is_cancelled, rename_profile, switch_profile};
 use crate::profile::AppConfig;
 use crate::ui::{
-    C_DANGER, C_DIM, C_FAINT, C_FG_OFF, C_NOBOLD, C_ORANGE, C_RESET, format_profile_entry,
-    format_submenu_title,
+    C_ACCENT, C_BOLD, C_DANGER, C_DIM, C_FAINT, C_FG_OFF, C_NOBOLD, C_ORANGE, C_RESET,
+    format_profile_entry, format_submenu_title,
 };
 
 // ── Profile submenu ───────────────────────────────────────────────────────────
@@ -82,6 +90,113 @@ pub(crate) enum MainAction {
     NewBlank,
     Capture,
     Quit,
+}
+
+pub(crate) enum MainMenuResult {
+    Selected(usize),
+    Cancelled,
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Result<Self> {
+        terminal::enable_raw_mode()?;
+        execute!(io::stdout(), Hide)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let mut out = io::stdout();
+        let _ = execute!(out, RestorePosition, Clear(ClearType::FromCursorDown), Show);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn render_main_menu(labels: &[String], selected: usize) -> Result<()> {
+    let mut out = io::stdout();
+    queue!(out, RestorePosition, Clear(ClearType::FromCursorDown))?;
+    queue!(
+        out,
+        MoveToColumn(0),
+        Print(format!("{C_ACCENT}?{C_RESET} clauth\r\n"))
+    )?;
+
+    for (i, label) in labels.iter().enumerate() {
+        queue!(out, MoveToColumn(0))?;
+        if i == selected {
+            queue!(
+                out,
+                Print(format!("{C_ORANGE}▶{C_RESET} {C_BOLD}{label}{C_RESET}\r\n"))
+            )?;
+        } else {
+            queue!(out, Print(format!("  {label}\r\n")))?;
+        }
+    }
+
+    out.flush()?;
+    Ok(())
+}
+
+pub(crate) fn main_menu_prompt(
+    mut labels: Vec<String>,
+    mut refresh: impl FnMut() -> Vec<String>,
+) -> Result<MainMenuResult> {
+    if labels.is_empty() {
+        return Ok(MainMenuResult::Cancelled);
+    }
+
+    let _raw_mode = RawModeGuard::new()?;
+    execute!(io::stdout(), SavePosition)?;
+
+    let mut selected = 0;
+    render_main_menu(&labels, selected)?;
+
+    loop {
+        if !event::poll(Duration::from_millis(500))? {
+            let refreshed = refresh();
+            if !refreshed.is_empty() {
+                labels = refreshed;
+                selected = selected.min(labels.len() - 1);
+                render_main_menu(&labels, selected)?;
+            }
+            continue;
+        }
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+                render_main_menu(&labels, selected)?;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(labels.len() - 1);
+                render_main_menu(&labels, selected)?;
+            }
+            KeyCode::Home => {
+                selected = 0;
+                render_main_menu(&labels, selected)?;
+            }
+            KeyCode::End => {
+                selected = labels.len() - 1;
+                render_main_menu(&labels, selected)?;
+            }
+            KeyCode::Enter => return Ok(MainMenuResult::Selected(selected)),
+            KeyCode::Esc => return Ok(MainMenuResult::Cancelled),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(MainMenuResult::Cancelled);
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) fn build_main_menu(config: &AppConfig) -> Vec<(String, MainAction)> {

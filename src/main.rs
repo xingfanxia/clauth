@@ -11,11 +11,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use inquire::{InquireError, Select};
 
 use crate::actions::{capture_current_profile, create_blank_profile, is_cancelled, switch_profile};
 use crate::claude::snapshot_active_credentials;
-use crate::menu::{MainAction, build_main_menu, profile_submenu};
+use crate::menu::{MainAction, MainMenuResult, build_main_menu, main_menu_prompt, profile_submenu};
 use crate::profile::{Profile, load_config};
 use crate::ui::build_render_config;
 
@@ -90,13 +89,15 @@ fn main() -> Result<()> {
         let menu = build_main_menu(&config);
         let labels: Vec<String> = menu.iter().map(|(l, _)| l.clone()).collect();
 
-        let idx = match Select::new("clauth", labels)
-            .without_filtering()
-            .raw_prompt()
-        {
-            Ok(opt) => opt.index,
-            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => break,
-            Err(e) => return Err(e.into()),
+        let idx = match main_menu_prompt(labels, || {
+            apply_usage(&mut config.profiles, &usage_store);
+            build_main_menu(&config)
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect()
+        })? {
+            MainMenuResult::Selected(idx) => idx,
+            MainMenuResult::Cancelled => break,
         };
 
         let result = match menu[idx].1 {
