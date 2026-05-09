@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::cursor::{Hide, MoveToColumn, RestorePosition, SavePosition, Show};
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::Print;
 use crossterm::terminal::{self, Clear, ClearType};
@@ -97,42 +97,46 @@ pub(crate) enum MainMenuResult {
     Cancelled,
 }
 
-struct RawModeGuard;
+struct RawModeGuard {
+    row: u16,
+}
 
 impl RawModeGuard {
     fn new() -> Result<Self> {
         terminal::enable_raw_mode()?;
+        let (_, row) = crossterm::cursor::position()?;
         execute!(io::stdout(), Hide)?;
-        Ok(Self)
+        Ok(Self { row })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let mut out = io::stdout();
-        let _ = execute!(out, RestorePosition, Clear(ClearType::FromCursorDown), Show);
+        let _ = execute!(
+            out,
+            MoveTo(0, self.row),
+            Clear(ClearType::FromCursorDown),
+            Show
+        );
         let _ = terminal::disable_raw_mode();
     }
 }
 
-fn render_main_menu(labels: &[String], selected: usize) -> Result<()> {
+fn render_main_menu(labels: &[String], selected: usize, row: u16) -> Result<()> {
     let mut out = io::stdout();
-    queue!(out, RestorePosition, Clear(ClearType::FromCursorDown))?;
-    queue!(
-        out,
-        MoveToColumn(0),
-        Print(format!("{C_ACCENT}?{C_RESET} clauth\r\n"))
-    )?;
+    queue!(out, MoveTo(0, row), Clear(ClearType::FromCursorDown))?;
+    queue!(out, Print(format!("{C_ACCENT}?{C_RESET} clauth")))?;
 
     for (i, label) in labels.iter().enumerate() {
-        queue!(out, MoveToColumn(0))?;
+        queue!(out, MoveTo(0, row + i as u16 + 1))?;
         if i == selected {
             queue!(
                 out,
-                Print(format!("{C_ORANGE}▶{C_RESET} {C_BOLD}{label}{C_RESET}\r\n"))
+                Print(format!("{C_ORANGE}▶{C_RESET} {C_BOLD}{label}{C_RESET}"))
             )?;
         } else {
-            queue!(out, Print(format!("  {label}\r\n")))?;
+            queue!(out, Print(format!("  {label}")))?;
         }
     }
 
@@ -148,11 +152,10 @@ pub(crate) fn main_menu_prompt(
         return Ok(MainMenuResult::Cancelled);
     }
 
-    let _raw_mode = RawModeGuard::new()?;
-    execute!(io::stdout(), SavePosition)?;
+    let raw_mode = RawModeGuard::new()?;
 
     let mut selected = 0;
-    render_main_menu(&labels, selected)?;
+    render_main_menu(&labels, selected, raw_mode.row)?;
 
     loop {
         if !event::poll(Duration::from_millis(500))? {
@@ -160,7 +163,7 @@ pub(crate) fn main_menu_prompt(
             if !refreshed.is_empty() {
                 labels = refreshed;
                 selected = selected.min(labels.len() - 1);
-                render_main_menu(&labels, selected)?;
+                render_main_menu(&labels, selected, raw_mode.row)?;
             }
             continue;
         }
@@ -179,19 +182,19 @@ pub(crate) fn main_menu_prompt(
                 } else {
                     selected - 1
                 };
-                render_main_menu(&labels, selected)?;
+                render_main_menu(&labels, selected, raw_mode.row)?;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 selected = (selected + 1) % labels.len();
-                render_main_menu(&labels, selected)?;
+                render_main_menu(&labels, selected, raw_mode.row)?;
             }
             KeyCode::Home => {
                 selected = 0;
-                render_main_menu(&labels, selected)?;
+                render_main_menu(&labels, selected, raw_mode.row)?;
             }
             KeyCode::End => {
                 selected = labels.len() - 1;
-                render_main_menu(&labels, selected)?;
+                render_main_menu(&labels, selected, raw_mode.row)?;
             }
             KeyCode::Enter => return Ok(MainMenuResult::Selected(selected)),
             KeyCode::Esc => return Ok(MainMenuResult::Cancelled),
