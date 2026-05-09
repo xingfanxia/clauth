@@ -174,11 +174,15 @@ pub(crate) fn main_menu_prompt(
 
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                selected = selected.saturating_sub(1);
+                selected = if selected == 0 {
+                    labels.len() - 1
+                } else {
+                    selected - 1
+                };
                 render_main_menu(&labels, selected)?;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                selected = (selected + 1).min(labels.len() - 1);
+                selected = (selected + 1) % labels.len();
                 render_main_menu(&labels, selected)?;
             }
             KeyCode::Home => {
