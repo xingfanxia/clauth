@@ -9,8 +9,18 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release notes
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+
   build-linux-windows:
     name: Build ${{ matrix.asset_name }}
+    needs: create-release
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -60,10 +70,10 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.asset_name }}${{ matrix.ext }}
-          generate_release_notes: true
 
   build-macos:
     name: Build ${{ matrix.asset_name }}
+    needs: create-release
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -102,4 +112,3 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.asset_name }}
-          generate_release_notes: true
