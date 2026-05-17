@@ -11,8 +11,8 @@ A simple and fast Claude Code account switcher; select a profile, hit enter, don
 
 ```
 ? clauth
-  ● work        Claude Max 5x  [████████░░] 82% · resets 2h 15m
-    personal    Claude Pro     [███░░░░░░░] 28% · resets 4h 02m
+  ● work        Claude Max 5x  5h [████████░░] 82% (2h 15m) · 7d [█░░░░░░░░░] 12% (1d 6h)
+    personal    Claude Pro     5h [███░░░░░░░] 28% (4h 02m)
     api-dev     https://api.notanthropic.com · API key set
   + New profile
   + New from current profile
@@ -26,7 +26,7 @@ clauth keeps snapshots of both files for each profile; on switch it swaps `.cred
 ## Features
 
 - **One-key switching:** select a profile, switch, done; or `clauth <profile>` to switch directly by profile name
-- **Usage bar:** live 5-hour utilization fetched from the Anthropic API and refreshed every 30s, color-coded by threshold, with the next reset time alongside the bar
+- **Usage bars:** live 5-hour utilization fetched from the Anthropic API and refreshed every 30s, color-coded by threshold, with the next reset time alongside the bar. Max accounts also get a 7-day bar when the terminal is wide enough; Pro accounts have no weekly window in the API response so only the 5h bar is shown
 - **Plan detection:** queries `/api/oauth/profile` to identify the real plan tier — Pro, Max 5x, Max 20x, Team, Enterprise, Free — instead of trusting the unreliable `subscriptionType` tag in the OAuth credentials
 - **Detailed window stats:** the per-profile submenu also shows the 7-day rolling window and any paid extra-usage spend
 - **Non-destructive:** only touches the two API-related keys in `settings.json`; all other config is preserved
@@ -99,7 +99,7 @@ clauth work
 # switched to 'work'
 ```
 
-The active profile is marked with `●`. The 5-hour usage bar refreshes every 30 seconds and is cached locally so it stays visible even if the Anthropic API is rate-limited or offline.
+The active profile is marked with `●`. Usage bars refresh every 30 seconds and are cached locally so they stay visible even if the Anthropic API is rate-limited or offline. The 7-day bar is appended only when the terminal is wide enough to fit every row's full line.
 
 ## Profile types
 
