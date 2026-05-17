@@ -2,6 +2,7 @@ mod actions;
 mod claude;
 mod completions;
 mod menu;
+mod oauth;
 mod platform;
 mod profile;
 mod ui;
@@ -85,6 +86,12 @@ fn main() -> Result<()> {
     inquire::set_global_render_config(build_render_config());
     let mut config = load_config()?;
     let _ = snapshot_active_credentials(&mut config);
+
+    // Refresh OAuth tokens before the first usage fetch, matching what
+    // Claude Code does on startup. Rotates refresh tokens — saved back to
+    // each profile's credentials.json (which is the symlink target for the
+    // active profile, so Claude Code sees the new pair too).
+    oauth::refresh_all(&mut config);
 
     let usage_store: usage::UsageStore = Arc::new(Mutex::new(HashMap::new()));
     let usage_tokens: usage::TokenList = Arc::new(Mutex::new(collect_tokens(&config.profiles)));
