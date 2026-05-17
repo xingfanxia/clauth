@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use crate::profile::{AppConfig, save_profile};
+use crate::usage::UsageStore;
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup
 /// to mint a fresh access token from the stored refresh token.
@@ -55,36 +56,51 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Mints fresh access tokens for every OAuth profile in parallel and writes
-/// the rotated credentials back to disk. Refresh tokens are single-use, so
-/// each successful call invalidates the old pair — saving the new pair is
-/// mandatory or the next launch loses access.
+/// Refreshes OAuth tokens for every profile whose 5-hour usage window is
+/// missing in the store — Claude Code's startup refresh is what starts that
+/// timer, so a missing window means the timer hasn't begun yet.
 ///
-/// Failures (network down, revoked refresh token) are swallowed: the cached
-/// access token stays put and the user re-authenticates via Claude Code if
-/// it's actually expired.
-pub(crate) fn refresh_all(config: &mut AppConfig) {
-    let snapshots: Vec<(String, String)> = config
-        .profiles
-        .iter()
-        .filter_map(|p| {
-            let token = p
-                .credentials
-                .as_ref()?
-                .claude_ai_oauth
-                .as_ref()?
-                .refresh_token
-                .as_ref()?
-                .clone();
-            Some((p.name.clone(), token))
-        })
-        .collect();
+/// Refresh tokens are single-use, so each successful call invalidates the
+/// old pair; the rotated pair is persisted to credentials.json (active
+/// profile's file is the symlink target Claude Code reads).
+///
+/// Returns the names of profiles whose tokens were successfully refreshed,
+/// so the caller can re-fetch usage and confirm the timer is now visible.
+/// Failures (network down, revoked refresh token) are swallowed: the
+/// cached access token stays put.
+pub(crate) fn refresh_missing_timers(config: &mut AppConfig, store: &UsageStore) -> Vec<String> {
+    let snapshots: Vec<(String, String)> = {
+        let usage = store.lock().ok();
+        config
+            .profiles
+            .iter()
+            .filter(|p| {
+                usage
+                    .as_ref()
+                    .and_then(|s| s.get(&p.name))
+                    .and_then(|u| u.five_hour.as_ref())
+                    .is_none()
+            })
+            .filter_map(|p| {
+                let token = p
+                    .credentials
+                    .as_ref()?
+                    .claude_ai_oauth
+                    .as_ref()?
+                    .refresh_token
+                    .as_ref()?
+                    .clone();
+                Some((p.name.clone(), token))
+            })
+            .collect()
+    };
 
     let handles: Vec<_> = snapshots
         .into_iter()
         .map(|(name, rt)| std::thread::spawn(move || (name, refresh(&rt))))
         .collect();
 
+    let mut refreshed = Vec::new();
     for h in handles {
         let Ok((name, Ok(tok))) = h.join() else {
             continue;
@@ -104,6 +120,9 @@ pub(crate) fn refresh_all(config: &mut AppConfig) {
         if let Some(scope) = tok.scope {
             oauth.scopes = Some(scope.split(' ').map(String::from).collect());
         }
-        let _ = save_profile(profile);
+        if save_profile(profile).is_ok() {
+            refreshed.push(name);
+        }
     }
+    refreshed
 }

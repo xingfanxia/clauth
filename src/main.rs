@@ -87,18 +87,38 @@ fn main() -> Result<()> {
     let mut config = load_config()?;
     let _ = snapshot_active_credentials(&mut config);
 
-    // Refresh OAuth tokens before the first usage fetch, matching what
-    // Claude Code does on startup. Rotates refresh tokens — saved back to
-    // each profile's credentials.json (which is the symlink target for the
-    // active profile, so Claude Code sees the new pair too).
-    oauth::refresh_all(&mut config);
-
     let usage_store: usage::UsageStore = Arc::new(Mutex::new(HashMap::new()));
     let usage_tokens: usage::TokenList = Arc::new(Mutex::new(collect_tokens(&config.profiles)));
 
+    // Initial usage fetch: tells us which profiles already have a running
+    // 5-hour window vs. which need their token refreshed to kick one off
+    // (Claude Code does the same thing on launch).
     {
         let snapshot = usage_tokens.lock().unwrap().clone();
         usage::fetch_all_into(&snapshot, &usage_store);
+    }
+
+    // Refresh tokens only for profiles missing a 5-hour window, then
+    // re-fetch their usage so the menu confirms the timer started.
+    let refreshed = oauth::refresh_missing_timers(&mut config, &usage_store);
+    if !refreshed.is_empty() {
+        let retry: Vec<(String, String)> = config
+            .profiles
+            .iter()
+            .filter(|p| refreshed.iter().any(|n| n == &p.name))
+            .filter_map(|p| {
+                let t = p
+                    .credentials
+                    .as_ref()?
+                    .claude_ai_oauth
+                    .as_ref()?
+                    .access_token
+                    .clone();
+                Some((p.name.clone(), t))
+            })
+            .collect();
+        usage::fetch_all_into(&retry, &usage_store);
+        *usage_tokens.lock().unwrap() = collect_tokens(&config.profiles);
     }
     usage::spawn_refresher(Arc::clone(&usage_tokens), Arc::clone(&usage_store));
 
