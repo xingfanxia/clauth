@@ -29,6 +29,10 @@ pub(crate) struct Profile {
     pub(crate) name: String,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
+    /// When true, clauth fires a 1-token Haiku ping at startup if this
+    /// profile has no active 5h window. Mirrors what Claude Code does on
+    /// launch; opt-in because it consumes a (tiny) amount of usage.
+    pub(crate) kick_timer: bool,
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) usage: Option<UsageInfo>,
 }
@@ -39,6 +43,7 @@ impl Profile {
             name,
             base_url,
             api_key,
+            kick_timer: false,
             credentials: None,
             usage: None,
         }
@@ -94,6 +99,12 @@ impl AppConfig {
 struct ProfileConfig {
     base_url: Option<String>,
     api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    kick_timer: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -169,6 +180,7 @@ fn load_profile(name: &str) -> Result<Profile> {
         name: name.to_string(),
         base_url: config.base_url,
         api_key: config.api_key,
+        kick_timer: config.kick_timer,
         credentials,
         usage: None,
     })
@@ -180,6 +192,7 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
     let config_toml = toml::to_string_pretty(&ProfileConfig {
         base_url: profile.base_url.clone(),
         api_key: profile.api_key.clone(),
+        kick_timer: profile.kick_timer,
     })?;
     std::fs::write(profile_config_path(&profile.name)?, config_toml)
         .context("Failed to write config.toml")?;

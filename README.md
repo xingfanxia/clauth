@@ -109,6 +109,16 @@ The active profile is marked with `●`. The 5-hour usage bar refreshes every 30
 
 You can edit a profile's URL and key at any time without losing its stored credentials.
 
+## Kicking the 5-hour timer
+
+The 5-hour usage window only starts after a real inference call — OAuth token refresh alone doesn't trigger it. To make a profile's timer show up at clauth startup, opt in per-profile by setting `kick_timer = true` in `~/.clauth/profiles/<name>/config.toml`:
+
+```toml
+kick_timer = true
+```
+
+When enabled, clauth refreshes the OAuth token and sends a 1-token Haiku ping (~22 input + 1 output token, fractions of a cent) for that profile on startup if no window is currently running. Default is off.
+
 ## Storage layout
 
 ```
@@ -116,7 +126,7 @@ You can edit a profile's URL and key at any time without losing its stored crede
   profiles.toml          # profile order + active marker
   profiles/
     work/
-      config.toml        # base_url, api_key
+      config.toml        # base_url, api_key, kick_timer
       credentials.json   # OAuth token snapshot
       usage_cache.json   # last known utilization + plan info
     personal/

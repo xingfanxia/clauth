@@ -98,14 +98,16 @@ fn main() -> Result<()> {
         usage::fetch_all_into(&snapshot, &usage_store);
     }
 
-    // Refresh tokens only for profiles missing a 5-hour window, then
-    // re-fetch their usage so the menu confirms the timer started.
-    let refreshed = oauth::refresh_missing_timers(&mut config, &usage_store);
-    if !refreshed.is_empty() {
+    // For profiles that opted in with `kick_timer = true` in their
+    // config.toml and have no running 5-hour window, refresh + fire a
+    // 1-token Haiku ping to start the window, then re-fetch usage so the
+    // menu confirms the timer started.
+    let kicked = oauth::kick_missing_timers(&mut config, &usage_store);
+    if !kicked.is_empty() {
         let retry: Vec<(String, String)> = config
             .profiles
             .iter()
-            .filter(|p| refreshed.iter().any(|n| n == &p.name))
+            .filter(|p| kicked.iter().any(|n| n == &p.name))
             .filter_map(|p| {
                 let t = p
                     .credentials
