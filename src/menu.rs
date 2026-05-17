@@ -102,10 +102,24 @@ struct RawModeGuard {
 }
 
 impl RawModeGuard {
-    fn new() -> Result<Self> {
+    fn new(lines_needed: u16) -> Result<Self> {
+        let mut out = io::stdout();
+        let (_, rows) = terminal::size()?;
+        let (_, mut row) = crossterm::cursor::position()?;
+
+        let shift = (row + lines_needed).saturating_sub(rows);
+        if shift > 0 {
+            // Using \n for native scrolling is much more reliable
+            write!(out, "{}", "\n".repeat(shift as usize))?;
+            out.flush()?;
+            let (_, r) = crossterm::cursor::position()?;
+            row = r.saturating_sub(lines_needed - 1);
+        }
+
         terminal::enable_raw_mode()?;
-        let (_, row) = crossterm::cursor::position()?;
-        execute!(io::stdout(), Hide)?;
+        // Re-read or move cursor just to be sure we are consistent,
+        // though logically we are at the same visually translated line.
+        execute!(out, MoveTo(0, row), Hide)?;
         Ok(Self { row })
     }
 }
@@ -152,7 +166,8 @@ pub(crate) fn main_menu_prompt(
         return Ok(MainMenuResult::Cancelled);
     }
 
-    let raw_mode = RawModeGuard::new()?;
+    let lines_needed = labels.len() as u16 + 1;
+    let raw_mode = RawModeGuard::new(lines_needed)?;
 
     let mut selected = 0;
     render_main_menu(&labels, selected, raw_mode.row)?;
