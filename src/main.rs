@@ -1,5 +1,6 @@
 mod actions;
 mod claude;
+mod completions;
 mod menu;
 mod platform;
 mod profile;
@@ -48,28 +49,34 @@ fn apply_usage(profiles: &mut [Profile], store: &usage::UsageStore) {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if let [name] = args.as_slice() {
-        platform::init();
-        let mut config = load_config()?;
-        let canonical = config
-            .names()
-            .into_iter()
-            .find(|n| n.eq_ignore_ascii_case(name))
-            .map(str::to_string);
-        let Some(canonical) = canonical else {
-            let available = config.names().join(", ");
-            anyhow::bail!("profile '{name}' not found\navailable: {available}");
-        };
-        switch_profile(&mut config, &canonical)?;
-        println!("switched to '{canonical}'");
-        return Ok(());
-    }
-
-    if args.len() > 1 {
-        anyhow::bail!("usage: clauth [profile]");
+    match args.as_slice() {
+        [cmd, shell] if cmd == "completions" => return completions::print_script(shell),
+        [cmd] if cmd == "__complete" => {
+            completions::print_profile_names();
+            return Ok(());
+        }
+        [name] => {
+            platform::init();
+            let mut config = load_config()?;
+            let canonical = config
+                .names()
+                .into_iter()
+                .find(|n| n.eq_ignore_ascii_case(name))
+                .map(str::to_string);
+            let Some(canonical) = canonical else {
+                let available = config.names().join(", ");
+                anyhow::bail!("profile '{name}' not found\navailable: {available}");
+            };
+            switch_profile(&mut config, &canonical)?;
+            println!("switched to '{canonical}'");
+            return Ok(());
+        }
+        [] => {}
+        _ => anyhow::bail!("usage: clauth [profile] | clauth completions <bash|zsh|fish>"),
     }
 
     platform::init();
+    completions::auto_install_once();
     update::spawn();
     inquire::set_global_render_config(build_render_config());
     let mut config = load_config()?;
