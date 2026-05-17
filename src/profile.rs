@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use crate::usage::UsageInfo;
@@ -62,6 +62,12 @@ impl Profile {
 pub(crate) struct AppState {
     pub(crate) active_profile: Option<String>,
     pub(crate) profiles: Vec<String>,
+    /// Epoch-ms of the last successful timer kick per profile. Used to skip
+    /// rekicking a profile whose previous kick should still be inside its
+    /// 5-hour window, so a silently-failed usage fetch doesn't cause us to
+    /// re-spend the kick on every launch.
+    #[serde(default)]
+    pub(crate) last_kick_at: HashMap<String, u64>,
 }
 
 pub(crate) struct AppConfig {
