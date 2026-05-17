@@ -99,12 +99,45 @@ impl AppConfig {
 struct ProfileConfig {
     base_url: Option<String>,
     api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default)]
     kick_timer: bool,
 }
 
-fn is_false(b: &bool) -> bool {
-    !*b
+/// Hand-rolled TOML writer that keeps every option visible — set values are
+/// uncommented, unset ones stay as commented examples so users can discover
+/// what's available without consulting the README.
+fn render_config_toml(profile: &Profile) -> String {
+    fn toml_str(s: &str) -> String {
+        toml::Value::String(s.to_string()).to_string()
+    }
+
+    let mut out = String::from("# clauth profile configuration\n\n");
+
+    out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
+    out.push_str("# (Pro / Max / Team / Enterprise) profile.\n");
+    match profile.base_url.as_deref() {
+        Some(v) => out.push_str(&format!("base_url = {}\n", toml_str(v))),
+        None => out.push_str("# base_url = \"https://api.anthropic.com\"\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# API key for the endpoint. Only used when base_url is set.\n");
+    match profile.api_key.as_deref() {
+        Some(v) => out.push_str(&format!("api_key = {}\n", toml_str(v))),
+        None => out.push_str("# api_key = \"sk-ant-...\"\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# Fire a 1-token Haiku ping at startup to start the 5-hour usage\n");
+    out.push_str("# window when this profile has no running window. Costs ~0.001¢ per\n");
+    out.push_str("# kick. OAuth profiles only.\n");
+    if profile.kick_timer {
+        out.push_str("kick_timer = true\n");
+    } else {
+        out.push_str("# kick_timer = true\n");
+    }
+
+    out
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -156,12 +189,12 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
 
 fn load_profile(name: &str) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
-    let config: ProfileConfig = if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read {name}/config.toml"))?;
-        toml::from_str(&content).with_context(|| format!("Failed to parse {name}/config.toml"))?
-    } else {
+    let raw_config = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let config: ProfileConfig = if raw_config.trim().is_empty() {
         ProfileConfig::default()
+    } else {
+        toml::from_str(&raw_config)
+            .with_context(|| format!("Failed to parse {name}/config.toml"))?
     };
 
     let cred_path = profile_credentials_path(name)?;
@@ -176,26 +209,36 @@ fn load_profile(name: &str) -> Result<Profile> {
         None
     };
 
-    Ok(Profile {
+    let profile = Profile {
         name: name.to_string(),
         base_url: config.base_url,
         api_key: config.api_key,
         kick_timer: config.kick_timer,
         credentials,
         usage: None,
-    })
+    };
+
+    // Keep config.toml in sync with the canonical template: missing options
+    // get added as comments, values already set are preserved in place.
+    let rendered = render_config_toml(&profile);
+    if raw_config != rendered {
+        if let Some(parent) = config_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&config_path, &rendered);
+    }
+
+    Ok(profile)
 }
 
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
     std::fs::create_dir_all(profile_dir(&profile.name)?)?;
 
-    let config_toml = toml::to_string_pretty(&ProfileConfig {
-        base_url: profile.base_url.clone(),
-        api_key: profile.api_key.clone(),
-        kick_timer: profile.kick_timer,
-    })?;
-    std::fs::write(profile_config_path(&profile.name)?, config_toml)
-        .context("Failed to write config.toml")?;
+    std::fs::write(
+        profile_config_path(&profile.name)?,
+        render_config_toml(profile),
+    )
+    .context("Failed to write config.toml")?;
 
     let cred_path = profile_credentials_path(&profile.name)?;
     match &profile.credentials {

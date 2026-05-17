@@ -186,6 +186,12 @@ pub(crate) fn endpoint_visible_width(profile: &Profile) -> usize {
     endpoint_label(profile).chars().count()
 }
 
+/// Plan/usage info is OAuth-only — an API-endpoint profile uses the
+/// proxy's own quota and Anthropic's `/oauth/usage` numbers don't apply.
+fn is_oauth_profile(profile: &Profile) -> bool {
+    profile.base_url.is_none()
+}
+
 pub(crate) fn format_profile_entry(
     profile: &Profile,
     is_active: bool,
@@ -193,7 +199,23 @@ pub(crate) fn format_profile_entry(
     endpoint_width: usize,
 ) -> String {
     let endpoint = endpoint_label(profile);
-    let endpoint_pad = " ".repeat(endpoint_width.saturating_sub(endpoint.chars().count()));
+    let usage_hint = if is_oauth_profile(profile) {
+        profile
+            .usage
+            .as_ref()
+            .map(five_hour_chunk)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    // Only pad to the alignment column when this row actually has a bar.
+    // API-profile rows let their suffixes hug the URL instead of dangling
+    // at the end of an empty column.
+    let endpoint_pad = if usage_hint.is_empty() {
+        String::new()
+    } else {
+        " ".repeat(endpoint_width.saturating_sub(endpoint.chars().count()))
+    };
     let key_hint = if profile.base_url.is_some() && profile.api_key.is_some() {
         format!("{C_FAINT} · API key set{C_RESET}")
     } else {
@@ -204,11 +226,6 @@ pub(crate) fn format_profile_entry(
     } else {
         String::new()
     };
-    let usage_hint = profile
-        .usage
-        .as_ref()
-        .map(five_hour_chunk)
-        .unwrap_or_default();
     let name = &profile.name;
 
     if is_active {
@@ -230,21 +247,14 @@ pub(crate) fn format_submenu_title(profile: &Profile) -> String {
     } else {
         String::new()
     };
-    let five_hour = profile
-        .usage
-        .as_ref()
-        .map(five_hour_chunk)
-        .unwrap_or_default();
-    let seven_day = profile
-        .usage
-        .as_ref()
-        .map(seven_day_chunk)
-        .unwrap_or_default();
-    let extra = profile
-        .usage
-        .as_ref()
-        .map(extra_usage_chunk)
-        .unwrap_or_default();
+    let usage = if is_oauth_profile(profile) {
+        profile.usage.as_ref()
+    } else {
+        None
+    };
+    let five_hour = usage.map(five_hour_chunk).unwrap_or_default();
+    let seven_day = usage.map(seven_day_chunk).unwrap_or_default();
+    let extra = usage.map(extra_usage_chunk).unwrap_or_default();
     format!(
         "{C_BOLD}{name}{C_RESET}{C_FAINT} · {C_RESET}{C_DIM}{url}{C_FAINT}{credentials}{C_RESET}{five_hour}{seven_day}{extra}"
     )
