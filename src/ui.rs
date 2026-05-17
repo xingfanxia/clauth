@@ -173,7 +173,11 @@ fn extra_usage_chunk(info: &UsageInfo) -> String {
         C_FAINT
     };
     let prefix = if currency.is_empty() { "" } else { " " };
-    format!("{C_FAINT} · {color}extra {used:.0}/{limit:.0}{prefix}{currency}{C_RESET}")
+    format!(
+        "{C_FAINT} · {color}extra {used_div:.2}/{limit_div:.2}{prefix}{currency}{C_RESET}",
+        used_div = used / 100.0,
+        limit_div = limit / 100.0,
+    )
 }
 
 /// Visible width (chars, no ANSI) of the plan/URL label. Used to align the
