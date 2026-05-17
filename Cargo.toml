@@ -1,6 +1,6 @@
 [package]
 name = "clauth"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "A simple Claude Code account switcher - swap OAuth and API profiles in an instant"
 license = "MIT"
