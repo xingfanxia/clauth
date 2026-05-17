@@ -9,9 +9,13 @@ mod update;
 mod usage;
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use crossterm::cursor::MoveTo;
+use crossterm::execute;
+use crossterm::terminal::{Clear, ClearType};
 
 use crate::actions::{capture_current_profile, create_blank_profile, is_cancelled, switch_profile};
 use crate::claude::snapshot_active_credentials;
@@ -107,6 +111,11 @@ fn main() -> Result<()> {
             MainMenuResult::Cancelled => break,
         };
 
+        // After main_menu_prompt drops its RawModeGuard the cursor sits where
+        // the menu started; remember it so we can wipe any inquire artifacts
+        // the next action leaves behind before re-rendering.
+        let menu_row = crossterm::cursor::position().map(|(_, r)| r).ok();
+
         let result = match menu[idx].1 {
             MainAction::Quit => break,
             MainAction::NewBlank => create_blank_profile(&mut config),
@@ -121,6 +130,14 @@ fn main() -> Result<()> {
             && !is_cancelled(&e)
         {
             return Err(e);
+        }
+
+        if let Some(row) = menu_row {
+            let _ = execute!(
+                io::stdout(),
+                MoveTo(0, row),
+                Clear(ClearType::FromCursorDown)
+            );
         }
 
         *usage_tokens.lock().unwrap() = collect_tokens(&config.profiles);

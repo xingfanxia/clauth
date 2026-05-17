@@ -46,7 +46,17 @@ pub(crate) fn profile_submenu(config: &mut AppConfig, profile_name: &str) -> Res
     use SubmenuAction::*;
     const ACTIONS: [SubmenuAction; 5] = [Switch, Edit, Rename, Delete, Back];
 
+    let start_row = crossterm::cursor::position().map(|(_, r)| r).ok();
+
     loop {
+        if let Some(row) = start_row {
+            let _ = execute!(
+                io::stdout(),
+                MoveTo(0, row),
+                Clear(ClearType::FromCursorDown)
+            );
+        }
+
         let (title, is_active) = match config.find(profile_name) {
             Some(p) => (format_submenu_title(p), config.is_active(profile_name)),
             None => return Ok(()),
@@ -109,16 +119,17 @@ impl RawModeGuard {
 
         let shift = (row + lines_needed).saturating_sub(rows);
         if shift > 0 {
-            // Using \n for native scrolling is much more reliable
+            // `\n` only scrolls when the cursor is on the last row; otherwise
+            // it just moves the cursor down and we end up rendering over
+            // existing history. Park on the bottom row first so each newline
+            // pushes a line into scrollback.
+            execute!(out, MoveTo(0, rows.saturating_sub(1)))?;
             write!(out, "{}", "\n".repeat(shift as usize))?;
             out.flush()?;
-            let (_, r) = crossterm::cursor::position()?;
-            row = r.saturating_sub(lines_needed - 1);
+            row = row.saturating_sub(shift);
         }
 
         terminal::enable_raw_mode()?;
-        // Re-read or move cursor just to be sure we are consistent,
-        // though logically we are at the same visually translated line.
         execute!(out, MoveTo(0, row), Hide)?;
         Ok(Self { row })
     }
