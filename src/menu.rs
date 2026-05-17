@@ -13,7 +13,7 @@ use crate::actions::{delete_profile, edit_profile, is_cancelled, rename_profile,
 use crate::profile::AppConfig;
 use crate::ui::{
     C_ACCENT, C_BOLD, C_DANGER, C_DIM, C_FAINT, C_FG_OFF, C_NOBOLD, C_ORANGE, C_RESET,
-    format_profile_entry, format_submenu_title,
+    endpoint_visible_width, format_profile_entry, format_submenu_title,
 };
 
 // ── Profile submenu ───────────────────────────────────────────────────────────
@@ -241,11 +241,26 @@ pub(crate) fn build_main_menu(config: &AppConfig) -> Vec<(String, MainAction)> {
         .unwrap_or(0)
         .max(4);
 
+    // Align bars to the widest endpoint among profiles that actually render
+    // one. Profiles without a fetched 5-hour window don't push the column.
+    let endpoint_width = config
+        .profiles
+        .iter()
+        .filter(|p| {
+            p.usage
+                .as_ref()
+                .and_then(|u| u.five_hour.as_ref())
+                .is_some()
+        })
+        .map(endpoint_visible_width)
+        .max()
+        .unwrap_or(0);
+
     let mut items = Vec::with_capacity(config.profiles.len() + 3);
 
     for (i, p) in config.profiles.iter().enumerate() {
         items.push((
-            format_profile_entry(p, config.is_active(&p.name), name_width),
+            format_profile_entry(p, config.is_active(&p.name), name_width, endpoint_width),
             MainAction::Profile(i),
         ));
     }
