@@ -223,7 +223,9 @@ pub(crate) fn main_menu_prompt(
                 render_main_menu(&labels, selected, raw_mode.row)?;
             }
             KeyCode::Enter => return Ok(MainMenuResult::Selected(selected)),
-            KeyCode::Esc => return Ok(MainMenuResult::Cancelled),
+            KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
+                return Ok(MainMenuResult::Cancelled);
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(MainMenuResult::Cancelled);
             }
