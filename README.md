@@ -11,8 +11,8 @@ A simple and fast Claude Code account switcher; select a profile, hit enter, don
 
 ```
 ? clauth
-  ● work        Claude Pro   [████████░░] 94%
-    personal    Claude Max   [███░░░░░░░] 28%
+  ● work        Claude Max 5x  [████████░░] 82% · resets 2h 15m
+    personal    Claude Pro     [███░░░░░░░] 28% · resets 4h 02m
     api-dev     https://api.notanthropic.com · API key set
   + New profile
   + New from current profile
@@ -26,8 +26,9 @@ clauth keeps snapshots of both files for each profile; on switch it swaps `.cred
 ## Features
 
 - **One-key switching:** select a profile, switch, done; or `clauth <profile>` to switch directly by profile name
-- **Usage bar:** live utilization fetched from the Anthropic API at startup, color-coded by threshold
-- **Subscription type detection:** reads `subscriptionType` from each profile's credentials and displays it (Pro, Max, etc.)
+- **Usage bar:** live 5-hour utilization fetched from the Anthropic API and refreshed every 30s, color-coded by threshold, with the next reset time alongside the bar
+- **Plan detection:** queries `/api/oauth/profile` to identify the real plan tier — Pro, Max 5x, Max 20x, Team, Enterprise, Free — instead of trusting the unreliable `subscriptionType` tag in the OAuth credentials
+- **Detailed window stats:** the per-profile submenu also shows the 7-day rolling window and any paid extra-usage spend
 - **Non-destructive:** only touches the two API-related keys in `settings.json`; all other config is preserved
 
 ## Install
@@ -98,11 +99,11 @@ clauth work
 # switched to 'work'
 ```
 
-The active profile is marked with `●`. The 5-hour usage bar updates on each launch and is cached locally so it stays visible even if the Anthropic API is rate-limited.
+The active profile is marked with `●`. The 5-hour usage bar refreshes every 30 seconds and is cached locally so it stays visible even if the Anthropic API is rate-limited or offline.
 
 ## Profile types
 
-**Claude Pro / Max (OAuth)** — leave base URL blank. clauth captures the OAuth token from your running session and restores it on switch. The subscription tier is read directly from the token and shown in the list.
+**Claude Pro / Max / Team / Enterprise (OAuth)** — leave base URL blank. clauth captures the OAuth token from your running session and restores it on switch. The actual plan tier (including Max 5x / Max 20x) is detected from the Anthropic API and shown in the list.
 
 **API endpoint** — set a base URL and (optionally) an API key. Works with the official Anthropic API or any compatible proxy.
 
@@ -117,7 +118,7 @@ You can edit a profile's URL and key at any time without losing its stored crede
     work/
       config.toml        # base_url, api_key
       credentials.json   # OAuth token snapshot
-      usage_cache.json   # last known 5-hour utilization
+      usage_cache.json   # last known utilization + plan info
     personal/
       ...
 ```
