@@ -30,7 +30,7 @@ const KICK_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI 
 struct TokenResponse {
     access_token: String,
     refresh_token: String,
-    expires_in: i64,
+    expires_in: u64,
     #[serde(default)]
     scope: Option<String>,
 }
@@ -54,10 +54,10 @@ fn refresh(refresh_token: &str) -> Result<TokenResponse> {
         .post(TOKEN_ENDPOINT)
         .header("Content-Type", "application/json")
         .send(&body)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .map_err(crate::ureq_error::into_anyhow)?
         .body_mut()
         .read_to_string()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(crate::ureq_error::into_anyhow)?;
 
     serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))
 }
@@ -79,14 +79,14 @@ fn kick(access_token: &str) -> Result<()> {
         .header("anthropic-version", "2023-06-01")
         .header("anthropic-beta", "oauth-2025-04-20")
         .send(&body)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(crate::ureq_error::into_anyhow)?;
     Ok(())
 }
 
-fn now_ms() -> i64 {
+fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -160,9 +160,9 @@ pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) ->
         };
         oauth.access_token = tok.access_token;
         oauth.refresh_token = Some(tok.refresh_token);
-        oauth.expires_at = Some(now_ms() + tok.expires_in * 1000);
+        oauth.expires_at = Some((now_ms() + tok.expires_in * 1000) as i64);
         if let Some(scope) = tok.scope {
-            oauth.scopes = Some(scope.split(' ').map(String::from).collect());
+            oauth.scopes = Some(scope.split_whitespace().map(String::from).collect());
         }
         if save_profile(profile).is_ok() {
             kicked.push(name);

@@ -137,17 +137,18 @@ fn get_json(agent: &ureq::Agent, url: &str, access_token: &str) -> Result<String
         .header("Authorization", &format!("Bearer {access_token}"))
         .header("anthropic-beta", "oauth-2025-04-20")
         .call()
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .map_err(crate::ureq_error::into_anyhow)?
         .body_mut()
         .read_to_string()
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(crate::ureq_error::into_anyhow)
 }
 
 fn fetch(access_token: &str) -> Result<UsageInfo> {
     let agent = agent();
 
     let usage_text = get_json(&agent, USAGE_ENDPOINT, access_token)?;
-    let raw: RawUsage = serde_json::from_str(&usage_text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let raw: RawUsage =
+        serde_json::from_str(&usage_text).map_err(crate::ureq_error::into_anyhow)?;
 
     // Profile is best-effort: a stale token may 401 on /profile while /usage still
     // serves cached numbers. We don't want a profile failure to drop usage data.
@@ -192,9 +193,12 @@ pub(crate) fn fetch_all_into(tokens: &[(String, String)], store: &UsageStore) {
     let handles: Vec<_> = tokens
         .iter()
         .map(|(name, token)| {
-            let n = name.clone();
-            let t = token.clone();
-            std::thread::spawn(move || (n.clone(), fetch_cached(&n, &t)))
+            let name = name.clone();
+            let token = token.clone();
+            std::thread::spawn(move || {
+                let result = fetch_cached(&name, &token);
+                (name, result)
+            })
         })
         .collect();
 
@@ -283,6 +287,7 @@ pub(crate) fn iso_to_epoch_secs(s: &str) -> Option<i64> {
     Some(days * 86400 + hour * 3600 + minute * 60 + second - tz_offset_secs)
 }
 
+// Returns i64 (not u64) because callers subtract it to get signed deltas.
 pub(crate) fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

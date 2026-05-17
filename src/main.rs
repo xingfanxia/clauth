@@ -7,6 +7,7 @@ mod platform;
 mod profile;
 mod ui;
 mod update;
+mod ureq_error;
 mod usage;
 
 use std::collections::HashMap;
@@ -94,7 +95,10 @@ fn main() -> Result<()> {
     // 5-hour window vs. which need their token refreshed to kick one off
     // (Claude Code does the same thing on launch).
     {
-        let snapshot = usage_tokens.lock().unwrap().clone();
+        let snapshot = usage_tokens
+            .lock()
+            .expect("usage_tokens mutex poisoned")
+            .clone();
         usage::fetch_all_into(&snapshot, &usage_store);
     }
 
@@ -104,23 +108,13 @@ fn main() -> Result<()> {
     // menu confirms the timer started.
     let kicked = oauth::kick_missing_timers(&mut config, &usage_store);
     if !kicked.is_empty() {
-        let retry: Vec<(String, String)> = config
-            .profiles
-            .iter()
-            .filter(|p| kicked.iter().any(|n| n == &p.name))
-            .filter_map(|p| {
-                let t = p
-                    .credentials
-                    .as_ref()?
-                    .claude_ai_oauth
-                    .as_ref()?
-                    .access_token
-                    .clone();
-                Some((p.name.clone(), t))
-            })
+        let retry: Vec<(String, String)> = collect_tokens(&config.profiles)
+            .into_iter()
+            .filter(|(name, _)| kicked.contains(name))
             .collect();
         usage::fetch_all_into(&retry, &usage_store);
-        *usage_tokens.lock().unwrap() = collect_tokens(&config.profiles);
+        *usage_tokens.lock().expect("usage_tokens mutex poisoned") =
+            collect_tokens(&config.profiles);
     }
     usage::spawn_refresher(Arc::clone(&usage_tokens), Arc::clone(&usage_store));
 
@@ -169,7 +163,8 @@ fn main() -> Result<()> {
             );
         }
 
-        *usage_tokens.lock().unwrap() = collect_tokens(&config.profiles);
+        *usage_tokens.lock().expect("usage_tokens mutex poisoned") =
+            collect_tokens(&config.profiles);
     }
 
     Ok(())

@@ -3,9 +3,21 @@ use std::fs;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde::Deserialize;
 
 const API_URL: &str = "https://api.github.com/repos/uwuclxdy/clauth/releases/latest";
+
+#[derive(Deserialize)]
+struct Release {
+    tag_name: String,
+    assets: Vec<Asset>,
+}
+
+#[derive(Deserialize)]
+struct Asset {
+    name: String,
+    browser_download_url: String,
+}
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Spawns a background thread that silently checks for and applies an update.
@@ -34,35 +46,27 @@ fn try_update() -> anyhow::Result<()> {
         .get(API_URL)
         .header("User-Agent", "clauth-updater")
         .call()
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .map_err(crate::ureq_error::into_anyhow)?
         .body_mut()
         .read_to_string()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(crate::ureq_error::into_anyhow)?;
 
-    let release: Value = serde_json::from_str(&text)?;
+    let release: Release = serde_json::from_str(&text)?;
 
-    let Some(tag) = release["tag_name"].as_str() else {
-        return Ok(());
-    };
-
-    if !is_newer(tag, CURRENT_VERSION) {
+    if !is_newer(&release.tag_name, CURRENT_VERSION) {
         return Ok(());
     }
 
-    let Some(url) = asset_url(&release, asset) else {
+    let Some(url) = release
+        .assets
+        .iter()
+        .find(|a| a.name == asset)
+        .map(|a| a.browser_download_url.clone())
+    else {
         return Ok(());
     };
 
     download_and_replace(&url)
-}
-
-fn asset_url(release: &Value, name: &str) -> Option<String> {
-    release["assets"]
-        .as_array()?
-        .iter()
-        .find(|a| a["name"].as_str() == Some(name))?["browser_download_url"]
-        .as_str()
-        .map(str::to_owned)
 }
 
 fn download_and_replace(url: &str) -> anyhow::Result<()> {

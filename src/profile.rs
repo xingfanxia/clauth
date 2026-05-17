@@ -5,22 +5,23 @@ use std::path::PathBuf;
 use crate::usage::UsageInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ClaudeCredentials {
-    #[serde(rename = "claudeAiOauth", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) claude_ai_oauth: Option<OAuthToken>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct OAuthToken {
-    #[serde(rename = "accessToken")]
     pub(crate) access_token: String,
-    #[serde(rename = "refreshToken", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) refresh_token: Option<String>,
-    #[serde(rename = "expiresAt", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) expires_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) scopes: Option<Vec<String>>,
-    #[serde(rename = "subscriptionType", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) subscription_type: Option<String>,
 }
 
@@ -189,7 +190,11 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
 
 fn load_profile(name: &str) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
-    let raw_config = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let raw_config = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("Failed to read {name}/config.toml")),
+    };
     let config: ProfileConfig = if raw_config.trim().is_empty() {
         ProfileConfig::default()
     } else {
