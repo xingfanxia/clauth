@@ -13,7 +13,8 @@ use crate::actions::{delete_profile, edit_profile, is_cancelled, rename_profile,
 use crate::profile::AppConfig;
 use crate::ui::{
     C_ACCENT, C_BOLD, C_DANGER, C_DIM, C_FAINT, C_FG_OFF, C_NOBOLD, C_ORANGE, C_RESET,
-    endpoint_visible_width, format_profile_entry, format_submenu_title,
+    endpoint_visible_width, format_profile_entry, format_submenu_title, visible_width,
+    weekly_bar_visible_width,
 };
 
 // ── Profile submenu ───────────────────────────────────────────────────────────
@@ -258,11 +259,40 @@ pub(crate) fn build_main_menu(config: &AppConfig) -> Vec<(String, MainAction)> {
         .max()
         .unwrap_or(0);
 
+    let cols = terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
+    let max_base_width = config
+        .profiles
+        .iter()
+        .map(|p| {
+            visible_width(&format_profile_entry(
+                p,
+                config.is_active(&p.name),
+                name_width,
+                endpoint_width,
+                false,
+            ))
+        })
+        .max()
+        .unwrap_or(0);
+    let max_weekly_width = config
+        .profiles
+        .iter()
+        .map(weekly_bar_visible_width)
+        .max()
+        .unwrap_or(0);
+    let show_weekly = max_weekly_width > 0 && max_base_width + max_weekly_width <= cols;
+
     let mut items = Vec::with_capacity(config.profiles.len() + 3);
 
     for (i, p) in config.profiles.iter().enumerate() {
         items.push((
-            format_profile_entry(p, config.is_active(&p.name), name_width, endpoint_width),
+            format_profile_entry(
+                p,
+                config.is_active(&p.name),
+                name_width,
+                endpoint_width,
+                show_weekly,
+            ),
             MainAction::Profile(i),
         ));
     }

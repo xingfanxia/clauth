@@ -131,9 +131,9 @@ fn five_hour_chunk(info: &UsageInfo) -> String {
     let (bar, color) = bar_for(window.utilization);
     let pct = window.utilization.clamp(0.0, 100.0);
     let reset = format_reset(window)
-        .map(|r| format!("{C_FAINT} · resets {r}{C_RESET}"))
+        .map(|r| format!("{C_FAINT} ({r}){C_RESET}"))
         .unwrap_or_default();
-    format!("  {color}[{bar}] {pct:.0}%{C_RESET}{reset}")
+    format!("  {C_FAINT}5h{C_RESET} {color}[{bar}] {pct:.0}%{C_RESET}{reset}")
 }
 
 fn seven_day_chunk(info: &UsageInfo) -> String {
@@ -152,6 +152,28 @@ fn seven_day_chunk(info: &UsageInfo) -> String {
         .map(|r| format!(" in {r}"))
         .unwrap_or_default();
     format!("{C_FAINT} · {color}7d {pct:.0}%{C_FAINT}{reset}{C_RESET}")
+}
+
+/// Picks the most representative weekly window. Max accounts return
+/// per-model windows (`seven_day_sonnet`/`seven_day_opus`); Pro returns the
+/// model-agnostic `seven_day`. Falls through to whichever is present.
+fn weekly_window(info: &UsageInfo) -> Option<&UsageWindow> {
+    info.seven_day
+        .as_ref()
+        .or(info.seven_day_sonnet.as_ref())
+        .or(info.seven_day_opus.as_ref())
+}
+
+fn weekly_bar_chunk(info: &UsageInfo) -> String {
+    let Some(window) = weekly_window(info) else {
+        return String::new();
+    };
+    let (bar, color) = bar_for(window.utilization);
+    let pct = window.utilization.clamp(0.0, 100.0);
+    let reset = format_reset(window)
+        .map(|r| format!("{C_FAINT} ({r}){C_RESET}"))
+        .unwrap_or_default();
+    format!("{C_FAINT} · 7d{C_RESET} {color}[{bar}] {pct:.0}%{C_RESET}{reset}")
 }
 
 fn extra_usage_chunk(info: &UsageInfo) -> String {
@@ -186,6 +208,43 @@ pub(crate) fn endpoint_visible_width(profile: &Profile) -> usize {
     endpoint_label(profile).chars().count()
 }
 
+/// Visible width of a string with ANSI CSI escape sequences stripped. Assumes
+/// each remaining char is one column wide — true for the ASCII + block-glyph
+/// content the menu emits.
+pub(crate) fn visible_width(s: &str) -> usize {
+    let mut count = 0;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            count += 1;
+            continue;
+        }
+        // Skip `ESC [ … final` — final byte is in 0x40..=0x7E.
+        let Some(next) = chars.next() else { break };
+        if next != '[' {
+            continue;
+        }
+        for c in chars.by_ref() {
+            if matches!(c, '\x40'..='\x7e') {
+                break;
+            }
+        }
+    }
+    count
+}
+
+/// Visible width of the 7-day bar a profile would render. Zero when the
+/// profile has no weekly window or is API-keyed.
+pub(crate) fn weekly_bar_visible_width(profile: &Profile) -> usize {
+    if !is_oauth_profile(profile) {
+        return 0;
+    }
+    match profile.usage.as_ref() {
+        Some(info) => visible_width(&weekly_bar_chunk(info)),
+        None => 0,
+    }
+}
+
 /// Plan/usage info is OAuth-only — an API-endpoint profile uses the
 /// proxy's own quota and Anthropic's `/oauth/usage` numbers don't apply.
 fn is_oauth_profile(profile: &Profile) -> bool {
@@ -197,14 +256,17 @@ pub(crate) fn format_profile_entry(
     is_active: bool,
     name_width: usize,
     endpoint_width: usize,
+    show_weekly: bool,
 ) -> String {
     let endpoint = endpoint_label(profile);
-    let usage_hint = if is_oauth_profile(profile) {
-        profile
-            .usage
-            .as_ref()
-            .map(five_hour_chunk)
-            .unwrap_or_default()
+    let usage = if is_oauth_profile(profile) {
+        profile.usage.as_ref()
+    } else {
+        None
+    };
+    let usage_hint = usage.map(five_hour_chunk).unwrap_or_default();
+    let weekly_hint = if show_weekly {
+        usage.map(weekly_bar_chunk).unwrap_or_default()
     } else {
         String::new()
     };
@@ -230,11 +292,11 @@ pub(crate) fn format_profile_entry(
 
     if is_active {
         format!(
-            "{C_ACCENT}● {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{endpoint_pad}{C_RESET}{usage_hint}{key_hint}{cred_warn}"
+            "{C_ACCENT}● {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{endpoint_pad}{C_RESET}{usage_hint}{weekly_hint}{key_hint}{cred_warn}"
         )
     } else {
         format!(
-            "  {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{endpoint_pad}{C_RESET}{usage_hint}{key_hint}{cred_warn}"
+            "  {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{endpoint_pad}{C_RESET}{usage_hint}{weekly_hint}{key_hint}{cred_warn}"
         )
     }
 }
