@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-use crate::profile::{AppConfig, ClaudeCredentials, home_dir, profile_dir, save_profile};
+use crate::profile::{AppConfig, ClaudeCredentials, Profile, home_dir, profile_dir, save_profile};
 
 fn claude_credentials_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude").join(".credentials.json"))
@@ -97,15 +97,21 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
     })
 }
 
-/// Patches only ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN inside the `env`
-/// object of settings.json. Every other key and field is left untouched.
-pub(crate) fn apply_endpoint_to_claude_settings(
-    base_url: Option<&str>,
-    api_key: Option<&str>,
+/// Patches the `env` object of settings.json with ANTHROPIC_BASE_URL,
+/// ANTHROPIC_AUTH_TOKEN, and the profile's `env` map. Keys in `prev_env_keys`
+/// that the new profile doesn't carry are removed first so stale entries from
+/// the previously active profile don't linger. Every other field is untouched.
+pub(crate) fn apply_profile_to_claude_settings(
+    profile: &Profile,
+    prev_env_keys: &[String],
 ) -> Result<()> {
     let path = claude_settings_path()?;
 
-    if base_url.is_none() && api_key.is_none() && !path.exists() {
+    let has_anything = profile.base_url.is_some()
+        || profile.api_key.is_some()
+        || !profile.env.is_empty()
+        || !prev_env_keys.is_empty();
+    if !has_anything && !path.exists() {
         return Ok(());
     }
 
@@ -124,7 +130,15 @@ pub(crate) fn apply_endpoint_to_claude_settings(
         .as_object_mut()
         .context("settings.json `env` is not an object")?;
 
-    match base_url {
+    // Drop prior-profile keys the new profile doesn't carry over. Keys still
+    // present in `profile.env` get re-inserted below with the new value.
+    for key in prev_env_keys {
+        if !profile.env.contains_key(key) {
+            env.remove(key);
+        }
+    }
+
+    match profile.base_url.as_deref() {
         Some(url) => {
             env.insert("ANTHROPIC_BASE_URL".into(), url.into());
         }
@@ -132,13 +146,19 @@ pub(crate) fn apply_endpoint_to_claude_settings(
             env.remove("ANTHROPIC_BASE_URL");
         }
     }
-    match api_key {
+    match profile.api_key.as_deref() {
         Some(key) => {
             env.insert("ANTHROPIC_AUTH_TOKEN".into(), key.into());
         }
         None => {
             env.remove("ANTHROPIC_AUTH_TOKEN");
         }
+    }
+
+    // Apply profile env last so an explicit `ANTHROPIC_*` entry in the
+    // profile's env map wins over the dedicated base_url / api_key fields.
+    for (k, v) in &profile.env {
+        env.insert(k.clone(), v.clone().into());
     }
 
     std::fs::write(&path, serde_json::to_string_pretty(&settings)?)

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use inquire::{Confirm, InquireError, Text};
 
 use crate::claude::{
-    ClaudeEndpoint, apply_endpoint_to_claude_settings, clear_claude_credentials,
+    ClaudeEndpoint, apply_profile_to_claude_settings, clear_claude_credentials,
     link_profile_credentials, read_claude_credentials, read_claude_endpoint_config,
     snapshot_active_credentials,
 };
@@ -54,13 +54,17 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
 
     snapshot_active_credentials(config)?;
 
-    let (base_url, api_key) = {
-        let profile = config.find(name).context("Profile not found")?;
-        (profile.base_url.clone(), profile.api_key.clone())
-    };
+    let prev_env_keys: Vec<String> = config
+        .state
+        .active_profile
+        .as_deref()
+        .and_then(|n| config.find(n))
+        .map(|p| p.env.keys().cloned().collect())
+        .unwrap_or_default();
 
     link_profile_credentials(name)?;
-    apply_endpoint_to_claude_settings(base_url.as_deref(), api_key.as_deref())?;
+    let profile = config.find(name).context("Profile not found")?;
+    apply_profile_to_claude_settings(profile, &prev_env_keys)?;
     config.state.active_profile = Some(name.to_string());
     save_app_state(&config.state)
 }
@@ -75,12 +79,14 @@ pub(crate) fn edit_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     let api_key = prompt_optional("API key:", current_key.as_deref())?;
 
     let profile = config.find_mut(name).context("Profile not found")?;
-    profile.base_url = base_url.clone();
-    profile.api_key = api_key.clone();
+    profile.base_url = base_url;
+    profile.api_key = api_key;
     save_profile(profile)?;
 
     if config.is_active(name) {
-        apply_endpoint_to_claude_settings(base_url.as_deref(), api_key.as_deref())?;
+        let profile = config.find(name).context("Profile not found")?;
+        let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
+        apply_profile_to_claude_settings(profile, &prev_env_keys)?;
     }
     Ok(())
 }

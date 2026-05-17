@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::usage::UsageInfo;
@@ -34,6 +35,9 @@ pub(crate) struct Profile {
     /// profile has no active 5h window. Mirrors what Claude Code does on
     /// launch; opt-in because it consumes a (tiny) amount of usage.
     pub(crate) kick_timer: bool,
+    /// Extra env vars to apply to `~/.claude/settings.json`'s `env` block
+    /// while this profile is active. Cleared on switch to another profile.
+    pub(crate) env: BTreeMap<String, String>,
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) usage: Option<UsageInfo>,
 }
@@ -45,6 +49,7 @@ impl Profile {
             base_url,
             api_key,
             kick_timer: false,
+            env: BTreeMap::new(),
             credentials: None,
             usage: None,
         }
@@ -102,6 +107,8 @@ struct ProfileConfig {
     api_key: Option<String>,
     #[serde(default)]
     kick_timer: bool,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 /// Hand-rolled TOML writer that keeps every option visible — set values are
@@ -136,6 +143,19 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("kick_timer = true\n");
     } else {
         out.push_str("# kick_timer = true\n");
+    }
+    out.push('\n');
+
+    out.push_str("# Extra env vars merged into ~/.claude/settings.json's env block while\n");
+    out.push_str("# this profile is active. Cleared on switch to another profile.\n");
+    if profile.env.is_empty() {
+        out.push_str("# [env]\n");
+        out.push_str("# HTTP_PROXY = \"http://localhost:8080\"\n");
+    } else {
+        out.push_str("[env]\n");
+        for (k, v) in &profile.env {
+            out.push_str(&format!("{k} = {}\n", toml_str(v)));
+        }
     }
 
     out
@@ -219,6 +239,7 @@ fn load_profile(name: &str) -> Result<Profile> {
         base_url: config.base_url,
         api_key: config.api_key,
         kick_timer: config.kick_timer,
+        env: config.env,
         credentials,
         usage: None,
     };
