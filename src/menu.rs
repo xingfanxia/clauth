@@ -7,10 +7,11 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::Print;
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
-use inquire::{InquireError, Select};
+use inquire::{CustomType, InquireError, Select};
 
 use crate::actions::{delete_profile, edit_profile, is_cancelled, rename_profile, switch_profile};
-use crate::profile::AppConfig;
+use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
+use crate::profile::{AppConfig, save_app_state, save_profile};
 use crate::ui::{
     C_ACCENT, C_BOLD, C_DANGER, C_DIM, C_FAINT, C_FG_OFF, C_NOBOLD, C_ORANGE, C_RESET,
     endpoint_visible_width, format_profile_entry, format_submenu_title, visible_width,
@@ -100,6 +101,7 @@ pub(crate) enum MainAction {
     Profile(usize),
     NewBlank,
     Capture,
+    FallbackChain,
     Quit,
 }
 
@@ -304,7 +306,248 @@ pub(crate) fn build_main_menu(config: &AppConfig) -> Vec<(String, MainAction)> {
         format!("{C_ORANGE}+{C_FG_OFF} New from current profile"),
         MainAction::Capture,
     ));
+    let chain_len = config.state.fallback_chain.len();
+    let chain_hint = if chain_len == 0 {
+        format!("{C_FAINT}empty{C_RESET}")
+    } else {
+        format!(
+            "{C_DIM}{chain_len} profile{}{C_RESET}",
+            if chain_len == 1 { "" } else { "s" }
+        )
+    };
+    items.push((
+        format!("{C_ACCENT}⇄{C_FG_OFF} Fallback chain  {chain_hint}"),
+        MainAction::FallbackChain,
+    ));
     items.push((format!("{C_FAINT}Quit{C_RESET}"), MainAction::Quit));
 
     items
+}
+
+// ── Fallback chain editor ─────────────────────────────────────────────────────
+
+fn five_hour_pct(config: &AppConfig, name: &str) -> Option<f64> {
+    config
+        .find(name)?
+        .usage
+        .as_ref()?
+        .five_hour
+        .as_ref()
+        .map(|w| w.utilization)
+}
+
+fn chain_member_label(config: &AppConfig, position: usize, name: &str) -> String {
+    let threshold = config
+        .find(name)
+        .map(threshold_for)
+        .unwrap_or(DEFAULT_THRESHOLD);
+    let usage = match five_hour_pct(config, name) {
+        Some(pct) => {
+            let color = if pct >= threshold {
+                C_DANGER
+            } else if pct >= threshold * 0.8 {
+                C_ORANGE
+            } else {
+                C_DIM
+            };
+            format!("{color}5h {pct:.0}%{C_RESET}")
+        }
+        None => format!("{C_FAINT}5h n/a{C_RESET}"),
+    };
+    let active = if config.is_active(name) {
+        format!("{C_ACCENT}● {C_RESET}")
+    } else {
+        "  ".to_string()
+    };
+    format!(
+        "{C_FAINT}{position:>2}.{C_RESET} {active}{C_BOLD}{name}{C_RESET}  {C_FAINT}@ {threshold:.0}%{C_RESET}  {usage}"
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ChainItemAction {
+    Threshold,
+    MoveUp,
+    MoveDown,
+    Remove,
+    Back,
+}
+
+fn chain_item_submenu(config: &mut AppConfig, name: &str) -> Result<()> {
+    use ChainItemAction::*;
+
+    loop {
+        let position = match config.state.fallback_chain.iter().position(|n| n == name) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let chain_len = config.state.fallback_chain.len();
+        let current = config
+            .find(name)
+            .map(threshold_for)
+            .unwrap_or(DEFAULT_THRESHOLD);
+
+        let mut actions: Vec<(String, ChainItemAction)> = Vec::new();
+        actions.push((
+            format!("Set threshold  {C_FAINT}(current: {current:.0}%){C_RESET}"),
+            Threshold,
+        ));
+        if position > 0 {
+            actions.push(("Move up".to_string(), MoveUp));
+        }
+        if position + 1 < chain_len {
+            actions.push(("Move down".to_string(), MoveDown));
+        }
+        actions.push((format!("{C_DANGER}Remove from chain{C_RESET}"), Remove));
+        actions.push((format!("{C_FAINT}← Back{C_RESET}"), Back));
+
+        let title = format!("{C_BOLD}{name}{C_RESET}{C_FAINT} · fallback chain{C_RESET}");
+        let labels: Vec<String> = actions.iter().map(|(l, _)| l.clone()).collect();
+        let idx = match Select::new(&title, labels).without_filtering().raw_prompt() {
+            Ok(opt) => opt.index,
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        match actions[idx].1 {
+            Threshold => {
+                let entered: Result<f64, _> = CustomType::<f64>::new("Threshold percentage:")
+                    .with_default(current)
+                    .with_help_message(
+                        "Auto-switch off this profile at this 5h utilization (0..=100).",
+                    )
+                    .with_error_message("Enter a number between 0 and 100.")
+                    .with_validator(|v: &f64| {
+                        if (0.0..=100.0).contains(v) {
+                            Ok(inquire::validator::Validation::Valid)
+                        } else {
+                            Ok(inquire::validator::Validation::Invalid(
+                                "Threshold must be between 0 and 100.".into(),
+                            ))
+                        }
+                    })
+                    .prompt()
+                    .map_err(anyhow::Error::from);
+                let value = match entered {
+                    Ok(v) => v,
+                    Err(e) if is_cancelled(&e) => continue,
+                    Err(e) => return Err(e),
+                };
+                if let Some(profile) = config.find_mut(name) {
+                    profile.fallback_threshold = Some(value);
+                    save_profile(profile)?;
+                }
+            }
+            MoveUp => {
+                config.state.fallback_chain.swap(position - 1, position);
+                save_app_state(&config.state)?;
+            }
+            MoveDown => {
+                config.state.fallback_chain.swap(position, position + 1);
+                save_app_state(&config.state)?;
+            }
+            Remove => {
+                config.state.fallback_chain.retain(|n| n != name);
+                save_app_state(&config.state)?;
+                return Ok(());
+            }
+            Back => return Ok(()),
+        }
+    }
+}
+
+fn add_to_chain_prompt(config: &mut AppConfig) -> Result<()> {
+    let candidates: Vec<String> = config
+        .profiles
+        .iter()
+        .map(|p| p.name.clone())
+        .filter(|n| !config.state.fallback_chain.iter().any(|c| c == n))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let title = format!("{C_BOLD}Add profile to chain{C_RESET}");
+    let selection = Select::new(&title, candidates.clone())
+        .without_filtering()
+        .raw_prompt();
+    let idx = match selection {
+        Ok(opt) => opt.index,
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let name = candidates[idx].clone();
+
+    if let Some(profile) = config.find_mut(&name)
+        && profile.fallback_threshold.is_none()
+    {
+        profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
+        save_profile(profile)?;
+    }
+    config.state.fallback_chain.push(name);
+    save_app_state(&config.state)?;
+    Ok(())
+}
+
+pub(crate) fn fallback_chain_menu(config: &mut AppConfig) -> Result<()> {
+    let start_row = crossterm::cursor::position().map(|(_, r)| r).ok();
+
+    loop {
+        if let Some(row) = start_row {
+            let _ = execute!(
+                io::stdout(),
+                MoveTo(0, row),
+                Clear(ClearType::FromCursorDown)
+            );
+        }
+
+        let chain = config.state.fallback_chain.clone();
+        let mut entries: Vec<(String, Option<String>)> = Vec::new();
+        for (i, name) in chain.iter().enumerate() {
+            entries.push((chain_member_label(config, i + 1, name), Some(name.clone())));
+        }
+
+        let any_unchained = config
+            .profiles
+            .iter()
+            .any(|p| !chain.iter().any(|c| c == &p.name));
+        if any_unchained {
+            entries.push((format!("{C_ORANGE}+{C_FG_OFF} Add profile to chain"), None));
+        }
+        entries.push((format!("{C_FAINT}← Back{C_RESET}"), Some(String::new())));
+
+        let title = if chain.is_empty() {
+            format!(
+                "{C_BOLD}Fallback chain{C_RESET}{C_FAINT} · empty — add a profile to enable auto-switch{C_RESET}"
+            )
+        } else {
+            format!(
+                "{C_BOLD}Fallback chain{C_RESET}{C_FAINT} · {} profile{}{C_RESET}",
+                chain.len(),
+                if chain.len() == 1 { "" } else { "s" }
+            )
+        };
+        let labels: Vec<String> = entries.iter().map(|(l, _)| l.clone()).collect();
+        let idx = match Select::new(&title, labels).without_filtering().raw_prompt() {
+            Ok(opt) => opt.index,
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        match entries[idx].1.clone() {
+            None => add_to_chain_prompt(config)?,
+            Some(s) if s.is_empty() => return Ok(()),
+            Some(name) => {
+                if let Err(e) = chain_item_submenu(config, &name)
+                    && !is_cancelled(&e)
+                {
+                    return Err(e);
+                }
+            }
+        }
+    }
 }

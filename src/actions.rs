@@ -111,6 +111,14 @@ pub(crate) fn rename_profile(config: &mut AppConfig, old: &str) -> Result<bool> 
     if let Some(slot) = config.state.profiles.iter_mut().find(|n| n.as_str() == old) {
         *slot = new.clone();
     }
+    if let Some(slot) = config
+        .state
+        .fallback_chain
+        .iter_mut()
+        .find(|n| n.as_str() == old)
+    {
+        *slot = new.clone();
+    }
     let was_active = config.is_active(old);
     if was_active {
         config.state.active_profile = Some(new.clone());

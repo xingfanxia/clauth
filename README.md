@@ -16,6 +16,7 @@ A simple and fast Claude Code account switcher; select a profile, hit enter, don
     api-dev     https://api.notanthropic.com · API key set
   + New profile
   + New from current profile
+  ⇄ Fallback chain  2 profiles
     Quit
 ```
 
@@ -29,6 +30,7 @@ clauth keeps snapshots of both files for each profile; on switch it swaps `.cred
 - **Usage bars:** live 5-hour utilization fetched from the Anthropic API and refreshed every 30s, color-coded by threshold, with the next reset time alongside the bar. Max accounts also get a 7-day bar when the terminal is wide enough; Pro accounts have no weekly window in the API response so only the 5h bar is shown
 - **Plan detection:** queries `/api/oauth/profile` to identify the real plan tier — Pro, Max 5x, Max 20x, Team, Enterprise, Free — instead of trusting the unreliable `subscriptionType` tag in the OAuth credentials
 - **Detailed window stats:** the per-profile submenu also shows the 7-day rolling window and any paid extra-usage spend
+- **Auto-switch on exhaustion:** opt profiles into an ordered fallback chain with per-profile thresholds; when the active profile crosses its 5h limit (95% by default), clauth automatically switches to the next chain member that still has headroom. clauth must be opened for this to work
 - **Non-destructive:** only touches the two API-related keys in `settings.json`; all other config is preserved
 
 ## Install
@@ -119,14 +121,28 @@ kick_timer = true
 
 When enabled, clauth refreshes the OAuth token and sends a 1-token Haiku ping (~22 input + 1 output token, fractions of a cent) for that profile on startup if no window is currently running. Default is off.
 
+## Automatic account switching
+
+Open the **Fallback chain** entry in the main menu to build an ordered list of profiles that clauth can hop between automatically when one runs out of 5-hour budget.
+
+How it works:
+
+- Each chain member has its own switch threshold (5h utilization %). Default is 95%; edit it from the chain entry's submenu.
+- After each usage refresh — both at startup and every 30 seconds while the menu is open — clauth checks the active profile. If it's a chain member and its 5h utilization is at or above its threshold, clauth walks the chain (starting at the slot after the active profile, wrapping) and switches to the first member whose own threshold hasn't been crossed. The active `●` marker shifts to the new profile in place.
+- A threshold of **100%** marks that profile as a last-resort slot. clauth still prefers any chain member with real headroom; only when every other member is past its threshold does it fall back to a 100%-threshold profile, even if that profile is itself capped. Claude Code will surface its own *"out of 5h limit"* message after the switch lands.
+- If no chain member is available as a target, clauth stays put. If the active profile isn't in the chain, auto-switch is disabled.
+- Profiles outside the chain are never auto-switched away from or auto-switched to — that's opt-in per profile.
+
+Configuration lives in `~/.clauth/profiles.toml` (`fallback_chain` array, ordered) and per-profile `config.toml` (`fallback_threshold`). Both files are safe to edit by hand, but the menu is the easier path.
+
 ## Storage layout
 
 ```
 ~/.clauth/
-  profiles.toml          # profile order + active marker
+  profiles.toml          # profile order, active marker, fallback chain
   profiles/
     work/
-      config.toml        # base_url, api_key, kick_timer
+      config.toml        # base_url, api_key, kick_timer, fallback_threshold, env
       credentials.json   # OAuth token snapshot
       usage_cache.json   # last known utilization + plan info
     personal/

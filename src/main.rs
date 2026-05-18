@@ -1,6 +1,7 @@
 mod actions;
 mod claude;
 mod completions;
+mod fallback;
 mod menu;
 mod oauth;
 mod platform;
@@ -21,7 +22,11 @@ use crossterm::terminal::{Clear, ClearType};
 
 use crate::actions::{capture_current_profile, create_blank_profile, is_cancelled, switch_profile};
 use crate::claude::snapshot_active_credentials;
-use crate::menu::{MainAction, MainMenuResult, build_main_menu, main_menu_prompt, profile_submenu};
+use crate::fallback::auto_switch_if_needed;
+use crate::menu::{
+    MainAction, MainMenuResult, build_main_menu, fallback_chain_menu, main_menu_prompt,
+    profile_submenu,
+};
 use crate::profile::{Profile, load_config};
 use crate::ui::build_render_config;
 
@@ -118,6 +123,9 @@ fn main() -> Result<()> {
     }
     usage::spawn_refresher(Arc::clone(&usage_tokens), Arc::clone(&usage_store));
 
+    apply_usage(&mut config.profiles, &usage_store);
+    let _ = auto_switch_if_needed(&mut config);
+
     loop {
         apply_usage(&mut config.profiles, &usage_store);
         let menu = build_main_menu(&config);
@@ -125,6 +133,7 @@ fn main() -> Result<()> {
 
         let idx = match main_menu_prompt(labels, || {
             apply_usage(&mut config.profiles, &usage_store);
+            let _ = auto_switch_if_needed(&mut config);
             build_main_menu(&config)
                 .into_iter()
                 .map(|(label, _)| label)
@@ -143,6 +152,7 @@ fn main() -> Result<()> {
             MainAction::Quit => break,
             MainAction::NewBlank => create_blank_profile(&mut config),
             MainAction::Capture => capture_current_profile(&mut config),
+            MainAction::FallbackChain => fallback_chain_menu(&mut config),
             MainAction::Profile(i) => {
                 let name = config.profiles[i].name.clone();
                 profile_submenu(&mut config, &name)

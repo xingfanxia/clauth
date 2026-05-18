@@ -38,6 +38,10 @@ pub(crate) struct Profile {
     /// Extra env vars to apply to `~/.claude/settings.json`'s `env` block
     /// while this profile is active. Cleared on switch to another profile.
     pub(crate) env: BTreeMap<String, String>,
+    /// 5-hour utilization percentage at/above which the auto-switch system
+    /// will move off this profile. Only takes effect while the profile is a
+    /// member of `AppState::fallback_chain`. None = use default (95%).
+    pub(crate) fallback_threshold: Option<f64>,
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) usage: Option<UsageInfo>,
 }
@@ -50,6 +54,7 @@ impl Profile {
             api_key,
             kick_timer: false,
             env: BTreeMap::new(),
+            fallback_threshold: None,
             credentials: None,
             usage: None,
         }
@@ -68,6 +73,13 @@ pub(crate) struct AppState {
     /// re-spend the kick on every launch.
     #[serde(default)]
     pub(crate) last_kick_at: HashMap<String, u64>,
+    /// Ordered list of profile names participating in the auto-switch chain.
+    /// When the active profile's 5h utilization crosses its
+    /// `fallback_threshold`, clauth walks this list (starting after the
+    /// active entry, wrapping around) and switches to the first member whose
+    /// own threshold has not been crossed.
+    #[serde(default)]
+    pub(crate) fallback_chain: Vec<String>,
 }
 
 pub(crate) struct AppConfig {
@@ -100,6 +112,7 @@ impl AppConfig {
     pub(crate) fn remove(&mut self, name: &str) {
         self.profiles.retain(|p| p.name != name);
         self.state.profiles.retain(|n| n != name);
+        self.state.fallback_chain.retain(|n| n != name);
         if self.is_active(name) {
             self.state.active_profile = None;
         }
@@ -115,6 +128,8 @@ struct ProfileConfig {
     kick_timer: bool,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    fallback_threshold: Option<f64>,
 }
 
 /// Hand-rolled TOML writer that keeps every option visible — set values are
@@ -149,6 +164,15 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("kick_timer = true\n");
     } else {
         out.push_str("# kick_timer = true\n");
+    }
+    out.push('\n');
+
+    out.push_str("# 5-hour utilization percentage at/above which clauth will auto-switch\n");
+    out.push_str("# off this profile, provided the profile is also a member of the\n");
+    out.push_str("# fallback chain configured in ~/.clauth/profiles.toml. Range 0..=100.\n");
+    match profile.fallback_threshold {
+        Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
+        None => out.push_str("# fallback_threshold = 95.0\n"),
     }
     out.push('\n');
 
@@ -246,6 +270,7 @@ fn load_profile(name: &str) -> Result<Profile> {
         api_key: config.api_key,
         kick_timer: config.kick_timer,
         env: config.env,
+        fallback_threshold: config.fallback_threshold,
         credentials,
         usage: None,
     };
