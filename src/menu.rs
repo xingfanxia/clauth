@@ -66,7 +66,11 @@ pub(crate) fn profile_submenu(config: &mut AppConfig, profile_name: &str) -> Res
 
         let labels: Vec<String> = ACTIONS.iter().map(|a| a.label(is_active)).collect();
 
-        let idx = match Select::new(&title, labels).without_filtering().raw_prompt() {
+        let idx = match Select::new(&title, labels)
+            .without_filtering()
+            .without_help_message()
+            .raw_prompt()
+        {
             Ok(opt) => opt.index,
             Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
                 return Ok(());
@@ -403,7 +407,11 @@ fn chain_item_submenu(config: &mut AppConfig, name: &str) -> Result<()> {
 
         let title = format!("{C_BOLD}{name}{C_RESET}{C_FAINT} · fallback chain{C_RESET}");
         let labels: Vec<String> = actions.iter().map(|(l, _)| l.clone()).collect();
-        let idx = match Select::new(&title, labels).without_filtering().raw_prompt() {
+        let idx = match Select::new(&title, labels)
+            .without_filtering()
+            .without_help_message()
+            .raw_prompt()
+        {
             Ok(opt) => opt.index,
             Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
                 return Ok(());
@@ -472,6 +480,7 @@ fn add_to_chain_prompt(config: &mut AppConfig) -> Result<()> {
     let title = format!("{C_BOLD}Add profile to chain{C_RESET}");
     let selection = Select::new(&title, candidates.clone())
         .without_filtering()
+        .without_help_message()
         .raw_prompt();
     let idx = match selection {
         Ok(opt) => opt.index,
@@ -530,7 +539,11 @@ pub(crate) fn fallback_chain_menu(config: &mut AppConfig) -> Result<()> {
             )
         };
         let labels: Vec<String> = entries.iter().map(|(l, _)| l.clone()).collect();
-        let idx = match Select::new(&title, labels).without_filtering().raw_prompt() {
+        let idx = match Select::new(&title, labels)
+            .without_filtering()
+            .without_help_message()
+            .raw_prompt()
+        {
             Ok(opt) => opt.index,
             Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
                 return Ok(());
