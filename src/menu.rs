@@ -79,10 +79,7 @@ pub(crate) fn profile_submenu(config: &mut AppConfig, profile_name: &str) -> Res
         };
 
         let result: Result<bool> = match ACTIONS[idx] {
-            Switch => {
-                switch_profile(config, profile_name)?;
-                std::process::exit(0);
-            }
+            Switch => switch_profile(config, profile_name).map(|_| true),
             Edit => edit_profile(config, profile_name).map(|_| false),
             Rename => rename_profile(config, profile_name),
             Delete => delete_profile(config, profile_name),
