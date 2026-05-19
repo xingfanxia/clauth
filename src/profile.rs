@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::lock::with_state_lock;
-use crate::usage::UsageInfo;
+use crate::usage::{FetchStatus, UsageInfo};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +46,10 @@ pub(crate) struct Profile {
     pub(crate) fallback_threshold: Option<f64>,
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) usage: Option<UsageInfo>,
+    /// Outcome of the most recent usage fetch — drives the account-name
+    /// underline so users can spot stale or missing data at a glance. None
+    /// before the first fetch attempt.
+    pub(crate) fetch_status: Option<FetchStatus>,
 }
 
 impl Profile {
@@ -59,6 +63,7 @@ impl Profile {
             fallback_threshold: None,
             credentials: None,
             usage: None,
+            fetch_status: None,
         }
     }
 }
@@ -306,6 +311,7 @@ fn load_profile(name: &str) -> Result<Profile> {
         fallback_threshold: config.fallback_threshold,
         credentials,
         usage: None,
+        fetch_status: None,
     };
 
     // Keep config.toml in sync with the canonical template: missing options

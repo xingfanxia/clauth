@@ -1,7 +1,9 @@
 use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
 
 use crate::profile::Profile;
-use crate::usage::{PlanInfo, UsageInfo, UsageWindow, iso_to_epoch_secs, now_epoch_secs};
+use crate::usage::{
+    FetchStatus, PlanInfo, UsageInfo, UsageWindow, iso_to_epoch_secs, now_epoch_secs,
+};
 
 // ── Terminal palette (cloudy-ui CLI) ──────────────────────────────────────────
 
@@ -17,6 +19,13 @@ pub(crate) const C_WARNING: &str = "\x1b[38;2;249;226;175m";
 pub(crate) const C_DANGER: &str = "\x1b[38;2;243;139;168m";
 pub(crate) const C_DIM: &str = "\x1b[38;2;166;173;200m";
 pub(crate) const C_FAINT: &str = "\x1b[38;2;127;132;156m";
+// Colored-underline pair: enables single underline (SGR 4) and sets the
+// underline color via SGR 58 (truecolor sub-parameter form). Terminals that
+// don't understand SGR 58 still render the underline in the current
+// foreground color, which is the intended fallback signal.
+pub(crate) const C_UL_WARNING: &str = "\x1b[4;58:2::249:226:175m";
+pub(crate) const C_UL_DANGER: &str = "\x1b[4;58:2::243:139:168m";
+pub(crate) const C_UL_OFF: &str = "\x1b[24;59m";
 
 fn titlecase_words(s: &str) -> String {
     s.split(['_', ' '])
@@ -251,6 +260,20 @@ fn is_oauth_profile(profile: &Profile) -> bool {
     profile.base_url.is_none()
 }
 
+/// Underline ANSI prefix/suffix for the profile name based on the last
+/// usage-fetch outcome. Yellow = cached data (API refused this tick), red =
+/// no data at all (API failed and no cache). Empty for fresh or untracked.
+fn name_underline_pair(profile: &Profile) -> (&'static str, &'static str) {
+    if !is_oauth_profile(profile) {
+        return ("", "");
+    }
+    match profile.fetch_status {
+        Some(FetchStatus::Cached) => (C_UL_WARNING, C_UL_OFF),
+        Some(FetchStatus::Failed) => (C_UL_DANGER, C_UL_OFF),
+        _ => ("", ""),
+    }
+}
+
 pub(crate) fn format_profile_entry(
     profile: &Profile,
     is_active: bool,
@@ -289,14 +312,18 @@ pub(crate) fn format_profile_entry(
         String::new()
     };
     let name = &profile.name;
+    let (ul_on, ul_off) = name_underline_pair(profile);
+    // Underline only the visible name characters — padding past it stays
+    // plain so the alignment column doesn't pick up an underline trail.
+    let name_pad = " ".repeat(name_width.saturating_sub(name.chars().count()));
 
     if is_active {
         format!(
-            "{C_ACCENT}● {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{endpoint_pad}{C_RESET}{usage_hint}{weekly_hint}{key_hint}{cred_warn}"
+            "{C_ACCENT}● {ul_on}{name}{ul_off}{name_pad}{C_NOBOLD}  {C_DIM}{endpoint}{endpoint_pad}{C_RESET}{usage_hint}{weekly_hint}{key_hint}{cred_warn}"
         )
     } else {
         format!(
-            "  {name:<name_width$}{C_NOBOLD}  {C_DIM}{endpoint}{endpoint_pad}{C_RESET}{usage_hint}{weekly_hint}{key_hint}{cred_warn}"
+            "  {ul_on}{name}{ul_off}{name_pad}{C_NOBOLD}  {C_DIM}{endpoint}{endpoint_pad}{C_RESET}{usage_hint}{weekly_hint}{key_hint}{cred_warn}"
         )
     }
 }
@@ -317,8 +344,9 @@ pub(crate) fn format_submenu_title(profile: &Profile) -> String {
     let five_hour = usage.map(five_hour_chunk).unwrap_or_default();
     let seven_day = usage.map(seven_day_chunk).unwrap_or_default();
     let extra = usage.map(extra_usage_chunk).unwrap_or_default();
+    let (ul_on, ul_off) = name_underline_pair(profile);
     format!(
-        "{C_BOLD}{name}{C_RESET}{C_FAINT} · {C_RESET}{C_DIM}{url}{C_FAINT}{credentials}{C_RESET}{five_hour}{seven_day}{extra}"
+        "{C_BOLD}{ul_on}{name}{ul_off}{C_RESET}{C_FAINT} · {C_RESET}{C_DIM}{url}{C_FAINT}{credentials}{C_RESET}{five_hour}{seven_day}{extra}"
     )
 }
 

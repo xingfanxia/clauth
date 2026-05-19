@@ -11,7 +11,21 @@ const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) type UsageStore = Arc<Mutex<HashMap<String, UsageInfo>>>;
+pub(crate) type StatusStore = Arc<Mutex<HashMap<String, FetchStatus>>>;
 pub(crate) type TokenList = Arc<Mutex<Vec<(String, String)>>>;
+
+/// Outcome of the most recent usage fetch attempt for a profile. Drives the
+/// account-name underline in the menu so users can tell at a glance whether
+/// the numbers they're looking at are live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FetchStatus {
+    /// Live response from the Anthropic API this tick.
+    Fresh,
+    /// API request failed; the numbers shown come from the on-disk cache.
+    Cached,
+    /// API request failed and no cache was available — no data to show.
+    Failed,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct UsageWindow {
@@ -102,7 +116,10 @@ struct RawProfileOrg {
     rate_limit_tier: Option<String>,
 }
 
-pub(crate) fn fetch_cached(profile_name: &str, access_token: &str) -> Option<UsageInfo> {
+pub(crate) fn fetch_cached(
+    profile_name: &str,
+    access_token: &str,
+) -> (Option<UsageInfo>, FetchStatus) {
     let cache = cache_path(profile_name);
     match fetch(access_token) {
         Ok(info) => {
@@ -114,12 +131,15 @@ pub(crate) fn fetch_cached(profile_name: &str, access_token: &str) -> Option<Usa
                 }
                 let _ = std::fs::write(path, json);
             }
-            Some(info)
+            (Some(info), FetchStatus::Fresh)
         }
-        Err(_) => cache.and_then(|p| {
+        Err(_) => match cache.and_then(|p| {
             let text = std::fs::read_to_string(p).ok()?;
-            serde_json::from_str(&text).ok()
-        }),
+            serde_json::from_str::<UsageInfo>(&text).ok()
+        }) {
+            Some(info) => (Some(info), FetchStatus::Cached),
+            None => (None, FetchStatus::Failed),
+        },
     }
 }
 
@@ -188,8 +208,12 @@ fn cache_path(profile_name: &str) -> Option<PathBuf> {
 }
 
 /// Fetches usage for every (name, token) pair in parallel and writes results
-/// into the shared store. Blocks until all fetches complete.
-pub(crate) fn fetch_all_into(tokens: &[(String, String)], store: &UsageStore) {
+/// into the shared stores. Blocks until all fetches complete.
+pub(crate) fn fetch_all_into(
+    tokens: &[(String, String)],
+    store: &UsageStore,
+    status: &StatusStore,
+) {
     let handles: Vec<_> = tokens
         .iter()
         .map(|(name, token)| {
@@ -202,20 +226,25 @@ pub(crate) fn fetch_all_into(tokens: &[(String, String)], store: &UsageStore) {
         })
         .collect();
 
-    let Ok(mut s) = store.lock() else {
-        return;
-    };
     for h in handles {
-        if let Ok((name, Some(info))) = h.join() {
-            s.insert(name, info);
+        let Ok((name, (info, fetch_status))) = h.join() else {
+            continue;
+        };
+        if let Some(info) = info
+            && let Ok(mut s) = store.lock()
+        {
+            s.insert(name.clone(), info);
+        }
+        if let Ok(mut st) = status.lock() {
+            st.insert(name, fetch_status);
         }
     }
 }
 
 /// Spawns a background thread that re-fetches usage for the current token
-/// list every 30s and writes results into the shared store. The token list
+/// list every 30s and writes results into the shared stores. The token list
 /// is read fresh each tick so renames and new profiles are picked up.
-pub(crate) fn spawn_refresher(tokens: TokenList, store: UsageStore) {
+pub(crate) fn spawn_refresher(tokens: TokenList, store: UsageStore, status: StatusStore) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(REFRESH_INTERVAL);
@@ -224,10 +253,14 @@ pub(crate) fn spawn_refresher(tokens: TokenList, store: UsageStore) {
                 Err(_) => continue,
             };
             for (name, token) in &snapshot {
-                if let Some(info) = fetch_cached(name, token)
+                let (info, fetch_status) = fetch_cached(name, token);
+                if let Some(info) = info
                     && let Ok(mut s) = store.lock()
                 {
                     s.insert(name.clone(), info);
+                }
+                if let Ok(mut st) = status.lock() {
+                    st.insert(name.clone(), fetch_status);
                 }
             }
         }

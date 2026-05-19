@@ -48,14 +48,16 @@ fn collect_tokens(profiles: &[Profile]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn apply_usage(profiles: &mut [Profile], store: &usage::UsageStore) {
-    let Ok(s) = store.lock() else {
-        return;
-    };
+fn apply_usage(profiles: &mut [Profile], store: &usage::UsageStore, status: &usage::StatusStore) {
+    let info_map = store.lock().ok();
+    let status_map = status.lock().ok();
     for p in profiles {
-        if let Some(info) = s.get(&p.name) {
+        if let Some(s) = info_map.as_ref()
+            && let Some(info) = s.get(&p.name)
+        {
             p.usage = Some(info.clone());
         }
+        p.fetch_status = status_map.as_ref().and_then(|s| s.get(&p.name).copied());
     }
 }
 
@@ -115,6 +117,7 @@ fn main() -> Result<()> {
     let _ = snapshot_active_credentials(&mut config);
 
     let usage_store: usage::UsageStore = Arc::new(Mutex::new(HashMap::new()));
+    let usage_status: usage::StatusStore = Arc::new(Mutex::new(HashMap::new()));
     let usage_tokens: usage::TokenList = Arc::new(Mutex::new(collect_tokens(&config.profiles)));
 
     // Initial usage fetch: tells us which profiles already have a running
@@ -125,7 +128,7 @@ fn main() -> Result<()> {
             .lock()
             .expect("usage_tokens mutex poisoned")
             .clone();
-        usage::fetch_all_into(&snapshot, &usage_store);
+        usage::fetch_all_into(&snapshot, &usage_store, &usage_status);
     }
 
     // For profiles that opted in with `kick_timer = true` in their
@@ -138,19 +141,23 @@ fn main() -> Result<()> {
             .into_iter()
             .filter(|(name, _)| kicked.contains(name))
             .collect();
-        usage::fetch_all_into(&retry, &usage_store);
+        usage::fetch_all_into(&retry, &usage_store, &usage_status);
         *usage_tokens.lock().expect("usage_tokens mutex poisoned") =
             collect_tokens(&config.profiles);
     }
-    usage::spawn_refresher(Arc::clone(&usage_tokens), Arc::clone(&usage_store));
+    usage::spawn_refresher(
+        Arc::clone(&usage_tokens),
+        Arc::clone(&usage_store),
+        Arc::clone(&usage_status),
+    );
 
-    apply_usage(&mut config.profiles, &usage_store);
+    apply_usage(&mut config.profiles, &usage_store, &usage_status);
     let _ = auto_switch_if_needed(&mut config);
 
     let mut last_state_mtime = app_state_mtime();
 
     loop {
-        apply_usage(&mut config.profiles, &usage_store);
+        apply_usage(&mut config.profiles, &usage_store, &usage_status);
         let menu = build_main_menu(&config);
         let labels: Vec<String> = menu.iter().map(|(l, _)| l.clone()).collect();
 
@@ -162,7 +169,7 @@ fn main() -> Result<()> {
                 *usage_tokens.lock().expect("usage_tokens mutex poisoned") =
                     collect_tokens(&config.profiles);
             }
-            apply_usage(&mut config.profiles, &usage_store);
+            apply_usage(&mut config.profiles, &usage_store, &usage_status);
             let _ = auto_switch_if_needed(&mut config);
             build_main_menu(&config)
                 .into_iter()
