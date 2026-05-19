@@ -97,6 +97,71 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Refreshes every profile's OAuth token pair (rotated pair saved to disk).
+/// Mirrors what Claude Code does silently on launch — minus the kick.
+///
+/// Profiles without a stored refresh token are skipped. Network or revocation
+/// failures are swallowed per-profile; the cached state stays put for those
+/// and the rest still refresh.
+///
+/// Returns the names of profiles whose token rotation succeeded so the caller
+/// can target follow-up work (usage re-fetch, kick) at the same set.
+pub(crate) fn refresh_all(config: &mut AppConfig) -> Vec<String> {
+    let snapshots: Vec<(String, String)> = config
+        .profiles
+        .iter()
+        .filter_map(|p| {
+            let rt = p
+                .credentials
+                .as_ref()?
+                .claude_ai_oauth
+                .as_ref()?
+                .refresh_token
+                .clone()?;
+            Some((p.name.clone(), rt))
+        })
+        .collect();
+
+    if snapshots.is_empty() {
+        return Vec::new();
+    }
+
+    let handles: Vec<_> = snapshots
+        .into_iter()
+        .map(|(name, rt)| std::thread::spawn(move || (name, refresh(&rt))))
+        .collect();
+
+    let mut refreshed = Vec::new();
+    for h in handles {
+        let Ok((name, Ok(tok))) = h.join() else {
+            continue;
+        };
+        let saved = with_state_lock(|| {
+            let Some(profile) = config.find_mut(&name) else {
+                return Ok::<_, anyhow::Error>(false);
+            };
+            let Some(creds) = profile.credentials.as_mut() else {
+                return Ok(false);
+            };
+            let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
+                return Ok(false);
+            };
+            oauth.access_token = tok.access_token;
+            oauth.refresh_token = Some(tok.refresh_token);
+            oauth.expires_at = Some((now_ms() + tok.expires_in * 1000) as i64);
+            if let Some(scope) = tok.scope {
+                oauth.scopes = Some(scope.split_whitespace().map(String::from).collect());
+            }
+            Ok(save_profile(profile).is_ok())
+        })
+        .unwrap_or(false);
+        if saved {
+            refreshed.push(name);
+        }
+    }
+    refreshed
+}
+
 /// For every profile that opted in via `kick_timer = true` and currently has
 /// no 5-hour usage window, refreshes its OAuth tokens (rotated pair saved to
 /// disk) and fires a 1-token Haiku ping to start the window.

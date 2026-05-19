@@ -79,7 +79,14 @@ pub(crate) fn profile_submenu(config: &mut AppConfig, profile_name: &str) -> Res
         };
 
         let result: Result<bool> = match ACTIONS[idx] {
-            Switch => switch_profile(config, profile_name).map(|_| true),
+            Switch => {
+                // Refresh every profile's OAuth token before linking the
+                // target — the rotated access token then ends up in
+                // ~/.claude/.credentials.json via the symlink, and the
+                // menu's usage column shows fresh data for the others.
+                let _ = crate::oauth::refresh_all(config);
+                switch_profile(config, profile_name).map(|_| true)
+            }
             Edit => edit_profile(config, profile_name).map(|_| false),
             Rename => rename_profile(config, profile_name),
             Delete => delete_profile(config, profile_name),

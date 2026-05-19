@@ -163,6 +163,10 @@ fn main() -> Result<()> {
                 let available = config.names().join(", ");
                 anyhow::bail!("profile '{name}' not found\navailable: {available}");
             };
+            // Refresh every profile's OAuth token before switching, same as
+            // the interactive menu. The just-rotated access token then ends
+            // up in ~/.claude/.credentials.json via the symlink.
+            let _ = oauth::refresh_all(&mut config);
             switch_profile(&mut config, &canonical)?;
             println!("switched to '{canonical}'");
             return Ok(());
@@ -184,6 +188,11 @@ fn main() -> Result<()> {
     if let Some(active) = config.state.active_profile.clone() {
         let _ = link_profile_credentials(&active);
     }
+
+    // Refresh every profile's OAuth token pair — Claude Code does the same
+    // thing silently on launch. Rotates and persists the new pair so the
+    // initial usage fetch below uses fresh access tokens.
+    let _ = oauth::refresh_all(&mut config);
 
     let usage_store: usage::UsageStore = Arc::new(Mutex::new(HashMap::new()));
     let usage_status: usage::StatusStore = Arc::new(Mutex::new(HashMap::new()));
