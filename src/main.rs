@@ -25,8 +25,8 @@ use inquire::{Confirm, InquireError};
 
 use crate::actions::{capture_current_profile, create_blank_profile, is_cancelled, switch_profile};
 use crate::claude::{
-    credentials_diverged, detach_credentials_link, read_claude_credentials,
-    snapshot_active_credentials,
+    credentials_diverged, detach_credentials_link, link_profile_credentials,
+    read_claude_credentials, snapshot_active_credentials,
 };
 use crate::fallback::auto_switch_if_needed;
 use crate::menu::{
@@ -177,6 +177,13 @@ fn main() -> Result<()> {
     inquire::set_global_render_config(build_render_config());
     let mut config = load_config()?;
     reconcile_startup_credentials(&mut config)?;
+    // Re-establish the symlink so in-session Claude Code refreshes flow
+    // back into the active profile's storage. The previous clauth exit
+    // replaced the symlink with a plain copy so external writes between
+    // sessions wouldn't bleed into the wrong profile.
+    if let Some(active) = config.state.active_profile.clone() {
+        let _ = link_profile_credentials(&active);
+    }
 
     let usage_store: usage::UsageStore = Arc::new(Mutex::new(HashMap::new()));
     let usage_status: usage::StatusStore = Arc::new(Mutex::new(HashMap::new()));
@@ -276,12 +283,14 @@ fn main() -> Result<()> {
             collect_tokens(&config.profiles);
     }
 
-    // Persist whatever Claude Code wrote to ~/.claude/.credentials.json
-    // during this session. On Unix the symlink already mirrors writes into
-    // the active profile's storage, so this is mainly a Windows safety net
-    // (where the link is a copy and mid-session refreshes only land in
-    // ~/.claude/), but it's cheap to run unconditionally.
+    // Persist whatever Claude Code wrote during this session, then replace
+    // the symlink with a plain copy of its current target. After shutdown
+    // any external write to ~/.claude/.credentials.json (a different
+    // account sign-in, for example) lands in that standalone file instead
+    // of mutating the active profile's storage through the link — so the
+    // next startup can detect the divergence and ask the user.
     let _ = snapshot_active_credentials(&mut config);
+    let _ = detach_credentials_link();
 
     Ok(())
 }
