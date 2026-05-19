@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
+use crate::lock::with_state_lock;
 use crate::usage::UsageInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,8 +199,37 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
     dirs::home_dir().context("Cannot determine home directory")
 }
 
-fn clauth_dir() -> Result<PathBuf> {
+pub(crate) fn clauth_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".clauth"))
+}
+
+/// Write `content` to `path` via tempfile + rename so concurrent readers in
+/// other instances see either the old file or the new one — never a partial
+/// write. Falls back to a plain write when rename across the temp file fails
+/// (e.g. exotic filesystems).
+pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, content)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+pub(crate) fn app_state_mtime() -> Option<SystemTime> {
+    let path = app_state_path().ok()?;
+    std::fs::metadata(&path).ok()?.modified().ok()
 }
 
 fn profiles_root() -> Result<PathBuf> {
@@ -233,9 +264,11 @@ fn load_app_state() -> Result<AppState> {
 }
 
 pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
-    std::fs::create_dir_all(clauth_dir()?)?;
-    std::fs::write(app_state_path()?, toml::to_string_pretty(state)?)
-        .context("Failed to write profiles.toml")
+    with_state_lock(|| {
+        std::fs::create_dir_all(clauth_dir()?)?;
+        atomic_write(&app_state_path()?, toml::to_string_pretty(state)?)
+            .context("Failed to write profiles.toml")
+    })
 }
 
 fn load_profile(name: &str) -> Result<Profile> {
@@ -279,35 +312,37 @@ fn load_profile(name: &str) -> Result<Profile> {
     // get added as comments, values already set are preserved in place.
     let rendered = render_config_toml(&profile);
     if raw_config != rendered {
-        if let Some(parent) = config_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&config_path, &rendered);
+        let _ = with_state_lock(|| {
+            let _ = atomic_write(&config_path, &rendered);
+            Ok(())
+        });
     }
 
     Ok(profile)
 }
 
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
-    std::fs::create_dir_all(profile_dir(&profile.name)?)?;
+    with_state_lock(|| {
+        std::fs::create_dir_all(profile_dir(&profile.name)?)?;
 
-    std::fs::write(
-        profile_config_path(&profile.name)?,
-        render_config_toml(profile),
-    )
-    .context("Failed to write config.toml")?;
+        atomic_write(
+            &profile_config_path(&profile.name)?,
+            render_config_toml(profile),
+        )
+        .context("Failed to write config.toml")?;
 
-    let cred_path = profile_credentials_path(&profile.name)?;
-    match &profile.credentials {
-        Some(creds) => std::fs::write(&cred_path, serde_json::to_string_pretty(creds)?)
-            .context("Failed to write credentials.json")?,
-        None if cred_path.exists() => {
-            std::fs::remove_file(&cred_path).context("Failed to remove credentials.json")?
+        let cred_path = profile_credentials_path(&profile.name)?;
+        match &profile.credentials {
+            Some(creds) => atomic_write(&cred_path, serde_json::to_string_pretty(creds)?)
+                .context("Failed to write credentials.json")?,
+            None if cred_path.exists() => {
+                std::fs::remove_file(&cred_path).context("Failed to remove credentials.json")?
+            }
+            None => {}
         }
-        None => {}
-    }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 pub(crate) fn load_config() -> Result<AppConfig> {

@@ -2,6 +2,7 @@ mod actions;
 mod claude;
 mod completions;
 mod fallback;
+mod lock;
 mod menu;
 mod oauth;
 mod platform;
@@ -14,6 +15,7 @@ mod usage;
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use crossterm::cursor::MoveTo;
@@ -27,7 +29,7 @@ use crate::menu::{
     MainAction, MainMenuResult, build_main_menu, fallback_chain_menu, main_menu_prompt,
     profile_submenu,
 };
-use crate::profile::{Profile, load_config};
+use crate::profile::{AppConfig, Profile, app_state_mtime, load_config};
 use crate::ui::build_render_config;
 
 fn collect_tokens(profiles: &[Profile]) -> Vec<(String, String)> {
@@ -54,6 +56,25 @@ fn apply_usage(profiles: &mut [Profile], store: &usage::UsageStore) {
         if let Some(info) = s.get(&p.name) {
             p.usage = Some(info.clone());
         }
+    }
+}
+
+/// Pick up edits from a concurrent clauth instance (or hand edits in
+/// ~/.clauth/) by reloading the on-disk config when profiles.toml has been
+/// rewritten since we last looked. Returns true if a reload happened so the
+/// caller can refresh derived state like the usage token list.
+fn reload_if_state_changed(config: &mut AppConfig, last_seen: &mut Option<SystemTime>) -> bool {
+    let current = app_state_mtime();
+    if current == *last_seen {
+        return false;
+    }
+    match load_config() {
+        Ok(fresh) => {
+            *config = fresh;
+            *last_seen = current;
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -126,12 +147,21 @@ fn main() -> Result<()> {
     apply_usage(&mut config.profiles, &usage_store);
     let _ = auto_switch_if_needed(&mut config);
 
+    let mut last_state_mtime = app_state_mtime();
+
     loop {
         apply_usage(&mut config.profiles, &usage_store);
         let menu = build_main_menu(&config);
         let labels: Vec<String> = menu.iter().map(|(l, _)| l.clone()).collect();
 
         let idx = match main_menu_prompt(labels, || {
+            // Pick up state edits from a concurrent instance (or hand edits).
+            // Done before apply_usage so the fresh profile list gets its
+            // usage filled in from our cache in the same tick.
+            if reload_if_state_changed(&mut config, &mut last_state_mtime) {
+                *usage_tokens.lock().expect("usage_tokens mutex poisoned") =
+                    collect_tokens(&config.profiles);
+            }
             apply_usage(&mut config.profiles, &usage_store);
             let _ = auto_switch_if_needed(&mut config);
             build_main_menu(&config)

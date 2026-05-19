@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-use crate::profile::{AppConfig, ClaudeCredentials, Profile, home_dir, profile_dir, save_profile};
+use crate::lock::with_state_lock;
+use crate::profile::{
+    AppConfig, ClaudeCredentials, Profile, atomic_write, home_dir, profile_dir, save_profile,
+};
 
 fn claude_credentials_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude").join(".credentials.json"))
@@ -46,29 +49,33 @@ fn create_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<()
 
 /// Symlinks `~/.claude/.credentials.json` → profile's `credentials.json`; copies on Windows without symlink privilege.
 pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
-    let link = claude_credentials_path()?;
+    with_state_lock(|| {
+        let link = claude_credentials_path()?;
 
-    if link.symlink_metadata().is_ok() {
-        std::fs::remove_file(&link).context("Failed to remove old .credentials.json")?;
-    }
-
-    let target = profile_dir(name)?.join("credentials.json");
-    if target.exists() {
-        if let Some(parent) = link.parent() {
-            std::fs::create_dir_all(parent)?;
+        if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).context("Failed to remove old .credentials.json")?;
         }
-        create_symlink(&target, &link)?;
-    }
 
-    Ok(())
+        let target = profile_dir(name)?.join("credentials.json");
+        if target.exists() {
+            if let Some(parent) = link.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            create_symlink(&target, &link)?;
+        }
+
+        Ok(())
+    })
 }
 
 pub(crate) fn clear_claude_credentials() -> Result<()> {
-    let link = claude_credentials_path()?;
-    if link.symlink_metadata().is_ok() {
-        std::fs::remove_file(&link).context("Failed to remove .credentials.json")?;
-    }
-    Ok(())
+    with_state_lock(|| {
+        let link = claude_credentials_path()?;
+        if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).context("Failed to remove .credentials.json")?;
+        }
+        Ok(())
+    })
 }
 
 pub(crate) struct ClaudeEndpoint {
@@ -102,6 +109,13 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
 /// that the new profile doesn't carry are removed first so stale entries from
 /// the previously active profile don't linger. Every other field is untouched.
 pub(crate) fn apply_profile_to_claude_settings(
+    profile: &Profile,
+    prev_env_keys: &[String],
+) -> Result<()> {
+    with_state_lock(|| apply_profile_to_claude_settings_inner(profile, prev_env_keys))
+}
+
+fn apply_profile_to_claude_settings_inner(
     profile: &Profile,
     prev_env_keys: &[String],
 ) -> Result<()> {
@@ -161,19 +175,24 @@ pub(crate) fn apply_profile_to_claude_settings(
         env.insert(k.clone(), v.clone().into());
     }
 
-    std::fs::write(&path, serde_json::to_string_pretty(&settings)?)
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write(&path, serde_json::to_string_pretty(&settings)?)
         .context("Failed to write settings.json")
 }
 
 /// Reads the live .credentials.json and saves it to the active profile.
 pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
-    let Some(active) = config.state.active_profile.clone() else {
-        return Ok(());
-    };
-    let credentials = read_claude_credentials()?;
-    if let Some(profile) = config.find_mut(&active) {
-        profile.credentials = credentials;
-        save_profile(profile)?;
-    }
-    Ok(())
+    with_state_lock(|| {
+        let Some(active) = config.state.active_profile.clone() else {
+            return Ok(());
+        };
+        let credentials = read_claude_credentials()?;
+        if let Some(profile) = config.find_mut(&active) {
+            profile.credentials = credentials;
+            save_profile(profile)?;
+        }
+        Ok(())
+    })
 }

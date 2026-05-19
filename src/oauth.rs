@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use serde::Deserialize;
 
+use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, save_app_state, save_profile};
 use crate::usage::UsageStore;
 
@@ -106,39 +107,66 @@ fn now_ms() -> u64 {
 /// Returns the names of profiles whose timer kick succeeded so the caller
 /// can re-fetch usage and confirm the window now shows up.
 pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) -> Vec<String> {
-    let now = now_ms();
-    let snapshots: Vec<(String, String)> = {
-        let usage = store.lock().ok();
-        config
-            .profiles
-            .iter()
-            .filter(|p| p.kick_timer)
-            .filter(|p| {
-                // Skip profiles whose timer is already running.
-                let info = usage.as_ref().and_then(|s| s.get(&p.name));
-                let resets_at = info
+    // Claim cooldown slots under the lock BEFORE doing any network work. A
+    // competing clauth process that starts up a moment later will observe
+    // our recorded `last_kick_at` and skip the same profile, so the refresh
+    // token rotates exactly once even when two instances race startup.
+    //
+    // Holding the lock during the OAuth/messages HTTP round trips would
+    // stall every other instance for seconds, which is why we release the
+    // lock between the claim and the per-profile network work.
+    let snapshots: Vec<(String, String)> = match with_state_lock(|| {
+        let now = now_ms();
+        let mut claimed = Vec::new();
+        for profile in &config.profiles {
+            if !profile.kick_timer {
+                continue;
+            }
+            // Skip profiles whose timer is already running.
+            let resets_at = {
+                let usage = store.lock().ok();
+                usage
+                    .as_ref()
+                    .and_then(|s| s.get(&profile.name))
                     .and_then(|u| u.five_hour.as_ref())
-                    .and_then(|w| w.resets_at.as_ref());
-                resets_at.is_none()
-            })
-            .filter(|p| {
-                // Skip profiles kicked recently — their window should still be
-                // open even if the usage endpoint hasn't surfaced it yet.
-                let last = config.state.last_kick_at.get(&p.name).copied().unwrap_or(0);
-                now.saturating_sub(last) >= KICK_COOLDOWN_MS
-            })
-            .filter_map(|p| {
-                let token = p
-                    .credentials
-                    .as_ref()?
-                    .claude_ai_oauth
-                    .as_ref()?
-                    .refresh_token
-                    .as_ref()?
-                    .clone();
-                Some((p.name.clone(), token))
-            })
-            .collect()
+                    .and_then(|w| w.resets_at.clone())
+            };
+            if resets_at.is_some() {
+                continue;
+            }
+            // Skip profiles kicked recently — by us or by a concurrent clauth.
+            let last = config
+                .state
+                .last_kick_at
+                .get(&profile.name)
+                .copied()
+                .unwrap_or(0);
+            if now.saturating_sub(last) < KICK_COOLDOWN_MS {
+                continue;
+            }
+            let Some(token) = profile
+                .credentials
+                .as_ref()
+                .and_then(|c| c.claude_ai_oauth.as_ref())
+                .and_then(|o| o.refresh_token.as_ref())
+                .cloned()
+            else {
+                continue;
+            };
+            claimed.push((profile.name.clone(), token));
+        }
+
+        // Persist the claim so concurrent instances see us as the owner.
+        for (name, _) in &claimed {
+            config.state.last_kick_at.insert(name.clone(), now);
+        }
+        if !claimed.is_empty() {
+            let _ = save_app_state(&config.state);
+        }
+        Ok::<_, anyhow::Error>(claimed)
+    }) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
     };
 
     let handles: Vec<_> = snapshots
@@ -162,15 +190,15 @@ pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) ->
         let Ok((name, Ok(tok))) = h.join() else {
             continue;
         };
-        let succeeded = {
+        let succeeded = with_state_lock(|| {
             let Some(profile) = config.find_mut(&name) else {
-                continue;
+                return Ok::<_, anyhow::Error>(false);
             };
             let Some(creds) = profile.credentials.as_mut() else {
-                continue;
+                return Ok(false);
             };
             let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
-                continue;
+                return Ok(false);
             };
             oauth.access_token = tok.access_token;
             oauth.refresh_token = Some(tok.refresh_token);
@@ -178,15 +206,12 @@ pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) ->
             if let Some(scope) = tok.scope {
                 oauth.scopes = Some(scope.split_whitespace().map(String::from).collect());
             }
-            save_profile(profile).is_ok()
-        };
+            Ok(save_profile(profile).is_ok())
+        })
+        .unwrap_or(false);
         if succeeded {
-            config.state.last_kick_at.insert(name.clone(), now_ms());
             kicked.push(name);
         }
-    }
-    if !kicked.is_empty() {
-        let _ = save_app_state(&config.state);
     }
     kicked
 }

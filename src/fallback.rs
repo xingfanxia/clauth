@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::actions::switch_profile;
+use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile};
 
 /// Default 5-hour utilization threshold (percent) applied when a chain member
@@ -63,29 +64,31 @@ fn next_target(config: &AppConfig) -> Option<String> {
 /// its threshold, switch to the next viable chain member. Returns the name
 /// switched to, or None when no action was taken.
 pub(crate) fn auto_switch_if_needed(config: &mut AppConfig) -> Result<Option<String>> {
-    let active_name = config.state.active_profile.clone();
-    let Some(active_name) = active_name else {
-        return Ok(None);
-    };
-    if !config
-        .state
-        .fallback_chain
-        .iter()
-        .any(|n| n == &active_name)
-    {
-        return Ok(None);
-    }
-    let Some(active) = config.find(&active_name) else {
-        return Ok(None);
-    };
-    if !is_exhausted(active) {
-        return Ok(None);
-    }
+    with_state_lock(|| {
+        let active_name = config.state.active_profile.clone();
+        let Some(active_name) = active_name else {
+            return Ok(None);
+        };
+        if !config
+            .state
+            .fallback_chain
+            .iter()
+            .any(|n| n == &active_name)
+        {
+            return Ok(None);
+        }
+        let Some(active) = config.find(&active_name) else {
+            return Ok(None);
+        };
+        if !is_exhausted(active) {
+            return Ok(None);
+        }
 
-    let Some(target) = next_target(config) else {
-        return Ok(None);
-    };
+        let Some(target) = next_target(config) else {
+            return Ok(None);
+        };
 
-    switch_profile(config, &target)?;
-    Ok(Some(target))
+        switch_profile(config, &target)?;
+        Ok(Some(target))
+    })
 }
