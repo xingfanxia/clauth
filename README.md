@@ -27,10 +27,14 @@ clauth keeps snapshots of both files for each profile; on switch it swaps `.cred
 ## Features
 
 - **One-key switching:** select a profile, switch, done; or `clauth <profile>` to switch directly by profile name
+- **Silent token refresh:** every profile's OAuth token pair is refreshed in parallel on launch and on manual switch — same as Claude Code on startup — so the rotated tokens land in `~/.claude/.credentials.json` and the usage column never queries with an expired access token
 - **Usage bars:** live 5-hour utilization fetched from the Anthropic API and refreshed every 30s, color-coded by threshold, with the next reset time alongside the bar. Max accounts also get a 7-day bar when the terminal is wide enough; Pro accounts have no weekly window in the API response so only the 5h bar is shown
 - **Plan detection:** queries `/api/oauth/profile` to identify the real plan tier — Pro, Max 5x, Max 20x, Team, Enterprise, Free — instead of trusting the unreliable `subscriptionType` tag in the OAuth credentials
 - **Detailed window stats:** the per-profile submenu also shows the 7-day rolling window and any paid extra-usage spend
 - **Auto-switch on exhaustion:** opt profiles into an ordered fallback chain with per-profile thresholds; when the active profile crosses its 5h limit (95% by default), clauth automatically switches to the next chain member that still has headroom. clauth must be opened for this to work
+- **Stale-data indicator:** the profile name is underlined yellow when the usage row is served from cache (API refused this tick) and red when no data is available at all, so it's obvious when the numbers aren't live
+- **Account-change detection:** if Claude Code was signed into a different account while clauth wasn't running, clauth notices on next startup and asks before overwriting the active profile's stored tokens
+- **Multi-instance safe:** several clauth processes can run side by side; state writes are serialized through a file lock and each instance reloads when another rewrites `profiles.toml`
 - **Non-destructive:** only touches the two API-related keys in `settings.json`; all other config is preserved
 
 ## Install
@@ -113,13 +117,13 @@ You can edit a profile's URL and key at any time without losing its stored crede
 
 ## Kicking the 5-hour timer
 
-The 5-hour usage window only starts after a real inference call — OAuth token refresh alone doesn't trigger it. To make a profile's timer show up at clauth startup, opt in per-profile by setting `kick_timer = true` in `~/.clauth/profiles/<name>/config.toml`:
+The 5-hour usage window only starts after a real inference call — the standard OAuth refresh that clauth runs on every launch and manual switch doesn't trigger it. To make a profile's timer show up at clauth startup, opt in per-profile by setting `kick_timer = true` in `~/.clauth/profiles/<name>/config.toml`:
 
 ```toml
 kick_timer = true
 ```
 
-When enabled, clauth refreshes the OAuth token and sends a 1-token Haiku ping (~22 input + 1 output token, fractions of a cent) for that profile on startup if no window is currently running. Default is off.
+When enabled, clauth sends a 1-token Haiku ping (~22 input + 1 output token, fractions of a cent) for that profile on startup if no window is currently running. Default is off.
 
 ## Automatic account switching
 
