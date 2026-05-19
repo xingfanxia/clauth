@@ -7,7 +7,9 @@ use crate::claude::{
     snapshot_active_credentials,
 };
 use crate::lock::with_state_lock;
-use crate::profile::{AppConfig, Profile, profile_dir, save_app_state, save_profile};
+use crate::profile::{
+    AppConfig, ClaudeCredentials, Profile, profile_dir, save_app_state, save_profile,
+};
 
 // ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -194,9 +196,43 @@ pub(crate) fn create_blank_profile(config: &mut AppConfig) -> Result<()> {
     })
 }
 
+/// Finds an existing profile whose stored OAuth tokens match `live`. The
+/// usual trigger is capturing while a profile is active — the live file is
+/// symlinked to that profile's storage, so the capture would duplicate the
+/// same identity into a second slot.
+fn find_matching_oauth_profile<'a>(
+    config: &'a AppConfig,
+    live: Option<&ClaudeCredentials>,
+) -> Option<&'a str> {
+    let live_oauth = live?.claude_ai_oauth.as_ref()?;
+    config.profiles.iter().find_map(|p| {
+        let stored = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
+        (stored.access_token == live_oauth.access_token
+            && stored.refresh_token == live_oauth.refresh_token)
+            .then_some(p.name.as_str())
+    })
+}
+
 pub(crate) fn capture_current_profile(config: &mut AppConfig) -> Result<()> {
     let credentials = read_claude_credentials()?;
     let ClaudeEndpoint { base_url, api_key } = read_claude_endpoint_config()?;
+
+    if let Some(matching) = find_matching_oauth_profile(config, credentials.as_ref()) {
+        let proceed = match Confirm::new(&format!(
+            "These credentials already belong to profile '{matching}'. Capture anyway?"
+        ))
+        .with_default(false)
+        .prompt()
+        {
+            Ok(b) => b,
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if !proceed {
+            return Ok(());
+        }
+    }
+
     let name = prompt_profile_name(&config.names(), None)?;
 
     with_state_lock(|| {
