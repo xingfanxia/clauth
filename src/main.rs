@@ -21,15 +21,19 @@ use anyhow::Result;
 use crossterm::cursor::MoveTo;
 use crossterm::execute;
 use crossterm::terminal::{Clear, ClearType};
+use inquire::{Confirm, InquireError};
 
 use crate::actions::{capture_current_profile, create_blank_profile, is_cancelled, switch_profile};
-use crate::claude::snapshot_active_credentials;
+use crate::claude::{
+    credentials_diverged, detach_credentials_link, read_claude_credentials,
+    snapshot_active_credentials,
+};
 use crate::fallback::auto_switch_if_needed;
 use crate::menu::{
     MainAction, MainMenuResult, build_main_menu, fallback_chain_menu, main_menu_prompt,
     profile_submenu,
 };
-use crate::profile::{AppConfig, Profile, app_state_mtime, load_config};
+use crate::profile::{AppConfig, Profile, app_state_mtime, load_config, save_app_state};
 use crate::ui::build_render_config;
 
 fn collect_tokens(profiles: &[Profile]) -> Vec<(String, String)> {
@@ -59,6 +63,64 @@ fn apply_usage(profiles: &mut [Profile], store: &usage::UsageStore, status: &usa
         }
         p.fetch_status = status_map.as_ref().and_then(|s| s.get(&p.name).copied());
     }
+}
+
+/// Resolve the gap between the live `~/.claude/.credentials.json` and the
+/// active profile's stored credentials at startup. The normal case is a
+/// silent snapshot — same tokens, or just a refresh that rotated them. The
+/// interesting case is when both access_token and/or refresh_token differ
+/// from what we have stored: that usually means Claude Code was used to
+/// sign into a different account while clauth wasn't running, and a blind
+/// snapshot would overwrite the active profile's identity. Ask first.
+fn reconcile_startup_credentials(config: &mut AppConfig) -> Result<()> {
+    let Some(active) = config.state.active_profile.clone() else {
+        return Ok(());
+    };
+
+    let live = read_claude_credentials().ok().flatten();
+    let stored = config.find(&active).and_then(|p| p.credentials.as_ref());
+
+    if !credentials_diverged(stored, live.as_ref()) {
+        let _ = snapshot_active_credentials(config);
+        return Ok(());
+    }
+
+    let keep = match Confirm::new(&format!("Still logged in as '{active}'?"))
+        .with_default(true)
+        .with_help_message("~/.claude/.credentials.json differs from this profile's saved tokens.")
+        .prompt()
+    {
+        Ok(b) => b,
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => true,
+        Err(e) => return Err(e.into()),
+    };
+
+    if keep {
+        let _ = snapshot_active_credentials(config);
+        return Ok(());
+    }
+
+    detach_credentials_link()?;
+    config.state.active_profile = None;
+    save_app_state(&config.state)?;
+
+    let capture = match Confirm::new("Capture current credentials as a new profile?")
+        .with_default(true)
+        .prompt()
+    {
+        Ok(b) => b,
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => false,
+        Err(e) => return Err(e.into()),
+    };
+
+    if capture
+        && let Err(e) = capture_current_profile(config)
+        && !is_cancelled(&e)
+    {
+        return Err(e);
+    }
+
+    Ok(())
 }
 
 /// Pick up edits from a concurrent clauth instance (or hand edits in
@@ -114,7 +176,7 @@ fn main() -> Result<()> {
     update::spawn();
     inquire::set_global_render_config(build_render_config());
     let mut config = load_config()?;
-    let _ = snapshot_active_credentials(&mut config);
+    reconcile_startup_credentials(&mut config)?;
 
     let usage_store: usage::UsageStore = Arc::new(Mutex::new(HashMap::new()));
     let usage_status: usage::StatusStore = Arc::new(Mutex::new(HashMap::new()));

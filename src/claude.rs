@@ -196,3 +196,46 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
         Ok(())
     })
 }
+
+/// Returns true when both sides carry an OAuth block and either the
+/// access token or refresh token differs. Missing data on either side
+/// returns false — the caller's normal snapshot/skip path is safer than
+/// guessing in the dark.
+pub(crate) fn credentials_diverged(
+    stored: Option<&ClaudeCredentials>,
+    live: Option<&ClaudeCredentials>,
+) -> bool {
+    let Some(stored) = stored.and_then(|c| c.claude_ai_oauth.as_ref()) else {
+        return false;
+    };
+    let Some(live) = live.and_then(|c| c.claude_ai_oauth.as_ref()) else {
+        return false;
+    };
+    stored.access_token != live.access_token || stored.refresh_token != live.refresh_token
+}
+
+/// Replaces the symlink at `~/.claude/.credentials.json` with a regular
+/// file containing the same bytes. No-op when the path is already a
+/// regular file or doesn't exist. Called when the user disowns the
+/// active profile so subsequent Claude Code writes don't bleed into
+/// that profile's storage through the symlink.
+pub(crate) fn detach_credentials_link() -> Result<()> {
+    with_state_lock(|| {
+        let path = claude_credentials_path()?;
+        let Ok(meta) = path.symlink_metadata() else {
+            return Ok(());
+        };
+        if !meta.file_type().is_symlink() {
+            return Ok(());
+        }
+        let content =
+            std::fs::read(&path).context("Failed to read .credentials.json before detach")?;
+        std::fs::remove_file(&path).context("Failed to remove .credentials.json symlink")?;
+        atomic_write(&path, content).context("Failed to write detached .credentials.json")?;
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+#[path = "../tests/inline/claude.rs"]
+mod tests;
