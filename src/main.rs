@@ -276,5 +276,12 @@ fn main() -> Result<()> {
             collect_tokens(&config.profiles);
     }
 
+    // Persist whatever Claude Code wrote to ~/.claude/.credentials.json
+    // during this session. On Unix the symlink already mirrors writes into
+    // the active profile's storage, so this is mainly a Windows safety net
+    // (where the link is a copy and mid-session refreshes only land in
+    // ~/.claude/), but it's cheap to run unconditionally.
+    let _ = snapshot_active_credentials(&mut config);
+
     Ok(())
 }
