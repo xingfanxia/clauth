@@ -9,18 +9,7 @@
 //!
 //! The lock is re-entrant within the same process so high-level actions
 //! (e.g. `switch_profile`) can take the lock and still call helpers that take
-//! it themselves without deadlocking. Cross-process semantics come from
-//! `flock(2)` (unix) / `LockFileEx` (windows); the kernel releases the lock
-//! automatically if the holder crashes.
-//!
-//! ## Pattern
-//!
-//! ```ignore
-//! lock::with_state_lock(|| {
-//!     // read-modify-write of shared state
-//!     Ok(())
-//! })
-//! ```
+//! it themselves without deadlocking.
 
 use std::fs::{File, OpenOptions};
 use std::sync::Mutex;
@@ -41,7 +30,6 @@ static LOCK: Mutex<Inner> = Mutex::new(Inner {
     depth: 0,
 });
 
-/// RAII guard. Released on drop. Construct via `acquire`.
 pub(crate) struct StateLock {
     _private: (),
 }
@@ -59,9 +47,7 @@ impl StateLock {
                 .truncate(false)
                 .open(dir.join(LOCK_FILENAME))
                 .context("Failed to open clauth state lock file")?;
-            // Blocking; releases when another process drops its lock or exits.
-            // Held briefly by every clauth process (milliseconds per write),
-            // so contention is rare.
+            // Blocking; releases when the holder drops its lock or exits.
             file.lock().context("Failed to acquire clauth state lock")?;
             guard.file = Some(file);
         }
@@ -81,8 +67,7 @@ impl Drop for StateLock {
         };
         guard.depth = guard.depth.saturating_sub(1);
         if guard.depth == 0 {
-            // Dropping the File closes its FD, which releases the advisory
-            // lock for other processes.
+            // Closing the File releases the advisory lock for other processes.
             guard.file = None;
         }
     }

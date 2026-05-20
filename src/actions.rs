@@ -1,5 +1,9 @@
+//! Pure-data mutations against `AppConfig` and the live `~/.claude` state.
+//!
+//! Each function takes already-validated inputs from the TUI layer and applies
+//! the change under the cross-process state lock.
+
 use anyhow::{Context, Result, bail};
-use inquire::{Confirm, InquireError, Text};
 
 use crate::claude::{
     ClaudeEndpoint, apply_profile_to_claude_settings, clear_claude_credentials,
@@ -11,44 +15,39 @@ use crate::profile::{
     AppConfig, ClaudeCredentials, Profile, profile_dir, save_app_state, save_profile,
 };
 
-// ── Prompts ───────────────────────────────────────────────────────────────────
+// ── Validation ────────────────────────────────────────────────────────────────
 
-pub(crate) fn prompt_optional(label: &str, current: Option<&str>) -> Result<Option<String>> {
-    let value = Text::new(label)
-        .with_default(current.unwrap_or(""))
-        .with_help_message("Leave empty to unset")
-        .prompt()?;
-    Ok((!value.trim().is_empty()).then_some(value))
-}
-
-pub(crate) fn prompt_profile_name(existing: &[&str], exclude: Option<&str>) -> Result<String> {
-    let name = Text::new("Profile name:").prompt()?.trim().to_string();
-    if name.is_empty() {
+/// Verifies `name` is a usable profile slug. Same rules as the legacy
+/// inquire prompt: ASCII alphanumeric plus `-`, `_`, `.`, not leading-dot,
+/// not empty, not a duplicate of any other profile (allowing `exclude` for
+/// rename-in-place).
+pub(crate) fn validate_profile_name(
+    name: &str,
+    existing: &[&str],
+    exclude: Option<&str>,
+) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
         bail!("Name cannot be empty.");
     }
-    if !name
+    let valid_chars = trimmed
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        || name.starts_with('.')
-    {
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !valid_chars || trimmed.starts_with('.') {
         bail!(
             "Name must contain only letters, digits, '-', '_', or '.', and cannot start with '.'."
         );
     }
-    if existing.iter().any(|&n| n == name && Some(n) != exclude) {
-        bail!("A profile named '{name}' already exists.");
+    if existing
+        .iter()
+        .any(|&n| n.eq_ignore_ascii_case(trimmed) && Some(n) != exclude)
+    {
+        bail!("A profile named '{trimmed}' already exists.");
     }
-    Ok(name)
+    Ok(())
 }
 
-pub(crate) fn is_cancelled(error: &anyhow::Error) -> bool {
-    matches!(
-        error.downcast_ref::<InquireError>(),
-        Some(InquireError::OperationCanceled | InquireError::OperationInterrupted),
-    )
-}
-
-// ── Submenu actions ───────────────────────────────────────────────────────────
+// ── Profile actions ───────────────────────────────────────────────────────────
 
 pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
@@ -74,17 +73,12 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     })
 }
 
-pub(crate) fn edit_profile(config: &mut AppConfig, name: &str) -> Result<()> {
-    let (current_url, current_key) = {
-        let profile = config.find(name).context("Profile not found")?;
-        (profile.base_url.clone(), profile.api_key.clone())
-    };
-
-    // Prompts run outside the lock — holding the state lock while waiting on
-    // user input would block other clauth processes indefinitely.
-    let base_url = prompt_optional("Base URL:", current_url.as_deref())?;
-    let api_key = prompt_optional("API key:", current_key.as_deref())?;
-
+pub(crate) fn edit_profile_endpoint(
+    config: &mut AppConfig,
+    name: &str,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> Result<()> {
     with_state_lock(|| {
         let profile = config.find_mut(name).context("Profile not found")?;
         profile.base_url = base_url;
@@ -100,26 +94,19 @@ pub(crate) fn edit_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     })
 }
 
-/// Returns true if the profile was renamed (submenu should exit to refresh list).
-pub(crate) fn rename_profile(config: &mut AppConfig, old: &str) -> Result<bool> {
-    let new = match prompt_profile_name(&config.names(), Some(old)) {
-        Ok(n) => n,
-        Err(e) if is_cancelled(&e) => return Ok(false),
-        Err(e) => return Err(e),
-    };
-
+pub(crate) fn rename_profile(config: &mut AppConfig, old: &str, new: &str) -> Result<()> {
     with_state_lock(|| {
         let old_dir = profile_dir(old)?;
         if old_dir.exists() {
-            std::fs::rename(&old_dir, profile_dir(&new)?)
+            std::fs::rename(&old_dir, profile_dir(new)?)
                 .with_context(|| format!("Failed to rename profile directory to '{new}'"))?;
         }
 
         if let Some(profile) = config.find_mut(old) {
-            profile.name = new.clone();
+            profile.name = new.to_string();
         }
         if let Some(slot) = config.state.profiles.iter_mut().find(|n| n.as_str() == old) {
-            *slot = new.clone();
+            *slot = new.to_string();
         }
         if let Some(slot) = config
             .state
@@ -127,38 +114,23 @@ pub(crate) fn rename_profile(config: &mut AppConfig, old: &str) -> Result<bool> 
             .iter_mut()
             .find(|n| n.as_str() == old)
         {
-            *slot = new.clone();
+            *slot = new.to_string();
         }
         let was_active = config.is_active(old);
         if was_active {
-            config.state.active_profile = Some(new.clone());
+            config.state.active_profile = Some(new.to_string());
         }
 
         save_app_state(&config.state)?;
 
         if was_active {
-            link_profile_credentials(&new)?;
+            link_profile_credentials(new)?;
         }
-        Ok(true)
+        Ok(())
     })
 }
 
-/// Returns true if the profile was deleted (submenu should exit).
-pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<bool> {
-    let confirmed = match Confirm::new(&format!("Delete '{name}'?"))
-        .with_default(false)
-        .prompt()
-    {
-        Ok(c) => c,
-        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
-            return Ok(false);
-        }
-        Err(e) => return Err(e.into()),
-    };
-    if !confirmed {
-        return Ok(false);
-    }
-
+pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
         let was_active = config.is_active(name);
         let dir = profile_dir(name)?;
@@ -173,21 +145,16 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<bool>
         if was_active {
             clear_claude_credentials()?;
         }
-        Ok(true)
+        Ok(())
     })
 }
 
-// ── Main-menu actions ─────────────────────────────────────────────────────────
-
-pub(crate) fn create_blank_profile(config: &mut AppConfig) -> Result<()> {
-    let name = prompt_profile_name(&config.names(), None)?;
-    let base_url = prompt_optional("Base URL:", None)?;
-    let api_key = if base_url.is_some() {
-        prompt_optional("API key:", None)?
-    } else {
-        None
-    };
-
+pub(crate) fn create_blank_profile(
+    config: &mut AppConfig,
+    name: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> Result<()> {
     with_state_lock(|| {
         let profile = Profile::new(name, base_url, api_key);
         save_profile(&profile)?;
@@ -196,11 +163,10 @@ pub(crate) fn create_blank_profile(config: &mut AppConfig) -> Result<()> {
     })
 }
 
-/// Finds an existing profile whose stored OAuth tokens match `live`. The
-/// usual trigger is capturing while a profile is active — the live file is
-/// symlinked to that profile's storage, so the capture would duplicate the
-/// same identity into a second slot.
-fn find_matching_oauth_profile<'a>(
+/// Reads the current `~/.claude` credentials/endpoint and saves them as a new
+/// profile under `name`. Returns the matching profile name if these exact
+/// OAuth tokens already belong to one (caller can warn before proceeding).
+pub(crate) fn find_matching_oauth_profile<'a>(
     config: &'a AppConfig,
     live: Option<&ClaudeCredentials>,
 ) -> Option<&'a str> {
@@ -213,29 +179,35 @@ fn find_matching_oauth_profile<'a>(
     })
 }
 
-pub(crate) fn capture_current_profile(config: &mut AppConfig) -> Result<()> {
+/// Snapshot of the live `~/.claude` state, ready to be turned into a profile.
+#[derive(Debug, Clone)]
+pub(crate) struct CaptureSnapshot {
+    pub(crate) credentials: Option<ClaudeCredentials>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key: Option<String>,
+}
+
+pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
     let credentials = read_claude_credentials()?;
     let ClaudeEndpoint { base_url, api_key } = read_claude_endpoint_config()?;
+    Ok(CaptureSnapshot {
+        credentials,
+        base_url,
+        api_key,
+    })
+}
 
-    if let Some(matching) = find_matching_oauth_profile(config, credentials.as_ref()) {
-        let proceed = match Confirm::new(&format!(
-            "These credentials already belong to profile '{matching}'. Capture anyway?"
-        ))
-        .with_default(false)
-        .prompt()
-        {
-            Ok(b) => b,
-            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if !proceed {
-            return Ok(());
-        }
-    }
-
-    let name = prompt_profile_name(&config.names(), None)?;
-
+pub(crate) fn capture_into_profile(
+    config: &mut AppConfig,
+    name: String,
+    snapshot: CaptureSnapshot,
+) -> Result<()> {
     with_state_lock(|| {
+        let CaptureSnapshot {
+            credentials,
+            base_url,
+            api_key,
+        } = snapshot;
         let mut profile = Profile::new(name.clone(), base_url, api_key);
         profile.credentials = credentials;
         save_profile(&profile)?;
@@ -245,6 +217,19 @@ pub(crate) fn capture_current_profile(config: &mut AppConfig) -> Result<()> {
             link_profile_credentials(&name)?;
             config.state.active_profile = Some(name);
         }
+        save_app_state(&config.state)
+    })
+}
+
+pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) -> Result<()> {
+    if from == to || from >= config.profiles.len() || to >= config.profiles.len() {
+        return Ok(());
+    }
+    with_state_lock(|| {
+        let profile = config.profiles.remove(from);
+        config.profiles.insert(to, profile);
+        let name = config.state.profiles.remove(from);
+        config.state.profiles.insert(to, name);
         save_app_state(&config.state)
     })
 }

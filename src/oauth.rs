@@ -69,8 +69,8 @@ fn refresh(refresh_token: &str) -> Result<TokenResponse> {
     serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))
 }
 
-/// Sends a 1-token Haiku message to start the 5-hour usage window. This is
-/// what Claude Code effectively does on launch (just not visibly).
+/// Sends a 1-token Haiku message to start the 5-hour usage window. Mirrors
+/// what Claude Code does silently on launch.
 fn kick(access_token: &str) -> Result<()> {
     let body = serde_json::to_string(&serde_json::json!({
         "model": KICK_MODEL,
@@ -101,8 +101,7 @@ fn now_ms() -> u64 {
 /// Mirrors what Claude Code does silently on launch — minus the kick.
 ///
 /// Profiles without a stored refresh token are skipped. Network or revocation
-/// failures are swallowed per-profile; the cached state stays put for those
-/// and the rest still refresh.
+/// failures are swallowed per-profile; cached state stays put for those.
 ///
 /// Returns the names of profiles whose token rotation succeeded so the caller
 /// can target follow-up work (usage re-fetch, kick) at the same set.
@@ -166,20 +165,16 @@ pub(crate) fn refresh_all(config: &mut AppConfig) -> Vec<String> {
 /// no 5-hour usage window, refreshes its OAuth tokens (rotated pair saved to
 /// disk) and fires a 1-token Haiku ping to start the window.
 ///
-/// Failures (network down, revoked refresh token, ping rejected) are
-/// swallowed: the cached state stays put.
-///
 /// Returns the names of profiles whose timer kick succeeded so the caller
 /// can re-fetch usage and confirm the window now shows up.
 pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) -> Vec<String> {
-    // Claim cooldown slots under the lock BEFORE doing any network work. A
-    // competing clauth process that starts up a moment later will observe
-    // our recorded `last_kick_at` and skip the same profile, so the refresh
-    // token rotates exactly once even when two instances race startup.
+    // Claim cooldown slots under the lock BEFORE any network work. A competing
+    // clauth process that starts up a moment later will observe our recorded
+    // `last_kick_at` and skip the same profile, so the refresh token rotates
+    // exactly once even when two instances race startup.
     //
-    // Holding the lock during the OAuth/messages HTTP round trips would
-    // stall every other instance for seconds, which is why we release the
-    // lock between the claim and the per-profile network work.
+    // Holding the lock during the OAuth/messages HTTP round trips would stall
+    // every other instance for seconds, so we release between claim and work.
     let snapshots: Vec<(String, String)> = match with_state_lock(|| {
         let now = now_ms();
         let mut claimed = Vec::new();
@@ -187,7 +182,6 @@ pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) ->
             if !profile.kick_timer {
                 continue;
             }
-            // Skip profiles whose timer is already running.
             let resets_at = {
                 let usage = store.lock().ok();
                 usage
@@ -199,7 +193,6 @@ pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) ->
             if resets_at.is_some() {
                 continue;
             }
-            // Skip profiles kicked recently — by us or by a concurrent clauth.
             let last = config
                 .state
                 .last_kick_at
@@ -221,7 +214,6 @@ pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) ->
             claimed.push((profile.name.clone(), token));
         }
 
-        // Persist the claim so concurrent instances see us as the owner.
         for (name, _) in &claimed {
             config.state.last_kick_at.insert(name.clone(), now);
         }

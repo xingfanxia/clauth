@@ -11,8 +11,7 @@ keywords = ["claude-code", "account-switch", "cli", "profiles", "anthropic"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-crossterm = "0.29.0"
-inquire = "0.9.4"
+ratatui = "0.29"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
 toml = "1.1.2"

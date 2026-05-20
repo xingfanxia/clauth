@@ -18,11 +18,12 @@ struct Asset {
     name: String,
     browser_download_url: String,
 }
+
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Spawns a background thread that silently checks for and applies an update.
 /// Returns immediately. All errors are discarded — update is best-effort.
-pub fn spawn() {
+pub(crate) fn spawn() {
     if is_cargo_installed() {
         return;
     }
@@ -71,8 +72,6 @@ fn try_update() -> anyhow::Result<()> {
 
 fn download_and_replace(url: &str) -> anyhow::Result<()> {
     let tmp_path = env::temp_dir().join("clauth_update.tmp");
-
-    // Remove any leftover partial file from a previous interrupted attempt.
     let _ = fs::remove_file(&tmp_path);
 
     // into_reader() has no size cap, unlike read_to_vec()'s 10 MB default.
@@ -97,8 +96,8 @@ fn download_and_replace(url: &str) -> anyhow::Result<()> {
         fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))?;
     }
 
-    // self_replace handles in-place replacement on all platforms, including
-    // Windows where you cannot directly overwrite a running executable.
+    // self_replace handles in-place replacement on every platform, including
+    // Windows where you can't directly overwrite a running executable.
     self_replace::self_replace(&tmp_path)?;
     let _ = fs::remove_file(&tmp_path);
 

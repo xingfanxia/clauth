@@ -1,11 +1,14 @@
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
 use crate::lock::with_state_lock;
 use crate::usage::{FetchStatus, UsageInfo};
+
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,21 +37,17 @@ pub(crate) struct Profile {
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
     /// When true, clauth fires a 1-token Haiku ping at startup if this
-    /// profile has no active 5h window. Mirrors what Claude Code does on
-    /// launch; opt-in because it consumes a (tiny) amount of usage.
+    /// profile has no active 5h window. Opt-in because it consumes usage.
     pub(crate) kick_timer: bool,
-    /// Extra env vars to apply to `~/.claude/settings.json`'s `env` block
+    /// Extra env vars merged into `~/.claude/settings.json`'s `env` block
     /// while this profile is active. Cleared on switch to another profile.
     pub(crate) env: BTreeMap<String, String>,
     /// 5-hour utilization percentage at/above which the auto-switch system
     /// will move off this profile. Only takes effect while the profile is a
-    /// member of `AppState::fallback_chain`. None = use default (95%).
+    /// member of `AppState::fallback_chain`. None = use default.
     pub(crate) fallback_threshold: Option<f64>,
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) usage: Option<UsageInfo>,
-    /// Outcome of the most recent usage fetch — drives the account-name
-    /// underline so users can spot stale or missing data at a glance. None
-    /// before the first fetch attempt.
     pub(crate) fetch_status: Option<FetchStatus>,
 }
 
@@ -66,6 +65,10 @@ impl Profile {
             fetch_status: None,
         }
     }
+
+    pub(crate) fn is_oauth(&self) -> bool {
+        self.base_url.is_none()
+    }
 }
 
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
@@ -76,15 +79,10 @@ pub(crate) struct AppState {
     pub(crate) profiles: Vec<String>,
     /// Epoch-ms of the last successful timer kick per profile. Used to skip
     /// rekicking a profile whose previous kick should still be inside its
-    /// 5-hour window, so a silently-failed usage fetch doesn't cause us to
-    /// re-spend the kick on every launch.
+    /// 5-hour window.
     #[serde(default)]
     pub(crate) last_kick_at: HashMap<String, u64>,
     /// Ordered list of profile names participating in the auto-switch chain.
-    /// When the active profile's 5h utilization crosses its
-    /// `fallback_threshold`, clauth walks this list (starting after the
-    /// active entry, wrapping around) and switches to the first member whose
-    /// own threshold has not been crossed.
     #[serde(default)]
     pub(crate) fallback_chain: Vec<String>,
 }
@@ -139,65 +137,6 @@ struct ProfileConfig {
     fallback_threshold: Option<f64>,
 }
 
-/// Hand-rolled TOML writer that keeps every option visible — set values are
-/// uncommented, unset ones stay as commented examples so users can discover
-/// what's available without consulting the README.
-fn render_config_toml(profile: &Profile) -> String {
-    fn toml_str(s: &str) -> String {
-        toml::Value::String(s.to_string()).to_string()
-    }
-
-    let mut out = String::from("# clauth profile configuration\n\n");
-
-    out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
-    out.push_str("# (Pro / Max / Team / Enterprise) profile.\n");
-    match profile.base_url.as_deref() {
-        Some(v) => out.push_str(&format!("base_url = {}\n", toml_str(v))),
-        None => out.push_str("# base_url = \"https://api.anthropic.com\"\n"),
-    }
-    out.push('\n');
-
-    out.push_str("# API key for the endpoint. Only used when base_url is set.\n");
-    match profile.api_key.as_deref() {
-        Some(v) => out.push_str(&format!("api_key = {}\n", toml_str(v))),
-        None => out.push_str("# api_key = \"sk-ant-...\"\n"),
-    }
-    out.push('\n');
-
-    out.push_str("# Fire a 1-token Haiku ping at startup to start the 5-hour usage\n");
-    out.push_str("# window when this profile has no running window. Costs ~0.001¢ per\n");
-    out.push_str("# kick. OAuth profiles only.\n");
-    if profile.kick_timer {
-        out.push_str("kick_timer = true\n");
-    } else {
-        out.push_str("# kick_timer = true\n");
-    }
-    out.push('\n');
-
-    out.push_str("# 5-hour utilization percentage at/above which clauth will auto-switch\n");
-    out.push_str("# off this profile, provided the profile is also a member of the\n");
-    out.push_str("# fallback chain configured in ~/.clauth/profiles.toml. Range 0..=100.\n");
-    match profile.fallback_threshold {
-        Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
-        None => out.push_str("# fallback_threshold = 95.0\n"),
-    }
-    out.push('\n');
-
-    out.push_str("# Extra env vars merged into ~/.claude/settings.json's env block while\n");
-    out.push_str("# this profile is active. Cleared on switch to another profile.\n");
-    if profile.env.is_empty() {
-        out.push_str("# [env]\n");
-        out.push_str("# HTTP_PROXY = \"http://localhost:8080\"\n");
-    } else {
-        out.push_str("[env]\n");
-        for (k, v) in &profile.env {
-            out.push_str(&format!("{k} = {}\n", toml_str(v)));
-        }
-    }
-
-    out
-}
-
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
 pub(crate) fn home_dir() -> Result<PathBuf> {
@@ -206,30 +145,6 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
 
 pub(crate) fn clauth_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".clauth"))
-}
-
-/// Write `content` to `path` via tempfile + rename so concurrent readers in
-/// other instances see either the old file or the new one — never a partial
-/// write. Falls back to a plain write when rename across the temp file fails
-/// (e.g. exotic filesystems).
-pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    if !dir.exists() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let file_name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
-    let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, content)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
 }
 
 pub(crate) fn app_state_mtime() -> Option<SystemTime> {
@@ -255,6 +170,28 @@ fn profile_config_path(name: &str) -> Result<PathBuf> {
 
 fn profile_credentials_path(name: &str) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join("credentials.json"))
+}
+
+/// Write `content` to `path` via tempfile + rename so concurrent readers see
+/// either the old file or the new one, never a partial write.
+pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, content)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 // ── Persistence ───────────────────────────────────────────────────────────────
@@ -360,4 +297,63 @@ pub(crate) fn load_config() -> Result<AppConfig> {
         .map(|n| load_profile(n))
         .collect::<Result<Vec<_>>>()?;
     Ok(AppConfig { state, profiles })
+}
+
+/// Hand-rolled TOML writer that keeps every option visible — set values are
+/// uncommented, unset ones stay as commented examples so users can discover
+/// what's available without consulting the README.
+fn render_config_toml(profile: &Profile) -> String {
+    fn toml_str(s: &str) -> String {
+        toml::Value::String(s.to_string()).to_string()
+    }
+
+    let mut out = String::from("# clauth profile configuration\n\n");
+
+    out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
+    out.push_str("# (Pro / Max / Team / Enterprise) profile.\n");
+    match profile.base_url.as_deref() {
+        Some(v) => out.push_str(&format!("base_url = {}\n", toml_str(v))),
+        None => out.push_str("# base_url = \"https://api.anthropic.com\"\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# API key for the endpoint. Only used when base_url is set.\n");
+    match profile.api_key.as_deref() {
+        Some(v) => out.push_str(&format!("api_key = {}\n", toml_str(v))),
+        None => out.push_str("# api_key = \"sk-ant-...\"\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# Fire a 1-token Haiku ping at startup to start the 5-hour usage\n");
+    out.push_str("# window when this profile has no running window. Costs ~0.001¢ per\n");
+    out.push_str("# kick. OAuth profiles only.\n");
+    if profile.kick_timer {
+        out.push_str("kick_timer = true\n");
+    } else {
+        out.push_str("# kick_timer = true\n");
+    }
+    out.push('\n');
+
+    out.push_str("# 5-hour utilization percentage at/above which clauth will auto-switch\n");
+    out.push_str("# off this profile, provided the profile is also a member of the\n");
+    out.push_str("# fallback chain configured in ~/.clauth/profiles.toml. Range 0..=100.\n");
+    match profile.fallback_threshold {
+        Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
+        None => out.push_str("# fallback_threshold = 95.0\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# Extra env vars merged into ~/.claude/settings.json's env block while\n");
+    out.push_str("# this profile is active. Cleared on switch to another profile.\n");
+    if profile.env.is_empty() {
+        out.push_str("# [env]\n");
+        out.push_str("# HTTP_PROXY = \"http://localhost:8080\"\n");
+    } else {
+        out.push_str("[env]\n");
+        for (k, v) in &profile.env {
+            out.push_str(&format!("{k} = {}\n", toml_str(v)));
+        }
+    }
+
+    out
 }

@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
 use std::path::PathBuf;
+
+use anyhow::{Context, Result};
 
 use crate::lock::with_state_lock;
 use crate::profile::{
@@ -47,7 +48,8 @@ fn create_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<()
         .context("Failed to copy credentials")
 }
 
-/// Symlinks `~/.claude/.credentials.json` → profile's `credentials.json`; copies on Windows without symlink privilege.
+/// Symlinks `~/.claude/.credentials.json` → profile's `credentials.json`;
+/// copies on Windows without symlink privilege.
 pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
@@ -104,7 +106,7 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
     })
 }
 
-/// Patches the `env` object of settings.json with ANTHROPIC_BASE_URL,
+/// Patches `settings.json`'s `env` block with ANTHROPIC_BASE_URL,
 /// ANTHROPIC_AUTH_TOKEN, and the profile's `env` map. Keys in `prev_env_keys`
 /// that the new profile doesn't carry are removed first so stale entries from
 /// the previously active profile don't linger. Every other field is untouched.
@@ -169,8 +171,8 @@ fn apply_profile_to_claude_settings_inner(
         }
     }
 
-    // Apply profile env last so an explicit `ANTHROPIC_*` entry in the
-    // profile's env map wins over the dedicated base_url / api_key fields.
+    // Apply profile env last so an explicit ANTHROPIC_* entry in the profile
+    // env map wins over the dedicated base_url / api_key fields.
     for (k, v) in &profile.env {
         env.insert(k.clone(), v.clone().into());
     }
@@ -197,10 +199,9 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
     })
 }
 
-/// Returns true when both sides carry an OAuth block and either the
-/// access token or refresh token differs. Missing data on either side
-/// returns false — the caller's normal snapshot/skip path is safer than
-/// guessing in the dark.
+/// Returns true when both sides carry an OAuth block and either the access
+/// token or refresh token differs. Missing data on either side returns false
+/// — the caller's normal snapshot/skip path is safer than guessing.
 pub(crate) fn credentials_diverged(
     stored: Option<&ClaudeCredentials>,
     live: Option<&ClaudeCredentials>,
@@ -214,11 +215,11 @@ pub(crate) fn credentials_diverged(
     stored.access_token != live.access_token || stored.refresh_token != live.refresh_token
 }
 
-/// Replaces the symlink at `~/.claude/.credentials.json` with a regular
-/// file containing the same bytes. No-op when the path is already a
-/// regular file or doesn't exist. Called when the user disowns the
-/// active profile so subsequent Claude Code writes don't bleed into
-/// that profile's storage through the symlink.
+/// Replaces the symlink at `~/.claude/.credentials.json` with a regular file
+/// containing the same bytes. No-op when the path is already a regular file
+/// or doesn't exist. Called when the user disowns the active profile so
+/// subsequent Claude Code writes don't bleed into that profile's storage
+/// through the symlink.
 pub(crate) fn detach_credentials_link() -> Result<()> {
     with_state_lock(|| {
         let path = claude_credentials_path()?;

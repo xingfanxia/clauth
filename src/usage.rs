@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,15 +9,26 @@ use serde::{Deserialize, Serialize};
 
 const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
-const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Per-profile in-memory ring buffer of recent 5-hour utilization samples.
+/// Capped to give the sparkline ~30 minutes of context at the 30s refresh
+/// cadence; tail-newest, head-oldest.
+const HISTORY_CAPACITY: usize = 60;
 
 pub(crate) type UsageStore = Arc<Mutex<HashMap<String, UsageInfo>>>;
 pub(crate) type StatusStore = Arc<Mutex<HashMap<String, FetchStatus>>>;
+pub(crate) type HistoryStore = Arc<Mutex<HashMap<String, VecDeque<f64>>>>;
 pub(crate) type TokenList = Arc<Mutex<Vec<(String, String)>>>;
 
-/// Outcome of the most recent usage fetch attempt for a profile. Drives the
-/// account-name underline in the menu so users can tell at a glance whether
-/// the numbers they're looking at are live.
+/// Coarse shared signal observed by the TUI header. Set true while any
+/// background fetch is in flight, so the Claude logo can flash sapphire.
+pub(crate) type ActivityFlag = Arc<AtomicBool>;
+
+/// Epoch-ms of the next scheduled refresh tick. Powers the footer countdown.
+pub(crate) type NextRefreshAt = Arc<AtomicU64>;
+
+/// Outcome of the most recent usage fetch attempt for a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FetchStatus {
     /// Live response from the Anthropic API this tick.
@@ -76,6 +88,18 @@ pub(crate) struct UsageInfo {
     pub(crate) seven_day_sonnet: Option<UsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) extra_usage: Option<ExtraUsage>,
+}
+
+impl UsageInfo {
+    /// Picks the most representative weekly window. Max accounts return
+    /// per-model windows (`seven_day_sonnet`/`seven_day_opus`); Pro returns
+    /// the model-agnostic `seven_day`.
+    pub(crate) fn weekly_window(&self) -> Option<&UsageWindow> {
+        self.seven_day
+            .as_ref()
+            .or(self.seven_day_sonnet.as_ref())
+            .or(self.seven_day_opus.as_ref())
+    }
 }
 
 #[derive(Deserialize)]
@@ -170,8 +194,8 @@ fn fetch(access_token: &str) -> Result<UsageInfo> {
     let raw: RawUsage =
         serde_json::from_str(&usage_text).map_err(crate::ureq_error::into_anyhow)?;
 
-    // Profile is best-effort: a stale token may 401 on /profile while /usage still
-    // serves cached numbers. We don't want a profile failure to drop usage data.
+    // Profile is best-effort: a stale token may 401 on /profile while /usage
+    // still serves cached numbers. A profile failure shouldn't drop usage.
     let plan = get_json(&agent, PROFILE_ENDPOINT, access_token)
         .ok()
         .and_then(|text| serde_json::from_str::<RawProfile>(&text).ok())
@@ -207,22 +231,40 @@ fn cache_path(profile_name: &str) -> Option<PathBuf> {
     })
 }
 
+fn push_history(history: &HistoryStore, name: &str, info: &UsageInfo) {
+    let Some(util) = info.five_hour.as_ref().map(|w| w.utilization) else {
+        return;
+    };
+    let Ok(mut map) = history.lock() else {
+        return;
+    };
+    let buf = map.entry(name.to_string()).or_default();
+    if buf.len() >= HISTORY_CAPACITY {
+        buf.pop_front();
+    }
+    buf.push_back(util);
+}
+
 /// Fetches usage for every (name, token) pair in parallel and writes results
 /// into the shared stores. Blocks until all fetches complete.
 pub(crate) fn fetch_all_into(
     tokens: &[(String, String)],
     store: &UsageStore,
     status: &StatusStore,
+    history: &HistoryStore,
+    activity: &ActivityFlag,
 ) {
+    if tokens.is_empty() {
+        return;
+    }
+    activity.store(true, Ordering::Relaxed);
+
     let handles: Vec<_> = tokens
         .iter()
         .map(|(name, token)| {
             let name = name.clone();
             let token = token.clone();
-            std::thread::spawn(move || {
-                let result = fetch_cached(&name, &token);
-                (name, result)
-            })
+            std::thread::spawn(move || (name.clone(), fetch_cached(&name, &token)))
         })
         .collect();
 
@@ -230,41 +272,52 @@ pub(crate) fn fetch_all_into(
         let Ok((name, (info, fetch_status))) = h.join() else {
             continue;
         };
-        if let Some(info) = info
-            && let Ok(mut s) = store.lock()
-        {
-            s.insert(name.clone(), info);
+        if let Some(info) = &info {
+            push_history(history, &name, info);
+            if let Ok(mut s) = store.lock() {
+                s.insert(name.clone(), info.clone());
+            }
         }
         if let Ok(mut st) = status.lock() {
             st.insert(name, fetch_status);
         }
     }
+
+    activity.store(false, Ordering::Relaxed);
 }
 
 /// Spawns a background thread that re-fetches usage for the current token
 /// list every 30s and writes results into the shared stores. The token list
 /// is read fresh each tick so renames and new profiles are picked up.
-pub(crate) fn spawn_refresher(tokens: TokenList, store: UsageStore, status: StatusStore) {
+pub(crate) fn spawn_refresher(
+    tokens: TokenList,
+    store: UsageStore,
+    status: StatusStore,
+    history: HistoryStore,
+    activity: ActivityFlag,
+    next_at: NextRefreshAt,
+) {
     std::thread::spawn(move || {
         loop {
+            next_at.store(
+                now_ms() + REFRESH_INTERVAL.as_millis() as u64,
+                Ordering::Relaxed,
+            );
             std::thread::sleep(REFRESH_INTERVAL);
             let snapshot = match tokens.lock() {
                 Ok(t) => t.clone(),
                 Err(_) => continue,
             };
-            for (name, token) in &snapshot {
-                let (info, fetch_status) = fetch_cached(name, token);
-                if let Some(info) = info
-                    && let Ok(mut s) = store.lock()
-                {
-                    s.insert(name.clone(), info);
-                }
-                if let Ok(mut st) = status.lock() {
-                    st.insert(name.clone(), fetch_status);
-                }
-            }
+            fetch_all_into(&snapshot, &store, &status, &history, &activity);
         }
     });
+}
+
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ── Time helpers ──────────────────────────────────────────────────────────────
@@ -320,10 +373,27 @@ pub(crate) fn iso_to_epoch_secs(s: &str) -> Option<i64> {
     Some(days * 86400 + hour * 3600 + minute * 60 + second - tz_offset_secs)
 }
 
-// Returns i64 (not u64) because callers subtract it to get signed deltas.
 pub(crate) fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Formats a duration in seconds as a tight `Nd Nh`, `Nh Nm`, or `Nm` string.
+/// Returns `now` for zero or negative.
+pub(crate) fn humanize_duration(secs: i64) -> String {
+    if secs <= 0 {
+        return "now".to_string();
+    }
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    if days > 0 {
+        format!("{}d {}h", days, hours % 24)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, mins % 60)
+    } else {
+        format!("{}m", mins.max(1))
+    }
 }

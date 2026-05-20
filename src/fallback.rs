@@ -13,8 +13,6 @@ pub(crate) fn threshold_for(profile: &Profile) -> f64 {
 }
 
 /// True when the profile's 5h utilization has crossed its own threshold.
-/// Used to decide whether to switch *away* from the active profile. A
-/// profile with no fetched 5-hour window can't have crossed anything.
 fn is_exhausted(profile: &Profile) -> bool {
     let Some(window) = profile.usage.as_ref().and_then(|u| u.five_hour.as_ref()) else {
         return false;
@@ -23,18 +21,14 @@ fn is_exhausted(profile: &Profile) -> bool {
 }
 
 /// Picks the next chain member to switch to, starting one slot after the
-/// active profile and wrapping. Returns None when nothing in the chain is a
-/// viable destination.
+/// active profile and wrapping. Returns None when nothing is viable.
 ///
 /// Two passes:
-///   1. Any member with real headroom (5h utilization below its own
-///      threshold, or no usage data fetched yet).
+///   1. Any member with real headroom (5h utilization below threshold, or no
+///      usage data fetched yet).
 ///   2. As a last resort, a member with threshold == 100% — accepted even
-///      while it's at 100%. Claude Code will show its own *"out of 5h
-///      limit"* message on arrival.
-///
-/// The second pass only runs when the first found nothing, so a capped
-/// 100% slot is never preferred over a profile that still has budget.
+///      while it's at 100%. Claude Code will show its own "out of 5h limit"
+///      message on arrival.
 fn next_target(config: &AppConfig) -> Option<String> {
     let active = config.state.active_profile.as_deref()?;
     let chain = &config.state.fallback_chain;
