@@ -297,17 +297,6 @@ fn draw_profile_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Profi
         .find(&state.name)
         .map(|p| p.auto_start)
         .unwrap_or(false);
-    let in_chain = app
-        .config
-        .state
-        .fallback_chain
-        .iter()
-        .any(|n| n == &state.name);
-    let current_threshold = app
-        .config
-        .find(&state.name)
-        .map(threshold_for)
-        .unwrap_or(DEFAULT_THRESHOLD);
 
     let mut lines: Vec<Line<'_>> = options
         .iter()
@@ -318,7 +307,7 @@ fn draw_profile_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Profi
             } else {
                 Span::raw("  ")
             };
-            let label = profile_menu_label(*action, auto_on, in_chain, current_threshold);
+            let label = profile_menu_label(*action, auto_on);
             let style = match action {
                 ProfileMenuAction::Delete => theme::danger(),
                 ProfileMenuAction::Back => theme::faint(),
@@ -337,12 +326,7 @@ fn draw_profile_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Profi
     frame.render_widget(para, inner);
 }
 
-fn profile_menu_label(
-    action: ProfileMenuAction,
-    auto_on: bool,
-    in_chain: bool,
-    threshold: f64,
-) -> String {
+fn profile_menu_label(action: ProfileMenuAction, auto_on: bool) -> String {
     match action {
         ProfileMenuAction::Switch => "Switch to this profile".to_string(),
         ProfileMenuAction::Details => "Open details".to_string(),
@@ -355,15 +339,6 @@ fn profile_menu_label(
                 "Auto-start usage: off  \u{2192}  turn on".to_string()
             }
         }
-        ProfileMenuAction::AddToChain => "Add to fallback chain".to_string(),
-        ProfileMenuAction::SetThreshold => {
-            if in_chain {
-                format!("Set threshold (current: {threshold:.0}%)")
-            } else {
-                "Set threshold".to_string()
-            }
-        }
-        ProfileMenuAction::RemoveFromChain => "Remove from fallback chain".to_string(),
         ProfileMenuAction::Delete => "Delete profile".to_string(),
         ProfileMenuAction::Back => "\u{2190} Back".to_string(),
     }

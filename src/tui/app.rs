@@ -211,9 +211,6 @@ pub(crate) enum ProfileMenuAction {
     Edit,
     Rename,
     ToggleAutoStart,
-    AddToChain,
-    SetThreshold,
-    RemoveFromChain,
     Delete,
     Back,
 }
@@ -970,7 +967,7 @@ fn handle_profile_detail_key(app: &mut App, key: KeyEvent) {
         return;
     };
     match key.code {
-        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
+        KeyCode::Esc | KeyCode::Char('q') => {
             app.screen = Screen::Overview;
         }
         // Single configuration entry point — Enter and `m` both open the
@@ -1020,13 +1017,13 @@ fn toggle_auto_start(app: &mut App, name: &str) {
     }
 }
 
-/// Options shown in the per-profile actions menu. Context-sensitive — entries
-/// only appear when meaningful (e.g. SetThreshold only when in chain).
+/// Options shown in the per-profile actions menu. Chain composition lives
+/// in the chain screen — not here — so this menu stays focused on
+/// profile-level concerns.
 pub(crate) fn profile_menu_options(app: &App, name: &str) -> Vec<ProfileMenuAction> {
-    let mut out = Vec::with_capacity(10);
+    let mut out = Vec::with_capacity(7);
     let profile = app.config.find(name);
     let is_active = app.config.is_active(name);
-    let in_chain = app.config.state.fallback_chain.iter().any(|n| n == name);
     let is_oauth = profile.map(|p| p.is_oauth()).unwrap_or(false);
 
     if !is_active {
@@ -1037,12 +1034,6 @@ pub(crate) fn profile_menu_options(app: &App, name: &str) -> Vec<ProfileMenuActi
     out.push(ProfileMenuAction::Rename);
     if is_oauth {
         out.push(ProfileMenuAction::ToggleAutoStart);
-    }
-    if in_chain {
-        out.push(ProfileMenuAction::SetThreshold);
-        out.push(ProfileMenuAction::RemoveFromChain);
-    } else {
-        out.push(ProfileMenuAction::AddToChain);
     }
     out.push(ProfileMenuAction::Delete);
     out.push(ProfileMenuAction::Back);
@@ -1110,43 +1101,6 @@ fn run_profile_menu_action(app: &mut App, name: &str, action: ProfileMenuAction)
         ProfileMenuAction::ToggleAutoStart => {
             // Stay in the menu so the user can flip several settings.
             toggle_auto_start(app, name);
-        }
-        ProfileMenuAction::AddToChain => {
-            if let Some(profile) = app.config.find_mut(name)
-                && profile.fallback_threshold.is_none()
-            {
-                profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
-                let _ = save_profile(profile);
-            }
-            if !app.config.state.fallback_chain.iter().any(|n| n == name) {
-                app.config.state.fallback_chain.push(name.to_string());
-                let _ = save_app_state(&app.config.state);
-                app.toast(
-                    ToastKind::Success,
-                    format!("added '{name}' to fallback chain"),
-                );
-            }
-        }
-        ProfileMenuAction::SetThreshold => {
-            let current = app
-                .config
-                .find(name)
-                .map(threshold_for)
-                .unwrap_or(DEFAULT_THRESHOLD);
-            app.modals.pop();
-            app.modals.push(Modal::ChainThreshold(ChainThresholdForm {
-                name: name.to_string(),
-                input: InputState::new(&format!("{current:.0}")),
-            }));
-        }
-        ProfileMenuAction::RemoveFromChain => {
-            let owned = name.to_string();
-            app.config.state.fallback_chain.retain(|n| n != &owned);
-            let _ = save_app_state(&app.config.state);
-            app.toast(
-                ToastKind::Info,
-                format!("removed '{owned}' from fallback chain"),
-            );
         }
         ProfileMenuAction::Delete => {
             app.modals.pop();
