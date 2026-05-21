@@ -227,20 +227,13 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
         Err(_) => return Vec::new(),
     };
 
+    // Refresh and kick are reported separately. Anthropic rotates the refresh
+    // token on every successful refresh, so the new pair MUST be persisted
+    // before the kick is attempted — otherwise a kick-only failure leaves the
+    // stored refresh token permanently invalid.
     let handles: Vec<_> = snapshots
         .into_iter()
-        .map(|(name, rt)| {
-            std::thread::spawn(move || {
-                let tok = match refresh(&rt) {
-                    Ok(t) => t,
-                    Err(e) => return (name, Err(e)),
-                };
-                if let Err(e) = kick(&tok.access_token) {
-                    return (name, Err(e));
-                }
-                (name, Ok(tok))
-            })
-        })
+        .map(|(name, rt)| std::thread::spawn(move || (name, refresh(&rt))))
         .collect();
 
     let mut kicked = Vec::new();
@@ -248,26 +241,32 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
         let Ok((name, Ok(tok))) = h.join() else {
             continue;
         };
-        let succeeded = with_state_lock(|| {
+        let saved_access = with_state_lock(|| {
             let Some(profile) = config.find_mut(&name) else {
-                return Ok::<_, anyhow::Error>(false);
+                return Ok::<_, anyhow::Error>(None);
             };
             let Some(creds) = profile.credentials.as_mut() else {
-                return Ok(false);
+                return Ok(None);
             };
             let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
-                return Ok(false);
+                return Ok(None);
             };
-            oauth.access_token = tok.access_token;
+            oauth.access_token = tok.access_token.clone();
             oauth.refresh_token = Some(tok.refresh_token);
             oauth.expires_at = Some((now_ms() + tok.expires_in * 1000) as i64);
             if let Some(scope) = tok.scope {
                 oauth.scopes = Some(scope.split_whitespace().map(String::from).collect());
             }
-            Ok(save_profile(profile).is_ok())
+            if save_profile(profile).is_err() {
+                return Ok(None);
+            }
+            Ok(Some(tok.access_token))
         })
-        .unwrap_or(false);
-        if succeeded {
+        .unwrap_or(None);
+        let Some(access_token) = saved_access else {
+            continue;
+        };
+        if kick(&access_token).is_ok() {
             kicked.push(name);
         }
     }
