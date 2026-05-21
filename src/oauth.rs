@@ -1,11 +1,11 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Result;
 use serde::Deserialize;
 
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, save_app_state, save_profile};
-use crate::usage::UsageStore;
+use crate::usage::{UsageStore, now_ms};
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup
 /// to mint a fresh access token from the stored refresh token.
@@ -89,13 +89,6 @@ fn kick(access_token: &str) -> Result<()> {
         .send(&body)
         .map_err(crate::ureq_error::into_anyhow)?;
     Ok(())
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Refreshes every profile's OAuth token pair (rotated pair saved to disk).
