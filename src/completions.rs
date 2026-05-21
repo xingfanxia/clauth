@@ -5,9 +5,14 @@ use anyhow::{Context, Result, bail};
 use crate::profile::{home_dir, load_config};
 
 const BASH: &str = r#"_clauth() {
-    local cur
+    local cur prev
     cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
     if [ "$COMP_CWORD" -eq 1 ]; then
+        local profiles
+        profiles=$(clauth __complete 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} start" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "start" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
@@ -23,6 +28,11 @@ _clauth() {
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
+        _values 'subcommand' 'start[launch claude with an isolated profile]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == start ]]; then
+        local -a profiles
+        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        _describe 'profile' profiles
     fi
 }
 _clauth "$@"
@@ -33,6 +43,8 @@ const FISH: &str = r#"function __clauth_profiles
 end
 complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with an isolated profile"
+complete -c clauth -f -n "__fish_seen_subcommand_from start" -a "(__clauth_profiles)" -d Profile
 "#;
 
 pub(crate) fn print_script(shell: &str) -> Result<()> {

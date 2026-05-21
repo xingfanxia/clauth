@@ -4,6 +4,7 @@ mod completions;
 mod fallback;
 mod lock;
 mod oauth;
+mod start;
 mod platform;
 mod profile;
 mod tui;
@@ -39,6 +40,23 @@ fn main() -> Result<()> {
             println!("clauth {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        [cmd] if cmd == "start" => {
+            anyhow::bail!("usage: clauth start <profile> [claude args...]");
+        }
+        [cmd, name, rest @ ..] if cmd == "start" => {
+            platform::init();
+            let config = load_config()?;
+            let canonical = config
+                .names()
+                .into_iter()
+                .find(|n| n.eq_ignore_ascii_case(name))
+                .map(str::to_string);
+            let Some(canonical) = canonical else {
+                let available = config.names().join(", ");
+                anyhow::bail!("profile '{name}' not found\navailable: {available}");
+            };
+            return start::run(&config, &canonical, rest);
+        }
         [name] => {
             platform::init();
             let mut config = load_config()?;
@@ -61,7 +79,7 @@ fn main() -> Result<()> {
         }
         [] => {}
         _ => anyhow::bail!(
-            "usage: clauth [profile] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
+            "usage: clauth [profile] | clauth start <profile> [claude args...] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
         ),
     }
 
@@ -78,6 +96,8 @@ fn print_help() {
          Usage:\n  \
            clauth                          launch the TUI\n  \
            clauth <profile>                switch to profile by name and exit\n  \
+           clauth start <profile> [args]   launch claude with that profile's settings\n                                  \
+         in an isolated CLAUDE_CONFIG_DIR; extra args go to claude\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \
            clauth completions install [shell]\n                                  \
          install completions into the user's shell rc\n  \

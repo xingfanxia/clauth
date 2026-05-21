@@ -79,6 +79,7 @@ dependencies = [
  "self-replace",
  "serde",
  "serde_json",
+ "tempfile",
  "toml",
  "ureq",
 ]

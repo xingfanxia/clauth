@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -27,12 +27,12 @@ pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
 }
 
 #[cfg(unix)]
-fn create_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     std::os::unix::fs::symlink(target, link).context("Failed to create credential symlink")
 }
 
 #[cfg(windows)]
-fn create_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     match std::os::windows::fs::symlink_file(target, link) {
         Ok(()) => Ok(()),
         Err(_) => std::fs::copy(target, link)
@@ -42,7 +42,7 @@ fn create_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<()
 }
 
 #[cfg(not(any(unix, windows)))]
-fn create_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     std::fs::copy(target, link)
         .map(|_| ())
         .context("Failed to copy credentials")
@@ -131,8 +131,25 @@ fn apply_profile_to_claude_settings_inner(
         return Ok(());
     }
 
-    let mut settings: serde_json::Value = if path.exists() {
-        let content = std::fs::read_to_string(&path).context("Failed to read settings.json")?;
+    let content = build_claude_settings_json(&path, profile, prev_env_keys)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write(&path, content).context("Failed to write settings.json")
+}
+
+/// Merges `base_path`'s settings.json (or `{}` when missing) with the profile's
+/// endpoint keys and env overlay. `prev_env_keys` lists env keys to strip
+/// before applying the new profile — used by the switch path to clear the
+/// previously active profile's custom env. `start` passes `&[]` so existing
+/// keys in the file stay untouched.
+pub(crate) fn build_claude_settings_json(
+    base_path: &Path,
+    profile: &Profile,
+    prev_env_keys: &[String],
+) -> Result<String> {
+    let mut settings: serde_json::Value = if base_path.exists() {
+        let content = std::fs::read_to_string(base_path).context("Failed to read settings.json")?;
         serde_json::from_str(&content).context("Failed to parse settings.json")?
     } else {
         serde_json::json!({})
@@ -146,8 +163,6 @@ fn apply_profile_to_claude_settings_inner(
         .as_object_mut()
         .context("settings.json `env` is not an object")?;
 
-    // Drop prior-profile keys the new profile doesn't carry over. Keys still
-    // present in `profile.env` get re-inserted below with the new value.
     for key in prev_env_keys {
         if !profile.env.contains_key(key) {
             env.remove(key);
@@ -177,11 +192,7 @@ fn apply_profile_to_claude_settings_inner(
         env.insert(k.clone(), v.clone().into());
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    atomic_write(&path, serde_json::to_string_pretty(&settings)?)
-        .context("Failed to write settings.json")
+    serde_json::to_string_pretty(&settings).context("Failed to serialize settings.json")
 }
 
 /// Reads the live .credentials.json and saves it to the active profile.
