@@ -117,14 +117,14 @@ pub(super) fn window_summary_parts(
         let reset = format_reset(window)
             .map(|r| format!(" ({r})"))
             .unwrap_or_default();
-        format!("{} {:>3.0}%{reset}", bar_string_with_cells(pct, 10), pct)
+        format!("{} {:>2.0}%{reset}", bar_string_with_cells(pct, 10), pct)
     } else if include_bar && width >= 17 {
-        format!("{} {:>3.0}%", bar_string_with_cells(pct, 10), pct)
+        format!("{} {:>2.0}%", bar_string_with_cells(pct, 10), pct)
     } else if include_bar && width >= 12 {
         let bar_cells = width.saturating_sub(5).clamp(3, 7);
-        format!("{}{:>3.0}", bar_string_with_cells(pct, bar_cells), pct)
+        format!("{}{:>2.0}", bar_string_with_cells(pct, bar_cells), pct)
     } else {
-        format!("{pct:>3.0}%")
+        format!("{pct:>2.0}%")
     };
     (text, Style::default().fg(color))
 }
