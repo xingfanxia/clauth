@@ -10,8 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use super::super::app::{
     App, ChainAction, ChainAddState, ChainItemMenuState, ChainThresholdForm, ConfirmAction,
     ConfirmState, EditProfileForm, EndpointField, InputState, Modal, NewProfileField,
-    NewProfileForm, ProfileMenuAction, ProfileMenuState, RenameForm, Screen, SwitchConfirmState,
-    profile_menu_options,
+    NewProfileForm, ProfileMenuAction, ProfileMenuState, RenameForm, Screen, profile_menu_options,
 };
 use super::super::theme;
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
@@ -27,7 +26,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         }
         Modal::ReconcileCaptureAsk { choice } => draw_reconcile_capture(frame, area, *choice),
         Modal::CaptureName(form) => draw_capture_name(frame, area, form.input.value.as_str()),
-        Modal::SwitchConfirm(state) => draw_switch_confirm(frame, area, state),
         Modal::ProfileMenu(state) => draw_profile_menu(frame, area, app, state),
         Modal::ChainItemMenu(state) => draw_chain_item_menu(frame, area, app, state),
         Modal::ChainAdd(state) => draw_chain_add(frame, area, state),
@@ -284,32 +282,6 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
     frame.render_widget(para, inner);
 }
 
-fn draw_switch_confirm(frame: &mut Frame<'_>, area: Rect, state: &SwitchConfirmState) {
-    let rect = centered(area, 56, 9);
-    frame.render_widget(Clear, rect);
-    let block = modal_block("switch profile");
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("Switch to ", theme::dim()),
-            Span::styled(format!("'{}'", state.name), theme::accent()),
-            Span::styled("?", theme::dim()),
-        ]),
-        Line::from(""),
-        yes_no_line(state.choice),
-        Line::from(""),
-        modal_footer_hints(&[
-            ("\u{2190} \u{2192}", "choose"),
-            ("y / n", "choose"),
-            ("\u{23ce}", "apply"),
-        ]),
-    ];
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
-    frame.render_widget(para, inner);
-}
-
 fn draw_profile_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &ProfileMenuState) {
     let options = profile_menu_options(app, &state.name);
     let body_height = options.len() as u16 + 4;
@@ -538,9 +510,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             (
                 "ACCOUNTS",
                 &[
-                    ("\u{23ce}", "switch to highlighted profile (asks)"),
-                    ("d", "open profile details"),
-                    ("m", "open per-profile actions menu"),
+                    (
+                        "\u{23ce} / m",
+                        "open per-profile menu (every action lives here)",
+                    ),
                     ("Shift+j / Shift+k", "reorder profile up / down"),
                 ][..],
             ),

@@ -195,13 +195,6 @@ pub(crate) struct ChainItemMenuState {
     pub(crate) cursor: usize,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct SwitchConfirmState {
-    pub(crate) name: String,
-    /// false = stay (no), true = switch (yes). Defaults to yes on open.
-    pub(crate) choice: bool,
-}
-
 /// Per-profile actions popup. Cursor is into the list returned by
 /// `profile_menu_options` so disabled / context-sensitive entries shift
 /// without the caller having to remember which row is which.
@@ -253,7 +246,6 @@ pub(crate) enum Modal {
         choice: bool,
     },
     CaptureName(CaptureNameForm),
-    SwitchConfirm(SwitchConfirmState),
     ProfileMenu(ProfileMenuState),
     ChainItemMenu(ChainItemMenuState),
     ChainAdd(ChainAddState),
@@ -702,9 +694,7 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
                 };
             }
         }
-        KeyCode::Enter => activate_main_item(app),
-        KeyCode::Char('d') => open_detail_for_main_cursor(app),
-        KeyCode::Char('m') => open_profile_menu_for_main_cursor(app),
+        KeyCode::Enter | KeyCode::Char('m') => activate_main_item(app),
         KeyCode::Char('q') | KeyCode::Esc => {
             if app.filter.is_some() {
                 app.filter = None;
@@ -735,20 +725,11 @@ fn activate_main_item(app: &mut App) {
     };
     match item {
         MainItemKind::Profile(idx) => {
-            // Enter on a profile asks before switching. 'd' opens detail.
             let Some(name) = app.config.profiles.get(idx).map(|p| p.name.clone()) else {
                 return;
             };
-            if app.config.is_active(&name) {
-                // Already active — Enter falls through to detail view so the
-                // user can still inspect / configure without an empty prompt.
-                app.screen = Screen::ProfileDetail { profile_index: idx };
-                return;
-            }
-            app.modals.push(Modal::SwitchConfirm(SwitchConfirmState {
-                name,
-                choice: true,
-            }));
+            app.modals
+                .push(Modal::ProfileMenu(ProfileMenuState { name, cursor: 0 }));
         }
         MainItemKind::NewProfile => open_new_profile(app),
         MainItemKind::CaptureCredentials => begin_capture(app),
@@ -757,23 +738,6 @@ fn activate_main_item(app: &mut App) {
             app.chain_cursor = 0;
         }
     }
-}
-
-fn open_detail_for_main_cursor(app: &mut App) {
-    if let Some(MainItemKind::Profile(idx)) = app.current_main_item() {
-        app.screen = Screen::ProfileDetail { profile_index: idx };
-    }
-}
-
-fn open_profile_menu_for_main_cursor(app: &mut App) {
-    let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
-        return;
-    };
-    let Some(name) = app.config.profiles.get(idx).map(|p| p.name.clone()) else {
-        return;
-    };
-    app.modals
-        .push(Modal::ProfileMenu(ProfileMenuState { name, cursor: 0 }));
 }
 
 fn reorder_main_cursor(app: &mut App, delta: i32) {
@@ -985,7 +949,6 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::ReconcileKeep { .. } => handle_reconcile_keep_key(app, key),
         Modal::ReconcileCaptureAsk { .. } => handle_reconcile_capture_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
-        Modal::SwitchConfirm(_) => handle_switch_confirm_key(app, key),
         Modal::ProfileMenu(_) => handle_profile_menu_key(app, key),
         Modal::ChainItemMenu(_) => handle_chain_item_menu_key(app, key),
         Modal::ChainAdd(_) => handle_chain_add_key(app, key),
@@ -1057,31 +1020,6 @@ fn toggle_auto_start(app: &mut App, name: &str) {
     }
 }
 
-fn handle_switch_confirm_key(app: &mut App, key: KeyEvent) {
-    let Some(Modal::SwitchConfirm(state)) = app.modals.last_mut() else {
-        return;
-    };
-    match key.code {
-        KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => {
-            state.choice = !state.choice;
-        }
-        KeyCode::Char('y') => state.choice = true,
-        KeyCode::Char('n') => state.choice = false,
-        KeyCode::Esc => {
-            app.modals.pop();
-        }
-        KeyCode::Enter | KeyCode::Char(' ') => {
-            let go = state.choice;
-            let name = state.name.clone();
-            app.modals.pop();
-            if go {
-                perform_switch(app, &name);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Options shown in the per-profile actions menu. Context-sensitive — entries
 /// only appear when meaningful (e.g. SetThreshold only when in chain).
 pub(crate) fn profile_menu_options(app: &App, name: &str) -> Vec<ProfileMenuAction> {
@@ -1149,10 +1087,7 @@ fn run_profile_menu_action(app: &mut App, name: &str, action: ProfileMenuAction)
     match action {
         ProfileMenuAction::Switch => {
             app.modals.pop();
-            app.modals.push(Modal::SwitchConfirm(SwitchConfirmState {
-                name: name.to_string(),
-                choice: true,
-            }));
+            perform_switch(app, name);
         }
         ProfileMenuAction::Details => {
             let idx = app.config.profiles.iter().position(|p| p.name == name);

@@ -13,13 +13,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Footer stays minimal. The per-profile menu (m) is the canonical place
     // for the rest; the help modal (?) lists every binding.
     let hints: &[(&str, &str)] = match app.screen {
-        Screen::Overview => &[
-            ("⏎", "switch"),
-            ("d", "details"),
-            ("m", "menu"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
+        Screen::Overview => &[("⏎", "menu"), ("?", "help"), ("q", "quit")],
         Screen::Chain => &[("⏎", "open"), ("⎋", "back"), ("?", "help")],
         Screen::ProfileDetail { .. } => &[("⏎", "menu"), ("⎋", "back"), ("?", "help")],
     };
