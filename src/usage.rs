@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -11,14 +11,8 @@ const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
 pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Per-profile in-memory ring buffer of recent 5-hour utilization samples.
-/// Capped to give the sparkline ~30 minutes of context at the 30s refresh
-/// cadence; tail-newest, head-oldest.
-const HISTORY_CAPACITY: usize = 60;
-
 pub(crate) type UsageStore = Arc<Mutex<HashMap<String, UsageInfo>>>;
 pub(crate) type StatusStore = Arc<Mutex<HashMap<String, FetchStatus>>>;
-pub(crate) type HistoryStore = Arc<Mutex<HashMap<String, VecDeque<f64>>>>;
 pub(crate) type TokenList = Arc<Mutex<Vec<(String, String)>>>;
 
 /// Coarse shared signal observed by the TUI header. Set true while any
@@ -229,27 +223,12 @@ fn cache_path(profile_name: &str) -> Option<PathBuf> {
     })
 }
 
-fn push_history(history: &HistoryStore, name: &str, info: &UsageInfo) {
-    let Some(util) = info.five_hour.as_ref().map(|w| w.utilization) else {
-        return;
-    };
-    let Ok(mut map) = history.lock() else {
-        return;
-    };
-    let buf = map.entry(name.to_string()).or_default();
-    if buf.len() >= HISTORY_CAPACITY {
-        buf.pop_front();
-    }
-    buf.push_back(util);
-}
-
 /// Fetches usage for every (name, token) pair in parallel and writes results
 /// into the shared stores. Blocks until all fetches complete.
 pub(crate) fn fetch_all_into(
     tokens: &[(String, String)],
     store: &UsageStore,
     status: &StatusStore,
-    history: &HistoryStore,
     activity: &ActivityFlag,
 ) {
     if tokens.is_empty() {
@@ -270,11 +249,10 @@ pub(crate) fn fetch_all_into(
         let Ok((name, (info, fetch_status))) = h.join() else {
             continue;
         };
-        if let Some(info) = &info {
-            push_history(history, &name, info);
-            if let Ok(mut s) = store.lock() {
-                s.insert(name.clone(), info.clone());
-            }
+        if let Some(info) = &info
+            && let Ok(mut s) = store.lock()
+        {
+            s.insert(name.clone(), info.clone());
         }
         if let Ok(mut st) = status.lock() {
             st.insert(name, fetch_status);
@@ -291,7 +269,6 @@ pub(crate) fn spawn_refresher(
     tokens: TokenList,
     store: UsageStore,
     status: StatusStore,
-    history: HistoryStore,
     activity: ActivityFlag,
     next_at: NextRefreshAt,
 ) {
@@ -306,7 +283,7 @@ pub(crate) fn spawn_refresher(
                 Ok(t) => t.clone(),
                 Err(_) => continue,
             };
-            fetch_all_into(&snapshot, &store, &status, &history, &activity);
+            fetch_all_into(&snapshot, &store, &status, &activity);
         }
     });
 }

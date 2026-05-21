@@ -32,8 +32,8 @@ use crate::profile::{
     AppConfig, Profile, app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::usage::{
-    ActivityFlag, HistoryStore, NextRefreshAt, REFRESH_INTERVAL, StatusStore, TokenList,
-    UsageStore, fetch_all_into, now_ms, spawn_refresher,
+    ActivityFlag, NextRefreshAt, REFRESH_INTERVAL, StatusStore, TokenList, UsageStore,
+    fetch_all_into, now_ms, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -301,7 +301,6 @@ pub(crate) struct App {
 
     pub(crate) usage_store: UsageStore,
     pub(crate) usage_status: StatusStore,
-    pub(crate) usage_history: HistoryStore,
     pub(crate) usage_tokens: TokenList,
     pub(crate) activity: ActivityFlag,
     pub(crate) next_refresh_at: NextRefreshAt,
@@ -331,7 +330,6 @@ impl App {
     pub(crate) fn new(config: AppConfig) -> Self {
         let usage_store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
         let usage_status: StatusStore = Arc::new(Mutex::new(HashMap::new()));
-        let usage_history: HistoryStore = Arc::new(Mutex::new(HashMap::new()));
         let usage_tokens: TokenList = Arc::new(Mutex::new(collect_tokens(&config.profiles)));
         let activity: ActivityFlag = Arc::new(AtomicBool::new(false));
         let next_refresh_at: NextRefreshAt = Arc::new(AtomicU64::new(
@@ -342,7 +340,6 @@ impl App {
             config,
             usage_store,
             usage_status,
-            usage_history,
             usage_tokens,
             activity,
             next_refresh_at,
@@ -385,7 +382,6 @@ impl App {
             &snapshot,
             &self.usage_store,
             &self.usage_status,
-            &self.usage_history,
             &self.activity,
         );
 
@@ -399,7 +395,6 @@ impl App {
                 &retry,
                 &self.usage_store,
                 &self.usage_status,
-                &self.usage_history,
                 &self.activity,
             );
             *self
@@ -412,7 +407,6 @@ impl App {
             Arc::clone(&self.usage_tokens),
             Arc::clone(&self.usage_store),
             Arc::clone(&self.usage_status),
-            Arc::clone(&self.usage_history),
             Arc::clone(&self.activity),
             Arc::clone(&self.next_refresh_at),
         );
@@ -473,10 +467,9 @@ impl App {
         );
         let store = Arc::clone(&self.usage_store);
         let status = Arc::clone(&self.usage_status);
-        let history = Arc::clone(&self.usage_history);
         let activity = Arc::clone(&self.activity);
         std::thread::spawn(move || {
-            fetch_all_into(&snapshot, &store, &status, &history, &activity);
+            fetch_all_into(&snapshot, &store, &status, &activity);
         });
     }
 
