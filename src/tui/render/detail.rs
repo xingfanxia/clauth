@@ -72,6 +72,21 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, profile_index: 
     lines.push(Line::from(""));
 
     // fallback
+    // config — OAuth-only flags. Hidden for endpoint profiles where the
+    // setting has no effect.
+    if profile.is_oauth() {
+        lines.push(detail_section_header("CONFIG"));
+        let (auto_state, auto_style) = if profile.auto_start {
+            ("on", theme::accent())
+        } else {
+            ("off", theme::faint())
+        };
+        lines.push(detail_kv("auto-start", auto_state, auto_style));
+        lines.push(Line::from(""));
+        lines.push(detail_separator(inner_w));
+        lines.push(Line::from(""));
+    }
+
     lines.push(detail_section_header("FALLBACK"));
     let chain_pos = app
         .config

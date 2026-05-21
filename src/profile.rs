@@ -36,9 +36,10 @@ pub(crate) struct Profile {
     pub(crate) name: String,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
-    /// When true, clauth fires a 1-token Haiku ping at startup if this
-    /// profile has no active 5h window. Opt-in because it consumes usage.
-    pub(crate) kick_timer: bool,
+    /// When true, clauth fires a 1-token Haiku ping at startup and on every
+    /// 30s refresh tick if this profile has no active 5h window. Opt-in
+    /// because every successful ping starts a fresh 5h usage window.
+    pub(crate) auto_start: bool,
     /// Extra env vars merged into `~/.claude/settings.json`'s `env` block
     /// while this profile is active. Cleared on switch to another profile.
     pub(crate) env: BTreeMap<String, String>,
@@ -57,7 +58,7 @@ impl Profile {
             name,
             base_url,
             api_key,
-            kick_timer: false,
+            auto_start: false,
             env: BTreeMap::new(),
             fallback_threshold: None,
             credentials: None,
@@ -77,11 +78,13 @@ impl Profile {
 pub(crate) struct AppState {
     pub(crate) active_profile: Option<String>,
     pub(crate) profiles: Vec<String>,
-    /// Epoch-ms of the last successful timer kick per profile. Used to skip
-    /// rekicking a profile whose previous kick should still be inside its
-    /// 5-hour window.
-    #[serde(default)]
-    pub(crate) last_kick_at: HashMap<String, u64>,
+    /// Epoch-ms of the last successful auto-start ping per profile. Used to
+    /// skip re-pinging a profile whose previous ping should still be inside
+    /// its 5-hour window. Field stays `last_kick_at` on disk for back-compat
+    /// with older clauth versions; new state can be read by them and vice
+    /// versa.
+    #[serde(default, alias = "last_kick_at", rename = "last_kick_at")]
+    pub(crate) last_auto_start_at: HashMap<String, u64>,
     /// Ordered list of profile names participating in the auto-switch chain.
     #[serde(default)]
     pub(crate) fallback_chain: Vec<String>,
@@ -129,8 +132,8 @@ impl AppConfig {
 struct ProfileConfig {
     base_url: Option<String>,
     api_key: Option<String>,
-    #[serde(default)]
-    kick_timer: bool,
+    #[serde(default, alias = "kick_timer")]
+    auto_start: bool,
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default)]
@@ -243,7 +246,7 @@ fn load_profile(name: &str) -> Result<Profile> {
         name: name.to_string(),
         base_url: config.base_url,
         api_key: config.api_key,
-        kick_timer: config.kick_timer,
+        auto_start: config.auto_start,
         env: config.env,
         fallback_threshold: config.fallback_threshold,
         credentials,
@@ -324,13 +327,14 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# Fire a 1-token Haiku ping at startup to start the 5-hour usage\n");
-    out.push_str("# window when this profile has no running window. Costs ~0.001¢ per\n");
-    out.push_str("# kick. OAuth profiles only.\n");
-    if profile.kick_timer {
-        out.push_str("kick_timer = true\n");
+    out.push_str("# Auto-start the 5-hour usage window for this profile. clauth fires a\n");
+    out.push_str("# 1-token Haiku ping at launch and on every 30s refresh while there's\n");
+    out.push_str("# no running window. ~0.001¢ per ping. OAuth profiles only.\n");
+    out.push_str("# Old name `kick_timer = true` is still accepted.\n");
+    if profile.auto_start {
+        out.push_str("auto_start = true\n");
     } else {
-        out.push_str("# kick_timer = true\n");
+        out.push_str("# auto_start = true\n");
     }
     out.push('\n');
 

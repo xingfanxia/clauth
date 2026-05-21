@@ -196,6 +196,36 @@ pub(crate) struct ChainItemMenuState {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct SwitchConfirmState {
+    pub(crate) name: String,
+    /// false = stay (no), true = switch (yes). Defaults to yes on open.
+    pub(crate) choice: bool,
+}
+
+/// Per-profile actions popup. Cursor is into the list returned by
+/// `profile_menu_options` so disabled / context-sensitive entries shift
+/// without the caller having to remember which row is which.
+#[derive(Debug, Clone)]
+pub(crate) struct ProfileMenuState {
+    pub(crate) name: String,
+    pub(crate) cursor: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileMenuAction {
+    Switch,
+    Details,
+    Edit,
+    Rename,
+    ToggleAutoStart,
+    AddToChain,
+    SetThreshold,
+    RemoveFromChain,
+    Delete,
+    Back,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct ChainAddState {
     pub(crate) candidates: Vec<String>,
     pub(crate) cursor: usize,
@@ -223,6 +253,8 @@ pub(crate) enum Modal {
         choice: bool,
     },
     CaptureName(CaptureNameForm),
+    SwitchConfirm(SwitchConfirmState),
+    ProfileMenu(ProfileMenuState),
     ChainItemMenu(ChainItemMenuState),
     ChainAdd(ChainAddState),
     ChainThreshold(ChainThresholdForm),
@@ -304,6 +336,10 @@ pub(crate) struct App {
     pub(crate) last_state_mtime: Option<SystemTime>,
     pub(crate) started_at: Instant,
     pub(crate) quit: bool,
+    /// Set true while the background usage refresher has work in flight. When
+    /// it drops false on the next tick we run auto-start, so the kick lands
+    /// after a refresh cycle confirmed which profiles have no 5h window.
+    pub(crate) was_busy: bool,
 }
 
 impl App {
@@ -334,6 +370,7 @@ impl App {
             last_state_mtime: app_state_mtime(),
             started_at: Instant::now(),
             quit: false,
+            was_busy: false,
         }
     }
 
@@ -367,11 +404,11 @@ impl App {
             &self.activity,
         );
 
-        let kicked = oauth::kick_missing_timers(&mut self.config, &self.usage_store);
-        if !kicked.is_empty() {
+        let started = oauth::auto_start_windows(&mut self.config, &self.usage_store);
+        if !started.is_empty() {
             let retry: Vec<(String, String)> = collect_tokens(&self.config.profiles)
                 .into_iter()
-                .filter(|(name, _)| kicked.contains(name))
+                .filter(|(name, _)| started.contains(name))
                 .collect();
             fetch_all_into(
                 &retry,
@@ -666,6 +703,8 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Enter => activate_main_item(app),
+        KeyCode::Char('d') => open_detail_for_main_cursor(app),
+        KeyCode::Char('m') => open_profile_menu_for_main_cursor(app),
         KeyCode::Char('q') | KeyCode::Esc => {
             if app.filter.is_some() {
                 app.filter = None;
@@ -696,7 +735,20 @@ fn activate_main_item(app: &mut App) {
     };
     match item {
         MainItemKind::Profile(idx) => {
-            app.screen = Screen::ProfileDetail { profile_index: idx };
+            // Enter on a profile asks before switching. 'd' opens detail.
+            let Some(name) = app.config.profiles.get(idx).map(|p| p.name.clone()) else {
+                return;
+            };
+            if app.config.is_active(&name) {
+                // Already active — Enter falls through to detail view so the
+                // user can still inspect / configure without an empty prompt.
+                app.screen = Screen::ProfileDetail { profile_index: idx };
+                return;
+            }
+            app.modals.push(Modal::SwitchConfirm(SwitchConfirmState {
+                name,
+                choice: true,
+            }));
         }
         MainItemKind::NewProfile => open_new_profile(app),
         MainItemKind::CaptureCredentials => begin_capture(app),
@@ -705,6 +757,23 @@ fn activate_main_item(app: &mut App) {
             app.chain_cursor = 0;
         }
     }
+}
+
+fn open_detail_for_main_cursor(app: &mut App) {
+    if let Some(MainItemKind::Profile(idx)) = app.current_main_item() {
+        app.screen = Screen::ProfileDetail { profile_index: idx };
+    }
+}
+
+fn open_profile_menu_for_main_cursor(app: &mut App) {
+    let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
+        return;
+    };
+    let Some(name) = app.config.profiles.get(idx).map(|p| p.name.clone()) else {
+        return;
+    };
+    app.modals
+        .push(Modal::ProfileMenu(ProfileMenuState { name, cursor: 0 }));
 }
 
 fn reorder_main_cursor(app: &mut App, delta: i32) {
@@ -916,6 +985,8 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::ReconcileKeep { .. } => handle_reconcile_keep_key(app, key),
         Modal::ReconcileCaptureAsk { .. } => handle_reconcile_capture_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
+        Modal::SwitchConfirm(_) => handle_switch_confirm_key(app, key),
+        Modal::ProfileMenu(_) => handle_profile_menu_key(app, key),
         Modal::ChainItemMenu(_) => handle_chain_item_menu_key(app, key),
         Modal::ChainAdd(_) => handle_chain_add_key(app, key),
         Modal::ChainThreshold(_) => handle_chain_threshold_key(app, key),
@@ -966,7 +1037,19 @@ fn handle_profile_detail_key(app: &mut App, key: KeyEvent) {
                     name,
                     input: InputState::new(&format!("{current:.0}")),
                 }));
+            } else {
+                app.toast(
+                    ToastKind::Info,
+                    "add this profile to the fallback chain first",
+                );
             }
+        }
+        KeyCode::Char('a') => {
+            toggle_auto_start(app, &name);
+        }
+        KeyCode::Char('m') => {
+            app.modals
+                .push(Modal::ProfileMenu(ProfileMenuState { name, cursor: 0 }));
         }
         KeyCode::Char('r') => {
             app.manual_refresh();
@@ -974,6 +1057,204 @@ fn handle_profile_detail_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('?') => app.modals.push(Modal::Help),
         _ => {}
+    }
+}
+
+fn toggle_auto_start(app: &mut App, name: &str) {
+    let Some(profile) = app.config.find_mut(name) else {
+        return;
+    };
+    if !profile.is_oauth() {
+        app.toast(
+            ToastKind::Warning,
+            "auto-start only applies to OAuth profiles",
+        );
+        return;
+    }
+    profile.auto_start = !profile.auto_start;
+    let now_on = profile.auto_start;
+    match save_profile(profile) {
+        Ok(()) => {
+            let body = if now_on {
+                format!("auto-start on for '{name}'")
+            } else {
+                format!("auto-start off for '{name}'")
+            };
+            app.toast(ToastKind::Success, body);
+        }
+        Err(e) => {
+            // Roll back so the disk + memory stay aligned.
+            if let Some(p) = app.config.find_mut(name) {
+                p.auto_start = !now_on;
+            }
+            app.toast(ToastKind::Danger, format!("save failed: {e}"));
+        }
+    }
+}
+
+fn handle_switch_confirm_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::SwitchConfirm(state)) = app.modals.last_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => {
+            state.choice = !state.choice;
+        }
+        KeyCode::Char('y') => state.choice = true,
+        KeyCode::Char('n') => state.choice = false,
+        KeyCode::Esc => {
+            app.modals.pop();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let go = state.choice;
+            let name = state.name.clone();
+            app.modals.pop();
+            if go {
+                perform_switch(app, &name);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Options shown in the per-profile actions menu. Context-sensitive — entries
+/// only appear when meaningful (e.g. SetThreshold only when in chain).
+pub(crate) fn profile_menu_options(app: &App, name: &str) -> Vec<ProfileMenuAction> {
+    let mut out = Vec::with_capacity(10);
+    let profile = app.config.find(name);
+    let is_active = app.config.is_active(name);
+    let in_chain = app.config.state.fallback_chain.iter().any(|n| n == name);
+    let is_oauth = profile.map(|p| p.is_oauth()).unwrap_or(false);
+
+    if !is_active {
+        out.push(ProfileMenuAction::Switch);
+    }
+    out.push(ProfileMenuAction::Details);
+    out.push(ProfileMenuAction::Edit);
+    out.push(ProfileMenuAction::Rename);
+    if is_oauth {
+        out.push(ProfileMenuAction::ToggleAutoStart);
+    }
+    if in_chain {
+        out.push(ProfileMenuAction::SetThreshold);
+        out.push(ProfileMenuAction::RemoveFromChain);
+    } else {
+        out.push(ProfileMenuAction::AddToChain);
+    }
+    out.push(ProfileMenuAction::Delete);
+    out.push(ProfileMenuAction::Back);
+    out
+}
+
+fn handle_profile_menu_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::ProfileMenu(state)) = app.modals.last().cloned() else {
+        return;
+    };
+    let options = profile_menu_options(app, &state.name);
+    let last = options.len().saturating_sub(1);
+    let mut cursor = state.cursor.min(last);
+
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            cursor = if cursor == 0 { last } else { cursor - 1 };
+            if let Some(Modal::ProfileMenu(s)) = app.modals.last_mut() {
+                s.cursor = cursor;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            cursor = if cursor >= last { 0 } else { cursor + 1 };
+            if let Some(Modal::ProfileMenu(s)) = app.modals.last_mut() {
+                s.cursor = cursor;
+            }
+        }
+        KeyCode::Esc => {
+            app.modals.pop();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let Some(&action) = options.get(cursor) else {
+                return;
+            };
+            run_profile_menu_action(app, &state.name, action);
+        }
+        _ => {}
+    }
+}
+
+fn run_profile_menu_action(app: &mut App, name: &str, action: ProfileMenuAction) {
+    match action {
+        ProfileMenuAction::Switch => {
+            app.modals.pop();
+            app.modals.push(Modal::SwitchConfirm(SwitchConfirmState {
+                name: name.to_string(),
+                choice: true,
+            }));
+        }
+        ProfileMenuAction::Details => {
+            let idx = app.config.profiles.iter().position(|p| p.name == name);
+            app.modals.pop();
+            if let Some(idx) = idx {
+                app.screen = Screen::ProfileDetail { profile_index: idx };
+            }
+        }
+        ProfileMenuAction::Edit => {
+            app.modals.pop();
+            open_edit_profile(app, name);
+        }
+        ProfileMenuAction::Rename => {
+            app.modals.pop();
+            app.modals.push(Modal::Rename(RenameForm {
+                old: name.to_string(),
+                input: InputState::new(name),
+            }));
+        }
+        ProfileMenuAction::ToggleAutoStart => {
+            // Stay in the menu so the user can flip several settings.
+            toggle_auto_start(app, name);
+        }
+        ProfileMenuAction::AddToChain => {
+            if let Some(profile) = app.config.find_mut(name)
+                && profile.fallback_threshold.is_none()
+            {
+                profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
+                let _ = save_profile(profile);
+            }
+            if !app.config.state.fallback_chain.iter().any(|n| n == name) {
+                app.config.state.fallback_chain.push(name.to_string());
+                let _ = save_app_state(&app.config.state);
+                app.toast(
+                    ToastKind::Success,
+                    format!("added '{name}' to fallback chain"),
+                );
+            }
+        }
+        ProfileMenuAction::SetThreshold => {
+            let current = app
+                .config
+                .find(name)
+                .map(threshold_for)
+                .unwrap_or(DEFAULT_THRESHOLD);
+            app.modals.pop();
+            app.modals.push(Modal::ChainThreshold(ChainThresholdForm {
+                name: name.to_string(),
+                input: InputState::new(&format!("{current:.0}")),
+            }));
+        }
+        ProfileMenuAction::RemoveFromChain => {
+            let owned = name.to_string();
+            app.config.state.fallback_chain.retain(|n| n != &owned);
+            let _ = save_app_state(&app.config.state);
+            app.toast(
+                ToastKind::Info,
+                format!("removed '{owned}' from fallback chain"),
+            );
+        }
+        ProfileMenuAction::Delete => {
+            app.modals.pop();
+            open_delete_confirm(app, name);
+        }
+        ProfileMenuAction::Back => {
+            app.modals.pop();
+        }
     }
 }
 
@@ -1442,6 +1723,29 @@ pub(crate) fn on_tick(app: &mut App) {
         app.clamp_main_cursor();
     }
     app.apply_usage();
+
+    // Refresher just finished a cycle. Now is the moment to check whether any
+    // opted-in profile is still missing a 5h window and prime one. Doing this
+    // here (instead of inside the refresher thread) keeps the mutation path
+    // on the main thread, reusing existing &mut AppConfig flows. The kick
+    // function short-circuits in microseconds when nothing needs work, so
+    // the per-tick cost is only paid when there's actual work to do.
+    let busy = app.activity.load(Ordering::Relaxed);
+    if app.was_busy && !busy {
+        let started = oauth::auto_start_windows(&mut app.config, &app.usage_store);
+        if !started.is_empty() {
+            app.refresh_tokens();
+            app.manual_refresh();
+            let body = if started.len() == 1 {
+                format!("auto-started window for '{}'", started[0])
+            } else {
+                format!("auto-started {} windows", started.len())
+            };
+            app.toast(ToastKind::Info, body);
+        }
+    }
+    app.was_busy = busy;
+
     if let Ok(Some(target)) = auto_switch_if_needed(&mut app.config) {
         app.refresh_tokens();
         app.last_state_mtime = app_state_mtime();

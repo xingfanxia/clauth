@@ -10,7 +10,8 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use super::super::app::{
     App, ChainAction, ChainAddState, ChainItemMenuState, ChainThresholdForm, ConfirmAction,
     ConfirmState, EditProfileForm, EndpointField, InputState, Modal, NewProfileField,
-    NewProfileForm, RenameForm,
+    NewProfileForm, ProfileMenuAction, ProfileMenuState, RenameForm, Screen, SwitchConfirmState,
+    profile_menu_options,
 };
 use super::super::theme;
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
@@ -26,6 +27,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         }
         Modal::ReconcileCaptureAsk { choice } => draw_reconcile_capture(frame, area, *choice),
         Modal::CaptureName(form) => draw_capture_name(frame, area, form.input.value.as_str()),
+        Modal::SwitchConfirm(state) => draw_switch_confirm(frame, area, state),
+        Modal::ProfileMenu(state) => draw_profile_menu(frame, area, app, state),
         Modal::ChainItemMenu(state) => draw_chain_item_menu(frame, area, app, state),
         Modal::ChainAdd(state) => draw_chain_add(frame, area, state),
         Modal::ChainThreshold(form) => draw_chain_threshold(frame, area, form),
@@ -281,6 +284,119 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
     frame.render_widget(para, inner);
 }
 
+fn draw_switch_confirm(frame: &mut Frame<'_>, area: Rect, state: &SwitchConfirmState) {
+    let rect = centered(area, 56, 9);
+    frame.render_widget(Clear, rect);
+    let block = modal_block("switch profile");
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Switch to ", theme::dim()),
+            Span::styled(format!("'{}'", state.name), theme::accent()),
+            Span::styled("?", theme::dim()),
+        ]),
+        Line::from(""),
+        yes_no_line(state.choice),
+        Line::from(""),
+        modal_footer_hints(&[
+            ("\u{2190} \u{2192}", "choose"),
+            ("y / n", "choose"),
+            ("\u{23ce}", "apply"),
+        ]),
+    ];
+    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
+    frame.render_widget(para, inner);
+}
+
+fn draw_profile_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &ProfileMenuState) {
+    let options = profile_menu_options(app, &state.name);
+    let body_height = options.len() as u16 + 4;
+    let rect = centered(area, 56, body_height.max(8));
+    frame.render_widget(Clear, rect);
+    let block = modal_block(format!("profile \u{00b7} {}", state.name));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let cursor = state.cursor.min(options.len().saturating_sub(1));
+    let auto_on = app
+        .config
+        .find(&state.name)
+        .map(|p| p.auto_start)
+        .unwrap_or(false);
+    let in_chain = app
+        .config
+        .state
+        .fallback_chain
+        .iter()
+        .any(|n| n == &state.name);
+    let current_threshold = app
+        .config
+        .find(&state.name)
+        .map(threshold_for)
+        .unwrap_or(DEFAULT_THRESHOLD);
+
+    let mut lines: Vec<Line<'_>> = options
+        .iter()
+        .enumerate()
+        .map(|(i, action)| {
+            let arrow = if i == cursor {
+                Span::styled("\u{25b6} ", theme::orange())
+            } else {
+                Span::raw("  ")
+            };
+            let label = profile_menu_label(*action, auto_on, in_chain, current_threshold);
+            let style = match action {
+                ProfileMenuAction::Delete => theme::danger(),
+                ProfileMenuAction::Back => theme::faint(),
+                _ => Style::default().fg(theme::TEXT),
+            };
+            Line::from(vec![arrow, Span::styled(label, style)])
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(modal_footer_hints(&[
+        ("\u{2191}\u{2193}", "nav"),
+        ("\u{23ce}", "select"),
+        ("\u{238b}", "close"),
+    ]));
+    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
+    frame.render_widget(para, inner);
+}
+
+fn profile_menu_label(
+    action: ProfileMenuAction,
+    auto_on: bool,
+    in_chain: bool,
+    threshold: f64,
+) -> String {
+    match action {
+        ProfileMenuAction::Switch => "Switch to this profile".to_string(),
+        ProfileMenuAction::Details => "Open details".to_string(),
+        ProfileMenuAction::Edit => "Edit endpoint".to_string(),
+        ProfileMenuAction::Rename => "Rename".to_string(),
+        ProfileMenuAction::ToggleAutoStart => {
+            if auto_on {
+                "Auto-start: on  \u{2192}  turn off".to_string()
+            } else {
+                "Auto-start: off  \u{2192}  turn on".to_string()
+            }
+        }
+        ProfileMenuAction::AddToChain => "Add to fallback chain".to_string(),
+        ProfileMenuAction::SetThreshold => {
+            if in_chain {
+                format!("Set threshold (current: {threshold:.0}%)")
+            } else {
+                "Set threshold".to_string()
+            }
+        }
+        ProfileMenuAction::RemoveFromChain => "Remove from fallback chain".to_string(),
+        ProfileMenuAction::Delete => "Delete profile".to_string(),
+        ProfileMenuAction::Back => "\u{2190} Back".to_string(),
+    }
+}
+
 fn draw_chain_item_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &ChainItemMenuState) {
     let rect = centered(area, 56, 14);
     frame.render_widget(Clear, rect);
@@ -405,51 +521,94 @@ fn draw_chain_threshold(frame: &mut Frame<'_>, area: Rect, form: &ChainThreshold
     frame.render_widget(para, inner);
 }
 
-fn draw_help(frame: &mut Frame<'_>, area: Rect, _app: &App) {
-    let rect = centered(area, 68, 22);
+fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let rect = centered(area, 70, 24);
     frame.render_widget(Clear, rect);
-    let block = modal_block("keybindings");
+    let title = match app.screen {
+        Screen::Overview => "help \u{00b7} overview",
+        Screen::Chain => "help \u{00b7} fallback chain",
+        Screen::ProfileDetail { .. } => "help \u{00b7} profile detail",
+    };
+    let block = modal_block(title);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let sections: &[(&str, &[(&str, &str)])] = &[
-        (
-            "NAVIGATION",
+    let screen_specific: Vec<(&str, &[(&str, &str)])> = match app.screen {
+        Screen::Overview => vec![
+            (
+                "ACCOUNTS",
+                &[
+                    ("\u{23ce}", "switch to highlighted profile (asks)"),
+                    ("d", "open profile details"),
+                    ("m", "open per-profile actions menu"),
+                    ("Shift+j / Shift+k", "reorder profile up / down"),
+                ][..],
+            ),
+            (
+                "LIST",
+                &[
+                    ("\u{2191}\u{2193} / j k", "move cursor"),
+                    ("/", "filter by name"),
+                    ("r", "refresh usage now"),
+                ][..],
+            ),
+        ],
+        Screen::Chain => vec![(
+            "CHAIN",
             &[
-                ("↑↓ / j k", "move"),
-                ("⏎", "activate"),
-                ("⎋", "back"),
-                ("Shift+j / Shift+k", "reorder profile"),
-            ],
-        ),
-        (
-            "GLOBAL",
+                ("\u{2191}\u{2193} / j k", "move cursor"),
+                ("\u{23ce}", "open entry / add profile"),
+                ("\u{238b}", "back to overview"),
+                ("r", "refresh usage now"),
+            ][..],
+        )],
+        Screen::ProfileDetail { .. } => vec![(
+            "PROFILE",
             &[
-                ("/", "filter"),
-                ("r", "refresh"),
-                ("?", "help"),
-                ("q", "quit"),
-            ],
-        ),
+                ("s", "switch to this profile"),
+                ("e", "edit base URL / API key"),
+                ("n", "rename profile"),
+                ("a", "toggle auto-start"),
+                ("t", "set fallback threshold (chain members)"),
+                ("d", "delete profile"),
+                ("m", "open per-profile menu"),
+                ("\u{238b}", "back to overview"),
+            ][..],
+        )],
+    };
+
+    let global: &[(&str, &str)] = &[
+        ("?", "toggle this help"),
+        ("q", "quit"),
+        ("Ctrl+C", "quit from anywhere"),
     ];
 
     let mut lines: Vec<Line<'_>> = Vec::new();
-    for (section, entries) in sections {
+    for (section, entries) in &screen_specific {
         lines.push(Line::from(Span::styled(*section, theme::label())));
         lines.push(Line::from(""));
         for (key, desc) in *entries {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {key:<14}", key = key),
-                    Style::default().fg(theme::ACCENT).bold(),
-                ),
-                Span::styled((*desc).to_string(), theme::dim()),
-            ]));
+            lines.push(help_row(key, desc));
         }
         lines.push(Line::from(""));
     }
+    lines.push(Line::from(Span::styled("GLOBAL", theme::label())));
+    lines.push(Line::from(""));
+    for (key, desc) in global {
+        lines.push(help_row(key, desc));
+    }
     let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
     frame.render_widget(para, inner);
+}
+
+fn help_row(key: &str, desc: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {key:<18}", key = key),
+            Style::default().fg(theme::ACCENT).bold(),
+        ),
+        Span::styled(desc.to_string(), theme::dim()),
+    ])
 }
 
 /// Footer hint line: accent-bold key + dim label, separated by `   `.

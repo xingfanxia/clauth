@@ -27,11 +27,12 @@ const KICK_MODEL: &str = "claude-haiku-4-5-20251001";
 /// the call as an unauthorized non-CC inference.
 const KICK_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// Refuse to rekick a profile until this long after its last kick. Sized just
-/// under the 5-hour window so a kick whose follow-up usage fetch failed
-/// (network blip, stale endpoint) doesn't cause us to re-fire on every
-/// launch, while still allowing a fresh kick once the window has elapsed.
-const KICK_COOLDOWN_MS: u64 = 4 * 3600 * 1000 + 30 * 60 * 1000;
+/// Refuse to re-ping a profile until this long after its last auto-start.
+/// Sized just under the 5-hour window so a ping whose follow-up usage fetch
+/// failed (network blip, stale endpoint) doesn't cause us to re-fire on
+/// every refresh, while still allowing a fresh ping once the window has
+/// elapsed.
+const AUTO_START_COOLDOWN_MS: u64 = 4 * 3600 * 1000 + 30 * 60 * 1000;
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -161,17 +162,17 @@ pub(crate) fn refresh_all(config: &mut AppConfig) -> Vec<String> {
     refreshed
 }
 
-/// For every profile that opted in via `kick_timer = true` and currently has
+/// For every profile that opted in via `auto_start = true` and currently has
 /// no 5-hour usage window, refreshes its OAuth tokens (rotated pair saved to
 /// disk) and fires a 1-token Haiku ping to start the window.
 ///
-/// Returns the names of profiles whose timer kick succeeded so the caller
-/// can re-fetch usage and confirm the window now shows up.
-pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) -> Vec<String> {
+/// Returns the names of profiles whose ping succeeded so the caller can
+/// re-fetch usage and confirm the window now shows up.
+pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> Vec<String> {
     // Claim cooldown slots under the lock BEFORE any network work. A competing
     // clauth process that starts up a moment later will observe our recorded
-    // `last_kick_at` and skip the same profile, so the refresh token rotates
-    // exactly once even when two instances race startup.
+    // `last_auto_start_at` and skip the same profile, so the refresh token
+    // rotates exactly once even when two instances race startup.
     //
     // Holding the lock during the OAuth/messages HTTP round trips would stall
     // every other instance for seconds, so we release between claim and work.
@@ -179,7 +180,7 @@ pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) ->
         let now = now_ms();
         let mut claimed = Vec::new();
         for profile in &config.profiles {
-            if !profile.kick_timer {
+            if !profile.auto_start {
                 continue;
             }
             let resets_at = {
@@ -195,11 +196,11 @@ pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) ->
             }
             let last = config
                 .state
-                .last_kick_at
+                .last_auto_start_at
                 .get(&profile.name)
                 .copied()
                 .unwrap_or(0);
-            if now.saturating_sub(last) < KICK_COOLDOWN_MS {
+            if now.saturating_sub(last) < AUTO_START_COOLDOWN_MS {
                 continue;
             }
             let Some(token) = profile
@@ -215,7 +216,7 @@ pub(crate) fn kick_missing_timers(config: &mut AppConfig, store: &UsageStore) ->
         }
 
         for (name, _) in &claimed {
-            config.state.last_kick_at.insert(name.clone(), now);
+            config.state.last_auto_start_at.insert(name.clone(), now);
         }
         if !claimed.is_empty() {
             let _ = save_app_state(&config.state);

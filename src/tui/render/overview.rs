@@ -249,9 +249,16 @@ fn render_overview_row(
         Span::raw("  ")
     };
     let dot = if active {
-        Span::styled("◆ ", theme::orange())
+        Span::styled("◆", theme::orange())
     } else {
-        Span::styled("◇ ", theme::faint())
+        Span::styled("◇", theme::faint())
+    };
+    // Auto-start indicator sits in the single space between the dot and the
+    // name, so the alignment of every other column stays identical.
+    let auto_marker = if profile.auto_start && profile.is_oauth() {
+        Span::styled("↻", theme::accent())
+    } else {
+        Span::raw(" ")
     };
     let name = Span::styled(
         fixed(&profile.name, widths.name),
@@ -262,7 +269,7 @@ fn render_overview_row(
         },
     );
 
-    let mut spans = vec![cursor, dot, name, gap(widths)];
+    let mut spans = vec![cursor, dot, auto_marker, name, gap(widths)];
     spans.push(Span::styled(
         fixed(&account_type_label(profile), widths.kind),
         account_type_style(profile),

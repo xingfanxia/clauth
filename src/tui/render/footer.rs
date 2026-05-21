@@ -10,29 +10,20 @@ use super::super::app::{App, Screen};
 use super::super::theme;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // Footer stays minimal. The per-profile menu (m) is the canonical place
+    // for the rest; the help modal (?) lists every binding.
     let hints: &[(&str, &str)] = match app.screen {
         Screen::Overview => &[
-            ("↑↓", "nav"),
-            ("⏎", "open"),
-            ("/", "filter"),
-            ("r", "refresh"),
+            ("⏎", "switch"),
+            ("d", "details"),
+            ("m", "menu"),
             ("?", "help"),
+            ("q", "quit"),
         ],
-        Screen::Chain => &[
-            ("↑↓", "nav"),
-            ("⏎", "select"),
-            ("⎋", "back"),
-            ("r", "refresh"),
-            ("?", "help"),
-        ],
-        Screen::ProfileDetail { .. } => &[
-            ("s", "switch"),
-            ("e", "edit"),
-            ("n", "rename"),
-            ("d", "delete"),
-            ("t", "threshold"),
-            ("⎋", "back"),
-        ],
+        Screen::Chain => &[("⏎", "open"), ("⎋", "back"), ("?", "help")],
+        Screen::ProfileDetail { .. } => {
+            &[("s", "switch"), ("m", "menu"), ("⎋", "back"), ("?", "help")]
+        }
     };
 
     let mut spans: Vec<Span<'_>> = Vec::new();
