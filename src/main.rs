@@ -2,20 +2,29 @@ mod actions;
 mod claude;
 mod completions;
 mod fallback;
+mod format;
 mod lock;
 mod oauth;
-mod start;
 mod platform;
 mod profile;
+mod start;
 mod tui;
 mod update;
 mod ureq_error;
 mod usage;
+mod which;
 
 use anyhow::Result;
 
 use crate::actions::switch_profile;
-use crate::profile::load_config;
+use crate::profile::{AppConfig, load_config};
+
+fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<String> {
+    config.canonical_name(name).ok_or_else(|| {
+        let available = config.names().join(", ");
+        anyhow::anyhow!("profile '{name}' not found\navailable: {available}")
+    })
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,35 +49,24 @@ fn main() -> Result<()> {
             println!("clauth {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        [cmd] if cmd == "which" => return which::run(false),
+        [cmd, flag] if cmd == "which" && flag == "--json" => return which::run(true),
+        [cmd, _, ..] if cmd == "which" => {
+            anyhow::bail!("usage: clauth which [--json]");
+        }
         [cmd] if cmd == "start" => {
             anyhow::bail!("usage: clauth start <profile> [claude args...]");
         }
         [cmd, name, rest @ ..] if cmd == "start" => {
             platform::init();
             let config = load_config()?;
-            let canonical = config
-                .names()
-                .into_iter()
-                .find(|n| n.eq_ignore_ascii_case(name))
-                .map(str::to_string);
-            let Some(canonical) = canonical else {
-                let available = config.names().join(", ");
-                anyhow::bail!("profile '{name}' not found\navailable: {available}");
-            };
+            let canonical = resolve_or_bail(&config, name)?;
             return start::run(&config, &canonical, rest);
         }
         [name] => {
             platform::init();
             let mut config = load_config()?;
-            let canonical = config
-                .names()
-                .into_iter()
-                .find(|n| n.eq_ignore_ascii_case(name))
-                .map(str::to_string);
-            let Some(canonical) = canonical else {
-                let available = config.names().join(", ");
-                anyhow::bail!("profile '{name}' not found\navailable: {available}");
-            };
+            let canonical = resolve_or_bail(&config, name)?;
             // Refresh every profile's OAuth token before switching, same as
             // the interactive flow. The rotated access token then ends up in
             // ~/.claude/.credentials.json via the symlink.
@@ -79,7 +77,7 @@ fn main() -> Result<()> {
         }
         [] => {}
         _ => anyhow::bail!(
-            "usage: clauth [profile] | clauth start <profile> [claude args...] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
+            "usage: clauth [profile] | clauth start <profile> [claude args...] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
         ),
     }
 
@@ -98,6 +96,8 @@ fn print_help() {
            clauth <profile>                switch to profile by name and exit\n  \
            clauth start <profile> [args]   launch claude with that profile's settings\n                                  \
          in an isolated CLAUDE_CONFIG_DIR; extra args go to claude\n  \
+           clauth which [--json]           print the profile owning the loaded\n                                  \
+         credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \
            clauth completions install [shell]\n                                  \
          install completions into the user's shell rc\n  \

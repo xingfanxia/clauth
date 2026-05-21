@@ -17,6 +17,12 @@ pub(crate) struct ClaudeCredentials {
     pub(crate) claude_ai_oauth: Option<OAuthToken>,
 }
 
+impl ClaudeCredentials {
+    pub(crate) fn refresh_token(&self) -> Option<&str> {
+        self.claude_ai_oauth.as_ref()?.refresh_token.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OAuthToken {
@@ -70,6 +76,10 @@ impl Profile {
     pub(crate) fn is_oauth(&self) -> bool {
         self.base_url.is_none()
     }
+
+    pub(crate) fn refresh_token(&self) -> Option<&str> {
+        self.credentials.as_ref()?.refresh_token()
+    }
 }
 
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
@@ -110,6 +120,14 @@ impl AppConfig {
 
     pub(crate) fn names(&self) -> Vec<&str> {
         self.profiles.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    /// Case-insensitive name lookup; returns the canonical-cased name on match.
+    pub(crate) fn canonical_name(&self, query: &str) -> Option<String> {
+        self.names()
+            .into_iter()
+            .find(|n| n.eq_ignore_ascii_case(query))
+            .map(str::to_string)
     }
 
     pub(crate) fn add(&mut self, profile: Profile) {

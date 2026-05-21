@@ -104,16 +104,7 @@ pub(crate) fn refresh_all(config: &mut AppConfig) -> Vec<String> {
     let snapshots: Vec<(String, String)> = config
         .profiles
         .iter()
-        .filter_map(|p| {
-            let rt = p
-                .credentials
-                .as_ref()?
-                .claude_ai_oauth
-                .as_ref()?
-                .refresh_token
-                .clone()?;
-            Some((p.name.clone(), rt))
-        })
+        .filter_map(|p| Some((p.name.clone(), p.refresh_token()?.to_string())))
         .collect();
 
     if snapshots.is_empty() {
@@ -197,13 +188,7 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
             if now.saturating_sub(last) < AUTO_START_COOLDOWN_MS {
                 continue;
             }
-            let Some(token) = profile
-                .credentials
-                .as_ref()
-                .and_then(|c| c.claude_ai_oauth.as_ref())
-                .and_then(|o| o.refresh_token.as_ref())
-                .cloned()
-            else {
+            let Some(token) = profile.refresh_token().map(str::to_string) else {
                 continue;
             };
             claimed.push((profile.name.clone(), token));

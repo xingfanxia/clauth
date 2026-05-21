@@ -10,7 +10,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{App, Screen};
 use super::super::theme;
-use super::format::plan_label;
+use crate::format::plan_label;
 use crate::usage::now_ms;
 
 const VERSION_SUFFIX: &str = concat!("  v", env!("CARGO_PKG_VERSION"));

@@ -11,11 +11,13 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start which" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "start" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
+        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     fi
     return 0
 }
@@ -28,11 +30,15 @@ _clauth() {
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
-        _values 'subcommand' 'start[launch claude with an isolated profile]'
+        _values 'subcommand' \
+            'start[launch claude with an isolated profile]' \
+            'which[print profile owning the loaded credentials]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == start ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
+        _values 'flag' '--json[emit JSON instead of plain name]'
     fi
 }
 _clauth "$@"
@@ -44,7 +50,9 @@ end
 complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with an isolated profile"
+complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
 "#;
 
 pub(crate) fn print_script(shell: &str) -> Result<()> {
