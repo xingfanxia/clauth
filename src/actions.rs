@@ -135,13 +135,16 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         let was_active = config.is_active(name);
         let dir = profile_dir(name)?;
 
-        config.remove(name);
-        save_app_state(&config.state)?;
-
+        // Remove the directory first so a filesystem failure keeps the profile
+        // visible in state and the user can retry. Persisting state ahead of a
+        // failed delete would leave an orphan directory the loader ignores.
         if dir.exists() {
             std::fs::remove_dir_all(&dir)
                 .with_context(|| format!("Failed to delete profile directory for '{name}'"))?;
         }
+        config.remove(name);
+        save_app_state(&config.state)?;
+
         if was_active {
             clear_claude_credentials()?;
         }
