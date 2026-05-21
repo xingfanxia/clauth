@@ -242,7 +242,7 @@ fn draw_reconcile_capture(frame: &mut Frame<'_>, area: Rect, choice: bool) {
 
     let lines = vec![
         Line::from(Span::styled(
-            "Capture current credentials as a new profile?",
+            "new from current profile as a new profile?",
             theme::muted(),
         )),
         Line::from(""),

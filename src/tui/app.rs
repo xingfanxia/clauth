@@ -238,7 +238,7 @@ pub(crate) enum Modal {
         active: String,
         choice: bool,
     },
-    /// Step 2 — "capture current credentials as a new profile?"
+    /// Step 2 — "new from current profile as a new profile?"
     ReconcileCaptureAsk {
         choice: bool,
     },

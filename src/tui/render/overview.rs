@@ -78,7 +78,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ListItem::new(render_action_row("+ new profile", row == app.main_cursor))
             }
             MainItemKind::CaptureCredentials => ListItem::new(render_action_row(
-                "+ capture current credentials",
+                "+ new from current profile",
                 row == app.main_cursor,
             )),
             MainItemKind::OpenChain => ListItem::new(render_action_row(
