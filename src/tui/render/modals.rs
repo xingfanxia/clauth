@@ -164,11 +164,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     lines.push(Line::from(""));
     lines.push(yes_no_line(state.choice));
     lines.push(Line::from(""));
-    lines.push(modal_footer_hints(&[
-        ("← →", "choose"),
-        ("y / n", "choose"),
-        ("⏎", "apply"),
-    ]));
+    lines.push(modal_footer_hints(&[("← →", "choose"), ("⏎", "apply")]));
 
     let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
     frame.render_widget(para, inner);
@@ -590,7 +586,7 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
     let after: String = tail_iter.collect();
 
     Line::from(vec![
-        Span::styled(format!("{label:<20}", label = label), theme::label()),
+        Span::styled(label.to_string(), theme::label()),
         Span::raw(" "),
         Span::styled(head.to_string(), body_style),
         Span::styled(caret_char, caret_style),
