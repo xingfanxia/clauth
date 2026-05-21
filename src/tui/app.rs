@@ -329,6 +329,10 @@ pub(crate) struct App {
     /// it drops false on the next tick we run auto-start, so the kick lands
     /// after a refresh cycle confirmed which profiles have no 5h window.
     pub(crate) was_busy: bool,
+    /// True for the busy→idle edge immediately after we fired auto-start; the
+    /// subsequent manual_refresh flips activity again, so we'd otherwise
+    /// re-enter the auto-start path on the next idle edge.
+    pub(crate) just_auto_started: bool,
 }
 
 impl App {
@@ -360,6 +364,7 @@ impl App {
             started_at: Instant::now(),
             quit: false,
             was_busy: false,
+            just_auto_started: false,
         }
     }
 
@@ -1592,16 +1597,24 @@ pub(crate) fn on_tick(app: &mut App) {
     // the per-tick cost is only paid when there's actual work to do.
     let busy = app.activity.load(Ordering::Relaxed);
     if app.was_busy && !busy {
-        let started = oauth::auto_start_windows(&mut app.config, &app.usage_store);
-        if !started.is_empty() {
-            app.refresh_tokens();
-            app.manual_refresh();
-            let body = if started.len() == 1 {
-                format!("auto-started usage window for '{}'", started[0])
-            } else {
-                format!("auto-started {} usage windows", started.len())
-            };
-            app.toast(ToastKind::Info, body);
+        if app.just_auto_started {
+            // Idle edge from the manual_refresh we kicked off below; skip one
+            // cycle so we don't re-enter auto-start while waiting for usage to
+            // report the freshly-opened 5h window.
+            app.just_auto_started = false;
+        } else {
+            let started = oauth::auto_start_windows(&mut app.config, &app.usage_store);
+            if !started.is_empty() {
+                app.refresh_tokens();
+                app.manual_refresh();
+                app.just_auto_started = true;
+                let body = if started.len() == 1 {
+                    format!("auto-started usage window for '{}'", started[0])
+                } else {
+                    format!("auto-started {} usage windows", started.len())
+                };
+                app.toast(ToastKind::Info, body);
+            }
         }
     }
     app.was_busy = busy;
