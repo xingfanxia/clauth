@@ -1,7 +1,7 @@
 //! Profile detail screen — usage breakdown + fallback metadata for one profile.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
@@ -11,6 +11,7 @@ use super::super::app::App;
 use super::super::theme;
 use super::format::format_reset;
 use crate::fallback::threshold_for;
+use crate::profile::Profile;
 use crate::usage::UsageWindow;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, profile_index: usize) {
@@ -28,9 +29,41 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, profile_index: 
     frame.render_widget(block, area);
     let inner_w = inner.width;
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let usage_lines = build_usage_lines(profile, inner_w);
+    // +1 for the separator below.
+    let usage_height = usage_lines.len() as u16 + 2;
 
-    // usage
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(usage_height), Constraint::Min(1)])
+        .split(inner);
+
+    let mut top_with_sep = usage_lines;
+    top_with_sep.push(Line::from(""));
+    top_with_sep.push(detail_separator(inner_w));
+    frame.render_widget(Paragraph::new(top_with_sep).style(theme::base()), chunks[0]);
+
+    // Side-by-side: CONFIG on the left, FALLBACK on the right. Narrow
+    // terminals will clip the right column — accepted trade-off so the two
+    // sections share a row instead of stacking.
+    let bottom = chunks[1];
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(bottom);
+
+    frame.render_widget(
+        Paragraph::new(build_config_lines(profile)).style(theme::base()),
+        cols[0],
+    );
+    frame.render_widget(
+        Paragraph::new(build_fallback_lines(app, profile)).style(theme::base()),
+        cols[1],
+    );
+}
+
+fn build_usage_lines(profile: &Profile, inner_w: u16) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(detail_section_header("USAGE"));
     lines.push(Line::from(""));
     match profile.usage.as_ref() {
@@ -67,27 +100,30 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, profile_index: 
             }
         }
     }
-    lines.push(Line::from(""));
-    lines.push(detail_separator(inner_w));
-    lines.push(Line::from(""));
+    lines
+}
 
-    // fallback
-    // config — OAuth-only flags. Hidden for endpoint profiles where the
-    // setting has no effect.
-    if profile.is_oauth() {
-        lines.push(detail_section_header("CONFIG"));
-        let (auto_state, auto_style) = if profile.auto_start {
-            ("on", theme::accent())
-        } else {
-            ("off", theme::faint())
-        };
-        lines.push(detail_kv("auto-start", auto_state, auto_style));
-        lines.push(Line::from(""));
-        lines.push(detail_separator(inner_w));
-        lines.push(Line::from(""));
+fn build_config_lines(profile: &Profile) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(detail_section_header("CONFIG"));
+    lines.push(Line::from(""));
+    if !profile.is_oauth() {
+        lines.push(detail_kv("auto-start usage", "n/a", theme::faint()));
+        return lines;
     }
+    let (auto_state, auto_style) = if profile.auto_start {
+        ("on", theme::accent())
+    } else {
+        ("off", theme::faint())
+    };
+    lines.push(detail_kv("auto-start usage", auto_state, auto_style));
+    lines
+}
 
+fn build_fallback_lines(app: &App, profile: &Profile) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(detail_section_header("FALLBACK"));
+    lines.push(Line::from(""));
     let chain_pos = app
         .config
         .state
@@ -113,9 +149,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, profile_index: 
             ));
         }
     }
-
-    let para = Paragraph::new(lines).style(theme::base());
-    frame.render_widget(para, inner);
+    lines
 }
 
 fn detail_section_header(label: &'static str) -> Line<'static> {

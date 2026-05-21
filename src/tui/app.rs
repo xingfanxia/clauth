@@ -1010,44 +1010,9 @@ fn handle_profile_detail_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
             app.screen = Screen::Overview;
         }
-        KeyCode::Char('s') => {
-            perform_switch(app, &name);
-        }
-        KeyCode::Char('e') => {
-            open_edit_profile(app, &name);
-        }
-        KeyCode::Char('n') => {
-            app.modals.push(Modal::Rename(RenameForm {
-                old: name.clone(),
-                input: InputState::new(&name),
-            }));
-        }
-        KeyCode::Char('d') => {
-            open_delete_confirm(app, &name);
-        }
-        KeyCode::Char('t') => {
-            let in_chain = app.config.state.fallback_chain.iter().any(|n| n == &name);
-            if in_chain {
-                let current = app
-                    .config
-                    .find(&name)
-                    .map(threshold_for)
-                    .unwrap_or(DEFAULT_THRESHOLD);
-                app.modals.push(Modal::ChainThreshold(ChainThresholdForm {
-                    name,
-                    input: InputState::new(&format!("{current:.0}")),
-                }));
-            } else {
-                app.toast(
-                    ToastKind::Info,
-                    "add this profile to the fallback chain first",
-                );
-            }
-        }
-        KeyCode::Char('a') => {
-            toggle_auto_start(app, &name);
-        }
-        KeyCode::Char('m') => {
+        // Single configuration entry point — Enter and `m` both open the
+        // per-profile menu. Every per-profile setting lives there.
+        KeyCode::Enter | KeyCode::Char('m') => {
             app.modals
                 .push(Modal::ProfileMenu(ProfileMenuState { name, cursor: 0 }));
         }
@@ -1067,7 +1032,7 @@ fn toggle_auto_start(app: &mut App, name: &str) {
     if !profile.is_oauth() {
         app.toast(
             ToastKind::Warning,
-            "auto-start only applies to OAuth profiles",
+            "auto-start usage only applies to OAuth profiles",
         );
         return;
     }
@@ -1076,9 +1041,9 @@ fn toggle_auto_start(app: &mut App, name: &str) {
     match save_profile(profile) {
         Ok(()) => {
             let body = if now_on {
-                format!("auto-start on for '{name}'")
+                format!("auto-start usage on for '{name}'")
             } else {
-                format!("auto-start off for '{name}'")
+                format!("auto-start usage off for '{name}'")
             };
             app.toast(ToastKind::Success, body);
         }
@@ -1737,9 +1702,9 @@ pub(crate) fn on_tick(app: &mut App) {
             app.refresh_tokens();
             app.manual_refresh();
             let body = if started.len() == 1 {
-                format!("auto-started window for '{}'", started[0])
+                format!("auto-started usage window for '{}'", started[0])
             } else {
-                format!("auto-started {} windows", started.len())
+                format!("auto-started {} usage windows", started.len())
             };
             app.toast(ToastKind::Info, body);
         }

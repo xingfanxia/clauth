@@ -378,9 +378,9 @@ fn profile_menu_label(
         ProfileMenuAction::Rename => "Rename".to_string(),
         ProfileMenuAction::ToggleAutoStart => {
             if auto_on {
-                "Auto-start: on  \u{2192}  turn off".to_string()
+                "Auto-start usage: on  \u{2192}  turn off".to_string()
             } else {
-                "Auto-start: off  \u{2192}  turn on".to_string()
+                "Auto-start usage: off  \u{2192}  turn on".to_string()
             }
         }
         ProfileMenuAction::AddToChain => "Add to fallback chain".to_string(),
@@ -565,13 +565,11 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Screen::ProfileDetail { .. } => vec![(
             "PROFILE",
             &[
-                ("s", "switch to this profile"),
-                ("e", "edit base URL / API key"),
-                ("n", "rename profile"),
-                ("a", "toggle auto-start"),
-                ("t", "set fallback threshold (chain members)"),
-                ("d", "delete profile"),
-                ("m", "open per-profile menu"),
+                (
+                    "\u{23ce} / m",
+                    "open per-profile menu (every action lives here)",
+                ),
+                ("r", "refresh usage now"),
                 ("\u{238b}", "back to overview"),
             ][..],
         )],

@@ -21,9 +21,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ("q", "quit"),
         ],
         Screen::Chain => &[("⏎", "open"), ("⎋", "back"), ("?", "help")],
-        Screen::ProfileDetail { .. } => {
-            &[("s", "switch"), ("m", "menu"), ("⎋", "back"), ("?", "help")]
-        }
+        Screen::ProfileDetail { .. } => &[("⏎", "menu"), ("⎋", "back"), ("?", "help")],
     };
 
     let mut spans: Vec<Span<'_>> = Vec::new();
