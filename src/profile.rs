@@ -394,3 +394,7 @@ fn render_config_toml(profile: &Profile) -> String {
 
     out
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/profile.rs"]
+mod tests;
