@@ -26,6 +26,7 @@ use crate::claude::{
     read_claude_credentials, snapshot_active_credentials,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, auto_switch_if_needed, threshold_for};
+use crate::lock::with_state_lock;
 use crate::oauth;
 use crate::profile::{
     AppConfig, Profile, app_state_mtime, load_config, save_app_state, save_profile,
@@ -593,7 +594,11 @@ pub(crate) fn reconcile_startup(app: &mut App) {
         return;
     };
 
-    let live = read_claude_credentials().ok().flatten();
+    // Read the live credentials under the same lock that mutators use, so a
+    // concurrent clauth process mid-rotation can't expose a torn snapshot.
+    let live = with_state_lock(|| Ok(read_claude_credentials().ok().flatten()))
+        .ok()
+        .flatten();
     let stored = app
         .config
         .find(&active)
