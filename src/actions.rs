@@ -229,6 +229,10 @@ pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) ->
         return Ok(());
     }
     with_state_lock(|| {
+        // Defensive: resync state.profiles from the in-memory list so a
+        // partial save in a prior session can't cause a length mismatch panic
+        // here.
+        config.state.profiles = config.profiles.iter().map(|p| p.name.clone()).collect();
         let profile = config.profiles.remove(from);
         config.profiles.insert(to, profile);
         let name = config.state.profiles.remove(from);
