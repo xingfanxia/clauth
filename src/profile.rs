@@ -128,7 +128,7 @@ impl AppConfig {
 }
 
 /// On-disk format for ~/.clauth/profiles/<name>/config.toml
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
 struct ProfileConfig {
     base_url: Option<String>,
     api_key: Option<String>,
@@ -254,10 +254,25 @@ fn load_profile(name: &str) -> Result<Profile> {
         fetch_status: None,
     };
 
-    // Keep config.toml in sync with the canonical template: missing options
-    // get added as comments, values already set are preserved in place.
+    // Refresh config.toml when its semantic content drifts from what we'd
+    // render today. Comment-only or whitespace-only differences shouldn't
+    // trigger a rewrite — the TUI reloads on every state-file change and we
+    // don't want to thrash disk on every reload.
     let rendered = render_config_toml(&profile);
-    if raw_config != rendered {
+    let needs_rewrite = match toml::from_str::<ProfileConfig>(&rendered) {
+        Ok(canonical) => {
+            let on_disk = ProfileConfig {
+                base_url: profile.base_url.clone(),
+                api_key: profile.api_key.clone(),
+                auto_start: profile.auto_start,
+                env: profile.env.clone(),
+                fallback_threshold: profile.fallback_threshold,
+            };
+            canonical != on_disk
+        }
+        Err(_) => raw_config != rendered,
+    };
+    if needs_rewrite {
         let _ = with_state_lock(|| {
             let _ = atomic_write(&config_path, &rendered);
             Ok(())
