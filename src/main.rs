@@ -20,13 +20,13 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.as_slice() {
-        [cmd, shell] if cmd == "completions" => return completions::print_script(shell),
         [cmd, sub] if cmd == "completions" && sub == "install" => {
             return completions::install(None);
         }
         [cmd, sub, shell] if cmd == "completions" && sub == "install" => {
             return completions::install(Some(shell));
         }
+        [cmd, shell] if cmd == "completions" => return completions::print_script(shell),
         [cmd] if cmd == "__complete" => {
             completions::print_profile_names();
             return Ok(());
