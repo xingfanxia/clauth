@@ -149,6 +149,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let title = match state.on_confirm {
         ConfirmAction::Delete(_) => "confirm · delete",
         ConfirmAction::CaptureConflict(_) => "confirm · duplicate",
+        ConfirmAction::Switch(_) => "confirm · switch",
     };
     let block = modal_block(title);
     let inner = block.inner(rect);
@@ -324,8 +325,6 @@ fn draw_profile_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Profi
 
 fn profile_menu_label(action: ProfileMenuAction, auto_on: bool) -> String {
     match action {
-        ProfileMenuAction::Switch => "Switch to this profile".to_string(),
-        ProfileMenuAction::Details => "Open details".to_string(),
         ProfileMenuAction::Edit => "Edit endpoint".to_string(),
         ProfileMenuAction::Rename => "Rename".to_string(),
         ProfileMenuAction::ToggleAutoStart => {
@@ -481,18 +480,20 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             (
                 "ACCOUNTS",
                 &[
+                    ("\u{23ce}", "switch to selected profile (confirm)"),
+                    ("m", "open per-profile menu (edit / rename / delete)"),
+                    ("d", "open profile details"),
+                    ("f", "open fallback chain"),
                     (
-                        "\u{23ce} / m",
-                        "open per-profile menu (every action lives here)",
+                        "Shift+\u{2191} / Shift+\u{2193}",
+                        "reorder profile up / down",
                     ),
-                    ("Shift+j / Shift+k", "reorder profile up / down"),
                 ][..],
             ),
             (
                 "LIST",
                 &[
                     ("\u{2191}\u{2193} / j k", "move cursor"),
-                    ("/", "filter by name"),
                     ("r", "refresh usage now"),
                 ][..],
             ),
@@ -509,10 +510,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Screen::ProfileDetail { .. } => vec![(
             "PROFILE",
             &[
-                (
-                    "\u{23ce} / m",
-                    "open per-profile menu (every action lives here)",
-                ),
+                ("m", "open per-profile menu (edit / rename / delete)"),
                 ("r", "refresh usage now"),
                 ("\u{238b}", "back to overview"),
             ][..],

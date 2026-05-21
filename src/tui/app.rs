@@ -182,6 +182,7 @@ pub(crate) struct ConfirmState {
 pub(crate) enum ConfirmAction {
     Delete(String),
     CaptureConflict(Box<CaptureSnapshot>),
+    Switch(String),
 }
 
 #[derive(Debug, Clone)]
@@ -207,8 +208,6 @@ pub(crate) struct ProfileMenuState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileMenuAction {
-    Switch,
-    Details,
     Edit,
     Rename,
     ToggleAutoStart,
@@ -273,16 +272,6 @@ const TOAST_CAPACITY: usize = 4;
 /// How long a toast stays visible before fading off the stack.
 const TOAST_TTL: Duration = Duration::from_secs(4);
 
-// ── Filter ────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub(crate) struct FilterState {
-    pub(crate) input: InputState,
-    /// True while keystrokes feed the input; false once Enter pins the term
-    /// so list nav keys work.
-    pub(crate) focused: bool,
-}
-
 // ── Screens ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,6 +286,9 @@ pub(crate) enum Screen {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MainItemKind {
     Profile(usize),
+    /// Visual break between the profile rows and action rows. Cursor steps
+    /// over it and Enter is a no-op.
+    ActionSeparator,
     NewProfile,
     CaptureCredentials,
     OpenChain,
@@ -319,7 +311,6 @@ pub(crate) struct App {
 
     pub(crate) main_cursor: usize,
     pub(crate) chain_cursor: usize,
-    pub(crate) filter: Option<FilterState>,
 
     pub(crate) toasts: VecDeque<Toast>,
 
@@ -359,7 +350,6 @@ impl App {
             modals: Vec::new(),
             main_cursor: 0,
             chain_cursor: 0,
-            filter: None,
             toasts: VecDeque::new(),
             last_state_mtime: app_state_mtime(),
             started_at: Instant::now(),
@@ -513,49 +503,36 @@ impl App {
 
     // ── Main list ────────────────────────────────────────────────────────────
 
-    /// Profile indices visible under the current filter, preserving order.
-    pub(crate) fn visible_profile_indices(&self) -> Vec<usize> {
-        let filter = self
-            .filter
-            .as_ref()
-            .map(|f| f.input.value.to_lowercase())
-            .unwrap_or_default();
-        if filter.is_empty() {
-            return (0..self.config.profiles.len()).collect();
-        }
-        self.config
-            .profiles
-            .iter()
-            .enumerate()
-            .filter_map(|(i, p)| p.name.to_lowercase().contains(&filter).then_some(i))
-            .collect()
-    }
-
     pub(crate) fn main_items(&self) -> Vec<MainItemKind> {
-        let mut items: Vec<MainItemKind> = self
-            .visible_profile_indices()
-            .into_iter()
+        let mut items: Vec<MainItemKind> = (0..self.config.profiles.len())
             .map(MainItemKind::Profile)
             .collect();
-        // Action rows are suppressed while an active filter is narrowing results.
-        let filter_active = self
-            .filter
-            .as_ref()
-            .is_some_and(|f| !f.input.value.is_empty());
-        if !filter_active {
-            items.push(MainItemKind::NewProfile);
-            items.push(MainItemKind::CaptureCredentials);
-            items.push(MainItemKind::OpenChain);
+        if !self.config.profiles.is_empty() {
+            items.push(MainItemKind::ActionSeparator);
         }
+        items.push(MainItemKind::NewProfile);
+        items.push(MainItemKind::CaptureCredentials);
+        items.push(MainItemKind::OpenChain);
         items
     }
 
     pub(crate) fn clamp_main_cursor(&mut self) {
-        let len = self.main_items().len();
+        let items = self.main_items();
+        let len = items.len();
         if len == 0 {
             self.main_cursor = 0;
-        } else if self.main_cursor >= len {
+            return;
+        }
+        if self.main_cursor >= len {
             self.main_cursor = len - 1;
+        }
+        // Slide off the separator if a delete left the cursor on it.
+        while matches!(
+            items.get(self.main_cursor),
+            Some(MainItemKind::ActionSeparator)
+        ) && self.main_cursor > 0
+        {
+            self.main_cursor -= 1;
         }
     }
 
@@ -641,85 +618,64 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_main_key(app: &mut App, key: KeyEvent) {
-    // Filter input mode steals most of the keymap.
-    if let Some(filter) = app.filter.as_mut()
-        && filter.focused
-    {
-        match key.code {
-            KeyCode::Enter => {
-                if filter.input.value.is_empty() {
-                    app.filter = None;
-                } else {
-                    filter.focused = false;
-                }
-                app.main_cursor = 0;
-            }
-            KeyCode::Esc => {
-                app.filter = None;
-                app.main_cursor = 0;
-            }
-            KeyCode::Backspace => {
-                filter.input.backspace();
-                app.main_cursor = 0;
-            }
-            KeyCode::Char(c) => {
-                filter.input.insert(c);
-                app.main_cursor = 0;
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    let items = app.main_items();
-    let last = items.len().saturating_sub(1);
-
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                reorder_main_cursor(app, -1);
-            } else {
-                app.main_cursor = if app.main_cursor == 0 {
-                    last
-                } else {
-                    app.main_cursor - 1
-                };
-            }
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
+        KeyCode::Up | KeyCode::Char('k') => step_main_cursor(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => step_main_cursor(app, 1),
+        KeyCode::Enter => activate_main_item(app),
+        KeyCode::Char('m') => open_profile_menu_at_cursor(app),
+        KeyCode::Char('d') => open_profile_detail_at_cursor(app),
+        KeyCode::Char('f') => {
+            app.screen = Screen::Chain;
+            app.chain_cursor = 0;
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                reorder_main_cursor(app, 1);
-            } else {
-                app.main_cursor = if app.main_cursor >= last {
-                    0
-                } else {
-                    app.main_cursor + 1
-                };
-            }
-        }
-        KeyCode::Enter | KeyCode::Char('m') => activate_main_item(app),
         KeyCode::Char('q') | KeyCode::Esc => {
-            if app.filter.is_some() {
-                app.filter = None;
-                app.main_cursor = 0;
-            } else {
-                app.quit = true;
-            }
+            app.quit = true;
         }
         KeyCode::Char('?') => app.modals.push(Modal::Help),
         KeyCode::Char('r') => {
             app.manual_refresh();
             app.toast(ToastKind::Info, "refreshing usage…");
         }
-        KeyCode::Char('/') => {
-            app.filter = Some(FilterState {
-                input: InputState::new(""),
-                focused: true,
-            });
-            app.main_cursor = 0;
-        }
         _ => {}
     }
+}
+
+/// Move the main cursor by one item, wrapping at both ends and skipping
+/// over non-selectable rows (currently just `ActionSeparator`).
+fn step_main_cursor(app: &mut App, delta: i32) {
+    let items = app.main_items();
+    let len = items.len();
+    if len == 0 {
+        return;
+    }
+    let mut idx = app.main_cursor as i32;
+    for _ in 0..len {
+        idx = (idx + delta).rem_euclid(len as i32);
+        if !matches!(items.get(idx as usize), Some(MainItemKind::ActionSeparator)) {
+            break;
+        }
+    }
+    app.main_cursor = idx as usize;
+}
+
+fn open_profile_menu_at_cursor(app: &mut App) {
+    let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
+        return;
+    };
+    let Some(name) = app.config.profiles.get(idx).map(|p| p.name.clone()) else {
+        return;
+    };
+    app.modals
+        .push(Modal::ProfileMenu(ProfileMenuState { name, cursor: 0 }));
+}
+
+fn open_profile_detail_at_cursor(app: &mut App) {
+    let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
+        return;
+    };
+    app.screen = Screen::ProfileDetail { profile_index: idx };
 }
 
 fn activate_main_item(app: &mut App) {
@@ -731,9 +687,19 @@ fn activate_main_item(app: &mut App) {
             let Some(name) = app.config.profiles.get(idx).map(|p| p.name.clone()) else {
                 return;
             };
-            app.modals
-                .push(Modal::ProfileMenu(ProfileMenuState { name, cursor: 0 }));
+            // No-op when already active; saves the round-trip through the
+            // confirm modal and a redundant token refresh.
+            if app.config.is_active(&name) {
+                return;
+            }
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: format!("Switch to '{name}'?"),
+                detail: None,
+                choice: true,
+                on_confirm: ConfirmAction::Switch(name),
+            }));
         }
+        MainItemKind::ActionSeparator => {}
         MainItemKind::NewProfile => open_new_profile(app),
         MainItemKind::CaptureCredentials => begin_capture(app),
         MainItemKind::OpenChain => {
@@ -976,9 +942,7 @@ fn handle_profile_detail_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.screen = Screen::Overview;
         }
-        // Single configuration entry point — Enter and `m` both open the
-        // per-profile menu. Every per-profile setting lives there.
-        KeyCode::Enter | KeyCode::Char('m') => {
+        KeyCode::Char('m') => {
             app.modals
                 .push(Modal::ProfileMenu(ProfileMenuState { name, cursor: 0 }));
         }
@@ -1023,19 +987,13 @@ fn toggle_auto_start(app: &mut App, name: &str) {
     }
 }
 
-/// Options shown in the per-profile actions menu. Chain composition lives
-/// in the chain screen — not here — so this menu stays focused on
-/// profile-level concerns.
+/// Options shown in the per-profile actions menu. Switching and viewing
+/// details are reachable directly from the overview (Enter / d), so this
+/// menu stays focused on mutations.
 pub(crate) fn profile_menu_options(app: &App, name: &str) -> Vec<ProfileMenuAction> {
-    let mut out = Vec::with_capacity(7);
-    let profile = app.config.find(name);
-    let is_active = app.config.is_active(name);
-    let is_oauth = profile.map(|p| p.is_oauth()).unwrap_or(false);
+    let mut out = Vec::with_capacity(5);
+    let is_oauth = app.config.find(name).map(|p| p.is_oauth()).unwrap_or(false);
 
-    if !is_active {
-        out.push(ProfileMenuAction::Switch);
-    }
-    out.push(ProfileMenuAction::Details);
     out.push(ProfileMenuAction::Edit);
     out.push(ProfileMenuAction::Rename);
     if is_oauth {
@@ -1082,17 +1040,6 @@ fn handle_profile_menu_key(app: &mut App, key: KeyEvent) {
 
 fn run_profile_menu_action(app: &mut App, name: &str, action: ProfileMenuAction) {
     match action {
-        ProfileMenuAction::Switch => {
-            app.modals.pop();
-            perform_switch(app, name);
-        }
-        ProfileMenuAction::Details => {
-            let idx = app.config.profiles.iter().position(|p| p.name == name);
-            app.modals.pop();
-            if let Some(idx) = idx {
-                app.screen = Screen::ProfileDetail { profile_index: idx };
-            }
-        }
         ProfileMenuAction::Edit => {
             app.modals.pop();
             open_edit_profile(app, name);
@@ -1302,6 +1249,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 input: InputState::new(""),
             }));
         }
+        ConfirmAction::Switch(name) => perform_switch(app, &name),
     }
 }
 

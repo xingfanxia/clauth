@@ -7,7 +7,7 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap};
 
-use super::super::app::{App, FilterState, MainItemKind};
+use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::format::{
     account_type_label, account_type_style, fixed, name_style, window_summary_span,
@@ -29,16 +29,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let title = match app.filter.as_ref() {
-        Some(filter) => filter_title(filter),
-        None => Line::from(vec![
-            Span::styled(" ACCOUNTS ", theme::label()),
-            Span::styled(
-                format!("{} total", app.config.profiles.len()),
-                theme::faint(),
-            ),
-        ]),
-    };
+    let title = Line::from(vec![
+        Span::styled(" ACCOUNTS ", theme::label()),
+        Span::styled(
+            format!("{} total", app.config.profiles.len()),
+            theme::faint(),
+        ),
+    ]);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -76,6 +73,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 &widths,
                 row == app.main_cursor,
             )),
+            MainItemKind::ActionSeparator => ListItem::new(render_separator_row()),
             MainItemKind::NewProfile => {
                 ListItem::new(render_action_row("+ new profile", row == app.main_cursor))
             }
@@ -96,18 +94,6 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(app.main_cursor.min(items.len().saturating_sub(1))));
     frame.render_stateful_widget(list, chunks[1], &mut state);
-}
-
-fn filter_title(filter: &FilterState) -> Line<'_> {
-    let prefix = if filter.focused {
-        Span::styled(" SEARCH ▍ ", theme::label())
-    } else {
-        Span::styled(" SEARCH ", theme::label())
-    };
-    Line::from(vec![
-        prefix,
-        Span::styled(filter.input.value.clone(), theme::accent()),
-    ])
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -304,6 +290,14 @@ fn render_action_row(label: &'static str, selected: bool) -> Line<'static> {
         Span::raw("  ")
     };
     Line::from(vec![cursor, Span::styled(label, theme::dim())])
+}
+
+/// Section break above the action rows. Cursor skips this line.
+fn render_separator_row() -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled("ACTIONS", theme::label()),
+    ])
 }
 
 fn gap(widths: &OverviewWidths) -> Span<'static> {
