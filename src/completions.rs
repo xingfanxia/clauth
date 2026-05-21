@@ -91,7 +91,7 @@ fn install_rc(shell: &str, script: &str, rc_name: &str) -> Result<()> {
         .with_context(|| format!("failed to write {}", script_path.display()))?;
 
     let rc_path = home.join(rc_name);
-    let source_line = format!("source {}", script_path.display());
+    let source_line = format!("source \"{}\"", script_path.display());
 
     let existing = fs::read_to_string(&rc_path).unwrap_or_default();
     let already = existing.lines().any(|l| l.trim() == source_line);
