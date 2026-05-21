@@ -13,20 +13,23 @@ use crate::profile::Profile;
 use crate::usage::{FetchStatus, UsageWindow, iso_to_epoch_secs, now_epoch_secs};
 
 pub(super) fn fixed(value: &str, width: usize) -> String {
-    let mut out = String::new();
-    for (i, ch) in value.chars().enumerate() {
-        if i >= width {
+    let mut out = String::with_capacity(width);
+    let mut count = 0;
+    let mut iter = value.chars();
+    for ch in iter.by_ref() {
+        if count >= width {
             break;
         }
         out.push(ch);
+        count += 1;
     }
-    if value.chars().count() > width && width > 0 {
+    if width > 0 && iter.next().is_some() {
         out.pop();
         out.push('…');
+        count = width;
     }
-    let len = out.chars().count();
-    if len < width {
-        out.push_str(&" ".repeat(width - len));
+    if count < width {
+        out.push_str(&" ".repeat(width - count));
     }
     out
 }
