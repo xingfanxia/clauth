@@ -2,7 +2,7 @@
 name = "clauth"
 version = "0.2.0"
 edition = "2024"
-description = "A simple Claude Code account switcher - swap OAuth and API profiles in an instant"
+description = "Simple Claude Code account switcher and usage monitor"
 license = "MIT"
 repository = "https://github.com/uwuclxdy/clauth"
 homepage = "https://github.com/uwuclxdy/clauth"
@@ -11,9 +11,9 @@ keywords = ["claude-code", "account-switch", "cli", "profiles", "anthropic"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-ratatui = "0.29"
+ratatui = "0.30.0"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.149", features = ["preserve_order"] }
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
 toml = "1.1.2"
 anyhow = "1.0.102"
 dirs = "6.0.0"
