@@ -436,11 +436,7 @@ impl App {
         let info_map = self.usage_store.lock().ok();
         let status_map = self.usage_status.lock().ok();
         for p in &mut self.config.profiles {
-            if let Some(s) = info_map.as_ref()
-                && let Some(info) = s.get(&p.name)
-            {
-                p.usage = Some(info.clone());
-            }
+            p.usage = info_map.as_ref().and_then(|s| s.get(&p.name)).cloned();
             p.fetch_status = status_map.as_ref().and_then(|s| s.get(&p.name).copied());
         }
     }
