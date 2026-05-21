@@ -184,8 +184,8 @@ impl OverviewWidths {
             }
         }
 
-        // Scale gap with leftover width so columns breathe on wide terminals
-        // and stay tight on narrow ones. Bars keep their natural size.
+        // Spread leftover width across the inter-column gaps so columns
+        // breathe on wide terminals and stay tight on narrow ones.
         let base = fixed_overview_width(name, kind, five_hour, seven_day, route, gap_min);
         let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
         let gap_slots = column_count.saturating_sub(1).max(1);
