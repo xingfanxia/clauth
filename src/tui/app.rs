@@ -1452,6 +1452,9 @@ fn handle_chain_item_menu_key(app: &mut App, key: KeyEvent) {
                     {
                         app.config.state.fallback_chain.swap(p - 1, p);
                         let _ = save_app_state(&app.config.state);
+                        if app.chain_cursor > 0 {
+                            app.chain_cursor -= 1;
+                        }
                     }
                 }
                 ChainAction::MoveDown => {
@@ -1460,6 +1463,9 @@ fn handle_chain_item_menu_key(app: &mut App, key: KeyEvent) {
                     {
                         app.config.state.fallback_chain.swap(p, p + 1);
                         let _ = save_app_state(&app.config.state);
+                        if app.chain_cursor + 1 < chain_items(app).len() {
+                            app.chain_cursor += 1;
+                        }
                     }
                 }
                 ChainAction::Remove => {
