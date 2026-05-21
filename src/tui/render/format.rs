@@ -48,7 +48,7 @@ pub(super) fn name_style(profile: &Profile) -> Style {
 }
 
 pub(super) fn account_type_label(profile: &Profile) -> String {
-    if profile.base_url.is_some() || profile.api_key.is_some() {
+    if !profile.is_oauth() {
         return "API".to_string();
     }
     let label = endpoint_label(profile);
@@ -59,7 +59,7 @@ pub(super) fn account_type_label(profile: &Profile) -> String {
 }
 
 pub(super) fn account_type_style(profile: &Profile) -> Style {
-    if profile.base_url.is_some() || profile.api_key.is_some() {
+    if !profile.is_oauth() {
         theme::accent()
     } else {
         Style::default().fg(theme::ACCENT_2)

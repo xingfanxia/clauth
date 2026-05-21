@@ -59,7 +59,7 @@ fn draw_title(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let name = profile.map(|p| p.name.as_str()).unwrap_or("—");
             let kind = profile
                 .map(|p| {
-                    if p.base_url.is_some() || p.api_key.is_some() {
+                    if !p.is_oauth() {
                         "endpoint".to_string()
                     } else {
                         p.usage
