@@ -108,10 +108,10 @@ fn is_cargo_installed() -> bool {
     let Ok(exe) = env::current_exe() else {
         return false;
     };
-    let cargo_bin = dirs::home_dir()
-        .map(|h| h.join(".cargo").join("bin"))
-        .unwrap_or_default();
-    exe.starts_with(cargo_bin)
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    exe.starts_with(home.join(".cargo").join("bin"))
 }
 
 fn asset_name() -> Option<&'static str> {
