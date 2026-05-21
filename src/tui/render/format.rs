@@ -5,7 +5,7 @@
 //! helpers (e.g. fallback flow widget, overview column math) stay on their
 //! screen module.
 
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 
 use super::super::theme;
