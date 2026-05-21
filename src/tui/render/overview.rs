@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap}
 use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::format::{
-    account_type_label, account_type_style, fixed, name_style, window_summary_parts,
+    account_type_label, account_type_style, fixed, fixed_split, name_style, window_summary_parts,
     window_summary_span,
 };
 use crate::fallback::threshold_for;
@@ -242,14 +242,16 @@ fn render_overview_row(
     } else {
         Span::styled("◇", theme::faint())
     };
+    let (name_text, name_pad) = fixed_split(&profile.name, widths.name);
     let name = Span::styled(
-        fixed(&profile.name, widths.name),
+        name_text,
         if active {
             name_style(profile).fg(theme::ACCENT_2)
         } else {
             name_style(profile)
         },
     );
+    let name_pad = Span::raw(name_pad);
 
     // Auto-start indicator sits after the 5h column so it reads alongside the
     // usage that triggers the rotation, with a fixed 1-char slot kept in all
@@ -260,7 +262,7 @@ fn render_overview_row(
         Span::raw(" ")
     };
 
-    let mut spans = vec![cursor, dot, Span::raw(" "), name, gap(widths)];
+    let mut spans = vec![cursor, dot, Span::raw(" "), name, name_pad, gap(widths)];
     spans.push(Span::styled(
         fixed(&account_type_label(profile), widths.kind),
         account_type_style(profile),

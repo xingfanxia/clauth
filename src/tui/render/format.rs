@@ -14,25 +14,32 @@ use crate::profile::Profile;
 use crate::usage::{FetchStatus, UsageWindow, iso_to_epoch_secs, now_epoch_secs};
 
 pub(super) fn fixed(value: &str, width: usize) -> String {
-    let mut out = String::with_capacity(width);
+    let (mut content, pad) = fixed_split(value, width);
+    content.push_str(&pad);
+    content
+}
+
+/// Split into the visible content (possibly truncated with `…`) and the trailing
+/// padding. Callers that style only the content (e.g. underlined names) keep
+/// the padding plain so decorations don't bleed past the text.
+pub(super) fn fixed_split(value: &str, width: usize) -> (String, String) {
+    let mut content = String::with_capacity(width);
     let mut count = 0;
     let mut iter = value.chars();
     for ch in iter.by_ref() {
         if count >= width {
             break;
         }
-        out.push(ch);
+        content.push(ch);
         count += 1;
     }
     if width > 0 && iter.next().is_some() {
-        out.pop();
-        out.push('…');
+        content.pop();
+        content.push('…');
         count = width;
     }
-    if count < width {
-        out.push_str(&" ".repeat(width - count));
-    }
-    out
+    let pad = " ".repeat(width - count);
+    (content, pad)
 }
 
 pub(super) fn name_style(profile: &Profile) -> Style {
