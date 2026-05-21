@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -43,13 +44,13 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
-fn agent() -> ureq::Agent {
+static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(4)))
         .timeout_recv_response(Some(Duration::from_secs(15)))
         .build()
         .into()
-}
+});
 
 fn refresh(refresh_token: &str) -> Result<TokenResponse> {
     let body = serde_json::to_string(&serde_json::json!({
@@ -58,7 +59,7 @@ fn refresh(refresh_token: &str) -> Result<TokenResponse> {
         "client_id": CLIENT_ID,
     }))?;
 
-    let text = agent()
+    let text = AGENT
         .post(TOKEN_ENDPOINT)
         .header("Content-Type", "application/json")
         .send(&body)
@@ -80,7 +81,7 @@ fn kick(access_token: &str) -> Result<()> {
         "messages": [{ "role": "user", "content": "x" }],
     }))?;
 
-    agent()
+    AGENT
         .post(MESSAGES_ENDPOINT)
         .header("Content-Type", "application/json")
         .header("Authorization", &format!("Bearer {access_token}"))

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -167,16 +167,16 @@ pub(crate) fn fetch_cached(
     }
 }
 
-fn agent() -> ureq::Agent {
+static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(4)))
         .timeout_recv_response(Some(Duration::from_secs(8)))
         .build()
         .into()
-}
+});
 
-fn get_json(agent: &ureq::Agent, url: &str, access_token: &str) -> Result<String> {
-    agent
+fn get_json(url: &str, access_token: &str) -> Result<String> {
+    AGENT
         .get(url)
         .header("Authorization", &format!("Bearer {access_token}"))
         .header("anthropic-beta", "oauth-2025-04-20")
@@ -188,15 +188,13 @@ fn get_json(agent: &ureq::Agent, url: &str, access_token: &str) -> Result<String
 }
 
 fn fetch(access_token: &str) -> Result<UsageInfo> {
-    let agent = agent();
-
-    let usage_text = get_json(&agent, USAGE_ENDPOINT, access_token)?;
+    let usage_text = get_json(USAGE_ENDPOINT, access_token)?;
     let raw: RawUsage =
         serde_json::from_str(&usage_text).map_err(crate::ureq_error::into_anyhow)?;
 
     // Profile is best-effort: a stale token may 401 on /profile while /usage
     // still serves cached numbers. A profile failure shouldn't drop usage.
-    let plan = get_json(&agent, PROFILE_ENDPOINT, access_token)
+    let plan = get_json(PROFILE_ENDPOINT, access_token)
         .ok()
         .and_then(|text| serde_json::from_str::<RawProfile>(&text).ok())
         .map(|p| PlanInfo {
