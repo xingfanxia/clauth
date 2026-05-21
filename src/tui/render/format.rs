@@ -89,8 +89,20 @@ pub(super) fn window_summary_span(
     width: usize,
     include_bar: bool,
 ) -> Span<'static> {
+    let (text, style) = window_summary_parts(window, width, include_bar);
+    Span::styled(fixed(&text, width), style)
+}
+
+/// Same content as [`window_summary_span`] but returns the raw text and its
+/// style so the caller can append decorations (e.g. an auto-start marker) and
+/// pad to the column width itself.
+pub(super) fn window_summary_parts(
+    window: Option<&UsageWindow>,
+    width: usize,
+    include_bar: bool,
+) -> (String, Style) {
     let Some(window) = window else {
-        return Span::styled(fixed("—", width), theme::faint());
+        return ("—".to_string(), theme::faint());
     };
     let pct = window.utilization.clamp(0.0, 100.0);
     let color = theme::util_color(pct);
@@ -107,5 +119,5 @@ pub(super) fn window_summary_span(
     } else {
         format!("{pct:>3.0}%")
     };
-    Span::styled(fixed(&text, width), Style::default().fg(color))
+    (text, Style::default().fg(color))
 }

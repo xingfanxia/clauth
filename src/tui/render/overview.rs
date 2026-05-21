@@ -10,7 +10,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap}
 use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::format::{
-    account_type_label, account_type_style, fixed, name_style, window_summary_span,
+    account_type_label, account_type_style, fixed, name_style, window_summary_parts,
+    window_summary_span,
 };
 use crate::fallback::threshold_for;
 use crate::profile::Profile;
@@ -197,7 +198,8 @@ fn fixed_overview_width(
     gap: usize,
 ) -> usize {
     let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
-    4 + name + kind + five_hour + seven_day + route + column_count.saturating_sub(1) * gap
+    // 4 = cursor + dot + spacer before name; +2 = spacer + auto-start marker after 5h.
+    6 + name + kind + five_hour + seven_day + route + column_count.saturating_sub(1) * gap
 }
 
 fn overview_header(widths: &OverviewWidths) -> Line<'static> {
@@ -207,6 +209,7 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
     spans.push(Span::styled(fixed("type", widths.kind), theme::label()));
     spans.push(gap(widths));
     spans.push(Span::styled(fixed("5h", widths.five_hour), theme::label()));
+    spans.push(Span::raw("  "));
     if widths.seven_day > 0 {
         spans.push(gap(widths));
         spans.push(Span::styled(fixed("7d", widths.seven_day), theme::label()));
@@ -239,13 +242,6 @@ fn render_overview_row(
     } else {
         Span::styled("◇", theme::faint())
     };
-    // Auto-start indicator sits in the single space between the dot and the
-    // name, so the alignment of every other column stays identical.
-    let auto_marker = if profile.auto_start && profile.is_oauth() {
-        Span::styled("↻", theme::accent())
-    } else {
-        Span::raw(" ")
-    };
     let name = Span::styled(
         fixed(&profile.name, widths.name),
         if active {
@@ -255,17 +251,31 @@ fn render_overview_row(
         },
     );
 
-    let mut spans = vec![cursor, dot, auto_marker, name, gap(widths)];
+    // Auto-start indicator sits after the 5h column so it reads alongside the
+    // usage that triggers the rotation, with a fixed 1-char slot kept in all
+    // rows so subsequent columns stay aligned.
+    let auto_marker = if profile.auto_start && profile.is_oauth() {
+        Span::styled("↻", theme::accent())
+    } else {
+        Span::raw(" ")
+    };
+
+    let mut spans = vec![cursor, dot, Span::raw(" "), name, gap(widths)];
     spans.push(Span::styled(
         fixed(&account_type_label(profile), widths.kind),
         account_type_style(profile),
     ));
     spans.push(gap(widths));
-    spans.push(window_summary_span(
+    let (five_text, five_style) = window_summary_parts(
         profile.usage.as_ref().and_then(|u| u.five_hour.as_ref()),
         widths.five_hour,
         true,
-    ));
+    );
+    let five_pad = widths.five_hour.saturating_sub(five_text.chars().count());
+    spans.push(Span::styled(five_text, five_style));
+    spans.push(Span::raw(" "));
+    spans.push(auto_marker);
+    spans.push(Span::raw(" ".repeat(five_pad)));
     if widths.seven_day > 0 {
         spans.push(gap(widths));
         spans.push(window_summary_span(
