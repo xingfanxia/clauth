@@ -22,9 +22,9 @@ use crate::actions::{
     switch_profile, validate_profile_name,
 };
 use crate::claude::{
-    credentials_diverged, detach_credentials_link, force_link_profile_credentials,
-    force_snapshot_active_credentials, link_profile_credentials, read_claude_credentials,
-    snapshot_active_credentials,
+    LinkState, classify_credentials_link, credentials_diverged, detach_credentials_link,
+    force_link_profile_credentials, force_snapshot_active_credentials, link_profile_credentials,
+    read_claude_credentials, snapshot_active_credentials,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, auto_switch_if_needed, threshold_for};
 use crate::lock::with_state_lock;
@@ -349,6 +349,11 @@ pub(crate) struct App {
     /// subsequent manual_refresh flips activity again, so we'd otherwise
     /// re-enter the auto-start path on the next idle edge.
     pub(crate) just_auto_started: bool,
+    /// Last time the 1Hz divergence poll ran. Re-checks whether
+    /// `~/.claude/.credentials.json` still points at the active profile and
+    /// pushes a Divergence modal when CC has overwritten the symlink
+    /// (typically by `/login`). Defers behind any open modal.
+    pub(crate) last_divergence_check: Instant,
 }
 
 impl App {
@@ -378,6 +383,7 @@ impl App {
             quit: false,
             was_busy: false,
             just_auto_started: false,
+            last_divergence_check: Instant::now(),
         }
     }
 
@@ -1617,7 +1623,38 @@ pub(crate) fn on_tick(app: &mut App) {
         app.last_state_mtime = app_state_mtime();
         app.toast(ToastKind::Warning, format!("auto-switched to '{target}'"));
     }
+
+    poll_credentials_divergence(app);
+
     app.prune_toasts();
+}
+
+/// 1Hz check that the live `.credentials.json` still points at the active
+/// profile's stored credentials. Pushes a Divergence modal when CC has
+/// overwritten the symlink (typically by `/login`). Skips when any modal is
+/// already open so we don't stack on top of work the user has in flight.
+fn poll_credentials_divergence(app: &mut App) {
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    if app.last_divergence_check.elapsed() < POLL_INTERVAL {
+        return;
+    }
+    app.last_divergence_check = Instant::now();
+
+    if !app.modals.is_empty() {
+        return;
+    }
+    let Some(active) = app.config.state.active_profile.clone() else {
+        return;
+    };
+    if !matches!(
+        classify_credentials_link(&active).ok(),
+        Some(LinkState::Diverged)
+    ) {
+        return;
+    }
+    app.modals
+        .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
 }
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────
