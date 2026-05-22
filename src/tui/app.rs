@@ -7,7 +7,7 @@
 //!   - Modals stack: the top of `modals` owns input; events fall through to
 //!     the screen below only when the stack is empty.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -33,8 +33,9 @@ use crate::profile::{
     AppConfig, Profile, app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::usage::{
-    ActivityFlag, NextRefreshAt, REFRESH_INTERVAL, StatusStore, TokenList, UsageStore,
-    fetch_all_into, now_ms, spawn_refresher,
+    ActivityFlag, LastFetchedAt, LastStable, NextRefreshAt, PendingAutoStart, StatusStore,
+    TokenEntry, TokenList, UsageStore, default_fallback_threshold, fetch_all_into, now_ms,
+    spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -333,6 +334,9 @@ pub(crate) struct App {
     pub(crate) usage_tokens: TokenList,
     pub(crate) activity: ActivityFlag,
     pub(crate) next_refresh_at: NextRefreshAt,
+    pub(crate) last_fetched: LastFetchedAt,
+    pub(crate) last_stable: LastStable,
+    pub(crate) pending_auto_start: PendingAutoStart,
 
     pub(crate) screen: Screen,
     pub(crate) modals: Vec<Modal>,
@@ -345,10 +349,6 @@ pub(crate) struct App {
     pub(crate) last_state_mtime: Option<SystemTime>,
     pub(crate) started_at: Instant,
     pub(crate) quit: bool,
-    /// Set true while the background usage refresher has work in flight. When
-    /// it drops false on the next tick we run auto-start, so the kick lands
-    /// after a refresh cycle confirmed which profiles have no 5h window.
-    pub(crate) was_busy: bool,
     /// Last time the 1Hz divergence poll ran. Re-checks whether
     /// `~/.claude/.credentials.json` still points at the active profile and
     /// pushes a Divergence modal when CC has overwritten the symlink
@@ -362,9 +362,10 @@ impl App {
         let usage_status: StatusStore = Arc::new(Mutex::new(HashMap::new()));
         let usage_tokens: TokenList = Arc::new(Mutex::new(collect_tokens(&config.profiles)));
         let activity: ActivityFlag = Arc::new(AtomicBool::new(false));
-        let next_refresh_at: NextRefreshAt = Arc::new(AtomicU64::new(
-            now_ms() + REFRESH_INTERVAL.as_millis() as u64,
-        ));
+        let next_refresh_at: NextRefreshAt = Arc::new(AtomicU64::new(now_ms() + 30_000));
+        let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
+        let last_stable: LastStable = Arc::new(Mutex::new(HashMap::new()));
+        let pending_auto_start: PendingAutoStart = Arc::new(Mutex::new(HashSet::new()));
 
         Self {
             config: Arc::new(Mutex::new(config)),
@@ -373,6 +374,9 @@ impl App {
             usage_tokens,
             activity,
             next_refresh_at,
+            last_fetched,
+            last_stable,
+            pending_auto_start,
             screen: Screen::Overview,
             modals: Vec::new(),
             main_cursor: 0,
@@ -381,7 +385,6 @@ impl App {
             last_state_mtime: app_state_mtime(),
             started_at: Instant::now(),
             quit: false,
-            was_busy: false,
             last_divergence_check: Instant::now(),
         }
     }
@@ -424,6 +427,9 @@ impl App {
             &self.usage_store,
             &self.usage_status,
             &self.activity,
+            &self.last_fetched,
+            &self.last_stable,
+            &self.pending_auto_start,
         );
 
         let started = {
@@ -431,15 +437,18 @@ impl App {
             oauth::auto_start_windows(&mut cfg, &self.usage_store)
         };
         if !started.is_empty() {
-            let retry: Vec<(String, String)> = collect_tokens(&self.config().profiles)
+            let retry: Vec<TokenEntry> = collect_tokens(&self.config().profiles)
                 .into_iter()
-                .filter(|(name, _)| started.contains(name))
+                .filter(|e| started.contains(&e.name))
                 .collect();
             fetch_all_into(
                 &retry,
                 &self.usage_store,
                 &self.usage_status,
                 &self.activity,
+                &self.last_fetched,
+                &self.last_stable,
+                &self.pending_auto_start,
             );
             *self
                 .usage_tokens
@@ -453,6 +462,9 @@ impl App {
             Arc::clone(&self.usage_status),
             Arc::clone(&self.activity),
             Arc::clone(&self.next_refresh_at),
+            Arc::clone(&self.last_fetched),
+            Arc::clone(&self.last_stable),
+            Arc::clone(&self.pending_auto_start),
         );
 
         self.apply_usage();
@@ -503,22 +515,35 @@ impl App {
     }
 
     pub(crate) fn manual_refresh(&self) {
-        // Pull current tokens fresh; tick the refresher's deadline forward so
-        // the background loop doesn't immediately duplicate this work.
+        // Manual refresh bypasses the cache rule. Clearing `last_fetched`
+        // forces every entry to be due, both for the immediate fetch we kick
+        // off here and for the refresher's next tick.
+        if let Ok(mut lf) = self.last_fetched.lock() {
+            lf.clear();
+        }
         let snapshot = self
             .usage_tokens
             .lock()
             .expect("usage_tokens mutex poisoned")
             .clone();
-        self.next_refresh_at.store(
-            now_ms() + REFRESH_INTERVAL.as_millis() as u64,
-            Ordering::Relaxed,
-        );
+        self.next_refresh_at
+            .store(now_ms() + 30_000, Ordering::Relaxed);
         let store = Arc::clone(&self.usage_store);
         let status = Arc::clone(&self.usage_status);
         let activity = Arc::clone(&self.activity);
+        let last_fetched = Arc::clone(&self.last_fetched);
+        let last_stable = Arc::clone(&self.last_stable);
+        let pending_auto_start = Arc::clone(&self.pending_auto_start);
         std::thread::spawn(move || {
-            fetch_all_into(&snapshot, &store, &status, &activity);
+            fetch_all_into(
+                &snapshot,
+                &store,
+                &status,
+                &activity,
+                &last_fetched,
+                &last_stable,
+                &pending_auto_start,
+            );
         });
     }
 
@@ -585,18 +610,20 @@ impl App {
 
 // ── Token snapshot ────────────────────────────────────────────────────────────
 
-pub(crate) fn collect_tokens(profiles: &[Profile]) -> Vec<(String, String)> {
+pub(crate) fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
     profiles
         .iter()
         .filter_map(|p| {
-            let token = p
-                .credentials
-                .as_ref()?
-                .claude_ai_oauth
-                .as_ref()?
-                .access_token
-                .clone();
-            Some((p.name.clone(), token))
+            let oauth = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
+            Some(TokenEntry {
+                name: p.name.clone(),
+                access_token: oauth.access_token.clone(),
+                refresh_token: oauth.refresh_token.clone(),
+                fallback_threshold: p
+                    .fallback_threshold
+                    .unwrap_or_else(default_fallback_threshold),
+                auto_start: p.auto_start,
+            })
         })
         .collect()
 }
@@ -1730,36 +1757,39 @@ pub(crate) fn on_tick(app: &mut App) {
     }
     app.apply_usage();
 
-    // Refresher just finished a cycle. Now is the moment to check whether any
-    // opted-in profile is still missing a 5h window and prime one. Doing this
-    // here (instead of inside the refresher thread) keeps the mutation path
-    // on the main thread, reusing existing &mut AppConfig flows. The kick
-    // function short-circuits in microseconds when nothing needs work, so
-    // the per-tick cost is only paid when there's actual work to do.
-    //
-    // No edge-debounce on the manual_refresh we trigger below: per-profile
-    // `last_auto_start_at` cooldown already blocks re-kicking the same
-    // profile, so a second auto_start_windows call from the follow-up edge
-    // is a harmless no-op. Trying to debounce by setting a flag would stall
-    // for 30s when the manual_refresh fetch lands inside one 100ms poll.
-    let busy = app.activity.load(Ordering::Relaxed);
-    if app.was_busy && !busy {
-        let started = {
+    // Drain the auto-start queue the refresher fills when a successful fetch
+    // shows no live 5h window. Mutation stays on the main thread so we keep
+    // reusing the existing `&mut AppConfig` flow. `auto_start_named` enforces
+    // its own per-profile cooldown, so a duplicate insert is a no-op.
+    let pending: Vec<String> = {
+        let mut p = app
+            .pending_auto_start
+            .lock()
+            .expect("pending_auto_start mutex poisoned");
+        let v: Vec<String> = p.iter().cloned().collect();
+        p.clear();
+        v
+    };
+    let mut started = Vec::new();
+    for name in pending {
+        let kicked = {
             let mut cfg = app.config();
-            oauth::auto_start_windows(&mut cfg, &app.usage_store)
+            oauth::auto_start_named(&mut cfg, &name)
         };
-        if !started.is_empty() {
-            app.refresh_tokens();
-            app.manual_refresh();
-            let body = if started.len() == 1 {
-                format!("auto-started usage window for '{}'", started[0])
-            } else {
-                format!("auto-started {} usage windows", started.len())
-            };
-            app.toast(ToastKind::Info, body);
+        if kicked {
+            started.push(name);
         }
     }
-    app.was_busy = busy;
+    if !started.is_empty() {
+        app.refresh_tokens();
+        app.manual_refresh();
+        let body = if started.len() == 1 {
+            format!("auto-started usage window for '{}'", started[0])
+        } else {
+            format!("auto-started {} usage windows", started.len())
+        };
+        app.toast(ToastKind::Info, body);
+    }
 
     let switched = {
         let mut cfg = app.config();
