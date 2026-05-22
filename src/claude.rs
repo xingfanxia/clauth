@@ -97,16 +97,29 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
 }
 
 /// Symlinks `~/.claude/.credentials.json` → profile's `credentials.json`;
-/// copies on Windows without symlink privilege.
+/// copies on Windows without symlink privilege. Refuses to overwrite a
+/// regular file at the live path unless its content already matches the
+/// profile target — replacing a divergent regular file would silently
+/// destroy whatever CC wrote there (typically a re-login the user hasn't
+/// resolved yet).
 pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
+        let target = profile_dir(name)?.join("credentials.json");
 
-        if link.symlink_metadata().is_ok() {
+        if let Ok(meta) = link.symlink_metadata() {
+            if !meta.file_type().is_symlink() {
+                let live_bytes = std::fs::read(&link).ok();
+                let target_bytes = std::fs::read(&target).ok();
+                if live_bytes != target_bytes {
+                    anyhow::bail!(
+                        "refusing to replace .credentials.json — live file differs from profile '{name}'; resolve divergence first"
+                    );
+                }
+            }
             std::fs::remove_file(&link).context("Failed to remove old .credentials.json")?;
         }
 
-        let target = profile_dir(name)?.join("credentials.json");
         if target.exists() {
             if let Some(parent) = link.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -244,18 +257,30 @@ pub(crate) fn build_claude_settings_json(
 }
 
 /// Reads the live .credentials.json and saves it to the active profile.
+/// No-op when the live path has diverged from our symlink — accepting a
+/// divergent live file as authoritative would silently overwrite the
+/// profile's stored identity. The reconciliation modal resolves divergence
+/// by calling `force_snapshot_active_credentials` after the user picks
+/// "Overwrite".
 pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
     with_state_lock(|| {
         let Some(active) = config.state.active_profile.clone() else {
             return Ok(());
         };
-        let credentials = read_claude_credentials()?;
-        if let Some(profile) = config.find_mut(&active) {
-            profile.credentials = credentials;
-            save_profile(profile)?;
+        if matches!(classify_credentials_link(&active)?, LinkState::Diverged) {
+            return Ok(());
         }
-        Ok(())
+        snapshot_active_credentials_unchecked(config, &active)
     })
+}
+
+fn snapshot_active_credentials_unchecked(config: &mut AppConfig, active: &str) -> Result<()> {
+    let credentials = read_claude_credentials()?;
+    if let Some(profile) = config.find_mut(active) {
+        profile.credentials = credentials;
+        save_profile(profile)?;
+    }
+    Ok(())
 }
 
 /// Returns true when both sides carry an OAuth block and either the access

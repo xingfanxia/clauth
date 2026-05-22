@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Deserialize;
 
+use crate::claude::{LinkState, classify_credentials_link};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, save_app_state, save_profile};
 use crate::usage::{UsageStore, now_ms};
@@ -101,10 +102,16 @@ fn kick(access_token: &str) -> Result<()> {
 /// Returns the names of profiles whose token rotation succeeded so the caller
 /// can target follow-up work (usage re-fetch, kick) at the same set.
 pub(crate) fn refresh_all(config: &mut AppConfig) -> Vec<String> {
+    let skip_active = active_link_diverged(config);
     let snapshots: Vec<(String, String)> = config
         .profiles
         .iter()
-        .filter_map(|p| Some((p.name.clone(), p.refresh_token()?.to_string())))
+        .filter_map(|p| {
+            if skip_active && config.is_active(&p.name) {
+                return None;
+            }
+            Some((p.name.clone(), p.refresh_token()?.to_string()))
+        })
         .collect();
 
     if snapshots.is_empty() {
@@ -161,11 +168,15 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
     //
     // Holding the lock during the OAuth/messages HTTP round trips would stall
     // every other instance for seconds, so we release between claim and work.
+    let skip_active = active_link_diverged(config);
     let snapshots: Vec<(String, String)> = match with_state_lock(|| {
         let now = now_ms();
         let mut claimed = Vec::new();
         for profile in &config.profiles {
             if !profile.auto_start {
+                continue;
+            }
+            if skip_active && config.is_active(&profile.name) {
                 continue;
             }
             let resets_at = {
@@ -250,4 +261,17 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
         }
     }
     kicked
+}
+
+/// True when an active profile is set and its live .credentials.json no
+/// longer resolves to that profile's stored credentials. In that state, the
+/// in-memory tokens are stale relative to whatever CC just wrote, so
+/// rotating them would leak a refresh chain nobody will use.
+fn active_link_diverged(config: &AppConfig) -> bool {
+    config.state.active_profile.as_deref().is_some_and(|name| {
+        matches!(
+            classify_credentials_link(name).ok(),
+            Some(LinkState::Diverged)
+        )
+    })
 }
