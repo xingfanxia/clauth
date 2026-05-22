@@ -37,12 +37,12 @@ const KICK_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI 
 const AUTO_START_COOLDOWN_MS: u64 = 4 * 3600 * 1000 + 30 * 60 * 1000;
 
 #[derive(Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: String,
-    expires_in: u64,
+pub(crate) struct TokenResponse {
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
+    pub(crate) expires_in: u64,
     #[serde(default)]
-    scope: Option<String>,
+    pub(crate) scope: Option<String>,
 }
 
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
@@ -53,7 +53,7 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .into()
 });
 
-fn refresh(refresh_token: &str) -> Result<TokenResponse> {
+pub(crate) fn refresh(refresh_token: &str) -> Result<TokenResponse> {
     let body = serde_json::to_string(&serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -261,6 +261,31 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
         }
     }
     kicked
+}
+
+/// Write a rotated token pair into the named profile's OAuth block and
+/// persist. Returns true on success. No-op when the profile or OAuth block
+/// is missing — callers that care can refuse to act on `false`.
+pub(crate) fn apply_rotated_tokens(config: &mut AppConfig, name: &str, tok: TokenResponse) -> bool {
+    with_state_lock(|| {
+        let Some(profile) = config.find_mut(name) else {
+            return Ok::<_, anyhow::Error>(false);
+        };
+        let Some(creds) = profile.credentials.as_mut() else {
+            return Ok(false);
+        };
+        let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
+            return Ok(false);
+        };
+        oauth.access_token = tok.access_token;
+        oauth.refresh_token = Some(tok.refresh_token);
+        oauth.expires_at = Some((now_ms() + tok.expires_in * 1000) as i64);
+        if let Some(scope) = tok.scope {
+            oauth.scopes = Some(scope.split_whitespace().map(String::from).collect());
+        }
+        Ok(save_profile(profile).is_ok())
+    })
+    .unwrap_or(false)
 }
 
 /// True when an active profile is set and its live .credentials.json no

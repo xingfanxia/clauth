@@ -610,6 +610,30 @@ pub(crate) fn reconcile_startup(app: &mut App) {
         return;
     }
 
+    // Tokens differ — can't tell from bytes alone whether CC silently
+    // refreshed (rotating the stored chain) or did a fresh `/login` on a
+    // separate chain. Probe by attempting to refresh the stored
+    // refresh_token: Anthropic rotates on every refresh, so the call fails
+    // iff CC already used it. Failure → live is the legit continuation,
+    // snapshot silently. Success → stored chain is still alive, CC's
+    // tokens come from a relog; persist the rotated pair (the old one is
+    // now invalid server-side anyway) and prompt the user.
+    let stored_refresh = app
+        .config
+        .find(&active)
+        .and_then(|p| p.refresh_token().map(str::to_string));
+    if let Some(rt) = stored_refresh {
+        match oauth::refresh(&rt) {
+            Err(_) => {
+                let _ = force_snapshot_active_credentials(&mut app.config);
+                return;
+            }
+            Ok(tok) => {
+                let _ = oauth::apply_rotated_tokens(&mut app.config, &active, tok);
+            }
+        }
+    }
+
     app.modals
         .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
 }
