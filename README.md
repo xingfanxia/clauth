@@ -35,23 +35,6 @@ Claude Code keeps session state in `~/.claude/.credentials.json` (OAuth tokens) 
 2. on switch it swaps `.credentials.json` and updates the API variables (plus the profile's own `env` block) in `settings.json` — everything else stays intact,
 3. or launches `claude` in a temporary `~/.claude` directory, connected to the main one via symlinks, with the profile's credentials and merged env vars, so you can run Claude Code with multiple accounts simultaneously.
 
-## Features
-
-- **One-key switching:** select a profile, press enter and confirm. Or `clauth <profile>` to switch directly from the shell.
-- **Automatic token refresh:** every profile's OAuth pair is refreshed in parallel on launch and on manual switch — matching what Claude Code does silently on startup — so usage queries never run with an expired access token.
-- **Usage bars:** live 5-hour utilization fetched from the Anthropic API every 30s, color-coded by threshold, with the next reset time alongside the bar. Max accounts also get a 7-day bar when the terminal is wide enough; Pro accounts have no weekly window in the API response so only the 5h bar is shown.
-- **Plan detection:** queries `/api/oauth/profile` to identify the plan tier — Pro, Max 5x, Max 20x, Team, Enterprise, Free.
-- **Per-profile detail screen:** `d` opens a side-by-side breakdown of every usage window (5h, 7d all, 7d sonnet, 7d opus, any paid extra-usage spend) plus the profile's endpoint, fallback threshold, and merged env keys.
-- **Auto-switch on exhaustion:** opt profiles into an ordered fallback chain with per-profile thresholds; when the active profile crosses its 5h limit (95% by default), clauth switches to the next chain member that still has headroom. clauth must be open for this to work.
-- **Stale-data indicator:** the profile name is underlined yellow when the usage row is served from cache (API refused this tick) and red when no data is available.
-- **Account-change detection:** if Claude Code signed into a different account while clauth wasn't running, clauth notices on next launch and asks before overwriting the active profile's stored tokens.
-- **Multi-instance safe:** several clauth processes can run side by side; state writes are serialized through a file lock and each instance reloads when another rewrites `profiles.toml`.
-- **Non-destructive:** only touches the API-related keys plus the profile's declared env block in `settings.json`; all other config is preserved.
-- **Isolated launch:** `clauth start <profile> [claude args...]` spawns `claude` in a per-call `CLAUDE_CONFIG_DIR` that mirrors `~/.claude` via symlinks, with this profile's credentials and merged settings.
-- **Status-line aware:** `clauth which [--json]` prints the profile that owns the loaded `credentials.json` (honors `CLAUDE_CONFIG_DIR`).
-- **Shell completions:** `clauth completions install [shell]` wires bash, zsh, or fish completion for profile names and subcommands.
-- **In-app help:** `?` from any screen opens a context-aware keybinding reference.
-
 ## Install
 
 Supported platforms:
@@ -89,6 +72,23 @@ cd clauth
 cargo build --release
 # binary at ./target/release/clauth
 ```
+
+## Features
+
+- **One-key switching:** select a profile, press enter and confirm. Or `clauth <profile>` to switch directly from the shell.
+- **Automatic token refresh:** every profile's OAuth pair is refreshed in parallel on launch and on manual switch — matching what Claude Code does silently on startup — so usage queries never run with an expired access token.
+- **Usage bars:** live 5-hour utilization fetched from the Anthropic API every 30s, color-coded by threshold, with the next reset time alongside the bar. Max accounts also get a 7-day bar when the terminal is wide enough; Pro accounts have no weekly window in the API response so only the 5h bar is shown.
+- **Plan detection:** queries `/api/oauth/profile` to identify the plan tier — Pro, Max 5x, Max 20x, Team, Enterprise, Free.
+- **Per-profile detail screen:** `d` opens a side-by-side breakdown of every usage window (5h, 7d all, 7d sonnet, 7d opus, any paid extra-usage spend) plus the profile's endpoint, fallback threshold, and merged env keys.
+- **Auto-switch on exhaustion:** opt profiles into an ordered fallback chain with per-profile thresholds; when the active profile crosses its 5h limit (95% by default), clauth switches to the next chain member that still has headroom. clauth must be open for this to work.
+- **Stale-data indicator:** the profile name is underlined yellow when the usage row is served from cache (API refused this tick) and red when no data is available.
+- **Account-change detection:** if Claude Code signed into a different account while clauth wasn't running, clauth notices on next launch and asks before overwriting the active profile's stored tokens.
+- **Multi-instance safe:** several clauth processes can run side by side; state writes are serialized through a file lock and each instance reloads when another rewrites `profiles.toml`.
+- **Non-destructive:** only touches the API-related keys plus the profile's declared env block in `settings.json`; all other config is preserved.
+- **Isolated launch:** `clauth start <profile> [claude args...]` spawns `claude` in a per-call `CLAUDE_CONFIG_DIR` that mirrors `~/.claude` via symlinks, with this profile's credentials and merged settings.
+- **Status-line aware:** `clauth which [--json]` prints the profile that owns the loaded `credentials.json` (honors `CLAUDE_CONFIG_DIR`).
+- **Shell completions:** `clauth completions install [shell]` wires bash, zsh, or fish completion for profile names and subcommands.
+- **In-app help:** `?` from any screen opens a context-aware keybinding reference.
 
 ## Updates
 
