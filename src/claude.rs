@@ -283,6 +283,38 @@ fn snapshot_active_credentials_unchecked(config: &mut AppConfig, active: &str) -
     Ok(())
 }
 
+/// Snapshot the live .credentials.json into the active profile even when
+/// the link is diverged. Called by the divergence-resolution modal's
+/// "Overwrite active profile with live creds" action.
+pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
+    with_state_lock(|| {
+        let Some(active) = config.state.active_profile.clone() else {
+            return Ok(());
+        };
+        snapshot_active_credentials_unchecked(config, &active)
+    })
+}
+
+/// Re-link `~/.claude/.credentials.json` to `name`'s stored credentials,
+/// overwriting whatever's at the live path. Used by the divergence modal's
+/// "Discard new creds" action to restore the profile's stored identity.
+pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
+    with_state_lock(|| {
+        let link = claude_credentials_path()?;
+        if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).context("Failed to remove .credentials.json")?;
+        }
+        let target = profile_dir(name)?.join("credentials.json");
+        if target.exists() {
+            if let Some(parent) = link.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            create_symlink(&target, &link)?;
+        }
+        Ok(())
+    })
+}
+
 /// Returns true when both sides carry an OAuth block and either the access
 /// token or refresh token differs. Missing data on either side returns false
 /// — the caller's normal snapshot/skip path is safer than guessing.

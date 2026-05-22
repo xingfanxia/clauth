@@ -22,8 +22,9 @@ use crate::actions::{
     switch_profile, validate_profile_name,
 };
 use crate::claude::{
-    credentials_diverged, detach_credentials_link, link_profile_credentials,
-    read_claude_credentials, snapshot_active_credentials,
+    credentials_diverged, detach_credentials_link, force_link_profile_credentials,
+    force_snapshot_active_credentials, link_profile_credentials, read_claude_credentials,
+    snapshot_active_credentials,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, auto_switch_if_needed, threshold_for};
 use crate::lock::with_state_lock;
@@ -183,12 +184,43 @@ pub(crate) enum ConfirmAction {
     Delete(String),
     CaptureConflict(Box<CaptureSnapshot>),
     Switch(String),
+    /// Confirm step before discarding CC's freshly-written credentials and
+    /// re-linking the live path to the named profile's stored creds.
+    DiscardDivergence(String),
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct CaptureNameForm {
     pub(crate) snapshot: Box<CaptureSnapshot>,
     pub(crate) input: InputState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DivergenceChoice {
+    Overwrite,
+    NewProfile,
+    Discard,
+}
+
+/// Modal state for the credential-divergence prompt. Shown both at startup
+/// and whenever the 1Hz runtime poll detects the live .credentials.json no
+/// longer resolves to the active profile's stored creds. Three explicit
+/// actions: take CC's new creds into the active profile, save them as a
+/// new profile, or discard them and restore the profile's stored identity.
+#[derive(Debug, Clone)]
+pub(crate) struct DivergenceForm {
+    pub(crate) active: String,
+    pub(crate) cursor: usize,
+}
+
+impl DivergenceForm {
+    pub(crate) fn options() -> [DivergenceChoice; 3] {
+        [
+            DivergenceChoice::Overwrite,
+            DivergenceChoice::NewProfile,
+            DivergenceChoice::Discard,
+        ]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -233,15 +265,8 @@ pub(crate) enum Modal {
     EditProfile(EditProfileForm),
     Rename(RenameForm),
     Confirm(ConfirmState),
-    /// Step 1 of startup reconciliation. Step 2 morphs into a Confirm modal.
-    ReconcileKeep {
-        active: String,
-        choice: bool,
-    },
-    /// Step 2 — "new from current profile as a new profile?"
-    ReconcileCaptureAsk {
-        choice: bool,
-    },
+    /// Credential divergence prompt — Overwrite / NewProfile / Discard.
+    Divergence(DivergenceForm),
     CaptureName(CaptureNameForm),
     ProfileMenu(ProfileMenuState),
     ChainItemMenu(ChainItemMenuState),
@@ -579,10 +604,8 @@ pub(crate) fn reconcile_startup(app: &mut App) {
         return;
     }
 
-    app.modals.push(Modal::ReconcileKeep {
-        active,
-        choice: true,
-    });
+    app.modals
+        .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
 }
 
 // ── Event handling ────────────────────────────────────────────────────────────
@@ -908,8 +931,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::EditProfile(_) => handle_edit_profile_key(app, key),
         Modal::Rename(_) => handle_rename_key(app, key),
         Modal::Confirm(_) => handle_confirm_key(app, key),
-        Modal::ReconcileKeep { .. } => handle_reconcile_keep_key(app, key),
-        Modal::ReconcileCaptureAsk { .. } => handle_reconcile_capture_key(app, key),
+        Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
         Modal::ProfileMenu(_) => handle_profile_menu_key(app, key),
         Modal::ChainItemMenu(_) => handle_chain_item_menu_key(app, key),
@@ -1243,62 +1265,91 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }));
         }
         ConfirmAction::Switch(name) => perform_switch(app, &name),
+        ConfirmAction::DiscardDivergence(name) => run_discard_divergence(app, &name),
     }
 }
 
-fn handle_reconcile_keep_key(app: &mut App, key: KeyEvent) {
-    let Some(Modal::ReconcileKeep { choice, .. }) = app.modals.last_mut() else {
+fn handle_divergence_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::Divergence(state)) = app.modals.last_mut() else {
         return;
     };
+    let options = DivergenceForm::options();
+    let last = options.len() - 1;
     match key.code {
-        KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => {
-            *choice = !*choice;
-        }
-        KeyCode::Char('y') => *choice = true,
-        KeyCode::Char('n') => *choice = false,
-        KeyCode::Esc => {
-            // Esc = "keep" — the safer fallback.
-            let _ = snapshot_active_credentials(&mut app.config);
-            app.modals.pop();
-        }
-        KeyCode::Enter | KeyCode::Char(' ') => {
-            let keep = *choice;
-            app.modals.pop();
-            if keep {
-                let _ = snapshot_active_credentials(&mut app.config);
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.cursor = if state.cursor == 0 {
+                last
             } else {
-                let _ = detach_credentials_link();
-                app.config.state.active_profile = None;
-                let _ = save_app_state(&app.config.state);
-                app.modals.push(Modal::ReconcileCaptureAsk { choice: true });
-            }
+                state.cursor - 1
+            };
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.cursor = if state.cursor >= last {
+                0
+            } else {
+                state.cursor + 1
+            };
+        }
+        KeyCode::Esc => {
+            // Esc dismisses without acting. The 1Hz poll re-pushes the modal
+            // on the next tick if the divergence persists.
+            app.modals.pop();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let choice = options[state.cursor];
+            let active = state.active.clone();
+            app.modals.pop();
+            run_divergence_choice(app, &active, choice);
         }
         _ => {}
     }
 }
 
-fn handle_reconcile_capture_key(app: &mut App, key: KeyEvent) {
-    let Some(Modal::ReconcileCaptureAsk { choice }) = app.modals.last_mut() else {
-        return;
-    };
-    match key.code {
-        KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => {
-            *choice = !*choice;
-        }
-        KeyCode::Char('y') => *choice = true,
-        KeyCode::Char('n') => *choice = false,
-        KeyCode::Esc => {
-            app.modals.pop();
-        }
-        KeyCode::Enter | KeyCode::Char(' ') => {
-            let go = *choice;
-            app.modals.pop();
-            if go {
-                begin_capture(app);
+fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) {
+    match choice {
+        DivergenceChoice::Overwrite => {
+            if let Err(e) = force_snapshot_active_credentials(&mut app.config) {
+                app.toast(ToastKind::Danger, format!("overwrite failed: {e}"));
+                return;
             }
+            if let Err(e) = force_link_profile_credentials(active) {
+                app.toast(ToastKind::Danger, format!("relink failed: {e}"));
+                return;
+            }
+            app.refresh_tokens();
+            app.toast(
+                ToastKind::Success,
+                format!("saved live credentials into '{active}'"),
+            );
         }
-        _ => {}
+        DivergenceChoice::NewProfile => {
+            let _ = detach_credentials_link();
+            app.config.state.active_profile = None;
+            let _ = save_app_state(&app.config.state);
+            begin_capture(app);
+        }
+        DivergenceChoice::Discard => {
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: format!("Discard the new login and restore '{active}'?"),
+                detail: Some(
+                    "Claude Code's freshly written credentials will be overwritten with the profile's stored tokens.".to_string(),
+                ),
+                choice: false,
+                on_confirm: ConfirmAction::DiscardDivergence(active.to_string()),
+            }));
+        }
     }
+}
+
+fn run_discard_divergence(app: &mut App, active: &str) {
+    if let Err(e) = force_link_profile_credentials(active) {
+        app.toast(ToastKind::Danger, format!("discard failed: {e}"));
+        return;
+    }
+    app.toast(
+        ToastKind::Warning,
+        format!("discarded new login; restored '{active}'"),
+    );
 }
 
 fn handle_capture_name_key(app: &mut App, key: KeyEvent) {

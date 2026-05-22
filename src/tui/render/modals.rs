@@ -9,8 +9,9 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use super::super::app::{
     App, ChainAction, ChainAddState, ChainItemMenuState, ChainThresholdForm, ConfirmAction,
-    ConfirmState, EditProfileForm, EndpointField, InputState, Modal, NewProfileField,
-    NewProfileForm, ProfileMenuAction, ProfileMenuState, RenameForm, Screen, profile_menu_options,
+    ConfirmState, DivergenceChoice, DivergenceForm, EditProfileForm, EndpointField, InputState,
+    Modal, NewProfileField, NewProfileForm, ProfileMenuAction, ProfileMenuState, RenameForm,
+    Screen, profile_menu_options,
 };
 use super::super::theme;
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
@@ -21,10 +22,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::EditProfile(form) => draw_edit_profile(frame, area, form),
         Modal::Rename(form) => draw_rename(frame, area, form),
         Modal::Confirm(state) => draw_confirm(frame, area, state),
-        Modal::ReconcileKeep { active, choice } => {
-            draw_reconcile_keep(frame, area, active, *choice)
-        }
-        Modal::ReconcileCaptureAsk { choice } => draw_reconcile_capture(frame, area, *choice),
+        Modal::Divergence(form) => draw_divergence(frame, area, form),
         Modal::CaptureName(form) => draw_capture_name(frame, area, form.input.value.as_str()),
         Modal::ProfileMenu(state) => draw_profile_menu(frame, area, app, state),
         Modal::ChainItemMenu(state) => draw_chain_item_menu(frame, area, app, state),
@@ -150,6 +148,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::Delete(_) => "confirm · delete",
         ConfirmAction::CaptureConflict(_) => "confirm · duplicate",
         ConfirmAction::Switch(_) => "confirm · switch",
+        ConfirmAction::DiscardDivergence(_) => "confirm · discard new login",
     };
     let block = modal_block(title);
     let inner = block.inner(rect);
@@ -191,67 +190,79 @@ fn yes_no_line(choice: bool) -> Line<'static> {
     Line::from(vec![no, Span::raw("  "), yes])
 }
 
-fn draw_reconcile_keep(frame: &mut Frame<'_>, area: Rect, active: &str, choice: bool) {
-    let rect = centered(area, 70, 13);
+fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
+    let rect = centered(area, 72, 18);
     frame.render_widget(Clear, rect);
-    let block = modal_block("startup · credential divergence");
+    let block = modal_block("credentials · divergence");
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let lines = vec![
+    let options = DivergenceForm::options();
+    let cursor = form.cursor.min(options.len() - 1);
+
+    let mut lines: Vec<Line<'_>> = vec![
         Line::from(vec![
             Span::styled("~/.claude/.credentials.json", theme::muted()),
-            Span::styled(" differs from this profile's saved tokens.", theme::dim()),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Still logged in as ", theme::dim()),
-            Span::styled(format!("'{active}'"), Style::default().fg(theme::ACCENT)),
-            Span::styled("?", theme::dim()),
-        ]),
-        Line::from(""),
-        yes_no_line(choice),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("yes", theme::accent()),
+            Span::styled(" no longer points to ", theme::dim()),
             Span::styled(
-                " — overwrites stored tokens with the live ones.",
-                theme::dim(),
+                format!("'{}'", form.active),
+                Style::default().fg(theme::ACCENT),
             ),
+            Span::styled(".", theme::dim()),
         ]),
-        Line::from(vec![
-            Span::styled("no", theme::accent()),
-            Span::styled(
-                " — disowns this profile and offers to capture instead.",
-                theme::dim(),
-            ),
-        ]),
+        Line::from(Span::styled(
+            "Claude Code re-logged or refreshed via unlink+write.",
+            theme::dim(),
+        )),
         Line::from(""),
-        modal_footer_hints(&[("← →", "choose"), ("⏎", "apply")]),
     ];
+
+    for (i, option) in options.iter().enumerate() {
+        let selected = i == cursor;
+        let arrow = if selected {
+            Span::styled("\u{25b6} ", theme::orange())
+        } else {
+            Span::raw("  ")
+        };
+        let (label, detail) = divergence_option_text(*option, &form.active);
+        let label_style = if selected {
+            theme::accent()
+        } else {
+            theme::muted()
+        };
+        lines.push(Line::from(vec![arrow, Span::styled(label, label_style)]));
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(detail, theme::dim()),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(modal_footer_hints(&[
+        ("↑ ↓", "choose"),
+        ("⏎", "apply"),
+        ("⎋", "dismiss"),
+    ]));
+
     let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
     frame.render_widget(para, inner);
 }
 
-fn draw_reconcile_capture(frame: &mut Frame<'_>, area: Rect, choice: bool) {
-    let rect = centered(area, 60, 9);
-    frame.render_widget(Clear, rect);
-    let block = modal_block("startup · capture credentials?");
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let lines = vec![
-        Line::from(Span::styled(
-            "new from current profile as a new profile?",
-            theme::muted(),
-        )),
-        Line::from(""),
-        yes_no_line(choice),
-        Line::from(""),
-        modal_footer_hints(&[("← →", "choose"), ("⏎", "apply")]),
-    ];
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
-    frame.render_widget(para, inner);
+fn divergence_option_text(option: DivergenceChoice, active: &str) -> (String, String) {
+    match option {
+        DivergenceChoice::Overwrite => (
+            format!("overwrite '{active}' with new credentials"),
+            "save the live tokens into the active profile and re-link".to_string(),
+        ),
+        DivergenceChoice::NewProfile => (
+            "save new credentials as a new profile".to_string(),
+            format!("preserve '{active}' as-is and capture the live tokens elsewhere"),
+        ),
+        DivergenceChoice::Discard => (
+            format!("discard new credentials, restore '{active}'"),
+            "overwrites the live file with the profile's stored tokens".to_string(),
+        ),
+    }
 }
 
 fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
