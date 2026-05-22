@@ -61,7 +61,13 @@ pub(crate) fn run(config: &AppConfig, name: &str, claude_args: &[String]) -> Res
         .status()
         .context("failed to spawn claude")?;
 
-    sync_relogged_credentials(&profile.name, &tmp.path().join(".credentials.json"));
+    if let Ok(target) = profile_dir(&profile.name).map(|d| d.join("credentials.json"))
+        && sync_relogged_credentials(&tmp.path().join(".credentials.json"), &target) {
+            eprintln!(
+                "clauth: re-login detected; updated credentials for profile '{}'",
+                profile.name
+            );
+        }
 
     drop(tmp);
 
@@ -74,27 +80,22 @@ pub(crate) fn run(config: &AppConfig, name: &str, claude_args: &[String]) -> Res
 /// When CC re-logs inside the isolated session it `unlink+write`s the
 /// `.credentials.json` we linked in, replacing the symlink with a fresh
 /// regular file. Copy those bytes into the profile's stored creds so the
-/// new identity survives the tempdir cleanup.
-fn sync_relogged_credentials(name: &str, tempdir_creds: &Path) {
+/// new identity survives the tempdir cleanup. Returns true when an update
+/// was actually written (caller surfaces a stderr note).
+pub(crate) fn sync_relogged_credentials(tempdir_creds: &Path, target: &Path) -> bool {
     let Ok(meta) = tempdir_creds.symlink_metadata() else {
-        return;
+        return false;
     };
     if meta.file_type().is_symlink() {
-        return;
+        return false;
     }
     let Ok(bytes) = std::fs::read(tempdir_creds) else {
-        return;
+        return false;
     };
-    let Ok(target) = profile_dir(name).map(|dir| dir.join("credentials.json")) else {
-        return;
-    };
-    if std::fs::read(&target).ok().as_deref() == Some(bytes.as_slice()) {
-        return;
+    if std::fs::read(target).ok().as_deref() == Some(bytes.as_slice()) {
+        return false;
     }
-    if atomic_write(&target, &bytes).is_err() {
-        return;
-    }
-    eprintln!("clauth: re-login detected; updated credentials for profile '{name}'");
+    atomic_write(target, &bytes).is_ok()
 }
 
 #[cfg(unix)]
@@ -123,3 +124,7 @@ fn link_entry(src: &Path, dst: &Path) -> Result<()> {
 fn link_entry(_src: &Path, _dst: &Path) -> Result<()> {
     bail!("clauth start requires symlink support");
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/start.rs"]
+mod tests;
