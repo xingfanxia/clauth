@@ -61,12 +61,40 @@ pub(crate) fn run(config: &AppConfig, name: &str, claude_args: &[String]) -> Res
         .status()
         .context("failed to spawn claude")?;
 
+    sync_relogged_credentials(&profile.name, &tmp.path().join(".credentials.json"));
+
     drop(tmp);
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+/// When CC re-logs inside the isolated session it `unlink+write`s the
+/// `.credentials.json` we linked in, replacing the symlink with a fresh
+/// regular file. Copy those bytes into the profile's stored creds so the
+/// new identity survives the tempdir cleanup.
+fn sync_relogged_credentials(name: &str, tempdir_creds: &Path) {
+    let Ok(meta) = tempdir_creds.symlink_metadata() else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(tempdir_creds) else {
+        return;
+    };
+    let Ok(target) = profile_dir(name).map(|dir| dir.join("credentials.json")) else {
+        return;
+    };
+    if std::fs::read(&target).ok().as_deref() == Some(bytes.as_slice()) {
+        return;
+    }
+    if atomic_write(&target, &bytes).is_err() {
+        return;
+    }
+    eprintln!("clauth: re-login detected; updated credentials for profile '{name}'");
 }
 
 #[cfg(unix)]
