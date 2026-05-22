@@ -14,7 +14,7 @@ use super::format::{
     window_summary_span,
 };
 use crate::fallback::threshold_for;
-use crate::profile::Profile;
+use crate::profile::{AppConfig, Profile};
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let target = if area.height >= 18 { 8 } else { 5 };
@@ -33,7 +33,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let title = Line::from(vec![
         Span::styled(" ACCOUNTS ", theme::label()),
         Span::styled(
-            format!("{} total", app.config.profiles.len()),
+            format!("{} total", app.config().profiles.len()),
             theme::faint(),
         ),
     ]);
@@ -47,7 +47,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.config.profiles.is_empty() {
+    if app.config().profiles.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled("no accounts yet", theme::muted())))
             .style(theme::base());
         frame.render_widget(empty, inner);
@@ -111,7 +111,7 @@ impl OverviewWidths {
     fn new(width: u16, app: &App) -> Self {
         let total = width as usize;
         let max_name = app
-            .config
+            .config()
             .profiles
             .iter()
             .map(|p| p.name.chars().count())
@@ -227,11 +227,12 @@ fn render_overview_row(
     widths: &OverviewWidths,
     selected: bool,
 ) -> Line<'static> {
-    let Some(profile) = app.config.profiles.get(idx) else {
+    let cfg = app.config();
+    let Some(profile) = cfg.profiles.get(idx) else {
         return Line::from("");
     };
 
-    let active = app.config.is_active(&profile.name);
+    let active = cfg.is_active(&profile.name);
     let cursor = if selected {
         Span::styled("▸ ", theme::accent())
     } else {
@@ -288,7 +289,7 @@ fn render_overview_row(
     }
     if widths.route > 0 {
         spans.push(gap(widths));
-        let (chain, chain_style) = chain_summary(app, profile);
+        let (chain, chain_style) = chain_summary(&cfg, profile);
         spans.push(Span::styled(fixed(&chain, widths.route), chain_style));
     }
 
@@ -316,9 +317,8 @@ fn gap(widths: &OverviewWidths) -> Span<'static> {
     Span::raw(" ".repeat(widths.gap))
 }
 
-fn chain_summary(app: &App, profile: &Profile) -> (String, Style) {
-    let Some(position) = app
-        .config
+fn chain_summary(cfg: &AppConfig, profile: &Profile) -> (String, Style) {
+    let Some(position) = cfg
         .state
         .fallback_chain
         .iter()
@@ -350,15 +350,15 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = fallback_flow_lines(app, inner.width, inner.height);
+    let lines = fallback_flow_lines(&app.config(), inner.width, inner.height);
     let para = Paragraph::new(lines)
         .style(theme::base())
         .wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
 }
 
-fn fallback_flow_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
-    if app.config.state.fallback_chain.is_empty() {
+fn fallback_flow_lines(cfg: &AppConfig, width: u16, height: u16) -> Vec<Line<'static>> {
+    if cfg.state.fallback_chain.is_empty() {
         return vec![
             Line::from(Span::styled(
                 "No fallback chain configured.",
@@ -376,11 +376,11 @@ fn fallback_flow_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
 
     if width >= 92 {
         let mut spans = Vec::new();
-        for (i, name) in app.config.state.fallback_chain.iter().enumerate() {
+        for (i, name) in cfg.state.fallback_chain.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" ─▶ ", theme::orange()));
             }
-            let (label, style) = chain_node(app, name, i);
+            let (label, style) = chain_node(cfg, name, i);
             spans.push(Span::styled(
                 format!(" {label} "),
                 style.bg(theme::BG_RAISED).bold(),
@@ -391,10 +391,10 @@ fn fallback_flow_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
     }
 
     let mut lines = Vec::new();
-    for (i, name) in app.config.state.fallback_chain.iter().enumerate() {
-        let (label, style) = chain_node(app, name, i);
+    for (i, name) in cfg.state.fallback_chain.iter().enumerate() {
+        let (label, style) = chain_node(cfg, name, i);
         lines.push(Line::from(Span::styled(label.to_string(), style.bold())));
-        if i + 1 < app.config.state.fallback_chain.len() && lines.len() + 1 < height as usize {
+        if i + 1 < cfg.state.fallback_chain.len() && lines.len() + 1 < height as usize {
             lines.push(Line::from(Span::styled("  ↓", theme::faint())));
         }
         if lines.len() >= height as usize {
@@ -407,10 +407,10 @@ fn fallback_flow_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
     lines
 }
 
-fn chain_node(app: &App, name: &str, index: usize) -> (String, Style) {
-    let active = app.config.is_active(name);
+fn chain_node(cfg: &AppConfig, name: &str, index: usize) -> (String, Style) {
+    let active = cfg.is_active(name);
     let marker = if active { "◆" } else { "◇" };
-    let Some(profile) = app.config.find(name) else {
+    let Some(profile) = cfg.find(name) else {
         return (
             format!("{} {marker} {name} · missing", index + 1),
             theme::danger(),

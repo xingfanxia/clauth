@@ -23,7 +23,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.config.state.fallback_chain.is_empty() {
+    if app.config().state.fallback_chain.is_empty() {
         let hint = Paragraph::new(vec![
             Line::from(Span::styled("Chain is empty.", theme::muted())),
             Line::from(""),
@@ -70,27 +70,28 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
-fn render_chain_row<'a>(app: &'a App, item: ChainItemKind) -> Line<'a> {
+fn render_chain_row(app: &App, item: ChainItemKind) -> Line<'static> {
     match item {
         ChainItemKind::Member(i) => {
-            let Some(name) = app.config.state.fallback_chain.get(i) else {
+            let cfg = app.config();
+            let Some(name) = cfg.state.fallback_chain.get(i).cloned() else {
                 return Line::from("");
             };
-            let profile = app.config.find(name);
+            let profile = cfg.find(&name);
             let threshold = profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD);
             let utilization = profile
                 .and_then(|p| p.usage.as_ref())
                 .and_then(|u| u.five_hour.as_ref())
                 .map(|w| w.utilization);
 
-            let active = app.config.is_active(name);
+            let active = cfg.is_active(&name);
             let active_mark = if active {
                 Span::styled("● ", theme::accent())
             } else {
                 Span::raw("  ")
             };
             let position = Span::styled(format!("{:>2}.  ", i + 1), theme::faint());
-            let name_span = Span::styled(name.clone(), Style::default().fg(theme::TEXT).bold());
+            let name_span = Span::styled(name, Style::default().fg(theme::TEXT).bold());
             let threshold_span = Span::styled(format!("  @ {threshold:.0}%"), theme::faint());
             let util_span = match utilization {
                 Some(pct) => {

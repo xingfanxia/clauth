@@ -9,8 +9,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -322,7 +322,11 @@ pub(crate) enum MainItemKind {
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub(crate) struct App {
-    pub(crate) config: AppConfig,
+    /// Shared mutable state — locked by the main thread on every read/write
+    /// and by the background usage refresher when rotating tokens or kicking
+    /// auto-start. Hold the guard only across the work that needs it; releasing
+    /// before HTTP-heavy operations keeps the refresher from stalling the UI.
+    pub(crate) config: Arc<Mutex<AppConfig>>,
 
     pub(crate) usage_store: UsageStore,
     pub(crate) usage_status: StatusStore,
@@ -363,7 +367,7 @@ impl App {
         ));
 
         Self {
-            config,
+            config: Arc::new(Mutex::new(config)),
             usage_store,
             usage_status,
             usage_tokens,
@@ -382,6 +386,13 @@ impl App {
         }
     }
 
+    /// Lock the shared AppConfig. Holds the lock for the lifetime of the
+    /// returned guard. Order: AppConfig mutex outer, `with_state_lock` inner;
+    /// the inner is taken by the actions that mutate disk state.
+    pub(crate) fn config(&self) -> MutexGuard<'_, AppConfig> {
+        self.config.lock().expect("config mutex poisoned")
+    }
+
     /// Kick off the background usage refresher. Runs once after startup
     /// reconciliation completes so the active profile's identity is settled
     /// before we rotate any refresh tokens.
@@ -389,14 +400,18 @@ impl App {
         // Re-establish the credentials symlink that the previous shutdown
         // replaced with a plain file. Without this, in-session Claude Code
         // refreshes write to a standalone file instead of the profile.
-        if let Some(active) = self.config.state.active_profile.clone() {
+        let active = self.config().state.active_profile.clone();
+        if let Some(active) = active {
             let _ = link_profile_credentials(&active);
         }
 
         // Refresh every profile's OAuth token pair — Claude Code does the
         // same thing silently on launch. Rotates and persists the new pair
         // so the initial usage fetch below uses fresh access tokens.
-        let _ = oauth::refresh_all(&mut self.config);
+        {
+            let mut cfg = self.config();
+            let _ = oauth::refresh_all(&mut cfg);
+        }
         self.refresh_tokens();
 
         let snapshot = self
@@ -411,9 +426,12 @@ impl App {
             &self.activity,
         );
 
-        let started = oauth::auto_start_windows(&mut self.config, &self.usage_store);
+        let started = {
+            let mut cfg = self.config();
+            oauth::auto_start_windows(&mut cfg, &self.usage_store)
+        };
         if !started.is_empty() {
-            let retry: Vec<(String, String)> = collect_tokens(&self.config.profiles)
+            let retry: Vec<(String, String)> = collect_tokens(&self.config().profiles)
                 .into_iter()
                 .filter(|(name, _)| started.contains(name))
                 .collect();
@@ -426,7 +444,7 @@ impl App {
             *self
                 .usage_tokens
                 .lock()
-                .expect("usage_tokens mutex poisoned") = collect_tokens(&self.config.profiles);
+                .expect("usage_tokens mutex poisoned") = collect_tokens(&self.config().profiles);
         }
 
         spawn_refresher(
@@ -438,7 +456,11 @@ impl App {
         );
 
         self.apply_usage();
-        if let Ok(Some(target)) = auto_switch_if_needed(&mut self.config) {
+        let switched = {
+            let mut cfg = self.config();
+            auto_switch_if_needed(&mut cfg).ok().flatten()
+        };
+        if let Some(target) = switched {
             self.toast(ToastKind::Warning, format!("auto-switched to '{target}'"));
         }
     }
@@ -446,7 +468,8 @@ impl App {
     pub(crate) fn apply_usage(&mut self) {
         let info_map = self.usage_store.lock().ok();
         let status_map = self.usage_status.lock().ok();
-        for p in &mut self.config.profiles {
+        let mut cfg = self.config();
+        for p in &mut cfg.profiles {
             p.usage = info_map.as_ref().and_then(|s| s.get(&p.name)).cloned();
             p.fetch_status = status_map.as_ref().and_then(|s| s.get(&p.name).copied());
         }
@@ -460,12 +483,12 @@ impl App {
             return false;
         }
         if let Ok(fresh) = load_config() {
-            self.config = fresh;
+            *self.config() = fresh;
             self.last_state_mtime = current;
             *self
                 .usage_tokens
                 .lock()
-                .expect("usage_tokens mutex poisoned") = collect_tokens(&self.config.profiles);
+                .expect("usage_tokens mutex poisoned") = collect_tokens(&self.config().profiles);
             true
         } else {
             false
@@ -476,7 +499,7 @@ impl App {
         *self
             .usage_tokens
             .lock()
-            .expect("usage_tokens mutex poisoned") = collect_tokens(&self.config.profiles);
+            .expect("usage_tokens mutex poisoned") = collect_tokens(&self.config().profiles);
     }
 
     pub(crate) fn manual_refresh(&self) {
@@ -523,10 +546,10 @@ impl App {
     // ── Main list ────────────────────────────────────────────────────────────
 
     pub(crate) fn main_items(&self) -> Vec<MainItemKind> {
-        let mut items: Vec<MainItemKind> = (0..self.config.profiles.len())
-            .map(MainItemKind::Profile)
-            .collect();
-        if !self.config.profiles.is_empty() {
+        let cfg = self.config();
+        let mut items: Vec<MainItemKind> =
+            (0..cfg.profiles.len()).map(MainItemKind::Profile).collect();
+        if !cfg.profiles.is_empty() {
             items.push(MainItemKind::ActionSeparator);
         }
         items.push(MainItemKind::NewProfile);
@@ -586,7 +609,7 @@ pub(crate) fn collect_tokens(profiles: &[Profile]) -> Vec<(String, String)> {
 /// sign into a different account between sessions — push a modal to ask the
 /// user before overwriting the stored identity.
 pub(crate) fn reconcile_startup(app: &mut App) {
-    let Some(active) = app.config.state.active_profile.clone() else {
+    let Some(active) = app.config().state.active_profile.clone() else {
         return;
     };
 
@@ -595,13 +618,15 @@ pub(crate) fn reconcile_startup(app: &mut App) {
     let live = with_state_lock(|| Ok(read_claude_credentials().ok().flatten()))
         .ok()
         .flatten();
-    let stored = app
-        .config
-        .find(&active)
-        .and_then(|p| p.credentials.as_ref());
+    let diverged = {
+        let cfg = app.config();
+        let stored = cfg.find(&active).and_then(|p| p.credentials.as_ref());
+        credentials_diverged(stored, live.as_ref())
+    };
 
-    if !credentials_diverged(stored, live.as_ref()) {
-        let _ = snapshot_active_credentials(&mut app.config);
+    if !diverged {
+        let mut cfg = app.config();
+        let _ = snapshot_active_credentials(&mut cfg);
         return;
     }
 
@@ -614,17 +639,19 @@ pub(crate) fn reconcile_startup(app: &mut App) {
     // tokens come from a relog; persist the rotated pair (the old one is
     // now invalid server-side anyway) and prompt the user.
     let stored_refresh = app
-        .config
+        .config()
         .find(&active)
         .and_then(|p| p.refresh_token().map(str::to_string));
     if let Some(rt) = stored_refresh {
         match oauth::refresh(&rt) {
             Err(_) => {
-                let _ = force_snapshot_active_credentials(&mut app.config);
+                let mut cfg = app.config();
+                let _ = force_snapshot_active_credentials(&mut cfg);
                 return;
             }
             Ok(tok) => {
-                let _ = oauth::apply_rotated_tokens(&mut app.config, &active, tok);
+                let mut cfg = app.config();
+                let _ = oauth::apply_rotated_tokens(&mut cfg, &active, tok);
             }
         }
     }
@@ -705,7 +732,7 @@ fn open_profile_menu_at_cursor(app: &mut App) {
     let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
         return;
     };
-    let Some(name) = app.config.profiles.get(idx).map(|p| p.name.clone()) else {
+    let Some(name) = app.config().profiles.get(idx).map(|p| p.name.clone()) else {
         return;
     };
     app.modals
@@ -725,14 +752,16 @@ fn activate_main_item(app: &mut App) {
     };
     match item {
         MainItemKind::Profile(idx) => {
-            let Some(name) = app.config.profiles.get(idx).map(|p| p.name.clone()) else {
+            let cfg = app.config();
+            let Some(name) = cfg.profiles.get(idx).map(|p| p.name.clone()) else {
                 return;
             };
             // No-op when already active; saves the round-trip through the
             // confirm modal and a redundant token refresh.
-            if app.config.is_active(&name) {
+            if cfg.is_active(&name) {
                 return;
             }
+            drop(cfg);
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: format!("Switch to '{name}'?"),
                 detail: None,
@@ -758,10 +787,14 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
     };
     let new_idx = match delta.signum() {
         -1 if idx > 0 => idx - 1,
-        1 if idx + 1 < app.config.profiles.len() => idx + 1,
+        1 if idx + 1 < app.config().profiles.len() => idx + 1,
         _ => return,
     };
-    if let Err(e) = reorder_profile(&mut app.config, idx, new_idx) {
+    let result = {
+        let mut cfg = app.config();
+        reorder_profile(&mut cfg, idx, new_idx)
+    };
+    if let Err(e) = result {
         app.toast(ToastKind::Danger, format!("reorder failed: {e}"));
         return;
     }
@@ -774,8 +807,12 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
 }
 
 fn perform_switch(app: &mut App, name: &str) {
-    let _ = oauth::refresh_all(&mut app.config);
-    match switch_profile(&mut app.config, name) {
+    let result = {
+        let mut cfg = app.config();
+        let _ = oauth::refresh_all(&mut cfg);
+        switch_profile(&mut cfg, name)
+    };
+    match result {
         Ok(()) => {
             app.refresh_tokens();
             app.last_state_mtime = app_state_mtime();
@@ -795,15 +832,18 @@ fn open_new_profile(app: &mut App) {
 }
 
 fn open_edit_profile(app: &mut App, name: &str) {
-    let Some(profile) = app.config.find(name) else {
+    let cfg = app.config();
+    let Some(profile) = cfg.find(name) else {
         return;
     };
-    app.modals.push(Modal::EditProfile(EditProfileForm {
+    let modal = Modal::EditProfile(EditProfileForm {
         name: name.to_string(),
         base_url: InputState::new(profile.base_url.as_deref().unwrap_or("")),
         api_key: InputState::new(profile.api_key.as_deref().unwrap_or("")),
         focus: EndpointField::BaseUrl,
-    }));
+    });
+    drop(cfg);
+    app.modals.push(modal);
 }
 
 fn open_delete_confirm(app: &mut App, name: &str) {
@@ -823,9 +863,11 @@ fn begin_capture(app: &mut App) {
             return;
         }
     };
-    if let Some(existing) = find_matching_oauth_profile(&app.config, snapshot.credentials.as_ref())
-    {
-        let existing = existing.to_string();
+    let existing_match = {
+        let cfg = app.config();
+        find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref()).map(str::to_string)
+    };
+    if let Some(existing) = existing_match {
         app.modals.push(Modal::Confirm(ConfirmState {
             message: format!("These credentials already belong to '{existing}'."),
             detail: Some("Capture anyway?".to_string()),
@@ -850,19 +892,18 @@ pub(crate) enum ChainItemKind {
 }
 
 pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
-    let mut items: Vec<ChainItemKind> = app
-        .config
+    let cfg = app.config();
+    let mut items: Vec<ChainItemKind> = cfg
         .state
         .fallback_chain
         .iter()
         .enumerate()
         .map(|(i, _)| ChainItemKind::Member(i))
         .collect();
-    let any_unchained = app
-        .config
+    let any_unchained = cfg
         .profiles
         .iter()
-        .any(|p| !app.config.state.fallback_chain.iter().any(|c| c == &p.name));
+        .any(|p| !cfg.state.fallback_chain.iter().any(|c| c == &p.name));
     if any_unchained {
         items.push(ChainItemKind::Add);
     }
@@ -909,20 +950,21 @@ fn activate_chain_item(app: &mut App) {
     };
     match item {
         ChainItemKind::Member(i) => {
-            let Some(name) = app.config.state.fallback_chain.get(i).cloned() else {
+            let Some(name) = app.config().state.fallback_chain.get(i).cloned() else {
                 return;
             };
             app.modals
                 .push(Modal::ChainItemMenu(ChainItemMenuState { name, cursor: 0 }));
         }
         ChainItemKind::Add => {
-            let candidates: Vec<String> = app
-                .config
-                .profiles
-                .iter()
-                .filter(|p| !app.config.state.fallback_chain.iter().any(|c| c == &p.name))
-                .map(|p| p.name.clone())
-                .collect();
+            let candidates: Vec<String> = {
+                let cfg = app.config();
+                cfg.profiles
+                    .iter()
+                    .filter(|p| !cfg.state.fallback_chain.iter().any(|c| c == &p.name))
+                    .map(|p| p.name.clone())
+                    .collect()
+            };
             if candidates.is_empty() {
                 return;
             }
@@ -970,7 +1012,7 @@ fn handle_profile_detail_key(app: &mut App, key: KeyEvent) {
         return;
     };
     let Some(name) = app
-        .config
+        .config()
         .profiles
         .get(profile_index)
         .map(|p| p.name.clone())
@@ -996,20 +1038,39 @@ fn handle_profile_detail_key(app: &mut App, key: KeyEvent) {
 }
 
 fn toggle_auto_start(app: &mut App, name: &str) {
-    let Some(profile) = app.config.find_mut(name) else {
-        return;
+    enum Outcome {
+        NotOAuth,
+        Saved(bool),
+        SaveFailed(anyhow::Error),
+        Missing,
+    }
+    let outcome = {
+        let mut cfg = app.config();
+        match cfg.find_mut(name) {
+            None => Outcome::Missing,
+            Some(profile) if !profile.is_oauth() => Outcome::NotOAuth,
+            Some(profile) => {
+                profile.auto_start = !profile.auto_start;
+                let now_on = profile.auto_start;
+                match save_profile(profile) {
+                    Ok(()) => Outcome::Saved(now_on),
+                    Err(e) => {
+                        if let Some(p) = cfg.find_mut(name) {
+                            p.auto_start = !now_on;
+                        }
+                        Outcome::SaveFailed(e)
+                    }
+                }
+            }
+        }
     };
-    if !profile.is_oauth() {
-        app.toast(
+    match outcome {
+        Outcome::Missing => {}
+        Outcome::NotOAuth => app.toast(
             ToastKind::Warning,
             "auto-start usage only applies to OAuth profiles",
-        );
-        return;
-    }
-    profile.auto_start = !profile.auto_start;
-    let now_on = profile.auto_start;
-    match save_profile(profile) {
-        Ok(()) => {
+        ),
+        Outcome::Saved(now_on) => {
             let body = if now_on {
                 format!("auto-start usage on for '{name}'")
             } else {
@@ -1017,11 +1078,7 @@ fn toggle_auto_start(app: &mut App, name: &str) {
             };
             app.toast(ToastKind::Success, body);
         }
-        Err(e) => {
-            // Roll back so the disk + memory stay aligned.
-            if let Some(p) = app.config.find_mut(name) {
-                p.auto_start = !now_on;
-            }
+        Outcome::SaveFailed(e) => {
             app.toast(ToastKind::Danger, format!("save failed: {e}"));
         }
     }
@@ -1032,7 +1089,11 @@ fn toggle_auto_start(app: &mut App, name: &str) {
 /// menu stays focused on mutations.
 pub(crate) fn profile_menu_options(app: &App, name: &str) -> Vec<ProfileMenuAction> {
     let mut out = Vec::with_capacity(5);
-    let is_oauth = app.config.find(name).map(|p| p.is_oauth()).unwrap_or(false);
+    let is_oauth = app
+        .config()
+        .find(name)
+        .map(|p| p.is_oauth())
+        .unwrap_or(false);
 
     out.push(ProfileMenuAction::Edit);
     out.push(ProfileMenuAction::Rename);
@@ -1148,14 +1209,22 @@ fn submit_new_profile(app: &mut App) {
     let name = form.name.trimmed().to_string();
     let base_url = form.base_url.trimmed_some();
     let api_key = form.api_key.trimmed_some();
-    let existing = app.config.names();
-    if let Err(e) = validate_profile_name(&name, &existing, None) {
+    let validation = {
+        let cfg = app.config();
+        let existing = cfg.names();
+        validate_profile_name(&name, &existing, None)
+    };
+    if let Err(e) = validation {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
     }
     // API key only makes sense for endpoint profiles. Drop it if no URL.
     let api_key = if base_url.is_some() { api_key } else { None };
-    match create_blank_profile(&mut app.config, name.clone(), base_url, api_key) {
+    let result = {
+        let mut cfg = app.config();
+        create_blank_profile(&mut cfg, name.clone(), base_url, api_key)
+    };
+    match result {
         Ok(()) => {
             app.refresh_tokens();
             app.last_state_mtime = app_state_mtime();
@@ -1204,7 +1273,11 @@ fn submit_edit_profile(app: &mut App) {
     } else {
         None
     };
-    match edit_profile_endpoint(&mut app.config, &name, base_url, api_key) {
+    let result = {
+        let mut cfg = app.config();
+        edit_profile_endpoint(&mut cfg, &name, base_url, api_key)
+    };
+    match result {
         Ok(()) => {
             app.modals.pop();
             app.toast(ToastKind::Success, format!("updated '{name}'"));
@@ -1228,12 +1301,20 @@ fn handle_rename_key(app: &mut App, key: KeyEvent) {
                 app.modals.pop();
                 return;
             }
-            let existing = app.config.names();
-            if let Err(e) = validate_profile_name(&new, &existing, Some(old.as_str())) {
+            let validation = {
+                let cfg = app.config();
+                let existing = cfg.names();
+                validate_profile_name(&new, &existing, Some(old.as_str()))
+            };
+            if let Err(e) = validation {
                 app.toast(ToastKind::Danger, format!("{e}"));
                 return;
             }
-            match rename_profile(&mut app.config, &old, &new) {
+            let result = {
+                let mut cfg = app.config();
+                rename_profile(&mut cfg, &old, &new)
+            };
+            match result {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_state_mtime = app_state_mtime();
@@ -1274,15 +1355,21 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
 
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
-        ConfirmAction::Delete(name) => match delete_profile(&mut app.config, &name) {
-            Ok(()) => {
-                app.refresh_tokens();
-                app.last_state_mtime = app_state_mtime();
-                app.clamp_main_cursor();
-                app.toast(ToastKind::Success, format!("deleted '{name}'"));
+        ConfirmAction::Delete(name) => {
+            let result = {
+                let mut cfg = app.config();
+                delete_profile(&mut cfg, &name)
+            };
+            match result {
+                Ok(()) => {
+                    app.refresh_tokens();
+                    app.last_state_mtime = app_state_mtime();
+                    app.clamp_main_cursor();
+                    app.toast(ToastKind::Success, format!("deleted '{name}'"));
+                }
+                Err(e) => app.toast(ToastKind::Danger, format!("delete failed: {e}")),
             }
-            Err(e) => app.toast(ToastKind::Danger, format!("delete failed: {e}")),
-        },
+        }
         ConfirmAction::CaptureConflict(snapshot) => {
             app.modals.push(Modal::CaptureName(CaptureNameForm {
                 snapshot,
@@ -1333,7 +1420,11 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
 fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) {
     match choice {
         DivergenceChoice::Overwrite => {
-            if let Err(e) = force_snapshot_active_credentials(&mut app.config) {
+            let snapshot_result = {
+                let mut cfg = app.config();
+                force_snapshot_active_credentials(&mut cfg)
+            };
+            if let Err(e) = snapshot_result {
                 app.toast(ToastKind::Danger, format!("overwrite failed: {e}"));
                 return;
             }
@@ -1349,8 +1440,11 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
         }
         DivergenceChoice::NewProfile => {
             let _ = detach_credentials_link();
-            app.config.state.active_profile = None;
-            let _ = save_app_state(&app.config.state);
+            {
+                let mut cfg = app.config();
+                cfg.state.active_profile = None;
+                let _ = save_app_state(&cfg.state);
+            }
             begin_capture(app);
         }
         DivergenceChoice::Discard => {
@@ -1387,8 +1481,12 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
-            let existing = app.config.names();
-            if let Err(e) = validate_profile_name(&name, &existing, None) {
+            let validation = {
+                let cfg = app.config();
+                let existing = cfg.names();
+                validate_profile_name(&name, &existing, None)
+            };
+            if let Err(e) = validation {
                 app.toast(ToastKind::Danger, format!("{e}"));
                 return;
             }
@@ -1397,7 +1495,11 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 return;
             };
             let snapshot = *form.snapshot;
-            match capture_into_profile(&mut app.config, name.clone(), snapshot) {
+            let result = {
+                let mut cfg = app.config();
+                capture_into_profile(&mut cfg, name.clone(), snapshot)
+            };
+            match result {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_state_mtime = app_state_mtime();
@@ -1414,13 +1516,16 @@ fn handle_chain_item_menu_key(app: &mut App, key: KeyEvent) {
     let Some(Modal::ChainItemMenu(state)) = app.modals.last_mut() else {
         return;
     };
-    let chain_len = app.config.state.fallback_chain.len();
-    let position = app
-        .config
-        .state
-        .fallback_chain
-        .iter()
-        .position(|n| n == &state.name);
+    let (chain_len, position) = {
+        let cfg = app.config.lock().expect("config mutex poisoned");
+        let chain_len = cfg.state.fallback_chain.len();
+        let position = cfg
+            .state
+            .fallback_chain
+            .iter()
+            .position(|n| n == &state.name);
+        (chain_len, position)
+    };
     let mut options: Vec<ChainAction> = vec![ChainAction::Threshold];
     if matches!(position, Some(p) if p > 0) {
         options.push(ChainAction::MoveUp);
@@ -1460,6 +1565,8 @@ fn handle_chain_item_menu_key(app: &mut App, key: KeyEvent) {
                 ChainAction::Threshold => {
                     let current = app
                         .config
+                        .lock()
+                        .expect("config mutex poisoned")
                         .find(&name)
                         .map(threshold_for)
                         .unwrap_or(DEFAULT_THRESHOLD);
@@ -1473,8 +1580,10 @@ fn handle_chain_item_menu_key(app: &mut App, key: KeyEvent) {
                     if let Some(p) = position
                         && p > 0
                     {
-                        app.config.state.fallback_chain.swap(p - 1, p);
-                        let _ = save_app_state(&app.config.state);
+                        let mut cfg = app.config.lock().expect("config mutex poisoned");
+                        cfg.state.fallback_chain.swap(p - 1, p);
+                        let _ = save_app_state(&cfg.state);
+                        drop(cfg);
                         if app.chain_cursor > 0 {
                             app.chain_cursor -= 1;
                         }
@@ -1484,16 +1593,21 @@ fn handle_chain_item_menu_key(app: &mut App, key: KeyEvent) {
                     if let Some(p) = position
                         && p + 1 < chain_len
                     {
-                        app.config.state.fallback_chain.swap(p, p + 1);
-                        let _ = save_app_state(&app.config.state);
+                        let mut cfg = app.config.lock().expect("config mutex poisoned");
+                        cfg.state.fallback_chain.swap(p, p + 1);
+                        let _ = save_app_state(&cfg.state);
+                        drop(cfg);
                         if app.chain_cursor + 1 < chain_items(app).len() {
                             app.chain_cursor += 1;
                         }
                     }
                 }
                 ChainAction::Remove => {
-                    app.config.state.fallback_chain.retain(|n| n != &name);
-                    let _ = save_app_state(&app.config.state);
+                    {
+                        let mut cfg = app.config.lock().expect("config mutex poisoned");
+                        cfg.state.fallback_chain.retain(|n| n != &name);
+                        let _ = save_app_state(&cfg.state);
+                    }
                     app.modals.pop();
                     let items_len = chain_items(app).len();
                     if app.chain_cursor >= items_len {
@@ -1536,14 +1650,17 @@ fn handle_chain_add_key(app: &mut App, key: KeyEvent) {
             let Some(name) = state.candidates.get(state.cursor).cloned() else {
                 return;
             };
-            if let Some(profile) = app.config.find_mut(&name)
-                && profile.fallback_threshold.is_none()
             {
-                profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
-                let _ = save_profile(profile);
+                let mut cfg = app.config.lock().expect("config mutex poisoned");
+                if let Some(profile) = cfg.find_mut(&name)
+                    && profile.fallback_threshold.is_none()
+                {
+                    profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
+                    let _ = save_profile(profile);
+                }
+                cfg.state.fallback_chain.push(name);
+                let _ = save_app_state(&cfg.state);
             }
-            app.config.state.fallback_chain.push(name);
-            let _ = save_app_state(&app.config.state);
             app.modals.pop();
         }
         _ => {}
@@ -1569,12 +1686,18 @@ fn handle_chain_threshold_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             let name = form.name.clone();
-            if let Some(profile) = app.config.find_mut(&name) {
-                profile.fallback_threshold = Some(value);
-                if let Err(e) = save_profile(profile) {
-                    app.toast(ToastKind::Danger, format!("save failed: {e}"));
-                    return;
+            let save_result: Option<anyhow::Error> = {
+                let mut cfg = app.config.lock().expect("config mutex poisoned");
+                if let Some(profile) = cfg.find_mut(&name) {
+                    profile.fallback_threshold = Some(value);
+                    save_profile(profile).err()
+                } else {
+                    None
                 }
+            };
+            if let Some(e) = save_result {
+                app.toast(ToastKind::Danger, format!("save failed: {e}"));
+                return;
             }
             app.modals.pop();
             app.toast(
@@ -1621,7 +1744,10 @@ pub(crate) fn on_tick(app: &mut App) {
     // for 30s when the manual_refresh fetch lands inside one 100ms poll.
     let busy = app.activity.load(Ordering::Relaxed);
     if app.was_busy && !busy {
-        let started = oauth::auto_start_windows(&mut app.config, &app.usage_store);
+        let started = {
+            let mut cfg = app.config();
+            oauth::auto_start_windows(&mut cfg, &app.usage_store)
+        };
         if !started.is_empty() {
             app.refresh_tokens();
             app.manual_refresh();
@@ -1635,7 +1761,11 @@ pub(crate) fn on_tick(app: &mut App) {
     }
     app.was_busy = busy;
 
-    if let Ok(Some(target)) = auto_switch_if_needed(&mut app.config) {
+    let switched = {
+        let mut cfg = app.config();
+        auto_switch_if_needed(&mut cfg).ok().flatten()
+    };
+    if let Some(target) = switched {
         app.refresh_tokens();
         app.last_state_mtime = app_state_mtime();
         app.toast(ToastKind::Warning, format!("auto-switched to '{target}'"));
@@ -1661,7 +1791,7 @@ fn poll_credentials_divergence(app: &mut App) {
     if !app.modals.is_empty() {
         return;
     }
-    let Some(active) = app.config.state.active_profile.clone() else {
+    let Some(active) = app.config().state.active_profile.clone() else {
         return;
     };
     if !matches!(
@@ -1681,7 +1811,10 @@ fn poll_credentials_divergence(app: &mut App) {
 /// ~/.claude/.credentials.json lands in that standalone file instead of
 /// mutating the active profile's storage through the link.
 pub(crate) fn shutdown(app: &mut App) -> Result<()> {
-    let _ = snapshot_active_credentials(&mut app.config);
+    {
+        let mut cfg = app.config();
+        let _ = snapshot_active_credentials(&mut cfg);
+    }
     let _ = detach_credentials_link();
     Ok(())
 }

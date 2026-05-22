@@ -26,7 +26,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_title(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let active = app.config.state.active_profile.as_deref();
+    let cfg = app.config();
+    let active = cfg.state.active_profile.as_deref();
     let active_span = match active {
         Some(name) => Span::styled(format!("active: {name}"), theme::accent()),
         None => Span::styled("no active profile", theme::warning()),
@@ -38,7 +39,7 @@ fn draw_title(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ]);
     let eyebrow = match app.screen {
         Screen::Overview => {
-            let n = app.config.profiles.len();
+            let n = cfg.profiles.len();
             Line::from(vec![
                 Span::styled("OVERVIEW", theme::label()),
                 Span::raw("  "),
@@ -47,7 +48,7 @@ fn draw_title(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ])
         }
         Screen::Chain => {
-            let n = app.config.state.fallback_chain.len();
+            let n = cfg.state.fallback_chain.len();
             Line::from(vec![
                 Span::styled("FALLBACK CHAIN", theme::label()),
                 Span::raw("  "),
@@ -55,7 +56,7 @@ fn draw_title(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ])
         }
         Screen::ProfileDetail { profile_index } => {
-            let profile = app.config.profiles.get(profile_index);
+            let profile = cfg.profiles.get(profile_index);
             let name = profile.map(|p| p.name.as_str()).unwrap_or("—");
             let kind = profile
                 .map(|p| {
@@ -70,7 +71,7 @@ fn draw_title(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     }
                 })
                 .unwrap_or_else(|| "—".to_string());
-            let active = profile.is_some_and(|p| app.config.is_active(&p.name));
+            let active = profile.is_some_and(|p| cfg.is_active(&p.name));
             Line::from(vec![
                 Span::styled(name.to_string(), Style::default().fg(theme::TEXT).bold()),
                 Span::styled("  ·  ", theme::faint()),
@@ -85,6 +86,7 @@ fn draw_title(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     };
 
+    drop(cfg);
     let para = Paragraph::new(vec![title, eyebrow, status_line(app)]).style(theme::base());
     frame.render_widget(para, area);
 }

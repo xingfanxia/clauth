@@ -11,11 +11,12 @@ use super::super::app::App;
 use super::super::theme;
 use super::format::format_reset;
 use crate::fallback::threshold_for;
-use crate::profile::Profile;
+use crate::profile::{AppConfig, Profile};
 use crate::usage::UsageWindow;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, profile_index: usize) {
-    let Some(profile) = app.config.profiles.get(profile_index) else {
+    let cfg = app.config();
+    let Some(profile) = cfg.profiles.get(profile_index) else {
         return;
     };
 
@@ -57,7 +58,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, profile_index: 
         cols[0],
     );
     frame.render_widget(
-        Paragraph::new(build_fallback_lines(app, profile)).style(theme::base()),
+        Paragraph::new(build_fallback_lines(&cfg, profile)).style(theme::base()),
         cols[1],
     );
 }
@@ -120,12 +121,11 @@ fn build_config_lines(profile: &Profile) -> Vec<Line<'static>> {
     lines
 }
 
-fn build_fallback_lines(app: &App, profile: &Profile) -> Vec<Line<'static>> {
+fn build_fallback_lines(cfg: &AppConfig, profile: &Profile) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(detail_section_header("FALLBACK"));
     lines.push(Line::from(""));
-    let chain_pos = app
-        .config
+    let chain_pos = cfg
         .state
         .fallback_chain
         .iter()
@@ -135,7 +135,7 @@ fn build_fallback_lines(app: &App, profile: &Profile) -> Vec<Line<'static>> {
             lines.push(detail_kv("position", "not in chain", theme::faint()));
         }
         Some(pos) => {
-            let total = app.config.state.fallback_chain.len();
+            let total = cfg.state.fallback_chain.len();
             lines.push(detail_kv(
                 "position",
                 &format!("{} of {total} in chain", pos + 1),

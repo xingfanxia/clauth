@@ -301,7 +301,7 @@ fn draw_profile_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Profi
 
     let cursor = state.cursor.min(options.len().saturating_sub(1));
     let auto_on = app
-        .config
+        .config()
         .find(&state.name)
         .map(|p| p.auto_start)
         .unwrap_or(false);
@@ -357,18 +357,18 @@ fn draw_chain_item_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Ch
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let chain_len = app.config.state.fallback_chain.len();
-    let position = app
-        .config
+    let cfg = app.config();
+    let chain_len = cfg.state.fallback_chain.len();
+    let position = cfg
         .state
         .fallback_chain
         .iter()
         .position(|n| n == &state.name);
-    let current = app
-        .config
+    let current = cfg
         .find(&state.name)
         .map(threshold_for)
         .unwrap_or(DEFAULT_THRESHOLD);
+    drop(cfg);
 
     let mut options: Vec<(ChainAction, String)> = vec![(
         ChainAction::Threshold,
