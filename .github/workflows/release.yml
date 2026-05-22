@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
@@ -16,7 +16,7 @@ jobs:
       - name: Create release notes
         uses: softprops/action-gh-release@v3
         with:
-          generate_release_notes: true
+          generate_release_notes: false
 
   build-linux-windows:
     name: Build ${{ matrix.asset_name }}
@@ -28,7 +28,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             asset_name: clauth-linux-x86_64
-            ext: ''
+            ext: ""
           - target: x86_64-pc-windows-gnu
             asset_name: clauth-windows-x86_64
             ext: .exe
