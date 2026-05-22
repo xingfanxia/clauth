@@ -345,10 +345,6 @@ pub(crate) struct App {
     /// it drops false on the next tick we run auto-start, so the kick lands
     /// after a refresh cycle confirmed which profiles have no 5h window.
     pub(crate) was_busy: bool,
-    /// True for the busy→idle edge immediately after we fired auto-start; the
-    /// subsequent manual_refresh flips activity again, so we'd otherwise
-    /// re-enter the auto-start path on the next idle edge.
-    pub(crate) just_auto_started: bool,
     /// Last time the 1Hz divergence poll ran. Re-checks whether
     /// `~/.claude/.credentials.json` still points at the active profile and
     /// pushes a Divergence modal when CC has overwritten the symlink
@@ -382,7 +378,6 @@ impl App {
             started_at: Instant::now(),
             quit: false,
             was_busy: false,
-            just_auto_started: false,
             last_divergence_check: Instant::now(),
         }
     }
@@ -1618,26 +1613,24 @@ pub(crate) fn on_tick(app: &mut App) {
     // on the main thread, reusing existing &mut AppConfig flows. The kick
     // function short-circuits in microseconds when nothing needs work, so
     // the per-tick cost is only paid when there's actual work to do.
+    //
+    // No edge-debounce on the manual_refresh we trigger below: per-profile
+    // `last_auto_start_at` cooldown already blocks re-kicking the same
+    // profile, so a second auto_start_windows call from the follow-up edge
+    // is a harmless no-op. Trying to debounce by setting a flag would stall
+    // for 30s when the manual_refresh fetch lands inside one 100ms poll.
     let busy = app.activity.load(Ordering::Relaxed);
     if app.was_busy && !busy {
-        if app.just_auto_started {
-            // Idle edge from the manual_refresh we kicked off below; skip one
-            // cycle so we don't re-enter auto-start while waiting for usage to
-            // report the freshly-opened 5h window.
-            app.just_auto_started = false;
-        } else {
-            let started = oauth::auto_start_windows(&mut app.config, &app.usage_store);
-            if !started.is_empty() {
-                app.refresh_tokens();
-                app.manual_refresh();
-                app.just_auto_started = true;
-                let body = if started.len() == 1 {
-                    format!("auto-started usage window for '{}'", started[0])
-                } else {
-                    format!("auto-started {} usage windows", started.len())
-                };
-                app.toast(ToastKind::Info, body);
-            }
+        let started = oauth::auto_start_windows(&mut app.config, &app.usage_store);
+        if !started.is_empty() {
+            app.refresh_tokens();
+            app.manual_refresh();
+            let body = if started.len() == 1 {
+                format!("auto-started usage window for '{}'", started[0])
+            } else {
+                format!("auto-started {} usage windows", started.len())
+            };
+            app.toast(ToastKind::Info, body);
         }
     }
     app.was_busy = busy;
