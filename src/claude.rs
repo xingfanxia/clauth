@@ -15,6 +15,54 @@ fn claude_settings_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude").join("settings.json"))
 }
 
+/// State of `~/.claude/.credentials.json` relative to a profile's stored
+/// credentials. Lets callers refuse to corrupt the profile when the live
+/// path is no longer the symlink clauth installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkState {
+    /// Symlink in place and resolving to the profile's stored credentials.
+    LinkedTo,
+    /// Live path exists but is not our symlink — CC re-logged via
+    /// unlink+write, the user edited it by hand, or a stale post-shutdown
+    /// copy is sitting there.
+    Diverged,
+    /// Live path does not exist.
+    Missing,
+}
+
+pub(crate) fn classify_credentials_link(active: &str) -> Result<LinkState> {
+    let link = claude_credentials_path()?;
+    let expected = profile_dir(active)?.join("credentials.json");
+    classify_link_at(&link, &expected)
+}
+
+/// Pure path classifier used by `classify_credentials_link` and the inline
+/// tests. Symlink target comparison is canonical-when-possible, falling back
+/// to literal path equality when either side does not currently resolve.
+pub(crate) fn classify_link_at(link: &Path, expected: &Path) -> Result<LinkState> {
+    let meta = match link.symlink_metadata() {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(LinkState::Missing),
+        Err(e) => return Err(e).context("Failed to stat .credentials.json"),
+    };
+    if !meta.file_type().is_symlink() {
+        return Ok(LinkState::Diverged);
+    }
+    let target = std::fs::read_link(link).context("Failed to read .credentials.json link")?;
+    if paths_equivalent(&target, expected) {
+        Ok(LinkState::LinkedTo)
+    } else {
+        Ok(LinkState::Diverged)
+    }
+}
+
+fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
     let path = claude_credentials_path()?;
     if !path.exists() {

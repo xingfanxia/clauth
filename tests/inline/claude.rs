@@ -1,5 +1,6 @@
 use super::*;
 use crate::profile::{ClaudeCredentials, OAuthToken};
+use std::fs;
 
 fn creds(access: &str, refresh: Option<&str>) -> ClaudeCredentials {
     ClaudeCredentials {
@@ -57,4 +58,72 @@ fn diverged_returns_false_when_oauth_block_missing_on_one_side() {
     };
     assert!(!credentials_diverged(Some(&with), Some(&without)));
     assert!(!credentials_diverged(Some(&without), Some(&with)));
+}
+
+#[test]
+fn classify_link_missing_when_path_absent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    assert_eq!(
+        classify_link_at(&link, &expected).expect("classify"),
+        LinkState::Missing,
+    );
+}
+
+#[test]
+fn classify_link_diverged_when_plain_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    fs::write(&link, b"{}").expect("write live");
+    assert_eq!(
+        classify_link_at(&link, &expected).expect("classify"),
+        LinkState::Diverged,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn classify_link_linked_to_when_pointing_at_expected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    fs::write(&expected, b"{}").expect("write target");
+    std::os::unix::fs::symlink(&expected, &link).expect("symlink");
+    assert_eq!(
+        classify_link_at(&link, &expected).expect("classify"),
+        LinkState::LinkedTo,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn classify_link_diverged_when_symlink_points_elsewhere() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    let other = tmp.path().join("other.json");
+    fs::write(&other, b"{}").expect("write other");
+    fs::write(&expected, b"{}").expect("write target");
+    std::os::unix::fs::symlink(&other, &link).expect("symlink");
+    assert_eq!(
+        classify_link_at(&link, &expected).expect("classify"),
+        LinkState::Diverged,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn classify_link_linked_to_even_when_target_missing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    std::os::unix::fs::symlink(&expected, &link).expect("symlink");
+    // Target file deliberately doesn't exist yet — e.g. first-ever link
+    // before save_profile writes the credentials file.
+    assert_eq!(
+        classify_link_at(&link, &expected).expect("classify"),
+        LinkState::LinkedTo,
+    );
 }
