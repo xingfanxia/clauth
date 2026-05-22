@@ -72,6 +72,10 @@ fn main() -> Result<()> {
             // ~/.claude/.credentials.json via the symlink.
             let _ = oauth::refresh_all(&mut config);
             switch_profile(&mut config, &canonical)?;
+            // Match the TUI: prime the 5h window if the target is opted in
+            // via `auto_start = true`. Cooldown blocks repeated CLI switches
+            // from re-kicking inside the same window.
+            let _ = oauth::auto_start_named(&mut config, &canonical);
             println!("switched to '{canonical}'");
             return Ok(());
         }

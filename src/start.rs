@@ -62,12 +62,13 @@ pub(crate) fn run(config: &AppConfig, name: &str, claude_args: &[String]) -> Res
         .context("failed to spawn claude")?;
 
     if let Ok(target) = profile_dir(&profile.name).map(|d| d.join("credentials.json"))
-        && sync_relogged_credentials(&tmp.path().join(".credentials.json"), &target) {
-            eprintln!(
-                "clauth: re-login detected; updated credentials for profile '{}'",
-                profile.name
-            );
-        }
+        && sync_relogged_credentials(&tmp.path().join(".credentials.json"), &target)
+    {
+        eprintln!(
+            "clauth: re-login detected; updated credentials for profile '{}'",
+            profile.name
+        );
+    }
 
     drop(tmp);
 

@@ -263,6 +263,57 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
     kicked
 }
 
+/// Refresh tokens and kick the 5h window for one named profile. Same
+/// cooldown + persistence semantics as `auto_start_windows`, just scoped to
+/// a single name and without a usage-store check — callers use this where
+/// no fresh `UsageStore` is on hand (e.g. one-shot CLI switch). The 4.5h
+/// cooldown stops repeated invocations from re-firing inside an open
+/// window. Returns true iff the kick HTTP call succeeded.
+pub(crate) fn auto_start_named(config: &mut AppConfig, name: &str) -> bool {
+    let now = now_ms();
+    let token = match with_state_lock(|| {
+        let Some(profile) = config.find(name) else {
+            return Ok::<_, anyhow::Error>(None);
+        };
+        if !profile.auto_start {
+            return Ok(None);
+        }
+        if active_link_diverged(config) && config.is_active(name) {
+            return Ok(None);
+        }
+        let last = config
+            .state
+            .last_auto_start_at
+            .get(name)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last) < AUTO_START_COOLDOWN_MS {
+            return Ok(None);
+        }
+        let Some(rt) = profile.refresh_token().map(str::to_string) else {
+            return Ok(None);
+        };
+        config
+            .state
+            .last_auto_start_at
+            .insert(name.to_string(), now);
+        let _ = save_app_state(&config.state);
+        Ok(Some(rt))
+    }) {
+        Ok(Some(t)) => t,
+        _ => return false,
+    };
+
+    let Ok(tok) = refresh(&token) else {
+        return false;
+    };
+    let access_token = tok.access_token.clone();
+    if !apply_rotated_tokens(config, name, tok) {
+        return false;
+    }
+    kick(&access_token).is_ok()
+}
+
 /// Write a rotated token pair into the named profile's OAuth block and
 /// persist. Returns true on success. No-op when the profile or OAuth block
 /// is missing — callers that care can refuse to act on `false`.
