@@ -28,6 +28,7 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::thread::{self, JoinHandle};
@@ -37,7 +38,7 @@ use anyhow::{Context, Result};
 
 use crate::claude::{build_claude_settings_json, create_symlink};
 use crate::lock::with_state_lock;
-use crate::profile::{Profile, atomic_write, home_dir, profile_dir};
+use crate::profile::{ClaudeCredentials, Profile, atomic_write, home_dir, profile_dir};
 
 /// Watchdog tick. 1s instead of a longer interval because fake-symlink mode
 /// needs a tight upper bound on how long a session can read stale credentials
@@ -67,33 +68,48 @@ fn canonical_credentials(name: &str) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join("credentials.json"))
 }
 
-/// Live-session guard. On drop: stops the watchdog, syncs a final time,
-/// drops the PID file, and tears the runtime down when this was the last
-/// session for the profile.
+/// Open or create a PID file without truncating — used for session liveness
+/// tracking via flock. `O_CREAT` without truncate preserves any existing lock
+/// held by a sibling that raced us to create the file.
+pub(crate) fn open_pid_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Live-session guard. On drop: stops the watchdog, runs a final sync
+/// (errors surface to stderr), drops the PID file, and tears the runtime
+/// down when this was the last session for the profile.
 pub(crate) struct ProfileRuntime {
-    name: String,
     runtime: PathBuf,
     pid_file: PathBuf,
     claude_home: PathBuf,
+    canonical: PathBuf,
+    sessions: PathBuf,
     mode: LinkMode,
     /// Held for the lifetime of the session so a sibling process's
     /// `try_lock` reveals we're still alive.
     _pid_lock: File,
-    watchdog_signal: Option<Sender<()>>,
+    /// Wrapped in ManuallyDrop so Drop can explicitly drop it before joining
+    /// the watchdog, signalling the thread to exit.
+    watchdog_signal: ManuallyDrop<Sender<()>>,
     watchdog_handle: Option<JoinHandle<()>>,
 }
 
 impl ProfileRuntime {
     pub(crate) fn acquire(profile: &Profile) -> Result<Self> {
-        let name = profile.name.clone();
+        let name = &profile.name;
         let claude_home = home_dir()?.join(".claude");
         if !claude_home.exists() {
             anyhow::bail!("~/.claude not found; install Claude Code first");
         }
-        let runtime = runtime_dir(&name)?;
-        let sessions = sessions_dir(&name)?;
+        let runtime = runtime_dir(name)?;
+        let sessions = sessions_dir(name)?;
         let pid_file = sessions.join(std::process::id().to_string());
-        let canonical = canonical_credentials(&name)?;
+        let canonical = canonical_credentials(name)?;
 
         let (pid_lock, mode) = with_state_lock(|| {
             std::fs::create_dir_all(&sessions)
@@ -102,7 +118,7 @@ impl ProfileRuntime {
             // No live siblings — rebuild the tree from scratch so stale
             // symlinks/copies to entries that have since vanished from
             // ~/.claude/ don't carry over.
-            if active == 0 && runtime.exists() {
+            if active == 0 && runtime.symlink_metadata().is_ok() {
                 std::fs::remove_dir_all(&runtime)
                     .with_context(|| format!("failed to clear {}", runtime.display()))?;
             }
@@ -110,12 +126,7 @@ impl ProfileRuntime {
                 .with_context(|| format!("failed to create {}", runtime.display()))?;
             let mode = detect_link_mode(&runtime)?;
             build_runtime_dir(&runtime, &claude_home, profile, &canonical, mode)?;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&pid_file)
+            let file = open_pid_file(&pid_file)
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
             file.lock()
                 .with_context(|| format!("failed to lock {}", pid_file.display()))?;
@@ -127,24 +138,28 @@ impl ProfileRuntime {
         let watchdog_canonical = canonical.clone();
         let watchdog_claude_home = claude_home.clone();
         let watchdog_handle = thread::spawn(move || {
+            // Loop exits on Disconnected (sender dropped in Drop) or Ok(()).
             while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(WATCHDOG_INTERVAL) {
-                let _ = tick(
+                if let Err(e) = tick(
                     mode,
                     &watchdog_runtime,
                     &watchdog_claude_home,
                     &watchdog_canonical,
-                );
+                ) {
+                    eprintln!("clauth: watchdog tick failed: {e}");
+                }
             }
         });
 
         Ok(Self {
-            name,
             runtime,
             pid_file,
             claude_home,
+            canonical,
+            sessions,
             mode,
             _pid_lock: pid_lock,
-            watchdog_signal: Some(tx),
+            watchdog_signal: ManuallyDrop::new(tx),
             watchdog_handle: Some(watchdog_handle),
         })
     }
@@ -156,25 +171,32 @@ impl ProfileRuntime {
 
 impl Drop for ProfileRuntime {
     fn drop(&mut self) {
-        self.watchdog_signal.take();
+        // Drop the sender first to signal the watchdog, then join.
+        // SAFETY: field is never used after this point.
+        unsafe { ManuallyDrop::drop(&mut self.watchdog_signal) };
         if let Some(h) = self.watchdog_handle.take() {
             let _ = h.join();
         }
 
-        if let Ok(canonical) = canonical_credentials(&self.name) {
-            let _ = tick(self.mode, &self.runtime, &self.claude_home, &canonical);
+        if let Err(e) = tick(self.mode, &self.runtime, &self.claude_home, &self.canonical) {
+            eprintln!("clauth: final sync failed: {e}");
         }
 
-        let _ = with_state_lock(|| {
-            let _ = std::fs::remove_file(&self.pid_file);
-            let sessions = sessions_dir(&self.name)?;
-            let still_active = prune_stale_sessions(&sessions).unwrap_or(0);
+        if let Err(e) = with_state_lock(|| {
+            if let Err(e) = std::fs::remove_file(&self.pid_file)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("clauth: remove pid file failed: {e}");
+            }
+            let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
             if still_active == 0 {
                 let _ = std::fs::remove_dir_all(&self.runtime);
-                let _ = std::fs::remove_dir(&sessions);
+                let _ = std::fs::remove_dir(&self.sessions);
             }
             Ok::<_, anyhow::Error>(())
-        });
+        }) {
+            eprintln!("clauth: drop cleanup failed: {e}");
+        }
     }
 }
 
@@ -237,13 +259,14 @@ fn prune_stale_sessions(sessions: &Path) -> Result<usize> {
 }
 
 fn is_session_alive(pid_file: &Path) -> bool {
+    // Open without O_CREAT: creating the file would race with another session
+    // that just created it but hasn't locked it yet, producing a false
+    // "unlocked = dead" reading. try_lock succeeds iff no other open fd holds
+    // an exclusive flock, i.e. the previous owner has exited.
     let Ok(file) = OpenOptions::new().read(true).write(true).open(pid_file) else {
         return false;
     };
-    // try_lock succeeds iff no other open file description holds an
-    // exclusive flock — i.e. the previous owner has exited. Any I/O error
-    // also surfaces as Err; we'd rather leak a session file than race a
-    // live one, so Err means "treat as alive".
+    // Any I/O error: treat as alive so we don't race a live session.
     file.try_lock().is_err()
 }
 
@@ -398,9 +421,13 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
         return Ok(false);
     }
     let bytes = std::fs::read(link_path).context("failed to read live credentials")?;
-    // Skip if CC's write is mid-flight (partial JSON). Next watchdog tick
-    // will catch the completed write.
-    if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+    // Skip if CC's write is mid-flight (partial, invalid, or empty object).
+    // {} deserializes as ClaudeCredentials { claude_ai_oauth: None } because
+    // the field is Option — require Some to confirm a completed write.
+    let Ok(creds) = serde_json::from_slice::<ClaudeCredentials>(&bytes) else {
+        return Ok(false);
+    };
+    if creds.claude_ai_oauth.is_none() {
         return Ok(false);
     }
     let canonical_bytes = std::fs::read(canonical).ok();
@@ -409,7 +436,7 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
         atomic_write(canonical, &bytes)?;
     }
     if canonical.exists() {
-        let tmp = link_path.with_file_name(".credentials.json.tmp");
+        let tmp = link_path.with_file_name(format!(".credentials.json.tmp.{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         create_symlink(canonical, &tmp)?;
         std::fs::rename(&tmp, link_path)?;
@@ -433,28 +460,33 @@ fn mirror_credentials(runtime_path: &Path, canonical: &Path) -> Result<()> {
             let ca_time = cm.modified().ok();
             match (rt_time, ca_time) {
                 (Some(rt), Some(ca)) if rt > ca => {
-                    copy_if_valid_json(runtime_path, canonical)?;
+                    copy_if_valid_creds(runtime_path, canonical)?;
                 }
                 (Some(rt), Some(ca)) if ca > rt => {
-                    copy_if_valid_json(canonical, runtime_path)?;
+                    copy_if_valid_creds(canonical, runtime_path)?;
                 }
                 _ => {}
             }
         }
         (Some(_), None) => {
-            copy_if_valid_json(runtime_path, canonical)?;
+            copy_if_valid_creds(runtime_path, canonical)?;
         }
         (None, Some(_)) => {
-            copy_if_valid_json(canonical, runtime_path)?;
+            copy_if_valid_creds(canonical, runtime_path)?;
         }
         (None, None) => {}
     }
     Ok(())
 }
 
-fn copy_if_valid_json(src: &Path, dst: &Path) -> Result<()> {
+fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<()> {
     let bytes = std::fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
-    if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+    // Same guard as sync_credentials_unlocked: reject partial, invalid, or
+    // empty-object writes before letting them stomp the canonical file.
+    let Ok(creds) = serde_json::from_slice::<ClaudeCredentials>(&bytes) else {
+        return Ok(());
+    };
+    if creds.claude_ai_oauth.is_none() {
         return Ok(());
     }
     if std::fs::read(dst).ok().as_deref() == Some(bytes.as_slice()) {

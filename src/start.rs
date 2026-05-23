@@ -24,6 +24,15 @@ pub(crate) fn run(config: &AppConfig, name: &str, claude_args: &[String]) -> Res
     drop(runtime);
 
     if !status.success() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let code = status
+                .code()
+                .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1));
+            std::process::exit(code);
+        }
+        #[cfg(not(unix))]
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
