@@ -7,6 +7,7 @@ mod lock;
 mod oauth;
 mod platform;
 mod profile;
+mod runtime;
 mod start;
 mod tui;
 mod update;
