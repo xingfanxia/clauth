@@ -247,6 +247,24 @@ fn is_session_alive(pid_file: &Path) -> bool {
     file.try_lock().is_err()
 }
 
+/// Build or incrementally update the runtime tree.
+///
+/// Called on every `acquire`, including when `active > 0` (live siblings
+/// already built the tree). The walk always runs; entries whose runtime
+/// counterpart already exists are skipped, so new `~/.claude/` additions
+/// after the first session's build are picked up without disturbing the rest.
+///
+/// Shared vs. per-profile layout:
+/// - **Shared via symlink/copy across all profiles:** every top-level entry
+///   in `~/.claude/` except `settings.json` and `.credentials.json` —
+///   this includes `projects/`, `todos/`, `statsig/`, `sessions/`, `cache/`,
+///   `commands/`, `plugins/`, `tasks/`, `teams/`, `hooks/`, `history.jsonl`,
+///   `.claude.json`, and similar. Claude Code treats these as user-global
+///   state so sharing is intentional; per-profile isolation would hide
+///   project history and installed commands.
+/// - **Per-profile:** `settings.json` (merged with profile overrides) and
+///   `.credentials.json` (the profile's own OAuth token chain). These are
+///   rewritten on every acquire and are never symlinked to the shared copy.
 fn build_runtime_dir(
     runtime: &Path,
     claude_home: &Path,
@@ -254,6 +272,8 @@ fn build_runtime_dir(
     canonical: &Path,
     mode: LinkMode,
 ) -> Result<()> {
+    // Re-walk on every acquire so entries added to ~/.claude/ after the
+    // first session's build are picked up. Existing entries stay as-is.
     for entry in std::fs::read_dir(claude_home)
         .with_context(|| format!("failed to read {}", claude_home.display()))?
     {
@@ -271,8 +291,16 @@ fn build_runtime_dir(
 
     let settings_src = claude_home.join("settings.json");
     let merged = build_claude_settings_json(&settings_src, profile, &[])?;
-    atomic_write(&runtime.join("settings.json"), merged)
-        .context("failed to write runtime settings.json")?;
+    let settings_dst = runtime.join("settings.json");
+    // Only write when absent or content differs — concurrent sessions on the
+    // same profile each compute the same merge, so a byte-identical result
+    // doesn't need to win a last-writer race and stomp a sibling's write.
+    let needs_write = std::fs::read(&settings_dst)
+        .map(|existing| existing != merged.as_bytes())
+        .unwrap_or(true);
+    if needs_write {
+        atomic_write(&settings_dst, merged).context("failed to write runtime settings.json")?;
+    }
 
     let creds_link = runtime.join(".credentials.json");
     if creds_link.symlink_metadata().is_ok() {
