@@ -437,6 +437,12 @@ impl App {
             oauth::auto_start_windows(&mut cfg, &self.usage_store)
         };
         if !started.is_empty() {
+            for name in &started {
+                self.toast(
+                    ToastKind::Info,
+                    format!("auto-started usage window for '{name}'"),
+                );
+            }
             let retry: Vec<TokenEntry> = collect_tokens(&self.config().profiles)
                 .into_iter()
                 .filter(|e| started.contains(&e.name))
@@ -1770,25 +1776,23 @@ pub(crate) fn on_tick(app: &mut App) {
         p.clear();
         v
     };
-    let mut started = Vec::new();
+    let mut any_started = false;
     for name in pending {
         let kicked = {
             let mut cfg = app.config();
             oauth::auto_start_named(&mut cfg, &name)
         };
         if kicked {
-            started.push(name);
+            any_started = true;
+            app.toast(
+                ToastKind::Info,
+                format!("auto-started usage window for '{name}'"),
+            );
         }
     }
-    if !started.is_empty() {
+    if any_started {
         app.refresh_tokens();
         app.manual_refresh();
-        let body = if started.len() == 1 {
-            format!("auto-started usage window for '{}'", started[0])
-        } else {
-            format!("auto-started {} usage windows", started.len())
-        };
-        app.toast(ToastKind::Info, body);
     }
 
     let switched = {
