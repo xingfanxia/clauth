@@ -39,6 +39,32 @@ fn endpoint_profile(name: &str) -> Profile {
     }
 }
 
+fn blank_profile(name: &str) -> Profile {
+    Profile {
+        name: name.to_string(),
+        base_url: None,
+        api_key: None,
+        auto_start: false,
+        env: BTreeMap::new(),
+        fallback_threshold: None,
+        credentials: None,
+        usage: None,
+        fetch_status: None,
+    }
+}
+
+fn live_oauth(refresh: Option<&str>) -> ClaudeCredentials {
+    ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-live".to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    }
+}
+
 fn config_with(profiles: Vec<Profile>, active: Option<&str>) -> AppConfig {
     let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
     AppConfig {
@@ -93,4 +119,48 @@ fn endpoint_profiles_without_oauth_are_skipped() {
         None,
     );
     assert_eq!(match_by_refresh_token(&config, "rt-work"), Some("work"));
+}
+
+#[test]
+fn attributes_unmatched_login_to_credential_less_active() {
+    let config = config_with(
+        vec![oauth_profile("work", "rt-work"), blank_profile("new")],
+        Some("new"),
+    );
+    let live = live_oauth(Some("rt-fresh"));
+    assert_eq!(resolve_profile(&config, &live), Some("new"));
+}
+
+#[test]
+fn token_match_wins_over_credential_less_active() {
+    let config = config_with(
+        vec![
+            oauth_profile("personal", "rt-personal"),
+            blank_profile("new"),
+        ],
+        Some("new"),
+    );
+    let live = live_oauth(Some("rt-personal"));
+    assert_eq!(resolve_profile(&config, &live), Some("personal"));
+}
+
+#[test]
+fn no_attribution_when_active_profile_has_creds() {
+    let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
+    let live = live_oauth(Some("rt-fresh"));
+    assert_eq!(resolve_profile(&config, &live), None);
+}
+
+#[test]
+fn no_attribution_when_no_active_profile() {
+    let config = config_with(vec![blank_profile("new")], None);
+    let live = live_oauth(Some("rt-fresh"));
+    assert_eq!(resolve_profile(&config, &live), None);
+}
+
+#[test]
+fn no_attribution_without_refresh_token() {
+    let config = config_with(vec![blank_profile("new")], Some("new"));
+    let live = live_oauth(None);
+    assert_eq!(resolve_profile(&config, &live), None);
 }

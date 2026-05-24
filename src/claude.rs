@@ -63,6 +63,38 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// True when `active` owns no stored credentials yet and the live
+/// `.credentials.json` is a regular file carrying a completed OAuth login.
+/// This is a credential-less profile's first login (e.g. a blank profile the
+/// user just authenticated through Claude Code), which clauth adopts rather
+/// than refusing as divergence. Mirrors the runtime watchdog's first-login
+/// handling in `sync_credentials_unlocked`.
+pub(crate) fn is_first_login(active: &str) -> Result<bool> {
+    let link = claude_credentials_path()?;
+    let expected = profile_dir(active)?.join("credentials.json");
+    Ok(is_first_login_at(&link, &expected))
+}
+
+/// Pure path-based companion to [`is_first_login`], split out for testing.
+/// `expected` is the profile's stored credentials file; its absence is the
+/// "no stored credentials" signal. The OAuth check rejects a mid-flight
+/// partial write (e.g. an empty `{}`) so adoption waits for a completed login.
+fn is_first_login_at(link: &Path, expected: &Path) -> bool {
+    if expected.exists() {
+        return false;
+    }
+    let Ok(meta) = link.symlink_metadata() else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return false;
+    }
+    std::fs::read(link)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ClaudeCredentials>(&bytes).ok())
+        .is_some_and(|creds| creds.claude_ai_oauth.is_some())
+}
+
 pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
     let path = claude_credentials_path()?;
     if !path.exists() {
@@ -268,9 +300,27 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
             return Ok(());
         };
         if matches!(classify_credentials_link(&active)?, LinkState::Diverged) {
+            // A divergent live file is normally a re-login the user must
+            // resolve, so the stored identity stays untouched. The one
+            // exception is a credential-less profile's first login: adopt
+            // Claude Code's write so the profile gains an identity.
+            if is_first_login(&active)? {
+                adopt_first_login(config, &active)?;
+            }
             return Ok(());
         }
         snapshot_active_credentials_unchecked(config, &active)
+    })
+}
+
+/// Adopt a credential-less profile's first login: store the live
+/// `.credentials.json` into the active profile, then replace it with a symlink
+/// so later Claude Code writes stay owned. Callers gate this on
+/// [`is_first_login`]; calling it otherwise would overwrite stored identity.
+pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &str) -> Result<()> {
+    with_state_lock(|| {
+        snapshot_active_credentials_unchecked(config, active)?;
+        force_link_profile_credentials(active)
     })
 }
 

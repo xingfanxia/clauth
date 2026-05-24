@@ -20,10 +20,7 @@ pub(crate) fn run(json: bool) -> Result<()> {
     let path = resolve_credentials_path()?;
     let creds = read_credentials(&path);
     let config = load_config()?;
-    let matched = creds
-        .as_ref()
-        .and_then(ClaudeCredentials::refresh_token)
-        .and_then(|rt| match_by_refresh_token(&config, rt));
+    let matched = creds.as_ref().and_then(|c| resolve_profile(&config, c));
 
     if json {
         emit_json(&config, matched);
@@ -43,6 +40,33 @@ fn resolve_credentials_path() -> Result<PathBuf> {
 fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// Resolve the loaded credentials to a stored profile. Prefers an exact
+/// refresh-token match; falls back to the active profile when that profile is
+/// credential-less and the loaded file is a real OAuth login.
+fn resolve_profile<'a>(config: &'a AppConfig, creds: &ClaudeCredentials) -> Option<&'a str> {
+    creds
+        .refresh_token()
+        .and_then(|rt| match_by_refresh_token(config, rt))
+        .or_else(|| match_credential_less_active(config, creds))
+}
+
+/// Read-time counterpart to first-login adoption: a freshly-activated blank
+/// profile that Claude Code just logged into holds no stored token yet, so no
+/// `refreshToken` match exists — but the live login is unambiguously the
+/// active profile's. Only fires when the active profile owns no credentials
+/// and the loaded file carries a completed OAuth login.
+fn match_credential_less_active<'a>(
+    config: &'a AppConfig,
+    creds: &ClaudeCredentials,
+) -> Option<&'a str> {
+    creds.refresh_token()?;
+    let active = config.state.active_profile.as_deref()?;
+    config
+        .find(active)
+        .filter(|p| p.credentials.is_none())
+        .map(|p| p.name.as_str())
 }
 
 fn match_by_refresh_token<'a>(config: &'a AppConfig, refresh_token: &str) -> Option<&'a str> {

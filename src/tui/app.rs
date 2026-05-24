@@ -22,9 +22,9 @@ use crate::actions::{
     switch_profile, validate_profile_name,
 };
 use crate::claude::{
-    LinkState, classify_credentials_link, credentials_diverged, detach_credentials_link,
-    force_link_profile_credentials, force_snapshot_active_credentials, link_profile_credentials,
-    read_claude_credentials, snapshot_active_credentials,
+    LinkState, adopt_first_login, classify_credentials_link, credentials_diverged,
+    detach_credentials_link, force_link_profile_credentials, force_snapshot_active_credentials,
+    is_first_login, link_profile_credentials, read_claude_credentials, snapshot_active_credentials,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, auto_switch_if_needed, threshold_for};
 use crate::lock::with_state_lock;
@@ -1832,6 +1832,23 @@ fn poll_credentials_divergence(app: &mut App) {
         classify_credentials_link(&active).ok(),
         Some(LinkState::Diverged)
     ) {
+        return;
+    }
+    // A credential-less profile's first login isn't a real divergence — adopt
+    // Claude Code's write into the profile silently instead of prompting.
+    if is_first_login(&active).unwrap_or(false) {
+        let result = {
+            let mut cfg = app.config();
+            adopt_first_login(&mut cfg, &active)
+        };
+        match result {
+            Ok(()) => {
+                app.refresh_tokens();
+                app.last_state_mtime = app_state_mtime();
+                app.toast(ToastKind::Success, format!("saved login into '{active}'"));
+            }
+            Err(e) => app.toast(ToastKind::Danger, format!("adopt failed: {e}")),
+        }
         return;
     }
     app.modals

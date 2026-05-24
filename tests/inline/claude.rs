@@ -113,6 +113,67 @@ fn classify_link_diverged_when_symlink_points_elsewhere() {
     );
 }
 
+#[test]
+fn first_login_true_when_no_stored_creds_and_plain_oauth_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json"); // absent → no stored creds
+    fs::write(
+        &link,
+        serde_json::to_vec(&creds("a", Some("r"))).expect("ser"),
+    )
+    .expect("write");
+    assert!(is_first_login_at(&link, &expected));
+}
+
+#[test]
+fn first_login_false_when_stored_creds_exist() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    fs::write(
+        &link,
+        serde_json::to_vec(&creds("a", Some("r"))).expect("ser"),
+    )
+    .expect("write");
+    fs::write(&expected, b"{}").expect("write stored");
+    assert!(!is_first_login_at(&link, &expected));
+}
+
+#[test]
+fn first_login_false_when_link_missing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    assert!(!is_first_login_at(&link, &expected));
+}
+
+#[test]
+fn first_login_false_when_oauth_block_absent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    // Mid-flight partial write: valid JSON but no OAuth block yet.
+    fs::write(&link, b"{}").expect("write");
+    assert!(!is_first_login_at(&link, &expected));
+}
+
+#[cfg(unix)]
+#[test]
+fn first_login_false_when_link_is_symlink() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    let store = tmp.path().join("store.json");
+    fs::write(
+        &store,
+        serde_json::to_vec(&creds("a", Some("r"))).expect("ser"),
+    )
+    .expect("write");
+    std::os::unix::fs::symlink(&store, &link).expect("symlink");
+    assert!(!is_first_login_at(&link, &expected));
+}
+
 #[cfg(unix)]
 #[test]
 fn classify_link_linked_to_even_when_target_missing() {
