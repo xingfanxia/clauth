@@ -698,6 +698,97 @@ fn build_runtime_dir_links_claude_json_from_parent() {
     });
 }
 
+// ── has_live_session ──────────────────────────────────────────────────────────
+
+#[test]
+fn has_live_session_false_when_no_sessions_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        // No sessions dir created — must return false, not error.
+        assert!(!has_live_session("ghost"));
+    });
+}
+
+#[test]
+fn has_live_session_false_when_sessions_dir_empty() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        // Create an empty sessions dir.
+        let sessions = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("empty")
+            .join("sessions");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        assert!(!has_live_session("empty"));
+    });
+}
+
+#[test]
+fn has_live_session_false_when_all_sessions_dead() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let sessions = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("dead")
+            .join("sessions");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        // Unlocked file = dead session.
+        fs::write(sessions.join("99999"), b"").expect("write dead pid");
+        assert!(!has_live_session("dead"));
+    });
+}
+
+#[test]
+fn has_live_session_true_when_any_session_alive() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let sessions = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("alive")
+            .join("sessions");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        let pid_path = sessions.join("12345");
+        let file = open_pid_file(&pid_path).expect("open pid");
+        file.lock().expect("lock pid");
+        assert!(has_live_session("alive"));
+        drop(file);
+        assert!(!has_live_session("alive"));
+    });
+}
+
+#[test]
+fn has_live_session_true_with_mixed_alive_and_dead() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let sessions = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("mixed")
+            .join("sessions");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        // One dead entry.
+        fs::write(sessions.join("11111"), b"").expect("write dead pid");
+        // One live entry.
+        let live_path = sessions.join("22222");
+        let file = open_pid_file(&live_path).expect("open live pid");
+        file.lock().expect("lock live pid");
+        assert!(has_live_session("mixed"));
+        drop(file);
+    });
+}
+
 // ── ProfileRuntime acquire / drop lifecycle ───────────────────────────────────
 
 #[test]

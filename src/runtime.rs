@@ -64,6 +64,20 @@ fn sessions_dir(name: &str) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join("sessions"))
 }
 
+/// True iff the profile currently has at least one live `clauth start` session.
+///
+/// Reads the sessions dir and tests each entry with `is_session_alive`. A
+/// missing or unreadable sessions dir returns false — the profile is idle.
+pub(crate) fn has_live_session(name: &str) -> bool {
+    let Ok(dir) = sessions_dir(name) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| is_session_alive(&e.path()))
+}
+
 fn canonical_credentials(name: &str) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join("credentials.json"))
 }

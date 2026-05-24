@@ -6,7 +6,8 @@ use serde::Deserialize;
 
 use crate::claude::{LinkState, classify_credentials_link};
 use crate::lock::with_state_lock;
-use crate::profile::{AppConfig, save_app_state, save_profile};
+use crate::profile::{AppConfig, OAuthToken, save_app_state, save_profile};
+use crate::runtime::has_live_session;
 use crate::usage::{UsageStore, now_ms};
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup
@@ -110,6 +111,9 @@ pub(crate) fn refresh_all(config: &mut AppConfig) -> Vec<String> {
             if skip_active && config.is_active(&p.name) {
                 return None;
             }
+            if has_live_session(&p.name) {
+                return None;
+            }
             Some((p.name.clone(), p.refresh_token()?.to_string()))
         })
         .collect();
@@ -138,12 +142,7 @@ pub(crate) fn refresh_all(config: &mut AppConfig) -> Vec<String> {
             let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
                 return Ok(false);
             };
-            oauth.access_token = tok.access_token;
-            oauth.refresh_token = Some(tok.refresh_token);
-            oauth.expires_at = Some((now_ms() + tok.expires_in * 1000) as i64);
-            if let Some(scope) = tok.scope {
-                oauth.scopes = Some(scope.split_whitespace().map(String::from).collect());
-            }
+            write_token_fields(oauth, tok);
             Ok(save_profile(profile).is_ok())
         })
         .unwrap_or(false);
@@ -179,6 +178,9 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
             if skip_active && config.is_active(&profile.name) {
                 continue;
             }
+            if has_live_session(&profile.name) {
+                continue;
+            }
             let resets_at = {
                 let usage = store.lock().ok();
                 usage
@@ -205,6 +207,9 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
             claimed.push((profile.name.clone(), token));
         }
 
+        // Claim cooldown slots before releasing the lock. A competing clauth
+        // process will observe these timestamps and skip the same profiles so
+        // the token rotates exactly once even when two instances race startup.
         for (name, _) in &claimed {
             config.state.last_auto_start_at.insert(name.clone(), now);
         }
@@ -231,31 +236,10 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
         let Ok((name, Ok(tok))) = h.join() else {
             continue;
         };
-        let saved_access = with_state_lock(|| {
-            let Some(profile) = config.find_mut(&name) else {
-                return Ok::<_, anyhow::Error>(None);
-            };
-            let Some(creds) = profile.credentials.as_mut() else {
-                return Ok(None);
-            };
-            let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
-                return Ok(None);
-            };
-            oauth.access_token = tok.access_token.clone();
-            oauth.refresh_token = Some(tok.refresh_token);
-            oauth.expires_at = Some((now_ms() + tok.expires_in * 1000) as i64);
-            if let Some(scope) = tok.scope {
-                oauth.scopes = Some(scope.split_whitespace().map(String::from).collect());
-            }
-            if save_profile(profile).is_err() {
-                return Ok(None);
-            }
-            Ok(Some(tok.access_token))
-        })
-        .unwrap_or(None);
-        let Some(access_token) = saved_access else {
+        let access_token = tok.access_token.clone();
+        if !apply_rotated_tokens_or_rollback_cooldown(config, &name, tok) {
             continue;
-        };
+        }
         if kick(&access_token).is_ok() {
             kicked.push(name);
         }
@@ -279,6 +263,9 @@ pub(crate) fn auto_start_named(config: &mut AppConfig, name: &str) -> bool {
             return Ok(None);
         }
         if active_link_diverged(config) && config.is_active(name) {
+            return Ok(None);
+        }
+        if has_live_session(name) {
             return Ok(None);
         }
         let last = config
@@ -308,10 +295,50 @@ pub(crate) fn auto_start_named(config: &mut AppConfig, name: &str) -> bool {
         return false;
     };
     let access_token = tok.access_token.clone();
-    if !apply_rotated_tokens(config, name, tok) {
+    if !apply_rotated_tokens_or_rollback_cooldown(config, name, tok) {
         return false;
     }
     kick(&access_token).is_ok()
+}
+
+/// Write rotated token fields into an OAuth block. Called under the state lock.
+fn write_token_fields(oauth: &mut OAuthToken, tok: TokenResponse) {
+    oauth.access_token = tok.access_token;
+    oauth.refresh_token = Some(tok.refresh_token);
+    oauth.expires_at = Some((now_ms() + tok.expires_in * 1000) as i64);
+    if let Some(scope) = tok.scope {
+        oauth.scopes = Some(scope.split_whitespace().map(String::from).collect());
+    }
+}
+
+/// Write a rotated token pair into the named profile's OAuth block and persist.
+/// If persist fails, rolls back the `last_auto_start_at` cooldown so the next
+/// run can retry without waiting the full 4.5h. Returns true on success.
+fn apply_rotated_tokens_or_rollback_cooldown(
+    config: &mut AppConfig,
+    name: &str,
+    tok: TokenResponse,
+) -> bool {
+    with_state_lock(|| {
+        let Some(profile) = config.find_mut(name) else {
+            return Ok::<_, anyhow::Error>(false);
+        };
+        let Some(creds) = profile.credentials.as_mut() else {
+            return Ok(false);
+        };
+        let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
+            return Ok(false);
+        };
+        write_token_fields(oauth, tok);
+        if save_profile(profile).is_err() {
+            // Roll back the cooldown so the profile isn't stranded.
+            config.state.last_auto_start_at.remove(name);
+            let _ = save_app_state(&config.state);
+            return Ok(false);
+        }
+        Ok(true)
+    })
+    .unwrap_or(false)
 }
 
 /// Write a rotated token pair into the named profile's OAuth block and
@@ -328,12 +355,7 @@ pub(crate) fn apply_rotated_tokens(config: &mut AppConfig, name: &str, tok: Toke
         let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
             return Ok(false);
         };
-        oauth.access_token = tok.access_token;
-        oauth.refresh_token = Some(tok.refresh_token);
-        oauth.expires_at = Some((now_ms() + tok.expires_in * 1000) as i64);
-        if let Some(scope) = tok.scope {
-            oauth.scopes = Some(scope.split_whitespace().map(String::from).collect());
-        }
+        write_token_fields(oauth, tok);
         Ok(save_profile(profile).is_ok())
     })
     .unwrap_or(false)
