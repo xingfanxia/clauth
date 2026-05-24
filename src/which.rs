@@ -1,10 +1,14 @@
 //! `clauth which [--json]` — identify which stored profile owns the OAuth
 //! tokens in the credentials.json currently loaded by Claude Code.
 //!
-//! Resolution: matches the loaded file's `refreshToken` against each stored
-//! profile's `refreshToken`. The clauth symlink layout means the live file
-//! and the matching profile's file are usually the same bytes, so equality
-//! holds across rotations done by either clauth or Claude Code itself.
+//! Resolution: (1) match the loaded file's `refreshToken` against each stored
+//! profile's `refreshToken` — the clauth symlink layout keeps the live file
+//! and the matching profile's file byte-identical across rotations. (2) Inside
+//! a `clauth start` runtime, fall back to the profile named by
+//! `CLAUDE_CONFIG_DIR` (`…/profiles/<name>/runtime`): the runtime tree is
+//! per-profile, so that profile owns the session even before its first login
+//! is stored. (3) Otherwise, attribute a fresh login to the credential-less
+//! active profile.
 //!
 //! Path: honors `CLAUDE_CONFIG_DIR` (the same env var `clauth start` sets) so
 //! a status line running inside an isolated session finds the right file.
@@ -17,13 +21,19 @@ use crate::format::endpoint_label;
 use crate::profile::{AppConfig, ClaudeCredentials, Profile, home_dir, load_config};
 
 pub(crate) fn run(json: bool) -> Result<()> {
-    let in_session = std::env::var_os("CLAUDE_CONFIG_DIR").is_some();
-    let path = resolve_credentials_path()?;
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+    let session_profile = config_dir
+        .as_deref()
+        .and_then(session_profile_from_config_dir);
+    let path = credentials_path(config_dir.as_deref())?;
     let creds = read_credentials(&path);
     let config = load_config()?;
-    let matched = creds
-        .as_ref()
-        .and_then(|c| resolve_profile(&config, c, in_session));
+    let matched = resolve_profile(
+        &config,
+        creds.as_ref(),
+        config_dir.is_some(),
+        session_profile.as_deref(),
+    );
 
     if json {
         emit_json(&config, matched);
@@ -33,11 +43,27 @@ pub(crate) fn run(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn resolve_credentials_path() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        return Ok(PathBuf::from(dir).join(".credentials.json"));
+fn credentials_path(config_dir: Option<&Path>) -> Result<PathBuf> {
+    match config_dir {
+        Some(dir) => Ok(dir.join(".credentials.json")),
+        None => Ok(home_dir()?.join(".claude").join(".credentials.json")),
     }
-    Ok(home_dir()?.join(".claude").join(".credentials.json"))
+}
+
+/// When `CLAUDE_CONFIG_DIR` points at a `clauth start` runtime
+/// (`~/.clauth/profiles/<name>/runtime`), the started profile name is encoded
+/// in the path. The runtime tree is per-profile, so that profile owns the
+/// loaded credentials regardless of what is stored yet. Returns the `<name>`
+/// segment; `None` for any other path shape.
+fn session_profile_from_config_dir(dir: &Path) -> Option<String> {
+    if dir.file_name()? != "runtime" {
+        return None;
+    }
+    let profile_dir = dir.parent()?;
+    if profile_dir.parent()?.file_name()? != "profiles" {
+        return None;
+    }
+    Some(profile_dir.file_name()?.to_str()?.to_string())
 }
 
 fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
@@ -45,29 +71,36 @@ fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
     serde_json::from_str(&content).ok()
 }
 
-/// Resolve the loaded credentials to a stored profile. Prefers an exact
-/// refresh-token match; falls back to the active profile when that profile is
-/// credential-less and the loaded file is a real OAuth login.
+/// Resolve the loaded credentials to a stored profile.
 ///
-/// `in_session` must be true when `CLAUDE_CONFIG_DIR` is set — i.e. the
-/// caller is running inside a `clauth start` runtime. In that case the
-/// credential-less fallback is suppressed: the runtime creds belong to the
-/// started profile, not necessarily the global active profile.
+/// Order: (1) exact refresh-token match; (2) inside a `clauth start` runtime,
+/// the started profile named by `CLAUDE_CONFIG_DIR` (it owns the per-profile
+/// runtime, so it owns these credentials even before its first login is
+/// stored); (3) for a non-runtime caller, the credential-less active profile a
+/// fresh login was just written into.
+///
+/// `in_session` is true when `CLAUDE_CONFIG_DIR` is set. A `CLAUDE_CONFIG_DIR`
+/// that isn't a clauth runtime (so `session_profile` is `None`) gets step 1
+/// only — its credentials don't belong to the global active profile.
 fn resolve_profile<'a>(
     config: &'a AppConfig,
-    creds: &ClaudeCredentials,
+    creds: Option<&ClaudeCredentials>,
     in_session: bool,
+    session_profile: Option<&str>,
 ) -> Option<&'a str> {
-    creds
-        .refresh_token()
+    if let Some(name) = creds
+        .and_then(ClaudeCredentials::refresh_token)
         .and_then(|rt| match_by_refresh_token(config, rt))
-        .or_else(|| {
-            if in_session {
-                None
-            } else {
-                match_credential_less_active(config, creds)
-            }
-        })
+    {
+        return Some(name);
+    }
+    if let Some(profile) = session_profile.and_then(|n| config.find(n)) {
+        return Some(profile.name.as_str());
+    }
+    if in_session {
+        return None;
+    }
+    creds.and_then(|c| match_credential_less_active(config, c))
 }
 
 /// Read-time counterpart to first-login adoption: a freshly-activated blank

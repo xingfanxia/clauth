@@ -128,7 +128,10 @@ fn attributes_unmatched_login_to_credential_less_active() {
         Some("new"),
     );
     let live = live_oauth(Some("rt-fresh"));
-    assert_eq!(resolve_profile(&config, &live, false), Some("new"));
+    assert_eq!(
+        resolve_profile(&config, Some(&live), false, None),
+        Some("new")
+    );
 }
 
 #[test]
@@ -141,28 +144,31 @@ fn token_match_wins_over_credential_less_active() {
         Some("new"),
     );
     let live = live_oauth(Some("rt-personal"));
-    assert_eq!(resolve_profile(&config, &live, false), Some("personal"));
+    assert_eq!(
+        resolve_profile(&config, Some(&live), false, None),
+        Some("personal")
+    );
 }
 
 #[test]
 fn no_attribution_when_active_profile_has_creds() {
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let live = live_oauth(Some("rt-fresh"));
-    assert_eq!(resolve_profile(&config, &live, false), None);
+    assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
 }
 
 #[test]
 fn no_attribution_when_no_active_profile() {
     let config = config_with(vec![blank_profile("new")], None);
     let live = live_oauth(Some("rt-fresh"));
-    assert_eq!(resolve_profile(&config, &live, false), None);
+    assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
 }
 
 #[test]
 fn no_attribution_without_refresh_token() {
     let config = config_with(vec![blank_profile("new")], Some("new"));
     let live = live_oauth(None);
-    assert_eq!(resolve_profile(&config, &live, false), None);
+    assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
 }
 
 #[test]
@@ -175,7 +181,7 @@ fn no_credential_less_attribution_inside_session() {
         Some("active"),
     );
     let live = live_oauth(Some("rt-from-runtime"));
-    assert_eq!(resolve_profile(&config, &live, true), None);
+    assert_eq!(resolve_profile(&config, Some(&live), true, None), None);
 }
 
 #[test]
@@ -186,5 +192,86 @@ fn token_match_still_works_inside_session() {
         Some("active"),
     );
     let live = live_oauth(Some("rt-work"));
-    assert_eq!(resolve_profile(&config, &live, true), Some("work"));
+    assert_eq!(
+        resolve_profile(&config, Some(&live), true, None),
+        Some("work")
+    );
+}
+
+#[test]
+fn resolves_started_profile_in_runtime_session() {
+    // `clauth start <blank>`: a credential-less started profile owns its
+    // runtime session, so its name resolves even with no stored token and an
+    // unmatched live login.
+    let config = config_with(
+        vec![oauth_profile("work", "rt-work"), blank_profile("new")],
+        Some("work"),
+    );
+    let live = live_oauth(Some("rt-fresh"));
+    assert_eq!(
+        resolve_profile(&config, Some(&live), true, Some("new")),
+        Some("new")
+    );
+}
+
+#[test]
+fn started_profile_resolves_with_no_loaded_creds() {
+    // Before the session's first login is written there are no loaded creds at
+    // all — the started profile still owns the session.
+    let config = config_with(vec![blank_profile("new")], Some("work"));
+    assert_eq!(
+        resolve_profile(&config, None, true, Some("new")),
+        Some("new")
+    );
+}
+
+#[test]
+fn token_match_wins_over_started_profile() {
+    // An exact token match is more precise than the path-derived profile.
+    let config = config_with(
+        vec![
+            oauth_profile("personal", "rt-personal"),
+            blank_profile("new"),
+        ],
+        Some("new"),
+    );
+    let live = live_oauth(Some("rt-personal"));
+    assert_eq!(
+        resolve_profile(&config, Some(&live), true, Some("new")),
+        Some("personal")
+    );
+}
+
+#[test]
+fn unknown_started_profile_is_not_resolved() {
+    // A runtime path naming a profile that no longer exists falls through to
+    // the in-session suppression rather than inventing a match.
+    let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
+    let live = live_oauth(Some("rt-fresh"));
+    assert_eq!(
+        resolve_profile(&config, Some(&live), true, Some("ghost")),
+        None
+    );
+}
+
+#[test]
+fn session_profile_extracted_from_runtime_path() {
+    assert_eq!(
+        session_profile_from_config_dir(std::path::Path::new(
+            "/home/u/.clauth/profiles/work/runtime"
+        )),
+        Some("work".to_string())
+    );
+}
+
+#[test]
+fn session_profile_none_for_non_runtime_path() {
+    assert_eq!(
+        session_profile_from_config_dir(std::path::Path::new("/home/u/.claude")),
+        None
+    );
+    assert_eq!(
+        session_profile_from_config_dir(std::path::Path::new("/home/u/.clauth/profiles/work")),
+        None
+    );
 }
