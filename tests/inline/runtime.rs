@@ -306,6 +306,46 @@ fn mirror_tree_skips_top_level_settings_and_credentials() {
 }
 
 #[test]
+fn mirror_tree_skips_identical_files_with_different_mtimes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(&claude).expect("mkdir claude");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    let canonical_file = claude.join("state.json");
+    let runtime_file = runtime.join("state.json");
+    fs::write(&canonical_file, br#"{"same":true}"#).expect("write canonical");
+    fs::write(&runtime_file, br#"{"same":true}"#).expect("write runtime");
+    let past = SystemTime::now() - Duration::from_secs(60);
+    let now = SystemTime::now();
+    set_mtime(&canonical_file, past);
+    set_mtime(&runtime_file, now);
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert_eq!(
+        canonical_file
+            .metadata()
+            .expect("canonical meta")
+            .modified()
+            .ok(),
+        Some(past)
+    );
+    assert_eq!(
+        runtime_file
+            .metadata()
+            .expect("runtime meta")
+            .modified()
+            .ok(),
+        Some(now)
+    );
+    assert_eq!(
+        fs::read(&canonical_file).expect("read canonical"),
+        br#"{"same":true}"#
+    );
+}
+
+#[test]
 fn mirror_tree_seeds_runtime_only_file_to_canonical() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let claude = tmp.path().join("claude");
@@ -493,6 +533,87 @@ fn build_runtime_dir_credentials_not_from_claude_home() {
         assert!(
             !runtime_creds.exists(),
             ".credentials.json from ~/.claude/ must not be copied into runtime"
+        );
+    });
+}
+
+#[test]
+fn build_runtime_dir_fake_preserves_live_runtime_credentials() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("test");
+        let canonical = tmp.path().join("profile-creds.json");
+        let runtime_creds = runtime.join(".credentials.json");
+        fs::write(&canonical, CREDS_V1).expect("write canonical");
+        fs::write(&runtime_creds, CREDS_V2).expect("write runtime credentials");
+        let past = SystemTime::now() - Duration::from_secs(60);
+        let now = SystemTime::now();
+        set_mtime(&canonical, past);
+        set_mtime(&runtime_creds, now);
+
+        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
+            .expect("build");
+
+        assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
+        assert_eq!(fs::read(&runtime_creds).expect("read runtime"), CREDS_V2);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn build_runtime_dir_real_preserves_live_runtime_credentials() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("test");
+        let canonical = tmp.path().join("profile-creds.json");
+        let runtime_creds = runtime.join(".credentials.json");
+        fs::write(&canonical, CREDS_V1).expect("write canonical");
+        fs::write(&runtime_creds, CREDS_V2).expect("write runtime credentials");
+
+        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Real)
+            .expect("build");
+
+        assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
+        assert!(
+            runtime_creds
+                .symlink_metadata()
+                .expect("runtime credentials meta")
+                .file_type()
+                .is_symlink()
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn build_runtime_dir_real_keeps_invalid_runtime_credentials_for_retry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("test");
+        let canonical = tmp.path().join("profile-creds.json");
+        let runtime_creds = runtime.join(".credentials.json");
+        fs::write(&canonical, CREDS_V1).expect("write canonical");
+        fs::write(&runtime_creds, b"partial write").expect("write runtime credentials");
+
+        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Real)
+            .expect("build");
+
+        assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V1);
+        assert_eq!(
+            fs::read(&runtime_creds).expect("read runtime"),
+            b"partial write"
         );
     });
 }

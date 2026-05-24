@@ -286,8 +286,9 @@ fn is_session_alive(pid_file: &Path) -> bool {
 ///   state so sharing is intentional; per-profile isolation would hide
 ///   project history and installed commands.
 /// - **Per-profile:** `settings.json` (merged with profile overrides) and
-///   `.credentials.json` (the profile's own OAuth token chain). These are
-///   rewritten on every acquire and are never symlinked to the shared copy.
+///   `.credentials.json` (the profile's own OAuth token chain). Settings are
+///   rewritten when changed; credentials are reconciled without using the
+///   shared `~/.claude/.credentials.json` copy.
 fn build_runtime_dir(
     runtime: &Path,
     claude_home: &Path,
@@ -326,12 +327,7 @@ fn build_runtime_dir(
     }
 
     let creds_link = runtime.join(".credentials.json");
-    if creds_link.symlink_metadata().is_ok() {
-        let _ = std::fs::remove_file(&creds_link);
-    }
-    if canonical.exists() {
-        install_credentials(canonical, &creds_link, mode)?;
-    }
+    reconcile_credentials(&creds_link, canonical, mode)?;
 
     // Share `~/.claude.json` (Claude Code's per-user state) so project
     // history stays in sync with the user's normal sessions.
@@ -353,13 +349,25 @@ fn materialize_entry(src: &Path, dst: &Path, mode: LinkMode) -> Result<()> {
     }
 }
 
-fn install_credentials(canonical: &Path, dst: &Path, mode: LinkMode) -> Result<()> {
+fn reconcile_credentials(runtime_path: &Path, canonical: &Path, mode: LinkMode) -> Result<()> {
     match mode {
-        LinkMode::Real => create_symlink(canonical, dst),
-        LinkMode::Fake => std::fs::copy(canonical, dst)
-            .map(|_| ())
-            .with_context(|| format!("failed to copy creds to {}", dst.display())),
+        LinkMode::Real => {
+            sync_credentials_unlocked(runtime_path, canonical)?;
+            let meta = runtime_path.symlink_metadata().ok();
+            if meta.as_ref().is_some_and(|m| m.file_type().is_symlink())
+                || meta.as_ref().is_some_and(|m| m.is_file())
+            {
+                return Ok(());
+            }
+            if canonical.exists() {
+                create_symlink(canonical, runtime_path)?;
+            }
+        }
+        LinkMode::Fake => {
+            mirror_credentials(runtime_path, canonical)?;
+        }
     }
+    Ok(())
 }
 
 /// Recursive `std::fs::copy`. Directories are created at the destination
@@ -562,23 +570,20 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
         (Some(am), Some(bm)) => {
             let a_time = am.modified().ok();
             let b_time = bm.modified().ok();
+            if files_match(a, b)? {
+                return Ok(());
+            }
             if mtime_newer(a_time, b_time) {
-                std::fs::copy(a, b).with_context(|| {
-                    format!("failed to copy {} -> {}", a.display(), b.display())
-                })?;
+                copy_file(a, b)?;
             } else if mtime_newer(b_time, a_time) {
-                std::fs::copy(b, a).with_context(|| {
-                    format!("failed to copy {} -> {}", b.display(), a.display())
-                })?;
+                copy_file(b, a)?;
             }
         }
         (Some(_), None) => {
-            std::fs::copy(a, b)
-                .with_context(|| format!("failed to copy {} -> {}", a.display(), b.display()))?;
+            copy_file(a, b)?;
         }
         (None, Some(_)) => {
-            std::fs::copy(b, a)
-                .with_context(|| format!("failed to copy {} -> {}", b.display(), a.display()))?;
+            copy_file(b, a)?;
         }
         (None, None) => {}
     }
@@ -591,6 +596,18 @@ fn mtime_newer(a: Option<SystemTime>, b: Option<SystemTime>) -> bool {
         (Some(_), None) => true,
         _ => false,
     }
+}
+
+fn files_match(a: &Path, b: &Path) -> Result<bool> {
+    let a_bytes = std::fs::read(a).with_context(|| format!("failed to read {}", a.display()))?;
+    let b_bytes = std::fs::read(b).with_context(|| format!("failed to read {}", b.display()))?;
+    Ok(a_bytes == b_bytes)
+}
+
+fn copy_file(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::copy(src, dst)
+        .map(|_| ())
+        .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))
 }
 
 #[cfg(unix)]
