@@ -149,6 +149,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::CaptureConflict(_) => "confirm · duplicate",
         ConfirmAction::Switch(_) => "confirm · switch",
         ConfirmAction::DiscardDivergence(_) => "confirm · discard new login",
+        ConfirmAction::RotateAll => "confirm · rotate all tokens",
     };
     let block = modal_block(title);
     let inner = block.inner(rect);

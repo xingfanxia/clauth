@@ -17,6 +17,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ("d", "details"),
             ("f", "chain"),
             ("r", "refresh"),
+            ("t", "rotate all"),
             ("?", "help"),
             ("q", "quit"),
         ],

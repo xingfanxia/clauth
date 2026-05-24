@@ -94,29 +94,42 @@ fn kick(access_token: &str) -> Result<()> {
     Ok(())
 }
 
-/// Refreshes every profile's OAuth token pair (rotated pair saved to disk).
-/// Mirrors what Claude Code does silently on launch — minus the kick.
+/// Profiles that would be rotated by `refresh_all`. Extracted so tests can
+/// pin the inclusion logic without touching the network.
 ///
-/// Profiles without a stored refresh token are skipped. Network or revocation
-/// failures are swallowed per-profile; cached state stays put for those.
-///
-/// Returns the names of profiles whose token rotation succeeded so the caller
-/// can target follow-up work (usage re-fetch, kick) at the same set.
-pub(crate) fn refresh_all(config: &mut AppConfig) -> Vec<String> {
+/// Returns `(name, refresh_token)` pairs. Diverged-active is always skipped;
+/// live-session profiles are included only when `force` is true.
+pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(String, String)> {
     let skip_active = active_link_diverged(config);
-    let snapshots: Vec<(String, String)> = config
+    config
         .profiles
         .iter()
         .filter_map(|p| {
             if skip_active && config.is_active(&p.name) {
                 return None;
             }
-            if has_live_session(&p.name) {
+            if !force && has_live_session(&p.name) {
                 return None;
             }
             Some((p.name.clone(), p.refresh_token()?.to_string()))
         })
-        .collect();
+        .collect()
+}
+
+/// Refreshes every profile's OAuth token pair (rotated pair saved to disk).
+/// Mirrors what Claude Code does silently on launch — minus the kick.
+///
+/// Profiles without a stored refresh token are skipped. Network or revocation
+/// failures are swallowed per-profile; cached state stays put for those.
+///
+/// When `force` is true the `has_live_session` guard is bypassed — profiles
+/// with an active `clauth start` session are rotated anyway. The diverged-active
+/// guard still applies regardless of `force`.
+///
+/// Returns the names of profiles whose token rotation succeeded so the caller
+/// can target follow-up work (usage re-fetch, kick) at the same set.
+pub(crate) fn refresh_all(config: &mut AppConfig, force: bool) -> Vec<String> {
+    let snapshots = rotation_candidates(config, force);
 
     if snapshots.is_empty() {
         return Vec::new();
@@ -373,3 +386,7 @@ fn active_link_diverged(config: &AppConfig) -> bool {
         )
     })
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/oauth.rs"]
+mod tests;

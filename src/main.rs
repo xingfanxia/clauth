@@ -71,7 +71,7 @@ fn main() -> Result<()> {
             // Refresh every profile's OAuth token before switching, same as
             // the interactive flow. The rotated access token then ends up in
             // ~/.claude/.credentials.json via the symlink.
-            let _ = oauth::refresh_all(&mut config);
+            let _ = oauth::refresh_all(&mut config, false);
             switch_profile(&mut config, &canonical)?;
             // Match the TUI: prime the 5h window if the target is opted in
             // via `auto_start = true`. Cooldown blocks repeated CLI switches

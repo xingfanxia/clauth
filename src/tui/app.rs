@@ -188,6 +188,9 @@ pub(crate) enum ConfirmAction {
     /// Confirm step before discarding CC's freshly-written credentials and
     /// re-linking the live path to the named profile's stored creds.
     DiscardDivergence(String),
+    /// Force-rotate every profile's refresh token, bypassing the live-session
+    /// guard. Profiles with an active `clauth start` session may be logged out.
+    RotateAll,
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +295,10 @@ pub(crate) struct Toast {
     pub(crate) body: String,
     pub(crate) born: Instant,
 }
+
+/// Confirm modal copy for the force-rotate-all action.
+const ROTATE_ALL_MSG: &str = "rotate tokens for all accounts?";
+const ROTATE_ALL_DETAIL: &str = "accounts with a live session might be logged out.";
 
 /// Maximum on-screen toasts at any one time; older expire to make room.
 const TOAST_CAPACITY: usize = 4;
@@ -413,7 +420,7 @@ impl App {
         // so the initial usage fetch below uses fresh access tokens.
         {
             let mut cfg = self.config();
-            let _ = oauth::refresh_all(&mut cfg);
+            let _ = oauth::refresh_all(&mut cfg, false);
         }
         self.refresh_tokens();
 
@@ -739,6 +746,14 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
             app.manual_refresh();
             app.toast(ToastKind::Info, "refreshing usage…");
         }
+        KeyCode::Char('t') => {
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: ROTATE_ALL_MSG.to_string(),
+                detail: Some(ROTATE_ALL_DETAIL.to_string()),
+                choice: false,
+                on_confirm: ConfirmAction::RotateAll,
+            }));
+        }
         _ => {}
     }
 }
@@ -842,7 +857,7 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
 fn perform_switch(app: &mut App, name: &str) {
     let result = {
         let mut cfg = app.config();
-        let _ = oauth::refresh_all(&mut cfg);
+        let _ = oauth::refresh_all(&mut cfg, false);
         switch_profile(&mut cfg, name)
     };
     match result {
@@ -1411,6 +1426,19 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         ConfirmAction::Switch(name) => perform_switch(app, &name),
         ConfirmAction::DiscardDivergence(name) => run_discard_divergence(app, &name),
+        ConfirmAction::RotateAll => {
+            let rotated = {
+                let mut cfg = app.config();
+                oauth::refresh_all(&mut cfg, true)
+            };
+            app.refresh_tokens();
+            let count = rotated.len();
+            if count == 0 {
+                app.toast(ToastKind::Warning, "no tokens rotated");
+            } else {
+                app.toast(ToastKind::Success, format!("rotated {count} token(s)"));
+            }
+        }
     }
 }
 
