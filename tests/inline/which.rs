@@ -128,7 +128,7 @@ fn attributes_unmatched_login_to_credential_less_active() {
         Some("new"),
     );
     let live = live_oauth(Some("rt-fresh"));
-    assert_eq!(resolve_profile(&config, &live), Some("new"));
+    assert_eq!(resolve_profile(&config, &live, false), Some("new"));
 }
 
 #[test]
@@ -141,26 +141,50 @@ fn token_match_wins_over_credential_less_active() {
         Some("new"),
     );
     let live = live_oauth(Some("rt-personal"));
-    assert_eq!(resolve_profile(&config, &live), Some("personal"));
+    assert_eq!(resolve_profile(&config, &live, false), Some("personal"));
 }
 
 #[test]
 fn no_attribution_when_active_profile_has_creds() {
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let live = live_oauth(Some("rt-fresh"));
-    assert_eq!(resolve_profile(&config, &live), None);
+    assert_eq!(resolve_profile(&config, &live, false), None);
 }
 
 #[test]
 fn no_attribution_when_no_active_profile() {
     let config = config_with(vec![blank_profile("new")], None);
     let live = live_oauth(Some("rt-fresh"));
-    assert_eq!(resolve_profile(&config, &live), None);
+    assert_eq!(resolve_profile(&config, &live, false), None);
 }
 
 #[test]
 fn no_attribution_without_refresh_token() {
     let config = config_with(vec![blank_profile("new")], Some("new"));
     let live = live_oauth(None);
-    assert_eq!(resolve_profile(&config, &live), None);
+    assert_eq!(resolve_profile(&config, &live, false), None);
+}
+
+#[test]
+fn no_credential_less_attribution_inside_session() {
+    // When CLAUDE_CONFIG_DIR is set the loaded creds belong to the started
+    // profile's runtime, not the global active. Suppress the fallback so a
+    // credential-less active profile isn't incorrectly credited.
+    let config = config_with(
+        vec![oauth_profile("work", "rt-work"), blank_profile("active")],
+        Some("active"),
+    );
+    let live = live_oauth(Some("rt-from-runtime"));
+    assert_eq!(resolve_profile(&config, &live, true), None);
+}
+
+#[test]
+fn token_match_still_works_inside_session() {
+    // A token-exact match is always valid, even inside a session.
+    let config = config_with(
+        vec![oauth_profile("work", "rt-work"), blank_profile("active")],
+        Some("active"),
+    );
+    let live = live_oauth(Some("rt-work"));
+    assert_eq!(resolve_profile(&config, &live, true), Some("work"));
 }

@@ -17,10 +17,13 @@ use crate::format::endpoint_label;
 use crate::profile::{AppConfig, ClaudeCredentials, Profile, home_dir, load_config};
 
 pub(crate) fn run(json: bool) -> Result<()> {
+    let in_session = std::env::var_os("CLAUDE_CONFIG_DIR").is_some();
     let path = resolve_credentials_path()?;
     let creds = read_credentials(&path);
     let config = load_config()?;
-    let matched = creds.as_ref().and_then(|c| resolve_profile(&config, c));
+    let matched = creds
+        .as_ref()
+        .and_then(|c| resolve_profile(&config, c, in_session));
 
     if json {
         emit_json(&config, matched);
@@ -45,11 +48,26 @@ fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
 /// Resolve the loaded credentials to a stored profile. Prefers an exact
 /// refresh-token match; falls back to the active profile when that profile is
 /// credential-less and the loaded file is a real OAuth login.
-fn resolve_profile<'a>(config: &'a AppConfig, creds: &ClaudeCredentials) -> Option<&'a str> {
+///
+/// `in_session` must be true when `CLAUDE_CONFIG_DIR` is set — i.e. the
+/// caller is running inside a `clauth start` runtime. In that case the
+/// credential-less fallback is suppressed: the runtime creds belong to the
+/// started profile, not necessarily the global active profile.
+fn resolve_profile<'a>(
+    config: &'a AppConfig,
+    creds: &ClaudeCredentials,
+    in_session: bool,
+) -> Option<&'a str> {
     creds
         .refresh_token()
         .and_then(|rt| match_by_refresh_token(config, rt))
-        .or_else(|| match_credential_less_active(config, creds))
+        .or_else(|| {
+            if in_session {
+                None
+            } else {
+                match_credential_less_active(config, creds)
+            }
+        })
 }
 
 /// Read-time counterpart to first-login adoption: a freshly-activated blank
