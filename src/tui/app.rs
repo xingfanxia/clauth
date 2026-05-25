@@ -33,9 +33,9 @@ use crate::profile::{
     AppConfig, Profile, app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::usage::{
-    ActivityFlag, LastFetchedAt, LastStable, NextRefreshAt, PendingAutoStart, RefetchQueue,
-    StatusStore, TokenEntry, TokenList, UsageStore, default_fallback_threshold, fetch_all_into,
-    now_ms, spawn_refresher,
+    ActivityFlag, LastFetchedAt, LastRotatedWindow, LastStable, NextRefreshAt, PendingAutoStart,
+    PendingWindowRotation, RefetchQueue, StatusStore, TokenEntry, TokenList, UsageStore,
+    default_fallback_threshold, fetch_all_into, now_ms, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -344,6 +344,8 @@ pub(crate) struct App {
     pub(crate) last_fetched: LastFetchedAt,
     pub(crate) last_stable: LastStable,
     pub(crate) pending_auto_start: PendingAutoStart,
+    pub(crate) pending_window_rotation: PendingWindowRotation,
+    pub(crate) last_rotated_window: LastRotatedWindow,
     pub(crate) refetch_queue: RefetchQueue,
 
     pub(crate) screen: Screen,
@@ -374,6 +376,8 @@ impl App {
         let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
         let last_stable: LastStable = Arc::new(Mutex::new(HashMap::new()));
         let pending_auto_start: PendingAutoStart = Arc::new(Mutex::new(HashSet::new()));
+        let pending_window_rotation: PendingWindowRotation = Arc::new(Mutex::new(HashMap::new()));
+        let last_rotated_window: LastRotatedWindow = Arc::new(Mutex::new(HashMap::new()));
         let refetch_queue: RefetchQueue = Arc::new(Mutex::new(HashSet::new()));
 
         Self {
@@ -386,6 +390,8 @@ impl App {
             last_fetched,
             last_stable,
             pending_auto_start,
+            pending_window_rotation,
+            last_rotated_window,
             refetch_queue,
             screen: Screen::Overview,
             modals: Vec::new(),
@@ -483,6 +489,8 @@ impl App {
             Arc::clone(&self.last_fetched),
             Arc::clone(&self.last_stable),
             Arc::clone(&self.pending_auto_start),
+            Arc::clone(&self.pending_window_rotation),
+            Arc::clone(&self.last_rotated_window),
             Arc::clone(&self.refetch_queue),
         );
 
@@ -1829,6 +1837,36 @@ pub(crate) fn on_tick(app: &mut App) {
     if any_started {
         app.refresh_tokens();
         app.manual_refresh();
+    }
+
+    // Drain 5h-window-expiry rotation requests posted by the scheduler.
+    // Performed on the main thread so `rotate_one` can take &mut AppConfig
+    // without introducing a shared config mutex in the scheduler thread.
+    // The map value is the `resets_at` epoch pinned at detection time; using
+    // it (not a re-read from `usage_store`) prevents stamping the wrong window
+    // if the API returned a fresh `resets_at` between detection and drain.
+    let pending_rotations: Vec<(String, i64)> = {
+        let mut p = app
+            .pending_window_rotation
+            .lock()
+            .expect("pending_window_rotation mutex poisoned");
+        p.drain().collect()
+    };
+    for (name, epoch) in pending_rotations {
+        let rotated = {
+            let mut cfg = app.config();
+            oauth::rotate_one(&mut cfg, &name)
+        };
+        if rotated {
+            if let Ok(mut lrw) = app.last_rotated_window.lock() {
+                lrw.insert(name.clone(), epoch);
+            }
+            if let Ok(mut q) = app.refetch_queue.lock() {
+                q.insert(name.clone());
+            }
+            app.refresh_tokens();
+            app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
+        }
     }
 
     let switched = {

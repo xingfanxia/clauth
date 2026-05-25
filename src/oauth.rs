@@ -94,6 +94,34 @@ fn kick(access_token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rotate the OAuth token chain for a single named profile. Returns true iff
+/// the new pair was persisted. Skips when the profile has no refresh token or
+/// a live `clauth start` session holds the chain (same gate as `refresh_all`).
+///
+/// No cooldown gating — the caller is responsible for deduplication via
+/// `LastRotatedWindow`. Does not touch `last_auto_start_at`.
+pub(crate) fn rotate_one(config: &mut AppConfig, name: &str) -> bool {
+    let token = with_state_lock(|| {
+        if has_live_session(name) {
+            return Ok::<_, anyhow::Error>(None);
+        }
+        let rt = config
+            .find(name)
+            .and_then(|p| p.refresh_token().map(str::to_string));
+        Ok(rt)
+    })
+    .ok()
+    .flatten();
+
+    let Some(rt) = token else {
+        return false;
+    };
+    let Ok(tok) = refresh(&rt) else {
+        return false;
+    };
+    apply_rotated_tokens(config, name, tok)
+}
+
 /// Profiles that would be rotated by `refresh_all`. Extracted so tests can
 /// pin the inclusion logic without touching the network.
 ///

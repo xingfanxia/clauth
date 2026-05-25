@@ -50,6 +50,16 @@ pub(crate) type LastStable = Arc<Mutex<HashMap<String, bool>>>;
 /// window. Main thread drains this set on every tick.
 pub(crate) type PendingAutoStart = Arc<Mutex<HashSet<String>>>;
 
+/// Profiles whose 5h window has just expired and need a token rotation.
+/// Value: the `resets_at` epoch-secs pinned at detection time so the drain
+/// stamps `LastRotatedWindow` with the exact window it acted on, not whatever
+/// the store holds when the drain runs (which may already be a newer window).
+pub(crate) type PendingWindowRotation = Arc<Mutex<HashMap<String, i64>>>;
+
+/// Per-profile `resets_at` epoch-secs we already rotated on, so each expiry
+/// fires exactly once.
+pub(crate) type LastRotatedWindow = Arc<Mutex<HashMap<String, i64>>>;
+
 /// Snapshot of one profile's OAuth identity used by the refresher.
 #[derive(Clone)]
 pub(crate) struct TokenEntry {
@@ -542,6 +552,8 @@ pub(crate) fn spawn_refresher(
     last_fetched: LastFetchedAt,
     last_stable: LastStable,
     pending_auto_start: PendingAutoStart,
+    pending_window_rotation: PendingWindowRotation,
+    last_rotated_window: LastRotatedWindow,
     refetch_queue: RefetchQueue,
 ) {
     std::thread::spawn(move || {
@@ -615,6 +627,17 @@ pub(crate) fn spawn_refresher(
             }
             activity.store(false, Ordering::Relaxed);
 
+            // After fetches complete, check for profiles whose 5h window has
+            // expired (now >= resets_at + 1s) and haven't been rotated for
+            // that window yet. Post them to the main thread's drain queue —
+            // avoids holding &mut AppConfig in the scheduler thread.
+            scan_expired_windows(
+                &snapshot,
+                &store,
+                &last_rotated_window,
+                &pending_window_rotation,
+            );
+
             // Recompute the soonest next due moment AFTER fetches have
             // updated `last_fetched`, so the footer countdown reflects the
             // freshly-recorded deadlines instead of the pre-tick estimate.
@@ -623,6 +646,52 @@ pub(crate) fn spawn_refresher(
             next_at.store(soonest_after, Ordering::Relaxed);
         }
     });
+}
+
+/// For each profile in `snapshot`, check whether its 5h window has expired
+/// (current time is at least 1s past `resets_at`) and we haven't already
+/// queued a rotation for that specific `resets_at` epoch. Qualifying profiles
+/// are pushed into `pending_window_rotation` for the main thread to drain.
+fn scan_expired_windows(
+    snapshot: &[TokenEntry],
+    store: &UsageStore,
+    last_rotated_window: &LastRotatedWindow,
+    pending: &PendingWindowRotation,
+) {
+    let now = now_epoch_secs();
+    let st = store.lock().ok();
+    let lrw = last_rotated_window.lock().ok();
+    let pend = pending.lock().ok();
+
+    let (Some(st), Some(lrw), Some(ref mut pend)) = (st, lrw, pend) else {
+        return;
+    };
+
+    for entry in snapshot {
+        let Some(resets_at_str) = st
+            .get(&entry.name)
+            .and_then(|u| u.five_hour.as_ref())
+            .and_then(|w| w.resets_at.as_deref())
+        else {
+            continue;
+        };
+        let Some(resets_at) = iso_to_epoch_secs(resets_at_str) else {
+            continue;
+        };
+        // 1s past the window boundary to avoid acting on a window that hasn't
+        // fully closed yet.
+        if now < resets_at + 1 {
+            continue;
+        }
+        // Already acted on this specific window.
+        if lrw.get(&entry.name).copied().unwrap_or(0) == resets_at {
+            continue;
+        }
+        // Pin the epoch at detection time. The drain uses this value to stamp
+        // `LastRotatedWindow` so it deduplicates the window it actually saw,
+        // not a potentially newer one the store holds by the time the drain runs.
+        pend.insert(entry.name.clone(), resets_at);
+    }
 }
 
 /// Split `snapshot` into the subset due this tick and the soonest epoch-ms
