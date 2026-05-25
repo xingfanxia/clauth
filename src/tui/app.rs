@@ -33,9 +33,10 @@ use crate::profile::{
     AppConfig, Profile, app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::usage::{
-    ActivityFlag, ConsecutiveOk, Last429At, LastFetchedAt, LastRotatedWindow, LearnedIntervals,
-    NextRefreshAt, PendingAutoStart, PendingWindowRotation, RefetchQueue, StatusStore, TokenEntry,
-    TokenList, UsageStore, default_fallback_threshold, fetch_all_into, now_ms, spawn_refresher,
+    ActivityFlag, ConsecutiveCacheHit, ConsecutiveOk, Last429At, LastFetchedAt, LastRotatedWindow,
+    LearnedIntervals, NextRefreshAt, PendingAutoStart, PendingWindowRotation, RefetchQueue,
+    StatusStore, TokenEntry, TokenList, UsageStore, default_fallback_threshold, fetch_all_into,
+    now_ms, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -348,6 +349,7 @@ pub(crate) struct App {
     pub(crate) refetch_queue: RefetchQueue,
     pub(crate) learned_intervals: LearnedIntervals,
     pub(crate) ok_count: ConsecutiveOk,
+    pub(crate) cache_hit_count: ConsecutiveCacheHit,
     pub(crate) last_429: Last429At,
 
     pub(crate) screen: Screen,
@@ -385,6 +387,8 @@ impl App {
             Arc::new(Mutex::new(config.state.learned_intervals_ms.clone()));
         let ok_count: ConsecutiveOk =
             Arc::new(Mutex::new(config.state.consecutive_ok_count.clone()));
+        // cache_hit_count is in-memory only — not persisted, intentionally resets on restart.
+        let cache_hit_count: ConsecutiveCacheHit = Arc::new(Mutex::new(HashMap::new()));
         let last_429: Last429At = Arc::new(Mutex::new(config.state.last_429_at.clone()));
 
         Self {
@@ -401,6 +405,7 @@ impl App {
             refetch_queue,
             learned_intervals,
             ok_count,
+            cache_hit_count,
             last_429,
             screen: Screen::Overview,
             modals: Vec::new(),
@@ -457,6 +462,7 @@ impl App {
             &self.refetch_queue,
             &self.learned_intervals,
             &self.ok_count,
+            &self.cache_hit_count,
             &self.last_429,
         );
 
@@ -485,6 +491,7 @@ impl App {
                 &self.refetch_queue,
                 &self.learned_intervals,
                 &self.ok_count,
+                &self.cache_hit_count,
                 &self.last_429,
             );
             *self
@@ -506,6 +513,7 @@ impl App {
             Arc::clone(&self.refetch_queue),
             Arc::clone(&self.learned_intervals),
             Arc::clone(&self.ok_count),
+            Arc::clone(&self.cache_hit_count),
             Arc::clone(&self.last_429),
         );
 
@@ -578,6 +586,7 @@ impl App {
         let refetch_queue = Arc::clone(&self.refetch_queue);
         let learned = Arc::clone(&self.learned_intervals);
         let ok_count = Arc::clone(&self.ok_count);
+        let cache_hit_count = Arc::clone(&self.cache_hit_count);
         let last_429 = Arc::clone(&self.last_429);
         std::thread::spawn(move || {
             fetch_all_into(
@@ -590,6 +599,7 @@ impl App {
                 &refetch_queue,
                 &learned,
                 &ok_count,
+                &cache_hit_count,
                 &last_429,
             );
         });

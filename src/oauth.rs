@@ -125,10 +125,12 @@ pub(crate) fn rotate_one(config: &mut AppConfig, name: &str) -> bool {
 /// Profiles that would be rotated by `refresh_all`. Extracted so tests can
 /// pin the inclusion logic without touching the network.
 ///
-/// Returns `(name, refresh_token)` pairs. Diverged-active is always skipped;
-/// live-session profiles are included only when `force` is true.
+/// Returns `(name, refresh_token)` pairs. Diverged-active is skipped unless
+/// `force` is true; live-session profiles are included only when `force` is true.
 pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(String, String)> {
-    let skip_active = active_link_diverged(config);
+    // when force=true (t-key rotate-all) we bypass diverged-active: the user
+    // explicitly wants every account rotated, including the one CC is touching.
+    let skip_active = !force && active_link_diverged(config);
     config
         .profiles
         .iter()
@@ -150,9 +152,8 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Strin
 /// Profiles without a stored refresh token are skipped. Network or revocation
 /// failures are swallowed per-profile; cached state stays put for those.
 ///
-/// When `force` is true the `has_live_session` guard is bypassed — profiles
-/// with an active `clauth start` session are rotated anyway. The diverged-active
-/// guard still applies regardless of `force`.
+/// When `force` is true both the `has_live_session` guard and the diverged-active
+/// guard are bypassed — the user explicitly requested every profile be rotated.
 ///
 /// Returns the names of profiles whose token rotation succeeded so the caller
 /// can target follow-up work (usage re-fetch, kick) at the same set.

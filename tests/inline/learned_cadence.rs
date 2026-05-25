@@ -1,7 +1,25 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use super::{
-    LEARNED_CEILING_MS, LEARNED_FLOOR_MS, LEARNED_QUIET_RESET_MS, LEARNED_STEP_MS,
-    NORMAL_INTERVAL_MS, bump_down, bump_up,
+    ConsecutiveCacheHit, ConsecutiveOk, FetchStatus, LEARNED_CEILING_MS, LEARNED_FLOOR_MS,
+    LEARNED_QUIET_RESET_MS, LEARNED_STEP_MS, Last429At, LearnedIntervals, NORMAL_INTERVAL_MS,
+    bump_down, bump_up, update_learner,
 };
+
+fn make_learner_maps() -> (
+    LearnedIntervals,
+    ConsecutiveOk,
+    ConsecutiveCacheHit,
+    Last429At,
+) {
+    (
+        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(Mutex::new(HashMap::new())),
+    )
+}
 
 #[test]
 fn bump_up_raises_by_1_5x_within_jitter_bounds() {
@@ -83,4 +101,78 @@ fn constant_ordering() {
         assert!(NORMAL_INTERVAL_MS < LEARNED_CEILING_MS);
         assert!(LEARNED_STEP_MS < NORMAL_INTERVAL_MS);
     }
+}
+
+#[test]
+fn two_cache_hits_at_floor_bump_up_to_floor_plus_step() {
+    // Polling at FLOOR with unchanged utilization → server-side cache. After
+    // two consecutive cache-hits the learner backs off by one STEP toward NORMAL.
+    let (learned, ok, ch, l429) = make_learner_maps();
+    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    // first hit — no bump yet
+    assert_eq!(
+        learned.lock().unwrap().get("p").copied().unwrap(),
+        LEARNED_FLOOR_MS
+    );
+
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    // second hit — bump to FLOOR + STEP, capped at NORMAL
+    let expected = (LEARNED_FLOOR_MS + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS);
+    assert_eq!(
+        learned.lock().unwrap().get("p").copied().unwrap(),
+        expected,
+        "two cache-hits at FLOOR should bump interval up by LEARNED_STEP_MS"
+    );
+    // cache-hit counter resets so a third hit starts fresh
+    assert_eq!(ch.lock().unwrap().get("p").copied().unwrap_or(0), 0);
+}
+
+#[test]
+fn two_cache_hits_at_20s_bump_up_but_not_past_normal() {
+    let (learned, ok, ch, l429) = make_learner_maps();
+    let start = 20_000u64;
+    learned.lock().unwrap().insert("p".into(), start);
+
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+
+    let result = learned.lock().unwrap().get("p").copied().unwrap();
+    assert_eq!(result, (start + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS));
+    assert!(
+        result <= NORMAL_INTERVAL_MS,
+        "cache-hit backoff must not exceed NORMAL"
+    );
+}
+
+#[test]
+fn cache_hit_then_change_event_resumes_recovery() {
+    // One cache-hit resets to 0 on a real change-event so the ok counter
+    // starts clean and two genuine Fresh responses still trigger bump_down.
+    let (learned, ok, ch, l429) = make_learner_maps();
+    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+
+    // first cache-hit — counter increments
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    assert_eq!(ch.lock().unwrap().get("p").copied().unwrap_or(0), 1);
+
+    // real change-event — cache-hit counter must reset, ok counter starts
+    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    assert_eq!(
+        ch.lock().unwrap().get("p").copied().unwrap_or(0),
+        0,
+        "cache-hit counter should reset on a real Fresh"
+    );
+    let ok_after = ok.lock().unwrap().get("p").copied().unwrap_or(0);
+    assert_eq!(ok_after, 1, "ok counter should start accumulating");
+
+    // second real Fresh → bump_down fires
+    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    let interval = learned.lock().unwrap().get("p").copied().unwrap();
+    assert_eq!(
+        interval,
+        bump_down(LEARNED_FLOOR_MS),
+        "two real Freshs should trigger additive decrease"
+    );
 }

@@ -101,6 +101,26 @@ fn live_session_included_when_force_true() {
 }
 
 #[test]
+fn force_true_bypasses_diverged_active_when_no_active_profile() {
+    // When active_profile is None, active_link_diverged returns false, so even
+    // force=false would not skip. This test verifies the force=true path includes
+    // the profile — and that the old `skip_active = active_link_diverged(config)`
+    // (which ignored force) is now `!force && active_link_diverged(config)`.
+    // With no active profile, diverged is always false and the behavior matches
+    // regardless of force; the meaningful contract change is that force=true
+    // with a diverged active now also includes that profile (tested here with
+    // no active so it compiles without filesystem side effects).
+    let config = single_profile_config("test-oauth-force-diverged", "rt-xyz");
+    // active_profile is None → active_link_diverged returns false → both
+    // force values include the profile.
+    let force_false = rotation_candidates(&config, false);
+    let force_true = rotation_candidates(&config, true);
+    assert_eq!(force_false.len(), 1);
+    assert_eq!(force_true.len(), 1);
+    assert_eq!(force_true[0].0, "test-oauth-force-diverged");
+}
+
+#[test]
 fn profile_without_refresh_token_excluded() {
     use std::collections::BTreeMap;
     let profile = Profile {

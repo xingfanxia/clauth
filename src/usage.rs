@@ -55,6 +55,11 @@ pub(crate) type LearnedIntervals = Arc<Mutex<HashMap<String, u64>>>;
 /// How many consecutive non-429 fetches each profile has seen since the last backoff.
 pub(crate) type ConsecutiveOk = Arc<Mutex<HashMap<String, u32>>>;
 
+/// How many consecutive Fresh fetches with unchanged utilization each profile
+/// has seen. Used to detect server-side cache hits and back off when polling
+/// faster than the server invalidates. In-memory only; not persisted.
+pub(crate) type ConsecutiveCacheHit = Arc<Mutex<HashMap<String, u32>>>;
+
 /// Epoch-ms of the most recent 429 per profile. Used for quiet-period resets.
 pub(crate) type Last429At = Arc<Mutex<HashMap<String, u64>>>;
 
@@ -491,18 +496,28 @@ fn interval_for(
 /// Update the AIMD learner maps for one profile based on the fetch outcome.
 /// Called from the scheduler thread; all three maps are shared with the main
 /// thread via `Arc<Mutex<...>>` and persisted to `AppState` on shutdown.
+///
+/// `cache_hit` is true when a Fresh response carried the same five-hour
+/// utilization as the previously stored value — the Anthropic usage API has a
+/// ~30s server-side cache, so unchanged numbers at FLOOR (10s) mean we're
+/// polling faster than the server invalidates, not that the API is healthy.
 fn update_learner(
     name: &str,
     status: FetchStatus,
+    cache_hit: bool,
     learned: &LearnedIntervals,
     ok_count: &ConsecutiveOk,
+    cache_hit_count: &ConsecutiveCacheHit,
     last_429: &Last429At,
 ) {
     let now = now_ms();
 
-    let (Ok(mut learned_g), Ok(mut ok_g), Ok(mut l429_g)) =
-        (learned.lock(), ok_count.lock(), last_429.lock())
-    else {
+    let (Ok(mut learned_g), Ok(mut ok_g), Ok(mut ch_g), Ok(mut l429_g)) = (
+        learned.lock(),
+        ok_count.lock(),
+        cache_hit_count.lock(),
+        last_429.lock(),
+    ) else {
         return;
     };
 
@@ -524,11 +539,29 @@ fn update_learner(
             let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
             learned_g.insert(name.to_string(), bump_up(current));
             ok_g.insert(name.to_string(), 0);
+            ch_g.insert(name.to_string(), 0);
             l429_g.insert(name.to_string(), now);
         }
-        // Only a confirmed API 200 counts as a recovery signal. Network failures
-        // and cache fallbacks don't prove the API is healthy, so they're no-ops
-        // in the learner — counting them would tick the interval down during outages.
+        // Only a confirmed API 200 with new data counts as a recovery signal.
+        // Network failures and cache fallbacks don't prove the API is healthy.
+        // A Fresh response with the same utilization is a server-side cache hit:
+        // back off additively toward NORMAL so we don't spin at FLOOR forever.
+        FetchStatus::Fresh if cache_hit => {
+            let hits = ch_g.get(name).copied().unwrap_or(0) + 1;
+            if hits >= 2 {
+                let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
+                // Ceiling is NORMAL, not LEARNED_CEILING — cache hits mean "fine,
+                // just polling too fast"; drift back to the baseline, not max backoff.
+                let bumped = current
+                    .saturating_add(LEARNED_STEP_MS)
+                    .min(NORMAL_INTERVAL_MS);
+                learned_g.insert(name.to_string(), bumped);
+                ch_g.insert(name.to_string(), 0);
+                ok_g.insert(name.to_string(), 0);
+            } else {
+                ch_g.insert(name.to_string(), hits);
+            }
+        }
         FetchStatus::Fresh => {
             let count = ok_g.get(name).copied().unwrap_or(0) + 1;
             if count >= 2 {
@@ -538,6 +571,7 @@ fn update_learner(
             } else {
                 ok_g.insert(name.to_string(), count);
             }
+            ch_g.insert(name.to_string(), 0);
         }
         FetchStatus::Cached | FetchStatus::Failed => {}
     }
@@ -587,8 +621,16 @@ fn apply_outcome(
     pending_auto_start: &PendingAutoStart,
     learned: &LearnedIntervals,
     ok_count: &ConsecutiveOk,
+    cache_hit_count: &ConsecutiveCacheHit,
     last_429: &Last429At,
 ) {
+    // Capture previous five-hour utilization before overwriting the store so
+    // we can tell whether this Fresh response is a server-side cache hit.
+    let prev_util: Option<f64> = store
+        .lock()
+        .ok()
+        .and_then(|s| s.get(&outcome.name).and_then(five_hour_utilization));
+
     if let Some(info) = &outcome.info {
         if matches!(
             outcome.status,
@@ -600,6 +642,14 @@ fn apply_outcome(
             s.insert(outcome.name.clone(), info.clone());
         }
     }
+
+    let new_util: Option<f64> = outcome.info.as_ref().and_then(five_hour_utilization);
+    let cache_hit = matches!(outcome.status, FetchStatus::Fresh)
+        && match (prev_util, new_util) {
+            (Some(a), Some(b)) => (a - b).abs() < f64::EPSILON,
+            _ => false,
+        };
+
     if let Ok(mut st) = status.lock() {
         st.insert(outcome.name.clone(), outcome.status);
     }
@@ -611,7 +661,15 @@ fn apply_outcome(
     {
         p.insert(outcome.name.clone());
     }
-    update_learner(&outcome.name, outcome.status, learned, ok_count, last_429);
+    update_learner(
+        &outcome.name,
+        outcome.status,
+        cache_hit,
+        learned,
+        ok_count,
+        cache_hit_count,
+        last_429,
+    );
 }
 
 /// Force-fetch every entry right now in parallel and write the results into
@@ -628,6 +686,7 @@ pub(crate) fn fetch_all_into(
     refetch: &RefetchQueue,
     learned: &LearnedIntervals,
     ok_count: &ConsecutiveOk,
+    cache_hit_count: &ConsecutiveCacheHit,
     last_429: &Last429At,
 ) {
     if tokens.is_empty() {
@@ -656,6 +715,7 @@ pub(crate) fn fetch_all_into(
             pending_auto_start,
             learned,
             ok_count,
+            cache_hit_count,
             last_429,
         );
     }
@@ -682,6 +742,7 @@ pub(crate) fn spawn_refresher(
     refetch_queue: RefetchQueue,
     learned: LearnedIntervals,
     ok_count: ConsecutiveOk,
+    cache_hit_count: ConsecutiveCacheHit,
     last_429: Last429At,
 ) {
     std::thread::spawn(move || {
@@ -750,6 +811,7 @@ pub(crate) fn spawn_refresher(
                     &pending_auto_start,
                     &learned,
                     &ok_count,
+                    &cache_hit_count,
                     &last_429,
                 );
             }
