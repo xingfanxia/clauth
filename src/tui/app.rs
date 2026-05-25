@@ -33,9 +33,9 @@ use crate::profile::{
     AppConfig, Profile, app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::usage::{
-    ActivityFlag, LastFetchedAt, LastRotatedWindow, LastStable, NextRefreshAt, PendingAutoStart,
-    PendingWindowRotation, RefetchQueue, StatusStore, TokenEntry, TokenList, UsageStore,
-    default_fallback_threshold, fetch_all_into, now_ms, spawn_refresher,
+    ActivityFlag, ConsecutiveOk, Last429At, LastFetchedAt, LastRotatedWindow, LearnedIntervals,
+    NextRefreshAt, PendingAutoStart, PendingWindowRotation, RefetchQueue, StatusStore, TokenEntry,
+    TokenList, UsageStore, default_fallback_threshold, fetch_all_into, now_ms, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -342,11 +342,13 @@ pub(crate) struct App {
     pub(crate) activity: ActivityFlag,
     pub(crate) next_refresh_at: NextRefreshAt,
     pub(crate) last_fetched: LastFetchedAt,
-    pub(crate) last_stable: LastStable,
     pub(crate) pending_auto_start: PendingAutoStart,
     pub(crate) pending_window_rotation: PendingWindowRotation,
     pub(crate) last_rotated_window: LastRotatedWindow,
     pub(crate) refetch_queue: RefetchQueue,
+    pub(crate) learned_intervals: LearnedIntervals,
+    pub(crate) ok_count: ConsecutiveOk,
+    pub(crate) last_429: Last429At,
 
     pub(crate) screen: Screen,
     pub(crate) modals: Vec<Modal>,
@@ -374,11 +376,16 @@ impl App {
         let activity: ActivityFlag = Arc::new(AtomicBool::new(false));
         let next_refresh_at: NextRefreshAt = Arc::new(AtomicU64::new(now_ms() + 30_000));
         let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
-        let last_stable: LastStable = Arc::new(Mutex::new(HashMap::new()));
         let pending_auto_start: PendingAutoStart = Arc::new(Mutex::new(HashSet::new()));
         let pending_window_rotation: PendingWindowRotation = Arc::new(Mutex::new(HashMap::new()));
         let last_rotated_window: LastRotatedWindow = Arc::new(Mutex::new(HashMap::new()));
         let refetch_queue: RefetchQueue = Arc::new(Mutex::new(HashSet::new()));
+        // Restore AIMD state from disk so cadence survives restarts.
+        let learned_intervals: LearnedIntervals =
+            Arc::new(Mutex::new(config.state.learned_intervals_ms.clone()));
+        let ok_count: ConsecutiveOk =
+            Arc::new(Mutex::new(config.state.consecutive_ok_count.clone()));
+        let last_429: Last429At = Arc::new(Mutex::new(config.state.last_429_at.clone()));
 
         Self {
             config: Arc::new(Mutex::new(config)),
@@ -388,11 +395,13 @@ impl App {
             activity,
             next_refresh_at,
             last_fetched,
-            last_stable,
             pending_auto_start,
             pending_window_rotation,
             last_rotated_window,
             refetch_queue,
+            learned_intervals,
+            ok_count,
+            last_429,
             screen: Screen::Overview,
             modals: Vec::new(),
             main_cursor: 0,
@@ -444,9 +453,11 @@ impl App {
             &self.usage_status,
             &self.activity,
             &self.last_fetched,
-            &self.last_stable,
             &self.pending_auto_start,
             &self.refetch_queue,
+            &self.learned_intervals,
+            &self.ok_count,
+            &self.last_429,
         );
 
         let started = {
@@ -470,9 +481,11 @@ impl App {
                 &self.usage_status,
                 &self.activity,
                 &self.last_fetched,
-                &self.last_stable,
                 &self.pending_auto_start,
                 &self.refetch_queue,
+                &self.learned_intervals,
+                &self.ok_count,
+                &self.last_429,
             );
             *self
                 .usage_tokens
@@ -487,11 +500,13 @@ impl App {
             Arc::clone(&self.activity),
             Arc::clone(&self.next_refresh_at),
             Arc::clone(&self.last_fetched),
-            Arc::clone(&self.last_stable),
             Arc::clone(&self.pending_auto_start),
             Arc::clone(&self.pending_window_rotation),
             Arc::clone(&self.last_rotated_window),
             Arc::clone(&self.refetch_queue),
+            Arc::clone(&self.learned_intervals),
+            Arc::clone(&self.ok_count),
+            Arc::clone(&self.last_429),
         );
 
         self.apply_usage();
@@ -559,9 +574,11 @@ impl App {
         let status = Arc::clone(&self.usage_status);
         let activity = Arc::clone(&self.activity);
         let last_fetched = Arc::clone(&self.last_fetched);
-        let last_stable = Arc::clone(&self.last_stable);
         let pending_auto_start = Arc::clone(&self.pending_auto_start);
         let refetch_queue = Arc::clone(&self.refetch_queue);
+        let learned = Arc::clone(&self.learned_intervals);
+        let ok_count = Arc::clone(&self.ok_count);
+        let last_429 = Arc::clone(&self.last_429);
         std::thread::spawn(move || {
             fetch_all_into(
                 &snapshot,
@@ -569,9 +586,11 @@ impl App {
                 &status,
                 &activity,
                 &last_fetched,
-                &last_stable,
                 &pending_auto_start,
                 &refetch_queue,
+                &learned,
+                &ok_count,
+                &last_429,
             );
         });
     }
@@ -1935,10 +1954,25 @@ fn poll_credentials_divergence(app: &mut App) {
 /// symlink with a plain copy. After shutdown any external write to
 /// ~/.claude/.credentials.json lands in that standalone file instead of
 /// mutating the active profile's storage through the link.
+///
+/// AIMD learner state is persisted here — the maps are advisory so writing
+/// only on clean shutdown is sufficient; a crash just means the next startup
+/// relearns from NORMAL.
 pub(crate) fn shutdown(app: &mut App) -> Result<()> {
     {
         let mut cfg = app.config();
         let _ = snapshot_active_credentials(&mut cfg);
+        // Flush AIMD learner state so cadence survives clean restarts.
+        if let Ok(li) = app.learned_intervals.lock() {
+            cfg.state.learned_intervals_ms = li.clone();
+        }
+        if let Ok(ok) = app.ok_count.lock() {
+            cfg.state.consecutive_ok_count = ok.clone();
+        }
+        if let Ok(l4) = app.last_429.lock() {
+            cfg.state.last_429_at = l4.clone();
+        }
+        let _ = save_app_state(&cfg.state);
     }
     let _ = detach_credentials_link();
     Ok(())

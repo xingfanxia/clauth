@@ -17,18 +17,25 @@ const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
 /// performs network work for profiles whose per-profile interval has elapsed.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Per-profile refresh cadences. Near-threshold profiles get the hot interval;
-/// stable profiles (utilization unchanged since the last fetch) get the cold
-/// one to amortize API pressure. Default profiles use `NORMAL_INTERVAL_MS`.
-const HOT_INTERVAL_MS: u64 = 15_000;
-const NORMAL_INTERVAL_MS: u64 = 30_000;
-const COLD_INTERVAL_MS: u64 = 45_000;
+/// Baseline refresh interval. Used as the default when no learned value exists
+/// and as the quiet-period reset target.
+pub(crate) const NORMAL_INTERVAL_MS: u64 = 30_000;
+
+/// AIMD learner bounds and step. The learned value is clamped to [FLOOR, CEILING]
+/// after every bump; STEP is the additive decrease per recovery round.
+pub(crate) const LEARNED_FLOOR_MS: u64 = 10_000;
+pub(crate) const LEARNED_CEILING_MS: u64 = 300_000;
+pub(crate) const LEARNED_STEP_MS: u64 = 5_000;
+
+/// After this many ms without a 429, a raised learned interval resets to
+/// NORMAL_INTERVAL_MS so a single spike doesn't permanently raise the floor.
+pub(crate) const LEARNED_QUIET_RESET_MS: u64 = 5 * 60 * 1_000;
 
 /// Default fallback threshold (must match `fallback::DEFAULT_THRESHOLD`).
 const DEFAULT_FALLBACK_THRESHOLD: f64 = 95.0;
 
-/// Distance below the fallback threshold at which the refresher swaps to the
-/// hot interval and ignores the cache rule.
+/// Distance below the fallback threshold at which the refresher clamps to
+/// LEARNED_FLOOR_MS regardless of the learned value.
 const NEAR_THRESHOLD_MARGIN: f64 = 5.0;
 
 pub(crate) type UsageStore = Arc<Mutex<HashMap<String, UsageInfo>>>;
@@ -42,9 +49,14 @@ pub(crate) type LastFetchedAt = Arc<Mutex<HashMap<String, u64>>>;
 /// next scheduler tick, bypassing the per-profile cadence.
 pub(crate) type RefetchQueue = Arc<Mutex<HashSet<String>>>;
 
-/// Per-profile flag: previous fetch's 5h utilization matched the one before
-/// it. Powers the cold-cache 45s cadence.
-pub(crate) type LastStable = Arc<Mutex<HashMap<String, bool>>>;
+/// Per-profile learned refresh interval in ms (AIMD cadence).
+pub(crate) type LearnedIntervals = Arc<Mutex<HashMap<String, u64>>>;
+
+/// How many consecutive non-429 fetches each profile has seen since the last backoff.
+pub(crate) type ConsecutiveOk = Arc<Mutex<HashMap<String, u32>>>;
+
+/// Epoch-ms of the most recent 429 per profile. Used for quiet-period resets.
+pub(crate) type Last429At = Arc<Mutex<HashMap<String, u64>>>;
 
 /// Profiles that need an auto-start kick after the fetch revealed no live 5h
 /// window. Main thread drains this set on every tick.
@@ -86,6 +98,10 @@ pub(crate) enum FetchStatus {
     Cached,
     /// API request failed and no cache was available — no data to show.
     Failed,
+    /// The API returned 429 on the initial call (the signal was observed this
+    /// tick regardless of whether the retry after token rotation succeeded).
+    /// The AIMD learner uses this to bump the per-profile interval up.
+    RateLimited,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,27 +337,42 @@ fn persist_oauth_token(name: &str, oauth: &OAuthToken) -> Result<()> {
 }
 
 /// One profile's fetch + rotate + retry path. On 401/429 we refresh the OAuth
-/// pair, persist it, and retry once. Any other error path falls back to the
-/// on-disk cache. Pushes `name` onto `refetch` when the rotation succeeds so
-/// the next scheduler tick re-fetches fresh numbers immediately.
+/// pair, persist it, and retry once. A 429 on the initial call sets
+/// `RateLimited` so the AIMD learner can back off; a successful retry still
+/// records it because the rate-limit signal was observed this tick. Any other
+/// error falls back to the on-disk cache. Pushes `name` onto `refetch` when
+/// rotation succeeds so the next scheduler tick re-fetches with the new token.
 fn fetch_with_rotation(
     name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
     refetch: &RefetchQueue,
 ) -> (Option<UsageInfo>, FetchStatus) {
-    match fetch_raw(access_token) {
+    let saw_429 = match fetch_raw(access_token) {
         Ok(info) => return (Some(info), FetchStatus::Fresh),
-        Err(FetchError::Status(401 | 429)) => {}
+        Err(FetchError::Status(429)) => true,
+        Err(FetchError::Status(401)) => false,
         Err(_) => return load_disk_cache(name, FetchStatus::Cached),
-    }
+    };
 
     let Some(rt) = refresh_token else {
-        return load_disk_cache(name, FetchStatus::Cached);
+        let status = if saw_429 {
+            FetchStatus::RateLimited
+        } else {
+            FetchStatus::Cached
+        };
+        return load_disk_cache(name, status);
     };
     let tok = match crate::oauth::refresh(rt) {
         Ok(t) => t,
-        Err(_) => return load_disk_cache(name, FetchStatus::Cached),
+        Err(_) => {
+            let status = if saw_429 {
+                FetchStatus::RateLimited
+            } else {
+                FetchStatus::Cached
+            };
+            return load_disk_cache(name, status);
+        }
     };
     let oauth = OAuthToken {
         access_token: tok.access_token.clone(),
@@ -354,12 +385,24 @@ fn fetch_with_rotation(
         subscription_type: None,
     };
     if persist_oauth_token(name, &oauth).is_err() {
-        return load_disk_cache(name, FetchStatus::Cached);
+        let status = if saw_429 {
+            FetchStatus::RateLimited
+        } else {
+            FetchStatus::Cached
+        };
+        return load_disk_cache(name, status);
     }
     match fetch_raw(&tok.access_token) {
         Ok(info) => {
             // Token rotated and fresh numbers are in hand — no re-fetch needed.
-            (Some(info), FetchStatus::Fresh)
+            // A 429 was still observed this tick, so report RateLimited so the
+            // learner backs off even though we recovered.
+            let status = if saw_429 {
+                FetchStatus::RateLimited
+            } else {
+                FetchStatus::Fresh
+            };
+            (Some(info), status)
         }
         Err(_) => {
             // Rotation succeeded but the follow-up fetch failed; schedule a
@@ -367,7 +410,12 @@ fn fetch_with_rotation(
             if let Ok(mut q) = refetch.lock() {
                 q.insert(name.to_string());
             }
-            load_disk_cache(name, FetchStatus::Cached)
+            let status = if saw_429 {
+                FetchStatus::RateLimited
+            } else {
+                FetchStatus::Cached
+            };
+            load_disk_cache(name, status)
         }
     }
 }
@@ -392,17 +440,106 @@ fn five_hour_has_window(info: &UsageInfo) -> bool {
         .is_some()
 }
 
-/// Compute the per-profile refresh interval for one entry. Hot when within
-/// `NEAR_THRESHOLD_MARGIN` of the configured fallback threshold; cold when
-/// the previous fetch was stable; normal otherwise.
-fn interval_for(entry: &TokenEntry, last_5h: Option<f64>, stable: bool) -> u64 {
+/// Multiplicative-increase: multiply current by 1.5, add ±10% jitter, clamp to ceiling.
+/// Jitter avoids synchronized retry storms across profiles hitting the same wall.
+pub(crate) fn bump_up(current: u64) -> u64 {
+    let raised = (current.saturating_mul(3) / 2).min(LEARNED_CEILING_MS);
+    // LCG seeded from the current tick counter — no allocation, no new dep.
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(raised);
+    let rng = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    let margin = raised / 10;
+    // Map rng into [0, 2*margin], then shift to [-margin, +margin].
+    let jitter = if margin == 0 {
+        0i64
+    } else {
+        (rng % (margin * 2 + 1)) as i64 - margin as i64
+    };
+    ((raised as i64 + jitter).max(LEARNED_FLOOR_MS as i64) as u64).min(LEARNED_CEILING_MS)
+}
+
+/// Additive-decrease: subtract LEARNED_STEP_MS, clamp to floor.
+pub(crate) fn bump_down(current: u64) -> u64 {
+    current
+        .saturating_sub(LEARNED_STEP_MS)
+        .max(LEARNED_FLOOR_MS)
+}
+
+/// Resolve the effective refresh interval for one profile. Near-threshold always
+/// wins with FLOOR (highest urgency). Otherwise returns the learned interval,
+/// defaulting to NORMAL when no learned value exists.
+fn interval_for(
+    entry: &TokenEntry,
+    last_5h: Option<f64>,
+    learned_intervals: &LearnedIntervals,
+) -> u64 {
     let near = matches!(last_5h, Some(u) if u >= entry.fallback_threshold - NEAR_THRESHOLD_MARGIN);
     if near {
-        HOT_INTERVAL_MS
-    } else if stable {
-        COLD_INTERVAL_MS
-    } else {
-        NORMAL_INTERVAL_MS
+        return LEARNED_FLOOR_MS;
+    }
+    learned_intervals
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&entry.name).copied())
+        .unwrap_or(NORMAL_INTERVAL_MS)
+}
+
+/// Update the AIMD learner maps for one profile based on the fetch outcome.
+/// Called from the scheduler thread; all three maps are shared with the main
+/// thread via `Arc<Mutex<...>>` and persisted to `AppState` on shutdown.
+fn update_learner(
+    name: &str,
+    status: FetchStatus,
+    learned: &LearnedIntervals,
+    ok_count: &ConsecutiveOk,
+    last_429: &Last429At,
+) {
+    let now = now_ms();
+
+    let (Ok(mut learned_g), Ok(mut ok_g), Ok(mut l429_g)) =
+        (learned.lock(), ok_count.lock(), last_429.lock())
+    else {
+        return;
+    };
+
+    // Quiet-period reset: if enough time has passed since the last 429 and
+    // the learned interval is still elevated, snap it back to normal so a
+    // single spike doesn't permanently raise the floor.
+    if let Some(&t429) = l429_g.get(name)
+        && now.saturating_sub(t429) >= LEARNED_QUIET_RESET_MS
+    {
+        let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
+        if current > NORMAL_INTERVAL_MS {
+            learned_g.insert(name.to_string(), NORMAL_INTERVAL_MS);
+            l429_g.remove(name);
+        }
+    }
+
+    match status {
+        FetchStatus::RateLimited => {
+            let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
+            learned_g.insert(name.to_string(), bump_up(current));
+            ok_g.insert(name.to_string(), 0);
+            l429_g.insert(name.to_string(), now);
+        }
+        // Only a confirmed API 200 counts as a recovery signal. Network failures
+        // and cache fallbacks don't prove the API is healthy, so they're no-ops
+        // in the learner — counting them would tick the interval down during outages.
+        FetchStatus::Fresh => {
+            let count = ok_g.get(name).copied().unwrap_or(0) + 1;
+            if count >= 2 {
+                let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
+                learned_g.insert(name.to_string(), bump_down(current));
+                ok_g.insert(name.to_string(), 0);
+            } else {
+                ok_g.insert(name.to_string(), count);
+            }
+        }
+        FetchStatus::Cached | FetchStatus::Failed => {}
     }
 }
 
@@ -413,19 +550,11 @@ struct FetchOutcome {
     name: String,
     info: Option<UsageInfo>,
     status: FetchStatus,
-    stable: bool,
     needs_auto_start: bool,
 }
 
-/// Run a single fetch for one entry. Pulls the previous 5h utilization out
-/// of the store before issuing the request so we can compute stability
-/// without holding the lock across I/O.
-fn run_fetch(entry: TokenEntry, store: &UsageStore, refetch: &RefetchQueue) -> FetchOutcome {
-    let prev_util = store
-        .lock()
-        .ok()
-        .and_then(|s| s.get(&entry.name).and_then(five_hour_utilization));
-
+/// Run a single fetch for one entry.
+fn run_fetch(entry: TokenEntry, refetch: &RefetchQueue) -> FetchOutcome {
     let (info, status) = fetch_with_rotation(
         &entry.name,
         &entry.access_token,
@@ -433,23 +562,15 @@ fn run_fetch(entry: TokenEntry, store: &UsageStore, refetch: &RefetchQueue) -> F
         refetch,
     );
 
-    let (stable, needs_auto_start) = match info.as_ref() {
-        Some(i) => {
-            let stable = match (prev_util, five_hour_utilization(i)) {
-                (Some(a), Some(b)) => (a - b).abs() < f64::EPSILON,
-                _ => false,
-            };
-            let needs_kick = entry.auto_start && !five_hour_has_window(i);
-            (stable, needs_kick)
-        }
-        None => (false, false),
+    let needs_auto_start = match info.as_ref() {
+        Some(i) => entry.auto_start && !five_hour_has_window(i),
+        None => false,
     };
 
     FetchOutcome {
         name: entry.name,
         info,
         status,
-        stable,
         needs_auto_start,
     }
 }
@@ -457,16 +578,22 @@ fn run_fetch(entry: TokenEntry, store: &UsageStore, refetch: &RefetchQueue) -> F
 /// Write one outcome into the shared stores. Disk cache is updated on every
 /// successful API response so a later process restart can still surface
 /// numbers without a fresh API call.
+#[allow(clippy::too_many_arguments)]
 fn apply_outcome(
     outcome: FetchOutcome,
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
-    last_stable: &LastStable,
     pending_auto_start: &PendingAutoStart,
+    learned: &LearnedIntervals,
+    ok_count: &ConsecutiveOk,
+    last_429: &Last429At,
 ) {
     if let Some(info) = &outcome.info {
-        if matches!(outcome.status, FetchStatus::Fresh) {
+        if matches!(
+            outcome.status,
+            FetchStatus::Fresh | FetchStatus::RateLimited
+        ) {
             write_disk_cache(&outcome.name, info);
         }
         if let Ok(mut s) = store.lock() {
@@ -479,14 +606,12 @@ fn apply_outcome(
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(outcome.name.clone(), now_ms());
     }
-    if let Ok(mut ls) = last_stable.lock() {
-        ls.insert(outcome.name.clone(), outcome.stable);
-    }
     if outcome.needs_auto_start
         && let Ok(mut p) = pending_auto_start.lock()
     {
-        p.insert(outcome.name);
+        p.insert(outcome.name.clone());
     }
+    update_learner(&outcome.name, outcome.status, learned, ok_count, last_429);
 }
 
 /// Force-fetch every entry right now in parallel and write the results into
@@ -499,9 +624,11 @@ pub(crate) fn fetch_all_into(
     status: &StatusStore,
     activity: &ActivityFlag,
     last_fetched: &LastFetchedAt,
-    last_stable: &LastStable,
     pending_auto_start: &PendingAutoStart,
     refetch: &RefetchQueue,
+    learned: &LearnedIntervals,
+    ok_count: &ConsecutiveOk,
+    last_429: &Last429At,
 ) {
     if tokens.is_empty() {
         return;
@@ -512,9 +639,8 @@ pub(crate) fn fetch_all_into(
         .iter()
         .cloned()
         .map(|entry| {
-            let store = Arc::clone(store);
             let refetch = Arc::clone(refetch);
-            std::thread::spawn(move || run_fetch(entry, &store, &refetch))
+            std::thread::spawn(move || run_fetch(entry, &refetch))
         })
         .collect();
 
@@ -527,21 +653,21 @@ pub(crate) fn fetch_all_into(
             store,
             status,
             last_fetched,
-            last_stable,
             pending_auto_start,
+            learned,
+            ok_count,
+            last_429,
         );
     }
 
     activity.store(false, Ordering::Relaxed);
 }
 
-/// Background scheduler. Wakes every second and fans out parallel fetches
-/// for every profile whose per-profile interval has elapsed. Per-profile
-/// cadence: 15s when near the configured fallback threshold, 45s when the
-/// previous fetch was stable, 30s otherwise. The cache rule (skip when the
-/// last fetch was <45s ago AND stable) is folded into the cadence: a stable
-/// profile's interval IS the cache-min-age, so the next tick lines up with
-/// the moment the cache rule would expire.
+/// Background scheduler. Wakes every second and fans out parallel fetches for
+/// every profile whose per-profile interval has elapsed. The effective interval
+/// per profile comes from the AIMD learner (stored in `learned`): FLOOR when
+/// near the configured fallback threshold, the learned value otherwise, falling
+/// back to NORMAL when no learned value exists.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_refresher(
     tokens: TokenList,
@@ -550,11 +676,13 @@ pub(crate) fn spawn_refresher(
     activity: ActivityFlag,
     next_at: NextRefreshAt,
     last_fetched: LastFetchedAt,
-    last_stable: LastStable,
     pending_auto_start: PendingAutoStart,
     pending_window_rotation: PendingWindowRotation,
     last_rotated_window: LastRotatedWindow,
     refetch_queue: RefetchQueue,
+    learned: LearnedIntervals,
+    ok_count: ConsecutiveOk,
+    last_429: Last429At,
 ) {
     std::thread::spawn(move || {
         loop {
@@ -578,11 +706,10 @@ pub(crate) fn spawn_refresher(
                 .unwrap_or_default();
 
             // Decide which entries are due this tick. Per-profile intervals
-            // are computed against the previous fetch's stability and 5h
-            // utilization, both held in the shared stores.
+            // come from the AIMD learner held in `learned`.
             let now = now_ms();
             let (mut due, soonest_next) =
-                partition_due(&snapshot, now, &store, &last_fetched, &last_stable);
+                partition_due(&snapshot, now, &store, &last_fetched, &learned);
 
             // Merge forced entries that aren't already scheduled this tick.
             if !forced.is_empty() {
@@ -607,9 +734,8 @@ pub(crate) fn spawn_refresher(
             let handles: Vec<_> = due
                 .into_iter()
                 .map(|entry| {
-                    let store = Arc::clone(&store);
                     let refetch_queue = Arc::clone(&refetch_queue);
-                    std::thread::spawn(move || run_fetch(entry, &store, &refetch_queue))
+                    std::thread::spawn(move || run_fetch(entry, &refetch_queue))
                 })
                 .collect();
             for h in handles {
@@ -621,8 +747,10 @@ pub(crate) fn spawn_refresher(
                     &store,
                     &status,
                     &last_fetched,
-                    &last_stable,
                     &pending_auto_start,
+                    &learned,
+                    &ok_count,
+                    &last_429,
                 );
             }
             activity.store(false, Ordering::Relaxed);
@@ -642,7 +770,7 @@ pub(crate) fn spawn_refresher(
             // updated `last_fetched`, so the footer countdown reflects the
             // freshly-recorded deadlines instead of the pre-tick estimate.
             let (_, soonest_after) =
-                partition_due(&snapshot, now_ms(), &store, &last_fetched, &last_stable);
+                partition_due(&snapshot, now_ms(), &store, &last_fetched, &learned);
             next_at.store(soonest_after, Ordering::Relaxed);
         }
     });
@@ -702,10 +830,9 @@ fn partition_due(
     now: u64,
     store: &UsageStore,
     last_fetched: &LastFetchedAt,
-    last_stable: &LastStable,
+    learned: &LearnedIntervals,
 ) -> (Vec<TokenEntry>, u64) {
     let lf = last_fetched.lock().ok();
-    let ls = last_stable.lock().ok();
     let st = store.lock().ok();
 
     let mut due = Vec::new();
@@ -715,14 +842,10 @@ fn partition_due(
             .as_ref()
             .and_then(|m| m.get(&entry.name).copied())
             .unwrap_or(0);
-        let stable = ls
-            .as_ref()
-            .and_then(|m| m.get(&entry.name).copied())
-            .unwrap_or(false);
         let last_5h = st
             .as_ref()
             .and_then(|s| s.get(&entry.name).and_then(five_hour_utilization));
-        let interval = interval_for(entry, last_5h, stable);
+        let interval = interval_for(entry, last_5h, learned);
         let next = last.saturating_add(interval);
         if now >= next {
             due.push(entry.clone());
@@ -824,3 +947,7 @@ pub(crate) fn humanize_duration(secs: i64) -> String {
         format!("{}m", mins.max(1))
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/learned_cadence.rs"]
+mod tests;

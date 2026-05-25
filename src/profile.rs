@@ -98,6 +98,20 @@ pub(crate) struct AppState {
     /// Ordered list of profile names participating in the auto-switch chain.
     #[serde(default)]
     pub(crate) fallback_chain: Vec<String>,
+    /// Per-profile learned refresh interval in ms. Updated by the AIMD cadence
+    /// learner in response to 429s and consecutive-ok counts. Advisory — a
+    /// missing entry means the profile uses `NORMAL_INTERVAL_MS`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) learned_intervals_ms: HashMap<String, u64>,
+    /// How many consecutive non-429 fetches each profile has accumulated since
+    /// the last backoff. Resets to 0 on every bump-up or bump-down.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) consecutive_ok_count: HashMap<String, u32>,
+    /// Epoch-ms of the most recent 429 seen for each profile. Used by the
+    /// quiet-period reset: if now - last_429_at >= LEARNED_QUIET_RESET_MS and
+    /// the learned interval is above NORMAL, it snaps back to NORMAL.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) last_429_at: HashMap<String, u64>,
 }
 
 pub(crate) struct AppConfig {
