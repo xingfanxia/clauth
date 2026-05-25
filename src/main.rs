@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use crate::actions::switch_profile;
+use crate::actions::{switch_profile, switch_profile_reconciled};
+use crate::claude::{LinkState, classify_credentials_link, is_first_login};
 use crate::profile::{AppConfig, load_config};
 use crate::usage::RefetchQueue;
 
@@ -79,7 +80,44 @@ fn main() -> Result<()> {
             // the CLI also discards.
             let noop: RefetchQueue = Arc::new(Mutex::new(std::collections::HashSet::new()));
             let _ = oauth::refresh_all(&mut config, false, &noop);
-            switch_profile(&mut config, &canonical)?;
+
+            // When the outgoing active profile has a diverged live credentials
+            // file (CC re-logged or wrote a regular file), prompt rather than
+            // refusing. On Yes: capture the live creds into the outgoing
+            // profile first, then force the switch. On No: abort cleanly.
+            let reconciled = if let Some(active) = config.state.active_profile.as_deref() {
+                matches!(classify_credentials_link(active)?, LinkState::Diverged)
+                    && !is_first_login(active)?
+            } else {
+                false
+            };
+            if reconciled {
+                let active = config
+                    .state
+                    .active_profile
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_string();
+                print!(
+                    "active profile '{active}' has uncaptured credentials in ~/.claude \
+                     (a re-login or token rotation). capture them into '{active}' and \
+                     switch to '{canonical}'? [Y/n] "
+                );
+                use std::io::Write;
+                std::io::stdout().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                let answer = answer.trim().to_ascii_lowercase();
+                if answer.is_empty() || answer == "y" || answer == "yes" {
+                    switch_profile_reconciled(&mut config, &canonical)?;
+                } else {
+                    println!("aborted — no changes made");
+                    return Ok(());
+                }
+            } else {
+                switch_profile(&mut config, &canonical)?;
+            }
+
             // Match the TUI: prime the 5h window if the target is opted in
             // via `auto_start = true`. Cooldown blocks repeated CLI switches
             // from re-kicking inside the same window.

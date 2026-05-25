@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::claude::{
     ClaudeEndpoint, apply_profile_to_claude_settings, clear_claude_credentials,
-    link_profile_credentials, read_claude_credentials, read_claude_endpoint_config,
-    snapshot_active_credentials,
+    force_link_profile_credentials, force_snapshot_active_credentials, link_profile_credentials,
+    read_claude_credentials, read_claude_endpoint_config, snapshot_active_credentials,
 };
 use crate::lock::with_state_lock;
 use crate::profile::{
@@ -54,23 +54,40 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         if config.is_active(name) {
             return Ok(());
         }
-
         snapshot_active_credentials(config)?;
-
-        let prev_env_keys: Vec<String> = config
-            .state
-            .active_profile
-            .as_deref()
-            .and_then(|n| config.find(n))
-            .map(|p| p.env.keys().cloned().collect())
-            .unwrap_or_default();
-
         link_profile_credentials(name)?;
-        let profile = config.find(name).context("Profile not found")?;
-        apply_profile_to_claude_settings(profile, &prev_env_keys)?;
-        config.state.active_profile = Some(name.to_string());
-        save_app_state(&config.state)
+        finish_switch(config, name)
     })
+}
+
+/// Switch after the caller has accepted reconciling a diverged live file:
+/// preserve the outgoing profile's live creds unconditionally, then force
+/// the symlink to the target. Used by the CLI prompt path only.
+pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &str) -> Result<()> {
+    with_state_lock(|| {
+        if config.is_active(name) {
+            return Ok(());
+        }
+        force_snapshot_active_credentials(config)?;
+        force_link_profile_credentials(name)?;
+        finish_switch(config, name)
+    })
+}
+
+fn finish_switch(config: &mut AppConfig, name: &str) -> Result<()> {
+    // Capture prev env keys before active_profile is reassigned so
+    // apply_profile_to_claude_settings can clear the outgoing profile's env.
+    let prev_env_keys: Vec<String> = config
+        .state
+        .active_profile
+        .as_deref()
+        .and_then(|n| config.find(n))
+        .map(|p| p.env.keys().cloned().collect())
+        .unwrap_or_default();
+    let profile = config.find(name).context("Profile not found")?;
+    apply_profile_to_claude_settings(profile, &prev_env_keys)?;
+    config.state.active_profile = Some(name.to_string());
+    save_app_state(&config.state)
 }
 
 pub(crate) fn edit_profile_endpoint(
