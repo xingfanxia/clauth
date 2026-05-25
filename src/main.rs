@@ -15,10 +15,13 @@ mod ureq_error;
 mod usage;
 mod which;
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 
 use crate::actions::switch_profile;
 use crate::profile::{AppConfig, load_config};
+use crate::usage::RefetchQueue;
 
 fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<String> {
     config.canonical_name(name).ok_or_else(|| {
@@ -71,12 +74,16 @@ fn main() -> Result<()> {
             // Refresh every profile's OAuth token before switching, same as
             // the interactive flow. The rotated access token then ends up in
             // ~/.claude/.credentials.json via the symlink.
-            let _ = oauth::refresh_all(&mut config, false);
+            // No scheduler running in the CLI path — queue contents are
+            // discarded; we only need the return value (rotated names) which
+            // the CLI also discards.
+            let noop: RefetchQueue = Arc::new(Mutex::new(std::collections::HashSet::new()));
+            let _ = oauth::refresh_all(&mut config, false, &noop);
             switch_profile(&mut config, &canonical)?;
             // Match the TUI: prime the 5h window if the target is opted in
             // via `auto_start = true`. Cooldown blocks repeated CLI switches
             // from re-kicking inside the same window.
-            let _ = oauth::auto_start_named(&mut config, &canonical);
+            let _ = oauth::auto_start_named(&mut config, &canonical, &noop);
             println!("switched to '{canonical}'");
             return Ok(());
         }

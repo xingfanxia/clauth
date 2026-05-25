@@ -38,6 +38,10 @@ pub(crate) type TokenList = Arc<Mutex<Vec<TokenEntry>>>;
 /// Per-profile epoch-ms of the last fetch attempt (cache-rule gating).
 pub(crate) type LastFetchedAt = Arc<Mutex<HashMap<String, u64>>>;
 
+/// Names pushed here after a successful token rotation are fetched on the very
+/// next scheduler tick, bypassing the per-profile cadence.
+pub(crate) type RefetchQueue = Arc<Mutex<HashSet<String>>>;
+
 /// Per-profile flag: previous fetch's 5h utilization matched the one before
 /// it. Powers the cold-cache 45s cadence.
 pub(crate) type LastStable = Arc<Mutex<HashMap<String, bool>>>;
@@ -308,11 +312,13 @@ fn persist_oauth_token(name: &str, oauth: &OAuthToken) -> Result<()> {
 
 /// One profile's fetch + rotate + retry path. On 401/429 we refresh the OAuth
 /// pair, persist it, and retry once. Any other error path falls back to the
-/// on-disk cache.
+/// on-disk cache. Pushes `name` onto `refetch` when the rotation succeeds so
+/// the next scheduler tick re-fetches fresh numbers immediately.
 fn fetch_with_rotation(
     name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
+    refetch: &RefetchQueue,
 ) -> (Option<UsageInfo>, FetchStatus) {
     match fetch_raw(access_token) {
         Ok(info) => return (Some(info), FetchStatus::Fresh),
@@ -341,8 +347,18 @@ fn fetch_with_rotation(
         return load_disk_cache(name, FetchStatus::Cached);
     }
     match fetch_raw(&tok.access_token) {
-        Ok(info) => (Some(info), FetchStatus::Fresh),
-        Err(_) => load_disk_cache(name, FetchStatus::Cached),
+        Ok(info) => {
+            // Token rotated and fresh numbers are in hand — no re-fetch needed.
+            (Some(info), FetchStatus::Fresh)
+        }
+        Err(_) => {
+            // Rotation succeeded but the follow-up fetch failed; schedule a
+            // re-fetch so the next tick picks up with the new access token.
+            if let Ok(mut q) = refetch.lock() {
+                q.insert(name.to_string());
+            }
+            load_disk_cache(name, FetchStatus::Cached)
+        }
     }
 }
 
@@ -394,7 +410,7 @@ struct FetchOutcome {
 /// Run a single fetch for one entry. Pulls the previous 5h utilization out
 /// of the store before issuing the request so we can compute stability
 /// without holding the lock across I/O.
-fn run_fetch(entry: TokenEntry, store: &UsageStore) -> FetchOutcome {
+fn run_fetch(entry: TokenEntry, store: &UsageStore, refetch: &RefetchQueue) -> FetchOutcome {
     let prev_util = store
         .lock()
         .ok()
@@ -404,6 +420,7 @@ fn run_fetch(entry: TokenEntry, store: &UsageStore) -> FetchOutcome {
         &entry.name,
         &entry.access_token,
         entry.refresh_token.as_deref(),
+        refetch,
     );
 
     let (stable, needs_auto_start) = match info.as_ref() {
@@ -474,6 +491,7 @@ pub(crate) fn fetch_all_into(
     last_fetched: &LastFetchedAt,
     last_stable: &LastStable,
     pending_auto_start: &PendingAutoStart,
+    refetch: &RefetchQueue,
 ) {
     if tokens.is_empty() {
         return;
@@ -485,7 +503,8 @@ pub(crate) fn fetch_all_into(
         .cloned()
         .map(|entry| {
             let store = Arc::clone(store);
-            std::thread::spawn(move || run_fetch(entry, &store))
+            let refetch = Arc::clone(refetch);
+            std::thread::spawn(move || run_fetch(entry, &store, &refetch))
         })
         .collect();
 
@@ -523,6 +542,7 @@ pub(crate) fn spawn_refresher(
     last_fetched: LastFetchedAt,
     last_stable: LastStable,
     pending_auto_start: PendingAutoStart,
+    refetch_queue: RefetchQueue,
 ) {
     std::thread::spawn(move || {
         loop {
@@ -537,12 +557,34 @@ pub(crate) fn spawn_refresher(
                 continue;
             }
 
+            // Drain names pushed by rotation paths so they bypass the cadence
+            // and get fresh numbers on this tick instead of waiting up to 45s.
+            let forced: HashSet<String> = refetch_queue
+                .lock()
+                .ok()
+                .map(|mut q| std::mem::take(&mut *q))
+                .unwrap_or_default();
+
             // Decide which entries are due this tick. Per-profile intervals
             // are computed against the previous fetch's stability and 5h
             // utilization, both held in the shared stores.
             let now = now_ms();
-            let (due, soonest_next) =
+            let (mut due, soonest_next) =
                 partition_due(&snapshot, now, &store, &last_fetched, &last_stable);
+
+            // Merge forced entries that aren't already scheduled this tick.
+            if !forced.is_empty() {
+                let mut extras: Vec<TokenEntry> = Vec::with_capacity(forced.len());
+                extras.extend(
+                    snapshot
+                        .iter()
+                        .filter(|e| {
+                            forced.contains(&e.name) && !due.iter().any(|d| d.name == e.name)
+                        })
+                        .cloned(),
+                );
+                due.extend(extras);
+            }
 
             if due.is_empty() {
                 next_at.store(soonest_next, Ordering::Relaxed);
@@ -554,7 +596,8 @@ pub(crate) fn spawn_refresher(
                 .into_iter()
                 .map(|entry| {
                     let store = Arc::clone(&store);
-                    std::thread::spawn(move || run_fetch(entry, &store))
+                    let refetch_queue = Arc::clone(&refetch_queue);
+                    std::thread::spawn(move || run_fetch(entry, &store, &refetch_queue))
                 })
                 .collect();
             for h in handles {

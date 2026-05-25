@@ -33,9 +33,9 @@ use crate::profile::{
     AppConfig, Profile, app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::usage::{
-    ActivityFlag, LastFetchedAt, LastStable, NextRefreshAt, PendingAutoStart, StatusStore,
-    TokenEntry, TokenList, UsageStore, default_fallback_threshold, fetch_all_into, now_ms,
-    spawn_refresher,
+    ActivityFlag, LastFetchedAt, LastStable, NextRefreshAt, PendingAutoStart, RefetchQueue,
+    StatusStore, TokenEntry, TokenList, UsageStore, default_fallback_threshold, fetch_all_into,
+    now_ms, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -344,6 +344,7 @@ pub(crate) struct App {
     pub(crate) last_fetched: LastFetchedAt,
     pub(crate) last_stable: LastStable,
     pub(crate) pending_auto_start: PendingAutoStart,
+    pub(crate) refetch_queue: RefetchQueue,
 
     pub(crate) screen: Screen,
     pub(crate) modals: Vec<Modal>,
@@ -373,6 +374,7 @@ impl App {
         let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
         let last_stable: LastStable = Arc::new(Mutex::new(HashMap::new()));
         let pending_auto_start: PendingAutoStart = Arc::new(Mutex::new(HashSet::new()));
+        let refetch_queue: RefetchQueue = Arc::new(Mutex::new(HashSet::new()));
 
         Self {
             config: Arc::new(Mutex::new(config)),
@@ -384,6 +386,7 @@ impl App {
             last_fetched,
             last_stable,
             pending_auto_start,
+            refetch_queue,
             screen: Screen::Overview,
             modals: Vec::new(),
             main_cursor: 0,
@@ -420,7 +423,7 @@ impl App {
         // so the initial usage fetch below uses fresh access tokens.
         {
             let mut cfg = self.config();
-            let _ = oauth::refresh_all(&mut cfg, false);
+            let _ = oauth::refresh_all(&mut cfg, false, &self.refetch_queue);
         }
         self.refresh_tokens();
 
@@ -437,11 +440,12 @@ impl App {
             &self.last_fetched,
             &self.last_stable,
             &self.pending_auto_start,
+            &self.refetch_queue,
         );
 
         let started = {
             let mut cfg = self.config();
-            oauth::auto_start_windows(&mut cfg, &self.usage_store)
+            oauth::auto_start_windows(&mut cfg, &self.usage_store, &self.refetch_queue)
         };
         if !started.is_empty() {
             for name in &started {
@@ -462,6 +466,7 @@ impl App {
                 &self.last_fetched,
                 &self.last_stable,
                 &self.pending_auto_start,
+                &self.refetch_queue,
             );
             *self
                 .usage_tokens
@@ -478,6 +483,7 @@ impl App {
             Arc::clone(&self.last_fetched),
             Arc::clone(&self.last_stable),
             Arc::clone(&self.pending_auto_start),
+            Arc::clone(&self.refetch_queue),
         );
 
         self.apply_usage();
@@ -547,6 +553,7 @@ impl App {
         let last_fetched = Arc::clone(&self.last_fetched);
         let last_stable = Arc::clone(&self.last_stable);
         let pending_auto_start = Arc::clone(&self.pending_auto_start);
+        let refetch_queue = Arc::clone(&self.refetch_queue);
         std::thread::spawn(move || {
             fetch_all_into(
                 &snapshot,
@@ -556,6 +563,7 @@ impl App {
                 &last_fetched,
                 &last_stable,
                 &pending_auto_start,
+                &refetch_queue,
             );
         });
     }
@@ -857,7 +865,7 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
 fn perform_switch(app: &mut App, name: &str) {
     let result = {
         let mut cfg = app.config();
-        let _ = oauth::refresh_all(&mut cfg, false);
+        let _ = oauth::refresh_all(&mut cfg, false, &app.refetch_queue);
         switch_profile(&mut cfg, name)
     };
     match result {
@@ -1429,7 +1437,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         ConfirmAction::RotateAll => {
             let rotated = {
                 let mut cfg = app.config();
-                oauth::refresh_all(&mut cfg, true)
+                oauth::refresh_all(&mut cfg, true, &app.refetch_queue)
             };
             app.refresh_tokens();
             let count = rotated.len();
@@ -1808,7 +1816,7 @@ pub(crate) fn on_tick(app: &mut App) {
     for name in pending {
         let kicked = {
             let mut cfg = app.config();
-            oauth::auto_start_named(&mut cfg, &name)
+            oauth::auto_start_named(&mut cfg, &name, &app.refetch_queue)
         };
         if kicked {
             any_started = true;

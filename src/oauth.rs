@@ -8,7 +8,7 @@ use crate::claude::{LinkState, classify_credentials_link};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, OAuthToken, save_app_state, save_profile};
 use crate::runtime::has_live_session;
-use crate::usage::{UsageStore, now_ms};
+use crate::usage::{RefetchQueue, UsageStore, now_ms};
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup
 /// to mint a fresh access token from the stored refresh token.
@@ -128,7 +128,13 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Strin
 ///
 /// Returns the names of profiles whose token rotation succeeded so the caller
 /// can target follow-up work (usage re-fetch, kick) at the same set.
-pub(crate) fn refresh_all(config: &mut AppConfig, force: bool) -> Vec<String> {
+/// Pushes each rotated name onto `refetch` so the next scheduler tick
+/// re-fetches usage immediately without waiting for the cadence.
+pub(crate) fn refresh_all(
+    config: &mut AppConfig,
+    force: bool,
+    refetch: &RefetchQueue,
+) -> Vec<String> {
     let snapshots = rotation_candidates(config, force);
 
     if snapshots.is_empty() {
@@ -163,6 +169,11 @@ pub(crate) fn refresh_all(config: &mut AppConfig, force: bool) -> Vec<String> {
             refreshed.push(name);
         }
     }
+    if let Ok(mut q) = refetch.lock() {
+        for name in &refreshed {
+            q.insert(name.clone());
+        }
+    }
     refreshed
 }
 
@@ -171,8 +182,14 @@ pub(crate) fn refresh_all(config: &mut AppConfig, force: bool) -> Vec<String> {
 /// disk) and fires a 1-token Haiku ping to start the window.
 ///
 /// Returns the names of profiles whose ping succeeded so the caller can
-/// re-fetch usage and confirm the window now shows up.
-pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> Vec<String> {
+/// re-fetch usage and confirm the window now shows up. Pushes each kicked
+/// name onto `refetch` so the scheduler re-fetches without waiting for the
+/// cadence.
+pub(crate) fn auto_start_windows(
+    config: &mut AppConfig,
+    store: &UsageStore,
+    refetch: &RefetchQueue,
+) -> Vec<String> {
     // Claim cooldown slots under the lock BEFORE any network work. A competing
     // clauth process that starts up a moment later will observe our recorded
     // `last_auto_start_at` and skip the same profile, so the refresh token
@@ -257,6 +274,11 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
             kicked.push(name);
         }
     }
+    if let Ok(mut q) = refetch.lock() {
+        for name in &kicked {
+            q.insert(name.clone());
+        }
+    }
     kicked
 }
 
@@ -265,8 +287,9 @@ pub(crate) fn auto_start_windows(config: &mut AppConfig, store: &UsageStore) -> 
 /// a single name and without a usage-store check — callers use this where
 /// no fresh `UsageStore` is on hand (e.g. one-shot CLI switch). The 4.5h
 /// cooldown stops repeated invocations from re-firing inside an open
-/// window. Returns true iff the kick HTTP call succeeded.
-pub(crate) fn auto_start_named(config: &mut AppConfig, name: &str) -> bool {
+/// window. Returns true iff the kick HTTP call succeeded. Pushes `name`
+/// onto `refetch` on success.
+pub(crate) fn auto_start_named(config: &mut AppConfig, name: &str, refetch: &RefetchQueue) -> bool {
     let now = now_ms();
     let token = match with_state_lock(|| {
         let Some(profile) = config.find(name) else {
@@ -311,7 +334,11 @@ pub(crate) fn auto_start_named(config: &mut AppConfig, name: &str) -> bool {
     if !apply_rotated_tokens_or_rollback_cooldown(config, name, tok) {
         return false;
     }
-    kick(&access_token).is_ok()
+    let kicked = kick(&access_token).is_ok();
+    if kicked && let Ok(mut q) = refetch.lock() {
+        q.insert(name.to_string());
+    }
+    kicked
 }
 
 /// Write rotated token fields into an OAuth block. Called under the state lock.
