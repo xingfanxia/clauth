@@ -29,7 +29,7 @@ fn is_exhausted(profile: &Profile) -> bool {
 ///   2. As a last resort, a member with threshold == 100% — accepted even
 ///      while it's at 100%. Claude Code will show its own "out of 5h limit"
 ///      message on arrival.
-fn next_target(config: &AppConfig) -> Option<String> {
+pub(crate) fn next_target(config: &AppConfig) -> Option<String> {
     let active = config.state.active_profile.as_deref()?;
     let chain = &config.state.fallback_chain;
     let active_idx = chain.iter().position(|n| n == active)?;
@@ -51,7 +51,19 @@ fn next_target(config: &AppConfig) -> Option<String> {
         None
     };
 
-    walk(&|p| !is_exhausted(p)).or_else(|| walk(&|p| threshold_for(p) >= 100.0))
+    // Only fall back to a 100%-threshold sink when the active profile is NOT
+    // itself such a sink. Two maxed sinks switching to each other indefinitely
+    // gains nothing — one migration is fine, but the next tick must stay put.
+    let active_is_sink = config
+        .find(active)
+        .is_some_and(|p| threshold_for(p) >= 100.0);
+
+    walk(&|p| !is_exhausted(p)).or_else(|| {
+        if active_is_sink {
+            return None;
+        }
+        walk(&|p| threshold_for(p) >= 100.0)
+    })
 }
 
 /// If the active profile is a chain member and its 5h utilization has crossed
@@ -86,3 +98,7 @@ pub(crate) fn auto_switch_if_needed(config: &mut AppConfig) -> Result<Option<Str
         Ok(Some(target))
     })
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/fallback.rs"]
+mod tests;
