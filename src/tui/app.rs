@@ -35,8 +35,9 @@ use crate::usage::{
     ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, Last429At, LastFetchedAt,
     LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult, OpResultReceiver,
     OpResultSender, PendingAutoStart, PendingSwitch, PendingWindowRotation, ProfileActivity,
-    RefetchQueue, StatusStore, TokenEntry, TokenList, UsageStore, any_busy, clear_activity,
-    default_fallback_threshold, fetch_all_into, is_idle, mark_activity, spawn_refresher,
+    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, TokenEntry,
+    TokenList, UsageStore, any_busy, clear_activity, default_fallback_threshold, fetch_all_into,
+    is_idle, mark_activity, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -352,6 +353,12 @@ pub(crate) struct App {
     /// Sender side. Cloned into workers (and passed to refresh/rotation
     /// helpers) so they can report completion without holding any lock.
     pub(crate) op_sender: OpResultSender,
+    /// Startup phase signals from the reconcile / bootstrap background workers.
+    /// Drained inside `on_tick`; sequences the event loop through reconcile →
+    /// bootstrap without blocking the first paint on HTTP or an FS walk.
+    pub(crate) startup_results: StartupReceiver,
+    /// Sender side, cloned into the two startup workers.
+    pub(crate) startup_sender: StartupSender,
     pub(crate) last_fetched: LastFetchedAt,
     pub(crate) pending_auto_start: PendingAutoStart,
     pub(crate) pending_window_rotation: PendingWindowRotation,
@@ -385,6 +392,13 @@ pub(crate) struct App {
     /// pushes a Divergence modal when CC has overwritten the symlink
     /// (typically by `/login`). Defers behind any open modal.
     pub(crate) last_divergence_check: Instant,
+    /// True once the startup reconcile worker has reported back. Gates the
+    /// bootstrap spawn so token rotation never races a soon-to-be-disowned
+    /// profile (the reconcile prompt must be resolved first).
+    pub(crate) reconcile_done: bool,
+    /// True once `spawn_bootstrap` has been dispatched. Guards against a
+    /// second dispatch on subsequent ticks.
+    pub(crate) bootstrap_started: bool,
 }
 
 impl App {
@@ -395,6 +409,7 @@ impl App {
         let next_refresh_per_profile: NextRefreshPerProfile = Arc::new(Mutex::new(HashMap::new()));
         let activity: ActivityStore = Arc::new(Mutex::new(HashMap::new()));
         let (op_sender, op_results) = std::sync::mpsc::channel::<OpResult>();
+        let (startup_sender, startup_results) = std::sync::mpsc::channel::<StartupSignal>();
         let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
         let pending_auto_start: PendingAutoStart = Arc::new(Mutex::new(HashSet::new()));
         let pending_window_rotation: PendingWindowRotation = Arc::new(Mutex::new(HashMap::new()));
@@ -419,6 +434,8 @@ impl App {
             activity,
             op_results,
             op_sender,
+            startup_results,
+            startup_sender,
             last_fetched,
             pending_auto_start,
             pending_window_rotation,
@@ -439,6 +456,8 @@ impl App {
             tick_count: 0,
             quit: false,
             last_divergence_check: Instant::now(),
+            reconcile_done: false,
+            bootstrap_started: false,
         }
     }
 
@@ -449,85 +468,108 @@ impl App {
         self.config.lock().expect("config mutex poisoned")
     }
 
-    /// Kick off the background usage refresher. Runs once after startup
-    /// reconciliation completes so the active profile's identity is settled
-    /// before we rotate any refresh tokens.
-    pub(crate) fn bootstrap_usage(&mut self) {
-        // Re-establish the credentials symlink that the previous shutdown
-        // replaced with a plain file. Without this, in-session Claude Code
-        // refreshes write to a standalone file instead of the profile.
-        let active = self.config().state.active_profile.clone();
-        if let Some(active) = active {
-            let _ = link_profile_credentials(&active);
-        }
+    /// Spawn the startup bootstrap onto a background thread so it never blocks
+    /// the first paint. The worker re-links the active profile's credentials,
+    /// rotates every profile's OAuth pair (`refresh_all`), runs the initial
+    /// usage fetch, and kicks any opted-in 5h windows (`auto_start_windows`).
+    /// All of this is HTTP-heavy and used to run on the UI thread before the
+    /// event loop ever painted.
+    ///
+    /// Per-profile spinners light up from inside `refresh_all` / `fetch_all_into`
+    /// / `auto_start_windows` (they mark `Refreshing` / `Fetching` /
+    /// `AutoStarting`), and per-profile completion toasts ride the existing
+    /// `OpResult` drain. When the worker finishes it posts
+    /// `StartupSignal::BootstrapDone`; the UI thread then rebuilds the token
+    /// snapshot, spawns the scheduler, applies usage, and runs the one-shot
+    /// startup auto-switch — all fast, lock-scoped, network-free work.
+    pub(crate) fn spawn_bootstrap(&self) {
+        let config = Arc::clone(&self.config);
+        let usage_store = Arc::clone(&self.usage_store);
+        let usage_status = Arc::clone(&self.usage_status);
+        let last_fetched = Arc::clone(&self.last_fetched);
+        let pending_auto_start = Arc::clone(&self.pending_auto_start);
+        let refetch_queue = Arc::clone(&self.refetch_queue);
+        let activity = Arc::clone(&self.activity);
+        let learned_intervals = Arc::clone(&self.learned_intervals);
+        let ok_count = Arc::clone(&self.ok_count);
+        let cache_hit_count = Arc::clone(&self.cache_hit_count);
+        let last_429 = Arc::clone(&self.last_429);
+        let op_sender = self.op_sender.clone();
+        let startup_sender = self.startup_sender.clone();
 
-        // Refresh every profile's OAuth token pair — Claude Code does the
-        // same thing silently on launch. Rotates and persists the new pair
-        // so the initial usage fetch below uses fresh access tokens.
-        let _ = oauth::refresh_all(
-            &self.config,
-            false,
-            &self.refetch_queue,
-            &self.activity,
-            &self.op_sender,
-        );
-        self.refresh_tokens();
+        std::thread::spawn(move || {
+            // Re-establish the credentials symlink that the previous shutdown
+            // replaced with a plain file. Without this, in-session Claude Code
+            // refreshes write to a standalone file instead of the profile.
+            let active = config
+                .lock()
+                .expect("config mutex poisoned")
+                .state
+                .active_profile
+                .clone();
+            if let Some(active) = active {
+                let _ = link_profile_credentials(&active);
+            }
 
-        let snapshot = self
-            .usage_tokens
-            .lock()
-            .expect("usage_tokens mutex poisoned")
-            .clone();
-        fetch_all_into(
-            &snapshot,
-            &self.usage_store,
-            &self.usage_status,
-            &self.last_fetched,
-            &self.pending_auto_start,
-            &self.refetch_queue,
-            &self.activity,
-            &self.learned_intervals,
-            &self.ok_count,
-            &self.cache_hit_count,
-            &self.last_429,
-        );
+            // Refresh every profile's OAuth token pair — Claude Code does the
+            // same thing silently on launch. Rotates and persists the new pair
+            // so the initial usage fetch below uses fresh access tokens.
+            let _ = oauth::refresh_all(&config, false, &refetch_queue, &activity, &op_sender);
 
-        let started = oauth::auto_start_windows(
-            &self.config,
-            &self.usage_store,
-            &self.refetch_queue,
-            &self.activity,
-            &self.op_sender,
-        );
-        if !started.is_empty() {
-            for name in &started {
-                self.toast(
-                    ToastKind::Info,
-                    format!("auto-started usage window for '{name}'"),
+            let snapshot = collect_tokens(&config.lock().expect("config mutex poisoned").profiles);
+            fetch_all_into(
+                &snapshot,
+                &usage_store,
+                &usage_status,
+                &last_fetched,
+                &pending_auto_start,
+                &refetch_queue,
+                &activity,
+                &learned_intervals,
+                &ok_count,
+                &cache_hit_count,
+                &last_429,
+            );
+
+            let started = oauth::auto_start_windows(
+                &config,
+                &usage_store,
+                &refetch_queue,
+                &activity,
+                &op_sender,
+            );
+            if !started.is_empty() {
+                let retry: Vec<TokenEntry> =
+                    collect_tokens(&config.lock().expect("config mutex poisoned").profiles)
+                        .into_iter()
+                        .filter(|e| started.contains(&e.name))
+                        .collect();
+                fetch_all_into(
+                    &retry,
+                    &usage_store,
+                    &usage_status,
+                    &last_fetched,
+                    &pending_auto_start,
+                    &refetch_queue,
+                    &activity,
+                    &learned_intervals,
+                    &ok_count,
+                    &cache_hit_count,
+                    &last_429,
                 );
             }
-            let retry: Vec<TokenEntry> = collect_tokens(&self.config().profiles)
-                .into_iter()
-                .filter(|e| started.contains(&e.name))
-                .collect();
-            fetch_all_into(
-                &retry,
-                &self.usage_store,
-                &self.usage_status,
-                &self.last_fetched,
-                &self.pending_auto_start,
-                &self.refetch_queue,
-                &self.activity,
-                &self.learned_intervals,
-                &self.ok_count,
-                &self.cache_hit_count,
-                &self.last_429,
-            );
-            *self
-                .usage_tokens
-                .lock()
-                .expect("usage_tokens mutex poisoned") = collect_tokens(&self.config().profiles);
-        }
+
+            let _ = startup_sender.send(StartupSignal::BootstrapDone);
+        });
+    }
+
+    /// UI-thread tail of the bootstrap, run when `StartupSignal::BootstrapDone`
+    /// drains. Rebuilds the scheduler's token snapshot from the (now rotated)
+    /// config, starts the background refresher, applies the freshly fetched
+    /// usage into the profile rows, and performs the one-shot startup
+    /// auto-switch. No HTTP — all of this is lock-scoped or in-process.
+    fn finish_bootstrap(&mut self) {
+        self.refresh_tokens();
 
         spawn_refresher(
             Arc::clone(&self.config),
@@ -717,13 +759,21 @@ pub(crate) fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
 
 // ── Startup reconciliation ────────────────────────────────────────────────────
 
-/// Resolve the gap between the live `~/.claude/.credentials.json` and the
-/// active profile's stored credentials. Most of the time this is a silent
-/// snapshot. When tokens diverge — usually because Claude Code was used to
-/// sign into a different account between sessions — push a modal to ask the
-/// user before overwriting the stored identity.
+/// Kick off startup credential reconciliation without blocking the first
+/// paint. The fast, network-free decision runs inline on the UI thread:
+/// read the live `~/.claude/.credentials.json`, compare it to the active
+/// profile's stored credentials. In the common no-divergence case we snapshot
+/// and signal `ReconcileDone` immediately.
+///
+/// When the bytes diverge we cannot tell from them alone whether Claude Code
+/// silently refreshed (rotating the stored chain) or did a fresh `/login` on a
+/// separate chain — disambiguating requires an HTTP refresh probe, so that
+/// leg is spawned onto a worker thread that posts a `StartupSignal` the UI
+/// drains. The probe + any FS write happen off the UI thread; the UI only
+/// reacts to the verdict (push the Divergence modal, or proceed).
 pub(crate) fn reconcile_startup(app: &mut App) {
     let Some(active) = app.config().state.active_profile.clone() else {
+        let _ = app.startup_sender.send(StartupSignal::ReconcileDone);
         return;
     };
 
@@ -741,37 +791,44 @@ pub(crate) fn reconcile_startup(app: &mut App) {
     if !diverged {
         let mut cfg = app.config();
         let _ = snapshot_active_credentials(&mut cfg);
+        let _ = app.startup_sender.send(StartupSignal::ReconcileDone);
         return;
     }
 
-    // Tokens differ — can't tell from bytes alone whether CC silently
-    // refreshed (rotating the stored chain) or did a fresh `/login` on a
-    // separate chain. Probe by attempting to refresh the stored
-    // refresh_token: Anthropic rotates on every refresh, so the call fails
-    // iff CC already used it. Failure → live is the legit continuation,
-    // snapshot silently. Success → stored chain is still alive, CC's
-    // tokens come from a relog; persist the rotated pair (the old one is
-    // now invalid server-side anyway) and prompt the user.
     let stored_refresh = app
         .config()
         .find(&active)
         .and_then(|p| p.refresh_token().map(str::to_string));
-    if let Some(rt) = stored_refresh {
-        match oauth::refresh(&rt) {
-            Err(_) => {
-                let mut cfg = app.config();
-                let _ = force_snapshot_active_credentials(&mut cfg);
-                return;
-            }
-            Ok(tok) => {
-                let mut cfg = app.config();
+    let Some(rt) = stored_refresh else {
+        // Diverged but no stored refresh token to probe with — nothing to
+        // disambiguate, prompt straight away.
+        let _ = app
+            .startup_sender
+            .send(StartupSignal::ReconcileNeedsPrompt { active });
+        return;
+    };
+
+    // Probe off the UI thread: Anthropic rotates the refresh token on every
+    // refresh, so the call fails iff CC already used it. Failure → live is the
+    // legit continuation, snapshot silently and proceed. Success → the stored
+    // chain is still alive, CC's tokens come from a relog; persist the rotated
+    // pair (the old one is now invalid server-side anyway) and prompt.
+    let config = Arc::clone(&app.config);
+    let sender = app.startup_sender.clone();
+    std::thread::spawn(move || match oauth::refresh(&rt) {
+        Err(_) => {
+            let mut cfg = config.lock().expect("config mutex poisoned");
+            let _ = force_snapshot_active_credentials(&mut cfg);
+            let _ = sender.send(StartupSignal::ReconcileDone);
+        }
+        Ok(tok) => {
+            {
+                let mut cfg = config.lock().expect("config mutex poisoned");
                 let _ = oauth::apply_rotated_tokens(&mut cfg, &active, tok);
             }
+            let _ = sender.send(StartupSignal::ReconcileNeedsPrompt { active });
         }
-    }
-
-    app.modals
-        .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+    });
 }
 
 // ── Event handling ────────────────────────────────────────────────────────────
@@ -2094,9 +2151,45 @@ pub(crate) fn on_tick(app: &mut App) {
         perform_switch(app, &name);
     }
 
+    drain_startup_signals(app);
+    maybe_spawn_bootstrap(app);
+
     poll_credentials_divergence(app);
 
     app.prune_toasts();
+}
+
+/// Drain the startup phase signals posted by the reconcile / bootstrap
+/// workers. Reconcile signals flip `reconcile_done` (and may push the
+/// Divergence prompt); the bootstrap-done signal runs the UI-thread tail.
+fn drain_startup_signals(app: &mut App) {
+    while let Ok(signal) = app.startup_results.try_recv() {
+        match signal {
+            StartupSignal::ReconcileDone => {
+                app.reconcile_done = true;
+            }
+            StartupSignal::ReconcileNeedsPrompt { active } => {
+                app.reconcile_done = true;
+                app.modals
+                    .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+            }
+            StartupSignal::BootstrapDone => {
+                app.finish_bootstrap();
+            }
+        }
+    }
+}
+
+/// Spawn the background bootstrap once reconciliation has settled and any
+/// reconcile prompt has been answered. Mirrors the old `!bootstrapped &&
+/// modals.is_empty()` gate, now keyed off the async reconcile verdict so the
+/// HTTP never blocks the first paint.
+fn maybe_spawn_bootstrap(app: &mut App) {
+    if app.bootstrap_started || !app.reconcile_done || !app.modals.is_empty() {
+        return;
+    }
+    app.bootstrap_started = true;
+    app.spawn_bootstrap();
 }
 
 /// 1Hz check that the live `.credentials.json` still points at the active

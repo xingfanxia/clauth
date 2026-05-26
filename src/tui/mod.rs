@@ -50,21 +50,19 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
 
 fn run_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
     let mut application = app::App::new(config);
-    // Push the divergence prompt (if any) BEFORE touching tokens. Refreshing
-    // a soon-to-be-disowned profile would silently rotate its refresh_token.
+    // Kick off startup reconciliation. This is non-blocking: the network-free
+    // decision runs inline, and the HTTP refresh probe (only needed when the
+    // live credentials diverge) is spawned onto a worker. Its verdict — and,
+    // crucially, the gate that token rotation must not race a soon-to-be-
+    // disowned profile — is sequenced through `StartupSignal`, drained in
+    // `on_tick`. The bootstrap (relink, refresh-all, initial fetch, kick) is
+    // likewise spawned from `on_tick` once reconcile settles, so neither runs
+    // before the first paint below.
     app::reconcile_startup(&mut application);
 
     let mut last_tick = Instant::now();
-    let mut bootstrapped = false;
 
     while !application.quit {
-        // Defer the bootstrap (link relink, token refresh, initial fetch,
-        // kick) until the user has answered the reconcile prompt.
-        if !bootstrapped && application.modals.is_empty() {
-            application.bootstrap_usage();
-            bootstrapped = true;
-        }
-
         terminal.draw(|frame| render::draw(frame, &application))?;
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());

@@ -186,6 +186,34 @@ pub(crate) struct OpResult {
 pub(crate) type OpResultSender = Sender<OpResult>;
 pub(crate) type OpResultReceiver = Receiver<OpResult>;
 
+/// Control-flow signal from the two startup background workers to the UI
+/// thread. Unlike [`OpResult`] (per-profile op completion), these carry the
+/// startup phase transitions the event loop sequences on: the reconcile
+/// worker's verdict and the bootstrap worker's completion. Drained in
+/// `on_tick` so the first paint never waits on the network or an FS walk.
+#[derive(Debug)]
+pub(crate) enum StartupSignal {
+    /// Reconcile worker finished without needing user input — the live
+    /// credentials were either in sync or a silent continuation. The UI may
+    /// now proceed to bootstrap.
+    ReconcileDone,
+    /// Reconcile worker proved the stored chain is still alive (so CC's live
+    /// credentials are a separate `/login`). The rotated pair was already
+    /// persisted by the worker; the UI pushes the Divergence prompt for
+    /// `active` and only proceeds to bootstrap once it's answered.
+    ReconcileNeedsPrompt { active: String },
+    /// Bootstrap worker finished its HTTP work (refresh + initial fetch +
+    /// auto-start kicks). The UI rebuilds the token snapshot, spawns the
+    /// scheduler, applies usage, and runs the one-shot startup auto-switch.
+    /// Per-profile toasts (rotations, auto-starts) and the post-auto-start
+    /// re-fetch ride the standard `OpResult` drain, same as the synchronous
+    /// predecessor did.
+    BootstrapDone,
+}
+
+pub(crate) type StartupSender = Sender<StartupSignal>;
+pub(crate) type StartupReceiver = Receiver<StartupSignal>;
+
 /// Mark a profile as performing `activity` in the shared store. Idempotent;
 /// caller should pair with [`clear_activity`] in every exit path.
 pub(crate) fn mark_activity(store: &ActivityStore, name: &str, activity: ProfileActivity) {
@@ -658,8 +686,8 @@ fn apply_outcome(
 }
 
 /// Force-fetch every entry right now in parallel and write the results into
-/// the shared stores. Bypasses the cache rule — used by `bootstrap_usage`
-/// and `manual_refresh`. Blocks until all fetches complete. One-shot, so any
+/// the shared stores. Bypasses the cache rule — used by the startup bootstrap
+/// worker and `manual_refresh`. Blocks until all fetches complete. One-shot, so any
 /// `rotated` tokens are dropped — the main thread's `reload_if_state_changed`
 /// will pick them up from the persisted `credentials.json` shortly.
 #[allow(clippy::too_many_arguments)]
