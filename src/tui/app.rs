@@ -34,8 +34,8 @@ use crate::profile::{
 use crate::usage::{
     ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, Last429At, LastFetchedAt,
     LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult, OpResultReceiver,
-    OpResultSender, PendingAutoStart, PendingWindowRotation, ProfileActivity, RefetchQueue,
-    StatusStore, TokenEntry, TokenList, UsageStore, any_busy, clear_activity,
+    OpResultSender, PendingAutoStart, PendingSwitch, PendingWindowRotation, ProfileActivity,
+    RefetchQueue, StatusStore, TokenEntry, TokenList, UsageStore, any_busy, clear_activity,
     default_fallback_threshold, fetch_all_into, is_idle, mark_activity, spawn_refresher,
 };
 
@@ -356,6 +356,10 @@ pub(crate) struct App {
     pub(crate) pending_auto_start: PendingAutoStart,
     pub(crate) pending_window_rotation: PendingWindowRotation,
     pub(crate) last_rotated_window: LastRotatedWindow,
+    /// Scheduler-posted auto-switch decisions. Drained inside `on_tick` and
+    /// dispatched to the same switch worker pipeline as user-initiated
+    /// switches.
+    pub(crate) pending_switch: PendingSwitch,
     pub(crate) refetch_queue: RefetchQueue,
     pub(crate) learned_intervals: LearnedIntervals,
     pub(crate) ok_count: ConsecutiveOk,
@@ -395,6 +399,7 @@ impl App {
         let pending_auto_start: PendingAutoStart = Arc::new(Mutex::new(HashSet::new()));
         let pending_window_rotation: PendingWindowRotation = Arc::new(Mutex::new(HashMap::new()));
         let last_rotated_window: LastRotatedWindow = Arc::new(Mutex::new(HashMap::new()));
+        let pending_switch: PendingSwitch = Arc::new(Mutex::new(HashSet::new()));
         let refetch_queue: RefetchQueue = Arc::new(Mutex::new(HashSet::new()));
         // Restore AIMD state from disk so cadence survives restarts.
         let learned_intervals: LearnedIntervals =
@@ -418,6 +423,7 @@ impl App {
             pending_auto_start,
             pending_window_rotation,
             last_rotated_window,
+            pending_switch,
             refetch_queue,
             learned_intervals,
             ok_count,
@@ -524,6 +530,7 @@ impl App {
         }
 
         spawn_refresher(
+            Arc::clone(&self.config),
             Arc::clone(&self.usage_tokens),
             Arc::clone(&self.usage_store),
             Arc::clone(&self.usage_status),
@@ -533,6 +540,7 @@ impl App {
             Arc::clone(&self.pending_auto_start),
             Arc::clone(&self.pending_window_rotation),
             Arc::clone(&self.last_rotated_window),
+            Arc::clone(&self.pending_switch),
             Arc::clone(&self.refetch_queue),
             Arc::clone(&self.learned_intervals),
             Arc::clone(&self.ok_count),
@@ -920,20 +928,37 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
     }
 }
 
+/// Kick off a TUI switch to `name`. Marks the target `Switching` and spawns a
+/// worker that runs `oauth::refresh_all` off the UI thread, then emits
+/// `OpResult { kind: Switching, outcome }`. The drain in `on_tick`
+/// completes the FS half (`switch_profile` + bookkeeping) when the result
+/// lands. Refusal on a non-idle target is the caller's responsibility.
 fn perform_switch(app: &mut App, name: &str) {
-    // Visible indicator for the full window: Switching covers both the
-    // pre-switch refresh and the relink step. Cleared in every exit path.
     mark_activity(&app.activity, name, ProfileActivity::Switching);
-    let _ = oauth::refresh_all(
-        &app.config,
-        false,
-        &app.refetch_queue,
-        &app.activity,
-        &app.op_sender,
-    );
-    // refresh_all may have flipped us back to Idle when it cleared its
-    // own per-name Refreshing; re-stamp Switching for the relink step.
-    mark_activity(&app.activity, name, ProfileActivity::Switching);
+    let config = Arc::clone(&app.config);
+    let refetch = Arc::clone(&app.refetch_queue);
+    let activity = Arc::clone(&app.activity);
+    let sender = app.op_sender.clone();
+    let target = name.to_string();
+    std::thread::spawn(move || {
+        // `refresh_all` joins its per-profile workers internally; on return
+        // every refresh slot is back to Idle. Re-stamp Switching so the
+        // spinner stays up through the FS leg the UI thread runs next.
+        let _ = oauth::refresh_all(&config, false, &refetch, &activity, &sender);
+        mark_activity(&activity, &target, ProfileActivity::Switching);
+        let _ = sender.send(OpResult {
+            name: target,
+            kind: ActivityKind::Switching,
+            outcome: Ok(()),
+        });
+    });
+}
+
+/// FS half of the TUI switch: runs on the UI thread when an
+/// `OpResult { kind: Switching, .. }` drains. No HTTP — safe to keep
+/// inline. Clears the Switching marker, runs `switch_profile`, and on
+/// success refreshes the scheduler's token snapshot and bumps state mtime.
+fn finalize_switch(app: &mut App, name: &str) {
     let result = {
         let mut cfg = app.config();
         switch_profile(&mut cfg, name)
@@ -1902,13 +1927,29 @@ pub(crate) fn on_tick(app: &mut App) {
     }
     let mut any_auto_started = false;
     let mut any_refreshed = false;
+    // Names whose `Switching` OpResult arrived — the FS half runs after the
+    // drain loop so the per-name `Refreshing` toasts/clears for the same
+    // tick have already been processed and the spinner stays Switching
+    // through the relink. (The worker re-stamps Switching after
+    // `refresh_all` returns; the drain's conditional clear below preserves
+    // that re-stamp against late `Refreshing` results.)
+    let mut switch_finalize: Vec<String> = Vec::new();
     for OpResult {
         name,
         kind,
         outcome,
     } in drained
     {
-        clear_activity(&app.activity, &name);
+        // Only clear the slot when it still reflects this op's kind. The
+        // switch worker re-stamps Switching after `refresh_all` returns; an
+        // in-flight Refreshing result for the same name must not clobber
+        // that stamp, or the spinner would blink Idle between the refresh
+        // leg and the relink leg.
+        if let Ok(mut a) = app.activity.lock()
+            && a.get(&name).copied() == Some(kind.as_activity())
+        {
+            a.remove(&name);
+        }
         match outcome {
             Ok(()) => match kind {
                 ActivityKind::AutoStarting => {
@@ -1921,6 +1962,9 @@ pub(crate) fn on_tick(app: &mut App) {
                 ActivityKind::Refreshing => {
                     any_refreshed = true;
                     app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
+                }
+                ActivityKind::Switching => {
+                    switch_finalize.push(name.clone());
                 }
                 _ => {}
             },
@@ -1938,6 +1982,13 @@ pub(crate) fn on_tick(app: &mut App) {
                 );
             }
         }
+    }
+    // Run the FS half for every successful Switching result. `finalize_switch`
+    // clears the Switching marker, runs `switch_profile`, and on success bumps
+    // mtime + refreshes the token snapshot. A no-op target is harmless —
+    // `switch_profile` returns early when already active.
+    for name in switch_finalize {
+        finalize_switch(app, &name);
     }
     // Rebuild the scheduler's TokenList snapshot whenever a rotation lands —
     // without this, the next tick fetches with the stale access token, 401s,
@@ -2022,14 +2073,25 @@ pub(crate) fn on_tick(app: &mut App) {
         });
     }
 
-    let switched = {
-        let mut cfg = app.config();
-        auto_switch_if_needed(&mut cfg).ok().flatten()
+    // Drain scheduler-posted auto-switch decisions. Each entry was computed
+    // by `scan_auto_switch` in the scheduler thread; the UI thread just
+    // dispatches the standard switch worker pipeline so the refresh + relink
+    // run off the main loop. Skip dispatch when the target is non-idle —
+    // either someone clicked switch already or a previous decision is still
+    // mid-flight.
+    let auto_switch_targets: Vec<String> = {
+        let mut p = app
+            .pending_switch
+            .lock()
+            .expect("pending_switch mutex poisoned");
+        p.drain().collect()
     };
-    if let Some(target) = switched {
-        app.refresh_tokens();
-        app.last_state_mtime = app_state_mtime();
-        app.toast(ToastKind::Warning, format!("auto-switched to '{target}'"));
+    for name in auto_switch_targets {
+        if !is_idle(&app.activity, &name) {
+            continue;
+        }
+        app.toast(ToastKind::Warning, format!("auto-switching to '{name}'"));
+        perform_switch(app, &name);
     }
 
     poll_credentials_divergence(app);

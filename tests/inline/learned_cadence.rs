@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    CACHE_HIT_EPSILON, ConsecutiveCacheHit, ConsecutiveOk, FetchOutcome, FetchStatus,
-    LEARNED_CEILING_MS, LEARNED_FLOOR_MS, LEARNED_QUIET_RESET_MS, LEARNED_STEP_MS, Last429At,
-    LastFetchedAt, LearnedIntervals, NEAR_THRESHOLD_MARGIN, NORMAL_INTERVAL_MS, PendingAutoStart,
-    SERVER_CACHE_TTL_ESTIMATE_MS, StatusStore, TokenEntry, UsageInfo, UsageStore, UsageWindow,
-    apply_outcome, bump_down, bump_up, detect_cache_hit, interval_for, now_ms, partition_due,
-    update_learner,
+    ActivityStore, CACHE_HIT_EPSILON, ConsecutiveCacheHit, ConsecutiveOk, FetchOutcome,
+    FetchStatus, LEARNED_CEILING_MS, LEARNED_FLOOR_MS, LEARNED_QUIET_RESET_MS, LEARNED_STEP_MS,
+    Last429At, LastFetchedAt, LearnedIntervals, NEAR_THRESHOLD_MARGIN, NORMAL_INTERVAL_MS,
+    PendingAutoStart, ProfileActivity, SERVER_CACHE_TTL_ESTIMATE_MS, StatusStore, TokenEntry,
+    UsageInfo, UsageStore, UsageWindow, apply_outcome, bump_down, bump_up, detect_cache_hit,
+    interval_for, now_ms, partition_due, update_learner,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -843,14 +843,26 @@ fn interval_with_no_5h_data_returns_learned() {
 
 // ── partition_due ─────────────────────────────────────────────────────────────
 
+fn empty_activity() -> ActivityStore {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 #[test]
 fn partition_due_never_fetched_profile_is_due() {
     let snapshot = vec![token("p", 95.0)];
     let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
     let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let activity = empty_activity();
 
-    let (due, _, per_profile) = partition_due(&snapshot, now_ms(), &store, &last_fetched, &learned);
+    let (due, _, per_profile) = partition_due(
+        &snapshot,
+        now_ms(),
+        &store,
+        &last_fetched,
+        &learned,
+        &activity,
+    );
 
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].name, "p");
@@ -863,10 +875,12 @@ fn partition_due_recent_fetch_is_not_due() {
     let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
     let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let activity = empty_activity();
     let now = now_ms();
     last_fetched.lock().unwrap().insert("p".into(), now);
 
-    let (due, _, per_profile) = partition_due(&snapshot, now, &store, &last_fetched, &learned);
+    let (due, _, per_profile) =
+        partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
     assert!(due.is_empty());
     assert_eq!(
@@ -881,13 +895,14 @@ fn partition_due_interval_elapsed_is_due() {
     let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
     let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let activity = empty_activity();
     let now = now_ms();
     last_fetched
         .lock()
         .unwrap()
         .insert("p".into(), now - NORMAL_INTERVAL_MS);
 
-    let (due, _, _) = partition_due(&snapshot, now, &store, &last_fetched, &learned);
+    let (due, _, _) = partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
     assert_eq!(due.len(), 1);
 }
@@ -898,6 +913,7 @@ fn partition_due_honors_learned_interval() {
     let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
     let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let activity = empty_activity();
     let now = now_ms();
     last_fetched
         .lock()
@@ -905,7 +921,8 @@ fn partition_due_honors_learned_interval() {
         .insert("p".into(), now - 15_000);
     learned.lock().unwrap().insert("p".into(), 20_000);
 
-    let (due, _, per_profile) = partition_due(&snapshot, now, &store, &last_fetched, &learned);
+    let (due, _, per_profile) =
+        partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
     // 15s elapsed, learned interval 20s → 5s remaining.
     assert!(due.is_empty());
@@ -921,6 +938,7 @@ fn partition_due_near_threshold_overrides_learned_with_floor() {
     let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
     let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let activity = empty_activity();
     let now = now_ms();
     last_fetched
         .lock()
@@ -937,7 +955,7 @@ fn partition_due_near_threshold_overrides_learned_with_floor() {
         .unwrap()
         .insert("p".into(), LEARNED_CEILING_MS);
 
-    let (due, _, _) = partition_due(&snapshot, now, &store, &last_fetched, &learned);
+    let (due, _, _) = partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
     assert_eq!(due.len(), 1, "near-threshold must override learned CEILING");
 }
@@ -947,11 +965,39 @@ fn partition_due_empty_snapshot_returns_empty() {
     let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
     let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let activity = empty_activity();
 
-    let (due, _, per_profile) = partition_due(&[], now_ms(), &store, &last_fetched, &learned);
+    let (due, _, per_profile) =
+        partition_due(&[], now_ms(), &store, &last_fetched, &learned, &activity);
 
     assert!(due.is_empty());
     assert!(per_profile.is_empty());
+}
+
+#[test]
+fn partition_due_excludes_switching_profiles() {
+    let snapshot = vec![token("p", 95.0)];
+    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let activity = empty_activity();
+    activity
+        .lock()
+        .unwrap()
+        .insert("p".into(), ProfileActivity::Switching);
+
+    let (due, _, per_profile) = partition_due(
+        &snapshot,
+        now_ms(),
+        &store,
+        &last_fetched,
+        &learned,
+        &activity,
+    );
+
+    assert!(due.is_empty(), "switching profile must be skipped");
+    // Countdown still publishes — UI keeps showing the eligibility timer.
+    assert!(per_profile.contains_key("p"));
 }
 
 // ── apply_outcome: store overwrite guard & cache-hit integration ──────────────

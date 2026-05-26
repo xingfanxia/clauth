@@ -94,6 +94,12 @@ pub(crate) type PendingWindowRotation = Arc<Mutex<HashMap<String, i64>>>;
 /// fires exactly once.
 pub(crate) type LastRotatedWindow = Arc<Mutex<HashMap<String, i64>>>;
 
+/// Scheduler-computed auto-switch decisions. Posted by the background scheduler
+/// when it observes the active profile has crossed its fallback threshold; the
+/// UI thread drains in `on_tick` and dispatches a switch worker. Set rather
+/// than Vec so duplicate enqueues collapse and a slow drain can't pile up.
+pub(crate) type PendingSwitch = Arc<Mutex<HashSet<String>>>;
+
 /// Snapshot of one profile's OAuth identity used by the refresher.
 #[derive(Clone)]
 pub(crate) struct TokenEntry {
@@ -716,8 +722,15 @@ pub(crate) fn fetch_all_into(
 /// per profile comes from the AIMD learner (stored in `learned`): FLOOR when
 /// near the configured fallback threshold, the learned value otherwise, falling
 /// back to NORMAL when no learned value exists.
+///
+/// Also evaluates the fallback chain at the end of every tick. When the active
+/// profile has crossed its threshold and a viable target exists, the name is
+/// posted to `pending_switch` for the UI thread to dispatch a switch worker.
+/// Computing the decision here keeps the 100 ms UI tick free of FS access
+/// (`with_state_lock` was previously taken on every `on_tick`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_refresher(
+    config: Arc<Mutex<crate::profile::AppConfig>>,
     tokens: TokenList,
     store: UsageStore,
     status: StatusStore,
@@ -727,6 +740,7 @@ pub(crate) fn spawn_refresher(
     pending_auto_start: PendingAutoStart,
     pending_window_rotation: PendingWindowRotation,
     last_rotated_window: LastRotatedWindow,
+    pending_switch: PendingSwitch,
     refetch_queue: RefetchQueue,
     learned: LearnedIntervals,
     ok_count: ConsecutiveOk,
@@ -757,16 +771,27 @@ pub(crate) fn spawn_refresher(
             // come from the AIMD learner held in `learned`.
             let now = now_ms();
             let (mut due, _soonest_next, mut per_profile_next) =
-                partition_due(&snapshot, now, &store, &last_fetched, &learned);
+                partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
             // Merge forced entries that aren't already scheduled this tick and
             // reflect them in the published map as "due now" (zero countdown).
+            // Forced entries still skip Switching profiles — the switch worker
+            // owns the TokenList write window.
             if !forced.is_empty() {
+                let switching: HashSet<String> = match activity.lock() {
+                    Ok(a) => a
+                        .iter()
+                        .filter(|(_, v)| matches!(v, ProfileActivity::Switching))
+                        .map(|(n, _)| n.clone())
+                        .collect(),
+                    Err(_) => snapshot.iter().map(|e| e.name.clone()).collect(),
+                };
                 let mut extras: Vec<TokenEntry> = Vec::with_capacity(forced.len());
-                for entry in snapshot
-                    .iter()
-                    .filter(|e| forced.contains(&e.name) && !due.iter().any(|d| d.name == e.name))
-                {
+                for entry in snapshot.iter().filter(|e| {
+                    forced.contains(&e.name)
+                        && !switching.contains(&e.name)
+                        && !due.iter().any(|d| d.name == e.name)
+                }) {
                     per_profile_next.insert(entry.name.clone(), now);
                     extras.push(entry.clone());
                 }
@@ -845,13 +870,76 @@ pub(crate) fn spawn_refresher(
 
             // Recompute per-profile next times AFTER fetches have updated
             // `last_fetched` so the overview countdowns reflect fresh deadlines.
-            let (_, _, per_profile_after) =
-                partition_due(&snapshot, now_ms(), &store, &last_fetched, &learned);
+            let (_, _, per_profile_after) = partition_due(
+                &snapshot,
+                now_ms(),
+                &store,
+                &last_fetched,
+                &learned,
+                &activity,
+            );
             if let Ok(mut nrpp) = next_refresh_per_profile.lock() {
                 nrpp.clone_from(&per_profile_after);
             }
+
+            // Auto-switch decision: read the live chain + thresholds under
+            // the config mutex (NOT across HTTP, NOT across with_state_lock)
+            // and consult `store` for utilization. Posting the target to
+            // `pending_switch` defers the actual relink to the UI thread,
+            // which dispatches a switch worker. A Switching profile here
+            // means the previous decision is still in flight — skip until
+            // the worker completes.
+            scan_auto_switch(&config, &store, &activity, &pending_switch);
         }
     });
+}
+
+/// Evaluate the fallback chain and queue an auto-switch target when the active
+/// profile has crossed its threshold. Snapshots the chain out of `AppConfig`
+/// under its mutex (and drops the guard), then reads utilization from the
+/// shared `UsageStore`. The split is load-bearing: `App::apply_usage` takes
+/// `usage_store` then `config`, so the scheduler must never hold `config`
+/// while taking `usage_store`. Skips when the active profile is already
+/// mid-switch.
+fn scan_auto_switch(
+    config: &Arc<Mutex<crate::profile::AppConfig>>,
+    store: &UsageStore,
+    activity: &ActivityStore,
+    pending_switch: &PendingSwitch,
+) {
+    // Skip when an auto-switch decision is still pending the UI drain or
+    // when any profile is currently Switching — either way the previous
+    // decision hasn't landed yet and a duplicate enqueue would be a no-op
+    // anyway (set semantics), but checking here avoids the config lock.
+    let already_pending_or_switching = match (pending_switch.lock(), activity.lock()) {
+        (Ok(p), Ok(a)) => {
+            !p.is_empty() || a.values().any(|v| matches!(v, ProfileActivity::Switching))
+        }
+        _ => true,
+    };
+    if already_pending_or_switching {
+        return;
+    }
+
+    // Snapshot under `config` only — no `usage_store` lock here.
+    let snapshot = {
+        let cfg = match config.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        crate::fallback::snapshot_chain(&cfg)
+    };
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+
+    // `config` guard is dropped. Safe to lock `usage_store` now.
+    let Some(name) = crate::fallback::next_auto_switch_target(&snapshot, store) else {
+        return;
+    };
+    if let Ok(mut p) = pending_switch.lock() {
+        p.insert(name);
+    }
 }
 
 /// For each profile in `snapshot`, check whether its 5h window has expired
@@ -904,17 +992,25 @@ fn scan_expired_windows(
 /// which any non-due entry will become due, and a per-profile map of next
 /// fetch epoch-ms. A poisoned `last_fetched` returns empty rather than
 /// falling back to `last=0` (which would mark every profile due → fetch storm).
+///
+/// `activity` is consulted to exclude profiles currently `Switching`: a
+/// concurrent switch worker may be rotating their tokens (`refresh_all` or
+/// the relink leg), and the scheduler's 401-rotated path would otherwise race
+/// it on the same `TokenList` write site. A poisoned activity mutex fails
+/// safe to "treat as Switching" so a duplicate fetch never fires.
 fn partition_due(
     snapshot: &[TokenEntry],
     now: u64,
     store: &UsageStore,
     last_fetched: &LastFetchedAt,
     learned: &LearnedIntervals,
+    activity: &ActivityStore,
 ) -> (Vec<TokenEntry>, u64, HashMap<String, u64>) {
     let Ok(lf) = last_fetched.lock() else {
         return (Vec::new(), now + NORMAL_INTERVAL_MS, HashMap::new());
     };
     let st = store.lock().ok();
+    let act = activity.lock();
 
     let mut due = Vec::new();
     let mut soonest_next = now + NORMAL_INTERVAL_MS;
@@ -927,6 +1023,18 @@ fn partition_due(
         let interval = interval_for(entry, last_5h, learned);
         let next = last.saturating_add(interval);
         per_profile.insert(entry.name.clone(), next);
+        // Profiles mid-switch are excluded from this tick's due set so the
+        // scheduler can't race the switch worker on the same TokenList write.
+        // The countdown still publishes — the UI shows when the profile will
+        // become eligible once Switching clears.
+        let switching = match act.as_ref() {
+            Ok(a) => matches!(a.get(&entry.name), Some(ProfileActivity::Switching)),
+            // Poisoned mutex: fail safe to "is switching" so no duplicate fetch.
+            Err(_) => true,
+        };
+        if switching {
+            continue;
+        }
         if now >= next {
             due.push(entry.clone());
         } else if next < soonest_next {
