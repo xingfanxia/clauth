@@ -2086,15 +2086,15 @@ pub(crate) fn on_tick(app: &mut App) {
     // standard OpResult channel (drained at the top of the next tick) so the
     // spinner clears in arrival order. `auto_start_named` enforces its own
     // per-profile cooldown, so a duplicate enqueue is a no-op.
-    let pending: Vec<String> = {
-        let mut p = app
-            .pending_auto_start
-            .lock()
-            .expect("pending_auto_start mutex poisoned");
-        let v: Vec<String> = p.iter().cloned().collect();
-        p.clear();
-        v
-    };
+    let pending: Vec<String> = app
+        .pending_auto_start
+        .lock()
+        .map(|mut g| {
+            let v: Vec<String> = g.iter().cloned().collect();
+            g.clear();
+            v
+        })
+        .unwrap_or_default();
     for name in pending {
         // Skip when the profile is already busy with another op — the
         // scheduler may re-enqueue on the next fetch if the condition holds.
@@ -2119,13 +2119,11 @@ pub(crate) fn on_tick(app: &mut App) {
     // `LastRotatedWindow` and `RefetchQueue` are independent mutexes (not
     // AppConfig), so the worker stamps them inline on success — no UI-side
     // bookkeeping is required after the OpResult lands.
-    let pending_rotations: Vec<(String, i64)> = {
-        let mut p = app
-            .pending_window_rotation
-            .lock()
-            .expect("pending_window_rotation mutex poisoned");
-        p.drain().collect()
-    };
+    let pending_rotations: Vec<(String, i64)> = app
+        .pending_window_rotation
+        .lock()
+        .map(|mut g| g.drain().collect())
+        .unwrap_or_default();
     for (name, epoch) in pending_rotations {
         if !is_idle(&app.activity, &name) {
             continue;
@@ -2154,13 +2152,11 @@ pub(crate) fn on_tick(app: &mut App) {
     // run off the main loop. Skip dispatch when the target is non-idle —
     // either someone clicked switch already or a previous decision is still
     // mid-flight.
-    let auto_switch_targets: Vec<String> = {
-        let mut p = app
-            .pending_switch
-            .lock()
-            .expect("pending_switch mutex poisoned");
-        p.drain().collect()
-    };
+    let auto_switch_targets: Vec<String> = app
+        .pending_switch
+        .lock()
+        .map(|mut g| g.drain().collect())
+        .unwrap_or_default();
     for name in auto_switch_targets {
         if !is_idle(&app.activity, &name) {
             continue;

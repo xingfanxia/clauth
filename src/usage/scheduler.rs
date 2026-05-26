@@ -972,6 +972,10 @@ pub(crate) fn spawn_refresher(
 
             // Recompute per-profile next times AFTER fetches have updated
             // `last_fetched` so the overview countdowns reflect fresh deadlines.
+            // `activity` is passed so a profile that became Switching mid-tick
+            // gets the same exclusion treatment here as in the pre-fetch call —
+            // its countdown is recomputed from current `last_fetched` rather
+            // than carrying a stale pre-fetch value for one extra tick.
             let (_, _, per_profile_after) = partition_due(
                 &snapshot,
                 now_ms(),
@@ -1055,38 +1059,52 @@ fn scan_expired_windows(
     pending: &PendingWindowRotation,
 ) {
     let now = now_epoch_secs();
-    let st = store.lock().ok();
-    let lrw = last_rotated_window.lock().ok();
-    let pend = pending.lock().ok();
 
-    let (Some(st), Some(lrw), Some(ref mut pend)) = (st, lrw, pend) else {
+    // Read what we need from the store, then drop the guard before acquiring
+    // the write locks — minimises held-lock overlap and avoids a latent
+    // three-mutex simultaneous hold that could become a deadlock if lock
+    // ordering is ever violated elsewhere.
+    // Required acquisition order: store → (drop) → last_rotated_window → pending.
+    let candidates: Vec<(String, i64)> = {
+        let Ok(st) = store.lock() else { return };
+        snapshot
+            .iter()
+            .filter_map(|entry| {
+                let resets_at_str = st
+                    .get(&entry.name)
+                    .and_then(|u| u.five_hour.as_ref())
+                    .and_then(|w| w.resets_at.as_deref())?;
+                let resets_at = iso_to_epoch_secs(resets_at_str)?;
+                // 1s past the window boundary to avoid acting on a window
+                // that hasn't fully closed yet.
+                if now < resets_at + 1 {
+                    return None;
+                }
+                Some((entry.name.clone(), resets_at))
+            })
+            .collect()
+    }; // store guard drops here
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    let Ok(lrw) = last_rotated_window.lock() else {
+        return;
+    };
+    let Ok(ref mut pend) = pending.lock() else {
         return;
     };
 
-    for entry in snapshot {
-        let Some(resets_at_str) = st
-            .get(&entry.name)
-            .and_then(|u| u.five_hour.as_ref())
-            .and_then(|w| w.resets_at.as_deref())
-        else {
-            continue;
-        };
-        let Some(resets_at) = iso_to_epoch_secs(resets_at_str) else {
-            continue;
-        };
-        // 1s past the window boundary to avoid acting on a window that hasn't
-        // fully closed yet.
-        if now < resets_at + 1 {
-            continue;
-        }
+    for (name, resets_at) in candidates {
         // Already acted on this specific window.
-        if lrw.get(&entry.name).copied().unwrap_or(0) == resets_at {
+        if lrw.get(&name).copied().unwrap_or(0) == resets_at {
             continue;
         }
         // Pin the epoch at detection time. The drain uses this value to stamp
         // `LastRotatedWindow` so it deduplicates the window it actually saw,
         // not a potentially newer one the store holds by the time the drain runs.
-        pend.insert(entry.name.clone(), resets_at);
+        pend.insert(name, resets_at);
     }
 }
 
@@ -1111,7 +1129,12 @@ fn partition_due(
     let Ok(lf) = last_fetched.lock() else {
         return (Vec::new(), now + NORMAL_INTERVAL_MS, HashMap::new());
     };
-    let st = store.lock().ok();
+    // Poisoned store: bail the same way as poisoned last_fetched. Proceeding
+    // with no utilization data silently disables the near-threshold FLOOR
+    // override — profiles near the limit would poll at NORMAL instead of FLOOR.
+    let Ok(st) = store.lock() else {
+        return (Vec::new(), now + NORMAL_INTERVAL_MS, HashMap::new());
+    };
     let act = activity.lock();
 
     let mut due = Vec::new();
@@ -1119,9 +1142,7 @@ fn partition_due(
     let mut per_profile = HashMap::with_capacity(snapshot.len());
     for entry in snapshot {
         let last = lf.get(&entry.name).copied().unwrap_or(0);
-        let last_5h = st
-            .as_ref()
-            .and_then(|s| s.get(&entry.name).and_then(five_hour_utilization));
+        let last_5h = st.get(&entry.name).and_then(five_hour_utilization);
         let interval = interval_for(entry, last_5h, learned);
         let next = last.saturating_add(interval);
         per_profile.insert(entry.name.clone(), next);

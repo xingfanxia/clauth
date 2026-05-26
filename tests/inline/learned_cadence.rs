@@ -1176,6 +1176,40 @@ fn partition_due_excludes_refreshing_profiles() {
     assert!(per_profile.contains_key("p"));
 }
 
+#[test]
+fn partition_due_bails_on_poisoned_store() {
+    // A poisoned usage-store must return the empty due set, not proceed with no
+    // utilization data (which would silently disable the near-threshold FLOOR
+    // override — near-limit profiles would poll at NORMAL instead of FLOOR).
+    let snapshot = vec![token("p", 95.0)];
+    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let activity = empty_activity();
+
+    // Poison the store by panicking inside a lock scope.
+    let store_clone = Arc::clone(&store);
+    let _ = std::panic::catch_unwind(move || {
+        let _g = store_clone.lock().unwrap();
+        panic!("poison");
+    });
+
+    let (due, _, per_profile) = partition_due(
+        &snapshot,
+        now_ms(),
+        &store,
+        &last_fetched,
+        &learned,
+        &activity,
+    );
+
+    assert!(due.is_empty(), "poisoned store must return empty due set");
+    assert!(
+        per_profile.is_empty(),
+        "poisoned store must return empty per_profile map"
+    );
+}
+
 // ── apply_outcome: store overwrite guard & cache-hit integration ──────────────
 
 #[test]
