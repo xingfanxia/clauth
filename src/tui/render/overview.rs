@@ -206,7 +206,10 @@ fn fixed_overview_width(
     let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
     // 4 = cursor + dot + spacer before name; +2 = spacer + auto-start marker after 5h.
     // Timer slot is rendered in the gap before 5h and does not count as a column.
-    6 + name + kind + five_hour + seven_day + route + column_count.saturating_sub(1) * gap
+    // The kind→timer gap is 4 chars narrower than the standard gap (min 1).
+    let narrow = gap.saturating_sub(4).max(1);
+    let standard_gaps = column_count.saturating_sub(2);
+    6 + name + kind + five_hour + seven_day + route + standard_gaps * gap + narrow
 }
 
 fn overview_header(widths: &OverviewWidths) -> Line<'static> {
@@ -214,7 +217,7 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
     spans.push(Span::styled(fixed("account", widths.name), theme::label()));
     spans.push(gap(widths));
     spans.push(Span::styled(fixed("type", widths.kind), theme::label()));
-    spans.push(gap(widths));
+    spans.push(narrow_gap(widths));
     // The timer slot sits before the 5h bar; keep the header label left-aligned
     // over the bar by rendering blanks for the slot width.
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
@@ -275,19 +278,17 @@ fn render_overview_row(
     };
 
     // Per-profile timer slot: busy pip while fetching, seconds countdown otherwise.
+    // Right-aligned in TIMER_SLOT-1 chars + 1 trailing space so the bar [ always
+    // has visible breathing room and the dot doesn't crowd the kind column.
     let timer_span = {
+        let inner = TIMER_SLOT - 1;
         let is_fetching = app
             .fetching_now
             .lock()
             .ok()
             .is_some_and(|s| s.contains(&name_str));
         if is_fetching {
-            // Pad the pip to TIMER_SLOT width so columns stay aligned.
-            let mut s = "● ".to_string();
-            while s.chars().count() < TIMER_SLOT {
-                s.push(' ');
-            }
-            Span::styled(s, theme::accent())
+            Span::styled(format!("{:>inner$} ", "●", inner = inner), theme::accent())
         } else {
             let secs_str = app
                 .next_refresh_per_profile
@@ -300,14 +301,7 @@ fn render_overview_row(
                     format!("{secs}s")
                 });
             match secs_str {
-                Some(s) => {
-                    // Right-pad to TIMER_SLOT so bar alignment is preserved.
-                    let mut padded = s;
-                    while padded.chars().count() < TIMER_SLOT {
-                        padded.push(' ');
-                    }
-                    Span::styled(padded, theme::faint())
-                }
+                Some(s) => Span::styled(format!("{:>inner$} ", s, inner = inner), theme::faint()),
                 None => Span::raw(" ".repeat(TIMER_SLOT)),
             }
         }
@@ -318,7 +312,7 @@ fn render_overview_row(
         fixed(&account_type_label(profile), widths.kind),
         account_type_style(profile),
     ));
-    spans.push(gap(widths));
+    spans.push(narrow_gap(widths));
     spans.push(timer_span);
     let (five_text, five_style) = window_summary_parts(
         profile.usage.as_ref().and_then(|u| u.five_hour.as_ref()),
@@ -366,6 +360,12 @@ fn render_separator_row() -> Line<'static> {
 
 fn gap(widths: &OverviewWidths) -> Span<'static> {
     Span::raw(" ".repeat(widths.gap))
+}
+
+/// Narrower gap used only between the `type` column and the timer slot.
+/// 4 chars less than the standard gap; never drops below 1.
+fn narrow_gap(widths: &OverviewWidths) -> Span<'static> {
+    Span::raw(" ".repeat(widths.gap.saturating_sub(4).max(1)))
 }
 
 fn chain_summary(cfg: &AppConfig, profile: &Profile) -> (String, Style) {
