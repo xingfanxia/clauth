@@ -74,12 +74,13 @@ fn main() -> Result<()> {
             platform::init();
             let config = load_config()?;
             let canonical = resolve_or_bail(&config, name)?;
-            // Refresh every profile's OAuth token before switching, same as
-            // the interactive flow. The rotated access token then ends up in
-            // ~/.claude/.credentials.json via the symlink.
-            // No scheduler running in the CLI path — queue contents are
-            // discarded; we only need the return value (rotated names) which
-            // the CLI also discards.
+            // Rotate only the outgoing active and incoming target profiles
+            // before the FS relink. Rotating every other profile's single-use
+            // refresh token on every switch is unnecessary and widens races with
+            // the scheduler.
+            let outgoing = config.state.active_profile.clone();
+            // No scheduler running — noop_refetch is a throwaway; auto_start_named
+            // below still uses it to push kicked names no one reads.
             let noop_refetch: RefetchQueue = Arc::new(Mutex::new(std::collections::HashSet::new()));
             // CLI path has no spinner — pass a throwaway ActivityStore so the
             // shared signature works without printing to stderr.
@@ -96,8 +97,12 @@ fn main() -> Result<()> {
                 // Scoped so the spinner stops before the interactive [Y/n]
                 // prompt below — a live spinner during stdin read corrupts it.
                 let _spinner = Spinner::start("clauth: rotating tokens…");
-                let _ =
-                    oauth::refresh_all(&config, false, &noop_refetch, &noop_activity, &op_sender);
+                if let Some(ref active) = outgoing
+                    && active != &canonical
+                {
+                    oauth::rotate_one(&config, active, &noop_activity, &op_sender);
+                }
+                oauth::rotate_one(&config, &canonical, &noop_activity, &op_sender);
             }
 
             // When the outgoing active profile has a diverged live credentials

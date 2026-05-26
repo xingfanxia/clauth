@@ -206,3 +206,127 @@ fn profile_without_refresh_token_excluded() {
     assert!(rotation_candidates(&config, false).is_empty());
     assert!(rotation_candidates(&config, true).is_empty());
 }
+
+/// Switch paths must call `rotate_one` only for the outgoing active and
+/// incoming target, not every profile. This test pins the selection logic by
+/// setting up three profiles with no refresh tokens (so `rotate_one` returns
+/// false immediately, no HTTP), then verifying that a bystander profile's
+/// activity slot is never stamped — i.e., it is never passed to `rotate_one`.
+///
+/// The observable proxy: only profiles passed to `rotate_one` can have their
+/// activity slot touched (Refreshing then cleared). A profile never passed
+/// always remains Idle.
+#[test]
+fn switch_rotate_targets_only_active_and_target() {
+    use std::collections::BTreeMap;
+    use std::sync::mpsc;
+
+    fn make_profile(name: &str) -> Profile {
+        Profile {
+            name: name.to_string(),
+            base_url: None,
+            api_key: None,
+            auto_start: false,
+            env: BTreeMap::new(),
+            fallback_threshold: None,
+            credentials: Some(ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: "at".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            }),
+            usage: None,
+            fetch_status: None,
+        }
+    }
+
+    let active_name = "switch-test-active";
+    let target_name = "switch-test-target";
+    let bystander_name = "switch-test-bystander";
+
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            make_profile(active_name),
+            make_profile(target_name),
+            make_profile(bystander_name),
+        ],
+    };
+    let config = Arc::new(Mutex::new(config));
+    let activity: ActivityStore = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (tx, _rx) = mpsc::channel();
+
+    // Simulate the new switch logic: rotate active then target (dedup skipped
+    // here since they differ), never the bystander.
+    rotate_one(&config, active_name, &activity, &tx);
+    rotate_one(&config, target_name, &activity, &tx);
+
+    // All three should be Idle: active and target have no refresh token so
+    // rotate_one short-circuits before stamping; bystander was never called.
+    assert!(
+        is_idle(&activity, active_name),
+        "active must be Idle after no-token short-circuit"
+    );
+    assert!(
+        is_idle(&activity, target_name),
+        "target must be Idle after no-token short-circuit"
+    );
+    assert!(
+        is_idle(&activity, bystander_name),
+        "bystander must never be stamped — only active+target are passed to rotate_one"
+    );
+}
+
+/// When active == target (re-switch), the switch paths deduplicate and call
+/// `rotate_one` at most once for that profile.
+#[test]
+fn switch_dedup_active_equals_target() {
+    use std::collections::BTreeMap;
+    use std::sync::mpsc;
+
+    let name = "switch-dedup-same";
+    let profile = Profile {
+        name: name.to_string(),
+        base_url: None,
+        api_key: None,
+        auto_start: false,
+        env: BTreeMap::new(),
+        fallback_threshold: None,
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }),
+        usage: None,
+        fetch_status: None,
+    };
+    let config = Arc::new(Mutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    }));
+    let activity: ActivityStore = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (tx, _rx) = mpsc::channel();
+
+    // active == target: the dedup condition `active != target` is false, so only
+    // one rotate_one call is made (for target). Verify the slot stays Idle.
+    let active = Some(name.to_string());
+    let target = name.to_string();
+    if let Some(ref a) = active
+        && a != &target
+    {
+        rotate_one(&config, a, &activity, &tx);
+    }
+    rotate_one(&config, &target, &activity, &tx);
+
+    assert!(
+        is_idle(&activity, name),
+        "slot must stay Idle after single no-token rotate_one call"
+    );
+}

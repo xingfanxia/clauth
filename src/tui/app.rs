@@ -986,17 +986,19 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
 }
 
 /// Kick off a TUI switch to `name`. Marks the target `Switching` and spawns a
-/// worker that runs `oauth::refresh_all` off the UI thread, then emits
-/// `OpResult { kind: Switching, outcome }`. The drain in `on_tick`
+/// worker that rotates the outgoing active and incoming target profiles via
+/// `rotate_one`, then emits `OpResult { kind: Switching, outcome }`. The drain in `on_tick`
 /// completes the FS half (`switch_profile` + bookkeeping) when the result
 /// lands. Refusal on a non-idle target is the caller's responsibility.
 fn perform_switch(app: &mut App, name: &str) {
     mark_activity(&app.activity, name, ProfileActivity::Switching);
     let config = Arc::clone(&app.config);
-    let refetch = Arc::clone(&app.refetch_queue);
     let activity = Arc::clone(&app.activity);
     let sender = app.op_sender.clone();
     let target = name.to_string();
+    // Read the outgoing active profile before mutating anything — worker only
+    // rotates active + target, not every profile.
+    let outgoing = app.config().state.active_profile.clone();
     std::thread::spawn(move || {
         // `catch_unwind` ensures the Switching slot is cleared even when a
         // panic fires before the `sender.send` below. Without this, a panic
@@ -1006,10 +1008,18 @@ fn perform_switch(app: &mut App, name: &str) {
         // shared-mutable cells with their own locks; no per-thread invariant
         // can be violated for other threads by a panic inside this closure.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // `refresh_all` joins its per-profile workers internally; on return
-            // every refresh slot is back to Idle. Re-stamp Switching so the
-            // spinner stays up through the FS leg the UI thread runs next.
-            let _ = oauth::refresh_all(&config, false, &refetch, &activity, &sender);
+            // Rotate only the outgoing active and incoming target profiles.
+            // Every other profile's single-use refresh token is left untouched.
+            // `rotate_one` returns false (no HTTP) when there is no refresh
+            // token or a live session holds the chain — both are safe to skip.
+            if let Some(ref active) = outgoing
+                && active != &target
+            {
+                oauth::rotate_one(&config, active, &activity, &sender);
+            }
+            oauth::rotate_one(&config, &target, &activity, &sender);
+            // Re-stamp Switching so the spinner stays up through the FS leg
+            // the UI thread runs next (rotate_one leaves the slot as Idle).
             mark_activity(&activity, &target, ProfileActivity::Switching);
             let _ = sender.send(OpResult {
                 name: target.clone(),
