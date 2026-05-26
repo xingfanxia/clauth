@@ -647,44 +647,18 @@ impl App {
     }
 
     pub(crate) fn manual_refresh(&self) {
-        // Manual refresh bypasses the cache rule. Clearing `last_fetched`
-        // forces every entry to be due, both for the immediate fetch we kick
-        // off here and for the refresher's next tick.
-        if let Ok(mut lf) = self.last_fetched.lock() {
-            lf.clear();
-        }
-        let snapshot = self
+        let names: Vec<String> = self
             .usage_tokens
             .lock()
             .expect("usage_tokens mutex poisoned")
-            .clone();
-        let store = Arc::clone(&self.usage_store);
-        let status = Arc::clone(&self.usage_status);
-        let last_fetched = Arc::clone(&self.last_fetched);
-        let pending_auto_start = Arc::clone(&self.pending_auto_start);
-        let refetch_queue = Arc::clone(&self.refetch_queue);
-        let activity = Arc::clone(&self.activity);
-        let learned = Arc::clone(&self.learned_intervals);
-        let ok_count = Arc::clone(&self.ok_count);
-        let cache_hit_count = Arc::clone(&self.cache_hit_count);
-        let last_429 = Arc::clone(&self.last_429);
-        std::thread::spawn(move || {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                fetch_all_into(
-                    &snapshot,
-                    &store,
-                    &status,
-                    &last_fetched,
-                    &pending_auto_start,
-                    &refetch_queue,
-                    &activity,
-                    &learned,
-                    &ok_count,
-                    &cache_hit_count,
-                    &last_429,
-                );
-            }));
-        });
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        if let Ok(mut q) = self.refetch_queue.lock() {
+            for name in names {
+                q.insert(name);
+            }
+        }
     }
 
     pub(crate) fn toast(&mut self, kind: ToastKind, body: impl Into<String>) {
