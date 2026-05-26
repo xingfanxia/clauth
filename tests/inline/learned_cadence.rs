@@ -115,7 +115,7 @@ fn constant_ordering() {
 
 #[test]
 fn bump_up_raises_by_1_5x_within_jitter_bounds() {
-    let current = NORMAL_INTERVAL_MS; // 30_000
+    let current = NORMAL_INTERVAL_MS; // 35_000
     let result = bump_up(current);
     // Expected center: 45_000; jitter is ±10% of 45_000 = ±4_500.
     let center = current * 3 / 2;
@@ -1495,7 +1495,7 @@ fn bump_up_below_jitter_band_still_jitters() {
     // Values where `raised + margin < CEILING` should still receive jitter.
     // Verify the window produces at least two distinct outputs across many calls.
     // Use NORMAL_INTERVAL_MS as a safe "far from ceiling" case.
-    let current = NORMAL_INTERVAL_MS; // raised = 45_000, margin = 4_500; CEILING = 300_000.
+    let current = NORMAL_INTERVAL_MS; // raised = 52_500, margin = 5_250; CEILING = 300_000.
     let raised = current * 3 / 2;
     let margin = raised / 10;
     assert!(
@@ -1678,6 +1678,80 @@ fn cache_hit_backoff_does_not_lower_already_raised_interval() {
         learned.lock().unwrap().get("p").copied().unwrap(),
         NORMAL_INTERVAL_MS,
         "cache-hit arm must not lower an already-at-NORMAL learned interval",
+    );
+}
+
+// ── H1: two-step descent from NORMAL stays at or above TTL ───────────────────
+
+#[test]
+fn steady_state_no_cache_hits_under_normal_conditions() {
+    // Verify the compile-time invariant at the update_learner level:
+    // two consecutive bump_downs from NORMAL must not drop `learned` below
+    // SERVER_CACHE_TTL_ESTIMATE_MS.
+    //
+    // Why this matters: when an idle profile polls at NORMAL cadence, two
+    // non-429 Fresh responses trigger two bump_downs. If the result is < TTL,
+    // the next same-util poll at that shorter interval is classified as a
+    // server cache hit (elapsed < TTL), the cache-hit arm snaps learned back
+    // toward NORMAL, and the cycle repeats — producing a non-zero steady-state
+    // cache-hit rate even when the user is idle and network is healthy.
+    //
+    // With OLD constants (NORMAL=30_000, STEP=5_000):
+    //   NORMAL - 2*STEP = 20_000 < TTL=25_000
+    //   → polling at 20_000ms with unchanged util IS a cache hit → oscillates.
+    // With NEW constants (NORMAL=35_000, STEP=5_000):
+    //   NORMAL - 2*STEP = 25_000 = TTL
+    //   → elapsed == TTL fails detect_cache_hit's strict `< TTL` gate → no hit.
+    let (learned, ok, ch, l429) = make_learner_maps();
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), NORMAL_INTERVAL_MS);
+
+    // Two non-cache-hit Fresh polls trigger one bump_down (ok_count 0→1→2→reset).
+    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+
+    let after_first_pair = learned
+        .lock()
+        .unwrap()
+        .get("p")
+        .copied()
+        .unwrap_or(NORMAL_INTERVAL_MS);
+
+    assert!(
+        after_first_pair >= SERVER_CACHE_TTL_ESTIMATE_MS,
+        "NORMAL - STEP ({after_first_pair}ms) fell below TTL ({SERVER_CACHE_TTL_ESTIMATE_MS}ms)",
+    );
+
+    // Second pair: two more non-cache-hit Fresh polls → second bump_down.
+    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+
+    let after_two_pairs = learned
+        .lock()
+        .unwrap()
+        .get("p")
+        .copied()
+        .unwrap_or(NORMAL_INTERVAL_MS);
+
+    // This is the load-bearing assertion: NORMAL - 2*STEP >= TTL.
+    // With old constants: 20_000 < 25_000 → fails.
+    // With new constants: 25_000 >= 25_000 → passes.
+    assert!(
+        after_two_pairs >= SERVER_CACHE_TTL_ESTIMATE_MS,
+        "NORMAL - 2*STEP ({after_two_pairs}ms) fell below SERVER_CACHE_TTL_ESTIMATE_MS \
+         ({SERVER_CACHE_TTL_ESTIMATE_MS}ms) — a same-util poll at this interval would \
+         be classified as a cache hit, causing oscillation back to NORMAL",
+    );
+
+    // Confirm: polling at `after_two_pairs` elapsed with unchanged util is NOT
+    // a cache hit. With old constants: detect_cache_hit(Fresh, 20_000, …) = true.
+    // With new constants: detect_cache_hit(Fresh, 25_000, …) = false (strict <).
+    assert!(
+        !detect_cache_hit(FetchStatus::Fresh, after_two_pairs, Some(42.0), Some(42.0),),
+        "interval after two bump_downs from NORMAL ({after_two_pairs}ms) must not \
+         register as a cache hit (requires elapsed >= TTL={SERVER_CACHE_TTL_ESTIMATE_MS}ms)",
     );
 }
 

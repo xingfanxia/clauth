@@ -24,7 +24,7 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Baseline refresh interval. Used as the default when no learned value exists
 /// and as the quiet-period reset target.
-pub(crate) const NORMAL_INTERVAL_MS: u64 = 30_000;
+pub(crate) const NORMAL_INTERVAL_MS: u64 = 35_000;
 
 /// AIMD learner bounds and step. The learned value is clamped to [FLOOR, CEILING]
 /// after every bump; STEP is the additive decrease per recovery round.
@@ -63,6 +63,14 @@ const SERVER_CACHE_TTL_ESTIMATE_MS: u64 = 25_000;
 const _: () = assert!(
     NORMAL_INTERVAL_MS > SERVER_CACHE_TTL_ESTIMATE_MS,
     "NORMAL_INTERVAL_MS must exceed SERVER_CACHE_TTL_ESTIMATE_MS for cache-hit elimination to terminate",
+);
+// Stronger invariant: two consecutive bump_downs from NORMAL must keep `learned`
+// at or above the server-cache TTL gate. Without this, the learner oscillates
+// between NORMAL and (NORMAL - 2*STEP), repeatedly crossing TTL and producing
+// a non-zero steady-state cache-hit rate in idle conditions.
+const _: () = assert!(
+    NORMAL_INTERVAL_MS.saturating_sub(2 * LEARNED_STEP_MS) >= SERVER_CACHE_TTL_ESTIMATE_MS,
+    "two bump_downs from NORMAL must stay at or above the server cache TTL, or the learner oscillates around TTL with a non-zero steady-state cache-hit rate",
 );
 
 pub(crate) type UsageStore = Arc<Mutex<HashMap<String, UsageInfo>>>;
