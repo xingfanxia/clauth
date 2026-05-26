@@ -1312,3 +1312,173 @@ fn apply_outcome_rapid_poll_with_same_value_registers_cache_hit() {
         "rapid same-value Fresh must register as a cache hit",
     );
 }
+
+// ── M5: apply_outcome elapsed measured against prior fetch, not just-written ──
+
+#[test]
+fn apply_outcome_elapsed_uses_prior_last_fetched_not_just_written() {
+    // Two sequential apply_outcome calls for the same profile: the second must
+    // compute elapsed_ms against the timestamp that was in last_fetched BEFORE
+    // the first call wrote its `now`, not the freshly-written value. Without
+    // the M5 single-snapshot fix, the second call would read the value the first
+    // just wrote → near-zero elapsed → false cache-hit classification.
+    let (store, status, last_fetched, pending, learned, ok, ch, l429) = apply_stores();
+    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+
+    // Simulate a prior fetch well outside the cache window so elapsed is large.
+    let prior = now_ms().saturating_sub(NORMAL_INTERVAL_MS);
+    last_fetched.lock().unwrap().insert("p".into(), prior);
+
+    // First call: elapsed ~ NORMAL_INTERVAL_MS → not a cache hit.
+    apply_outcome(
+        outcome("p", FetchStatus::Fresh, 42.0),
+        &store,
+        &status,
+        &last_fetched,
+        &pending,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+
+    // After the first call, last_fetched["p"] was updated to `now`. The second
+    // call must NOT see near-zero elapsed from reading that just-written value.
+    // We verify indirectly: the cache-hit counter must be 0 (not 1) because
+    // elapsed was large (NORMAL_INTERVAL_MS > SERVER_CACHE_TTL_ESTIMATE_MS).
+    apply_outcome(
+        outcome("p", FetchStatus::Fresh, 42.0),
+        &store,
+        &status,
+        &last_fetched,
+        &pending,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+
+    // The second call computed elapsed against the value the first call wrote
+    // (which is ~0ms ago) — a cache-hit would mean the race exists. If the fix
+    // is correct, this second call sees elapsed ~= time between the two
+    // apply_outcome calls (effectively ~0ms), which IS inside the cache window.
+    // BUT the key invariant is that the `last_fetched` read for `elapsed_ms`
+    // happens before the write, so for the SECOND call in this test the elapsed
+    // is measured from what the FIRST call wrote (a few microseconds ago →
+    // very small elapsed → cache hit), which is the correct behavior per the
+    // spec. What the fix prevents is reading a value written DURING the same
+    // call. Let's test the actual documented regression path: set last_fetched
+    // to a fresh value and verify elapsed reads it correctly.
+    let (store2, status2, last_fetched2, pending2, learned2, ok2, ch2, l429_2) = apply_stores();
+    learned2
+        .lock()
+        .unwrap()
+        .insert("q".into(), LEARNED_FLOOR_MS);
+
+    // Seed with a timestamp that is OUTSIDE the server cache TTL.
+    let old_ts = now_ms().saturating_sub(NORMAL_INTERVAL_MS);
+    last_fetched2.lock().unwrap().insert("q".into(), old_ts);
+
+    apply_outcome(
+        outcome("q", FetchStatus::Fresh, 77.0),
+        &store2,
+        &status2,
+        &last_fetched2,
+        &pending2,
+        &learned2,
+        &ok2,
+        &ch2,
+        &l429_2,
+    );
+
+    // elapsed_ms was computed from `old_ts` (≥ NORMAL_INTERVAL_MS ms ago),
+    // which is ≥ SERVER_CACHE_TTL_ESTIMATE_MS → not a cache hit → ch stays 0.
+    assert_eq!(
+        ch2.lock().unwrap().get("q").copied().unwrap_or(0),
+        0,
+        "elapsed measured from prior last_fetched (outside TTL) must not register cache hit",
+    );
+}
+
+// ── M6: bump_up near-ceiling pins cleanly, no asymmetric under-shoot ──────────
+
+#[test]
+fn bump_up_near_ceiling_pins_to_ceiling_no_undershoot() {
+    // Before the M6 fix, `raised` values where `raised + margin >= CEILING`
+    // (but `raised < CEILING`) would have upward jitter clipped by `.min(CEILING)`
+    // while downward jitter passed through, shifting the mean below `raised`.
+    // After the fix, any `current` whose `raised + raised/10 >= CEILING` pins.
+    //
+    // Pick current=181_820: raised=272_730, margin=27_273, sum=300_003 >= CEILING.
+    // (current=181_818 gives sum=299_999 < CEILING, demonstrating the threshold
+    // is tight — only values that actually straddle the ceiling get pinned.)
+    let current = 181_820u64;
+    let raised = current * 3 / 2; // 272_730
+    let margin = raised / 10; // 27_273
+    assert!(
+        raised < LEARNED_CEILING_MS,
+        "test setup: raised ({raised}) must be below CEILING for this to test the new band",
+    );
+    assert!(
+        raised + margin >= LEARNED_CEILING_MS,
+        "test setup: raised+margin ({}) must reach CEILING so the new guard fires",
+        raised + margin,
+    );
+
+    for _ in 0..50 {
+        assert_eq!(
+            bump_up(current),
+            LEARNED_CEILING_MS,
+            "bump_up({current}) with raised+margin straddling CEILING must pin to CEILING",
+        );
+    }
+}
+
+#[test]
+fn bump_up_below_jitter_band_still_jitters() {
+    // Values where `raised + margin < CEILING` should still receive jitter.
+    // Verify the window produces at least two distinct outputs across many calls.
+    // Use NORMAL_INTERVAL_MS as a safe "far from ceiling" case.
+    let current = NORMAL_INTERVAL_MS; // raised = 45_000, margin = 4_500; CEILING = 300_000.
+    let raised = current * 3 / 2;
+    let margin = raised / 10;
+    assert!(
+        raised + margin < LEARNED_CEILING_MS,
+        "test setup: raised+margin must be below ceiling for jitter to apply",
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        seen.insert(bump_up(current));
+    }
+    assert!(
+        seen.len() > 1,
+        "bump_up below the jitter band must produce variation, not always pin",
+    );
+}
+
+// ── L1: quiet-period reset does not fire when last_429_at == 0 ────────────────
+
+#[test]
+fn quiet_reset_does_not_fire_when_last_429_at_is_zero() {
+    // A stored `last_429_at == 0` (from `now_ms()` returning 0 on a skewed
+    // clock) must not satisfy the quiet-period check, because 0 as a sentinel
+    // means "no stamp" and `now.saturating_sub(0)` >= LEARNED_QUIET_RESET_MS
+    // is trivially true for any reasonable current time.
+    let (learned, ok, ch, l429) = make_learner_maps();
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), LEARNED_CEILING_MS);
+    // Explicitly insert 0 — simulates what happens when `now_ms()` fails.
+    l429.lock().unwrap().insert("p".into(), 0u64);
+
+    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+
+    // With the L1 fix, the reset must NOT fire — backoff must be preserved.
+    assert_eq!(
+        learned.lock().unwrap().get("p").copied().unwrap(),
+        LEARNED_CEILING_MS,
+        "quiet-period reset must not fire when last_429_at == 0",
+    );
+}

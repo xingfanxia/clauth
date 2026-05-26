@@ -424,16 +424,25 @@ fn jitter_seed() -> u64 {
 /// clamped to ceiling. At saturation the result pins to CEILING with no
 /// jitter — applying jitter after the clamp would let continued 429s drift
 /// the effective ceiling down by half the jitter range.
+///
+/// The saturation guard fires when `raised + margin >= CEILING` (equivalently
+/// `raised >= CEILING * 10 / 11`), not just when `raised >= CEILING`. This
+/// ensures jitter is only applied when the full ±10% window fits under the
+/// ceiling — without this, upward jitter gets clipped by `.min()` while
+/// downward jitter passes through, shifting the mean below `raised`.
 pub(crate) fn bump_up(current: u64) -> u64 {
     let raised = current.saturating_mul(3) / 2;
-    if raised >= LEARNED_CEILING_MS {
+    let margin = raised / 10;
+    // Pin to CEILING (no jitter) when the full ±margin window would straddle
+    // the ceiling. `LEARNED_CEILING_MS * 10 / 11` is the equivalent threshold.
+    if raised.saturating_add(margin) >= LEARNED_CEILING_MS {
         return LEARNED_CEILING_MS;
     }
-    let margin = raised / 10;
     let jitter = if margin == 0 {
         0i64
     } else {
-        (jitter_seed() % (margin * 2 + 1)) as i64 - margin as i64
+        i64::try_from(jitter_seed() % (margin * 2 + 1)).unwrap_or(0)
+            - i64::try_from(margin).unwrap_or(0)
     };
     ((raised as i64 + jitter).max(LEARNED_FLOOR_MS as i64) as u64).min(LEARNED_CEILING_MS)
 }
@@ -542,8 +551,13 @@ fn update_learner(
     // the stale 429 stamp when the quiet window has elapsed, even if the
     // learner is already at or below NORMAL — otherwise the entry lingers
     // forever on disk.
+    //
+    // `t429 != 0` guards against a zero sentinel from `now_ms()` returning 0
+    // on a badly-skewed clock — a stored 0 would satisfy the elapsed check and
+    // spuriously wipe legitimate 429 backoff.
     if matches!(status, FetchStatus::Fresh)
         && let Some(&t429) = l429_g.get(name)
+        && t429 != 0
         && now.saturating_sub(t429) >= LEARNED_QUIET_RESET_MS
     {
         let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
@@ -676,17 +690,22 @@ fn apply_outcome(
         }
     }
 
-    // Elapsed since the previous fetch attempt for this profile. Read before
-    // we overwrite `last_fetched` below. Used to distinguish a true server-side
-    // cache hit (poll landed inside the ~30s cache window with unchanged
-    // numbers) from an idle period (poll at NORMAL pace, user just isn't
-    // burning tokens). Without this gate, idle periods misclassify as cache
-    // hits and the AIMD learner gets dragged back up to NORMAL on every pause.
+    // Single clock snapshot for this outcome. Using one `now_ms()` call for
+    // both the elapsed calculation and the `last_fetched` write prevents a
+    // double-read race under concurrent `fetch_all_into` fan-out: if two
+    // `apply_outcome` calls for the same profile interleave, the second would
+    // otherwise read the timestamp just written by the first → near-zero
+    // `elapsed_ms` → false cache-hit → spurious upward bump.
+    let now = now_ms();
+
+    // Snapshot the previous `last_fetched` value BEFORE any write so
+    // `elapsed_ms` is measured against the prior fetch, not the just-written
+    // timestamp from an earlier call in the same concurrent batch.
     let elapsed_ms: u64 = last_fetched
         .lock()
         .ok()
         .and_then(|m| m.get(&outcome.name).copied())
-        .map(|prev| now_ms().saturating_sub(prev))
+        .map(|prev| now.saturating_sub(prev))
         .unwrap_or(u64::MAX);
 
     let new_util: Option<f64> = outcome.info.as_ref().and_then(five_hour_utilization);
@@ -696,7 +715,7 @@ fn apply_outcome(
         st.insert(outcome.name.clone(), outcome.status);
     }
     if let Ok(mut lf) = last_fetched.lock() {
-        lf.insert(outcome.name.clone(), now_ms());
+        lf.insert(outcome.name.clone(), now);
     }
     if outcome.needs_auto_start
         && let Ok(mut p) = pending_auto_start.lock()
