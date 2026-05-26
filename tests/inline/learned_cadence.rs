@@ -371,9 +371,12 @@ fn bump_down_at_floor_stays_at_floor() {
 // ── update_learner: Fresh with cache hit ──────────────────────────────────────
 
 #[test]
-fn two_cache_hits_at_floor_bump_up_to_floor_plus_step() {
+fn two_cache_hits_at_floor_jump_above_server_cache_ttl() {
     // Polling at FLOOR with unchanged utilization → server-side cache. After
-    // two consecutive cache-hits the learner backs off by one STEP toward NORMAL.
+    // two consecutive cache-hits the learner jumps directly to
+    // (SERVER_CACHE_TTL_ESTIMATE_MS + LEARNED_STEP_MS).min(NORMAL), guaranteeing
+    // the very next poll's elapsed >= SERVER_CACHE_TTL_ESTIMATE_MS so
+    // detect_cache_hit returns false. One pair is all it takes from FLOOR.
     let (learned, ok, ch, l429) = make_learner_maps();
     learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
 
@@ -385,22 +388,39 @@ fn two_cache_hits_at_floor_bump_up_to_floor_plus_step() {
     );
 
     update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
-    let expected = (LEARNED_FLOOR_MS + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS);
-    assert_eq!(learned.lock().unwrap().get("p").copied().unwrap(), expected,);
+    let target = (SERVER_CACHE_TTL_ESTIMATE_MS + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS);
+    let expected = LEARNED_FLOOR_MS.max(target);
+    assert_eq!(
+        learned.lock().unwrap().get("p").copied().unwrap(),
+        expected,
+        "after one cache-hit pair the learned interval must jump to the convergence target",
+    );
+    assert!(
+        expected > SERVER_CACHE_TTL_ESTIMATE_MS,
+        "convergence target must be strictly above SERVER_CACHE_TTL_ESTIMATE_MS",
+    );
     assert_eq!(ch.lock().unwrap().get("p").copied().unwrap_or(0), 0);
 }
 
 #[test]
-fn two_cache_hits_at_20s_bump_up_but_not_past_normal() {
+fn two_cache_hits_at_below_ttl_jump_to_convergence_target() {
+    // Starting below SERVER_CACHE_TTL_ESTIMATE_MS: same guarantee — one pair
+    // jumps to the convergence target, not just one STEP at a time.
     let (learned, ok, ch, l429) = make_learner_maps();
-    let start = 20_000u64;
+    let start = 20_000u64; // below SERVER_CACHE_TTL_ESTIMATE_MS (25_000)
     learned.lock().unwrap().insert("p".into(), start);
 
     update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
     update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
 
+    let target = (SERVER_CACHE_TTL_ESTIMATE_MS + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS);
+    let expected = start.max(target);
     let result = learned.lock().unwrap().get("p").copied().unwrap();
-    assert_eq!(result, (start + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS));
+    assert_eq!(result, expected);
+    assert!(
+        result > SERVER_CACHE_TTL_ESTIMATE_MS,
+        "after one pair, learned must exceed SERVER_CACHE_TTL_ESTIMATE_MS",
+    );
     assert!(
         result <= NORMAL_INTERVAL_MS,
         "cache-hit backoff must not exceed NORMAL",
@@ -429,8 +449,10 @@ fn cache_hits_at_normal_stay_at_normal() {
 
 #[test]
 fn cache_hit_then_change_event_resumes_recovery() {
-    // One cache-hit resets to 0 on a real change-event so the ok counter
-    // starts clean and two genuine Fresh responses still trigger bump_down.
+    // A single cache-hit (below the 2-hit threshold) does not fire the backoff
+    // arm. A subsequent genuine Fresh clears ch and increments ok_count; a
+    // second genuine Fresh triggers bump_down. The cache-hit does not interfere
+    // with recovery because it no longer resets ConsecutiveOk.
     let (learned, ok, ch, l429) = make_learner_maps();
     learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
 
@@ -1480,5 +1502,147 @@ fn quiet_reset_does_not_fire_when_last_429_at_is_zero() {
         learned.lock().unwrap().get("p").copied().unwrap(),
         LEARNED_CEILING_MS,
         "quiet-period reset must not fire when last_429_at == 0",
+    );
+}
+
+// ── M1: cache-hit arm does not reset ConsecutiveOk ───────────────────────────
+
+#[test]
+fn cache_hit_pair_does_not_reset_consecutive_ok() {
+    // A cache-hit pair must NOT zero ConsecutiveOk — cache hits carry no
+    // information about API health, so discarding recovery progress would force
+    // an extra bump_down cycle after 429 backoff unwinds.
+    let (learned, ok, ch, l429) = make_learner_maps();
+    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+    // Pre-load ok_count with 1 (first step of a recovery sequence).
+    ok.lock().unwrap().insert("p".into(), 1);
+
+    // Two cache hits fire the backoff arm.
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+
+    // The cache-hit arm fired — interval must have been raised.
+    let result = learned.lock().unwrap().get("p").copied().unwrap();
+    assert!(
+        result > LEARNED_FLOOR_MS,
+        "cache-hit pair must raise the learned interval",
+    );
+    // ConsecutiveOk must be unchanged — the pre-loaded 1 must still be there.
+    assert_eq!(
+        ok.lock().unwrap().get("p").copied().unwrap_or(0),
+        1,
+        "cache-hit arm must not reset ConsecutiveOk",
+    );
+    // ConsecutiveCacheHit must be reset after the threshold fires.
+    assert_eq!(
+        ch.lock().unwrap().get("p").copied().unwrap_or(0),
+        0,
+        "cache-hit arm must reset ConsecutiveCacheHit after threshold",
+    );
+}
+
+#[test]
+fn only_rate_limited_resets_consecutive_ok() {
+    // Verify the invariant: only RateLimited zeros ConsecutiveOk.
+    // A single Fresh (non-cache-hit) increments it; a cache-hit must leave it
+    // unchanged; only RateLimited zeros it.
+    let (learned, ok, ch, l429) = make_learner_maps();
+    ok.lock().unwrap().insert("p".into(), 0);
+
+    // One Fresh non-cache-hit increments ok_count to 1.
+    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    assert_eq!(ok.lock().unwrap().get("p").copied().unwrap_or(0), 1);
+
+    // A cache-hit (first of a pair — threshold not yet reached) must not touch ok_count.
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    assert_eq!(
+        ok.lock().unwrap().get("p").copied().unwrap_or(0),
+        1,
+        "cache-hit must not reset ConsecutiveOk",
+    );
+
+    // RateLimited must zero it.
+    update_learner(
+        "p",
+        FetchStatus::RateLimited,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    assert_eq!(ok.lock().unwrap().get("p").copied().unwrap_or(0), 0);
+}
+
+// ── R2-b: cache-hit convergence is deterministic and bounded ──────────────────
+
+#[test]
+fn cache_hits_from_floor_exceed_server_cache_ttl_within_one_pair() {
+    // From FLOOR (10s), a single cache-hit pair must drive `learned` strictly
+    // above SERVER_CACHE_TTL_ESTIMATE_MS (25s). After that, detect_cache_hit
+    // returns false (elapsed >= TTL) and the backoff arm stops firing.
+    // Convergence guarantee: at most one pair needed from any starting point
+    // at or below SERVER_CACHE_TTL_ESTIMATE_MS.
+    let (learned, ok, ch, l429) = make_learner_maps();
+    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+    const {
+        assert!(
+            LEARNED_FLOOR_MS <= SERVER_CACHE_TTL_ESTIMATE_MS,
+            "test setup: FLOOR must be <= TTL for this scenario to be valid",
+        )
+    };
+
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+
+    let result = learned.lock().unwrap().get("p").copied().unwrap();
+    assert!(
+        result > SERVER_CACHE_TTL_ESTIMATE_MS,
+        "after one cache-hit pair from FLOOR, learned ({result}ms) must exceed \
+         SERVER_CACHE_TTL_ESTIMATE_MS ({SERVER_CACHE_TTL_ESTIMATE_MS}ms)",
+    );
+}
+
+#[test]
+fn cache_hit_convergence_never_exceeds_normal() {
+    // The cache-hit arm must never push `learned` above NORMAL_INTERVAL_MS,
+    // regardless of the starting value (e.g. mid-recovery from a low learned).
+    let (learned, ok, ch, l429) = make_learner_maps();
+
+    // Start just below NORMAL to verify the NORMAL cap holds.
+    let start = NORMAL_INTERVAL_MS - 1;
+    learned.lock().unwrap().insert("p".into(), start);
+
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+
+    let result = learned.lock().unwrap().get("p").copied().unwrap();
+    assert!(
+        result <= NORMAL_INTERVAL_MS,
+        "cache-hit backoff must not exceed NORMAL_INTERVAL_MS (got {result}ms)",
+    );
+}
+
+#[test]
+fn cache_hit_backoff_does_not_lower_already_raised_interval() {
+    // If the interval was already raised above the cache-hit target (e.g. by
+    // 429 backoff that went above NORMAL), the cache-hit arm must not lower it.
+    // The `current.max(target)` guard ensures we only ever raise here.
+    let (learned, ok, ch, l429) = make_learner_maps();
+    // Artificially place learned above NORMAL (simulating post-429 state at NORMAL
+    // ceiling cap — actually NORMAL is the max for cache hits, so test at NORMAL).
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), NORMAL_INTERVAL_MS);
+
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+
+    // Learned must not be lowered below NORMAL — it was already there.
+    assert_eq!(
+        learned.lock().unwrap().get("p").copied().unwrap(),
+        NORMAL_INTERVAL_MS,
+        "cache-hit arm must not lower an already-at-NORMAL learned interval",
     );
 }

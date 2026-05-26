@@ -1984,6 +1984,12 @@ pub(crate) fn on_tick(app: &mut App) {
     }
     let mut any_auto_started = false;
     let mut any_refreshed = false;
+    // Names of profiles whose auto-start completed successfully this tick.
+    // These are pushed into RefetchQueue rather than triggering an all-profile
+    // manual_refresh — only the auto-started profiles need an immediate re-fetch,
+    // and the scheduler's forced-merge path respects Switching/Refreshing
+    // exclusions, keeping AIMD the single cadence authority.
+    let mut auto_started_names: Vec<String> = Vec::new();
     // Names whose `Switching` OpResult arrived — the FS half runs after the
     // drain loop so the per-name `Refreshing` toasts/clears for the same
     // tick have already been processed and the spinner stays Switching
@@ -2011,6 +2017,7 @@ pub(crate) fn on_tick(app: &mut App) {
             Ok(()) => match kind {
                 ActivityKind::AutoStarting => {
                     any_auto_started = true;
+                    auto_started_names.push(name.clone());
                     app.toast(
                         ToastKind::Info,
                         format!("auto-started usage window for '{name}'"),
@@ -2053,8 +2060,19 @@ pub(crate) fn on_tick(app: &mut App) {
     if any_refreshed || any_auto_started {
         app.refresh_tokens();
     }
-    if any_auto_started {
-        app.manual_refresh();
+    // Route auto-start re-fetches through RefetchQueue so only the auto-started
+    // profiles get an immediate re-fetch, not every profile. The scheduler's
+    // forced-merge path picks them up on the next tick, respecting
+    // Switching/Refreshing exclusions and keeping AIMD the single cadence
+    // authority. This replaces the prior all-profile manual_refresh which was
+    // a full double-fetch that raced the scheduler's next tick and injected a
+    // false cache-hit signal.
+    if !auto_started_names.is_empty()
+        && let Ok(mut q) = app.refetch_queue.lock()
+    {
+        for n in auto_started_names {
+            q.insert(n);
+        }
     }
 
     if app.reload_if_state_changed() {

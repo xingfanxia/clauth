@@ -380,9 +380,19 @@ fn fetch_with_rotation(
             };
             (Some(info), status, rotated)
         }
+        Err(FetchError::Status(429)) => {
+            // Rotation succeeded, but the retry itself got rate-limited. Let the
+            // AIMD learner's RateLimited→bump_up path govern the next poll cadence;
+            // pushing to RefetchQueue here would schedule a 1s-floor re-fetch that
+            // fights the backoff and risks cycling: rotate→retry-429→enqueue→rotate.
+            // The learner's backoff must win — no forced refetch on a 429 retry.
+            let (info, _) = load_cached_with_status(name, FetchStatus::RateLimited);
+            (info, FetchStatus::RateLimited, rotated)
+        }
         Err(_) => {
-            // Rotation succeeded but the follow-up fetch failed; schedule a
-            // re-fetch so the next tick picks up with the new access token.
+            // Rotation succeeded but a non-429 transient error stopped the retry.
+            // Force a re-fetch on the next tick so we pick up with the new token
+            // as soon as possible without waiting the full learned interval.
             if let Ok(mut q) = refetch.lock() {
                 q.insert(name.to_string());
             }
@@ -576,19 +586,32 @@ fn update_learner(
             l429_g.insert(name.to_string(), now);
         }
         // A Fresh response with the same utilization is a server-side cache hit:
-        // back off additively toward NORMAL so we don't spin at FLOOR forever.
+        // jump the interval above SERVER_CACHE_TTL_ESTIMATE_MS so the very next
+        // poll lands outside the cache window and cache-hit detection stops firing.
+        // Convergence guarantee: from FLOOR, at most two consecutive cache-hit polls
+        // drive `learned` strictly above SERVER_CACHE_TTL_ESTIMATE_MS; once there,
+        // `detect_cache_hit` returns false (elapsed >= TTL) and the arm stops firing.
+        // Ceiling is NORMAL, not LEARNED_CEILING — cache hits mean "polling too fast",
+        // not "server overloaded". Only ever raise `learned` here; if we're already
+        // above the target (e.g. post-429 backoff held above NORMAL), leave it alone.
+        // `ConsecutiveOk` is intentionally NOT reset here — cache hits are neutral
+        // evidence about API health, so zeroing ok_count would discard post-429
+        // recovery progress and require an extra bump_down cycle.
         FetchStatus::Fresh if cache_hit => {
             let hits = ch_g.get(name).copied().unwrap_or(0) + 1;
             if hits >= 2 {
                 let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
-                // Ceiling is NORMAL, not LEARNED_CEILING — cache hits mean "fine,
-                // just polling too fast"; drift back to the baseline, not max backoff.
-                let bumped = current
-                    .saturating_add(LEARNED_STEP_MS)
-                    .min(NORMAL_INTERVAL_MS);
+                // Jump strictly above the server-cache TTL so the next poll's elapsed
+                // >= TTL and detect_cache_hit returns false. Clamp to NORMAL so cache
+                // hits never push above the baseline. Never lower the interval here —
+                // a 429-backed raised value above NORMAL must be preserved.
+                let target =
+                    (SERVER_CACHE_TTL_ESTIMATE_MS + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS);
+                let bumped = current.max(target);
                 learned_g.insert(name.to_string(), bumped);
                 ch_g.insert(name.to_string(), 0);
-                ok_g.insert(name.to_string(), 0);
+                // `ok_g` is deliberately left unchanged — only `RateLimited` resets
+                // ConsecutiveOk. Cache hits carry no information about API health.
             } else {
                 ch_g.insert(name.to_string(), hits);
             }
