@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -9,7 +9,8 @@ use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, OAuthToken, save_app_state, save_profile};
 use crate::runtime::has_live_session;
 use crate::usage::{
-    ActivityStore, ProfileActivity, RefetchQueue, UsageStore, clear_activity, mark_activity, now_ms,
+    ActivityKind, ActivityStore, OpResult, OpResultSender, ProfileActivity, RefetchQueue,
+    UsageStore, clear_activity, mark_activity, now_ms,
 };
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup
@@ -102,18 +103,31 @@ fn kick(access_token: &str) -> Result<()> {
 ///
 /// No cooldown gating — the caller is responsible for deduplication via
 /// `LastRotatedWindow`. Does not touch `last_auto_start_at`.
-pub(crate) fn rotate_one(config: &mut AppConfig, name: &str, activity: &ActivityStore) -> bool {
-    let token = with_state_lock(|| {
-        if has_live_session(name) {
-            return Ok::<_, anyhow::Error>(None);
-        }
-        let rt = config
-            .find(name)
-            .and_then(|p| p.refresh_token().map(str::to_string));
-        Ok(rt)
-    })
-    .ok()
-    .flatten();
+///
+/// Takes `Arc<Mutex<AppConfig>>` so the lock is held only across the brief
+/// read/write windows around HTTP, not across the network round trip.
+/// Emits one `OpResult { kind: Refreshing }` on the supplied sender unless
+/// the profile is skipped (no refresh token / live session).
+pub(crate) fn rotate_one(
+    config: &Arc<Mutex<AppConfig>>,
+    name: &str,
+    activity: &ActivityStore,
+    sender: &OpResultSender,
+) -> bool {
+    let token = {
+        let cfg = config.lock().expect("config mutex poisoned");
+        with_state_lock(|| {
+            if has_live_session(name) {
+                return Ok::<_, anyhow::Error>(None);
+            }
+            let rt = cfg
+                .find(name)
+                .and_then(|p| p.refresh_token().map(str::to_string));
+            Ok(rt)
+        })
+        .ok()
+        .flatten()
+    };
 
     let Some(rt) = token else {
         return false;
@@ -121,11 +135,27 @@ pub(crate) fn rotate_one(config: &mut AppConfig, name: &str, activity: &Activity
     // Mark Refreshing only around the HTTP call, never across the state lock.
     mark_activity(activity, name, ProfileActivity::Refreshing);
     let refreshed = refresh(&rt);
-    clear_activity(activity, name);
-    let Ok(tok) = refreshed else {
-        return false;
+    let (outcome, applied) = match refreshed {
+        Ok(tok) => {
+            let saved = apply_rotated_tokens_locked(config, name, tok);
+            if saved {
+                (Ok(()), true)
+            } else {
+                (
+                    Err(anyhow::anyhow!("failed to persist rotated tokens")),
+                    false,
+                )
+            }
+        }
+        Err(e) => (Err(e), false),
     };
-    apply_rotated_tokens(config, name, tok)
+    clear_activity(activity, name);
+    let _ = sender.send(OpResult {
+        name: name.to_string(),
+        kind: ActivityKind::Refreshing,
+        outcome,
+    });
+    applied
 }
 
 /// Profiles that would be rotated by `refresh_all`. Extracted so tests can
@@ -165,21 +195,32 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Strin
 /// can target follow-up work (usage re-fetch, kick) at the same set.
 /// Pushes each rotated name onto `refetch` so the next scheduler tick
 /// re-fetches usage immediately without waiting for the cadence.
+///
+/// Takes `&Arc<Mutex<AppConfig>>` so per-profile workers can lock/unlock
+/// independently around their HTTP calls without ever holding the config
+/// mutex across the network. Each per-profile worker emits one `OpResult`
+/// on `sender` the moment its HTTP completes, so the spinner clears in
+/// arrival order rather than waiting for the slowest sibling.
 pub(crate) fn refresh_all(
-    config: &mut AppConfig,
+    config: &Arc<Mutex<AppConfig>>,
     force: bool,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
+    sender: &OpResultSender,
 ) -> Vec<String> {
-    let snapshots = rotation_candidates(config, force);
+    let snapshots = {
+        let cfg = config.lock().expect("config mutex poisoned");
+        rotation_candidates(&cfg, force)
+    };
 
     if snapshots.is_empty() {
         return Vec::new();
     }
 
     // Stamp every candidate Refreshing before the fan-out so the overview row
-    // shows a refresh spinner for the entire window. Each thread clears its
-    // own slot on completion (success or failure) below.
+    // shows a refresh spinner for the entire window. Each worker clears its
+    // own slot when it emits its OpResult so the spinner drops as soon as
+    // that profile's HTTP returns, not when the slowest sibling does.
     for (name, _) in &snapshots {
         mark_activity(activity, name, ProfileActivity::Refreshing);
     }
@@ -187,40 +228,42 @@ pub(crate) fn refresh_all(
     let handles: Vec<_> = snapshots
         .into_iter()
         .map(|(name, rt)| {
+            let config = Arc::clone(config);
             let activity = Arc::clone(activity);
+            let sender = sender.clone();
             std::thread::spawn(move || {
-                let res = refresh(&rt);
-                // Clear inside the worker so a Drop'd handle still releases
-                // the spinner — the join loop below would skip a panicked
-                // thread otherwise.
+                let refreshed = refresh(&rt);
+                let (outcome, saved) = match refreshed {
+                    Ok(tok) => {
+                        let ok = apply_rotated_tokens_locked(&config, &name, tok);
+                        if ok {
+                            (Ok(()), true)
+                        } else {
+                            (
+                                Err(anyhow::anyhow!("failed to persist rotated tokens")),
+                                false,
+                            )
+                        }
+                    }
+                    Err(e) => (Err(e), false),
+                };
                 clear_activity(&activity, &name);
-                (name, res)
+                let _ = sender.send(OpResult {
+                    name: name.clone(),
+                    kind: ActivityKind::Refreshing,
+                    outcome,
+                });
+                (name, saved)
             })
         })
         .collect();
 
     let mut refreshed = Vec::new();
     for h in handles {
-        let Ok((name, Ok(tok))) = h.join() else {
+        let Ok((name, true)) = h.join() else {
             continue;
         };
-        let saved = with_state_lock(|| {
-            let Some(profile) = config.find_mut(&name) else {
-                return Ok::<_, anyhow::Error>(false);
-            };
-            let Some(creds) = profile.credentials.as_mut() else {
-                return Ok(false);
-            };
-            let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
-                return Ok(false);
-            };
-            write_token_fields(oauth, tok);
-            Ok(save_profile(profile).is_ok())
-        })
-        .unwrap_or(false);
-        if saved {
-            refreshed.push(name);
-        }
+        refreshed.push(name);
     }
     if let Ok(mut q) = refetch.lock() {
         for name in &refreshed {
@@ -239,10 +282,11 @@ pub(crate) fn refresh_all(
 /// name onto `refetch` so the scheduler re-fetches without waiting for the
 /// cadence.
 pub(crate) fn auto_start_windows(
-    config: &mut AppConfig,
+    config: &Arc<Mutex<AppConfig>>,
     store: &UsageStore,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
+    sender: &OpResultSender,
 ) -> Vec<String> {
     // Claim cooldown slots under the lock BEFORE any network work. A competing
     // clauth process that starts up a moment later will observe our recorded
@@ -251,59 +295,63 @@ pub(crate) fn auto_start_windows(
     //
     // Holding the lock during the OAuth/messages HTTP round trips would stall
     // every other instance for seconds, so we release between claim and work.
-    let skip_active = active_link_diverged(config);
-    let snapshots: Vec<(String, String)> = match with_state_lock(|| {
-        let now = now_ms();
-        let mut claimed = Vec::new();
-        for profile in &config.profiles {
-            if !profile.auto_start {
-                continue;
+    let snapshots: Vec<(String, String)> = {
+        let mut cfg = config.lock().expect("config mutex poisoned");
+        match with_state_lock(|| {
+            let skip_active = active_link_diverged(&cfg);
+            let now = now_ms();
+            let mut claimed = Vec::new();
+            for profile in &cfg.profiles {
+                if !profile.auto_start {
+                    continue;
+                }
+                if skip_active && cfg.is_active(&profile.name) {
+                    continue;
+                }
+                if has_live_session(&profile.name) {
+                    continue;
+                }
+                let resets_at = {
+                    let usage = store.lock().ok();
+                    usage
+                        .as_ref()
+                        .and_then(|s| s.get(&profile.name))
+                        .and_then(|u| u.five_hour.as_ref())
+                        .and_then(|w| w.resets_at.clone())
+                };
+                if resets_at.is_some() {
+                    continue;
+                }
+                let last = cfg
+                    .state
+                    .last_auto_start_at
+                    .get(&profile.name)
+                    .copied()
+                    .unwrap_or(0);
+                if now.saturating_sub(last) < AUTO_START_COOLDOWN_MS {
+                    continue;
+                }
+                let Some(token) = profile.refresh_token().map(str::to_string) else {
+                    continue;
+                };
+                claimed.push((profile.name.clone(), token));
             }
-            if skip_active && config.is_active(&profile.name) {
-                continue;
-            }
-            if has_live_session(&profile.name) {
-                continue;
-            }
-            let resets_at = {
-                let usage = store.lock().ok();
-                usage
-                    .as_ref()
-                    .and_then(|s| s.get(&profile.name))
-                    .and_then(|u| u.five_hour.as_ref())
-                    .and_then(|w| w.resets_at.clone())
-            };
-            if resets_at.is_some() {
-                continue;
-            }
-            let last = config
-                .state
-                .last_auto_start_at
-                .get(&profile.name)
-                .copied()
-                .unwrap_or(0);
-            if now.saturating_sub(last) < AUTO_START_COOLDOWN_MS {
-                continue;
-            }
-            let Some(token) = profile.refresh_token().map(str::to_string) else {
-                continue;
-            };
-            claimed.push((profile.name.clone(), token));
-        }
 
-        // Claim cooldown slots before releasing the lock. A competing clauth
-        // process will observe these timestamps and skip the same profiles so
-        // the token rotates exactly once even when two instances race startup.
-        for (name, _) in &claimed {
-            config.state.last_auto_start_at.insert(name.clone(), now);
+            // Claim cooldown slots before releasing the lock. A competing
+            // clauth process will observe these timestamps and skip the same
+            // profiles so the token rotates exactly once even when two
+            // instances race startup.
+            for (name, _) in &claimed {
+                cfg.state.last_auto_start_at.insert(name.clone(), now);
+            }
+            if !claimed.is_empty() {
+                let _ = save_app_state(&cfg.state);
+            }
+            Ok::<_, anyhow::Error>(claimed)
+        }) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
         }
-        if !claimed.is_empty() {
-            let _ = save_app_state(&config.state);
-        }
-        Ok::<_, anyhow::Error>(claimed)
-    }) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
     };
 
     // Refresh and kick are reported separately. Anthropic rotates the refresh
@@ -313,30 +361,37 @@ pub(crate) fn auto_start_windows(
     //
     // Spinner-wise: AutoStarting covers refresh + persist + kick for the full
     // window. Each worker stamps its own slot AutoStarting before the network
-    // round trip and the join loop clears on completion (success or failure).
+    // round trip, posts an OpResult on completion, and clears its slot so
+    // the spinner drops at HTTP completion rather than waiting for the
+    // slowest sibling.
     for (name, _) in &snapshots {
         mark_activity(activity, name, ProfileActivity::AutoStarting);
     }
     let handles: Vec<_> = snapshots
         .into_iter()
-        .map(|(name, rt)| std::thread::spawn(move || (name, refresh(&rt))))
+        .map(|(name, rt)| {
+            let config = Arc::clone(config);
+            let activity = Arc::clone(activity);
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                let (outcome, kicked) = run_auto_start(&config, &name, &rt);
+                clear_activity(&activity, &name);
+                let _ = sender.send(OpResult {
+                    name: name.clone(),
+                    kind: ActivityKind::AutoStarting,
+                    outcome,
+                });
+                (name, kicked)
+            })
+        })
         .collect();
 
     let mut kicked = Vec::new();
     for h in handles {
-        let Ok((name, Ok(tok))) = h.join() else {
+        let Ok((name, true)) = h.join() else {
             continue;
         };
-        let access_token = tok.access_token.clone();
-        if !apply_rotated_tokens_or_rollback_cooldown(config, &name, tok) {
-            clear_activity(activity, &name);
-            continue;
-        }
-        let ok = kick(&access_token).is_ok();
-        clear_activity(activity, &name);
-        if ok {
-            kicked.push(name);
-        }
+        kicked.push(name);
     }
     if let Ok(mut q) = refetch.lock() {
         for name in &kicked {
@@ -344,6 +399,32 @@ pub(crate) fn auto_start_windows(
         }
     }
     kicked
+}
+
+/// Per-profile auto-start work: refresh tokens, persist, kick the 5h window.
+/// Returns `(outcome, kicked)` where `kicked` is true iff the messages POST
+/// succeeded. Used by both `auto_start_windows` (fan-out) and the single-name
+/// `auto_start_named` path. Never holds the config mutex across HTTP.
+fn run_auto_start(
+    config: &Arc<Mutex<AppConfig>>,
+    name: &str,
+    refresh_token: &str,
+) -> (Result<()>, bool) {
+    let tok = match refresh(refresh_token) {
+        Ok(t) => t,
+        Err(e) => return (Err(e), false),
+    };
+    let access_token = tok.access_token.clone();
+    if !apply_rotated_tokens_or_rollback_cooldown_locked(config, name, tok) {
+        return (
+            Err(anyhow::anyhow!("failed to persist rotated tokens")),
+            false,
+        );
+    }
+    match kick(&access_token) {
+        Ok(()) => (Ok(()), true),
+        Err(e) => (Err(e), false),
+    }
 }
 
 /// Refresh tokens and kick the 5h window for one named profile. Same
@@ -354,62 +435,54 @@ pub(crate) fn auto_start_windows(
 /// window. Returns true iff the kick HTTP call succeeded. Pushes `name`
 /// onto `refetch` on success.
 pub(crate) fn auto_start_named(
-    config: &mut AppConfig,
+    config: &Arc<Mutex<AppConfig>>,
     name: &str,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
+    sender: &OpResultSender,
 ) -> bool {
     let now = now_ms();
-    let token = match with_state_lock(|| {
-        let Some(profile) = config.find(name) else {
-            return Ok::<_, anyhow::Error>(None);
-        };
-        if !profile.auto_start {
-            return Ok(None);
+    let token = {
+        let mut cfg = config.lock().expect("config mutex poisoned");
+        match with_state_lock(|| {
+            let Some(profile) = cfg.find(name) else {
+                return Ok::<_, anyhow::Error>(None);
+            };
+            if !profile.auto_start {
+                return Ok(None);
+            }
+            if active_link_diverged(&cfg) && cfg.is_active(name) {
+                return Ok(None);
+            }
+            if has_live_session(name) {
+                return Ok(None);
+            }
+            let last = cfg.state.last_auto_start_at.get(name).copied().unwrap_or(0);
+            if now.saturating_sub(last) < AUTO_START_COOLDOWN_MS {
+                return Ok(None);
+            }
+            let Some(rt) = profile.refresh_token().map(str::to_string) else {
+                return Ok(None);
+            };
+            cfg.state.last_auto_start_at.insert(name.to_string(), now);
+            let _ = save_app_state(&cfg.state);
+            Ok(Some(rt))
+        }) {
+            Ok(Some(t)) => t,
+            _ => return false,
         }
-        if active_link_diverged(config) && config.is_active(name) {
-            return Ok(None);
-        }
-        if has_live_session(name) {
-            return Ok(None);
-        }
-        let last = config
-            .state
-            .last_auto_start_at
-            .get(name)
-            .copied()
-            .unwrap_or(0);
-        if now.saturating_sub(last) < AUTO_START_COOLDOWN_MS {
-            return Ok(None);
-        }
-        let Some(rt) = profile.refresh_token().map(str::to_string) else {
-            return Ok(None);
-        };
-        config
-            .state
-            .last_auto_start_at
-            .insert(name.to_string(), now);
-        let _ = save_app_state(&config.state);
-        Ok(Some(rt))
-    }) {
-        Ok(Some(t)) => t,
-        _ => return false,
     };
 
     // AutoStarting spinner covers the full refresh + persist + kick window.
     // Never held across `with_state_lock`; cleared in every exit path.
     mark_activity(activity, name, ProfileActivity::AutoStarting);
-    let Ok(tok) = refresh(&token) else {
-        clear_activity(activity, name);
-        return false;
-    };
-    let access_token = tok.access_token.clone();
-    if !apply_rotated_tokens_or_rollback_cooldown(config, name, tok) {
-        clear_activity(activity, name);
-        return false;
-    }
-    let kicked = kick(&access_token).is_ok();
+    let (outcome, kicked) = run_auto_start(config, name, &token);
     clear_activity(activity, name);
+    let _ = sender.send(OpResult {
+        name: name.to_string(),
+        kind: ActivityKind::AutoStarting,
+        outcome,
+    });
     if kicked && let Ok(mut q) = refetch.lock() {
         q.insert(name.to_string());
     }
@@ -429,13 +502,20 @@ fn write_token_fields(oauth: &mut OAuthToken, tok: TokenResponse) {
 /// Write a rotated token pair into the named profile's OAuth block and persist.
 /// If persist fails, rolls back the `last_auto_start_at` cooldown so the next
 /// run can retry without waiting the full 4.5h. Returns true on success.
-fn apply_rotated_tokens_or_rollback_cooldown(
-    config: &mut AppConfig,
+///
+/// Takes `&Arc<Mutex<AppConfig>>` and locks it only across the brief write
+/// window, so workers can call this without holding the lock during HTTP.
+///
+/// Lock order: AppConfig in-process mutex first, then state flock. Matches
+/// the existing UI-thread order so workers and the UI thread never invert.
+fn apply_rotated_tokens_or_rollback_cooldown_locked(
+    config: &Arc<Mutex<AppConfig>>,
     name: &str,
     tok: TokenResponse,
 ) -> bool {
+    let mut cfg = config.lock().expect("config mutex poisoned");
     with_state_lock(|| {
-        let Some(profile) = config.find_mut(name) else {
+        let Some(profile) = cfg.find_mut(name) else {
             return Ok::<_, anyhow::Error>(false);
         };
         let Some(creds) = profile.credentials.as_mut() else {
@@ -447,8 +527,8 @@ fn apply_rotated_tokens_or_rollback_cooldown(
         write_token_fields(oauth, tok);
         if save_profile(profile).is_err() {
             // Roll back the cooldown so the profile isn't stranded.
-            config.state.last_auto_start_at.remove(name);
-            let _ = save_app_state(&config.state);
+            cfg.state.last_auto_start_at.remove(name);
+            let _ = save_app_state(&cfg.state);
             return Ok(false);
         }
         Ok(true)
@@ -459,6 +539,38 @@ fn apply_rotated_tokens_or_rollback_cooldown(
 /// Write a rotated token pair into the named profile's OAuth block and
 /// persist. Returns true on success. No-op when the profile or OAuth block
 /// is missing — callers that care can refuse to act on `false`.
+///
+/// Locking variant of [`apply_rotated_tokens`]: takes `&Arc<Mutex<AppConfig>>`
+/// so workers can call from a thread without holding the lock across HTTP.
+/// Lock order: AppConfig in-process mutex first, then state flock.
+fn apply_rotated_tokens_locked(
+    config: &Arc<Mutex<AppConfig>>,
+    name: &str,
+    tok: TokenResponse,
+) -> bool {
+    let mut cfg = config.lock().expect("config mutex poisoned");
+    with_state_lock(|| {
+        let Some(profile) = cfg.find_mut(name) else {
+            return Ok::<_, anyhow::Error>(false);
+        };
+        let Some(creds) = profile.credentials.as_mut() else {
+            return Ok(false);
+        };
+        let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
+            return Ok(false);
+        };
+        write_token_fields(oauth, tok);
+        Ok(save_profile(profile).is_ok())
+    })
+    .unwrap_or(false)
+}
+
+/// Write a rotated token pair into the named profile's OAuth block and
+/// persist. Returns true on success. No-op when the profile or OAuth block
+/// is missing — callers that care can refuse to act on `false`.
+///
+/// `&mut AppConfig` variant for callers that already hold the lock (e.g. the
+/// divergence-probe path on the UI thread).
 pub(crate) fn apply_rotated_tokens(config: &mut AppConfig, name: &str, tok: TokenResponse) -> bool {
     with_state_lock(|| {
         let Some(profile) = config.find_mut(name) else {

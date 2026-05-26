@@ -22,7 +22,7 @@ use anyhow::Result;
 use crate::actions::{switch_profile, switch_profile_reconciled};
 use crate::claude::{LinkState, classify_credentials_link, is_first_login};
 use crate::profile::{AppConfig, load_config};
-use crate::usage::{ActivityStore, RefetchQueue};
+use crate::usage::{ActivityStore, OpResult, RefetchQueue};
 
 fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<String> {
     config.canonical_name(name).ok_or_else(|| {
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
         }
         [name] => {
             platform::init();
-            let mut config = load_config()?;
+            let config = load_config()?;
             let canonical = resolve_or_bail(&config, name)?;
             // Refresh every profile's OAuth token before switching, same as
             // the interactive flow. The rotated access token then ends up in
@@ -78,30 +78,42 @@ fn main() -> Result<()> {
             // No scheduler running in the CLI path — queue contents are
             // discarded; we only need the return value (rotated names) which
             // the CLI also discards.
-            let noop: RefetchQueue = Arc::new(Mutex::new(std::collections::HashSet::new()));
+            let noop_refetch: RefetchQueue = Arc::new(Mutex::new(std::collections::HashSet::new()));
             // CLI path has no spinner — pass a throwaway ActivityStore so the
             // shared signature works without printing to stderr.
             let noop_activity: ActivityStore =
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
-            let _ = oauth::refresh_all(&mut config, false, &noop, &noop_activity);
+            // CLI has no OpResult drain — drop the receiver immediately so
+            // workers' `sender.send` returns disconnected-error which they
+            // ignore (`let _ = …`). The Arc<Mutex<AppConfig>> wraps the
+            // owned config so oauth fns can take/drop the lock per their
+            // contract.
+            let (op_sender, _op_receiver) = std::sync::mpsc::channel::<OpResult>();
+            let config = Arc::new(Mutex::new(config));
+            let _ = oauth::refresh_all(&config, false, &noop_refetch, &noop_activity, &op_sender);
 
             // When the outgoing active profile has a diverged live credentials
             // file (CC re-logged or wrote a regular file), prompt rather than
             // refusing. On Yes: capture the live creds into the outgoing
             // profile first, then force the switch. On No: abort cleanly.
-            let reconciled = if let Some(active) = config.state.active_profile.as_deref() {
-                matches!(classify_credentials_link(active)?, LinkState::Diverged)
-                    && !is_first_login(active)?
-            } else {
-                false
+            let reconciled = {
+                let cfg = config.lock().expect("config mutex poisoned");
+                if let Some(active) = cfg.state.active_profile.as_deref() {
+                    matches!(classify_credentials_link(active)?, LinkState::Diverged)
+                        && !is_first_login(active)?
+                } else {
+                    false
+                }
             };
             if reconciled {
-                let active = config
-                    .state
-                    .active_profile
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_string();
+                let active = {
+                    let cfg = config.lock().expect("config mutex poisoned");
+                    cfg.state
+                        .active_profile
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_string()
+                };
                 print!(
                     "active profile '{active}' has uncaptured credentials in ~/.claude \
                      (a re-login or token rotation). capture them into '{active}' and \
@@ -113,19 +125,27 @@ fn main() -> Result<()> {
                 std::io::stdin().read_line(&mut answer)?;
                 let answer = answer.trim().to_ascii_lowercase();
                 if answer.is_empty() || answer == "y" || answer == "yes" {
-                    switch_profile_reconciled(&mut config, &canonical)?;
+                    let mut cfg = config.lock().expect("config mutex poisoned");
+                    switch_profile_reconciled(&mut cfg, &canonical)?;
                 } else {
                     println!("aborted — no changes made");
                     return Ok(());
                 }
             } else {
-                switch_profile(&mut config, &canonical)?;
+                let mut cfg = config.lock().expect("config mutex poisoned");
+                switch_profile(&mut cfg, &canonical)?;
             }
 
             // Match the TUI: prime the 5h window if the target is opted in
             // via `auto_start = true`. Cooldown blocks repeated CLI switches
             // from re-kicking inside the same window.
-            let _ = oauth::auto_start_named(&mut config, &canonical, &noop, &noop_activity);
+            let _ = oauth::auto_start_named(
+                &config,
+                &canonical,
+                &noop_refetch,
+                &noop_activity,
+                &op_sender,
+            );
             println!("switched to '{canonical}'");
             return Ok(());
         }

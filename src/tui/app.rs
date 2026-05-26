@@ -35,8 +35,8 @@ use crate::usage::{
     ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, Last429At, LastFetchedAt,
     LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult, OpResultReceiver,
     OpResultSender, PendingAutoStart, PendingWindowRotation, ProfileActivity, RefetchQueue,
-    StatusStore, TokenEntry, TokenList, UsageStore, clear_activity, default_fallback_threshold,
-    fetch_all_into, mark_activity, spawn_refresher,
+    StatusStore, TokenEntry, TokenList, UsageStore, any_busy, clear_activity,
+    default_fallback_threshold, fetch_all_into, is_idle, mark_activity, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -351,8 +351,6 @@ pub(crate) struct App {
     pub(crate) op_results: OpResultReceiver,
     /// Sender side. Cloned into workers (and passed to refresh/rotation
     /// helpers) so they can report completion without holding any lock.
-    /// Phase 1 owns this for Phase 2 — workers don't exist yet.
-    #[allow(dead_code)]
     pub(crate) op_sender: OpResultSender,
     pub(crate) last_fetched: LastFetchedAt,
     pub(crate) pending_auto_start: PendingAutoStart,
@@ -460,10 +458,13 @@ impl App {
         // Refresh every profile's OAuth token pair — Claude Code does the
         // same thing silently on launch. Rotates and persists the new pair
         // so the initial usage fetch below uses fresh access tokens.
-        {
-            let mut cfg = self.config();
-            let _ = oauth::refresh_all(&mut cfg, false, &self.refetch_queue, &self.activity);
-        }
+        let _ = oauth::refresh_all(
+            &self.config,
+            false,
+            &self.refetch_queue,
+            &self.activity,
+            &self.op_sender,
+        );
         self.refresh_tokens();
 
         let snapshot = self
@@ -485,15 +486,13 @@ impl App {
             &self.last_429,
         );
 
-        let started = {
-            let mut cfg = self.config();
-            oauth::auto_start_windows(
-                &mut cfg,
-                &self.usage_store,
-                &self.refetch_queue,
-                &self.activity,
-            )
-        };
+        let started = oauth::auto_start_windows(
+            &self.config,
+            &self.usage_store,
+            &self.refetch_queue,
+            &self.activity,
+            &self.op_sender,
+        );
         if !started.is_empty() {
             for name in &started {
                 self.toast(
@@ -925,12 +924,18 @@ fn perform_switch(app: &mut App, name: &str) {
     // Visible indicator for the full window: Switching covers both the
     // pre-switch refresh and the relink step. Cleared in every exit path.
     mark_activity(&app.activity, name, ProfileActivity::Switching);
+    let _ = oauth::refresh_all(
+        &app.config,
+        false,
+        &app.refetch_queue,
+        &app.activity,
+        &app.op_sender,
+    );
+    // refresh_all may have flipped us back to Idle when it cleared its
+    // own per-name Refreshing; re-stamp Switching for the relink step.
+    mark_activity(&app.activity, name, ProfileActivity::Switching);
     let result = {
         let mut cfg = app.config();
-        let _ = oauth::refresh_all(&mut cfg, false, &app.refetch_queue, &app.activity);
-        // refresh_all may have flipped us back to Idle when it cleared its
-        // own per-name Refreshing; re-stamp Switching for the relink step.
-        mark_activity(&app.activity, name, ProfileActivity::Switching);
         switch_profile(&mut cfg, name)
     };
     clear_activity(&app.activity, name);
@@ -1498,20 +1503,43 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 input: InputState::new(""),
             }));
         }
-        ConfirmAction::Switch(name) => perform_switch(app, &name),
+        ConfirmAction::Switch(name) => {
+            // Block a second switch while the previous one is still mid-flight.
+            if !is_idle(&app.activity, &name) {
+                app.toast(
+                    ToastKind::Warning,
+                    format!("'{name}' is already busy — try again in a moment"),
+                );
+                return;
+            }
+            perform_switch(app, &name);
+        }
         ConfirmAction::DiscardDivergence(name) => run_discard_divergence(app, &name),
         ConfirmAction::RotateAll => {
-            let rotated = {
-                let mut cfg = app.config();
-                oauth::refresh_all(&mut cfg, true, &app.refetch_queue, &app.activity)
-            };
-            app.refresh_tokens();
-            let count = rotated.len();
-            if count == 0 {
-                app.toast(ToastKind::Warning, "no tokens rotated");
-            } else {
-                app.toast(ToastKind::Success, format!("rotated {count} token(s)"));
+            // Refuse if anything is already in flight — a parallel rotate-all
+            // worker would step on per-profile work or duplicate a refresh
+            // already mid-rotation.
+            if any_busy(&app.activity) {
+                app.toast(
+                    ToastKind::Warning,
+                    "rotate-all skipped — another op is still in flight",
+                );
+                return;
             }
+            // Spawn the rotate-all worker so HTTP runs off the UI thread.
+            // The worker locks the config only across its brief snapshot /
+            // persist windows; per-profile spinners clear as each profile's
+            // HTTP completes via the OpResult channel drained in on_tick.
+            // A toast confirms the kick-off; per-profile errors surface
+            // through the standard drain.
+            let config = Arc::clone(&app.config);
+            let refetch = Arc::clone(&app.refetch_queue);
+            let activity = Arc::clone(&app.activity);
+            let sender = app.op_sender.clone();
+            std::thread::spawn(move || {
+                let _ = oauth::refresh_all(&config, true, &refetch, &activity, &sender);
+            });
+            app.toast(ToastKind::Info, "rotating all tokens…");
         }
     }
 }
@@ -1864,14 +1892,16 @@ pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
 
     // Drain completed op results posted by workers. Each result clears the
-    // profile's activity slot back to Idle and surfaces errors as toasts.
-    // Phase 1: all the named refresh paths still run synchronously on the main
-    // thread, so the channel is mostly empty — but the drain has to exist
-    // before Phase 2 starts moving them off-thread.
+    // profile's activity slot back to Idle, surfaces errors as toasts, and —
+    // for op kinds where the user wants confirmation — emits a success toast
+    // and any follow-up bookkeeping that touches `AppConfig` (refresh tokens,
+    // kick off a usage re-fetch).
     let mut drained: Vec<OpResult> = Vec::new();
     while let Ok(result) = app.op_results.try_recv() {
         drained.push(result);
     }
+    let mut any_auto_started = false;
+    let mut any_refreshed = false;
     for OpResult {
         name,
         kind,
@@ -1879,19 +1909,44 @@ pub(crate) fn on_tick(app: &mut App) {
     } in drained
     {
         clear_activity(&app.activity, &name);
-        if let Err(e) = outcome {
-            let verb = match kind {
-                ActivityKind::Fetching => "fetch",
-                ActivityKind::Refreshing => "refresh",
-                ActivityKind::Switching => "switch",
-                ActivityKind::Starting => "start",
-                ActivityKind::AutoStarting => "auto-start",
-            };
-            app.toast(
-                ToastKind::Danger,
-                format!("{verb} for '{name}' failed: {e}"),
-            );
+        match outcome {
+            Ok(()) => match kind {
+                ActivityKind::AutoStarting => {
+                    any_auto_started = true;
+                    app.toast(
+                        ToastKind::Info,
+                        format!("auto-started usage window for '{name}'"),
+                    );
+                }
+                ActivityKind::Refreshing => {
+                    any_refreshed = true;
+                    app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
+                }
+                _ => {}
+            },
+            Err(e) => {
+                let verb = match kind {
+                    ActivityKind::Fetching => "fetch",
+                    ActivityKind::Refreshing => "refresh",
+                    ActivityKind::Switching => "switch",
+                    ActivityKind::Starting => "start",
+                    ActivityKind::AutoStarting => "auto-start",
+                };
+                app.toast(
+                    ToastKind::Danger,
+                    format!("{verb} for '{name}' failed: {e}"),
+                );
+            }
         }
+    }
+    // Rebuild the scheduler's TokenList snapshot whenever a rotation lands —
+    // without this, the next tick fetches with the stale access token, 401s,
+    // and rotates again through `fetch_with_rotation`'s recovery leg.
+    if any_refreshed || any_auto_started {
+        app.refresh_tokens();
+    }
+    if any_auto_started {
+        app.manual_refresh();
     }
 
     if app.reload_if_state_changed() {
@@ -1900,9 +1955,11 @@ pub(crate) fn on_tick(app: &mut App) {
     app.apply_usage();
 
     // Drain the auto-start queue the refresher fills when a successful fetch
-    // shows no live 5h window. Mutation stays on the main thread so we keep
-    // reusing the existing `&mut AppConfig` flow. `auto_start_named` enforces
-    // its own per-profile cooldown, so a duplicate insert is a no-op.
+    // shows no live 5h window. Each pending name is handed to a worker thread
+    // so the HTTP runs off the UI thread; the result is surfaced through the
+    // standard OpResult channel (drained at the top of the next tick) so the
+    // spinner clears in arrival order. `auto_start_named` enforces its own
+    // per-profile cooldown, so a duplicate enqueue is a no-op.
     let pending: Vec<String> = {
         let mut p = app
             .pending_auto_start
@@ -1912,31 +1969,30 @@ pub(crate) fn on_tick(app: &mut App) {
         p.clear();
         v
     };
-    let mut any_started = false;
     for name in pending {
-        let kicked = {
-            let mut cfg = app.config();
-            oauth::auto_start_named(&mut cfg, &name, &app.refetch_queue, &app.activity)
-        };
-        if kicked {
-            any_started = true;
-            app.toast(
-                ToastKind::Info,
-                format!("auto-started usage window for '{name}'"),
-            );
+        // Skip when the profile is already busy with another op — the
+        // scheduler may re-enqueue on the next fetch if the condition holds.
+        if !is_idle(&app.activity, &name) {
+            continue;
         }
-    }
-    if any_started {
-        app.refresh_tokens();
-        app.manual_refresh();
+        let config = Arc::clone(&app.config);
+        let refetch = Arc::clone(&app.refetch_queue);
+        let activity = Arc::clone(&app.activity);
+        let sender = app.op_sender.clone();
+        std::thread::spawn(move || {
+            let _ = oauth::auto_start_named(&config, &name, &refetch, &activity, &sender);
+        });
     }
 
-    // Drain 5h-window-expiry rotation requests posted by the scheduler.
-    // Performed on the main thread so `rotate_one` can take &mut AppConfig
-    // without introducing a shared config mutex in the scheduler thread.
+    // Drain 5h-window-expiry rotation requests posted by the scheduler. Each
+    // entry is handed to a worker that runs the rotation off the UI thread.
     // The map value is the `resets_at` epoch pinned at detection time; using
     // it (not a re-read from `usage_store`) prevents stamping the wrong window
     // if the API returned a fresh `resets_at` between detection and drain.
+    //
+    // `LastRotatedWindow` and `RefetchQueue` are independent mutexes (not
+    // AppConfig), so the worker stamps them inline on success — no UI-side
+    // bookkeeping is required after the OpResult lands.
     let pending_rotations: Vec<(String, i64)> = {
         let mut p = app
             .pending_window_rotation
@@ -1945,20 +2001,25 @@ pub(crate) fn on_tick(app: &mut App) {
         p.drain().collect()
     };
     for (name, epoch) in pending_rotations {
-        let rotated = {
-            let mut cfg = app.config();
-            oauth::rotate_one(&mut cfg, &name, &app.activity)
-        };
-        if rotated {
-            if let Ok(mut lrw) = app.last_rotated_window.lock() {
-                lrw.insert(name.clone(), epoch);
-            }
-            if let Ok(mut q) = app.refetch_queue.lock() {
-                q.insert(name.clone());
-            }
-            app.refresh_tokens();
-            app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
+        if !is_idle(&app.activity, &name) {
+            continue;
         }
+        let config = Arc::clone(&app.config);
+        let activity = Arc::clone(&app.activity);
+        let refetch = Arc::clone(&app.refetch_queue);
+        let last_rotated = Arc::clone(&app.last_rotated_window);
+        let sender = app.op_sender.clone();
+        std::thread::spawn(move || {
+            let rotated = oauth::rotate_one(&config, &name, &activity, &sender);
+            if rotated {
+                if let Ok(mut lrw) = last_rotated.lock() {
+                    lrw.insert(name.clone(), epoch);
+                }
+                if let Ok(mut q) = refetch.lock() {
+                    q.insert(name);
+                }
+            }
+        });
     }
 
     let switched = {

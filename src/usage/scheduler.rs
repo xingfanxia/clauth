@@ -200,6 +200,26 @@ pub(crate) fn clear_activity(store: &ActivityStore, name: &str) {
     }
 }
 
+/// True iff the profile currently has no in-flight op. Used by input handlers
+/// and tick-time enqueue paths to avoid double-triggering an op on a profile
+/// that already has one running.
+pub(crate) fn is_idle(store: &ActivityStore, name: &str) -> bool {
+    match store.lock() {
+        Ok(g) => !g.contains_key(name),
+        // Poisoned — fail-safe to "busy" so we don't fire a duplicate op.
+        Err(_) => false,
+    }
+}
+
+/// True iff any profile currently has any in-flight op. Used to gate global
+/// actions like "rotate all" against concurrent per-profile work.
+pub(crate) fn any_busy(store: &ActivityStore) -> bool {
+    match store.lock() {
+        Ok(g) => !g.is_empty(),
+        Err(_) => true,
+    }
+}
+
 /// Outcome of the most recent usage fetch attempt for a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FetchStatus {

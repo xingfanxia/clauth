@@ -9,6 +9,6 @@ pub(crate) use scheduler::{
     ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, FetchStatus, Last429At,
     LastFetchedAt, LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult,
     OpResultReceiver, OpResultSender, PendingAutoStart, PendingWindowRotation, ProfileActivity,
-    RefetchQueue, StatusStore, TokenEntry, TokenList, UsageStore, clear_activity,
-    default_fallback_threshold, fetch_all_into, mark_activity, spawn_refresher,
+    RefetchQueue, StatusStore, TokenEntry, TokenList, UsageStore, any_busy, clear_activity,
+    default_fallback_threshold, fetch_all_into, is_idle, mark_activity, spawn_refresher,
 };
