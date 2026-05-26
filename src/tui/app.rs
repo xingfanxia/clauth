@@ -497,55 +497,31 @@ impl App {
         let op_sender = self.op_sender.clone();
         let startup_sender = self.startup_sender.clone();
 
+        let startup_sender_for_panic = startup_sender.clone();
         std::thread::spawn(move || {
-            // Re-establish the credentials symlink that the previous shutdown
-            // replaced with a plain file. Without this, in-session Claude Code
-            // refreshes write to a standalone file instead of the profile.
-            let active = config
-                .lock()
-                .expect("config mutex poisoned")
-                .state
-                .active_profile
-                .clone();
-            if let Some(active) = active {
-                let _ = link_profile_credentials(&active);
-            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Re-establish the credentials symlink that the previous shutdown
+                // replaced with a plain file. Without this, in-session Claude Code
+                // refreshes write to a standalone file instead of the profile.
+                let active = config
+                    .lock()
+                    .expect("config mutex poisoned")
+                    .state
+                    .active_profile
+                    .clone();
+                if let Some(active) = active {
+                    let _ = link_profile_credentials(&active);
+                }
 
-            // Refresh every profile's OAuth token pair — Claude Code does the
-            // same thing silently on launch. Rotates and persists the new pair
-            // so the initial usage fetch below uses fresh access tokens.
-            let _ = oauth::refresh_all(&config, false, &refetch_queue, &activity, &op_sender);
+                // Refresh every profile's OAuth token pair — Claude Code does the
+                // same thing silently on launch. Rotates and persists the new pair
+                // so the initial usage fetch below uses fresh access tokens.
+                let _ = oauth::refresh_all(&config, false, &refetch_queue, &activity, &op_sender);
 
-            let snapshot = collect_tokens(&config.lock().expect("config mutex poisoned").profiles);
-            fetch_all_into(
-                &snapshot,
-                &usage_store,
-                &usage_status,
-                &last_fetched,
-                &pending_auto_start,
-                &refetch_queue,
-                &activity,
-                &learned_intervals,
-                &ok_count,
-                &cache_hit_count,
-                &last_429,
-            );
-
-            let started = oauth::auto_start_windows(
-                &config,
-                &usage_store,
-                &refetch_queue,
-                &activity,
-                &op_sender,
-            );
-            if !started.is_empty() {
-                let retry: Vec<TokenEntry> =
-                    collect_tokens(&config.lock().expect("config mutex poisoned").profiles)
-                        .into_iter()
-                        .filter(|e| started.contains(&e.name))
-                        .collect();
+                let snapshot =
+                    collect_tokens(&config.lock().expect("config mutex poisoned").profiles);
                 fetch_all_into(
-                    &retry,
+                    &snapshot,
                     &usage_store,
                     &usage_status,
                     &last_fetched,
@@ -557,9 +533,42 @@ impl App {
                     &cache_hit_count,
                     &last_429,
                 );
-            }
 
-            let _ = startup_sender.send(StartupSignal::BootstrapDone);
+                let started = oauth::auto_start_windows(
+                    &config,
+                    &usage_store,
+                    &refetch_queue,
+                    &activity,
+                    &op_sender,
+                );
+                if !started.is_empty() {
+                    let retry: Vec<TokenEntry> =
+                        collect_tokens(&config.lock().expect("config mutex poisoned").profiles)
+                            .into_iter()
+                            .filter(|e| started.contains(&e.name))
+                            .collect();
+                    fetch_all_into(
+                        &retry,
+                        &usage_store,
+                        &usage_status,
+                        &last_fetched,
+                        &pending_auto_start,
+                        &refetch_queue,
+                        &activity,
+                        &learned_intervals,
+                        &ok_count,
+                        &cache_hit_count,
+                        &last_429,
+                    );
+                }
+
+                let _ = startup_sender.send(StartupSignal::BootstrapDone);
+            }));
+            if result.is_err() {
+                // Panic path: send BootstrapDone so the scheduler still starts
+                // rather than hanging forever waiting for the signal.
+                let _ = startup_sender_for_panic.send(StartupSignal::BootstrapDone);
+            }
         });
     }
 
@@ -660,19 +669,21 @@ impl App {
         let cache_hit_count = Arc::clone(&self.cache_hit_count);
         let last_429 = Arc::clone(&self.last_429);
         std::thread::spawn(move || {
-            fetch_all_into(
-                &snapshot,
-                &store,
-                &status,
-                &last_fetched,
-                &pending_auto_start,
-                &refetch_queue,
-                &activity,
-                &learned,
-                &ok_count,
-                &cache_hit_count,
-                &last_429,
-            );
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fetch_all_into(
+                    &snapshot,
+                    &store,
+                    &status,
+                    &last_fetched,
+                    &pending_auto_start,
+                    &refetch_queue,
+                    &activity,
+                    &learned,
+                    &ok_count,
+                    &cache_hit_count,
+                    &last_429,
+                );
+            }));
         });
     }
 
@@ -815,18 +826,27 @@ pub(crate) fn reconcile_startup(app: &mut App) {
     // pair (the old one is now invalid server-side anyway) and prompt.
     let config = Arc::clone(&app.config);
     let sender = app.startup_sender.clone();
-    std::thread::spawn(move || match oauth::refresh(&rt) {
-        Err(_) => {
-            let mut cfg = config.lock().expect("config mutex poisoned");
-            let _ = force_snapshot_active_credentials(&mut cfg);
-            let _ = sender.send(StartupSignal::ReconcileDone);
-        }
-        Ok(tok) => {
-            {
-                let mut cfg = config.lock().expect("config mutex poisoned");
-                let _ = oauth::apply_rotated_tokens(&mut cfg, &active, tok);
-            }
-            let _ = sender.send(StartupSignal::ReconcileNeedsPrompt { active });
+    let sender_for_panic = sender.clone();
+    std::thread::spawn(move || {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match oauth::refresh(&rt) {
+                Err(_) => {
+                    let mut cfg = config.lock().expect("config mutex poisoned");
+                    let _ = force_snapshot_active_credentials(&mut cfg);
+                    let _ = sender.send(StartupSignal::ReconcileDone);
+                }
+                Ok(tok) => {
+                    {
+                        let mut cfg = config.lock().expect("config mutex poisoned");
+                        let _ = oauth::apply_rotated_tokens(&mut cfg, &active, tok);
+                    }
+                    let _ = sender.send(StartupSignal::ReconcileNeedsPrompt { active });
+                }
+            }));
+        if result.is_err() {
+            // Panic path: send ReconcileDone so startup unblocks rather than
+            // hanging forever. Proceeds as if no divergence was found.
+            let _ = sender_for_panic.send(StartupSignal::ReconcileDone);
         }
     });
 }
@@ -1648,7 +1668,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             let activity = Arc::clone(&app.activity);
             let sender = app.op_sender.clone();
             std::thread::spawn(move || {
-                let _ = oauth::refresh_all(&config, true, &refetch, &activity, &sender);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = oauth::refresh_all(&config, true, &refetch, &activity, &sender);
+                }));
             });
             app.toast(ToastKind::Info, "rotating all tokens…");
         }
@@ -2150,8 +2172,21 @@ pub(crate) fn on_tick(app: &mut App) {
         let refetch = Arc::clone(&app.refetch_queue);
         let activity = Arc::clone(&app.activity);
         let sender = app.op_sender.clone();
+        let name_for_panic = name.clone();
+        let activity_for_panic = Arc::clone(&app.activity);
+        let sender_for_panic = app.op_sender.clone();
         std::thread::spawn(move || {
-            let _ = oauth::auto_start_named(&config, &name, &refetch, &activity, &sender);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = oauth::auto_start_named(&config, &name, &refetch, &activity, &sender);
+            }));
+            if result.is_err() {
+                clear_activity(&activity_for_panic, &name_for_panic);
+                let _ = sender_for_panic.send(OpResult {
+                    name: name_for_panic,
+                    kind: ActivityKind::AutoStarting,
+                    outcome: Err(anyhow::anyhow!("auto-start worker panicked")),
+                });
+            }
         });
     }
 
@@ -2178,17 +2213,30 @@ pub(crate) fn on_tick(app: &mut App) {
         let refetch = Arc::clone(&app.refetch_queue);
         let last_rotated = Arc::clone(&app.last_rotated_window);
         let sender = app.op_sender.clone();
+        let name_for_panic = name.clone();
+        let activity_for_panic = Arc::clone(&app.activity);
+        let sender_for_panic = app.op_sender.clone();
         std::thread::spawn(move || {
-            let rotated = oauth::rotate_one_for_window(
-                &config,
-                &name,
-                &activity,
-                &sender,
-                &last_rotated,
-                epoch,
-            );
-            if rotated && let Ok(mut q) = refetch.lock() {
-                q.insert(name);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rotated = oauth::rotate_one_for_window(
+                    &config,
+                    &name,
+                    &activity,
+                    &sender,
+                    &last_rotated,
+                    epoch,
+                );
+                if rotated && let Ok(mut q) = refetch.lock() {
+                    q.insert(name);
+                }
+            }));
+            if result.is_err() {
+                clear_activity(&activity_for_panic, &name_for_panic);
+                let _ = sender_for_panic.send(OpResult {
+                    name: name_for_panic,
+                    kind: ActivityKind::Refreshing,
+                    outcome: Err(anyhow::anyhow!("window-rotation worker panicked")),
+                });
             }
         });
     }
