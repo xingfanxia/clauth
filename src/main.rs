@@ -8,6 +8,7 @@ mod oauth;
 mod platform;
 mod profile;
 mod runtime;
+mod spinner;
 mod start;
 mod tui;
 mod update;
@@ -22,6 +23,7 @@ use anyhow::Result;
 use crate::actions::{switch_profile, switch_profile_reconciled};
 use crate::claude::{LinkState, classify_credentials_link, is_first_login};
 use crate::profile::{AppConfig, load_config};
+use crate::spinner::Spinner;
 use crate::usage::{ActivityStore, OpResult, RefetchQueue};
 
 fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<String> {
@@ -90,7 +92,13 @@ fn main() -> Result<()> {
             // contract.
             let (op_sender, _op_receiver) = std::sync::mpsc::channel::<OpResult>();
             let config = Arc::new(Mutex::new(config));
-            let _ = oauth::refresh_all(&config, false, &noop_refetch, &noop_activity, &op_sender);
+            {
+                // Scoped so the spinner stops before the interactive [Y/n]
+                // prompt below — a live spinner during stdin read corrupts it.
+                let _spinner = Spinner::start("clauth: rotating tokens…");
+                let _ =
+                    oauth::refresh_all(&config, false, &noop_refetch, &noop_activity, &op_sender);
+            }
 
             // When the outgoing active profile has a diverged live credentials
             // file (CC re-logged or wrote a regular file), prompt rather than
@@ -139,13 +147,16 @@ fn main() -> Result<()> {
             // Match the TUI: prime the 5h window if the target is opted in
             // via `auto_start = true`. Cooldown blocks repeated CLI switches
             // from re-kicking inside the same window.
-            let _ = oauth::auto_start_named(
-                &config,
-                &canonical,
-                &noop_refetch,
-                &noop_activity,
-                &op_sender,
-            );
+            {
+                let _spinner = Spinner::start("clauth: priming usage window…");
+                let _ = oauth::auto_start_named(
+                    &config,
+                    &canonical,
+                    &noop_refetch,
+                    &noop_activity,
+                    &op_sender,
+                );
+            }
             println!("switched to '{canonical}'");
             return Ok(());
         }
