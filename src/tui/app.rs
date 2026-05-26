@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -399,6 +400,11 @@ pub(crate) struct App {
     /// True once `spawn_bootstrap` has been dispatched. Guards against a
     /// second dispatch on subsequent ticks.
     pub(crate) bootstrap_started: bool,
+    /// True while the bootstrap worker is still running (set before spawn,
+    /// cleared inside the worker on every exit path). `ConfirmAction::RotateAll`
+    /// consults this alongside `any_busy` to block a concurrent rotate-all
+    /// from racing the bootstrap's `auto_start_windows` leg.
+    pub(crate) bootstrap_active: Arc<AtomicBool>,
 }
 
 impl App {
@@ -458,6 +464,7 @@ impl App {
             last_divergence_check: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
+            bootstrap_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -496,8 +503,10 @@ impl App {
         let last_429 = Arc::clone(&self.last_429);
         let op_sender = self.op_sender.clone();
         let startup_sender = self.startup_sender.clone();
+        let bootstrap_active = Arc::clone(&self.bootstrap_active);
 
         let startup_sender_for_panic = startup_sender.clone();
+        let bootstrap_active_for_panic = Arc::clone(&bootstrap_active);
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Re-establish the credentials symlink that the previous shutdown
@@ -562,11 +571,13 @@ impl App {
                     );
                 }
 
+                bootstrap_active.store(false, Ordering::SeqCst);
                 let _ = startup_sender.send(StartupSignal::BootstrapDone);
             }));
             if result.is_err() {
-                // Panic path: send BootstrapDone so the scheduler still starts
-                // rather than hanging forever waiting for the signal.
+                // Panic path: clear flag and send BootstrapDone so the scheduler
+                // still starts rather than hanging forever waiting for the signal.
+                bootstrap_active_for_panic.store(false, Ordering::SeqCst);
                 let _ = startup_sender_for_panic.send(StartupSignal::BootstrapDone);
             }
         });
@@ -1623,8 +1634,12 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         ConfirmAction::RotateAll => {
             // Refuse if anything is already in flight — a parallel rotate-all
             // worker would step on per-profile work or duplicate a refresh
-            // already mid-rotation.
-            if any_busy(&app.activity) {
+            // already mid-rotation. Bootstrap is a whole-worker busy signal
+            // separate from per-profile activity: between the last Refreshing
+            // slot clearing and the first AutoStarting slot setting there is a
+            // window where activity_store is empty but the bootstrap worker is
+            // still running auto_start_windows. The flag covers that gap.
+            if app.bootstrap_active.load(Ordering::SeqCst) || any_busy(&app.activity) {
                 app.toast(
                     ToastKind::Warning,
                     "rotate-all skipped — another op is still in flight",
@@ -2127,18 +2142,24 @@ pub(crate) fn on_tick(app: &mut App) {
     // standard OpResult channel (drained at the top of the next tick) so the
     // spinner clears in arrival order. `auto_start_named` enforces its own
     // per-profile cooldown, so a duplicate enqueue is a no-op.
-    let pending: Vec<String> = app
-        .pending_auto_start
-        .lock()
-        .map(|mut g| {
-            let v: Vec<String> = g.iter().cloned().collect();
-            g.clear();
-            v
-        })
-        .unwrap_or_default();
+    //
+    // Skip the entire drain while the bootstrap worker is running: it may be
+    // mid-`auto_start_windows` for these same profiles, and draining here
+    // would race on the same single-use refresh tokens. Entries left in the
+    // mutex are picked up on the next tick once the flag clears.
+    let pending: Vec<String> = if app.bootstrap_active.load(Ordering::SeqCst) {
+        Vec::new()
+    } else {
+        app.pending_auto_start
+            .lock()
+            .map(|mut g| {
+                let v: Vec<String> = g.iter().cloned().collect();
+                g.clear();
+                v
+            })
+            .unwrap_or_default()
+    };
     for name in pending {
-        // Skip when the profile is already busy with another op — the
-        // scheduler may re-enqueue on the next fetch if the condition holds.
         if !is_idle(&app.activity, &name) {
             continue;
         }
@@ -2173,11 +2194,17 @@ pub(crate) fn on_tick(app: &mut App) {
     // `LastRotatedWindow` and `RefetchQueue` are independent mutexes (not
     // AppConfig), so the worker stamps them inline on success — no UI-side
     // bookkeeping is required after the OpResult lands.
-    let pending_rotations: Vec<(String, i64)> = app
-        .pending_window_rotation
-        .lock()
-        .map(|mut g| g.drain().collect())
-        .unwrap_or_default();
+    //
+    // Skip the entire drain while bootstrap is running for the same reason as
+    // `pending_auto_start` above — entries stay in the mutex for the next tick.
+    let pending_rotations: Vec<(String, i64)> = if app.bootstrap_active.load(Ordering::SeqCst) {
+        Vec::new()
+    } else {
+        app.pending_window_rotation
+            .lock()
+            .map(|mut g| g.drain().collect())
+            .unwrap_or_default()
+    };
     for (name, epoch) in pending_rotations {
         if !is_idle(&app.activity, &name) {
             continue;
@@ -2272,6 +2299,7 @@ fn maybe_spawn_bootstrap(app: &mut App) {
         return;
     }
     app.bootstrap_started = true;
+    app.bootstrap_active.store(true, Ordering::SeqCst);
     app.spawn_bootstrap();
 }
 
@@ -2348,4 +2376,55 @@ pub(crate) fn shutdown(app: &mut App) -> Result<()> {
     }
     let _ = detach_credentials_link();
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use crate::usage::{ActivityStore, ProfileActivity, any_busy};
+
+    fn make_activity(entries: &[(&str, ProfileActivity)]) -> ActivityStore {
+        let mut map = HashMap::new();
+        for (name, activity) in entries {
+            map.insert(name.to_string(), *activity);
+        }
+        Arc::new(Mutex::new(map))
+    }
+
+    fn bootstrap_busy(flag: &Arc<AtomicBool>, activity: &ActivityStore) -> bool {
+        flag.load(Ordering::SeqCst) || any_busy(activity)
+    }
+
+    #[test]
+    fn bootstrap_active_true_reports_busy() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let activity = make_activity(&[]);
+        assert!(bootstrap_busy(&flag, &activity));
+    }
+
+    #[test]
+    fn bootstrap_active_false_empty_store_reports_idle() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let activity = make_activity(&[]);
+        assert!(!bootstrap_busy(&flag, &activity));
+    }
+
+    #[test]
+    fn bootstrap_active_true_with_refreshing_slot_reports_busy() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let activity = make_activity(&[("alice", ProfileActivity::Refreshing)]);
+        assert!(bootstrap_busy(&flag, &activity));
+    }
+
+    #[test]
+    fn bootstrap_active_false_with_refreshing_slot_still_busy() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let activity = make_activity(&[("alice", ProfileActivity::Refreshing)]);
+        assert!(bootstrap_busy(&flag, &activity));
+    }
 }
