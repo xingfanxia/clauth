@@ -1000,6 +1000,32 @@ fn partition_due_excludes_switching_profiles() {
     assert!(per_profile.contains_key("p"));
 }
 
+#[test]
+fn partition_due_excludes_refreshing_profiles() {
+    let snapshot = vec![token("p", 95.0)];
+    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let activity = empty_activity();
+    activity
+        .lock()
+        .unwrap()
+        .insert("p".into(), ProfileActivity::Refreshing);
+
+    let (due, _, per_profile) = partition_due(
+        &snapshot,
+        now_ms(),
+        &store,
+        &last_fetched,
+        &learned,
+        &activity,
+    );
+
+    assert!(due.is_empty(), "refreshing profile must be skipped");
+    // Countdown still publishes — UI keeps showing the eligibility timer.
+    assert!(per_profile.contains_key("p"));
+}
+
 // ── apply_outcome: store overwrite guard & cache-hit integration ──────────────
 
 #[test]

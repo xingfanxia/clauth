@@ -803,13 +803,16 @@ pub(crate) fn spawn_refresher(
 
             // Merge forced entries that aren't already scheduled this tick and
             // reflect them in the published map as "due now" (zero countdown).
-            // Forced entries still skip Switching profiles — the switch worker
-            // owns the TokenList write window.
+            // Forced entries still skip Switching and Refreshing profiles — the
+            // switch worker owns the TokenList write window, and a concurrent
+            // rotate_one holds the single-use refresh token.
             if !forced.is_empty() {
                 let switching: HashSet<String> = match activity.lock() {
                     Ok(a) => a
                         .iter()
-                        .filter(|(_, v)| matches!(v, ProfileActivity::Switching))
+                        .filter(|(_, v)| {
+                            matches!(v, ProfileActivity::Switching | ProfileActivity::Refreshing)
+                        })
                         .map(|(n, _)| n.clone())
                         .collect(),
                     Err(_) => snapshot.iter().map(|e| e.name.clone()).collect(),
@@ -1051,16 +1054,21 @@ fn partition_due(
         let interval = interval_for(entry, last_5h, learned);
         let next = last.saturating_add(interval);
         per_profile.insert(entry.name.clone(), next);
-        // Profiles mid-switch are excluded from this tick's due set so the
-        // scheduler can't race the switch worker on the same TokenList write.
+        // Profiles mid-switch or mid-refresh are excluded from this tick's due
+        // set so the scheduler can't race the switch worker on the same
+        // TokenList write, and can't race `rotate_one` / `fetch_with_rotation`'s
+        // inline refresh leg on the same single-use refresh token.
         // The countdown still publishes — the UI shows when the profile will
-        // become eligible once Switching clears.
-        let switching = match act.as_ref() {
-            Ok(a) => matches!(a.get(&entry.name), Some(ProfileActivity::Switching)),
-            // Poisoned mutex: fail safe to "is switching" so no duplicate fetch.
+        // become eligible once Switching/Refreshing clears.
+        let excluded = match act.as_ref() {
+            Ok(a) => matches!(
+                a.get(&entry.name),
+                Some(ProfileActivity::Switching | ProfileActivity::Refreshing)
+            ),
+            // Poisoned mutex: fail safe to "excluded" so no duplicate fetch.
             Err(_) => true,
         };
-        if switching {
+        if excluded {
             continue;
         }
         if now >= next {
