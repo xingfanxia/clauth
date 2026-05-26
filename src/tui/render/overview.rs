@@ -15,6 +15,12 @@ use super::format::{
 };
 use crate::fallback::threshold_for;
 use crate::profile::{AppConfig, Profile};
+use crate::usage::now_ms;
+
+/// Width of the per-profile timer slot inserted before the 5h bar.
+/// Format: `XXXs` (3 digits + 's') + 1 trailing space = 5 chars.
+/// When fetching: `● ` padded to this width.
+const TIMER_SLOT: usize = 5;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let target = if area.height >= 18 { 8 } else { 5 };
@@ -199,6 +205,7 @@ fn fixed_overview_width(
 ) -> usize {
     let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
     // 4 = cursor + dot + spacer before name; +2 = spacer + auto-start marker after 5h.
+    // Timer slot is rendered in the gap before 5h and does not count as a column.
     6 + name + kind + five_hour + seven_day + route + column_count.saturating_sub(1) * gap
 }
 
@@ -208,6 +215,9 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
     spans.push(gap(widths));
     spans.push(Span::styled(fixed("type", widths.kind), theme::label()));
     spans.push(gap(widths));
+    // The timer slot sits before the 5h bar; keep the header label left-aligned
+    // over the bar by rendering blanks for the slot width.
+    spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
     spans.push(Span::styled(fixed("5h", widths.five_hour), theme::label()));
     spans.push(Span::raw("  "));
     if widths.seven_day > 0 {
@@ -233,6 +243,7 @@ fn render_overview_row(
     };
 
     let active = cfg.is_active(&profile.name);
+    let name_str = profile.name.clone();
     let cursor = if selected {
         Span::styled("▸ ", theme::accent())
     } else {
@@ -263,12 +274,52 @@ fn render_overview_row(
         Span::raw(" ")
     };
 
+    // Per-profile timer slot: busy pip while fetching, seconds countdown otherwise.
+    let timer_span = {
+        let is_fetching = app
+            .fetching_now
+            .lock()
+            .ok()
+            .is_some_and(|s| s.contains(&name_str));
+        if is_fetching {
+            // Pad the pip to TIMER_SLOT width so columns stay aligned.
+            let mut s = "● ".to_string();
+            while s.chars().count() < TIMER_SLOT {
+                s.push(' ');
+            }
+            Span::styled(s, theme::accent())
+        } else {
+            let secs_str = app
+                .next_refresh_per_profile
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&name_str).copied())
+                .map(|next_ms| {
+                    let now = now_ms();
+                    let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
+                    format!("{secs}s")
+                });
+            match secs_str {
+                Some(s) => {
+                    // Right-pad to TIMER_SLOT so bar alignment is preserved.
+                    let mut padded = s;
+                    while padded.chars().count() < TIMER_SLOT {
+                        padded.push(' ');
+                    }
+                    Span::styled(padded, theme::faint())
+                }
+                None => Span::raw(" ".repeat(TIMER_SLOT)),
+            }
+        }
+    };
+
     let mut spans = vec![cursor, dot, Span::raw(" "), name, name_pad, gap(widths)];
     spans.push(Span::styled(
         fixed(&account_type_label(profile), widths.kind),
         account_type_style(profile),
     ));
     spans.push(gap(widths));
+    spans.push(timer_span);
     let (five_text, five_style) = window_summary_parts(
         profile.usage.as_ref().and_then(|u| u.five_hour.as_ref()),
         widths.five_hour,

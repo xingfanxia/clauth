@@ -1,6 +1,4 @@
-//! Top bar: claude glyph + title block (brand, screen eyebrow, status).
-
-use std::sync::atomic::Ordering;
+//! Top bar: claude glyph + title block (brand, screen eyebrow).
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -11,7 +9,6 @@ use ratatui::widgets::Paragraph;
 use super::super::app::{App, Screen};
 use super::super::theme;
 use crate::format::plan_label;
-use crate::usage::now_ms;
 
 const VERSION_SUFFIX: &str = concat!("  v", env!("CARGO_PKG_VERSION"));
 
@@ -87,39 +84,15 @@ fn draw_title(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     drop(cfg);
-    let para = Paragraph::new(vec![title, eyebrow, status_line(app)]).style(theme::base());
+    let para = Paragraph::new(vec![title, eyebrow]).style(theme::base());
     frame.render_widget(para, area);
-}
-
-/// Live refresh state — busy pip plus countdown to the next background
-/// poll. Sits on the header's third row so the footer is free for hints.
-fn status_line(app: &App) -> Line<'static> {
-    let busy = app.activity.load(Ordering::Relaxed);
-    let pip = if busy {
-        Span::styled("●", theme::accent())
-    } else {
-        Span::styled("●", theme::faint())
-    };
-    let countdown = next_refresh_secs(app);
-    Line::from(vec![
-        pip,
-        Span::styled(format!(" next refresh in {countdown}s"), theme::faint()),
-    ])
-}
-
-fn next_refresh_secs(app: &App) -> i64 {
-    let target = app.next_refresh_at.load(Ordering::Relaxed) as i64;
-    let now = now_ms() as i64;
-    ((target - now) / 1000).max(0)
 }
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Claude glyph in the top-left. Static orange — the status pip on the third
-/// title row is the one busy indicator, so the logo stays a calm anchor.
-/// Eyes blank for ~200ms every ~6s as a subtle sign of life.
+/// Claude glyph in the top-left. Eyes blank for ~200ms every ~6s as a subtle sign of life.
 fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let elapsed = app.started_at.elapsed().as_millis() as u64;
     let blink = (elapsed % 6000) < 200;

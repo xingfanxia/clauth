@@ -9,7 +9,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -33,10 +32,10 @@ use crate::profile::{
     AppConfig, Profile, app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::usage::{
-    ActivityFlag, ConsecutiveCacheHit, ConsecutiveOk, Last429At, LastFetchedAt, LastRotatedWindow,
-    LearnedIntervals, NextRefreshAt, PendingAutoStart, PendingWindowRotation, RefetchQueue,
+    ConsecutiveCacheHit, ConsecutiveOk, FetchingNow, Last429At, LastFetchedAt, LastRotatedWindow,
+    LearnedIntervals, NextRefreshPerProfile, PendingAutoStart, PendingWindowRotation, RefetchQueue,
     StatusStore, TokenEntry, TokenList, UsageStore, default_fallback_threshold, fetch_all_into,
-    now_ms, spawn_refresher,
+    spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -340,8 +339,8 @@ pub(crate) struct App {
     pub(crate) usage_store: UsageStore,
     pub(crate) usage_status: StatusStore,
     pub(crate) usage_tokens: TokenList,
-    pub(crate) activity: ActivityFlag,
-    pub(crate) next_refresh_at: NextRefreshAt,
+    pub(crate) next_refresh_per_profile: NextRefreshPerProfile,
+    pub(crate) fetching_now: FetchingNow,
     pub(crate) last_fetched: LastFetchedAt,
     pub(crate) pending_auto_start: PendingAutoStart,
     pub(crate) pending_window_rotation: PendingWindowRotation,
@@ -375,8 +374,8 @@ impl App {
         let usage_store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
         let usage_status: StatusStore = Arc::new(Mutex::new(HashMap::new()));
         let usage_tokens: TokenList = Arc::new(Mutex::new(collect_tokens(&config.profiles)));
-        let activity: ActivityFlag = Arc::new(AtomicBool::new(false));
-        let next_refresh_at: NextRefreshAt = Arc::new(AtomicU64::new(now_ms() + 30_000));
+        let next_refresh_per_profile: NextRefreshPerProfile = Arc::new(Mutex::new(HashMap::new()));
+        let fetching_now: FetchingNow = Arc::new(Mutex::new(HashSet::new()));
         let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
         let pending_auto_start: PendingAutoStart = Arc::new(Mutex::new(HashSet::new()));
         let pending_window_rotation: PendingWindowRotation = Arc::new(Mutex::new(HashMap::new()));
@@ -396,8 +395,8 @@ impl App {
             usage_store,
             usage_status,
             usage_tokens,
-            activity,
-            next_refresh_at,
+            next_refresh_per_profile,
+            fetching_now,
             last_fetched,
             pending_auto_start,
             pending_window_rotation,
@@ -456,7 +455,6 @@ impl App {
             &snapshot,
             &self.usage_store,
             &self.usage_status,
-            &self.activity,
             &self.last_fetched,
             &self.pending_auto_start,
             &self.refetch_queue,
@@ -485,7 +483,6 @@ impl App {
                 &retry,
                 &self.usage_store,
                 &self.usage_status,
-                &self.activity,
                 &self.last_fetched,
                 &self.pending_auto_start,
                 &self.refetch_queue,
@@ -504,8 +501,8 @@ impl App {
             Arc::clone(&self.usage_tokens),
             Arc::clone(&self.usage_store),
             Arc::clone(&self.usage_status),
-            Arc::clone(&self.activity),
-            Arc::clone(&self.next_refresh_at),
+            Arc::clone(&self.next_refresh_per_profile),
+            Arc::clone(&self.fetching_now),
             Arc::clone(&self.last_fetched),
             Arc::clone(&self.pending_auto_start),
             Arc::clone(&self.pending_window_rotation),
@@ -576,11 +573,8 @@ impl App {
             .lock()
             .expect("usage_tokens mutex poisoned")
             .clone();
-        self.next_refresh_at
-            .store(now_ms() + 30_000, Ordering::Relaxed);
         let store = Arc::clone(&self.usage_store);
         let status = Arc::clone(&self.usage_status);
-        let activity = Arc::clone(&self.activity);
         let last_fetched = Arc::clone(&self.last_fetched);
         let pending_auto_start = Arc::clone(&self.pending_auto_start);
         let refetch_queue = Arc::clone(&self.refetch_queue);
@@ -593,7 +587,6 @@ impl App {
                 &snapshot,
                 &store,
                 &status,
-                &activity,
                 &last_fetched,
                 &pending_auto_start,
                 &refetch_queue,

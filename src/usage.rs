@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -87,12 +86,14 @@ pub(crate) struct TokenEntry {
     pub(crate) auto_start: bool,
 }
 
-/// Coarse shared signal observed by the TUI header. Set true while any
-/// background fetch is in flight, so the Claude logo can flash sapphire.
-pub(crate) type ActivityFlag = Arc<AtomicBool>;
+/// Per-profile epoch-ms of the next scheduled fetch. Written by the scheduler
+/// after each `partition_due` run so the overview rows can show a countdown
+/// without re-running the partition math on the render thread.
+pub(crate) type NextRefreshPerProfile = Arc<Mutex<HashMap<String, u64>>>;
 
-/// Epoch-ms of the next scheduled refresh tick. Powers the footer countdown.
-pub(crate) type NextRefreshAt = Arc<AtomicU64>;
+/// Profile names currently being fetched. The overview row shows a busy pip
+/// in the timer slot instead of a countdown while a fetch is in flight.
+pub(crate) type FetchingNow = Arc<Mutex<HashSet<String>>>;
 
 /// Outcome of the most recent usage fetch attempt for a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -680,7 +681,6 @@ pub(crate) fn fetch_all_into(
     tokens: &[TokenEntry],
     store: &UsageStore,
     status: &StatusStore,
-    activity: &ActivityFlag,
     last_fetched: &LastFetchedAt,
     pending_auto_start: &PendingAutoStart,
     refetch: &RefetchQueue,
@@ -692,7 +692,6 @@ pub(crate) fn fetch_all_into(
     if tokens.is_empty() {
         return;
     }
-    activity.store(true, Ordering::Relaxed);
 
     let handles: Vec<_> = tokens
         .iter()
@@ -719,8 +718,6 @@ pub(crate) fn fetch_all_into(
             last_429,
         );
     }
-
-    activity.store(false, Ordering::Relaxed);
 }
 
 /// Background scheduler. Wakes every second and fans out parallel fetches for
@@ -733,8 +730,8 @@ pub(crate) fn spawn_refresher(
     tokens: TokenList,
     store: UsageStore,
     status: StatusStore,
-    activity: ActivityFlag,
-    next_at: NextRefreshAt,
+    next_refresh_per_profile: NextRefreshPerProfile,
+    fetching_now: FetchingNow,
     last_fetched: LastFetchedAt,
     pending_auto_start: PendingAutoStart,
     pending_window_rotation: PendingWindowRotation,
@@ -754,7 +751,6 @@ pub(crate) fn spawn_refresher(
                 Err(_) => continue,
             };
             if snapshot.is_empty() {
-                next_at.store(now_ms() + NORMAL_INTERVAL_MS, Ordering::Relaxed);
                 continue;
             }
 
@@ -769,8 +765,14 @@ pub(crate) fn spawn_refresher(
             // Decide which entries are due this tick. Per-profile intervals
             // come from the AIMD learner held in `learned`.
             let now = now_ms();
-            let (mut due, soonest_next) =
+            let (mut due, _soonest_next, per_profile_next) =
                 partition_due(&snapshot, now, &store, &last_fetched, &learned);
+
+            // Publish the per-profile next times so overview rows can render
+            // countdowns without re-running partition logic.
+            if let Ok(mut nrpp) = next_refresh_per_profile.lock() {
+                nrpp.clone_from(&per_profile_next);
+            }
 
             // Merge forced entries that aren't already scheduled this tick.
             if !forced.is_empty() {
@@ -787,11 +789,16 @@ pub(crate) fn spawn_refresher(
             }
 
             if due.is_empty() {
-                next_at.store(soonest_next, Ordering::Relaxed);
                 continue;
             }
 
-            activity.store(true, Ordering::Relaxed);
+            // Mark profiles as in-flight so the overview row shows a pip.
+            if let Ok(mut fn_set) = fetching_now.lock() {
+                for entry in &due {
+                    fn_set.insert(entry.name.clone());
+                }
+            }
+
             let handles: Vec<_> = due
                 .into_iter()
                 .map(|entry| {
@@ -803,6 +810,13 @@ pub(crate) fn spawn_refresher(
                 let Ok(outcome) = h.join() else {
                     continue;
                 };
+                // Clear the in-flight marker before writing results so the
+                // overview row transitions from pip → fresh countdown atomically
+                // from the render thread's perspective (it reads both under separate
+                // locks, but a brief flicker to "no pip + stale timer" is acceptable).
+                if let Ok(mut fn_set) = fetching_now.lock() {
+                    fn_set.remove(&outcome.name);
+                }
                 apply_outcome(
                     outcome,
                     &store,
@@ -815,7 +829,6 @@ pub(crate) fn spawn_refresher(
                     &last_429,
                 );
             }
-            activity.store(false, Ordering::Relaxed);
 
             // After fetches complete, check for profiles whose 5h window has
             // expired (now >= resets_at + 1s) and haven't been rotated for
@@ -828,12 +841,13 @@ pub(crate) fn spawn_refresher(
                 &pending_window_rotation,
             );
 
-            // Recompute the soonest next due moment AFTER fetches have
-            // updated `last_fetched`, so the footer countdown reflects the
-            // freshly-recorded deadlines instead of the pre-tick estimate.
-            let (_, soonest_after) =
+            // Recompute per-profile next times AFTER fetches have updated
+            // `last_fetched` so the overview countdowns reflect fresh deadlines.
+            let (_, _, per_profile_after) =
                 partition_due(&snapshot, now_ms(), &store, &last_fetched, &learned);
-            next_at.store(soonest_after, Ordering::Relaxed);
+            if let Ok(mut nrpp) = next_refresh_per_profile.lock() {
+                nrpp.clone_from(&per_profile_after);
+            }
         }
     });
 }
@@ -884,21 +898,22 @@ fn scan_expired_windows(
     }
 }
 
-/// Split `snapshot` into the subset due this tick and the soonest epoch-ms
-/// at which any non-due entry will become due. The empty-list case is
-/// callers' responsibility (we never get here with an empty snapshot).
+/// Split `snapshot` into the subset due this tick, the soonest epoch-ms at
+/// which any non-due entry will become due, and a per-profile map of next
+/// fetch epoch-ms. The empty-list case is callers' responsibility.
 fn partition_due(
     snapshot: &[TokenEntry],
     now: u64,
     store: &UsageStore,
     last_fetched: &LastFetchedAt,
     learned: &LearnedIntervals,
-) -> (Vec<TokenEntry>, u64) {
+) -> (Vec<TokenEntry>, u64, HashMap<String, u64>) {
     let lf = last_fetched.lock().ok();
     let st = store.lock().ok();
 
     let mut due = Vec::new();
     let mut soonest_next = now + NORMAL_INTERVAL_MS;
+    let mut per_profile = HashMap::with_capacity(snapshot.len());
     for entry in snapshot {
         let last = lf
             .as_ref()
@@ -909,13 +924,14 @@ fn partition_due(
             .and_then(|s| s.get(&entry.name).and_then(five_hour_utilization));
         let interval = interval_for(entry, last_5h, learned);
         let next = last.saturating_add(interval);
+        per_profile.insert(entry.name.clone(), next);
         if now >= next {
             due.push(entry.clone());
         } else if next < soonest_next {
             soonest_next = next;
         }
     }
-    (due, soonest_next)
+    (due, soonest_next, per_profile)
 }
 
 pub(crate) fn now_ms() -> u64 {
