@@ -8,6 +8,7 @@
 use super::*;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, Profile, profile_dir};
 use crate::runtime::open_pid_file;
+use crate::usage::is_idle;
 
 // Build a minimal AppConfig with one OAuth profile named `name`.
 fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
@@ -118,6 +119,59 @@ fn force_true_bypasses_diverged_active_when_no_active_profile() {
     assert_eq!(force_false.len(), 1);
     assert_eq!(force_true.len(), 1);
     assert_eq!(force_true[0].0, "test-oauth-force-diverged");
+}
+
+/// `rotate_one` must NOT stamp `Refreshing` when the profile has no refresh
+/// token — the short-circuit `let Some(rt) = token else { return false }` runs
+/// before any HTTP, so the activity slot should remain clean (Idle).
+#[test]
+fn rotate_one_no_stamp_when_no_refresh_token() {
+    use std::collections::BTreeMap;
+    use std::sync::mpsc;
+
+    // Profile with OAuth block but no refresh token.
+    let profile = Profile {
+        name: "test-rotate-one-no-rt".to_string(),
+        base_url: None,
+        api_key: None,
+        auto_start: false,
+        env: BTreeMap::new(),
+        fallback_threshold: None,
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }),
+        usage: None,
+        fetch_status: None,
+    };
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    };
+    config
+        .state
+        .profiles
+        .push("test-rotate-one-no-rt".to_string());
+
+    let config = Arc::new(Mutex::new(config));
+    let activity: ActivityStore = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (tx, _rx) = mpsc::channel();
+
+    let result = rotate_one(&config, "test-rotate-one-no-rt", &activity, &tx);
+
+    assert!(
+        !result,
+        "rotate_one should return false when no refresh token"
+    );
+    assert!(
+        is_idle(&activity, "test-rotate-one-no-rt"),
+        "activity slot must remain Idle when rotate_one short-circuits at no-token"
+    );
 }
 
 #[test]

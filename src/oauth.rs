@@ -123,6 +123,13 @@ pub(crate) fn rotate_one(
             let rt = cfg
                 .find(name)
                 .and_then(|p| p.refresh_token().map(str::to_string));
+            if rt.is_some() {
+                // Stamp Refreshing under the state lock so partition_due cannot
+                // observe this profile as Idle between the credential read and
+                // the HTTP call. Lock order (AppConfig → state → leaf) is preserved:
+                // activity is a leaf mutex acquired inside with_state_lock.
+                mark_activity(activity, name, ProfileActivity::Refreshing);
+            }
             Ok(rt)
         })
         .ok()
@@ -132,8 +139,6 @@ pub(crate) fn rotate_one(
     let Some(rt) = token else {
         return false;
     };
-    // Mark Refreshing only around the HTTP call, never across the state lock.
-    mark_activity(activity, name, ProfileActivity::Refreshing);
     let refreshed = refresh(&rt);
     let (outcome, applied) = match refreshed {
         Ok(tok) => {
