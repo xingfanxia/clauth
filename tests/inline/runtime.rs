@@ -3,8 +3,10 @@ use std::fs::{self, OpenOptions};
 use std::time::{Duration, SystemTime};
 
 // Minimal valid ClaudeCredentials JSON — has claudeAiOauth.accessToken.
-const CREDS_V1: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok1"}}"#;
-const CREDS_V2: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok2"}}"#;
+// V1 has an earlier expires_at than V2 so real-mode tests can assert the
+// newer side wins without ambiguity.
+const CREDS_V1: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok1","expiresAt":1000}}"#;
+const CREDS_V2: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok2","expiresAt":2000}}"#;
 
 fn set_mtime(path: &Path, when: SystemTime) {
     let file = OpenOptions::new()
@@ -122,6 +124,99 @@ fn sync_creates_canonical_when_missing() {
             .file_type()
             .is_symlink()
     );
+}
+
+// ── M6: expires_at tie-breaking in sync_credentials_unlocked ─────────────────
+
+// When canonical and runtime are byte-identical, no write should occur.
+#[test]
+fn sync_no_write_when_bytes_identical() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical = tmp.path().join("canonical.json");
+    let link_path = tmp.path().join(".credentials.json");
+    fs::write(&link_path, CREDS_V1).expect("write link");
+    fs::write(&canonical, CREDS_V1).expect("write canonical");
+
+    let written = sync_credentials_unlocked(&link_path, &canonical).expect("sync");
+    assert!(!written, "no write when bytes identical");
+    assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
+}
+
+// When canonical has a later expires_at, it wins — canonical must NOT be
+// overwritten even though the runtime is a regular file.
+#[test]
+fn sync_canonical_wins_when_expires_at_is_later() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical = tmp.path().join("canonical.json");
+    let link_path = tmp.path().join(".credentials.json");
+    // V2 has a higher expires_at than V1.
+    fs::write(&link_path, CREDS_V1).expect("write runtime (stale)");
+    fs::write(&canonical, CREDS_V2).expect("write canonical (rotated)");
+
+    let written = sync_credentials_unlocked(&link_path, &canonical).expect("sync");
+    assert!(
+        !written,
+        "canonical must not be overwritten when it has later expires_at"
+    );
+    assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
+    #[cfg(unix)]
+    assert!(
+        link_path
+            .symlink_metadata()
+            .expect("meta")
+            .file_type()
+            .is_symlink(),
+        "runtime re-linked to canonical even when canonical wins"
+    );
+}
+
+// When runtime has a later expires_at, it wins — canonical IS overwritten
+// (existing behavior, now with explicit expires_at context).
+#[test]
+fn sync_runtime_wins_when_expires_at_is_later() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical = tmp.path().join("canonical.json");
+    let link_path = tmp.path().join(".credentials.json");
+    // V2 > V1 in expires_at, so V2 runtime wins.
+    fs::write(&link_path, CREDS_V2).expect("write runtime (newer)");
+    fs::write(&canonical, CREDS_V1).expect("write canonical (older)");
+
+    let written = sync_credentials_unlocked(&link_path, &canonical).expect("sync");
+    assert!(
+        written,
+        "canonical must be overwritten when runtime has later expires_at"
+    );
+    assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
+}
+
+// When canonical is missing, runtime always wins regardless of expires_at.
+#[test]
+fn sync_runtime_wins_when_canonical_missing_expires_at() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical = tmp.path().join("nested").join("canonical.json");
+    let link_path = tmp.path().join(".credentials.json");
+    fs::write(&link_path, CREDS_V1).expect("write runtime");
+
+    let written = sync_credentials_unlocked(&link_path, &canonical).expect("sync");
+    assert!(
+        written,
+        "runtime must become canonical when canonical is absent"
+    );
+    assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
+}
+
+// When canonical cannot be parsed as JSON, runtime wins (safer than losing it).
+#[test]
+fn sync_runtime_wins_when_canonical_unparseable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical = tmp.path().join("canonical.json");
+    let link_path = tmp.path().join(".credentials.json");
+    fs::write(&link_path, CREDS_V1).expect("write runtime");
+    fs::write(&canonical, b"corrupt json {{{").expect("write corrupt canonical");
+
+    let written = sync_credentials_unlocked(&link_path, &canonical).expect("sync");
+    assert!(written, "runtime must win when canonical is unparseable");
+    assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
 }
 
 #[test]

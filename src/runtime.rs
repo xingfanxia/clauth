@@ -510,20 +510,48 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     if meta.file_type().is_symlink() {
         return Ok(false);
     }
-    let bytes = std::fs::read(link_path).context("failed to read live credentials")?;
+    let runtime_bytes = std::fs::read(link_path).context("failed to read live credentials")?;
     // Skip if CC's write is mid-flight (partial, invalid, or empty object).
     // {} deserializes as ClaudeCredentials { claude_ai_oauth: None } because
     // the field is Option — require Some to confirm a completed write.
-    let Ok(creds) = serde_json::from_slice::<ClaudeCredentials>(&bytes) else {
+    let Ok(runtime_creds) = serde_json::from_slice::<ClaudeCredentials>(&runtime_bytes) else {
         return Ok(false);
     };
-    if creds.claude_ai_oauth.is_none() {
+    if runtime_creds.claude_ai_oauth.is_none() {
         return Ok(false);
     }
     let canonical_bytes = std::fs::read(canonical).ok();
-    let differs = canonical_bytes.as_deref() != Some(bytes.as_slice());
+    let differs = canonical_bytes.as_deref() != Some(runtime_bytes.as_slice());
+    let mut wrote_canonical = false;
     if differs {
-        atomic_write(canonical, &bytes)?;
+        // Bytes differ: the TUI may have rotated canonical while CC wrote a
+        // fresh login into the runtime regular file. Use expires_at as the
+        // tie-breaker so the newer token wins. Canonical wins on tie or when
+        // it can't be parsed (missing canonical → runtime wins by default).
+        let canonical_exp = canonical_bytes.as_deref().and_then(|cb| {
+            let c = serde_json::from_slice::<ClaudeCredentials>(cb).ok()?;
+            Some(c.claude_ai_oauth?.expires_at.unwrap_or(0))
+        });
+        let runtime_exp = runtime_creds
+            .claude_ai_oauth
+            .as_ref()
+            .map(|o| o.expires_at.unwrap_or(0));
+        let canonical_wins = match (canonical_exp, runtime_exp) {
+            (Some(ce), Some(re)) => ce >= re,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if canonical_wins {
+            // TUI rotation wrote a fresher token into canonical; do not
+            // overwrite it with the stale runtime bytes.
+            eprintln!(
+                "clauth: watchdog kept canonical credentials \
+                 (canonical expires_at >= runtime); not overwriting with runtime re-login bytes"
+            );
+        } else {
+            atomic_write(canonical, &runtime_bytes)?;
+            wrote_canonical = true;
+        }
     }
     if canonical.exists() {
         let tmp = link_path.with_file_name(format!(".credentials.json.tmp.{}", std::process::id()));
@@ -533,7 +561,7 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     } else {
         std::fs::remove_file(link_path)?;
     }
-    Ok(differs)
+    Ok(wrote_canonical)
 }
 
 /// Bidirectional mtime-based mirror between `runtime/.credentials.json` and
