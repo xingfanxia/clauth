@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,104 +12,6 @@ use crate::profile::{ClaudeCredentials, OAuthToken, atomic_write, clauth_dir, pr
 
 const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
-
-/// Default scheduler tick. `spawn_refresher` wakes every second and only
-/// performs network work for profiles whose per-profile interval has elapsed.
-const TICK_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Baseline refresh interval. Used as the default when no learned value exists
-/// and as the quiet-period reset target.
-pub(crate) const NORMAL_INTERVAL_MS: u64 = 30_000;
-
-/// AIMD learner bounds and step. The learned value is clamped to [FLOOR, CEILING]
-/// after every bump; STEP is the additive decrease per recovery round.
-pub(crate) const LEARNED_FLOOR_MS: u64 = 10_000;
-pub(crate) const LEARNED_CEILING_MS: u64 = 300_000;
-pub(crate) const LEARNED_STEP_MS: u64 = 5_000;
-
-/// After this many ms without a 429, a raised learned interval resets to
-/// NORMAL_INTERVAL_MS so a single spike doesn't permanently raise the floor.
-pub(crate) const LEARNED_QUIET_RESET_MS: u64 = 5 * 60 * 1_000;
-
-/// Default fallback threshold (must match `fallback::DEFAULT_THRESHOLD`).
-const DEFAULT_FALLBACK_THRESHOLD: f64 = 95.0;
-
-/// Distance below the fallback threshold at which the refresher clamps to
-/// LEARNED_FLOOR_MS regardless of the learned value.
-const NEAR_THRESHOLD_MARGIN: f64 = 5.0;
-
-pub(crate) type UsageStore = Arc<Mutex<HashMap<String, UsageInfo>>>;
-pub(crate) type StatusStore = Arc<Mutex<HashMap<String, FetchStatus>>>;
-pub(crate) type TokenList = Arc<Mutex<Vec<TokenEntry>>>;
-
-/// Per-profile epoch-ms of the last fetch attempt (cache-rule gating).
-pub(crate) type LastFetchedAt = Arc<Mutex<HashMap<String, u64>>>;
-
-/// Names pushed here after a successful token rotation are fetched on the very
-/// next scheduler tick, bypassing the per-profile cadence.
-pub(crate) type RefetchQueue = Arc<Mutex<HashSet<String>>>;
-
-/// Per-profile learned refresh interval in ms (AIMD cadence).
-pub(crate) type LearnedIntervals = Arc<Mutex<HashMap<String, u64>>>;
-
-/// How many consecutive non-429 fetches each profile has seen since the last backoff.
-pub(crate) type ConsecutiveOk = Arc<Mutex<HashMap<String, u32>>>;
-
-/// How many consecutive Fresh fetches with unchanged utilization each profile
-/// has seen. Used to detect server-side cache hits and back off when polling
-/// faster than the server invalidates. In-memory only; not persisted.
-pub(crate) type ConsecutiveCacheHit = Arc<Mutex<HashMap<String, u32>>>;
-
-/// Epoch-ms of the most recent 429 per profile. Used for quiet-period resets.
-pub(crate) type Last429At = Arc<Mutex<HashMap<String, u64>>>;
-
-/// Profiles that need an auto-start kick after the fetch revealed no live 5h
-/// window. Main thread drains this set on every tick.
-pub(crate) type PendingAutoStart = Arc<Mutex<HashSet<String>>>;
-
-/// Profiles whose 5h window has just expired and need a token rotation.
-/// Value: the `resets_at` epoch-secs pinned at detection time so the drain
-/// stamps `LastRotatedWindow` with the exact window it acted on, not whatever
-/// the store holds when the drain runs (which may already be a newer window).
-pub(crate) type PendingWindowRotation = Arc<Mutex<HashMap<String, i64>>>;
-
-/// Per-profile `resets_at` epoch-secs we already rotated on, so each expiry
-/// fires exactly once.
-pub(crate) type LastRotatedWindow = Arc<Mutex<HashMap<String, i64>>>;
-
-/// Snapshot of one profile's OAuth identity used by the refresher.
-#[derive(Clone)]
-pub(crate) struct TokenEntry {
-    pub(crate) name: String,
-    pub(crate) access_token: String,
-    pub(crate) refresh_token: Option<String>,
-    pub(crate) fallback_threshold: f64,
-    pub(crate) auto_start: bool,
-}
-
-/// Per-profile epoch-ms of the next scheduled fetch. Written by the scheduler
-/// after each `partition_due` run so the overview rows can show a countdown
-/// without re-running the partition math on the render thread.
-pub(crate) type NextRefreshPerProfile = Arc<Mutex<HashMap<String, u64>>>;
-
-/// Profile names currently being fetched. The overview row shows a busy pip
-/// in the timer slot instead of a countdown while a fetch is in flight.
-pub(crate) type FetchingNow = Arc<Mutex<HashSet<String>>>;
-
-/// Outcome of the most recent usage fetch attempt for a profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FetchStatus {
-    /// Live response from the Anthropic API this tick.
-    Fresh,
-    /// API request failed; the numbers shown come from the on-disk cache.
-    Cached,
-    /// API request failed and no cache was available — no data to show.
-    Failed,
-    /// The API returned 429 on the initial call (the signal was observed this
-    /// tick regardless of whether the retry after token rotation succeeded).
-    /// The AIMD learner uses this to bump the per-profile interval up.
-    RateLimited,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct UsageWindow {
@@ -276,14 +179,14 @@ fn fetch_raw(access_token: &str) -> std::result::Result<UsageInfo, FetchError> {
     })
 }
 
-/// Read the on-disk usage cache for `name`. Returns `Cached` when a snapshot
-/// is available, `Failed` when no cache exists.
+/// Read the on-disk usage cache for `name`. Returns `(Some, status)` when a
+/// snapshot is available, `(None, Failed)` when no cache exists.
 fn load_disk_cache(name: &str, status: FetchStatus) -> (Option<UsageInfo>, FetchStatus) {
-    let cache = cache_path(name);
-    match cache.and_then(|p| {
+    let loaded = cache_path(name).and_then(|p| {
         let text = std::fs::read_to_string(p).ok()?;
         serde_json::from_str::<UsageInfo>(&text).ok()
-    }) {
+    });
+    match loaded {
         Some(info) => (Some(info), status),
         None => (None, FetchStatus::Failed),
     }
@@ -342,42 +245,255 @@ fn persist_oauth_token(name: &str, oauth: &OAuthToken) -> Result<()> {
     })
 }
 
+fn cache_path(profile_name: &str) -> Option<PathBuf> {
+    dirs::home_dir().map(|h| {
+        h.join(".clauth")
+            .join("profiles")
+            .join(profile_name)
+            .join("usage_cache.json")
+    })
+}
+
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ── Time helpers ──────────────────────────────────────────────────────────────
+
+/// Parses an ISO-8601 timestamp like `2026-05-17T14:20:00.121699+00:00` into
+/// seconds since the Unix epoch. Returns None on any format deviation.
+pub(crate) fn iso_to_epoch_secs(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    let year: i64 = std::str::from_utf8(&bytes[0..4]).ok()?.parse().ok()?;
+    let month: i64 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
+    let day: i64 = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
+    let hour: i64 = std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?;
+    let minute: i64 = std::str::from_utf8(&bytes[14..16]).ok()?.parse().ok()?;
+    let second: i64 = std::str::from_utf8(&bytes[17..19]).ok()?.parse().ok()?;
+
+    let tail = &s[19..];
+    let after_frac = if let Some(rest) = tail.strip_prefix('.') {
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        &rest[end..]
+    } else {
+        tail
+    };
+    let tz_offset_secs: i64 = if after_frac.is_empty() || after_frac.starts_with('Z') {
+        0
+    } else {
+        let sign = match after_frac.as_bytes()[0] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        if after_frac.len() < 6 {
+            return None;
+        }
+        let tz_h: i64 = after_frac[1..3].parse().ok()?;
+        let tz_m: i64 = after_frac[4..6].parse().ok()?;
+        sign * (tz_h * 3600 + tz_m * 60)
+    };
+
+    // Howard Hinnant's days-from-civil — yields days since 1970-01-01.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = month;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+
+    Some(days * 86400 + hour * 3600 + minute * 60 + second - tz_offset_secs)
+}
+
+pub(crate) fn now_epoch_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Formats a duration in seconds as a tight `Nd Nh`, `Nh Nm`, or `Nm` string.
+/// Returns `now` for zero or negative.
+pub(crate) fn humanize_duration(secs: i64) -> String {
+    if secs <= 0 {
+        return "now".to_string();
+    }
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    if days > 0 {
+        format!("{}d {}h", days, hours % 24)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, mins % 60)
+    } else {
+        format!("{}m", mins.max(1))
+    }
+}
+
+/// Default scheduler tick. `spawn_refresher` wakes every second and only
+/// performs network work for profiles whose per-profile interval has elapsed.
+const TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Baseline refresh interval. Used as the default when no learned value exists
+/// and as the quiet-period reset target.
+pub(crate) const NORMAL_INTERVAL_MS: u64 = 30_000;
+
+/// AIMD learner bounds and step. The learned value is clamped to [FLOOR, CEILING]
+/// after every bump; STEP is the additive decrease per recovery round.
+pub(crate) const LEARNED_FLOOR_MS: u64 = 10_000;
+pub(crate) const LEARNED_CEILING_MS: u64 = 300_000;
+pub(crate) const LEARNED_STEP_MS: u64 = 5_000;
+
+/// After this many ms without a 429, a raised learned interval resets to
+/// NORMAL_INTERVAL_MS so a single spike doesn't permanently raise the floor.
+pub(crate) const LEARNED_QUIET_RESET_MS: u64 = 5 * 60 * 1_000;
+
+/// Default fallback threshold (must match `fallback::DEFAULT_THRESHOLD`).
+const DEFAULT_FALLBACK_THRESHOLD: f64 = 95.0;
+
+/// Distance below the fallback threshold at which the refresher clamps to
+/// LEARNED_FLOOR_MS regardless of the learned value.
+const NEAR_THRESHOLD_MARGIN: f64 = 5.0;
+
+/// Tolerance for "same five-hour utilization" comparison when deciding a
+/// Fresh response is actually a server-side cache hit. Well below display
+/// precision but above any plausible f64 round-trip jitter.
+const CACHE_HIT_EPSILON: f64 = 1e-9;
+
+/// Estimated TTL of the Anthropic `/usage` server-side cache. Two consecutive
+/// Fresh responses with identical five-hour utilization only count as a
+/// "server cache hit" when the second one landed within this window — beyond
+/// it, an unchanged value just means the user isn't burning tokens, and that
+/// must not pull the learner back up toward NORMAL.
+const SERVER_CACHE_TTL_ESTIMATE_MS: u64 = 25_000;
+
+pub(crate) type UsageStore = Arc<Mutex<HashMap<String, UsageInfo>>>;
+pub(crate) type StatusStore = Arc<Mutex<HashMap<String, FetchStatus>>>;
+pub(crate) type TokenList = Arc<Mutex<Vec<TokenEntry>>>;
+
+/// Per-profile epoch-ms of the last fetch attempt (cache-rule gating).
+pub(crate) type LastFetchedAt = Arc<Mutex<HashMap<String, u64>>>;
+
+/// Names pushed here after a successful token rotation are fetched on the very
+/// next scheduler tick, bypassing the per-profile cadence.
+pub(crate) type RefetchQueue = Arc<Mutex<HashSet<String>>>;
+
+/// Per-profile learned refresh interval in ms (AIMD cadence).
+pub(crate) type LearnedIntervals = Arc<Mutex<HashMap<String, u64>>>;
+
+/// How many consecutive non-429 fetches each profile has seen since the last backoff.
+pub(crate) type ConsecutiveOk = Arc<Mutex<HashMap<String, u32>>>;
+
+/// How many consecutive Fresh fetches with unchanged utilization each profile
+/// has seen. Used to detect server-side cache hits and back off when polling
+/// faster than the server invalidates. In-memory only; not persisted.
+pub(crate) type ConsecutiveCacheHit = Arc<Mutex<HashMap<String, u32>>>;
+
+/// Epoch-ms of the most recent 429 per profile. Used for quiet-period resets.
+pub(crate) type Last429At = Arc<Mutex<HashMap<String, u64>>>;
+
+/// Profiles that need an auto-start kick after the fetch revealed no live 5h
+/// window. Main thread drains this set on every tick.
+pub(crate) type PendingAutoStart = Arc<Mutex<HashSet<String>>>;
+
+/// Profiles whose 5h window has just expired and need a token rotation.
+/// Value: the `resets_at` epoch-secs pinned at detection time so the drain
+/// stamps `LastRotatedWindow` with the exact window it acted on, not whatever
+/// the store holds when the drain runs (which may already be a newer window).
+pub(crate) type PendingWindowRotation = Arc<Mutex<HashMap<String, i64>>>;
+
+/// Per-profile `resets_at` epoch-secs we already rotated on, so each expiry
+/// fires exactly once.
+pub(crate) type LastRotatedWindow = Arc<Mutex<HashMap<String, i64>>>;
+
+/// Snapshot of one profile's OAuth identity used by the refresher.
+#[derive(Clone)]
+pub(crate) struct TokenEntry {
+    pub(crate) name: String,
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: Option<String>,
+    pub(crate) fallback_threshold: f64,
+    pub(crate) auto_start: bool,
+}
+
+/// Per-profile epoch-ms of the next scheduled fetch. Written by the scheduler
+/// after each `partition_due` run so the overview rows can show a countdown
+/// without re-running the partition math on the render thread.
+pub(crate) type NextRefreshPerProfile = Arc<Mutex<HashMap<String, u64>>>;
+
+/// Profile names currently being fetched. The overview row shows a busy pip
+/// in the timer slot instead of a countdown while a fetch is in flight.
+pub(crate) type FetchingNow = Arc<Mutex<HashSet<String>>>;
+
+/// Outcome of the most recent usage fetch attempt for a profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FetchStatus {
+    /// Live response from the Anthropic API this tick.
+    Fresh,
+    /// API request failed; the numbers shown come from the on-disk cache.
+    Cached,
+    /// API request failed and no cache was available — no data to show.
+    Failed,
+    /// The API returned 429 on the initial call (the signal was observed this
+    /// tick regardless of whether the retry after token rotation succeeded).
+    /// The AIMD learner uses this to bump the per-profile interval up.
+    RateLimited,
+}
+
+/// New access + refresh token returned by a successful in-fetch rotation.
+/// The scheduler propagates this back into the live `TokenList` so the next
+/// tick uses the rotated pair instead of re-401'ing with the stale access
+/// token and burning the refresh-token chain by rotating again.
+type RotatedTokens = (String, Option<String>);
+
 /// One profile's fetch + rotate + retry path. On 401/429 we refresh the OAuth
 /// pair, persist it, and retry once. A 429 on the initial call sets
 /// `RateLimited` so the AIMD learner can back off; a successful retry still
 /// records it because the rate-limit signal was observed this tick. Any other
 /// error falls back to the on-disk cache. Pushes `name` onto `refetch` when
-/// rotation succeeds so the next scheduler tick re-fetches with the new token.
+/// rotation succeeds but the follow-up fetch failed, so the next scheduler
+/// tick re-fetches with the new token. Returns the rotated pair on success
+/// so the caller can update the live `TokenList`.
 fn fetch_with_rotation(
     name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
     refetch: &RefetchQueue,
-) -> (Option<UsageInfo>, FetchStatus) {
+) -> (Option<UsageInfo>, FetchStatus, Option<RotatedTokens>) {
     let saw_429 = match fetch_raw(access_token) {
-        Ok(info) => return (Some(info), FetchStatus::Fresh),
+        Ok(info) => return (Some(info), FetchStatus::Fresh, None),
         Err(FetchError::Status(429)) => true,
         Err(FetchError::Status(401)) => false,
-        Err(_) => return load_disk_cache(name, FetchStatus::Cached),
+        Err(_) => {
+            let (info, status) = load_disk_cache(name, FetchStatus::Cached);
+            return (info, status, None);
+        }
+    };
+
+    let fallback_status = if saw_429 {
+        FetchStatus::RateLimited
+    } else {
+        FetchStatus::Cached
     };
 
     let Some(rt) = refresh_token else {
-        let status = if saw_429 {
-            FetchStatus::RateLimited
-        } else {
-            FetchStatus::Cached
-        };
-        return load_disk_cache(name, status);
+        let (info, status) = load_disk_cache(name, fallback_status);
+        return (info, status, None);
     };
     let tok = match crate::oauth::refresh(rt) {
         Ok(t) => t,
         Err(_) => {
-            let status = if saw_429 {
-                FetchStatus::RateLimited
-            } else {
-                FetchStatus::Cached
-            };
-            return load_disk_cache(name, status);
+            let (info, status) = load_disk_cache(name, fallback_status);
+            return (info, status, None);
         }
     };
     let oauth = OAuthToken {
@@ -390,25 +506,26 @@ fn fetch_with_rotation(
             .map(|s| s.split_whitespace().map(String::from).collect()),
         subscription_type: None,
     };
+    // Don't claim the rotation if we couldn't persist — the new tokens would
+    // be lost on restart, and the caller would update the live list with a
+    // pair the disk doesn't reflect.
     if persist_oauth_token(name, &oauth).is_err() {
-        let status = if saw_429 {
-            FetchStatus::RateLimited
-        } else {
-            FetchStatus::Cached
-        };
-        return load_disk_cache(name, status);
+        let (info, status) = load_disk_cache(name, fallback_status);
+        return (info, status, None);
     }
+    let rotated: Option<RotatedTokens> =
+        Some((tok.access_token.clone(), Some(tok.refresh_token.clone())));
     match fetch_raw(&tok.access_token) {
         Ok(info) => {
-            // Token rotated and fresh numbers are in hand — no re-fetch needed.
-            // A 429 was still observed this tick, so report RateLimited so the
-            // learner backs off even though we recovered.
+            // Token rotated and fresh numbers are in hand. A 429 was still
+            // observed this tick, so report RateLimited so the learner backs
+            // off even though we recovered.
             let status = if saw_429 {
                 FetchStatus::RateLimited
             } else {
                 FetchStatus::Fresh
             };
-            (Some(info), status)
+            (Some(info), status, rotated)
         }
         Err(_) => {
             // Rotation succeeded but the follow-up fetch failed; schedule a
@@ -416,23 +533,10 @@ fn fetch_with_rotation(
             if let Ok(mut q) = refetch.lock() {
                 q.insert(name.to_string());
             }
-            let status = if saw_429 {
-                FetchStatus::RateLimited
-            } else {
-                FetchStatus::Cached
-            };
-            load_disk_cache(name, status)
+            let (info, status) = load_disk_cache(name, fallback_status);
+            (info, status, rotated)
         }
     }
-}
-
-fn cache_path(profile_name: &str) -> Option<PathBuf> {
-    dirs::home_dir().map(|h| {
-        h.join(".clauth")
-            .join("profiles")
-            .join(profile_name)
-            .join("usage_cache.json")
-    })
 }
 
 fn five_hour_utilization(info: &UsageInfo) -> Option<f64> {
@@ -446,24 +550,37 @@ fn five_hour_has_window(info: &UsageInfo) -> bool {
         .is_some()
 }
 
-/// Multiplicative-increase: multiply current by 1.5, add ±10% jitter, clamp to ceiling.
-/// Jitter avoids synchronized retry storms across profiles hitting the same wall.
-pub(crate) fn bump_up(current: u64) -> u64 {
-    let raised = (current.saturating_mul(3) / 2).min(LEARNED_CEILING_MS);
-    // LCG seeded from the current tick counter — no allocation, no new dep.
-    let seed = SystemTime::now()
+/// Process-wide counter mixed into the bump-up jitter seed so two profiles
+/// bumping in the same tick get distinct jitter — `subsec_nanos` alone often
+/// collides under burst load, defeating the whole point of jittering.
+static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn jitter_seed() -> u64 {
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(raised);
-    let rng = seed
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let counter = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mixed = nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    mixed
         .wrapping_mul(6_364_136_223_846_793_005)
-        .wrapping_add(1_442_695_040_888_963_407);
+        .wrapping_add(1_442_695_040_888_963_407)
+}
+
+/// Multiplicative-increase: multiply current by 1.5 and add ±10% jitter,
+/// clamped to ceiling. At saturation the result pins to CEILING with no
+/// jitter — applying jitter after the clamp would let continued 429s drift
+/// the effective ceiling down by half the jitter range.
+pub(crate) fn bump_up(current: u64) -> u64 {
+    let raised = current.saturating_mul(3) / 2;
+    if raised >= LEARNED_CEILING_MS {
+        return LEARNED_CEILING_MS;
+    }
     let margin = raised / 10;
-    // Map rng into [0, 2*margin], then shift to [-margin, +margin].
     let jitter = if margin == 0 {
         0i64
     } else {
-        (rng % (margin * 2 + 1)) as i64 - margin as i64
+        (jitter_seed() % (margin * 2 + 1)) as i64 - margin as i64
     };
     ((raised as i64 + jitter).max(LEARNED_FLOOR_MS as i64) as u64).min(LEARNED_CEILING_MS)
 }
@@ -473,6 +590,31 @@ pub(crate) fn bump_down(current: u64) -> u64 {
     current
         .saturating_sub(LEARNED_STEP_MS)
         .max(LEARNED_FLOOR_MS)
+}
+
+/// True when an unchanged five-hour utilization should be attributed to the
+/// server-side /usage cache rather than to genuine idle. Three conditions:
+/// status must be Fresh (other statuses can't carry a "same as last" signal);
+/// the poll must have landed inside the server cache window (slower polls
+/// would see invalidated cache, so unchanged values mean the user just wasn't
+/// burning tokens); both prev and new utilizations must be present and equal
+/// within `CACHE_HIT_EPSILON`.
+fn detect_cache_hit(
+    status: FetchStatus,
+    elapsed_ms: u64,
+    prev_util: Option<f64>,
+    new_util: Option<f64>,
+) -> bool {
+    if !matches!(status, FetchStatus::Fresh) {
+        return false;
+    }
+    if elapsed_ms >= SERVER_CACHE_TTL_ESTIMATE_MS {
+        return false;
+    }
+    match (prev_util, new_util) {
+        (Some(a), Some(b)) => (a - b).abs() < CACHE_HIT_EPSILON,
+        _ => false,
+    }
 }
 
 /// Resolve the effective refresh interval for one profile. Near-threshold always
@@ -495,8 +637,9 @@ fn interval_for(
 }
 
 /// Update the AIMD learner maps for one profile based on the fetch outcome.
-/// Called from the scheduler thread; all three maps are shared with the main
-/// thread via `Arc<Mutex<...>>` and persisted to `AppState` on shutdown.
+/// Called from the scheduler thread; all four maps are shared with the main
+/// thread via `Arc<Mutex<...>>` and persisted to `AppState` on shutdown
+/// (except `cache_hit_count`, which is in-memory only).
 ///
 /// `cache_hit` is true when a Fresh response carried the same five-hour
 /// utilization as the previously stored value — the Anthropic usage API has a
@@ -522,17 +665,20 @@ fn update_learner(
         return;
     };
 
-    // Quiet-period reset: if enough time has passed since the last 429 and
-    // the learned interval is still elevated, snap it back to normal so a
-    // single spike doesn't permanently raise the floor.
-    if let Some(&t429) = l429_g.get(name)
+    // Quiet-period reset only fires on a confirmed Fresh: a 5-minute network
+    // outage shouldn't undo legitimate backoff from prior 429s. Always remove
+    // the stale 429 stamp when the quiet window has elapsed, even if the
+    // learner is already at or below NORMAL — otherwise the entry lingers
+    // forever on disk.
+    if matches!(status, FetchStatus::Fresh)
+        && let Some(&t429) = l429_g.get(name)
         && now.saturating_sub(t429) >= LEARNED_QUIET_RESET_MS
     {
         let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
         if current > NORMAL_INTERVAL_MS {
             learned_g.insert(name.to_string(), NORMAL_INTERVAL_MS);
-            l429_g.remove(name);
         }
+        l429_g.remove(name);
     }
 
     match status {
@@ -543,8 +689,6 @@ fn update_learner(
             ch_g.insert(name.to_string(), 0);
             l429_g.insert(name.to_string(), now);
         }
-        // Only a confirmed API 200 with new data counts as a recovery signal.
-        // Network failures and cache fallbacks don't prove the API is healthy.
         // A Fresh response with the same utilization is a server-side cache hit:
         // back off additively toward NORMAL so we don't spin at FLOOR forever.
         FetchStatus::Fresh if cache_hit => {
@@ -563,6 +707,7 @@ fn update_learner(
                 ch_g.insert(name.to_string(), hits);
             }
         }
+        // Only a confirmed API 200 with changed data counts as a recovery signal.
         FetchStatus::Fresh => {
             let count = ok_g.get(name).copied().unwrap_or(0) + 1;
             if count >= 2 {
@@ -574,6 +719,9 @@ fn update_learner(
             }
             ch_g.insert(name.to_string(), 0);
         }
+        // Network failures and cache fallbacks neither confirm nor refute API
+        // health — leave the counters alone so a single blip doesn't wipe
+        // legitimate recovery progress accumulated from prior Fresh responses.
         FetchStatus::Cached | FetchStatus::Failed => {}
     }
 }
@@ -586,11 +734,15 @@ struct FetchOutcome {
     info: Option<UsageInfo>,
     status: FetchStatus,
     needs_auto_start: bool,
+    /// New `(access_token, refresh_token)` pair when the fetch path rotated
+    /// the OAuth tokens. The scheduler propagates this into the live
+    /// `TokenList` so the next tick uses the fresh pair.
+    rotated: Option<RotatedTokens>,
 }
 
 /// Run a single fetch for one entry.
 fn run_fetch(entry: TokenEntry, refetch: &RefetchQueue) -> FetchOutcome {
-    let (info, status) = fetch_with_rotation(
+    let (info, status, rotated) = fetch_with_rotation(
         &entry.name,
         &entry.access_token,
         entry.refresh_token.as_deref(),
@@ -607,6 +759,7 @@ fn run_fetch(entry: TokenEntry, refetch: &RefetchQueue) -> FetchOutcome {
         info,
         status,
         needs_auto_start,
+        rotated,
     }
 }
 
@@ -633,23 +786,38 @@ fn apply_outcome(
         .and_then(|s| s.get(&outcome.name).and_then(five_hour_utilization));
 
     if let Some(info) = &outcome.info {
-        if matches!(
+        let is_fresh = matches!(
             outcome.status,
             FetchStatus::Fresh | FetchStatus::RateLimited
-        ) {
+        );
+        if is_fresh {
             write_disk_cache(&outcome.name, info);
         }
         if let Ok(mut s) = store.lock() {
-            s.insert(outcome.name.clone(), info.clone());
+            // Don't clobber newer Fresh data with older Cached snapshots loaded
+            // from disk by `fetch_with_rotation`'s fallback path. Cached only
+            // fills the store when no entry exists (cold start without network).
+            if is_fresh || !s.contains_key(&outcome.name) {
+                s.insert(outcome.name.clone(), info.clone());
+            }
         }
     }
 
+    // Elapsed since the previous fetch attempt for this profile. Read before
+    // we overwrite `last_fetched` below. Used to distinguish a true server-side
+    // cache hit (poll landed inside the ~30s cache window with unchanged
+    // numbers) from an idle period (poll at NORMAL pace, user just isn't
+    // burning tokens). Without this gate, idle periods misclassify as cache
+    // hits and the AIMD learner gets dragged back up to NORMAL on every pause.
+    let elapsed_ms: u64 = last_fetched
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&outcome.name).copied())
+        .map(|prev| now_ms().saturating_sub(prev))
+        .unwrap_or(u64::MAX);
+
     let new_util: Option<f64> = outcome.info.as_ref().and_then(five_hour_utilization);
-    let cache_hit = matches!(outcome.status, FetchStatus::Fresh)
-        && match (prev_util, new_util) {
-            (Some(a), Some(b)) => (a - b).abs() < f64::EPSILON,
-            _ => false,
-        };
+    let cache_hit = detect_cache_hit(outcome.status, elapsed_ms, prev_util, new_util);
 
     if let Ok(mut st) = status.lock() {
         st.insert(outcome.name.clone(), outcome.status);
@@ -675,7 +843,9 @@ fn apply_outcome(
 
 /// Force-fetch every entry right now in parallel and write the results into
 /// the shared stores. Bypasses the cache rule — used by `bootstrap_usage`
-/// and `manual_refresh`. Blocks until all fetches complete.
+/// and `manual_refresh`. Blocks until all fetches complete. One-shot, so any
+/// `rotated` tokens are dropped — the main thread's `reload_if_state_changed`
+/// will pick them up from the persisted `credentials.json` shortly.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fetch_all_into(
     tokens: &[TokenEntry],
@@ -765,27 +935,28 @@ pub(crate) fn spawn_refresher(
             // Decide which entries are due this tick. Per-profile intervals
             // come from the AIMD learner held in `learned`.
             let now = now_ms();
-            let (mut due, _soonest_next, per_profile_next) =
+            let (mut due, _soonest_next, mut per_profile_next) =
                 partition_due(&snapshot, now, &store, &last_fetched, &learned);
 
-            // Publish the per-profile next times so overview rows can render
-            // countdowns without re-running partition logic.
-            if let Ok(mut nrpp) = next_refresh_per_profile.lock() {
-                nrpp.clone_from(&per_profile_next);
-            }
-
-            // Merge forced entries that aren't already scheduled this tick.
+            // Merge forced entries that aren't already scheduled this tick and
+            // reflect them in the published map as "due now" (zero countdown).
             if !forced.is_empty() {
                 let mut extras: Vec<TokenEntry> = Vec::with_capacity(forced.len());
-                extras.extend(
-                    snapshot
-                        .iter()
-                        .filter(|e| {
-                            forced.contains(&e.name) && !due.iter().any(|d| d.name == e.name)
-                        })
-                        .cloned(),
-                );
+                for entry in snapshot
+                    .iter()
+                    .filter(|e| forced.contains(&e.name) && !due.iter().any(|d| d.name == e.name))
+                {
+                    per_profile_next.insert(entry.name.clone(), now);
+                    extras.push(entry.clone());
+                }
                 due.extend(extras);
+            }
+
+            // Publish the per-profile next times AFTER the forced merge so the
+            // UI countdown doesn't show "in Xs" for a profile that is in fact
+            // fetching this very tick.
+            if let Ok(mut nrpp) = next_refresh_per_profile.lock() {
+                nrpp.clone_from(&per_profile_next);
             }
 
             if due.is_empty() {
@@ -816,6 +987,17 @@ pub(crate) fn spawn_refresher(
                 // locks, but a brief flicker to "no pip + stale timer" is acceptable).
                 if let Ok(mut fn_set) = fetching_now.lock() {
                     fn_set.remove(&outcome.name);
+                }
+                // Propagate any rotated OAuth pair back into the live snapshot
+                // before the next tick — otherwise tick N+1 reuses the stale
+                // access token, 401s, rotates again, and burns the refresh-token
+                // chain while waiting for the mtime watch to reload AppConfig.
+                if let Some((new_access, new_refresh)) = &outcome.rotated
+                    && let Ok(mut t) = tokens.lock()
+                    && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
+                {
+                    entry.access_token = new_access.clone();
+                    entry.refresh_token = new_refresh.clone();
                 }
                 apply_outcome(
                     outcome,
@@ -900,7 +1082,8 @@ fn scan_expired_windows(
 
 /// Split `snapshot` into the subset due this tick, the soonest epoch-ms at
 /// which any non-due entry will become due, and a per-profile map of next
-/// fetch epoch-ms. The empty-list case is callers' responsibility.
+/// fetch epoch-ms. A poisoned `last_fetched` returns empty rather than
+/// falling back to `last=0` (which would mark every profile due → fetch storm).
 fn partition_due(
     snapshot: &[TokenEntry],
     now: u64,
@@ -908,17 +1091,16 @@ fn partition_due(
     last_fetched: &LastFetchedAt,
     learned: &LearnedIntervals,
 ) -> (Vec<TokenEntry>, u64, HashMap<String, u64>) {
-    let lf = last_fetched.lock().ok();
+    let Ok(lf) = last_fetched.lock() else {
+        return (Vec::new(), now + NORMAL_INTERVAL_MS, HashMap::new());
+    };
     let st = store.lock().ok();
 
     let mut due = Vec::new();
     let mut soonest_next = now + NORMAL_INTERVAL_MS;
     let mut per_profile = HashMap::with_capacity(snapshot.len());
     for entry in snapshot {
-        let last = lf
-            .as_ref()
-            .and_then(|m| m.get(&entry.name).copied())
-            .unwrap_or(0);
+        let last = lf.get(&entry.name).copied().unwrap_or(0);
         let last_5h = st
             .as_ref()
             .and_then(|s| s.get(&entry.name).and_then(five_hour_utilization));
@@ -934,96 +1116,11 @@ fn partition_due(
     (due, soonest_next, per_profile)
 }
 
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Default fallback threshold used when a profile leaves it unset. Public so
 /// `App::collect_tokens` can resolve once at snapshot time instead of every
 /// scheduler tick.
 pub(crate) const fn default_fallback_threshold() -> f64 {
     DEFAULT_FALLBACK_THRESHOLD
-}
-
-// ── Time helpers ──────────────────────────────────────────────────────────────
-
-/// Parses an ISO-8601 timestamp like `2026-05-17T14:20:00.121699+00:00` into
-/// seconds since the Unix epoch. Returns None on any format deviation.
-pub(crate) fn iso_to_epoch_secs(s: &str) -> Option<i64> {
-    let bytes = s.as_bytes();
-    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
-        return None;
-    }
-    let year: i64 = std::str::from_utf8(&bytes[0..4]).ok()?.parse().ok()?;
-    let month: i64 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
-    let day: i64 = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
-    let hour: i64 = std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?;
-    let minute: i64 = std::str::from_utf8(&bytes[14..16]).ok()?.parse().ok()?;
-    let second: i64 = std::str::from_utf8(&bytes[17..19]).ok()?.parse().ok()?;
-
-    let tail = &s[19..];
-    let after_frac = if let Some(rest) = tail.strip_prefix('.') {
-        let end = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        &rest[end..]
-    } else {
-        tail
-    };
-    let tz_offset_secs: i64 = if after_frac.is_empty() || after_frac.starts_with('Z') {
-        0
-    } else {
-        let sign = match after_frac.as_bytes()[0] {
-            b'+' => 1,
-            b'-' => -1,
-            _ => return None,
-        };
-        if after_frac.len() < 6 {
-            return None;
-        }
-        let tz_h: i64 = after_frac[1..3].parse().ok()?;
-        let tz_m: i64 = after_frac[4..6].parse().ok()?;
-        sign * (tz_h * 3600 + tz_m * 60)
-    };
-
-    // Howard Hinnant's days-from-civil — yields days since 1970-01-01.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let m = month;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-
-    Some(days * 86400 + hour * 3600 + minute * 60 + second - tz_offset_secs)
-}
-
-pub(crate) fn now_epoch_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// Formats a duration in seconds as a tight `Nd Nh`, `Nh Nm`, or `Nm` string.
-/// Returns `now` for zero or negative.
-pub(crate) fn humanize_duration(secs: i64) -> String {
-    if secs <= 0 {
-        return "now".to_string();
-    }
-    let mins = secs / 60;
-    let hours = mins / 60;
-    let days = hours / 24;
-    if days > 0 {
-        format!("{}d {}h", days, hours % 24)
-    } else if hours > 0 {
-        format!("{}h {}m", hours, mins % 60)
-    } else {
-        format!("{}m", mins.max(1))
-    }
 }
 
 #[cfg(test)]
