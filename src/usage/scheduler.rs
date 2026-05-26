@@ -1043,14 +1043,19 @@ fn scan_auto_switch(
     // when any profile is currently Switching — either way the previous
     // decision hasn't landed yet and a duplicate enqueue would be a no-op
     // anyway (set semantics), but checking here avoids the config lock.
-    let already_pending_or_switching = match (pending_switch.lock(), activity.lock()) {
-        (Ok(p), Ok(a)) => {
-            !p.is_empty() || a.values().any(|v| matches!(v, ProfileActivity::Switching))
+    // Each lock is acquired and dropped before the next to avoid holding two
+    // leaf mutexes simultaneously.
+    {
+        let Ok(p) = pending_switch.lock() else { return };
+        if !p.is_empty() {
+            return;
         }
-        _ => true,
-    };
-    if already_pending_or_switching {
-        return;
+    }
+    {
+        let Ok(a) = activity.lock() else { return };
+        if a.values().any(|v| matches!(v, ProfileActivity::Switching)) {
+            return;
+        }
     }
 
     // Snapshot under `config` only — no `usage_store` lock here.
@@ -1115,18 +1120,26 @@ fn scan_expired_windows(
         return;
     }
 
-    let Ok(lrw) = last_rotated_window.lock() else {
-        return;
-    };
-    let Ok(ref mut pend) = pending.lock() else {
-        return;
-    };
+    // Filter out already-acted-on windows using `last_rotated_window`, then
+    // drop it before acquiring `pending`. Never hold two leaf mutexes at once.
+    let to_enqueue: Vec<(String, i64)> = {
+        let Ok(lrw) = last_rotated_window.lock() else {
+            return;
+        };
+        candidates
+            .into_iter()
+            .filter(|(name, resets_at)| lrw.get(name).copied().unwrap_or(0) != *resets_at)
+            .collect()
+    }; // lrw dropped here
 
-    for (name, resets_at) in candidates {
-        // Already acted on this specific window.
-        if lrw.get(&name).copied().unwrap_or(0) == resets_at {
-            continue;
-        }
+    if to_enqueue.is_empty() {
+        return;
+    }
+
+    let Ok(mut pend) = pending.lock() else {
+        return;
+    };
+    for (name, resets_at) in to_enqueue {
         // Pin the epoch at detection time. The drain uses this value to stamp
         // `LastRotatedWindow` so it deduplicates the window it actually saw,
         // not a potentially newer one the store holds by the time the drain runs.
