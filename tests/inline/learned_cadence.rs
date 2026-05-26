@@ -825,6 +825,31 @@ fn interval_clamps_to_floor_at_or_above_near_threshold() {
 }
 
 #[test]
+fn interval_zero_threshold_is_not_floor_clamped() {
+    // threshold == 0.0 (unset/default) must never trigger the near-threshold
+    // override regardless of utilization. Without the > NEAR_THRESHOLD_MARGIN
+    // guard the RHS (-5.0) is always satisfied by any non-negative utilization.
+    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), NORMAL_INTERVAL_MS);
+    let entry = token("p", 0.0);
+    assert_eq!(
+        interval_for(&entry, Some(0.0), &learned),
+        NORMAL_INTERVAL_MS
+    );
+    assert_eq!(
+        interval_for(&entry, Some(50.0), &learned),
+        NORMAL_INTERVAL_MS
+    );
+    assert_eq!(
+        interval_for(&entry, Some(99.0), &learned),
+        NORMAL_INTERVAL_MS
+    );
+}
+
+#[test]
 fn interval_just_below_near_threshold_returns_learned() {
     let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
     learned.lock().unwrap().insert("p".into(), 17_000);
@@ -839,6 +864,109 @@ fn interval_with_no_5h_data_returns_learned() {
     learned.lock().unwrap().insert("p".into(), 17_000);
     let entry = token("p", 95.0);
     assert_eq!(interval_for(&entry, None, &learned), 17_000);
+}
+
+// ── interval_for: zero/unset threshold (H1 regression) ───────────────────────
+
+#[test]
+fn interval_for_zero_threshold_is_not_clamped_to_floor() {
+    // A profile with fallback_threshold == 0.0 (unset/default) must NOT be
+    // pinned to FLOOR regardless of utilization. Without the > NEAR_THRESHOLD_MARGIN
+    // guard the RHS is negative (-5.0), making the comparison true for any
+    // non-None utilization and pinning the interval to 10s forever.
+    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), NORMAL_INTERVAL_MS);
+    let entry = token("p", 0.0);
+
+    // At 0% utilization — should still use learned.
+    assert_eq!(
+        interval_for(&entry, Some(0.0), &learned),
+        NORMAL_INTERVAL_MS,
+        "threshold 0.0 with util 0.0 must not pin to FLOOR",
+    );
+    // At 100% utilization — should still use learned (no configured threshold).
+    assert_eq!(
+        interval_for(&entry, Some(100.0), &learned),
+        NORMAL_INTERVAL_MS,
+        "threshold 0.0 with util 100.0 must not pin to FLOOR",
+    );
+    // No utilization data — must use learned.
+    assert_eq!(
+        interval_for(&entry, None, &learned),
+        NORMAL_INTERVAL_MS,
+        "threshold 0.0 with no util must not pin to FLOOR",
+    );
+}
+
+#[test]
+fn interval_for_threshold_below_margin_is_not_clamped_to_floor() {
+    // A threshold just below NEAR_THRESHOLD_MARGIN (e.g. 4.9 with margin 5.0)
+    // must not trigger the near-threshold override for any utilization.
+    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    learned.lock().unwrap().insert("p".into(), 17_000);
+    let threshold_below_margin = NEAR_THRESHOLD_MARGIN - 0.1;
+    let entry = token("p", threshold_below_margin);
+
+    // Utilization at 100% (well above threshold) — override must not fire.
+    assert_eq!(
+        interval_for(&entry, Some(100.0), &learned),
+        17_000,
+        "threshold below margin must not pin to FLOOR even at 100% util",
+    );
+    // Utilization at or above threshold.
+    assert_eq!(
+        interval_for(&entry, Some(threshold_below_margin), &learned),
+        17_000,
+        "threshold below margin must not pin to FLOOR at threshold util",
+    );
+}
+
+#[test]
+fn interval_for_threshold_at_margin_is_not_clamped_to_floor() {
+    // Threshold exactly equal to NEAR_THRESHOLD_MARGIN (5.0) — the guard is
+    // `> NEAR_THRESHOLD_MARGIN` so equality must not trigger the override.
+    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    learned.lock().unwrap().insert("p".into(), 17_000);
+    let entry = token("p", NEAR_THRESHOLD_MARGIN);
+
+    assert_eq!(
+        interval_for(&entry, Some(100.0), &learned),
+        17_000,
+        "threshold == NEAR_THRESHOLD_MARGIN must not pin to FLOOR",
+    );
+}
+
+#[test]
+fn interval_for_genuine_threshold_near_match_pins_to_floor() {
+    // A profile with threshold 80.0 at 78% utilization (within the 5pp margin)
+    // must be clamped to FLOOR.
+    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), LEARNED_CEILING_MS);
+    let entry = token("p", 80.0);
+
+    assert_eq!(
+        interval_for(&entry, Some(78.0), &learned),
+        LEARNED_FLOOR_MS,
+        "threshold 80 at 78% util must pin to FLOOR",
+    );
+    // At threshold itself.
+    assert_eq!(
+        interval_for(&entry, Some(80.0), &learned),
+        LEARNED_FLOOR_MS,
+        "threshold 80 at 80% util must pin to FLOOR",
+    );
+    // Well below the margin — must use learned.
+    assert_eq!(
+        interval_for(&entry, Some(74.9), &learned),
+        LEARNED_CEILING_MS,
+        "threshold 80 at 74.9% util is outside near margin, must use learned",
+    );
 }
 
 // ── partition_due ─────────────────────────────────────────────────────────────

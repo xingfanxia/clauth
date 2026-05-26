@@ -55,6 +55,16 @@ const CACHE_HIT_EPSILON: f64 = 1e-9;
 /// must not pull the learner back up toward NORMAL.
 const SERVER_CACHE_TTL_ESTIMATE_MS: u64 = 25_000;
 
+// Cache-hit elimination invariant: the cache-hit backoff cap (NORMAL) must
+// sit strictly above the server-cache-TTL gate (SERVER_CACHE_TTL_ESTIMATE_MS)
+// used by `detect_cache_hit`. If NORMAL ≤ TTL, a profile converging to
+// NORMAL would still poll inside the cache window and register hits forever,
+// making cache-hit elimination impossible in steady state.
+const _: () = assert!(
+    NORMAL_INTERVAL_MS > SERVER_CACHE_TTL_ESTIMATE_MS,
+    "NORMAL_INTERVAL_MS must exceed SERVER_CACHE_TTL_ESTIMATE_MS for cache-hit elimination to terminate",
+);
+
 pub(crate) type UsageStore = Arc<Mutex<HashMap<String, UsageInfo>>>;
 pub(crate) type StatusStore = Arc<Mutex<HashMap<String, FetchStatus>>>;
 pub(crate) type TokenList = Arc<Mutex<Vec<TokenEntry>>>;
@@ -451,6 +461,11 @@ fn detect_cache_hit(
     if !matches!(status, FetchStatus::Fresh) {
         return false;
     }
+    // `>=` is correct: at exactly the TTL boundary the server has had time to
+    // invalidate its cache, so equal values mean idle, not a cache hit. This
+    // boundary is what makes cache-hit elimination terminate — once the learned
+    // interval reaches SERVER_CACHE_TTL_ESTIMATE_MS, polls stop registering as
+    // cache hits and the backoff arm stops firing.
     if elapsed_ms >= SERVER_CACHE_TTL_ESTIMATE_MS {
         return false;
     }
@@ -463,12 +478,26 @@ fn detect_cache_hit(
 /// Resolve the effective refresh interval for one profile. Near-threshold always
 /// wins with FLOOR (highest urgency). Otherwise returns the learned interval,
 /// defaulting to NORMAL when no learned value exists.
+///
+/// The near-threshold override pins FLOOR (10s), which is below the server
+/// cache TTL (25s), so cache hits are intentionally NOT eliminated when a
+/// profile is within NEAR_THRESHOLD_MARGIN of its configured fallback threshold.
+/// This is the one accepted exception to the "eliminate cache hits in steady
+/// state" goal — traded for responsiveness as a profile approaches its fallback
+/// limit. It only fires for profiles with a genuinely-configured threshold
+/// (> NEAR_THRESHOLD_MARGIN); a zero/unset threshold (0.0) does not trigger it.
 fn interval_for(
     entry: &TokenEntry,
     last_5h: Option<f64>,
     learned_intervals: &LearnedIntervals,
 ) -> u64 {
-    let near = matches!(last_5h, Some(u) if u >= entry.fallback_threshold - NEAR_THRESHOLD_MARGIN);
+    // Guard: only apply the near-threshold override when the threshold is
+    // genuinely configured (> NEAR_THRESHOLD_MARGIN). Without this guard,
+    // a zero/unset threshold (0.0) produces a negative RHS, making the
+    // comparison true for any utilization — pinning every such profile to
+    // FLOOR (10s) forever and defeating the AIMD learner entirely.
+    let near = entry.fallback_threshold > NEAR_THRESHOLD_MARGIN
+        && matches!(last_5h, Some(u) if u >= entry.fallback_threshold - NEAR_THRESHOLD_MARGIN);
     if near {
         return LEARNED_FLOOR_MS;
     }
