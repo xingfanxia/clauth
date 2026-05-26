@@ -696,22 +696,21 @@ fn apply_outcome(
     cache_hit_count: &ConsecutiveCacheHit,
     last_429: &Last429At,
 ) {
-    // Capture previous five-hour utilization before overwriting the store so
-    // we can tell whether this Fresh response is a server-side cache hit.
-    let prev_util: Option<f64> = store
-        .lock()
-        .ok()
-        .and_then(|s| s.get(&outcome.name).and_then(five_hour_utilization));
+    let is_fresh = matches!(
+        outcome.status,
+        FetchStatus::Fresh | FetchStatus::RateLimited
+    );
+    if is_fresh && let Some(info) = &outcome.info {
+        write_disk_cache(&outcome.name, info);
+    }
 
-    if let Some(info) = &outcome.info {
-        let is_fresh = matches!(
-            outcome.status,
-            FetchStatus::Fresh | FetchStatus::RateLimited
-        );
-        if is_fresh {
-            write_disk_cache(&outcome.name, info);
-        }
-        if let Ok(mut s) = store.lock() {
+    // Read prev_util and write the new entry in a single lock acquisition so
+    // no concurrent apply_outcome for the same name can slip a write between
+    // the two operations and produce a stale prev_util for detect_cache_hit.
+    let (prev_util, new_util): (Option<f64>, Option<f64>) = if let Ok(mut s) = store.lock() {
+        let prev = s.get(&outcome.name).and_then(five_hour_utilization);
+        let new_u = outcome.info.as_ref().and_then(five_hour_utilization);
+        if let Some(info) = &outcome.info {
             // Don't clobber newer Fresh data with older Cached snapshots loaded
             // from disk by `fetch_with_rotation`'s fallback path. Cached only
             // fills the store when no entry exists (cold start without network).
@@ -719,7 +718,10 @@ fn apply_outcome(
                 s.insert(outcome.name.clone(), info.clone());
             }
         }
-    }
+        (prev, new_u)
+    } else {
+        (None, outcome.info.as_ref().and_then(five_hour_utilization))
+    };
 
     // Single clock snapshot for this outcome. Using one `now_ms()` call for
     // both the elapsed calculation and the `last_fetched` write prevents a
@@ -739,7 +741,6 @@ fn apply_outcome(
         .map(|prev| now.saturating_sub(prev))
         .unwrap_or(u64::MAX);
 
-    let new_util: Option<f64> = outcome.info.as_ref().and_then(five_hour_utilization);
     let cache_hit = detect_cache_hit(outcome.status, elapsed_ms, prev_util, new_util);
 
     if let Ok(mut st) = status.lock() {
