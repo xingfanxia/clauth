@@ -288,6 +288,29 @@ pub(crate) fn auto_start_windows(
     activity: &ActivityStore,
     sender: &OpResultSender,
 ) -> Vec<String> {
+    // Snapshot which profiles already have an active 5h window BEFORE taking
+    // the config lock. `apply_usage` on the UI thread holds `usage_store` then
+    // acquires `config`; taking `config` first and then `store` inside
+    // `with_state_lock` would invert that order and deadlock. Reading into an
+    // owned map here keeps the lock order consistent: store snapshot first,
+    // config lock second.
+    let has_active_window: std::collections::HashMap<String, bool> = store
+        .lock()
+        .ok()
+        .map(|s| {
+            s.iter()
+                .map(|(name, info)| {
+                    let active = info
+                        .five_hour
+                        .as_ref()
+                        .and_then(|w| w.resets_at.as_ref())
+                        .is_some();
+                    (name.clone(), active)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Claim cooldown slots under the lock BEFORE any network work. A competing
     // clauth process that starts up a moment later will observe our recorded
     // `last_auto_start_at` and skip the same profile, so the refresh token
@@ -311,15 +334,7 @@ pub(crate) fn auto_start_windows(
                 if has_live_session(&profile.name) {
                     continue;
                 }
-                let resets_at = {
-                    let usage = store.lock().ok();
-                    usage
-                        .as_ref()
-                        .and_then(|s| s.get(&profile.name))
-                        .and_then(|u| u.five_hour.as_ref())
-                        .and_then(|w| w.resets_at.clone())
-                };
-                if resets_at.is_some() {
+                if *has_active_window.get(&profile.name).unwrap_or(&false) {
                     continue;
                 }
                 let last = cfg
