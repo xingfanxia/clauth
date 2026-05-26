@@ -2179,14 +2179,16 @@ pub(crate) fn on_tick(app: &mut App) {
         let last_rotated = Arc::clone(&app.last_rotated_window);
         let sender = app.op_sender.clone();
         std::thread::spawn(move || {
-            let rotated = oauth::rotate_one(&config, &name, &activity, &sender);
-            if rotated {
-                if let Ok(mut lrw) = last_rotated.lock() {
-                    lrw.insert(name.clone(), epoch);
-                }
-                if let Ok(mut q) = refetch.lock() {
-                    q.insert(name);
-                }
+            let rotated = oauth::rotate_one_for_window(
+                &config,
+                &name,
+                &activity,
+                &sender,
+                &last_rotated,
+                epoch,
+            );
+            if rotated && let Ok(mut q) = refetch.lock() {
+                q.insert(name);
             }
         });
     }

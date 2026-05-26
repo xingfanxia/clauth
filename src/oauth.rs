@@ -9,8 +9,8 @@ use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, OAuthToken, save_app_state, save_profile};
 use crate::runtime::has_live_session;
 use crate::usage::{
-    ActivityKind, ActivityStore, OpResult, OpResultSender, ProfileActivity, RefetchQueue,
-    UsageStore, clear_activity, mark_activity, now_ms,
+    ActivityKind, ActivityStore, LastRotatedWindow, OpResult, OpResultSender, ProfileActivity,
+    RefetchQueue, UsageStore, clear_activity, mark_activity, now_ms,
 };
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup
@@ -142,7 +142,73 @@ pub(crate) fn rotate_one(
     let refreshed = refresh(&rt);
     let (outcome, applied) = match refreshed {
         Ok(tok) => {
-            let saved = apply_rotated_tokens_locked(config, name, tok);
+            let saved = apply_rotated_tokens_locked(config, name, tok, None);
+            if saved {
+                (Ok(()), true)
+            } else {
+                (
+                    Err(anyhow::anyhow!("failed to persist rotated tokens")),
+                    false,
+                )
+            }
+        }
+        Err(e) => (Err(e), false),
+    };
+    clear_activity(activity, name);
+    let _ = sender.send(OpResult {
+        name: name.to_string(),
+        kind: ActivityKind::Refreshing,
+        outcome,
+    });
+    applied
+}
+
+/// Window-expiry variant of [`rotate_one`] that stamps `LastRotatedWindow`
+/// atomically with the credential write. Use this from the on_tick
+/// window-expiry dispatcher instead of `rotate_one + manual LRW insert`.
+///
+/// The stamp happens inside `apply_rotated_tokens_locked` under the same
+/// state-lock acquisition as the credential write, so no panic or
+/// mutex-poison between persist and stamp can cause the scheduler to
+/// re-enqueue and burn an already-rotated refresh token chain.
+///
+/// Returns true iff the rotation was persisted (same as `rotate_one`).
+/// On `has_live_session = true` the profile is skipped and LRW is
+/// left untouched — `scan_expired_windows` will re-enqueue next tick
+/// (no HTTP, benign).
+pub(crate) fn rotate_one_for_window(
+    config: &Arc<Mutex<AppConfig>>,
+    name: &str,
+    activity: &ActivityStore,
+    sender: &OpResultSender,
+    lrw: &LastRotatedWindow,
+    resets_at: i64,
+) -> bool {
+    let token = {
+        let cfg = config.lock().expect("config mutex poisoned");
+        with_state_lock(|| {
+            if has_live_session(name) {
+                return Ok::<_, anyhow::Error>(None);
+            }
+            let rt = cfg
+                .find(name)
+                .and_then(|p| p.refresh_token().map(str::to_string));
+            if rt.is_some() {
+                mark_activity(activity, name, ProfileActivity::Refreshing);
+            }
+            Ok(rt)
+        })
+        .ok()
+        .flatten()
+    };
+
+    let Some(rt) = token else {
+        return false;
+    };
+    let refreshed = refresh(&rt);
+    let (outcome, applied) = match refreshed {
+        Ok(tok) => {
+            let saved = apply_rotated_tokens_locked(config, name, tok, Some((lrw, resets_at)));
             if saved {
                 (Ok(()), true)
             } else {
@@ -244,7 +310,7 @@ pub(crate) fn refresh_all(
                 let refreshed = refresh(&rt);
                 let (outcome, saved) = match refreshed {
                     Ok(tok) => {
-                        let ok = apply_rotated_tokens_locked(&config, &name, tok);
+                        let ok = apply_rotated_tokens_locked(&config, &name, tok, None);
                         if ok {
                             (Ok(()), true)
                         } else {
@@ -580,13 +646,19 @@ fn apply_rotated_tokens_or_rollback_cooldown_locked(
 /// persist. Returns true on success. No-op when the profile or OAuth block
 /// is missing — callers that care can refuse to act on `false`.
 ///
+/// When `window_stamp` is `Some((lrw, resets_at))`, the `LastRotatedWindow`
+/// map is updated atomically with the credential write — under the same
+/// state-lock acquisition — so no panic or mutex-poison between the persist
+/// and the stamp can cause a silent chain burn on the next scheduler tick.
+/// Lock order: AppConfig → state flock → LRW leaf mutex.
+///
 /// Locking variant of [`apply_rotated_tokens`]: takes `&Arc<Mutex<AppConfig>>`
 /// so workers can call from a thread without holding the lock across HTTP.
-/// Lock order: AppConfig in-process mutex first, then state flock.
 fn apply_rotated_tokens_locked(
     config: &Arc<Mutex<AppConfig>>,
     name: &str,
     tok: TokenResponse,
+    window_stamp: Option<(&LastRotatedWindow, i64)>,
 ) -> bool {
     let mut cfg = config.lock().expect("config mutex poisoned");
     with_state_lock(|| {
@@ -600,7 +672,15 @@ fn apply_rotated_tokens_locked(
             return Ok(false);
         };
         write_token_fields(oauth, tok);
-        Ok(save_profile(profile).is_ok())
+        if save_profile(profile).is_err() {
+            return Ok(false);
+        }
+        if let Some((lrw, resets_at)) = window_stamp
+            && let Ok(mut guard) = lrw.lock()
+        {
+            guard.insert(name.to_string(), resets_at);
+        }
+        Ok(true)
     })
     .unwrap_or(false)
 }

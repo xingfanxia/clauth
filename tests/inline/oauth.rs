@@ -8,7 +8,7 @@
 use super::*;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, Profile, profile_dir};
 use crate::runtime::open_pid_file;
-use crate::usage::is_idle;
+use crate::usage::{LastRotatedWindow, is_idle};
 
 // Build a minimal AppConfig with one OAuth profile named `name`.
 fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
@@ -278,6 +278,113 @@ fn switch_rotate_targets_only_active_and_target() {
         is_idle(&activity, bystander_name),
         "bystander must never be stamped — only active+target are passed to rotate_one"
     );
+}
+
+/// `rotate_one_for_window` must NOT stamp `LastRotatedWindow` when the profile
+/// has no refresh token. The function short-circuits before HTTP, so LRW is
+/// untouched and the caller can rely on re-enqueue behaviour from the scheduler.
+#[test]
+fn rotate_one_for_window_no_stamp_when_no_refresh_token() {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::mpsc;
+
+    let name = "test-rotate-window-no-rt";
+    let profile = Profile {
+        name: name.to_string(),
+        base_url: None,
+        api_key: None,
+        auto_start: false,
+        env: BTreeMap::new(),
+        fallback_threshold: None,
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }),
+        usage: None,
+        fetch_status: None,
+    };
+    let config = Arc::new(Mutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    }));
+    let activity: ActivityStore = Arc::new(Mutex::new(HashMap::new()));
+    let lrw: LastRotatedWindow = Arc::new(Mutex::new(HashMap::new()));
+    let (tx, _rx) = mpsc::channel();
+    let resets_at: i64 = 9999;
+
+    let rotated = rotate_one_for_window(&config, name, &activity, &tx, &lrw, resets_at);
+
+    assert!(!rotated, "should return false with no refresh token");
+    assert!(
+        lrw.lock().unwrap().is_empty(),
+        "LRW must not be stamped when rotation short-circuits at no-token"
+    );
+    assert!(
+        is_idle(&activity, name),
+        "activity slot must remain Idle when short-circuiting"
+    );
+}
+
+/// `rotate_one_for_window` must NOT stamp `LastRotatedWindow` when a live
+/// `clauth start` session holds the chain. The scheduler will re-enqueue the
+/// same window on the next tick; `has_live_session` returns early without HTTP.
+#[test]
+fn rotate_one_for_window_no_stamp_when_live_session() {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::mpsc;
+
+    let name = "test-rotate-window-live-session";
+    let sessions = profile_dir(name).expect("profile_dir").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create sessions dir");
+    let pid_file = sessions.join("test-pid-window");
+    let file = open_pid_file(&pid_file).expect("open pid file");
+    file.lock().expect("lock pid file");
+
+    let profile = Profile {
+        name: name.to_string(),
+        base_url: None,
+        api_key: None,
+        auto_start: false,
+        env: BTreeMap::new(),
+        fallback_threshold: None,
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at".to_string(),
+                refresh_token: Some("rt-live".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }),
+        usage: None,
+        fetch_status: None,
+    };
+    let config = Arc::new(Mutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    }));
+    let activity: ActivityStore = Arc::new(Mutex::new(HashMap::new()));
+    let lrw: LastRotatedWindow = Arc::new(Mutex::new(HashMap::new()));
+    let (tx, _rx) = mpsc::channel();
+    let resets_at: i64 = 8888;
+
+    let rotated = rotate_one_for_window(&config, name, &activity, &tx, &lrw, resets_at);
+
+    assert!(
+        !rotated,
+        "should return false when live session holds the chain"
+    );
+    assert!(
+        lrw.lock().unwrap().is_empty(),
+        "LRW must not be stamped when skipped due to live session"
+    );
+
+    drop(file);
 }
 
 /// When active == target (re-switch), the switch paths deduplicate and call
