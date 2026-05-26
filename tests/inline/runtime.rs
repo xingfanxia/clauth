@@ -427,6 +427,92 @@ fn mirror_tree_seeds_canonical_only_nested_to_runtime() {
 }
 
 #[test]
+fn copy_file_overwrites_existing_destination() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("src.json");
+    let dst = tmp.path().join("dst.json");
+    fs::write(&src, b"new bytes").expect("write src");
+    fs::write(&dst, b"old bytes").expect("write dst");
+
+    copy_file(&src, &dst).expect("copy_file");
+    assert_eq!(fs::read(&dst).expect("read dst"), b"new bytes");
+}
+
+#[test]
+fn copy_file_creates_missing_parent_dirs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("src.json");
+    let dst = tmp.path().join("nested").join("deeper").join("dst.json");
+    fs::write(&src, b"payload").expect("write src");
+
+    copy_file(&src, &dst).expect("copy_file");
+    assert_eq!(fs::read(&dst).expect("read dst"), b"payload");
+}
+
+#[test]
+fn copy_file_leaves_no_tmp_artifact() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("src.json");
+    let dst = tmp.path().join("dst.json");
+    fs::write(&src, b"payload").expect("write src");
+
+    copy_file(&src, &dst).expect("copy_file");
+
+    // atomic_write uses a `.<name>.tmp.<pid>` sidecar that must be renamed away.
+    let stray = tmp
+        .path()
+        .join(format!(".dst.json.tmp.{}", std::process::id()));
+    assert!(!stray.exists(), "atomic copy must not leave a tmp file");
+}
+
+// A reader racing copy_file must never observe a torn/partial file — only the
+// old or the complete new bytes. This is the invariant that lets mirror_tree
+// run lockless: the rename in copy_file is the atomicity boundary, so a
+// concurrent acquire/switch/sibling reading the same path can't see a half
+// written copy. A non-atomic `std::fs::copy` (truncate-then-stream) would let
+// this assertion fail intermittently.
+#[test]
+fn copy_file_visible_state_is_never_torn() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("src.json");
+    let dst = Arc::new(tmp.path().join("dst.json"));
+
+    let old = vec![b'a'; 64 * 1024];
+    let new = vec![b'b'; 64 * 1024];
+    fs::write(&src, &new).expect("write src");
+    fs::write(dst.as_ref(), &old).expect("seed dst");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_dst = dst.clone();
+    let reader_stop = stop.clone();
+    let old_clone = old.clone();
+    let new_clone = new.clone();
+    let reader = std::thread::spawn(move || {
+        while !reader_stop.load(Ordering::Relaxed) {
+            // Mid-rename the path may momentarily not resolve; that read error
+            // is fine. Any successful read must be the old or complete-new file.
+            if let Ok(bytes) = fs::read(reader_dst.as_ref()) {
+                assert!(
+                    bytes == old_clone || bytes == new_clone,
+                    "reader observed a torn file ({} bytes)",
+                    bytes.len()
+                );
+            }
+        }
+    });
+
+    for _ in 0..200 {
+        copy_file(&src, &dst).expect("copy_file");
+    }
+    stop.store(true, Ordering::Relaxed);
+    reader.join().expect("reader panicked");
+    assert_eq!(fs::read(dst.as_ref()).expect("final read"), new);
+}
+
+#[test]
 fn detect_link_mode_returns_real_on_unix() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mode = detect_link_mode(tmp.path()).expect("detect");

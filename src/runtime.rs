@@ -417,11 +417,21 @@ fn tick(mode: LinkMode, runtime: &Path, claude_home: &Path, canonical: &Path) ->
             let _ = sync_credentials(runtime, canonical)?;
             Ok(())
         }
-        LinkMode::Fake => with_state_lock(|| {
+        LinkMode::Fake => {
+            // The bulk tree walk + copies run WITHOUT the state lock. On a
+            // large ~/.claude/ tree holding the lock across the whole walk
+            // stalled every concurrent acquire / CLI switch for hundreds of ms
+            // each tick. The walk is safe to run lockless: every per-file merge
+            // is independent, self-converging under "latest mtime wins" + the
+            // byte-equality skip, and never deletes — so a file changing in the
+            // TOCTOU window between snapshot and copy just re-converges on the
+            // next 1s tick. settings.json / .credentials.json are skipped by
+            // mirror_tree, so it never races build_runtime_dir's per-profile
+            // writes. Only credential reconciliation, which must not interleave
+            // with acquire / switch credential writes, stays under the lock.
             mirror_tree(claude_home, runtime)?;
-            mirror_credentials(&runtime.join(".credentials.json"), canonical)?;
-            Ok(())
-        }),
+            with_state_lock(|| mirror_credentials(&runtime.join(".credentials.json"), canonical))
+        }
     }
 }
 
@@ -618,9 +628,16 @@ fn files_match(a: &Path, b: &Path) -> Result<bool> {
     Ok(a_bytes == b_bytes)
 }
 
+/// Copy `src` onto `dst` via a PID-suffixed tmp + atomic rename. `mirror_tree`
+/// now runs lockless, so a concurrent reader (a sibling session, the user, or
+/// `build_runtime_dir`) could observe `dst` mid-write. A raw `std::fs::copy`
+/// truncates then streams bytes — not atomic — so it could be seen torn. The
+/// rename makes the swap atomic on POSIX: any observer sees either the old or
+/// the complete new file. The PID suffix keeps two processes from colliding on
+/// the same tmp name.
 fn copy_file(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::copy(src, dst)
-        .map(|_| ())
+    let bytes = std::fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
+    atomic_write(dst, &bytes)
         .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))
 }
 
