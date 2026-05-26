@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -8,7 +8,9 @@ use crate::claude::{LinkState, classify_credentials_link};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, OAuthToken, save_app_state, save_profile};
 use crate::runtime::has_live_session;
-use crate::usage::{RefetchQueue, UsageStore, now_ms};
+use crate::usage::{
+    ActivityStore, ProfileActivity, RefetchQueue, UsageStore, clear_activity, mark_activity, now_ms,
+};
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup
 /// to mint a fresh access token from the stored refresh token.
@@ -100,7 +102,7 @@ fn kick(access_token: &str) -> Result<()> {
 ///
 /// No cooldown gating — the caller is responsible for deduplication via
 /// `LastRotatedWindow`. Does not touch `last_auto_start_at`.
-pub(crate) fn rotate_one(config: &mut AppConfig, name: &str) -> bool {
+pub(crate) fn rotate_one(config: &mut AppConfig, name: &str, activity: &ActivityStore) -> bool {
     let token = with_state_lock(|| {
         if has_live_session(name) {
             return Ok::<_, anyhow::Error>(None);
@@ -116,7 +118,11 @@ pub(crate) fn rotate_one(config: &mut AppConfig, name: &str) -> bool {
     let Some(rt) = token else {
         return false;
     };
-    let Ok(tok) = refresh(&rt) else {
+    // Mark Refreshing only around the HTTP call, never across the state lock.
+    mark_activity(activity, name, ProfileActivity::Refreshing);
+    let refreshed = refresh(&rt);
+    clear_activity(activity, name);
+    let Ok(tok) = refreshed else {
         return false;
     };
     apply_rotated_tokens(config, name, tok)
@@ -163,6 +169,7 @@ pub(crate) fn refresh_all(
     config: &mut AppConfig,
     force: bool,
     refetch: &RefetchQueue,
+    activity: &ActivityStore,
 ) -> Vec<String> {
     let snapshots = rotation_candidates(config, force);
 
@@ -170,9 +177,26 @@ pub(crate) fn refresh_all(
         return Vec::new();
     }
 
+    // Stamp every candidate Refreshing before the fan-out so the overview row
+    // shows a refresh spinner for the entire window. Each thread clears its
+    // own slot on completion (success or failure) below.
+    for (name, _) in &snapshots {
+        mark_activity(activity, name, ProfileActivity::Refreshing);
+    }
+
     let handles: Vec<_> = snapshots
         .into_iter()
-        .map(|(name, rt)| std::thread::spawn(move || (name, refresh(&rt))))
+        .map(|(name, rt)| {
+            let activity = Arc::clone(activity);
+            std::thread::spawn(move || {
+                let res = refresh(&rt);
+                // Clear inside the worker so a Drop'd handle still releases
+                // the spinner — the join loop below would skip a panicked
+                // thread otherwise.
+                clear_activity(&activity, &name);
+                (name, res)
+            })
+        })
         .collect();
 
     let mut refreshed = Vec::new();
@@ -218,6 +242,7 @@ pub(crate) fn auto_start_windows(
     config: &mut AppConfig,
     store: &UsageStore,
     refetch: &RefetchQueue,
+    activity: &ActivityStore,
 ) -> Vec<String> {
     // Claim cooldown slots under the lock BEFORE any network work. A competing
     // clauth process that starts up a moment later will observe our recorded
@@ -285,6 +310,13 @@ pub(crate) fn auto_start_windows(
     // token on every successful refresh, so the new pair MUST be persisted
     // before the kick is attempted — otherwise a kick-only failure leaves the
     // stored refresh token permanently invalid.
+    //
+    // Spinner-wise: AutoStarting covers refresh + persist + kick for the full
+    // window. Each worker stamps its own slot AutoStarting before the network
+    // round trip and the join loop clears on completion (success or failure).
+    for (name, _) in &snapshots {
+        mark_activity(activity, name, ProfileActivity::AutoStarting);
+    }
     let handles: Vec<_> = snapshots
         .into_iter()
         .map(|(name, rt)| std::thread::spawn(move || (name, refresh(&rt))))
@@ -297,9 +329,12 @@ pub(crate) fn auto_start_windows(
         };
         let access_token = tok.access_token.clone();
         if !apply_rotated_tokens_or_rollback_cooldown(config, &name, tok) {
+            clear_activity(activity, &name);
             continue;
         }
-        if kick(&access_token).is_ok() {
+        let ok = kick(&access_token).is_ok();
+        clear_activity(activity, &name);
+        if ok {
             kicked.push(name);
         }
     }
@@ -318,7 +353,12 @@ pub(crate) fn auto_start_windows(
 /// cooldown stops repeated invocations from re-firing inside an open
 /// window. Returns true iff the kick HTTP call succeeded. Pushes `name`
 /// onto `refetch` on success.
-pub(crate) fn auto_start_named(config: &mut AppConfig, name: &str, refetch: &RefetchQueue) -> bool {
+pub(crate) fn auto_start_named(
+    config: &mut AppConfig,
+    name: &str,
+    refetch: &RefetchQueue,
+    activity: &ActivityStore,
+) -> bool {
     let now = now_ms();
     let token = match with_state_lock(|| {
         let Some(profile) = config.find(name) else {
@@ -356,14 +396,20 @@ pub(crate) fn auto_start_named(config: &mut AppConfig, name: &str, refetch: &Ref
         _ => return false,
     };
 
+    // AutoStarting spinner covers the full refresh + persist + kick window.
+    // Never held across `with_state_lock`; cleared in every exit path.
+    mark_activity(activity, name, ProfileActivity::AutoStarting);
     let Ok(tok) = refresh(&token) else {
+        clear_activity(activity, name);
         return false;
     };
     let access_token = tok.access_token.clone();
     if !apply_rotated_tokens_or_rollback_cooldown(config, name, tok) {
+        clear_activity(activity, name);
         return false;
     }
     let kicked = kick(&access_token).is_ok();
+    clear_activity(activity, name);
     if kicked && let Ok(mut q) = refetch.lock() {
         q.insert(name.to_string());
     }

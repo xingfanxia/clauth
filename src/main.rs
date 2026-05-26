@@ -22,7 +22,7 @@ use anyhow::Result;
 use crate::actions::{switch_profile, switch_profile_reconciled};
 use crate::claude::{LinkState, classify_credentials_link, is_first_login};
 use crate::profile::{AppConfig, load_config};
-use crate::usage::RefetchQueue;
+use crate::usage::{ActivityStore, RefetchQueue};
 
 fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<String> {
     config.canonical_name(name).ok_or_else(|| {
@@ -79,7 +79,11 @@ fn main() -> Result<()> {
             // discarded; we only need the return value (rotated names) which
             // the CLI also discards.
             let noop: RefetchQueue = Arc::new(Mutex::new(std::collections::HashSet::new()));
-            let _ = oauth::refresh_all(&mut config, false, &noop);
+            // CLI path has no spinner — pass a throwaway ActivityStore so the
+            // shared signature works without printing to stderr.
+            let noop_activity: ActivityStore =
+                Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let _ = oauth::refresh_all(&mut config, false, &noop, &noop_activity);
 
             // When the outgoing active profile has a diverged live credentials
             // file (CC re-logged or wrote a regular file), prompt rather than
@@ -121,7 +125,7 @@ fn main() -> Result<()> {
             // Match the TUI: prime the 5h window if the target is opted in
             // via `auto_start = true`. Cooldown blocks repeated CLI switches
             // from re-kicking inside the same window.
-            let _ = oauth::auto_start_named(&mut config, &canonical, &noop);
+            let _ = oauth::auto_start_named(&mut config, &canonical, &noop, &noop_activity);
             println!("switched to '{canonical}'");
             return Ok(());
         }

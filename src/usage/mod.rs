@@ -6,8 +6,9 @@ pub(crate) use fetch::{
     now_epoch_secs, now_ms,
 };
 pub(crate) use scheduler::{
-    ConsecutiveCacheHit, ConsecutiveOk, FetchStatus, FetchingNow, Last429At, LastFetchedAt,
-    LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, PendingAutoStart,
-    PendingWindowRotation, RefetchQueue, StatusStore, TokenEntry, TokenList, UsageStore,
-    default_fallback_threshold, fetch_all_into, spawn_refresher,
+    ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, FetchStatus, Last429At,
+    LastFetchedAt, LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult,
+    OpResultReceiver, OpResultSender, PendingAutoStart, PendingWindowRotation, ProfileActivity,
+    RefetchQueue, StatusStore, TokenEntry, TokenList, UsageStore, clear_activity,
+    default_fallback_threshold, fetch_all_into, mark_activity, spawn_refresher,
 };

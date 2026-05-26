@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -108,9 +109,96 @@ pub(crate) struct TokenEntry {
 /// without re-running the partition math on the render thread.
 pub(crate) type NextRefreshPerProfile = Arc<Mutex<HashMap<String, u64>>>;
 
-/// Profile names currently being fetched. The overview row shows a busy pip
-/// in the timer slot instead of a countdown while a fetch is in flight.
-pub(crate) type FetchingNow = Arc<Mutex<HashSet<String>>>;
+/// In-flight blocking operation per profile. The overview row shows a spinner
+/// in the timer slot instead of a countdown whenever a profile's slot is
+/// anything other than `Idle`. The map omits `Idle` entries — absent and
+/// `Idle` are equivalent.
+///
+/// Mutex is leaf-level: never hold across HTTP. Snapshot or per-name
+/// read/write only so the UI render thread isn't blocked by a worker.
+pub(crate) type ActivityStore = Arc<Mutex<HashMap<String, ProfileActivity>>>;
+
+/// What's currently happening to one profile. `Idle` means no in-flight work;
+/// every other variant is a blocking op the overview row should visualize
+/// with a spinner in the per-profile timer slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileActivity {
+    Idle,
+    /// `/usage` HTTP fetch in flight.
+    Fetching,
+    /// OAuth refresh (rotate access + refresh tokens) in flight.
+    Refreshing,
+    /// CLI/TUI account switch in flight (relink + pre-switch refresh).
+    Switching,
+    /// One-shot `clauth start` launch path. Phase 1 doesn't drive this from
+    /// any path (`start::run` runs in a separate process); Phase 2 wires it
+    /// when the launch becomes a background worker.
+    #[allow(dead_code)]
+    Starting,
+    /// Background auto-start kick — token refresh + 1-token Haiku ping.
+    AutoStarting,
+}
+
+/// Kind of operation reported through an [`OpResult`]. Mirrors the non-`Idle`
+/// variants of [`ProfileActivity`] one-for-one. Phase 1 keeps every refresh
+/// path synchronous on the main thread, so the channel stays mostly empty;
+/// Phase 2 hands each variant to a real worker.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivityKind {
+    Fetching,
+    Refreshing,
+    Switching,
+    Starting,
+    AutoStarting,
+}
+
+impl ActivityKind {
+    /// Lift a kind to the matching activity variant.
+    #[allow(dead_code)]
+    pub(crate) fn as_activity(self) -> ProfileActivity {
+        match self {
+            ActivityKind::Fetching => ProfileActivity::Fetching,
+            ActivityKind::Refreshing => ProfileActivity::Refreshing,
+            ActivityKind::Switching => ProfileActivity::Switching,
+            ActivityKind::Starting => ProfileActivity::Starting,
+            ActivityKind::AutoStarting => ProfileActivity::AutoStarting,
+        }
+    }
+}
+
+/// Result of one async (or for now: synchronous-but-tracked) operation. The
+/// main thread drains the receiver inside `on_tick`, clears the profile's
+/// `ActivityStore` slot back to `Idle`, and surfaces any error as a toast.
+#[derive(Debug)]
+pub(crate) struct OpResult {
+    pub(crate) name: String,
+    pub(crate) kind: ActivityKind,
+    pub(crate) outcome: anyhow::Result<()>,
+}
+
+pub(crate) type OpResultSender = Sender<OpResult>;
+pub(crate) type OpResultReceiver = Receiver<OpResult>;
+
+/// Mark a profile as performing `activity` in the shared store. Idempotent;
+/// caller should pair with [`clear_activity`] in every exit path.
+pub(crate) fn mark_activity(store: &ActivityStore, name: &str, activity: ProfileActivity) {
+    if let Ok(mut g) = store.lock() {
+        if matches!(activity, ProfileActivity::Idle) {
+            g.remove(name);
+        } else {
+            g.insert(name.to_string(), activity);
+        }
+    }
+}
+
+/// Drop a profile back to `Idle` (removes the entry entirely; readers treat
+/// missing and `Idle` identically).
+pub(crate) fn clear_activity(store: &ActivityStore, name: &str) {
+    if let Ok(mut g) = store.lock() {
+        g.remove(name);
+    }
+}
 
 /// Outcome of the most recent usage fetch attempt for a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,11 +239,18 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
 /// rotation succeeds but the follow-up fetch failed, so the next scheduler
 /// tick re-fetches with the new token. Returns the rotated pair on success
 /// so the caller can update the live `TokenList`.
+///
+/// The inline 401 refresh leg flips `activity[name]` to `Refreshing` for the
+/// duration of `oauth::refresh` so the overview row shows a refresh spinner
+/// instead of a fetch spinner during the rotation, then back to `Fetching`
+/// for the retry. The caller is responsible for the initial `Fetching` mark
+/// and the final `Idle` clear.
 fn fetch_with_rotation(
     name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
     refetch: &RefetchQueue,
+    activity: &ActivityStore,
 ) -> (Option<UsageInfo>, FetchStatus, Option<RotatedTokens>) {
     let saw_429 = match fetch_raw(access_token) {
         Ok(info) => return (Some(info), FetchStatus::Fresh, None),
@@ -177,7 +272,13 @@ fn fetch_with_rotation(
         let (info, status) = load_cached_with_status(name, fallback_status);
         return (info, status, None);
     };
-    let tok = match crate::oauth::refresh(rt) {
+    // Refresh leg: surface a refresh spinner during the network round trip,
+    // then drop back to Fetching for the retry. `Idle` is only reached on the
+    // scheduler-side clear after this function returns.
+    mark_activity(activity, name, ProfileActivity::Refreshing);
+    let refresh_result = crate::oauth::refresh(rt);
+    mark_activity(activity, name, ProfileActivity::Fetching);
+    let tok = match refresh_result {
         Ok(t) => t,
         Err(_) => {
             let (info, status) = load_cached_with_status(name, fallback_status);
@@ -429,12 +530,13 @@ struct FetchOutcome {
 }
 
 /// Run a single fetch for one entry.
-fn run_fetch(entry: TokenEntry, refetch: &RefetchQueue) -> FetchOutcome {
+fn run_fetch(entry: TokenEntry, refetch: &RefetchQueue, activity: &ActivityStore) -> FetchOutcome {
     let (info, status, rotated) = fetch_with_rotation(
         &entry.name,
         &entry.access_token,
         entry.refresh_token.as_deref(),
         refetch,
+        activity,
     );
 
     let needs_auto_start = match info.as_ref() {
@@ -542,6 +644,7 @@ pub(crate) fn fetch_all_into(
     last_fetched: &LastFetchedAt,
     pending_auto_start: &PendingAutoStart,
     refetch: &RefetchQueue,
+    activity: &ActivityStore,
     learned: &LearnedIntervals,
     ok_count: &ConsecutiveOk,
     cache_hit_count: &ConsecutiveCacheHit,
@@ -551,12 +654,21 @@ pub(crate) fn fetch_all_into(
         return;
     }
 
+    // Mark every entry as Fetching before the thread fan-out so the UI shows
+    // a spinner for the full window, then clear on join (or on fetch-with-
+    // rotation flipping back through Refreshing). Cleared per-name as each
+    // thread joins.
+    for entry in tokens {
+        mark_activity(activity, &entry.name, ProfileActivity::Fetching);
+    }
+
     let handles: Vec<_> = tokens
         .iter()
         .cloned()
         .map(|entry| {
             let refetch = Arc::clone(refetch);
-            std::thread::spawn(move || run_fetch(entry, &refetch))
+            let activity = Arc::clone(activity);
+            std::thread::spawn(move || run_fetch(entry, &refetch, &activity))
         })
         .collect();
 
@@ -564,6 +676,7 @@ pub(crate) fn fetch_all_into(
         let Ok(outcome) = h.join() else {
             continue;
         };
+        clear_activity(activity, &outcome.name);
         apply_outcome(
             outcome,
             store,
@@ -589,7 +702,7 @@ pub(crate) fn spawn_refresher(
     store: UsageStore,
     status: StatusStore,
     next_refresh_per_profile: NextRefreshPerProfile,
-    fetching_now: FetchingNow,
+    activity: ActivityStore,
     last_fetched: LastFetchedAt,
     pending_auto_start: PendingAutoStart,
     pending_window_rotation: PendingWindowRotation,
@@ -651,18 +764,19 @@ pub(crate) fn spawn_refresher(
                 continue;
             }
 
-            // Mark profiles as in-flight so the overview row shows a pip.
-            if let Ok(mut fn_set) = fetching_now.lock() {
-                for entry in &due {
-                    fn_set.insert(entry.name.clone());
-                }
+            // Mark profiles as in-flight so the overview row shows a spinner.
+            // Per-name leaf write — the lock is never held across the HTTP
+            // round trips below.
+            for entry in &due {
+                mark_activity(&activity, &entry.name, ProfileActivity::Fetching);
             }
 
             let handles: Vec<_> = due
                 .into_iter()
                 .map(|entry| {
                     let refetch_queue = Arc::clone(&refetch_queue);
-                    std::thread::spawn(move || run_fetch(entry, &refetch_queue))
+                    let activity = Arc::clone(&activity);
+                    std::thread::spawn(move || run_fetch(entry, &refetch_queue, &activity))
                 })
                 .collect();
             for h in handles {
@@ -670,12 +784,10 @@ pub(crate) fn spawn_refresher(
                     continue;
                 };
                 // Clear the in-flight marker before writing results so the
-                // overview row transitions from pip → fresh countdown atomically
+                // overview row transitions from spinner → fresh countdown atomically
                 // from the render thread's perspective (it reads both under separate
-                // locks, but a brief flicker to "no pip + stale timer" is acceptable).
-                if let Ok(mut fn_set) = fetching_now.lock() {
-                    fn_set.remove(&outcome.name);
-                }
+                // locks, but a brief flicker to "no spinner + stale timer" is acceptable).
+                clear_activity(&activity, &outcome.name);
                 // Propagate any rotated OAuth pair back into the live snapshot
                 // before the next tick — otherwise tick N+1 reuses the stale
                 // access token, 401s, rotates again, and burns the refresh-token

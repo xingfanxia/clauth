@@ -15,7 +15,11 @@ use super::format::{
 };
 use crate::fallback::threshold_for;
 use crate::profile::{AppConfig, Profile};
-use crate::usage::now_ms;
+use crate::usage::{ProfileActivity, now_ms};
+
+/// Braille spinner frames — same set most CLI tools use. Cycled by
+/// `app.tick_count` so every render frame advances one step.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Width of the per-profile timer slot inserted before the 5h bar.
 /// Format: `XXXs` (3 digits + 's') + 1 trailing space = 5 chars.
@@ -277,18 +281,21 @@ fn render_overview_row(
         Span::raw(" ")
     };
 
-    // Per-profile timer slot: busy pip while fetching, seconds countdown otherwise.
-    // Right-aligned in TIMER_SLOT-1 chars + 1 trailing space so the bar [ always
-    // has visible breathing room and the dot doesn't crowd the kind column.
+    // Per-profile timer slot: braille spinner during any in-flight activity,
+    // seconds countdown when Idle. Right-aligned in TIMER_SLOT-1 chars + 1
+    // trailing space so the bar [ always has visible breathing room.
     let timer_span = {
         let inner = TIMER_SLOT - 1;
-        let is_fetching = app
-            .fetching_now
+        let activity = app
+            .activity
             .lock()
             .ok()
-            .is_some_and(|s| s.contains(&name_str));
-        if is_fetching {
-            Span::styled(format!("{:>inner$} ", "●", inner = inner), theme::accent())
+            .and_then(|g| g.get(&name_str).copied())
+            .unwrap_or(ProfileActivity::Idle);
+        if !matches!(activity, ProfileActivity::Idle) {
+            let frame = SPINNER_FRAMES[(app.tick_count as usize) % SPINNER_FRAMES.len()];
+            let style = spinner_style(activity);
+            Span::styled(format!("{frame:>inner$} ", inner = inner), style)
         } else {
             let secs_str = app
                 .next_refresh_per_profile
@@ -339,6 +346,26 @@ fn render_overview_row(
     }
 
     Line::from(spans)
+}
+
+/// Maps an in-flight activity to the spinner color. Idle is unreachable here;
+/// the caller falls back to the seconds countdown for it.
+fn spinner_style(activity: ProfileActivity) -> Style {
+    match activity {
+        // Sapphire primary — the routine "I'm pulling fresh numbers" state.
+        ProfileActivity::Fetching => theme::accent(),
+        // Info cyan — distinct from accent so a refresh inside a fetch reads
+        // visibly different from a plain fetch.
+        ProfileActivity::Refreshing => theme::info(),
+        // Claude orange — secondary accent; switching is the rare,
+        // user-visible state and earns the warm slot.
+        ProfileActivity::Switching => theme::orange(),
+        // Warning yellow — a launching session is a transient mid-state.
+        ProfileActivity::Starting => theme::warning(),
+        // Catppuccin green — a successful auto-start arms the 5h window.
+        ProfileActivity::AutoStarting => theme::success(),
+        ProfileActivity::Idle => theme::faint(),
+    }
 }
 
 fn render_action_row(label: &'static str, selected: bool) -> Line<'static> {

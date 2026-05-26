@@ -93,3 +93,15 @@ pub(crate) fn util_color(pct: f64) -> Color {
         TEXT_DIM
     }
 }
+
+/// Sapphire info accent. Used as the spinner color for refresh operations to
+/// keep ACCENT (the primary sapphire) reserved for the active fetch spinner.
+pub(crate) fn info() -> Style {
+    Style::default().fg(INFO)
+}
+
+/// Catppuccin green — success / confirmation tint. Spinner color for the
+/// auto-start kick path so a successful window arming reads green.
+pub(crate) fn success() -> Style {
+    Style::default().fg(SUCCESS)
+}

@@ -32,10 +32,11 @@ use crate::profile::{
     AppConfig, Profile, app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::usage::{
-    ConsecutiveCacheHit, ConsecutiveOk, FetchingNow, Last429At, LastFetchedAt, LastRotatedWindow,
-    LearnedIntervals, NextRefreshPerProfile, PendingAutoStart, PendingWindowRotation, RefetchQueue,
-    StatusStore, TokenEntry, TokenList, UsageStore, default_fallback_threshold, fetch_all_into,
-    spawn_refresher,
+    ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, Last429At, LastFetchedAt,
+    LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult, OpResultReceiver,
+    OpResultSender, PendingAutoStart, PendingWindowRotation, ProfileActivity, RefetchQueue,
+    StatusStore, TokenEntry, TokenList, UsageStore, clear_activity, default_fallback_threshold,
+    fetch_all_into, mark_activity, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -340,7 +341,19 @@ pub(crate) struct App {
     pub(crate) usage_status: StatusStore,
     pub(crate) usage_tokens: TokenList,
     pub(crate) next_refresh_per_profile: NextRefreshPerProfile,
-    pub(crate) fetching_now: FetchingNow,
+    /// One source of truth for "what's happening to profile X right now",
+    /// shared between the scheduler thread, oauth refresh paths, and the TUI
+    /// render loop. The render loop reads it on every frame to drive the
+    /// spinner; workers write per-name. Never held across HTTP.
+    pub(crate) activity: ActivityStore,
+    /// Drained inside `on_tick`. Each result clears its profile's
+    /// `ActivityStore` slot and surfaces any error as a danger toast.
+    pub(crate) op_results: OpResultReceiver,
+    /// Sender side. Cloned into workers (and passed to refresh/rotation
+    /// helpers) so they can report completion without holding any lock.
+    /// Phase 1 owns this for Phase 2 — workers don't exist yet.
+    #[allow(dead_code)]
+    pub(crate) op_sender: OpResultSender,
     pub(crate) last_fetched: LastFetchedAt,
     pub(crate) pending_auto_start: PendingAutoStart,
     pub(crate) pending_window_rotation: PendingWindowRotation,
@@ -361,6 +374,9 @@ pub(crate) struct App {
 
     pub(crate) last_state_mtime: Option<SystemTime>,
     pub(crate) started_at: Instant,
+    /// Monotonically increasing render-tick counter used to advance the
+    /// activity spinner frame. Bumped once per `on_tick`.
+    pub(crate) tick_count: u64,
     pub(crate) quit: bool,
     /// Last time the 1Hz divergence poll ran. Re-checks whether
     /// `~/.claude/.credentials.json` still points at the active profile and
@@ -375,7 +391,8 @@ impl App {
         let usage_status: StatusStore = Arc::new(Mutex::new(HashMap::new()));
         let usage_tokens: TokenList = Arc::new(Mutex::new(collect_tokens(&config.profiles)));
         let next_refresh_per_profile: NextRefreshPerProfile = Arc::new(Mutex::new(HashMap::new()));
-        let fetching_now: FetchingNow = Arc::new(Mutex::new(HashSet::new()));
+        let activity: ActivityStore = Arc::new(Mutex::new(HashMap::new()));
+        let (op_sender, op_results) = std::sync::mpsc::channel::<OpResult>();
         let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
         let pending_auto_start: PendingAutoStart = Arc::new(Mutex::new(HashSet::new()));
         let pending_window_rotation: PendingWindowRotation = Arc::new(Mutex::new(HashMap::new()));
@@ -396,7 +413,9 @@ impl App {
             usage_status,
             usage_tokens,
             next_refresh_per_profile,
-            fetching_now,
+            activity,
+            op_results,
+            op_sender,
             last_fetched,
             pending_auto_start,
             pending_window_rotation,
@@ -413,6 +432,7 @@ impl App {
             toasts: VecDeque::new(),
             last_state_mtime: app_state_mtime(),
             started_at: Instant::now(),
+            tick_count: 0,
             quit: false,
             last_divergence_check: Instant::now(),
         }
@@ -442,7 +462,7 @@ impl App {
         // so the initial usage fetch below uses fresh access tokens.
         {
             let mut cfg = self.config();
-            let _ = oauth::refresh_all(&mut cfg, false, &self.refetch_queue);
+            let _ = oauth::refresh_all(&mut cfg, false, &self.refetch_queue, &self.activity);
         }
         self.refresh_tokens();
 
@@ -458,6 +478,7 @@ impl App {
             &self.last_fetched,
             &self.pending_auto_start,
             &self.refetch_queue,
+            &self.activity,
             &self.learned_intervals,
             &self.ok_count,
             &self.cache_hit_count,
@@ -466,7 +487,12 @@ impl App {
 
         let started = {
             let mut cfg = self.config();
-            oauth::auto_start_windows(&mut cfg, &self.usage_store, &self.refetch_queue)
+            oauth::auto_start_windows(
+                &mut cfg,
+                &self.usage_store,
+                &self.refetch_queue,
+                &self.activity,
+            )
         };
         if !started.is_empty() {
             for name in &started {
@@ -486,6 +512,7 @@ impl App {
                 &self.last_fetched,
                 &self.pending_auto_start,
                 &self.refetch_queue,
+                &self.activity,
                 &self.learned_intervals,
                 &self.ok_count,
                 &self.cache_hit_count,
@@ -502,7 +529,7 @@ impl App {
             Arc::clone(&self.usage_store),
             Arc::clone(&self.usage_status),
             Arc::clone(&self.next_refresh_per_profile),
-            Arc::clone(&self.fetching_now),
+            Arc::clone(&self.activity),
             Arc::clone(&self.last_fetched),
             Arc::clone(&self.pending_auto_start),
             Arc::clone(&self.pending_window_rotation),
@@ -578,6 +605,7 @@ impl App {
         let last_fetched = Arc::clone(&self.last_fetched);
         let pending_auto_start = Arc::clone(&self.pending_auto_start);
         let refetch_queue = Arc::clone(&self.refetch_queue);
+        let activity = Arc::clone(&self.activity);
         let learned = Arc::clone(&self.learned_intervals);
         let ok_count = Arc::clone(&self.ok_count);
         let cache_hit_count = Arc::clone(&self.cache_hit_count);
@@ -590,6 +618,7 @@ impl App {
                 &last_fetched,
                 &pending_auto_start,
                 &refetch_queue,
+                &activity,
                 &learned,
                 &ok_count,
                 &cache_hit_count,
@@ -893,11 +922,18 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
 }
 
 fn perform_switch(app: &mut App, name: &str) {
+    // Visible indicator for the full window: Switching covers both the
+    // pre-switch refresh and the relink step. Cleared in every exit path.
+    mark_activity(&app.activity, name, ProfileActivity::Switching);
     let result = {
         let mut cfg = app.config();
-        let _ = oauth::refresh_all(&mut cfg, false, &app.refetch_queue);
+        let _ = oauth::refresh_all(&mut cfg, false, &app.refetch_queue, &app.activity);
+        // refresh_all may have flipped us back to Idle when it cleared its
+        // own per-name Refreshing; re-stamp Switching for the relink step.
+        mark_activity(&app.activity, name, ProfileActivity::Switching);
         switch_profile(&mut cfg, name)
     };
+    clear_activity(&app.activity, name);
     match result {
         Ok(()) => {
             app.refresh_tokens();
@@ -1467,7 +1503,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         ConfirmAction::RotateAll => {
             let rotated = {
                 let mut cfg = app.config();
-                oauth::refresh_all(&mut cfg, true, &app.refetch_queue)
+                oauth::refresh_all(&mut cfg, true, &app.refetch_queue, &app.activity)
             };
             app.refresh_tokens();
             let count = rotated.len();
@@ -1824,6 +1860,40 @@ fn apply_input_edit(input: &mut InputState, key: KeyEvent) {
 // ── Per-tick maintenance ──────────────────────────────────────────────────────
 
 pub(crate) fn on_tick(app: &mut App) {
+    // Advance the spinner frame. Wraps naturally on the 10-frame braille set.
+    app.tick_count = app.tick_count.wrapping_add(1);
+
+    // Drain completed op results posted by workers. Each result clears the
+    // profile's activity slot back to Idle and surfaces errors as toasts.
+    // Phase 1: all the named refresh paths still run synchronously on the main
+    // thread, so the channel is mostly empty — but the drain has to exist
+    // before Phase 2 starts moving them off-thread.
+    let mut drained: Vec<OpResult> = Vec::new();
+    while let Ok(result) = app.op_results.try_recv() {
+        drained.push(result);
+    }
+    for OpResult {
+        name,
+        kind,
+        outcome,
+    } in drained
+    {
+        clear_activity(&app.activity, &name);
+        if let Err(e) = outcome {
+            let verb = match kind {
+                ActivityKind::Fetching => "fetch",
+                ActivityKind::Refreshing => "refresh",
+                ActivityKind::Switching => "switch",
+                ActivityKind::Starting => "start",
+                ActivityKind::AutoStarting => "auto-start",
+            };
+            app.toast(
+                ToastKind::Danger,
+                format!("{verb} for '{name}' failed: {e}"),
+            );
+        }
+    }
+
     if app.reload_if_state_changed() {
         app.clamp_main_cursor();
     }
@@ -1846,7 +1916,7 @@ pub(crate) fn on_tick(app: &mut App) {
     for name in pending {
         let kicked = {
             let mut cfg = app.config();
-            oauth::auto_start_named(&mut cfg, &name, &app.refetch_queue)
+            oauth::auto_start_named(&mut cfg, &name, &app.refetch_queue, &app.activity)
         };
         if kicked {
             any_started = true;
@@ -1877,7 +1947,7 @@ pub(crate) fn on_tick(app: &mut App) {
     for (name, epoch) in pending_rotations {
         let rotated = {
             let mut cfg = app.config();
-            oauth::rotate_one(&mut cfg, &name)
+            oauth::rotate_one(&mut cfg, &name, &app.activity)
         };
         if rotated {
             if let Ok(mut lrw) = app.last_rotated_window.lock() {
