@@ -312,6 +312,7 @@ fn build_runtime_dir(
 ) -> Result<()> {
     // Re-walk on every acquire so entries added to ~/.claude/ after the
     // first session's build are picked up. Existing entries stay as-is.
+    let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(claude_home)
         .with_context(|| format!("failed to read {}", claude_home.display()))?
     {
@@ -324,8 +325,9 @@ fn build_runtime_dir(
         if dst.symlink_metadata().is_ok() {
             continue;
         }
-        materialize_entry(&entry.path(), &dst, mode)?;
+        pending.push((entry.path(), dst));
     }
+    materialize_entries(pending, mode)?;
 
     let settings_src = claude_home.join("settings.json");
     let merged = build_claude_settings_json(&settings_src, profile, &[])?;
@@ -360,6 +362,62 @@ fn materialize_entry(src: &Path, dst: &Path, mode: LinkMode) -> Result<()> {
     match mode {
         LinkMode::Real => link_entry(src, dst),
         LinkMode::Fake => copy_tree(src, dst),
+    }
+}
+
+/// Materialize the pending top-level entries into the runtime tree.
+///
+/// Real mode creates symlinks (near-free) serially. Fake mode is a recursive
+/// byte copy, so the independent top-level subtrees are fanned across a
+/// bounded worker pool to cut acquire wall-time on a large `~/.claude/`. This
+/// stays inside the single `with_state_lock` hold the caller already owns —
+/// the lock is never released; threads only parallelize the copy. Each
+/// subtree is disjoint, so the per-entry contract (no shared dst) is intact;
+/// credential reconciliation still runs serially after this returns.
+fn materialize_entries(pending: Vec<(PathBuf, PathBuf)>, mode: LinkMode) -> Result<()> {
+    if mode == LinkMode::Real || pending.len() < 2 {
+        for (src, dst) in &pending {
+            materialize_entry(src, dst, mode)?;
+        }
+        return Ok(());
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(pending.len());
+    if workers < 2 {
+        for (src, dst) in &pending {
+            materialize_entry(src, dst, mode)?;
+        }
+        return Ok(());
+    }
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let first_err = std::sync::Mutex::new(None::<anyhow::Error>);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((src, dst)) = pending.get(idx) else {
+                        break;
+                    };
+                    if let Err(e) = materialize_entry(src, dst, mode) {
+                        let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    match first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
