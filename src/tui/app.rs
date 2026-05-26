@@ -998,16 +998,35 @@ fn perform_switch(app: &mut App, name: &str) {
     let sender = app.op_sender.clone();
     let target = name.to_string();
     std::thread::spawn(move || {
-        // `refresh_all` joins its per-profile workers internally; on return
-        // every refresh slot is back to Idle. Re-stamp Switching so the
-        // spinner stays up through the FS leg the UI thread runs next.
-        let _ = oauth::refresh_all(&config, false, &refetch, &activity, &sender);
-        mark_activity(&activity, &target, ProfileActivity::Switching);
-        let _ = sender.send(OpResult {
-            name: target,
-            kind: ActivityKind::Switching,
-            outcome: Ok(()),
-        });
+        // `catch_unwind` ensures the Switching slot is cleared even when a
+        // panic fires before the `sender.send` below. Without this, a panic
+        // leaves the slot set forever: `any_busy` stays true and ALL future
+        // switches are blocked for the lifetime of the process. The
+        // `AssertUnwindSafe` wrappers are intentional — these Arcs are
+        // shared-mutable cells with their own locks; no per-thread invariant
+        // can be violated for other threads by a panic inside this closure.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // `refresh_all` joins its per-profile workers internally; on return
+            // every refresh slot is back to Idle. Re-stamp Switching so the
+            // spinner stays up through the FS leg the UI thread runs next.
+            let _ = oauth::refresh_all(&config, false, &refetch, &activity, &sender);
+            mark_activity(&activity, &target, ProfileActivity::Switching);
+            let _ = sender.send(OpResult {
+                name: target.clone(),
+                kind: ActivityKind::Switching,
+                outcome: Ok(()),
+            });
+        }));
+        if result.is_err() {
+            // Panic path: clear the slot and send a failure result so the UI
+            // thread can toast the error and the switch operation is unblocked.
+            clear_activity(&activity, &target);
+            let _ = sender.send(OpResult {
+                name: target,
+                kind: ActivityKind::Switching,
+                outcome: Err(anyhow::anyhow!("switch worker panicked")),
+            });
+        }
     });
 }
 
@@ -2008,6 +2027,22 @@ pub(crate) fn on_tick(app: &mut App) {
         // in-flight Refreshing result for the same name must not clobber
         // that stamp, or the spinner would blink Idle between the refresh
         // leg and the relink leg.
+        //
+        // Invariant: `ActivityKind::Fetching` is NEVER sent through OpResult.
+        // `fetch_with_rotation` and `run_fetch` manage the Fetching activity
+        // slot directly (mark before spawn, clear in join loop) without going
+        // through the OpResult channel. The conditional guard here is correct
+        // and complete for the kinds that ARE sent: Refreshing, AutoStarting,
+        // and Switching. A stray Fetching result would reach the `_ => {}` arm
+        // in the `Ok(())` match below and be a silent no-op for bookkeeping,
+        // which is acceptable — but the clear above would not fire because
+        // the activity slot would typically be Idle or a different variant.
+        // Adding a debug assertion here would force a panic in tests if this
+        // invariant is ever broken.
+        debug_assert!(
+            !matches!(kind, ActivityKind::Fetching),
+            "ActivityKind::Fetching must never be sent via OpResult"
+        );
         if let Ok(mut a) = app.activity.lock()
             && a.get(&name).copied() == Some(kind.as_activity())
         {

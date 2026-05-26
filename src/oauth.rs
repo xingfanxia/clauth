@@ -225,13 +225,17 @@ pub(crate) fn refresh_all(
         mark_activity(activity, name, ProfileActivity::Refreshing);
     }
 
-    let handles: Vec<_> = snapshots
+    // Pair each handle with the profile name so the join loop can clear the
+    // activity slot on panic — the name is consumed by the closure, so we
+    // need a second copy held outside it.
+    let handles: Vec<(String, _)> = snapshots
         .into_iter()
         .map(|(name, rt)| {
             let config = Arc::clone(config);
             let activity = Arc::clone(activity);
             let sender = sender.clone();
-            std::thread::spawn(move || {
+            let name_for_handle = name.clone();
+            let h = std::thread::spawn(move || {
                 let refreshed = refresh(&rt);
                 let (outcome, saved) = match refreshed {
                     Ok(tok) => {
@@ -254,16 +258,23 @@ pub(crate) fn refresh_all(
                     outcome,
                 });
                 (name, saved)
-            })
+            });
+            (name_for_handle, h)
         })
         .collect();
 
     let mut refreshed = Vec::new();
-    for h in handles {
-        let Ok((name, true)) = h.join() else {
-            continue;
-        };
-        refreshed.push(name);
+    for (name, h) in handles {
+        match h.join() {
+            Ok((n, true)) => refreshed.push(n),
+            Ok(_) => {}
+            Err(_) => {
+                // Worker panicked before calling `clear_activity`. Clear the slot
+                // here so the spinner doesn't freeze and `any_busy` can resolve.
+                // No OpResult was sent, so no toast is emitted for this profile.
+                clear_activity(activity, &name);
+            }
+        }
     }
     if let Ok(mut q) = refetch.lock() {
         for name in &refreshed {
@@ -382,13 +393,16 @@ pub(crate) fn auto_start_windows(
     for (name, _) in &snapshots {
         mark_activity(activity, name, ProfileActivity::AutoStarting);
     }
-    let handles: Vec<_> = snapshots
+    // Pair each handle with the profile name so the join loop can clear the
+    // activity slot on panic — the name is consumed by the closure.
+    let handles: Vec<(String, _)> = snapshots
         .into_iter()
         .map(|(name, rt)| {
             let config = Arc::clone(config);
             let activity = Arc::clone(activity);
             let sender = sender.clone();
-            std::thread::spawn(move || {
+            let name_for_handle = name.clone();
+            let h = std::thread::spawn(move || {
                 let (outcome, kicked) = run_auto_start(&config, &name, &rt);
                 clear_activity(&activity, &name);
                 let _ = sender.send(OpResult {
@@ -397,16 +411,22 @@ pub(crate) fn auto_start_windows(
                     outcome,
                 });
                 (name, kicked)
-            })
+            });
+            (name_for_handle, h)
         })
         .collect();
 
     let mut kicked = Vec::new();
-    for h in handles {
-        let Ok((name, true)) = h.join() else {
-            continue;
-        };
-        kicked.push(name);
+    for (name, h) in handles {
+        match h.join() {
+            Ok((n, true)) => kicked.push(n),
+            Ok(_) => {}
+            Err(_) => {
+                // Worker panicked before calling `clear_activity`. Clear the slot
+                // here so the spinner doesn't freeze and `any_busy` can resolve.
+                clear_activity(activity, &name);
+            }
+        }
     }
     if let Ok(mut q) = refetch.lock() {
         for name in &kicked {

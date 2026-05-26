@@ -791,28 +791,37 @@ pub(crate) fn fetch_all_into(
         .iter()
         .cloned()
         .map(|entry| {
+            let name = entry.name.clone();
             let refetch = Arc::clone(refetch);
             let activity = Arc::clone(activity);
-            std::thread::spawn(move || run_fetch(entry, &refetch, &activity))
+            let h = std::thread::spawn(move || run_fetch(entry, &refetch, &activity));
+            (name, h)
         })
         .collect();
 
-    for h in handles {
-        let Ok(outcome) = h.join() else {
-            continue;
-        };
-        clear_activity(activity, &outcome.name);
-        apply_outcome(
-            outcome,
-            store,
-            status,
-            last_fetched,
-            pending_auto_start,
-            learned,
-            ok_count,
-            cache_hit_count,
-            last_429,
-        );
+    for (name, h) in handles {
+        match h.join() {
+            Ok(outcome) => {
+                clear_activity(activity, &outcome.name);
+                apply_outcome(
+                    outcome,
+                    store,
+                    status,
+                    last_fetched,
+                    pending_auto_start,
+                    learned,
+                    ok_count,
+                    cache_hit_count,
+                    last_429,
+                );
+            }
+            Err(_) => {
+                // Worker panicked. Clear the activity slot so the spinner doesn't
+                // freeze and `any_busy` can resolve. The panic message is lost here;
+                // there is no `OpResult` sender in this path so no toast is emitted.
+                clear_activity(activity, &name);
+            }
+        }
     }
 }
 
@@ -921,42 +930,50 @@ pub(crate) fn spawn_refresher(
             let handles: Vec<_> = due
                 .into_iter()
                 .map(|entry| {
+                    let name = entry.name.clone();
                     let refetch_queue = Arc::clone(&refetch_queue);
                     let activity = Arc::clone(&activity);
-                    std::thread::spawn(move || run_fetch(entry, &refetch_queue, &activity))
+                    let h = std::thread::spawn(move || run_fetch(entry, &refetch_queue, &activity));
+                    (name, h)
                 })
                 .collect();
-            for h in handles {
-                let Ok(outcome) = h.join() else {
-                    continue;
-                };
-                // Clear the in-flight marker before writing results so the
-                // overview row transitions from spinner → fresh countdown atomically
-                // from the render thread's perspective (it reads both under separate
-                // locks, but a brief flicker to "no spinner + stale timer" is acceptable).
-                clear_activity(&activity, &outcome.name);
-                // Propagate any rotated OAuth pair back into the live snapshot
-                // before the next tick — otherwise tick N+1 reuses the stale
-                // access token, 401s, rotates again, and burns the refresh-token
-                // chain while waiting for the mtime watch to reload AppConfig.
-                if let Some((new_access, new_refresh)) = &outcome.rotated
-                    && let Ok(mut t) = tokens.lock()
-                    && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
-                {
-                    entry.access_token = new_access.clone();
-                    entry.refresh_token = new_refresh.clone();
+            for (name, h) in handles {
+                match h.join() {
+                    Ok(outcome) => {
+                        // Clear the in-flight marker before writing results so the
+                        // overview row transitions from spinner → fresh countdown atomically
+                        // from the render thread's perspective (it reads both under separate
+                        // locks, but a brief flicker to "no spinner + stale timer" is acceptable).
+                        clear_activity(&activity, &outcome.name);
+                        // Propagate any rotated OAuth pair back into the live snapshot
+                        // before the next tick — otherwise tick N+1 reuses the stale
+                        // access token, 401s, rotates again, and burns the refresh-token
+                        // chain while waiting for the mtime watch to reload AppConfig.
+                        if let Some((new_access, new_refresh)) = &outcome.rotated
+                            && let Ok(mut t) = tokens.lock()
+                            && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
+                        {
+                            entry.access_token = new_access.clone();
+                            entry.refresh_token = new_refresh.clone();
+                        }
+                        apply_outcome(
+                            outcome,
+                            &store,
+                            &status,
+                            &last_fetched,
+                            &pending_auto_start,
+                            &learned,
+                            &ok_count,
+                            &cache_hit_count,
+                            &last_429,
+                        );
+                    }
+                    Err(_) => {
+                        // Worker panicked. Clear the activity slot so the spinner
+                        // doesn't freeze permanently and `any_busy` can resolve.
+                        clear_activity(&activity, &name);
+                    }
                 }
-                apply_outcome(
-                    outcome,
-                    &store,
-                    &status,
-                    &last_fetched,
-                    &pending_auto_start,
-                    &learned,
-                    &ok_count,
-                    &cache_hit_count,
-                    &last_429,
-                );
             }
 
             // After fetches complete, check for profiles whose 5h window has

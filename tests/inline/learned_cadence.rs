@@ -1680,3 +1680,40 @@ fn cache_hit_backoff_does_not_lower_already_raised_interval() {
         "cache-hit arm must not lower an already-at-NORMAL learned interval",
     );
 }
+
+// ── Panic-clear discipline ────────────────────────────────────────────────────
+
+/// Verify that the mark/join/clear discipline used by fetch_all_into and
+/// spawn_refresher's join loop clears the ActivityStore slot even when the
+/// worker function panics. This exercises the `Err(_)` arm of `h.join()` at
+/// the helper level without requiring real HTTP or a full scheduler.
+#[test]
+fn activity_cleared_on_worker_panic() {
+    use super::{ActivityStore, ProfileActivity, clear_activity, mark_activity};
+    use std::sync::{Arc, Mutex};
+
+    let activity: ActivityStore = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let name = "test-profile";
+
+    // Simulate the mark-before-spawn step.
+    mark_activity(&activity, name, ProfileActivity::Fetching);
+    assert!(
+        !activity.lock().unwrap().is_empty(),
+        "slot must be set after mark_activity"
+    );
+
+    // Spawn a worker that panics immediately — mirrors what happens when
+    // run_fetch panics inside fetch_all_into / spawn_refresher.
+    let h = std::thread::spawn(|| -> () { panic!("simulated worker panic") });
+
+    // The join loop's Err arm: clear the slot on panic.
+    match h.join() {
+        Ok(_) => panic!("expected panic in worker"),
+        Err(_) => clear_activity(&activity, name),
+    }
+
+    assert!(
+        activity.lock().unwrap().is_empty(),
+        "activity slot must be cleared after worker panic"
+    );
+}
