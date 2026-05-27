@@ -696,6 +696,17 @@ fn apply_outcome(
     cache_hit_count: &ConsecutiveCacheHit,
     last_429: &Last429At,
 ) {
+    // Single clock snapshot at function entry, before any I/O. Using one
+    // `now_ms()` call here ensures `elapsed_ms` measures the true inter-poll
+    // interval rather than inter-poll-plus-disk-write, preventing
+    // non-deterministic misclassification near the TTL boundary on slow or
+    // variable-latency storage. Also prevents the double-read race under
+    // concurrent `fetch_all_into` fan-out: if two `apply_outcome` calls for
+    // the same profile interleave, the second would otherwise read the
+    // timestamp just written by the first → near-zero `elapsed_ms` → false
+    // cache-hit → spurious upward bump.
+    let now = now_ms();
+
     let is_fresh = matches!(
         outcome.status,
         FetchStatus::Fresh | FetchStatus::RateLimited
@@ -722,14 +733,6 @@ fn apply_outcome(
     } else {
         (None, outcome.info.as_ref().and_then(five_hour_utilization))
     };
-
-    // Single clock snapshot for this outcome. Using one `now_ms()` call for
-    // both the elapsed calculation and the `last_fetched` write prevents a
-    // double-read race under concurrent `fetch_all_into` fan-out: if two
-    // `apply_outcome` calls for the same profile interleave, the second would
-    // otherwise read the timestamp just written by the first → near-zero
-    // `elapsed_ms` → false cache-hit → spurious upward bump.
-    let now = now_ms();
 
     // Snapshot the previous `last_fetched` value BEFORE any write so
     // `elapsed_ms` is measured against the prior fetch, not the just-written
