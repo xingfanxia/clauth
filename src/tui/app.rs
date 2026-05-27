@@ -2039,8 +2039,10 @@ pub(crate) fn on_tick(app: &mut App) {
     while let Ok(result) = app.op_results.try_recv() {
         drained.push(result);
     }
-    let mut any_auto_started = false;
-    let mut any_refreshed = false;
+    // Set when any Refreshing or AutoStarting OpResult succeeded; triggers
+    // `refresh_tokens()` to rebuild the scheduler's TokenList snapshot so
+    // the next fetch uses the rotated access tokens.
+    let mut needs_token_snapshot_rebuild = false;
     // Names of profiles whose auto-start completed successfully this tick.
     // These are pushed into RefetchQueue rather than triggering an all-profile
     // manual_refresh — only the auto-started profiles need an immediate re-fetch,
@@ -2085,7 +2087,7 @@ pub(crate) fn on_tick(app: &mut App) {
         match outcome {
             Ok(()) => match kind {
                 ActivityKind::AutoStarting => {
-                    any_auto_started = true;
+                    needs_token_snapshot_rebuild = true;
                     auto_started_names.push(name.clone());
                     app.toast(
                         ToastKind::Info,
@@ -2093,7 +2095,7 @@ pub(crate) fn on_tick(app: &mut App) {
                     );
                 }
                 ActivityKind::Refreshing => {
-                    any_refreshed = true;
+                    needs_token_snapshot_rebuild = true;
                     app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
                 }
                 ActivityKind::Switching => {
@@ -2125,10 +2127,7 @@ pub(crate) fn on_tick(app: &mut App) {
     for name in switch_finalize {
         finalize_switch(app, &name);
     }
-    // Rebuild the scheduler's TokenList snapshot whenever a rotation lands —
-    // without this, the next tick fetches with the stale access token, 401s,
-    // and rotates again through `fetch_with_rotation`'s recovery leg.
-    if any_refreshed || any_auto_started {
+    if needs_token_snapshot_rebuild {
         app.refresh_tokens();
     }
     // Route auto-start re-fetches through RefetchQueue so only the auto-started
