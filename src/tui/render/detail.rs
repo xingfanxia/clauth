@@ -157,8 +157,15 @@ fn detail_section_header(label: &'static str) -> Line<'static> {
 }
 
 fn detail_kv(key: &str, value: &str, value_style: Style) -> Line<'static> {
+    // Pad the key to a 12-col gutter. Keys wider than the gutter (e.g.
+    // "auto-start usage", 16 chars) still get a 3-space minimum gap so the
+    // value never glues onto the key — a plain `{:<12}` emits no padding once
+    // the content already exceeds 12.
+    const LABEL_W: usize = 12;
+    const MIN_GUTTER: usize = 3;
+    let pad = LABEL_W.saturating_sub(key.chars().count()).max(MIN_GUTTER);
     Line::from(vec![
-        Span::styled(format!("  {key:<12}", key = key), theme::faint()),
+        Span::styled(format!("  {key}{}", " ".repeat(pad)), theme::faint()),
         Span::styled(value.to_string(), value_style),
     ])
 }
