@@ -4,11 +4,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::profile::OAuthToken;
-
 use super::fetch::{
     FetchError, UsageInfo, fetch_raw, iso_to_epoch_secs, load_disk_cache, now_epoch_secs, now_ms,
-    persist_oauth_token, write_disk_cache,
+    write_disk_cache,
 };
 // Re-exported into the scheduler namespace so the inline test module (which
 // references `super::UsageWindow`) resolves it through this module instead of
@@ -318,6 +316,7 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
 /// for the retry. The caller is responsible for the initial `Fetching` mark
 /// and the final `Idle` clear.
 fn fetch_with_rotation(
+    config: &Arc<Mutex<crate::profile::AppConfig>>,
     name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
@@ -357,26 +356,18 @@ fn fetch_with_rotation(
             return (info, status, None);
         }
     };
-    let oauth = OAuthToken {
-        access_token: tok.access_token.clone(),
-        refresh_token: Some(tok.refresh_token.clone()),
-        expires_at: Some((now_ms() + tok.expires_in * 1000) as i64),
-        scopes: tok
-            .scope
-            .as_ref()
-            .map(|s| s.split_whitespace().map(String::from).collect()),
-        subscription_type: None,
-    };
-    // Don't claim the rotation if we couldn't persist — the new tokens would
-    // be lost on restart, and the caller would update the live list with a
-    // pair the disk doesn't reflect.
-    if persist_oauth_token(name, &oauth).is_err() {
+    // Persist under the AppConfig mutex AND state lock together — matches
+    // every other rotation site so a concurrent `rotate_one` writer can't
+    // interleave between read and write. Using the shared helper also keeps
+    // the in-memory AppConfig in step with the on-disk credentials.
+    let access = tok.access_token.clone();
+    let refresh = tok.refresh_token.clone();
+    if !crate::oauth::apply_rotated_tokens_locked(config, name, tok, None) {
         let (info, status) = load_cached_with_status(name, fallback_status);
         return (info, status, None);
     }
-    let rotated: Option<RotatedTokens> =
-        Some((tok.access_token.clone(), Some(tok.refresh_token.clone())));
-    match fetch_raw(&tok.access_token) {
+    let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
+    match fetch_raw(&access) {
         Ok(info) => {
             // Token rotated and fresh numbers are in hand. A 429 was still
             // observed this tick, so report RateLimited so the learner backs
@@ -658,8 +649,14 @@ struct FetchOutcome {
 }
 
 /// Run a single fetch for one entry.
-fn run_fetch(entry: TokenEntry, refetch: &RefetchQueue, activity: &ActivityStore) -> FetchOutcome {
+fn run_fetch(
+    config: &Arc<Mutex<crate::profile::AppConfig>>,
+    entry: TokenEntry,
+    refetch: &RefetchQueue,
+    activity: &ActivityStore,
+) -> FetchOutcome {
     let (info, status, rotated) = fetch_with_rotation(
+        config,
         &entry.name,
         &entry.access_token,
         entry.refresh_token.as_deref(),
@@ -775,6 +772,7 @@ fn apply_outcome(
 /// will pick them up from the persisted `credentials.json` shortly.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fetch_all_into(
+    config: &Arc<Mutex<crate::profile::AppConfig>>,
     tokens: &[TokenEntry],
     store: &UsageStore,
     status: &StatusStore,
@@ -804,9 +802,10 @@ pub(crate) fn fetch_all_into(
         .cloned()
         .map(|entry| {
             let name = entry.name.clone();
+            let config = Arc::clone(config);
             let refetch = Arc::clone(refetch);
             let activity = Arc::clone(activity);
-            let h = std::thread::spawn(move || run_fetch(entry, &refetch, &activity));
+            let h = std::thread::spawn(move || run_fetch(&config, entry, &refetch, &activity));
             (name, h)
         })
         .collect();
@@ -943,9 +942,12 @@ pub(crate) fn spawn_refresher(
                 .into_iter()
                 .map(|entry| {
                     let name = entry.name.clone();
+                    let config = Arc::clone(&config);
                     let refetch_queue = Arc::clone(&refetch_queue);
                     let activity = Arc::clone(&activity);
-                    let h = std::thread::spawn(move || run_fetch(entry, &refetch_queue, &activity));
+                    let h = std::thread::spawn(move || {
+                        run_fetch(&config, entry, &refetch_queue, &activity)
+                    });
                     (name, h)
                 })
                 .collect();

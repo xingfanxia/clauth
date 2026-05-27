@@ -547,6 +547,7 @@ impl App {
                 let snapshot =
                     collect_tokens(&config.lock().expect("config mutex poisoned").profiles);
                 fetch_all_into(
+                    &config,
                     &snapshot,
                     &usage_store,
                     &usage_status,
@@ -574,6 +575,7 @@ impl App {
                             .filter(|e| started.contains(&e.name))
                             .collect();
                     fetch_all_into(
+                        &config,
                         &retry,
                         &usage_store,
                         &usage_status,

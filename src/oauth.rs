@@ -654,7 +654,7 @@ fn apply_rotated_tokens_or_rollback_cooldown_locked(
 ///
 /// Locking variant of [`apply_rotated_tokens`]: takes `&Arc<Mutex<AppConfig>>`
 /// so workers can call from a thread without holding the lock across HTTP.
-fn apply_rotated_tokens_locked(
+pub(crate) fn apply_rotated_tokens_locked(
     config: &Arc<Mutex<AppConfig>>,
     name: &str,
     tok: TokenResponse,

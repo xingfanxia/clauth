@@ -2,11 +2,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
-
-use crate::lock::with_state_lock;
-use crate::profile::{ClaudeCredentials, OAuthToken, atomic_write, clauth_dir, profile_dir};
 
 const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
@@ -201,44 +197,6 @@ pub(crate) fn write_disk_cache(name: &str, info: &UsageInfo) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(path, json);
-}
-
-/// Persist a rotated OAuth pair into `~/.clauth/profiles/<name>/credentials.json`
-/// and bump `profiles.toml`'s mtime so any process polling that file picks up
-/// the new tokens. `subscription_type` is preserved from the prior file when
-/// present — the rotation response never includes it.
-pub(crate) fn persist_oauth_token(name: &str, oauth: &OAuthToken) -> Result<()> {
-    with_state_lock(|| {
-        let path = profile_dir(name)?.join("credentials.json");
-        let mut creds: ClaudeCredentials = if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&content)?
-        } else {
-            ClaudeCredentials {
-                claude_ai_oauth: None,
-            }
-        };
-        let prior_sub = creds
-            .claude_ai_oauth
-            .as_ref()
-            .and_then(|o| o.subscription_type.clone());
-        let merged = OAuthToken {
-            subscription_type: prior_sub,
-            ..oauth.clone()
-        };
-        creds.claude_ai_oauth = Some(merged);
-        atomic_write(&path, serde_json::to_string_pretty(&creds)?)?;
-
-        // Touching profiles.toml advances its mtime, which the main thread's
-        // `reload_if_state_changed` watches. Without this, an in-session
-        // rotation wouldn't propagate into AppConfig until the next external
-        // edit, leaving subsequent fetches reusing the old access token.
-        let state_path = clauth_dir()?.join("profiles.toml");
-        if let Ok(content) = std::fs::read_to_string(&state_path) {
-            let _ = atomic_write(&state_path, content);
-        }
-        Ok(())
-    })
 }
 
 fn cache_path(profile_name: &str) -> Option<PathBuf> {
