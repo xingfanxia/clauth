@@ -36,9 +36,9 @@ use crate::usage::{
     ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, Last429At, LastFetchedAt,
     LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult, OpResultReceiver,
     OpResultSender, PendingAutoStart, PendingSwitch, PendingWindowRotation, ProfileActivity,
-    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, TokenEntry,
-    TokenList, UsageStore, any_busy, clear_activity, default_fallback_threshold, fetch_all_into,
-    is_idle, mark_activity, spawn_refresher,
+    RefetchQueue, SERVER_CACHE_TTL_ESTIMATE_MS, StartupReceiver, StartupSender, StartupSignal,
+    StatusStore, TokenEntry, TokenList, UsageStore, any_busy, clear_activity,
+    default_fallback_threshold, fetch_all_into, is_idle, mark_activity, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -427,8 +427,25 @@ impl App {
             Arc::new(Mutex::new(config.state.learned_intervals_ms.clone()));
         let ok_count: ConsecutiveOk =
             Arc::new(Mutex::new(config.state.consecutive_ok_count.clone()));
-        // cache_hit_count is in-memory only — not persisted, intentionally resets on restart.
-        let cache_hit_count: ConsecutiveCacheHit = Arc::new(Mutex::new(HashMap::new()));
+        // Restore cache-hit counters only when learned < TTL — above TTL the
+        // counter is irrelevant (polling is slow enough that cache hits can't
+        // occur in steady state), and below TTL it captures mid-elimination
+        // state that would otherwise need another hit-pair to correct.
+        let restored_ch: HashMap<String, u32> = config
+            .state
+            .consecutive_cache_hit_count
+            .iter()
+            .filter(|(name, _)| {
+                config
+                    .state
+                    .learned_intervals_ms
+                    .get(*name)
+                    .copied()
+                    .is_some_and(|l| l < SERVER_CACHE_TTL_ESTIMATE_MS)
+            })
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let cache_hit_count: ConsecutiveCacheHit = Arc::new(Mutex::new(restored_ch));
         let last_429: Last429At = Arc::new(Mutex::new(config.state.last_429_at.clone()));
 
         Self {
@@ -2371,6 +2388,9 @@ pub(crate) fn shutdown(app: &mut App) -> Result<()> {
         }
         if let Ok(l4) = app.last_429.lock() {
             cfg.state.last_429_at = l4.clone();
+        }
+        if let Ok(ch) = app.cache_hit_count.lock() {
+            cfg.state.consecutive_cache_hit_count = ch.clone();
         }
         let _ = save_app_state(&cfg.state);
     }

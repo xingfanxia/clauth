@@ -107,6 +107,11 @@ pub(crate) struct AppState {
     /// the last backoff. Resets to 0 on every bump-up or bump-down.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) consecutive_ok_count: HashMap<String, u32>,
+    /// How many consecutive Fresh+unchanged-util fetches each profile has
+    /// seen. Only restored when `learned < SERVER_CACHE_TTL_ESTIMATE_MS` —
+    /// above TTL the counter is irrelevant and is dropped on load.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) consecutive_cache_hit_count: HashMap<String, u32>,
     /// Epoch-ms of the most recent 429 seen for each profile. Used by the
     /// quiet-period reset: if now - last_429_at >= LEARNED_QUIET_RESET_MS and
     /// the learned interval is above NORMAL, it snaps back to NORMAL.

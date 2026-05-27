@@ -53,7 +53,7 @@ const CACHE_HIT_EPSILON: f64 = 1e-9;
 /// "server cache hit" when the second one landed within this window — beyond
 /// it, an unchanged value just means the user isn't burning tokens, and that
 /// must not pull the learner back up toward NORMAL.
-const SERVER_CACHE_TTL_ESTIMATE_MS: u64 = 25_000;
+pub(crate) const SERVER_CACHE_TTL_ESTIMATE_MS: u64 = 25_000;
 
 // Cache-hit elimination invariant: the cache-hit backoff cap (NORMAL) must
 // sit strictly above the server-cache-TTL gate (SERVER_CACHE_TTL_ESTIMATE_MS)
