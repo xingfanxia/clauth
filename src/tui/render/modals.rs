@@ -554,9 +554,14 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn help_row(key: &str, desc: &str) -> Line<'static> {
+    // Pad the key to an 18-col gutter, but always leave at least 1 space so a
+    // key ≥ 18 chars can't glue onto its description (a plain `{:<18}` emits no
+    // padding once the content reaches the width). Keys under 18 are unchanged.
+    const KEY_W: usize = 18;
+    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     Line::from(vec![
         Span::styled(
-            format!("  {key:<18}", key = key),
+            format!("  {key}{}", " ".repeat(pad)),
             Style::default().fg(theme::ACCENT).bold(),
         ),
         Span::styled(desc.to_string(), theme::dim()),
