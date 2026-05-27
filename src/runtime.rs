@@ -46,6 +46,12 @@ use crate::profile::{ClaudeCredentials, Profile, atomic_write, home_dir, profile
 /// which a 401 could revoke an already-rotated refresh token chain.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 
+/// `.claude.json` cross-profile sync cadence. Tighter than the credential
+/// watchdog because Claude Code rewrites `.claude.json` constantly; 100ms keeps
+/// the window in which one profile observes another's stale shared state small.
+/// Also bounds watchdog-thread shutdown latency to one tick of this interval.
+const CJSON_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinkMode {
     /// OS-level symlinks. Used on Unix unconditionally and on Windows when
@@ -152,15 +158,27 @@ impl ProfileRuntime {
         let watchdog_canonical = canonical.clone();
         let watchdog_claude_home = claude_home.clone();
         let watchdog_handle = thread::spawn(move || {
-            // Loop exits on Disconnected (sender dropped in Drop) or Ok(()).
-            while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(WATCHDOG_INTERVAL) {
-                if let Err(e) = tick(
-                    mode,
-                    &watchdog_runtime,
-                    &watchdog_claude_home,
-                    &watchdog_canonical,
-                ) {
-                    eprintln!("clauth: watchdog tick failed: {e}");
+            // One thread, two cadences: `.claude.json` reconciles every
+            // CJSON_INTERVAL; credentials reconcile every ~WATCHDOG_INTERVAL,
+            // counted in cjson ticks. Loop exits on Disconnected (sender dropped
+            // in Drop) or Ok(()).
+            let cred_every = (WATCHDOG_INTERVAL.as_millis() / CJSON_INTERVAL.as_millis()).max(1);
+            let mut until_cred = cred_every;
+            while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(CJSON_INTERVAL) {
+                if let Err(e) = crate::claude_json::sync_once() {
+                    eprintln!("clauth: .claude.json sync failed: {e}");
+                }
+                until_cred -= 1;
+                if until_cred == 0 {
+                    until_cred = cred_every;
+                    if let Err(e) = tick(
+                        mode,
+                        &watchdog_runtime,
+                        &watchdog_claude_home,
+                        &watchdog_canonical,
+                    ) {
+                        eprintln!("clauth: watchdog tick failed: {e}");
+                    }
                 }
             }
         });
@@ -194,6 +212,12 @@ impl Drop for ProfileRuntime {
 
         if let Err(e) = tick(self.mode, &self.runtime, &self.claude_home, &self.canonical) {
             eprintln!("clauth: final sync failed: {e}");
+        }
+
+        // Flush this session's last `.claude.json` changes to the global file
+        // and siblings before a possible teardown removes this runtime copy.
+        if let Err(e) = crate::claude_json::sync_once() {
+            eprintln!("clauth: final .claude.json sync failed: {e}");
         }
 
         if let Err(e) = with_state_lock(|| {
@@ -296,13 +320,16 @@ fn is_session_alive(pid_file: &Path) -> bool {
 ///   in `~/.claude/` except `settings.json` and `.credentials.json` —
 ///   this includes `projects/`, `todos/`, `statsig/`, `sessions/`, `cache/`,
 ///   `commands/`, `plugins/`, `tasks/`, `teams/`, `hooks/`, `history.jsonl`,
-///   `.claude.json`, and similar. Claude Code treats these as user-global
-///   state so sharing is intentional; per-profile isolation would hide
-///   project history and installed commands.
-/// - **Per-profile:** `settings.json` (merged with profile overrides) and
-///   `.credentials.json` (the profile's own OAuth token chain). Settings are
+///   and similar. Claude Code treats these as user-global state so sharing is
+///   intentional; per-profile isolation would hide project history and
+///   installed commands.
+/// - **Per-profile:** `settings.json` (merged with profile overrides),
+///   `.credentials.json` (the profile's own OAuth token chain), and
+///   `.claude.json` (a copy seeded from `~/.claude.json`). Settings are
 ///   rewritten when changed; credentials are reconciled without using the
-///   shared `~/.claude/.credentials.json` copy.
+///   shared `~/.claude/.credentials.json` copy; `.claude.json` is reconciled
+///   across all profiles by `crate::claude_json`, which propagates every field
+///   except the account-specific ones (`oauthAccount` + billing caches).
 fn build_runtime_dir(
     runtime: &Path,
     claude_home: &Path,
@@ -345,13 +372,31 @@ fn build_runtime_dir(
     let creds_link = runtime.join(".credentials.json");
     reconcile_credentials(&creds_link, canonical, mode)?;
 
-    // Share `~/.claude.json` (Claude Code's per-user state) so project
-    // history stays in sync with the user's normal sessions.
+    // Per-profile copy of `~/.claude.json`. Claude Code's big config file
+    // embeds an account-specific `oauthAccount` block (plus billing caches)
+    // that must NOT be shared across profiles — CC trusts the cached identity
+    // and won't re-derive it from the token on a normal startup, so a shared
+    // symlink leaks one account's identity into another. The background syncer
+    // (`crate::claude_json`) keeps the non-per-profile fields converged across
+    // all copies (latest write wins). A freshly seeded copy inherits the global
+    // file's `oauthAccount`; that profile's next OAuth login overwrites it with
+    // the correct identity, which the syncer then preserves.
     if let Some(home) = claude_home.parent() {
-        let claude_json = home.join(".claude.json");
+        let global = home.join(".claude.json");
         let dst = runtime.join(".claude.json");
-        if claude_json.exists() && dst.symlink_metadata().is_err() {
-            materialize_entry(&claude_json, &dst, mode)?;
+        // Seed from the global file when this profile has no real copy yet, or
+        // migrate the old shared symlink (pre-per-profile behavior) to a copy.
+        // `atomic_write` renames over the path, replacing a symlink in one step
+        // — no window where a sibling session sees the file missing. Existing
+        // real copies keep their own identity and synced shared fields.
+        let is_symlink = dst
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink());
+        if (is_symlink || !dst.exists())
+            && let Ok(bytes) = std::fs::read(&global)
+        {
+            atomic_write(&dst, &bytes)
+                .with_context(|| format!("failed to seed {}", dst.display()))?;
         }
     }
 
@@ -625,7 +670,12 @@ fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<()> {
 /// copy and credentials has its own mirror with stricter validation.
 /// Used in fake-symlink mode only.
 fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
-    let skip_top: HashSet<&str> = ["settings.json", ".credentials.json"].into_iter().collect();
+    // `.claude.json` is a per-profile copy reconciled by `crate::claude_json`,
+    // not part of the `~/.claude/` tree — skip it here so the tree mirror never
+    // copies it into `~/.claude/.claude.json`.
+    let skip_top: HashSet<&str> = ["settings.json", ".credentials.json", ".claude.json"]
+        .into_iter()
+        .collect();
     for name in union_children(claude_home, runtime) {
         if name.to_str().is_some_and(|n| skip_top.contains(n)) {
             continue;

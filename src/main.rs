@@ -1,5 +1,6 @@
 mod actions;
 mod claude;
+mod claude_json;
 mod completions;
 mod fallback;
 mod format;
