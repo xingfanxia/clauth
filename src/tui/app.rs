@@ -2069,18 +2069,14 @@ pub(crate) fn on_tick(app: &mut App) {
         // Invariant: `ActivityKind::Fetching` is NEVER sent through OpResult.
         // `fetch_with_rotation` and `run_fetch` manage the Fetching activity
         // slot directly (mark before spawn, clear in join loop) without going
-        // through the OpResult channel. The conditional guard here is correct
-        // and complete for the kinds that ARE sent: Refreshing, AutoStarting,
-        // and Switching. A stray Fetching result would reach the `_ => {}` arm
-        // in the `Ok(())` match below and be a silent no-op for bookkeeping,
-        // which is acceptable — but the clear above would not fire because
-        // the activity slot would typically be Idle or a different variant.
-        // Adding a debug assertion here would force a panic in tests if this
-        // invariant is ever broken.
-        debug_assert!(
-            !matches!(kind, ActivityKind::Fetching),
-            "ActivityKind::Fetching must never be sent via OpResult"
-        );
+        // through the OpResult channel. Valid kinds in OpResult: Refreshing,
+        // AutoStarting, Switching.
+        if matches!(kind, ActivityKind::Fetching) {
+            unreachable!(
+                "ActivityKind::Fetching must never be sent via OpResult; \
+                 the Fetching slot is managed by the join loop directly"
+            );
+        }
         if let Ok(mut a) = app.activity.lock()
             && a.get(&name).copied() == Some(kind.as_activity())
         {
@@ -2107,7 +2103,9 @@ pub(crate) fn on_tick(app: &mut App) {
             },
             Err(e) => {
                 let verb = match kind {
-                    ActivityKind::Fetching => "fetch",
+                    ActivityKind::Fetching => {
+                        unreachable!("ActivityKind::Fetching must never be sent via OpResult")
+                    }
                     ActivityKind::Refreshing => "refresh",
                     ActivityKind::Switching => "switch",
                     ActivityKind::Starting => "start",
