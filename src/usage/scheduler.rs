@@ -532,13 +532,27 @@ fn interval_for(
 /// (except `cache_hit_count`, which is in-memory only).
 ///
 /// `cache_hit` is true when a Fresh response carried the same five-hour
-/// utilization as the previously stored value — the Anthropic usage API has a
-/// ~30s server-side cache, so unchanged numbers at FLOOR (10s) mean we're
-/// polling faster than the server invalidates, not that the API is healthy.
+/// utilization as the previously stored value AND the poll landed inside the
+/// server cache window — the Anthropic usage API has a ~30s server-side cache,
+/// so unchanged numbers at FLOOR (10s) mean we're polling faster than the
+/// server invalidates, not that the API is healthy.
+///
+/// `util_changed` is true when this Fresh response carried a five-hour
+/// utilization that genuinely differs from the previously stored value (beyond
+/// `CACHE_HIT_EPSILON`). It is the recovery signal: only a Fresh whose data
+/// actually moved counts as evidence the API is healthy and the interval can
+/// be tightened. A Fresh with unchanged utilization at elapsed >= TTL (an idle
+/// profile burning no tokens) is NOT a cache hit AND NOT a recovery signal — it
+/// is neutral, so the learner leaves it untouched. Without this gate the bare
+/// recovery arm fired `bump_down` on every idle poll above TTL, walking the
+/// interval down until it dropped below TTL where the cache-hit arm snapped it
+/// back up — a permanent oscillation for any genuinely idle profile.
+#[allow(clippy::too_many_arguments)]
 fn update_learner(
     name: &str,
     status: FetchStatus,
     cache_hit: bool,
+    util_changed: bool,
     learned: &LearnedIntervals,
     ok_count: &ConsecutiveOk,
     cache_hit_count: &ConsecutiveCacheHit,
@@ -615,8 +629,12 @@ fn update_learner(
                 ch_g.insert(name.to_string(), hits);
             }
         }
-        // Only a confirmed API 200 with changed data counts as a recovery signal.
-        FetchStatus::Fresh => {
+        // A Fresh response that carried genuinely changed utilization is the
+        // only recovery signal: the API answered AND the user is actively
+        // burning tokens, so the interval can be tightened. Two consecutive
+        // change-events fire `bump_down`. A real change also wipes the cache-hit
+        // accumulator so it can't bridge across an intervening change.
+        FetchStatus::Fresh if util_changed => {
             let count = ok_g.get(name).copied().unwrap_or(0) + 1;
             if count >= 2 {
                 let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
@@ -627,6 +645,14 @@ fn update_learner(
             }
             ch_g.insert(name.to_string(), 0);
         }
+        // Fresh, not a cache hit, unchanged utilization: an idle poll at
+        // elapsed >= TTL (the user simply isn't burning tokens). Neutral
+        // evidence — leave every counter and the learned interval untouched so
+        // the interval settles at its current value instead of oscillating.
+        // `ConsecutiveOk` is preserved (a real change later still counts toward
+        // recovery); `ch` is left alone (cache hits only accumulate at <TTL,
+        // which this arm never reaches).
+        FetchStatus::Fresh => {}
         // Network failures and cache fallbacks neither confirm nor refute API
         // health — leave the counters alone so a single blip doesn't wipe
         // legitimate recovery progress accumulated from prior Fresh responses.
@@ -743,6 +769,16 @@ fn apply_outcome(
 
     let cache_hit = detect_cache_hit(outcome.status, elapsed_ms, prev_util, new_util);
 
+    // Recovery signal: the five-hour utilization genuinely moved since the last
+    // stored value (beyond `CACHE_HIT_EPSILON`). Requires both a prior and a new
+    // value — a cold start (no prior) carries no change evidence, so it is not a
+    // recovery signal. A Fresh with unchanged util is neutral, not recovery; this
+    // is what keeps an idle profile from walking its interval down forever.
+    let util_changed = matches!(
+        (prev_util, new_util),
+        (Some(a), Some(b)) if (a - b).abs() >= CACHE_HIT_EPSILON
+    );
+
     if let Ok(mut st) = status.lock() {
         st.insert(outcome.name.clone(), outcome.status);
     }
@@ -758,6 +794,7 @@ fn apply_outcome(
         &outcome.name,
         outcome.status,
         cache_hit,
+        util_changed,
         learned,
         ok_count,
         cache_hit_count,

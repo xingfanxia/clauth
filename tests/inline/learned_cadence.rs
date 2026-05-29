@@ -241,6 +241,7 @@ fn rate_limited_bumps_up_stamps_429_and_resets_counters() {
         "p",
         FetchStatus::RateLimited,
         false,
+        false,
         &learned,
         &ok,
         &ch,
@@ -274,6 +275,7 @@ fn rate_limited_at_ceiling_stays_pinned() {
             "p",
             FetchStatus::RateLimited,
             false,
+            false,
             &learned,
             &ok,
             &ch,
@@ -295,6 +297,7 @@ fn rate_limited_without_prior_learned_uses_normal_as_baseline() {
         "p",
         FetchStatus::RateLimited,
         false,
+        false,
         &learned,
         &ok,
         &ch,
@@ -315,7 +318,16 @@ fn rate_limited_without_prior_learned_uses_normal_as_baseline() {
 #[test]
 fn first_fresh_starts_ok_count_at_one_with_no_bump() {
     let (learned, ok, ch, l429) = make_learner_maps();
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(ok.lock().unwrap().get("p").copied().unwrap(), 1);
     assert!(
@@ -332,8 +344,26 @@ fn two_genuine_fresh_trigger_bump_down() {
         .unwrap()
         .insert("p".into(), NORMAL_INTERVAL_MS);
 
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
@@ -349,7 +379,16 @@ fn fresh_no_change_resets_cache_hit_counter() {
     let (learned, ok, ch, l429) = make_learner_maps();
     ch.lock().unwrap().insert("p".into(), 1);
 
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(ch.lock().unwrap().get("p").copied().unwrap(), 0);
 }
@@ -359,12 +398,126 @@ fn bump_down_at_floor_stays_at_floor() {
     let (learned, ok, ch, l429) = make_learner_maps();
     learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
 
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
         LEARNED_FLOOR_MS,
+    );
+}
+
+// ── update_learner: Fresh, unchanged util, above TTL (idle no-op) ─────────────
+
+#[test]
+fn idle_unchanged_fresh_does_not_bump_down() {
+    // Core oscillation fix: a Fresh poll that is neither a cache hit nor a
+    // util change (an idle profile above TTL) must leave the learned interval
+    // untouched, no matter how many times it fires. Without this, repeated idle
+    // polls walked the interval down via the recovery arm.
+    let (learned, ok, ch, l429) = make_learner_maps();
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), NORMAL_INTERVAL_MS);
+
+    for _ in 0..10 {
+        update_learner(
+            "p",
+            FetchStatus::Fresh,
+            false,
+            false,
+            &learned,
+            &ok,
+            &ch,
+            &l429,
+        );
+    }
+
+    assert_eq!(
+        learned.lock().unwrap().get("p").copied().unwrap(),
+        NORMAL_INTERVAL_MS,
+        "idle Fresh (no cache hit, no util change) must never bump the interval",
+    );
+    assert_eq!(
+        ok.lock().unwrap().get("p").copied().unwrap_or(0),
+        0,
+        "idle Fresh must not accrue ConsecutiveOk",
+    );
+}
+
+#[test]
+fn idle_unchanged_fresh_preserves_in_progress_recovery() {
+    // An unchanged-util idle poll interleaved between two genuine change-events
+    // must not reset the recovery counter — the two real changes still fire one
+    // bump_down. Idle is neutral, not a recovery interrupt.
+    let (learned, ok, ch, l429) = make_learner_maps();
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), NORMAL_INTERVAL_MS);
+
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    assert_eq!(ok.lock().unwrap().get("p").copied().unwrap_or(0), 1);
+
+    // Idle poll in the middle — must be a no-op, leaving ok_count at 1.
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    assert_eq!(
+        ok.lock().unwrap().get("p").copied().unwrap_or(0),
+        1,
+        "idle Fresh must preserve in-progress ConsecutiveOk",
+    );
+
+    // Second genuine change → bump_down fires.
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    assert_eq!(
+        learned.lock().unwrap().get("p").copied().unwrap(),
+        bump_down(NORMAL_INTERVAL_MS),
     );
 }
 
@@ -380,14 +533,32 @@ fn two_cache_hits_at_floor_jump_above_server_cache_ttl() {
     let (learned, ok, ch, l429) = make_learner_maps();
     learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
 
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
         LEARNED_FLOOR_MS,
         "first cache-hit must not bump",
     );
 
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
     let target = (SERVER_CACHE_TTL_ESTIMATE_MS + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS);
     let expected = LEARNED_FLOOR_MS.max(target);
     assert_eq!(
@@ -410,8 +581,26 @@ fn two_cache_hits_at_below_ttl_jump_to_convergence_target() {
     let start = 20_000u64; // below SERVER_CACHE_TTL_ESTIMATE_MS (25_000)
     learned.lock().unwrap().insert("p".into(), start);
 
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     let target = (SERVER_CACHE_TTL_ESTIMATE_MS + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS);
     let expected = start.max(target);
@@ -438,7 +627,16 @@ fn cache_hits_at_normal_stay_at_normal() {
         .insert("p".into(), NORMAL_INTERVAL_MS);
 
     for _ in 0..6 {
-        update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+        update_learner(
+            "p",
+            FetchStatus::Fresh,
+            true,
+            false,
+            &learned,
+            &ok,
+            &ch,
+            &l429,
+        );
     }
 
     assert_eq!(
@@ -456,14 +654,41 @@ fn cache_hit_then_change_event_resumes_recovery() {
     let (learned, ok, ch, l429) = make_learner_maps();
     learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
 
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
     assert_eq!(ch.lock().unwrap().get("p").copied().unwrap_or(0), 1);
 
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
     assert_eq!(ch.lock().unwrap().get("p").copied().unwrap_or(0), 0);
     assert_eq!(ok.lock().unwrap().get("p").copied().unwrap_or(0), 1);
 
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
         bump_down(LEARNED_FLOOR_MS),
@@ -482,7 +707,16 @@ fn cached_does_not_touch_any_counter() {
     ok.lock().unwrap().insert("p".into(), 1);
     ch.lock().unwrap().insert("p".into(), 1);
 
-    update_learner("p", FetchStatus::Cached, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Cached,
+        false,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
@@ -502,7 +736,16 @@ fn failed_does_not_touch_any_counter() {
     ok.lock().unwrap().insert("p".into(), 1);
     ch.lock().unwrap().insert("p".into(), 1);
 
-    update_learner("p", FetchStatus::Failed, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Failed,
+        false,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
@@ -523,9 +766,36 @@ fn intermittent_failure_preserves_recovery_progress() {
         .unwrap()
         .insert("p".into(), NORMAL_INTERVAL_MS);
 
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
-    update_learner("p", FetchStatus::Cached, false, &learned, &ok, &ch, &l429);
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    update_learner(
+        "p",
+        FetchStatus::Cached,
+        false,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
@@ -545,7 +815,16 @@ fn quiet_reset_fires_on_fresh_after_window() {
     let stale = now_ms().saturating_sub(LEARNED_QUIET_RESET_MS + 1_000);
     l429.lock().unwrap().insert("p".into(), stale);
 
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
@@ -567,7 +846,16 @@ fn quiet_reset_does_not_fire_on_cached() {
     let stale = now_ms().saturating_sub(LEARNED_QUIET_RESET_MS + 1_000);
     l429.lock().unwrap().insert("p".into(), stale);
 
-    update_learner("p", FetchStatus::Cached, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Cached,
+        false,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
@@ -587,7 +875,16 @@ fn quiet_reset_does_not_fire_on_failed() {
     let stale = now_ms().saturating_sub(LEARNED_QUIET_RESET_MS + 1_000);
     l429.lock().unwrap().insert("p".into(), stale);
 
-    update_learner("p", FetchStatus::Failed, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Failed,
+        false,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
@@ -611,6 +908,7 @@ fn quiet_reset_does_not_fire_on_rate_limited() {
     update_learner(
         "p",
         FetchStatus::RateLimited,
+        false,
         false,
         &learned,
         &ok,
@@ -639,7 +937,16 @@ fn quiet_reset_does_not_fire_before_window_elapses() {
     let recent = now_ms().saturating_sub(1_000);
     l429.lock().unwrap().insert("p".into(), recent);
 
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
@@ -661,7 +968,16 @@ fn quiet_reset_clears_stale_429_stamp_even_when_already_at_normal() {
     let stale = now_ms().saturating_sub(LEARNED_QUIET_RESET_MS + 1_000);
     l429.lock().unwrap().insert("p".into(), stale);
 
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
@@ -681,7 +997,16 @@ fn quiet_reset_without_429_stamp_is_noop() {
         .unwrap()
         .insert("p".into(), LEARNED_CEILING_MS);
 
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     // No 429 stamp → reset doesn't fire → learned untouched, Fresh arm runs.
     assert_eq!(
@@ -1270,11 +1595,13 @@ fn apply_outcome_cached_fills_empty_store_on_cold_start() {
 }
 
 #[test]
-fn apply_outcome_idle_at_normal_does_not_register_cache_hit() {
-    // Regression: equal utilization at NORMAL polling cadence (idle user)
-    // was being misclassified as a server cache hit, dragging the learner
-    // back up to NORMAL on every pause. After the elapsed-gate fix, two
-    // such idle Fresh calls should fire bump_down, not snap back to NORMAL.
+fn apply_outcome_idle_at_normal_settles_without_oscillating() {
+    // Regression (learner oscillation): an idle profile — utilization not
+    // moving, no 429s — polling at NORMAL must SETTLE there, not walk its
+    // interval down. Equal utilization at elapsed >= TTL is neither a cache hit
+    // nor a recovery signal: it is a no-op for the learner. The previous code
+    // fired bump_down on every such poll, dropping the interval below TTL where
+    // the cache-hit arm then snapped it back up — a permanent oscillation.
     let (store, status, last_fetched, pending, learned, ok, ch, l429) = apply_stores();
     learned
         .lock()
@@ -1294,36 +1621,39 @@ fn apply_outcome_idle_at_normal_does_not_register_cache_hit() {
         &l429,
     );
 
-    // Simulate the next tick landing exactly NORMAL ms later (idle).
-    let now = now_ms();
-    last_fetched
-        .lock()
-        .unwrap()
-        .insert("p".into(), now - NORMAL_INTERVAL_MS);
+    // Several idle ticks, each landing NORMAL ms after the prior fetch with
+    // unchanged utilization. None of them may move the learned interval.
+    for _ in 0..5 {
+        let now = now_ms();
+        last_fetched
+            .lock()
+            .unwrap()
+            .insert("p".into(), now - NORMAL_INTERVAL_MS);
 
-    apply_outcome(
-        outcome("p", FetchStatus::Fresh, 42.0),
-        &store,
-        &status,
-        &last_fetched,
-        &pending,
-        &learned,
-        &ok,
-        &ch,
-        &l429,
-    );
+        apply_outcome(
+            outcome("p", FetchStatus::Fresh, 42.0),
+            &store,
+            &status,
+            &last_fetched,
+            &pending,
+            &learned,
+            &ok,
+            &ch,
+            &l429,
+        );
+    }
 
-    // Cache-hit counter must stay 0 (idle is not a cache hit at NORMAL).
+    // Cache-hit counter must stay 0 (idle at NORMAL is never a cache hit).
     assert_eq!(
         ch.lock().unwrap().get("p").copied().unwrap_or(0),
         0,
         "idle at NORMAL must not register as a cache hit",
     );
-    // ok_count went 1 → 2 → bump_down → 0.
+    // The learned interval must remain pinned at NORMAL — idle is a no-op.
     assert_eq!(
         learned.lock().unwrap().get("p").copied().unwrap(),
-        bump_down(NORMAL_INTERVAL_MS),
-        "two idle Fresh at NORMAL must bump the learner down",
+        NORMAL_INTERVAL_MS,
+        "an idle profile at NORMAL must settle, not walk its interval down",
     );
 }
 
@@ -1529,7 +1859,16 @@ fn quiet_reset_does_not_fire_when_last_429_at_is_zero() {
     // Explicitly insert 0 — simulates what happens when `now_ms()` fails.
     l429.lock().unwrap().insert("p".into(), 0u64);
 
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     // With the L1 fix, the reset must NOT fire — backoff must be preserved.
     assert_eq!(
@@ -1552,8 +1891,26 @@ fn cache_hit_pair_does_not_reset_consecutive_ok() {
     ok.lock().unwrap().insert("p".into(), 1);
 
     // Two cache hits fire the backoff arm.
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     // The cache-hit arm fired — interval must have been raised.
     let result = learned.lock().unwrap().get("p").copied().unwrap();
@@ -1584,11 +1941,29 @@ fn only_rate_limited_resets_consecutive_ok() {
     ok.lock().unwrap().insert("p".into(), 0);
 
     // One Fresh non-cache-hit increments ok_count to 1.
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
     assert_eq!(ok.lock().unwrap().get("p").copied().unwrap_or(0), 1);
 
     // A cache-hit (first of a pair — threshold not yet reached) must not touch ok_count.
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
     assert_eq!(
         ok.lock().unwrap().get("p").copied().unwrap_or(0),
         1,
@@ -1599,6 +1974,7 @@ fn only_rate_limited_resets_consecutive_ok() {
     update_learner(
         "p",
         FetchStatus::RateLimited,
+        false,
         false,
         &learned,
         &ok,
@@ -1626,8 +2002,26 @@ fn cache_hits_from_floor_exceed_server_cache_ttl_within_one_pair() {
         )
     };
 
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     let result = learned.lock().unwrap().get("p").copied().unwrap();
     assert!(
@@ -1647,8 +2041,26 @@ fn cache_hit_convergence_never_exceeds_normal() {
     let start = NORMAL_INTERVAL_MS - 1;
     learned.lock().unwrap().insert("p".into(), start);
 
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     let result = learned.lock().unwrap().get("p").copied().unwrap();
     assert!(
@@ -1670,8 +2082,26 @@ fn cache_hit_backoff_does_not_lower_already_raised_interval() {
         .unwrap()
         .insert("p".into(), NORMAL_INTERVAL_MS);
 
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
-    update_learner("p", FetchStatus::Fresh, true, &learned, &ok, &ch, &l429);
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        true,
+        false,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     // Learned must not be lowered below NORMAL — it was already there.
     assert_eq!(
@@ -1689,12 +2119,13 @@ fn steady_state_no_cache_hits_under_normal_conditions() {
     // two consecutive bump_downs from NORMAL must not drop `learned` below
     // SERVER_CACHE_TTL_ESTIMATE_MS.
     //
-    // Why this matters: when an idle profile polls at NORMAL cadence, two
-    // non-429 Fresh responses trigger two bump_downs. If the result is < TTL,
-    // the next same-util poll at that shorter interval is classified as a
-    // server cache hit (elapsed < TTL), the cache-hit arm snaps learned back
-    // toward NORMAL, and the cycle repeats — producing a non-zero steady-state
-    // cache-hit rate even when the user is idle and network is healthy.
+    // Why this matters: bump_down fires only on genuine recovery — a Fresh poll
+    // whose utilization actually changed. An active user can drive two descents
+    // from NORMAL. If the result is < TTL, the next CHANGED-util poll at that
+    // shorter interval would still be Fresh, but an unchanged-util poll there
+    // would land inside the cache window (elapsed < TTL) and the cache-hit arm
+    // would snap learned back toward NORMAL — producing a non-zero steady-state
+    // cache-hit rate. The invariant keeps the descent floor at or above TTL.
     //
     // With OLD constants (NORMAL=30_000, STEP=5_000):
     //   NORMAL - 2*STEP = 20_000 < TTL=25_000
@@ -1708,9 +2139,27 @@ fn steady_state_no_cache_hits_under_normal_conditions() {
         .unwrap()
         .insert("p".into(), NORMAL_INTERVAL_MS);
 
-    // Two non-cache-hit Fresh polls trigger one bump_down (ok_count 0→1→2→reset).
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    // Two changed-util Fresh polls trigger one bump_down (ok_count 0→1→2→reset).
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     let after_first_pair = learned
         .lock()
@@ -1724,9 +2173,27 @@ fn steady_state_no_cache_hits_under_normal_conditions() {
         "NORMAL - STEP ({after_first_pair}ms) fell below TTL ({SERVER_CACHE_TTL_ESTIMATE_MS}ms)",
     );
 
-    // Second pair: two more non-cache-hit Fresh polls → second bump_down.
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
-    update_learner("p", FetchStatus::Fresh, false, &learned, &ok, &ch, &l429);
+    // Second pair: two more changed-util Fresh polls → second bump_down.
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
+    update_learner(
+        "p",
+        FetchStatus::Fresh,
+        false,
+        true,
+        &learned,
+        &ok,
+        &ch,
+        &l429,
+    );
 
     let after_two_pairs = learned
         .lock()
