@@ -146,7 +146,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     frame.render_widget(Clear, rect);
     let title = match state.on_confirm {
         ConfirmAction::Delete(_) => "confirm · delete",
-        ConfirmAction::CaptureConflict(_) => "confirm · duplicate",
+        ConfirmAction::CaptureConflict(..) => "confirm · duplicate",
         ConfirmAction::Switch(_) => "confirm · switch",
         ConfirmAction::DiscardDivergence(_) => "confirm · discard new login",
         ConfirmAction::RotateAll => "confirm · rotate all tokens",

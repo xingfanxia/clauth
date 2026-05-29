@@ -186,7 +186,9 @@ pub(crate) struct ConfirmState {
 #[derive(Debug, Clone)]
 pub(crate) enum ConfirmAction {
     Delete(String),
-    CaptureConflict(Box<CaptureSnapshot>),
+    /// `bool` = `from_divergence`, carried through so the conflict path
+    /// keeps the deferred-detach semantics of the `NewProfile` divergence flow.
+    CaptureConflict(Box<CaptureSnapshot>, bool),
     Switch(String),
     /// Confirm step before discarding CC's freshly-written credentials and
     /// re-linking the live path to the named profile's stored creds.
@@ -200,6 +202,11 @@ pub(crate) enum ConfirmAction {
 pub(crate) struct CaptureNameForm {
     pub(crate) snapshot: Box<CaptureSnapshot>,
     pub(crate) input: InputState,
+    /// Set when the capture was initiated by the `NewProfile` divergence
+    /// choice. Deferring the destructive detach + deactivate of the
+    /// previously-active profile to the capture's success arm keeps that
+    /// profile linked and active if the user cancels the name modal.
+    pub(crate) from_divergence: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -984,7 +991,7 @@ fn activate_main_item(app: &mut App) {
         }
         MainItemKind::ActionSeparator => {}
         MainItemKind::NewProfile => open_new_profile(app),
-        MainItemKind::CaptureCredentials => begin_capture(app),
+        MainItemKind::CaptureCredentials => begin_capture(app, false),
         MainItemKind::OpenChain => {
             app.screen = Screen::Chain;
             app.chain_cursor = 0;
@@ -1154,7 +1161,7 @@ fn open_delete_confirm(app: &mut App, name: &str) {
     }));
 }
 
-fn begin_capture(app: &mut App) {
+fn begin_capture(app: &mut App, from_divergence: bool) {
     let snapshot = match capture_snapshot() {
         Ok(s) => s,
         Err(e) => {
@@ -1171,13 +1178,14 @@ fn begin_capture(app: &mut App) {
             message: format!("These credentials already belong to '{existing}'."),
             detail: Some("Capture anyway?".to_string()),
             choice: false,
-            on_confirm: ConfirmAction::CaptureConflict(Box::new(snapshot)),
+            on_confirm: ConfirmAction::CaptureConflict(Box::new(snapshot), from_divergence),
         }));
         return;
     }
     app.modals.push(Modal::CaptureName(CaptureNameForm {
         snapshot: Box::new(snapshot),
         input: InputState::new(""),
+        from_divergence,
     }));
 }
 
@@ -1669,10 +1677,11 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Err(e) => app.toast(ToastKind::Danger, format!("delete failed: {e}")),
             }
         }
-        ConfirmAction::CaptureConflict(snapshot) => {
+        ConfirmAction::CaptureConflict(snapshot, from_divergence) => {
             app.modals.push(Modal::CaptureName(CaptureNameForm {
                 snapshot,
                 input: InputState::new(""),
+                from_divergence,
             }));
         }
         ConfirmAction::Switch(name) => {
@@ -1780,13 +1789,12 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
             );
         }
         DivergenceChoice::NewProfile => {
-            let _ = detach_credentials_link();
-            {
-                let mut cfg = app.config();
-                cfg.state.active_profile = None;
-                let _ = save_app_state(&cfg.state);
-            }
-            begin_capture(app);
+            // Defer detaching the live link and deactivating the
+            // previously-active profile until the capture actually succeeds
+            // (handled in `handle_capture_name_key`'s success arm). Doing it
+            // here would silently deactivate the active profile and drop the
+            // live link if the user cancels the name modal with Esc.
+            begin_capture(app, true);
         }
         DivergenceChoice::Discard => {
             app.modals.push(Modal::Confirm(ConfirmState {
@@ -1836,6 +1844,17 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 return;
             };
             let snapshot = *form.snapshot;
+            // Divergence-originated capture: only now that the name is
+            // confirmed do we detach the live link and deactivate the
+            // previously-active profile, so `capture_into_profile` observes
+            // `active_profile.is_none()` and links + activates the new one.
+            // On Esc/cancel this never ran, so the prior profile stays linked.
+            if form.from_divergence {
+                let _ = detach_credentials_link();
+                let mut cfg = app.config();
+                cfg.state.active_profile = None;
+                let _ = save_app_state(&cfg.state);
+            }
             let result = {
                 let mut cfg = app.config();
                 capture_into_profile(&mut cfg, name.clone(), snapshot)
