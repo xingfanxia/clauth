@@ -1069,6 +1069,33 @@ fn perform_switch(app: &mut App, name: &str) {
 /// inline. Clears the Switching marker, runs `switch_profile`, and on
 /// success refreshes the scheduler's token snapshot and bumps state mtime.
 fn finalize_switch(app: &mut App, name: &str) {
+    // Guard a diverged outgoing active before `switch_profile` runs blind.
+    // `switch_profile` would no-op the snapshot of the diverged live creds and
+    // then `link_profile_credentials(target)` would bail on the regular file,
+    // failing the switch and stranding the outgoing profile's fresh `/login`
+    // chain (later overwritten by relink/shutdown). The auto-switch path has no
+    // other divergence check, so raise the same Divergence modal the 1Hz poll
+    // and CLI use: the user resolves the outgoing creds (Overwrite / NewProfile
+    // / Discard) and re-triggers the switch from the now-clean link. First-login
+    // adoption stays a clean switch (`switch_profile` adopts it).
+    let outgoing = app.config().state.active_profile.clone();
+    if let Some(active) = outgoing
+        && active != name
+        && matches!(
+            classify_credentials_link(&active).ok(),
+            Some(LinkState::Diverged)
+        )
+        && !is_first_login(&active).unwrap_or(false)
+    {
+        clear_activity(&app.activity, name);
+        app.toast(
+            ToastKind::Warning,
+            format!("'{active}' has unsaved Claude Code credentials — resolve before switching"),
+        );
+        app.modals
+            .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+        return;
+    }
     let result = {
         let mut cfg = app.config();
         switch_profile(&mut cfg, name)
