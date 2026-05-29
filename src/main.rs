@@ -93,13 +93,34 @@ fn main() -> Result<()> {
             // owned config so oauth fns can take/drop the lock per their
             // contract.
             let (op_sender, _op_receiver) = std::sync::mpsc::channel::<OpResult>();
+
+            // Classify the outgoing active profile's live link BEFORE any
+            // rotation. A diverged link means CC re-logged or rotated and wrote
+            // a regular file — a different, still-valid chain. Rotating the
+            // STORED chain in that case burns a single-use refresh token that
+            // the reconcile path (`force_snapshot_active_credentials`) then
+            // discards when it captures the live creds. Computing the verdict
+            // first lets us skip the doomed rotation. These checks are pure
+            // path/FS reads (no network, no config lock).
+            let reconciled = match outgoing.as_deref() {
+                Some(active) => {
+                    matches!(classify_credentials_link(active)?, LinkState::Diverged)
+                        && !is_first_login(active)?
+                }
+                None => false,
+            };
+
             let config = Arc::new(Mutex::new(config));
             {
                 // Scoped so the spinner stops before the interactive [Y/n]
                 // prompt below — a live spinner during stdin read corrupts it.
                 let _spinner = Spinner::start("clauth: rotating tokens…");
+                // Skip the outgoing rotation when its live link diverged: its
+                // stored chain is about to be overwritten by the live creds, so
+                // rotating it only burns a refresh token for nothing.
                 if let Some(ref active) = outgoing
                     && active != &canonical
+                    && !reconciled
                 {
                     oauth::rotate_one(&config, active, &noop_activity, &op_sender);
                 }
@@ -110,15 +131,6 @@ fn main() -> Result<()> {
             // file (CC re-logged or wrote a regular file), prompt rather than
             // refusing. On Yes: capture the live creds into the outgoing
             // profile first, then force the switch. On No: abort cleanly.
-            let reconciled = {
-                let cfg = config.lock().expect("config mutex poisoned");
-                if let Some(active) = cfg.state.active_profile.as_deref() {
-                    matches!(classify_credentials_link(active)?, LinkState::Diverged)
-                        && !is_first_login(active)?
-                } else {
-                    false
-                }
-            };
             if reconciled {
                 let active = {
                     let cfg = config.lock().expect("config mutex poisoned");
