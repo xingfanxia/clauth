@@ -344,6 +344,27 @@ fn fetch_with_rotation(
         let (info, status) = load_cached_with_status(name, fallback_status);
         return (info, status, None);
     };
+    // Per-profile rotation lock across the refresh HTTP window so an external
+    // `clauth start <name>` cannot double-spend this single-use token while our
+    // 401-recovery rotation is in flight (same template as `rotate_one`).
+    // Blocking acquire is safe in the scheduler thread: the tick body holds no
+    // lock (leaf-mutex discipline), so this cannot deadlock against anything
+    // the scheduler already holds, and the rotation holder window is short.
+    // On acquire failure, fall back to cache rather than refreshing unguarded.
+    let Ok(_rotation_guard) = crate::runtime::RotationGuard::acquire(name) else {
+        let (info, status) = load_cached_with_status(name, fallback_status);
+        return (info, status, None);
+    };
+    // Re-check liveness under the guard: a live session holds the chain and
+    // will refresh it itself; rotating here would spend the same single-use
+    // token and 401 one of the two actors, burning the chain. The guard makes
+    // this read authoritative (a session that won the acquire race stamped its
+    // PID file before releasing). `partition_due` already excludes
+    // `Refreshing`/`Switching`, but nothing excludes a *live external session*.
+    if crate::runtime::has_live_session(name) {
+        let (info, status) = load_cached_with_status(name, fallback_status);
+        return (info, status, None);
+    }
     // Refresh leg: surface a refresh spinner during the network round trip,
     // then drop back to Fetching for the retry. `Idle` is only reached on the
     // scheduler-side clear after this function returns.

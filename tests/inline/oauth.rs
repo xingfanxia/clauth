@@ -437,3 +437,79 @@ fn switch_dedup_active_equals_target() {
         "slot must stay Idle after single no-token rotate_one call"
     );
 }
+
+/// A guarded acquire for a DIFFERENT profile must not block — the rotation
+/// lock is per-profile, so two distinct profiles rotate concurrently. Without
+/// this, fanning `refresh_all` across worker threads would serialize every
+/// profile behind the slowest sibling.
+#[test]
+fn rotation_guard_is_independent_across_profiles() {
+    use crate::runtime::RotationGuard;
+
+    let a = "test-rotation-guard-indep-a";
+    let b = "test-rotation-guard-indep-b";
+    let held_a = RotationGuard::acquire(a).expect("acquire a");
+    // b is a different profile → its lock file is distinct → no blocking.
+    let held_b = RotationGuard::acquire(b).expect("acquire b while a is held");
+    drop(held_b);
+    drop(held_a);
+}
+
+/// `auto_start_named` must return false (no token spent) when a live
+/// `clauth start` session holds the chain. Selection-time `has_live_session`
+/// short-circuits before any HTTP; the in-guard re-check in `run_auto_start`
+/// is the second layer for the post-selection race window. Network-free: the
+/// live-session gate fires before any refresh.
+#[test]
+fn auto_start_named_skips_when_live_session() {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::mpsc;
+
+    let name = "test-auto-start-named-live-session";
+    let sessions = profile_dir(name).expect("profile_dir").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create sessions dir");
+    let pid_file = sessions.join("test-pid-autostart");
+    let file = open_pid_file(&pid_file).expect("open pid file");
+    file.lock().expect("lock pid file");
+
+    let profile = Profile {
+        name: name.to_string(),
+        base_url: None,
+        api_key: None,
+        auto_start: true,
+        env: BTreeMap::new(),
+        fallback_threshold: None,
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at".to_string(),
+                refresh_token: Some("rt-autostart-live".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }),
+        usage: None,
+        fetch_status: None,
+    };
+    let config = Arc::new(Mutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    }));
+    let activity: ActivityStore = Arc::new(Mutex::new(HashMap::new()));
+    let refetch: crate::usage::RefetchQueue =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let (tx, _rx) = mpsc::channel();
+
+    let kicked = auto_start_named(&config, name, &refetch, &activity, &tx);
+
+    assert!(
+        !kicked,
+        "auto_start_named must skip (no token spent) when a live session holds the chain"
+    );
+    assert!(
+        is_idle(&activity, name),
+        "activity slot must remain Idle when skipped at the live-session gate"
+    );
+
+    drop(file);
+}

@@ -325,6 +325,29 @@ pub(crate) fn refresh_all(
             let sender = sender.clone();
             let name_for_handle = name.clone();
             let h = std::thread::spawn(move || {
+                // Per-profile rotation lock across the HTTP window so an external
+                // `clauth start <name>` cannot double-spend this single-use token
+                // mid-rotation (same template as `rotate_one`). `force` bypasses
+                // the `has_live_session` SKIP (we still want to rotate the token),
+                // but NOT this mutual exclusion: a forced rotate must still not
+                // race a live session's own refresh of the same chain. The guard
+                // only blocks for the short acquire/rotate holder window.
+                let Ok(_rotation_guard) = RotationGuard::acquire(&name) else {
+                    clear_activity(&activity, &name);
+                    let _ = sender.send(OpResult {
+                        name: name.clone(),
+                        kind: ActivityKind::Refreshing,
+                        outcome: Err(anyhow::anyhow!("failed to acquire rotation lock")),
+                    });
+                    return (name, false);
+                };
+                // Re-check liveness under the guard for the non-forced path: a
+                // session that won the acquire race has stamped its PID file
+                // before releasing the guard, so this read is authoritative.
+                if !force && has_live_session(&name) {
+                    clear_activity(&activity, &name);
+                    return (name, false);
+                }
                 let refreshed = refresh(&rt);
                 let (outcome, saved) = match refreshed {
                     Ok(tok) => {
@@ -534,6 +557,20 @@ fn run_auto_start(
     name: &str,
     refresh_token: &str,
 ) -> (Result<()>, bool) {
+    // Per-profile rotation lock across the refresh HTTP window so an external
+    // `clauth start <name>` cannot double-spend this single-use token mid-kick
+    // (same template as `rotate_one`). Both auto-start callers already skip
+    // live sessions at selection time; the in-guard re-check closes the window
+    // between that selection and this refresh — a session that won the acquire
+    // race has stamped its PID file before releasing the guard, so the read is
+    // authoritative.
+    let _rotation_guard = match RotationGuard::acquire(name) {
+        Ok(g) => g,
+        Err(e) => return (Err(e), false),
+    };
+    if has_live_session(name) {
+        return (Err(anyhow::anyhow!("live session holds the chain")), false);
+    }
     let tok = match refresh(refresh_token) {
         Ok(t) => t,
         Err(e) => return (Err(e), false),
