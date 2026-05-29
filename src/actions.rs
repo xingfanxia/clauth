@@ -184,19 +184,23 @@ pub(crate) fn create_blank_profile(
 }
 
 /// Reads the current `~/.claude` credentials/endpoint and saves them as a new
-/// profile under `name`. Returns the matching profile name if these exact
-/// OAuth tokens already belong to one (caller can warn before proceeding).
+/// profile under `name`. Returns the matching profile name if these OAuth
+/// tokens already belong to one (caller can warn before proceeding).
+///
+/// Matches on `refresh_token` alone, like `which::resolve_profile`: the refresh
+/// token is the stable account identity, while access tokens rotate on every
+/// refresh. Keying on the access token here would miss a freshly-rotated login
+/// and let capture create a duplicate profile sharing one refresh chain.
 pub(crate) fn find_matching_oauth_profile<'a>(
     config: &'a AppConfig,
     live: Option<&ClaudeCredentials>,
 ) -> Option<&'a str> {
-    let live_oauth = live?.claude_ai_oauth.as_ref()?;
-    config.profiles.iter().find_map(|p| {
-        let stored = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
-        (stored.access_token == live_oauth.access_token
-            && stored.refresh_token == live_oauth.refresh_token)
-            .then_some(p.name.as_str())
-    })
+    let live_refresh = live?.refresh_token().filter(|t| !t.is_empty())?;
+    config
+        .profiles
+        .iter()
+        .find(|p| p.refresh_token() == Some(live_refresh))
+        .map(|p| p.name.as_str())
 }
 
 /// Snapshot of the live `~/.claude` state, ready to be turned into a profile.
