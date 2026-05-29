@@ -56,8 +56,11 @@ impl StateLock {
         }
 
         // Outermost acquisition: block until we own the thread mutex.
+        // `THREAD_LOCK` is a `static`, so `.lock()` borrows it for `'static`
+        // and the returned guard is `MutexGuard<'static, _>` directly — it can
+        // be stored in `StateLock` with no lifetime laundering.
         // Poison recovery: if a previous holder panicked we still proceed.
-        let mut guard = match THREAD_LOCK.lock() {
+        let mut guard: std::sync::MutexGuard<'static, Option<File>> = match THREAD_LOCK.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -79,14 +82,6 @@ impl StateLock {
         }
 
         DEPTH.set(1);
-
-        // Extend the guard's lifetime to 'static. This is sound: THREAD_LOCK
-        // is a 'static Mutex, so its contents live for the program lifetime.
-        // We hold the guard inside StateLock and drop it in Drop before any
-        // other cleanup, so the borrow is valid for as long as Self exists.
-        let guard: std::sync::MutexGuard<'static, Option<File>> =
-            // SAFETY: THREAD_LOCK is 'static; the guard is valid for 'static.
-            unsafe { std::mem::transmute(guard) };
 
         Ok(Self {
             _thread_guard: Some(guard),

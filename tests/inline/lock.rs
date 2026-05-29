@@ -64,3 +64,30 @@ fn same_thread_reentrancy_does_not_deadlock() {
     let result = with_state_lock(|| with_state_lock(|| with_state_lock(|| Ok(42u32))));
     assert_eq!(result.unwrap(), 42);
 }
+
+/// A panic inside the closure unwinds through `StateLock::Drop`, which closes
+/// the flock `File` and releases `THREAD_LOCK` (poisoning it). The next
+/// acquisition must recover via `into_inner()`, observe the cleared slot, and
+/// re-flock — the lock must not be permanently wedged.
+#[test]
+fn poison_recovery_after_panicking_closure() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        let _guard = StateLock::acquire().expect("acquire before panic");
+        panic!("closure blew up while holding the state lock");
+    }));
+    assert!(panicked.is_err(), "the inner closure must have panicked");
+
+    // DEPTH must be back to 0 on this thread — Drop ran during unwind.
+    DEPTH.with(|d| assert_eq!(d.get(), 0, "depth must reset to 0 after unwind"));
+
+    // THREAD_LOCK is now poisoned and its slot is None. A fresh acquire must
+    // succeed (recover poison + reopen the flock file) rather than deadlock.
+    let result = with_state_lock(|| Ok(7u32));
+    assert_eq!(result.unwrap(), 7, "lock must be reusable after a panic");
+
+    // And it must still serialize a second time around (slot rebuilt cleanly).
+    let again = with_state_lock(|| with_state_lock(|| Ok(8u32)));
+    assert_eq!(again.unwrap(), 8, "reentrancy still works post-recovery");
+}
