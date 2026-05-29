@@ -248,11 +248,19 @@ pub(crate) fn iso_to_epoch_secs(s: &str) -> Option<i64> {
             b'-' => -1,
             _ => return None,
         };
-        if after_frac.len() < 6 {
+        // Accept `±HH`, `±HHMM`, and `±HH:MM`; normalize by dropping the colon.
+        let digits: String = after_frac[1..].chars().filter(|&c| c != ':').collect();
+        if after_frac[1..]
+            .chars()
+            .any(|c| c != ':' && !c.is_ascii_digit())
+        {
             return None;
         }
-        let tz_h: i64 = after_frac[1..3].parse().ok()?;
-        let tz_m: i64 = after_frac[4..6].parse().ok()?;
+        let (tz_h, tz_m): (i64, i64) = match digits.len() {
+            2 => (digits.parse().ok()?, 0),
+            4 => (digits[0..2].parse().ok()?, digits[2..4].parse().ok()?),
+            _ => return None,
+        };
         sign * (tz_h * 3600 + tz_m * 60)
     };
 
@@ -292,3 +300,7 @@ pub(crate) fn humanize_duration(secs: i64) -> String {
         format!("{}m", mins.max(1))
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/inline/fetch.rs"]
+mod tests;
