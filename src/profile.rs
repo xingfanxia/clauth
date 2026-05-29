@@ -21,6 +21,10 @@ impl ClaudeCredentials {
     pub(crate) fn refresh_token(&self) -> Option<&str> {
         self.claude_ai_oauth.as_ref()?.refresh_token.as_deref()
     }
+
+    pub(crate) fn access_token(&self) -> Option<&str> {
+        Some(self.claude_ai_oauth.as_ref()?.access_token.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +83,10 @@ impl Profile {
 
     pub(crate) fn refresh_token(&self) -> Option<&str> {
         self.credentials.as_ref()?.refresh_token()
+    }
+
+    pub(crate) fn access_token(&self) -> Option<&str> {
+        self.credentials.as_ref()?.access_token()
     }
 }
 

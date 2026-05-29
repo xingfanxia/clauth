@@ -5,9 +5,9 @@ use super::{
     ActivityStore, CACHE_HIT_EPSILON, ConsecutiveCacheHit, ConsecutiveOk, FetchOutcome,
     FetchStatus, LEARNED_CEILING_MS, LEARNED_FLOOR_MS, LEARNED_QUIET_RESET_MS, LEARNED_STEP_MS,
     Last429At, LastFetchedAt, LearnedIntervals, NEAR_THRESHOLD_MARGIN, NORMAL_INTERVAL_MS,
-    PendingAutoStart, ProfileActivity, SERVER_CACHE_TTL_ESTIMATE_MS, StatusStore, TokenEntry,
-    UsageInfo, UsageStore, UsageWindow, apply_outcome, bump_down, bump_up, detect_cache_hit,
-    interval_for, now_ms, partition_due, update_learner,
+    ProfileActivity, SERVER_CACHE_TTL_ESTIMATE_MS, StatusStore, TokenEntry, UsageInfo, UsageStore,
+    UsageWindow, apply_outcome, bump_down, bump_up, detect_cache_hit, interval_for, now_ms,
+    partition_due, update_learner,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -32,7 +32,6 @@ fn token(name: &str, threshold: f64) -> TokenEntry {
         access_token: "tok".into(),
         refresh_token: None,
         fallback_threshold: threshold,
-        auto_start: false,
     }
 }
 
@@ -51,7 +50,6 @@ fn outcome(name: &str, status: FetchStatus, util: f64) -> FetchOutcome {
         name: name.into(),
         info: Some(usage_with_util(util)),
         status,
-        needs_auto_start: false,
         rotated: None,
     }
 }
@@ -60,7 +58,6 @@ fn apply_stores() -> (
     UsageStore,
     StatusStore,
     LastFetchedAt,
-    PendingAutoStart,
     LearnedIntervals,
     ConsecutiveOk,
     ConsecutiveCacheHit,
@@ -71,7 +68,6 @@ fn apply_stores() -> (
         Arc::new(Mutex::new(HashMap::new())),
         Arc::new(Mutex::new(HashMap::new())),
         Arc::new(Mutex::new(HashMap::new())),
-        Arc::new(Mutex::new(HashSet::new())),
         learned,
         ok,
         ch,
@@ -1539,14 +1535,13 @@ fn partition_due_bails_on_poisoned_store() {
 
 #[test]
 fn apply_outcome_cached_does_not_overwrite_fresh_data() {
-    let (store, status, last_fetched, pending, learned, ok, ch, l429) = apply_stores();
+    let (store, status, last_fetched, learned, ok, ch, l429) = apply_stores();
 
     apply_outcome(
         outcome("p", FetchStatus::Fresh, 50.0),
         &store,
         &status,
         &last_fetched,
-        &pending,
         &learned,
         &ok,
         &ch,
@@ -1560,7 +1555,6 @@ fn apply_outcome_cached_does_not_overwrite_fresh_data() {
         &store,
         &status,
         &last_fetched,
-        &pending,
         &learned,
         &ok,
         &ch,
@@ -1575,7 +1569,7 @@ fn apply_outcome_cached_does_not_overwrite_fresh_data() {
 
 #[test]
 fn apply_outcome_cached_fills_empty_store_on_cold_start() {
-    let (store, status, last_fetched, pending, learned, ok, ch, l429) = apply_stores();
+    let (store, status, last_fetched, learned, ok, ch, l429) = apply_stores();
 
     // No prior entry — Cached should fill the store so the UI has something
     // to render after a cold start with no network.
@@ -1584,7 +1578,6 @@ fn apply_outcome_cached_fills_empty_store_on_cold_start() {
         &store,
         &status,
         &last_fetched,
-        &pending,
         &learned,
         &ok,
         &ch,
@@ -1602,7 +1595,7 @@ fn apply_outcome_idle_at_normal_settles_without_oscillating() {
     // nor a recovery signal: it is a no-op for the learner. The previous code
     // fired bump_down on every such poll, dropping the interval below TTL where
     // the cache-hit arm then snapped it back up — a permanent oscillation.
-    let (store, status, last_fetched, pending, learned, ok, ch, l429) = apply_stores();
+    let (store, status, last_fetched, learned, ok, ch, l429) = apply_stores();
     learned
         .lock()
         .unwrap()
@@ -1614,7 +1607,6 @@ fn apply_outcome_idle_at_normal_settles_without_oscillating() {
         &store,
         &status,
         &last_fetched,
-        &pending,
         &learned,
         &ok,
         &ch,
@@ -1635,7 +1627,6 @@ fn apply_outcome_idle_at_normal_settles_without_oscillating() {
             &store,
             &status,
             &last_fetched,
-            &pending,
             &learned,
             &ok,
             &ch,
@@ -1661,7 +1652,7 @@ fn apply_outcome_idle_at_normal_settles_without_oscillating() {
 fn apply_outcome_rapid_poll_with_same_value_registers_cache_hit() {
     // Same-value Fresh inside the server cache window (e.g. polling at FLOOR)
     // is a true cache hit and must back off via the cache-hit arm.
-    let (store, status, last_fetched, pending, learned, ok, ch, l429) = apply_stores();
+    let (store, status, last_fetched, learned, ok, ch, l429) = apply_stores();
     learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
 
     apply_outcome(
@@ -1669,7 +1660,6 @@ fn apply_outcome_rapid_poll_with_same_value_registers_cache_hit() {
         &store,
         &status,
         &last_fetched,
-        &pending,
         &learned,
         &ok,
         &ch,
@@ -1685,7 +1675,6 @@ fn apply_outcome_rapid_poll_with_same_value_registers_cache_hit() {
         &store,
         &status,
         &last_fetched,
-        &pending,
         &learned,
         &ok,
         &ch,
@@ -1708,7 +1697,7 @@ fn apply_outcome_elapsed_uses_prior_last_fetched_not_just_written() {
     // the first call wrote its `now`, not the freshly-written value. Without
     // the M5 single-snapshot fix, the second call would read the value the first
     // just wrote → near-zero elapsed → false cache-hit classification.
-    let (store, status, last_fetched, pending, learned, ok, ch, l429) = apply_stores();
+    let (store, status, last_fetched, learned, ok, ch, l429) = apply_stores();
     learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
 
     // Simulate a prior fetch well outside the cache window so elapsed is large.
@@ -1721,7 +1710,6 @@ fn apply_outcome_elapsed_uses_prior_last_fetched_not_just_written() {
         &store,
         &status,
         &last_fetched,
-        &pending,
         &learned,
         &ok,
         &ch,
@@ -1737,7 +1725,6 @@ fn apply_outcome_elapsed_uses_prior_last_fetched_not_just_written() {
         &store,
         &status,
         &last_fetched,
-        &pending,
         &learned,
         &ok,
         &ch,
@@ -1755,7 +1742,7 @@ fn apply_outcome_elapsed_uses_prior_last_fetched_not_just_written() {
     // spec. What the fix prevents is reading a value written DURING the same
     // call. Let's test the actual documented regression path: set last_fetched
     // to a fresh value and verify elapsed reads it correctly.
-    let (store2, status2, last_fetched2, pending2, learned2, ok2, ch2, l429_2) = apply_stores();
+    let (store2, status2, last_fetched2, learned2, ok2, ch2, l429_2) = apply_stores();
     learned2
         .lock()
         .unwrap()
@@ -1770,7 +1757,6 @@ fn apply_outcome_elapsed_uses_prior_last_fetched_not_just_written() {
         &store2,
         &status2,
         &last_fetched2,
-        &pending2,
         &learned2,
         &ok2,
         &ch2,

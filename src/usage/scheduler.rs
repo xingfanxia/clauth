@@ -123,7 +123,6 @@ pub(crate) struct TokenEntry {
     pub(crate) access_token: String,
     pub(crate) refresh_token: Option<String>,
     pub(crate) fallback_threshold: f64,
-    pub(crate) auto_start: bool,
 }
 
 /// Per-profile epoch-ms of the next scheduled fetch. Written by the scheduler
@@ -427,13 +426,6 @@ fn five_hour_utilization(info: &UsageInfo) -> Option<f64> {
     info.five_hour.as_ref().map(|w| w.utilization)
 }
 
-fn five_hour_has_window(info: &UsageInfo) -> bool {
-    info.five_hour
-        .as_ref()
-        .and_then(|w| w.resets_at.as_ref())
-        .is_some()
-}
-
 /// Process-wide counter mixed into the bump-up jitter seed so two profiles
 /// bumping in the same tick get distinct jitter — `subsec_nanos` alone often
 /// collides under burst load, defeating the whole point of jittering.
@@ -689,7 +681,6 @@ struct FetchOutcome {
     name: String,
     info: Option<UsageInfo>,
     status: FetchStatus,
-    needs_auto_start: bool,
     /// New `(access_token, refresh_token)` pair when the fetch path rotated
     /// the OAuth tokens. The scheduler propagates this into the live
     /// `TokenList` so the next tick uses the fresh pair.
@@ -712,16 +703,10 @@ fn run_fetch(
         activity,
     );
 
-    let needs_auto_start = match info.as_ref() {
-        Some(i) => entry.auto_start && !five_hour_has_window(i),
-        None => false,
-    };
-
     FetchOutcome {
         name: entry.name,
         info,
         status,
-        needs_auto_start,
         rotated,
     }
 }
@@ -735,7 +720,6 @@ fn apply_outcome(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
-    pending_auto_start: &PendingAutoStart,
     learned: &LearnedIntervals,
     ok_count: &ConsecutiveOk,
     cache_hit_count: &ConsecutiveCacheHit,
@@ -807,11 +791,6 @@ fn apply_outcome(
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(outcome.name.clone(), now);
     }
-    if outcome.needs_auto_start
-        && let Ok(mut p) = pending_auto_start.lock()
-    {
-        p.insert(outcome.name.clone());
-    }
     update_learner(
         &outcome.name,
         outcome.status,
@@ -836,7 +815,6 @@ pub(crate) fn fetch_all_into(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
-    pending_auto_start: &PendingAutoStart,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
     learned: &LearnedIntervals,
@@ -878,7 +856,6 @@ pub(crate) fn fetch_all_into(
                     store,
                     status,
                     last_fetched,
-                    pending_auto_start,
                     learned,
                     ok_count,
                     cache_hit_count,
@@ -915,7 +892,6 @@ pub(crate) fn spawn_refresher(
     next_refresh_per_profile: NextRefreshPerProfile,
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
-    pending_auto_start: PendingAutoStart,
     pending_window_rotation: PendingWindowRotation,
     last_rotated_window: LastRotatedWindow,
     pending_switch: PendingSwitch,
@@ -986,6 +962,32 @@ pub(crate) fn spawn_refresher(
                 nrpp.clone_from(&per_profile_next);
             }
 
+            // Snapshot each profile's 5h `resets_at` as it stands BEFORE this
+            // tick's fetches run. A fetch that crosses the boundary returns a
+            // fresh window (resets_at ~5h out); reading the store AFTER the fetch
+            // would overwrite the expired value and never observe the expiry.
+            // Scanning here — above the `due.is_empty()` bail — also covers idle
+            // ticks that cross a boundary no fetch would otherwise report.
+            let pre_fetch_resets: HashMap<String, i64> = match store.lock() {
+                Ok(st) => snapshot
+                    .iter()
+                    .filter_map(|entry| {
+                        let resets_at_str = st
+                            .get(&entry.name)
+                            .and_then(|u| u.five_hour.as_ref())
+                            .and_then(|w| w.resets_at.as_deref())?;
+                        Some((entry.name.clone(), iso_to_epoch_secs(resets_at_str)?))
+                    })
+                    .collect(),
+                Err(_) => HashMap::new(),
+            };
+            scan_expired_windows(
+                &pre_fetch_resets,
+                &activity,
+                &last_rotated_window,
+                &pending_window_rotation,
+            );
+
             if due.is_empty() {
                 continue;
             }
@@ -1034,7 +1036,6 @@ pub(crate) fn spawn_refresher(
                             &store,
                             &status,
                             &last_fetched,
-                            &pending_auto_start,
                             &learned,
                             &ok_count,
                             &cache_hit_count,
@@ -1048,18 +1049,6 @@ pub(crate) fn spawn_refresher(
                     }
                 }
             }
-
-            // After fetches complete, check for profiles whose 5h window has
-            // expired (now >= resets_at + 1s) and haven't been rotated for
-            // that window yet. Post them to the main thread's drain queue —
-            // avoids holding &mut AppConfig in the scheduler thread.
-            scan_expired_windows(
-                &snapshot,
-                &store,
-                &activity,
-                &last_rotated_window,
-                &pending_window_rotation,
-            );
 
             // Recompute per-profile next times AFTER fetches have updated
             // `last_fetched` so the overview countdowns reflect fresh deadlines.
@@ -1144,10 +1133,15 @@ fn scan_auto_switch(
     }
 }
 
-/// For each profile in `snapshot`, check whether its 5h window has expired
-/// (current time is at least 1s past `resets_at`) and we haven't already
+/// For each profile in `pre_fetch_resets` (name → 5h `resets_at` epoch-secs
+/// captured BEFORE this tick's fetches), check whether the window has expired
+/// (current time is at least 5s past `resets_at`) and we haven't already
 /// queued a rotation for that specific `resets_at` epoch. Qualifying profiles
 /// are pushed into `pending_window_rotation` for the main thread to drain.
+///
+/// The snapshot is taken pre-fetch on purpose: a fetch crossing the boundary
+/// returns a fresh window (resets_at ~5h out), so reading the live store here
+/// would overwrite the expired value and the expiry would never be observed.
 ///
 /// Profiles currently `Switching` or `Refreshing` are skipped (same exclusion
 /// `partition_due` applies): a rotate/switch worker already holds that
@@ -1157,39 +1151,26 @@ fn scan_auto_switch(
 /// is simply re-enqueued on a later tick once it returns to `Idle`. A poisoned
 /// activity mutex fails safe to "all busy" so no entry is posted.
 fn scan_expired_windows(
-    snapshot: &[TokenEntry],
-    store: &UsageStore,
+    pre_fetch_resets: &HashMap<String, i64>,
     activity: &ActivityStore,
     last_rotated_window: &LastRotatedWindow,
     pending: &PendingWindowRotation,
 ) {
     let now = now_epoch_secs();
 
-    // Read what we need from the store, then drop the guard before acquiring
-    // the write locks — minimises held-lock overlap and avoids a latent
-    // three-mutex simultaneous hold that could become a deadlock if lock
-    // ordering is ever violated elsewhere.
-    // Required acquisition order: store → (drop) → activity → (drop) →
-    // last_rotated_window → (drop) → pending. Never two leaf mutexes at once.
-    let candidates: Vec<(String, i64)> = {
-        let Ok(st) = store.lock() else { return };
-        snapshot
-            .iter()
-            .filter_map(|entry| {
-                let resets_at_str = st
-                    .get(&entry.name)
-                    .and_then(|u| u.five_hour.as_ref())
-                    .and_then(|w| w.resets_at.as_deref())?;
-                let resets_at = iso_to_epoch_secs(resets_at_str)?;
-                // 1s past the window boundary to avoid acting on a window
-                // that hasn't fully closed yet.
-                if now < resets_at + 1 {
-                    return None;
-                }
-                Some((entry.name.clone(), resets_at))
-            })
-            .collect()
-    }; // store guard drops here
+    // Required acquisition order: activity → (drop) → last_rotated_window →
+    // (drop) → pending. Never two leaf mutexes at once.
+    let candidates: Vec<(String, i64)> = pre_fetch_resets
+        .iter()
+        .filter_map(|(name, &resets_at)| {
+            // 5s past the window boundary to avoid acting on a window
+            // that hasn't fully closed yet.
+            if now < resets_at + 5 {
+                return None;
+            }
+            Some((name.clone(), resets_at))
+        })
+        .collect();
 
     if candidates.is_empty() {
         return;

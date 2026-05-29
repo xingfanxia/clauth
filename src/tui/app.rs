@@ -518,7 +518,6 @@ impl App {
         let usage_store = Arc::clone(&self.usage_store);
         let usage_status = Arc::clone(&self.usage_status);
         let last_fetched = Arc::clone(&self.last_fetched);
-        let pending_auto_start = Arc::clone(&self.pending_auto_start);
         let refetch_queue = Arc::clone(&self.refetch_queue);
         let activity = Arc::clone(&self.activity);
         let learned_intervals = Arc::clone(&self.learned_intervals);
@@ -559,7 +558,6 @@ impl App {
                     &usage_store,
                     &usage_status,
                     &last_fetched,
-                    &pending_auto_start,
                     &refetch_queue,
                     &activity,
                     &learned_intervals,
@@ -587,7 +585,6 @@ impl App {
                         &usage_store,
                         &usage_status,
                         &last_fetched,
-                        &pending_auto_start,
                         &refetch_queue,
                         &activity,
                         &learned_intervals,
@@ -625,7 +622,6 @@ impl App {
             Arc::clone(&self.next_refresh_per_profile),
             Arc::clone(&self.activity),
             Arc::clone(&self.last_fetched),
-            Arc::clone(&self.pending_auto_start),
             Arc::clone(&self.pending_window_rotation),
             Arc::clone(&self.last_rotated_window),
             Arc::clone(&self.pending_switch),
@@ -783,7 +779,6 @@ pub(crate) fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
                 fallback_threshold: p
                     .fallback_threshold
                     .unwrap_or_else(default_fallback_threshold),
-                auto_start: p.auto_start,
             })
         })
         .collect()
@@ -1346,6 +1341,39 @@ fn toggle_auto_start(app: &mut App, name: &str) {
             "auto-start usage only applies to OAuth profiles",
         ),
         Outcome::Saved(now_on) => {
+            // Turning auto-start ON kicks the 5h window right away when the
+            // profile has no live window. Toggling is an explicit user action,
+            // so clear the 4.5h cooldown first — otherwise a prior (possibly
+            // failed) auto-start stamp makes `auto_start_named` silently skip.
+            // Then enqueue into `pending_auto_start`; the on_tick drain spawns
+            // the AutoStarting worker (refresh + Haiku kick + usage re-fetch).
+            // A profile that already has a live window is left alone — the
+            // window-expiry rotation path re-arms it when it next resets.
+            if now_on {
+                let has_window = app
+                    .usage_store
+                    .lock()
+                    .ok()
+                    .and_then(|s| {
+                        s.get(name).map(|u| {
+                            u.five_hour
+                                .as_ref()
+                                .and_then(|w| w.resets_at.as_ref())
+                                .is_some()
+                        })
+                    })
+                    .unwrap_or(false);
+                if !has_window {
+                    {
+                        let mut cfg = app.config();
+                        cfg.state.last_auto_start_at.remove(name);
+                        let _ = save_app_state(&cfg.state);
+                    }
+                    if let Ok(mut q) = app.pending_auto_start.lock() {
+                        q.insert(name.to_string());
+                    }
+                }
+            }
             let body = if now_on {
                 format!("auto-start usage on for '{name}'")
             } else {
@@ -2267,8 +2295,24 @@ pub(crate) fn on_tick(app: &mut App) {
                     &last_rotated,
                     epoch,
                 );
-                if rotated && let Ok(mut q) = refetch.lock() {
-                    q.insert(name);
+                if rotated {
+                    // The 5h window just expired and the token was refreshed.
+                    // Opted-in OAuth profiles re-arm the window immediately with
+                    // the freshly rotated access token (kick-only, no second
+                    // refresh): `start_window` shows the AutoStarting spinner,
+                    // fires the Haiku ping, and re-fetches usage on success.
+                    // Non-opted-in profiles just re-fetch as before.
+                    let auto = {
+                        let cfg = config.lock().expect("config mutex poisoned");
+                        cfg.find(&name)
+                            .map(|p| p.auto_start && p.is_oauth())
+                            .unwrap_or(false)
+                    };
+                    if auto {
+                        oauth::start_window(&config, &name, &refetch, &activity, &sender);
+                    } else if let Ok(mut q) = refetch.lock() {
+                        q.insert(name);
+                    }
                 }
             }));
             if result.is_err() {

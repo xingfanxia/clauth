@@ -37,8 +37,16 @@ const KICK_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI 
 /// Sized just under the 5-hour window so a ping whose follow-up usage fetch
 /// failed (network blip, stale endpoint) doesn't cause us to re-fire on
 /// every refresh, while still allowing a fresh ping once the window has
-/// elapsed.
+/// elapsed. Used by the single-name `auto_start_named` path.
 const AUTO_START_COOLDOWN_MS: u64 = 4 * 3600 * 1000 + 30 * 60 * 1000;
+
+/// Startup-only dedup window for `auto_start_windows`. The 5h-window check
+/// (`has_active_window`) is the real "already armed" guard, so this only needs
+/// to be long enough to stop two clauth instances launched within the same
+/// startup burst from both kicking (and double-spending the refresh token).
+/// Deliberately short — a fresh launch must re-arm a windowless opted-in
+/// account even if a prior session pinged it minutes ago.
+const STARTUP_DEDUP_MS: u64 = 60 * 1000;
 
 #[derive(Deserialize)]
 pub(crate) struct TokenResponse {
@@ -434,10 +442,14 @@ pub(crate) fn auto_start_windows(
         })
         .unwrap_or_default();
 
-    // Claim cooldown slots under the lock BEFORE any network work. A competing
-    // clauth process that starts up a moment later will observe our recorded
-    // `last_auto_start_at` and skip the same profile, so the refresh token
-    // rotates exactly once even when two instances race startup.
+    // Claim dedup slots under the lock BEFORE any network work. A competing
+    // clauth process that starts up within `STARTUP_DEDUP_MS` will observe our
+    // recorded `last_auto_start_at` and skip the same profile, so the refresh
+    // token rotates exactly once even when two instances race startup. The
+    // window is short on purpose: every fresh launch must re-arm an opted-in
+    // account that has no live 5h window, regardless of how long ago a prior
+    // session pinged it — `has_active_window` already skips accounts that are
+    // already armed.
     //
     // Holding the lock during the OAuth/messages HTTP round trips would stall
     // every other instance for seconds, so we release between claim and work.
@@ -466,7 +478,7 @@ pub(crate) fn auto_start_windows(
                     .get(&profile.name)
                     .copied()
                     .unwrap_or(0);
-                if now.saturating_sub(last) < AUTO_START_COOLDOWN_MS {
+                if now.saturating_sub(last) < STARTUP_DEDUP_MS {
                     continue;
                 }
                 let Some(token) = profile.refresh_token().map(str::to_string) else {
@@ -475,10 +487,10 @@ pub(crate) fn auto_start_windows(
                 claimed.push((profile.name.clone(), token));
             }
 
-            // Claim cooldown slots before releasing the lock. A competing
-            // clauth process will observe these timestamps and skip the same
-            // profiles so the token rotates exactly once even when two
-            // instances race startup.
+            // Stamp the dedup slots before releasing the lock. A competing
+            // clauth process starting within `STARTUP_DEDUP_MS` will observe
+            // these timestamps and skip the same profiles so the token rotates
+            // exactly once even when two instances race startup.
             for (name, _) in &claimed {
                 cfg.state.last_auto_start_at.insert(name.clone(), now);
             }
@@ -638,6 +650,47 @@ pub(crate) fn auto_start_named(
     // Never held across `with_state_lock`; cleared in every exit path.
     mark_activity(activity, name, ProfileActivity::AutoStarting);
     let (outcome, kicked) = run_auto_start(config, name, &token);
+    clear_activity(activity, name);
+    let _ = sender.send(OpResult {
+        name: name.to_string(),
+        kind: ActivityKind::AutoStarting,
+        outcome,
+    });
+    if kicked && let Ok(mut q) = refetch.lock() {
+        q.insert(name.to_string());
+    }
+    kicked
+}
+
+/// Kick the 5h usage window for `name` using its CURRENT (already-rotated)
+/// access token — NO token refresh, so this is safe to call right after a
+/// window-expiry rotation without double-spending the single-use refresh
+/// token. Marks `AutoStarting` so the overview shows the starting spinner,
+/// fires the 1-token Haiku ping, sends one `OpResult`, and on a successful
+/// kick pushes `name` onto `refetch` so usage re-fetches and the freshly
+/// armed window shows up. Returns true iff the kick succeeded.
+///
+/// `kick` spends only the access token (not the refresh token), so no
+/// `RotationGuard` is needed here.
+pub(crate) fn start_window(
+    config: &Arc<Mutex<AppConfig>>,
+    name: &str,
+    refetch: &RefetchQueue,
+    activity: &ActivityStore,
+    sender: &OpResultSender,
+) -> bool {
+    let access_token = {
+        let cfg = config.lock().expect("config mutex poisoned");
+        cfg.find(name)
+            .and_then(|p| p.access_token().map(str::to_string))
+    };
+    let Some(access_token) = access_token else {
+        return false;
+    };
+
+    mark_activity(activity, name, ProfileActivity::AutoStarting);
+    let outcome = kick(&access_token);
+    let kicked = outcome.is_ok();
     clear_activity(activity, name);
     let _ = sender.send(OpResult {
         name: name.to_string(),
