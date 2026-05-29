@@ -640,12 +640,22 @@ impl App {
     }
 
     pub(crate) fn apply_usage(&mut self) {
+        // Fail-safe on a poisoned lock: a fetch worker that panicked under the
+        // store lock must not blank every profile's usage. Skip the field whose
+        // lock errored and keep the prior value, matching the "poison == no new
+        // info" direction used by partition_due / scan_auto_switch. A blanked
+        // map here would run every tick (poison is permanent) and blind
+        // auto-switch forever.
         let info_map = self.usage_store.lock().ok();
         let status_map = self.usage_status.lock().ok();
         let mut cfg = self.config();
         for p in &mut cfg.profiles {
-            p.usage = info_map.as_ref().and_then(|s| s.get(&p.name)).cloned();
-            p.fetch_status = status_map.as_ref().and_then(|s| s.get(&p.name).copied());
+            if let Some(s) = info_map.as_ref() {
+                p.usage = s.get(&p.name).cloned();
+            }
+            if let Some(s) = status_map.as_ref() {
+                p.fetch_status = s.get(&p.name).copied();
+            }
         }
     }
 
