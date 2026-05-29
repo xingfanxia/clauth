@@ -624,10 +624,23 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     let differs = canonical_bytes.as_deref() != Some(runtime_bytes.as_slice());
     let mut wrote_canonical = false;
     if differs {
-        // Bytes differ: the TUI may have rotated canonical while CC wrote a
-        // fresh login into the runtime regular file. Use expires_at as the
-        // tie-breaker so the newer token wins. Canonical wins on tie or when
-        // it can't be parsed (missing canonical → runtime wins by default).
+        // Bytes differ: the TUI/scheduler may have rotated canonical while CC
+        // wrote a fresh interactive re-login into the runtime regular file.
+        // These can be two INDEPENDENT, both-valid refresh-token chains, so
+        // `expires_at` is the wrong tie-break — it is a property of the token,
+        // not a signal of which login the user actually performed last. A
+        // forced rotate-all (`t` key, `has_live_session` bypassed) can stamp a
+        // canonical token whose `expires_at` is marginally later than CC's
+        // fresh login; keeping canonical there would silently discard the
+        // user's just-completed interactive login and burn its chain.
+        //
+        // Use write recency (file mtime) as the primary signal instead: CC's
+        // `unlink+write` re-login and our `atomic_write` both bump mtime, so
+        // "most recently written wins" reflects which login is actually the
+        // intended-live one. `expires_at` survives only as the tie-break when
+        // mtimes are equal or unavailable (e.g. clock granularity), and a full
+        // tie keeps canonical (missing/unparseable canonical → runtime wins by
+        // default, handled above by `canonical_bytes`/`canonical_exp` = None).
         let canonical_exp = canonical_bytes.as_deref().and_then(|cb| {
             let c = serde_json::from_slice::<ClaudeCredentials>(cb).ok()?;
             Some(c.claude_ai_oauth?.expires_at.unwrap_or(0))
@@ -636,17 +649,33 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
             .claude_ai_oauth
             .as_ref()
             .map(|o| o.expires_at.unwrap_or(0));
+        let canonical_mtime = std::fs::metadata(canonical)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let runtime_mtime = meta.modified().ok();
         let canonical_wins = match (canonical_exp, runtime_exp) {
-            (Some(ce), Some(re)) => ce >= re,
+            // Canonical present and parseable: mtime is the primary signal —
+            // trust the most recently written file regardless of token expiry.
+            // This is what fixes the silent discard of CC's fresh re-login.
+            // expires_at is the tie-break only when mtimes are equal or
+            // unavailable; canonical wins that fallback tie.
+            (Some(ce), Some(re)) => match (canonical_mtime, runtime_mtime) {
+                (Some(cm), Some(rm)) if cm != rm => cm > rm,
+                _ => ce >= re,
+            },
+            // Runtime has no token: nothing to adopt, keep canonical.
             (Some(_), None) => true,
+            // Canonical missing or unparseable: runtime always wins, never let
+            // a newer mtime on corrupt/absent canonical override that.
             _ => false,
         };
         if canonical_wins {
-            // TUI rotation wrote a fresher token into canonical; do not
-            // overwrite it with the stale runtime bytes.
+            // Canonical was written at/after the runtime re-login (or wins the
+            // mtime tie-break); do not overwrite it with the runtime bytes.
             eprintln!(
                 "clauth: watchdog kept canonical credentials \
-                 (canonical expires_at >= runtime); not overwriting with runtime re-login bytes"
+                 (canonical written more recently than runtime); \
+                 not overwriting with runtime re-login bytes"
             );
         } else {
             atomic_write(canonical, &runtime_bytes)?;

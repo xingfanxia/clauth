@@ -96,6 +96,10 @@ fn sync_writes_canonical_when_differs() {
     let link_path = tmp.path().join(".credentials.json");
     fs::write(&link_path, CREDS_V2).expect("write link");
     fs::write(&canonical, CREDS_V1).expect("write canonical");
+    // Runtime is the more recent write, so it wins under the mtime tie-break.
+    let base = SystemTime::now();
+    set_mtime(&canonical, base);
+    set_mtime(&link_path, base + Duration::from_secs(5));
     assert!(sync_credentials_unlocked(&link_path, &canonical).expect("sync"));
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V2);
     #[cfg(unix)]
@@ -142,21 +146,24 @@ fn sync_no_write_when_bytes_identical() {
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
 }
 
-// When canonical has a later expires_at, it wins — canonical must NOT be
-// overwritten even though the runtime is a regular file.
+// Canonical written more recently than runtime → canonical wins, runtime is
+// re-linked. mtime is the primary tie-break; expires_at agrees here (V2 > V1).
 #[test]
-fn sync_canonical_wins_when_expires_at_is_later() {
+fn sync_canonical_wins_when_written_more_recently() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let canonical = tmp.path().join("canonical.json");
     let link_path = tmp.path().join(".credentials.json");
-    // V2 has a higher expires_at than V1.
     fs::write(&link_path, CREDS_V1).expect("write runtime (stale)");
     fs::write(&canonical, CREDS_V2).expect("write canonical (rotated)");
+    // Pin canonical strictly newer than runtime.
+    let base = SystemTime::now();
+    set_mtime(&link_path, base);
+    set_mtime(&canonical, base + Duration::from_secs(5));
 
     let written = sync_credentials_unlocked(&link_path, &canonical).expect("sync");
     assert!(
         !written,
-        "canonical must not be overwritten when it has later expires_at"
+        "canonical must not be overwritten when it is the more recent write"
     );
     assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
     #[cfg(unix)]
@@ -170,21 +177,75 @@ fn sync_canonical_wins_when_expires_at_is_later() {
     );
 }
 
-// When runtime has a later expires_at, it wins — canonical IS overwritten
-// (existing behavior, now with explicit expires_at context).
+// Runtime written more recently than canonical → runtime wins, canonical
+// overwritten. mtime is primary; expires_at agrees here (V2 > V1).
 #[test]
-fn sync_runtime_wins_when_expires_at_is_later() {
+fn sync_runtime_wins_when_written_more_recently() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let canonical = tmp.path().join("canonical.json");
     let link_path = tmp.path().join(".credentials.json");
-    // V2 > V1 in expires_at, so V2 runtime wins.
     fs::write(&link_path, CREDS_V2).expect("write runtime (newer)");
     fs::write(&canonical, CREDS_V1).expect("write canonical (older)");
+    let base = SystemTime::now();
+    set_mtime(&canonical, base);
+    set_mtime(&link_path, base + Duration::from_secs(5));
 
     let written = sync_credentials_unlocked(&link_path, &canonical).expect("sync");
     assert!(
         written,
-        "canonical must be overwritten when runtime has later expires_at"
+        "canonical must be overwritten when runtime is the more recent write"
+    );
+    assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
+}
+
+// THE BUG FIX: a forced rotate-all can stamp a canonical token whose
+// expires_at is marginally LATER than CC's fresh interactive re-login, yet the
+// re-login (a different, still-valid chain) was written AFTER. mtime, not
+// expires_at, must decide — otherwise the watchdog silently discards the
+// user's just-completed login and burns its chain.
+#[test]
+fn sync_runtime_wins_when_newer_mtime_despite_lower_expires_at() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical = tmp.path().join("canonical.json");
+    let link_path = tmp.path().join(".credentials.json");
+    // Canonical (rotated) carries the LATER expires_at (V2 = 2000); runtime
+    // (CC re-login) carries the earlier one (V1 = 1000) but was written last.
+    fs::write(&canonical, CREDS_V2).expect("write canonical (rotated, later exp)");
+    fs::write(&link_path, CREDS_V1).expect("write runtime (fresh re-login)");
+    let base = SystemTime::now();
+    set_mtime(&canonical, base);
+    set_mtime(&link_path, base + Duration::from_secs(5));
+
+    let written = sync_credentials_unlocked(&link_path, &canonical).expect("sync");
+    assert!(
+        written,
+        "runtime re-login must win on newer mtime even with lower expires_at"
+    );
+    assert_eq!(
+        fs::read(&canonical).expect("read canonical"),
+        CREDS_V1,
+        "CC's fresh login bytes must be preserved into canonical, not discarded"
+    );
+}
+
+// mtime tie (or unavailable) → fall back to expires_at, canonical on the
+// stronger side. Here canonical V2 > runtime V1 with equal mtimes, so
+// canonical keeps and runtime is re-linked.
+#[test]
+fn sync_falls_back_to_expires_at_on_equal_mtime() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical = tmp.path().join("canonical.json");
+    let link_path = tmp.path().join(".credentials.json");
+    fs::write(&link_path, CREDS_V1).expect("write runtime");
+    fs::write(&canonical, CREDS_V2).expect("write canonical");
+    let when = SystemTime::now();
+    set_mtime(&link_path, when);
+    set_mtime(&canonical, when);
+
+    let written = sync_credentials_unlocked(&link_path, &canonical).expect("sync");
+    assert!(
+        !written,
+        "on equal mtime, higher expires_at (canonical) wins the fallback"
     );
     assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
 }
