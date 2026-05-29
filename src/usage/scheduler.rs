@@ -1034,6 +1034,7 @@ pub(crate) fn spawn_refresher(
             scan_expired_windows(
                 &snapshot,
                 &store,
+                &activity,
                 &last_rotated_window,
                 &pending_window_rotation,
             );
@@ -1125,9 +1126,18 @@ fn scan_auto_switch(
 /// (current time is at least 1s past `resets_at`) and we haven't already
 /// queued a rotation for that specific `resets_at` epoch. Qualifying profiles
 /// are pushed into `pending_window_rotation` for the main thread to drain.
+///
+/// Profiles currently `Switching` or `Refreshing` are skipped (same exclusion
+/// `partition_due` applies): a rotate/switch worker already holds that
+/// profile's single-use refresh token over HTTP, and re-posting it here would
+/// let `on_tick` dispatch a second window-rotation worker that double-spends
+/// the chain. The pin/stamp semantics are unchanged — a still-expired profile
+/// is simply re-enqueued on a later tick once it returns to `Idle`. A poisoned
+/// activity mutex fails safe to "all busy" so no entry is posted.
 fn scan_expired_windows(
     snapshot: &[TokenEntry],
     store: &UsageStore,
+    activity: &ActivityStore,
     last_rotated_window: &LastRotatedWindow,
     pending: &PendingWindowRotation,
 ) {
@@ -1137,7 +1147,8 @@ fn scan_expired_windows(
     // the write locks — minimises held-lock overlap and avoids a latent
     // three-mutex simultaneous hold that could become a deadlock if lock
     // ordering is ever violated elsewhere.
-    // Required acquisition order: store → (drop) → last_rotated_window → pending.
+    // Required acquisition order: store → (drop) → activity → (drop) →
+    // last_rotated_window → (drop) → pending. Never two leaf mutexes at once.
     let candidates: Vec<(String, i64)> = {
         let Ok(st) = store.lock() else { return };
         snapshot
@@ -1157,6 +1168,27 @@ fn scan_expired_windows(
             })
             .collect()
     }; // store guard drops here
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Drop profiles whose activity slot is Switching/Refreshing — a worker is
+    // already holding their refresh token. Scoped on its own so the activity
+    // guard drops before `last_rotated_window`. Poisoned mutex => fail safe to
+    // "all busy" and post nothing this tick.
+    let candidates: Vec<(String, i64)> = {
+        let Ok(act) = activity.lock() else { return };
+        candidates
+            .into_iter()
+            .filter(|(name, _)| {
+                !matches!(
+                    act.get(name),
+                    Some(ProfileActivity::Switching | ProfileActivity::Refreshing)
+                )
+            })
+            .collect()
+    }; // activity guard drops here
 
     if candidates.is_empty() {
         return;
