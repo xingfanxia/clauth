@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::claude::{LinkState, classify_credentials_link};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, OAuthToken, save_app_state, save_profile};
-use crate::runtime::has_live_session;
+use crate::runtime::{RotationGuard, has_live_session};
 use crate::usage::{
     ActivityKind, ActivityStore, LastRotatedWindow, OpResult, OpResultSender, ProfileActivity,
     RefetchQueue, UsageStore, clear_activity, mark_activity, now_ms,
@@ -114,6 +114,18 @@ pub(crate) fn rotate_one(
     activity: &ActivityStore,
     sender: &OpResultSender,
 ) -> bool {
+    // Hold the per-profile rotation lock across the ENTIRE HTTP window so an
+    // external `clauth start <name>` cannot begin a refresh of the same
+    // single-use token while ours is in flight. The state flock cannot do this
+    // (it must be released across the network round trip). Ordering rule
+    // (matches `ProfileRuntime::acquire`): RotationGuard OUTERMOST, then the
+    // state flock inside. With the guard held, the `has_live_session` check
+    // below is authoritative, not a TOCTOU probe: a session that won the race
+    // has already stamped its PID file before releasing the guard, and one that
+    // lost it is blocked here until we finish and persist the rotated pair.
+    let Ok(_rotation_guard) = RotationGuard::acquire(name) else {
+        return false;
+    };
     let token = {
         let cfg = config.lock().expect("config mutex poisoned");
         with_state_lock(|| {
@@ -184,6 +196,12 @@ pub(crate) fn rotate_one_for_window(
     lrw: &LastRotatedWindow,
     resets_at: i64,
 ) -> bool {
+    // See `rotate_one`: hold the per-profile rotation lock across the HTTP
+    // window so an external `clauth start <name>` cannot double-spend the
+    // single-use token. RotationGuard OUTERMOST, then the state flock inside.
+    let Ok(_rotation_guard) = RotationGuard::acquire(name) else {
+        return false;
+    };
     let token = {
         let cfg = config.lock().expect("config mutex poisoned");
         with_state_lock(|| {

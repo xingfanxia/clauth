@@ -88,6 +88,52 @@ fn canonical_credentials(name: &str) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join("credentials.json"))
 }
 
+fn rotation_lock_path(name: &str) -> Result<PathBuf> {
+    Ok(profile_dir(name)?.join("rotation.lock"))
+}
+
+/// Cross-process advisory lock serializing a token rotation against a
+/// `clauth start` session acquire for the SAME profile.
+///
+/// A refresh token is single-use: once `oauth::refresh` spends it the server
+/// kills it, and a second refresh of the same token 401s and burns the whole
+/// chain. The global state flock (`with_state_lock`) cannot guard this because
+/// it must be released across the network round trip; the per-PID session
+/// flocks only track liveness, not "a rotation is in flight". This lock is
+/// held for the FULL rotate HTTP window (which `with_state_lock` cannot be),
+/// and `ProfileRuntime::acquire` takes the same lock before it stamps its
+/// session PID file — so the two operations are mutually exclusive:
+///
+/// - rotate wins the race → acquire blocks until the new pair is persisted,
+///   then the session starts against the rotated token;
+/// - acquire wins the race → it creates its session PID file before releasing,
+///   so rotate's in-lock `has_live_session` re-check sees the live session and
+///   skips (the token is never spent).
+///
+/// Distinct from `~/.clauth/.lock` (global state) and `sessions/<pid>`
+/// (per-session liveness). Blocking `flock`; the holder window is short.
+pub(crate) struct RotationGuard {
+    _file: File,
+}
+
+impl RotationGuard {
+    /// Acquire the per-profile rotation lock, blocking until any in-flight
+    /// rotation or acquire for this profile releases it. The directory is
+    /// created if missing (a profile with no session yet has no `sessions/`).
+    pub(crate) fn acquire(name: &str) -> Result<Self> {
+        let path = rotation_lock_path(name)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let file =
+            open_pid_file(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("failed to lock {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
 /// Open or create a PID file without truncating — used for session liveness
 /// tracking via flock. `O_CREAT` without truncate preserves any existing lock
 /// held by a sibling that raced us to create the file.
@@ -130,6 +176,15 @@ impl ProfileRuntime {
         let sessions = sessions_dir(name)?;
         let pid_file = sessions.join(std::process::id().to_string());
         let canonical = canonical_credentials(name)?;
+
+        // Hold the per-profile rotation lock across the session-stamp window so
+        // a concurrent `oauth::rotate_one` for this profile cannot spend the
+        // single-use refresh token while we are starting up. Ordering rule
+        // (matches `oauth::rotate_one`): RotationGuard OUTERMOST, then the
+        // state flock inside. Dropped right after the PID file is locked — from
+        // then on the PID flock itself signals liveness, and rotate's in-lock
+        // `has_live_session` re-check observes it.
+        let _rotation_guard = RotationGuard::acquire(name)?;
 
         let (pid_lock, mode) = with_state_lock(|| {
             std::fs::create_dir_all(&sessions)
