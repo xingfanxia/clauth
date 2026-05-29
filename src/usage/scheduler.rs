@@ -213,10 +213,11 @@ pub(crate) enum StartupSignal {
     /// credentials were either in sync or a silent continuation. The UI may
     /// now proceed to bootstrap.
     ReconcileDone,
-    /// Reconcile worker proved the stored chain is still alive (so CC's live
-    /// credentials are a separate `/login`). The rotated pair was already
-    /// persisted by the worker; the UI pushes the Divergence prompt for
-    /// `active` and only proceeds to bootstrap once it's answered.
+    /// Reconcile found the live credentials diverged from the active profile's
+    /// stored creds. We don't probe the stored chain's liveness (an OAuth
+    /// refresh would spend its single-use token), so the UI pushes the
+    /// Divergence prompt for `active` and only proceeds to bootstrap once the
+    /// user picks an action.
     ReconcileNeedsPrompt { active: String },
     /// Bootstrap worker finished its HTTP work (refresh + initial fetch +
     /// auto-start kicks). The UI rebuilds the token snapshot, spawns the

@@ -799,10 +799,15 @@ pub(crate) fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
 ///
 /// When the bytes diverge we cannot tell from them alone whether Claude Code
 /// silently refreshed (rotating the stored chain) or did a fresh `/login` on a
-/// separate chain — disambiguating requires an HTTP refresh probe, so that
-/// leg is spawned onto a worker thread that posts a `StartupSignal` the UI
-/// drains. The probe + any FS write happen off the UI thread; the UI only
-/// reacts to the verdict (push the Divergence modal, or proceed).
+/// separate chain. The only authoritative liveness test for the stored chain is
+/// an OAuth refresh, but a refresh *spends* the single-use refresh token
+/// server-side — so probing here would rotate the stored identity on every
+/// diverged startup, even when the user goes on to keep it. We therefore never
+/// probe: divergence always hands the verdict to the user via the Divergence
+/// modal. None of its actions spend the stored token as a side effect (Overwrite
+/// takes the live creds, NewProfile captures them into a new profile, Discard
+/// relinks the stored creds as-is); a kept-but-stale stored access token is
+/// refreshed lazily on the next real fetch, when the user is actually using it.
 pub(crate) fn reconcile_startup(app: &mut App) {
     let Some(active) = app.config().state.active_profile.clone() else {
         let _ = app.startup_sender.send(StartupSignal::ReconcileDone);
@@ -827,49 +832,12 @@ pub(crate) fn reconcile_startup(app: &mut App) {
         return;
     }
 
-    let stored_refresh = app
-        .config()
-        .find(&active)
-        .and_then(|p| p.refresh_token().map(str::to_string));
-    let Some(rt) = stored_refresh else {
-        // Diverged but no stored refresh token to probe with — nothing to
-        // disambiguate, prompt straight away.
-        let _ = app
-            .startup_sender
-            .send(StartupSignal::ReconcileNeedsPrompt { active });
-        return;
-    };
-
-    // Probe off the UI thread: Anthropic rotates the refresh token on every
-    // refresh, so the call fails iff CC already used it. Failure → live is the
-    // legit continuation, snapshot silently and proceed. Success → the stored
-    // chain is still alive, CC's tokens come from a relog; persist the rotated
-    // pair (the old one is now invalid server-side anyway) and prompt.
-    let config = Arc::clone(&app.config);
-    let sender = app.startup_sender.clone();
-    let sender_for_panic = sender.clone();
-    std::thread::spawn(move || {
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match oauth::refresh(&rt) {
-                Err(_) => {
-                    let mut cfg = config.lock().expect("config mutex poisoned");
-                    let _ = force_snapshot_active_credentials(&mut cfg);
-                    let _ = sender.send(StartupSignal::ReconcileDone);
-                }
-                Ok(tok) => {
-                    {
-                        let mut cfg = config.lock().expect("config mutex poisoned");
-                        let _ = oauth::apply_rotated_tokens(&mut cfg, &active, tok);
-                    }
-                    let _ = sender.send(StartupSignal::ReconcileNeedsPrompt { active });
-                }
-            }));
-        if result.is_err() {
-            // Panic path: send ReconcileDone so startup unblocks rather than
-            // hanging forever. Proceeds as if no divergence was found.
-            let _ = sender_for_panic.send(StartupSignal::ReconcileDone);
-        }
-    });
+    // Diverged: hand the verdict to the user without spending the stored
+    // refresh token. No network, no FS write here — the chosen modal action
+    // resolves divergence. Inline send keeps startup off the network path.
+    let _ = app
+        .startup_sender
+        .send(StartupSignal::ReconcileNeedsPrompt { active });
 }
 
 // ── Event handling ────────────────────────────────────────────────────────────

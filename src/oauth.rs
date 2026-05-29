@@ -661,17 +661,16 @@ fn apply_rotated_tokens_or_rollback_cooldown_locked(
 }
 
 /// Write a rotated token pair into the named profile's OAuth block and
-/// persist. Returns true on success. No-op when the profile or OAuth block
-/// is missing — callers that care can refuse to act on `false`.
+/// persist. Takes `&Arc<Mutex<AppConfig>>` so workers can call from a thread
+/// without holding the lock across HTTP. Returns true on success. No-op when
+/// the profile or OAuth block is missing — callers that care can refuse to act
+/// on `false`.
 ///
 /// When `window_stamp` is `Some((lrw, resets_at))`, the `LastRotatedWindow`
 /// map is updated atomically with the credential write — under the same
 /// state-lock acquisition — so no panic or mutex-poison between the persist
 /// and the stamp can cause a silent chain burn on the next scheduler tick.
 /// Lock order: AppConfig → state flock → LRW leaf mutex.
-///
-/// Locking variant of [`apply_rotated_tokens`]: takes `&Arc<Mutex<AppConfig>>`
-/// so workers can call from a thread without holding the lock across HTTP.
 pub(crate) fn apply_rotated_tokens_locked(
     config: &Arc<Mutex<AppConfig>>,
     name: &str,
@@ -699,29 +698,6 @@ pub(crate) fn apply_rotated_tokens_locked(
             guard.insert(name.to_string(), resets_at);
         }
         Ok(true)
-    })
-    .unwrap_or(false)
-}
-
-/// Write a rotated token pair into the named profile's OAuth block and
-/// persist. Returns true on success. No-op when the profile or OAuth block
-/// is missing — callers that care can refuse to act on `false`.
-///
-/// `&mut AppConfig` variant for callers that already hold the lock (e.g. the
-/// divergence-probe path on the UI thread).
-pub(crate) fn apply_rotated_tokens(config: &mut AppConfig, name: &str, tok: TokenResponse) -> bool {
-    with_state_lock(|| {
-        let Some(profile) = config.find_mut(name) else {
-            return Ok::<_, anyhow::Error>(false);
-        };
-        let Some(creds) = profile.credentials.as_mut() else {
-            return Ok(false);
-        };
-        let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
-            return Ok(false);
-        };
-        write_token_fields(oauth, tok);
-        Ok(save_profile(profile).is_ok())
     })
     .unwrap_or(false)
 }
