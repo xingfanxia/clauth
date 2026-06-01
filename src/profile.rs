@@ -220,6 +220,10 @@ fn profile_credentials_path(name: &str) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join("credentials.json"))
 }
 
+fn profile_credentials_pending_path(name: &str) -> Result<PathBuf> {
+    Ok(profile_dir(name)?.join("credentials.json.pending"))
+}
+
 /// Write `content` to `path` via tempfile + rename so concurrent readers see
 /// either the old file or the new one, never a partial write.
 pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
@@ -286,6 +290,9 @@ fn load_profile(name: &str) -> Result<Profile> {
     } else {
         None
     };
+    // Adopt a rotation that was staged but never committed (failed save or a
+    // crash between the OAuth response and the structured write).
+    let credentials = recover_pending_credentials(name, credentials);
 
     let profile = Profile {
         name: name.to_string(),
@@ -331,12 +338,10 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
     with_state_lock(|| {
         std::fs::create_dir_all(profile_dir(&profile.name)?)?;
 
-        atomic_write(
-            &profile_config_path(&profile.name)?,
-            render_config_toml(profile),
-        )
-        .context("Failed to write config.toml")?;
-
+        // Persist credentials.json BEFORE config.toml: the OAuth token chain
+        // lives here, and a single-use refresh token must not be lost to an
+        // unrelated config.toml write failure. A failure here aborts before
+        // config.toml is touched.
         let cred_path = profile_credentials_path(&profile.name)?;
         match &profile.credentials {
             Some(creds) => atomic_write(&cred_path, serde_json::to_string_pretty(creds)?)
@@ -347,8 +352,81 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
             None => {}
         }
 
+        atomic_write(
+            &profile_config_path(&profile.name)?,
+            render_config_toml(profile),
+        )
+        .context("Failed to write config.toml")?;
+
         Ok(())
     })
+}
+
+/// Durably stage a freshly-rotated credential blob to a sidecar BEFORE the
+/// structured `save_profile`. The OAuth refresh token is single-use: once the
+/// server returns a rotated pair the previous token is dead, so losing the new
+/// pair (a failed write, a crash mid-save) permanently breaks the chain. If the
+/// commit never lands, `load_profile` adopts this sidecar on the next start.
+/// Callers clear it with [`clear_staged_credentials`] after a successful commit.
+pub(crate) fn stage_rotated_credentials(name: &str, creds: &ClaudeCredentials) -> Result<()> {
+    with_state_lock(|| {
+        std::fs::create_dir_all(profile_dir(name)?)?;
+        atomic_write(
+            &profile_credentials_pending_path(name)?,
+            serde_json::to_string_pretty(creds)?,
+        )
+        .context("Failed to stage rotated credentials")
+    })
+}
+
+/// Remove the rotation sidecar after the structured save committed successfully.
+pub(crate) fn clear_staged_credentials(name: &str) {
+    if let Ok(path) = profile_credentials_pending_path(name) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Adopt a staged rotation that never committed. The sidecar is written before
+/// the structured save during token rotation; if that save failed or the
+/// process died between the OAuth response and the commit, `credentials.json`
+/// may still hold the now-dead pre-rotation token while the sidecar holds the
+/// live rotated one. Adopt the sidecar when it is at least as new as
+/// `credentials.json` (or the latter is missing), persist it, and clear it. A
+/// stale sidecar (commit succeeded but cleanup didn't) is simply discarded.
+fn recover_pending_credentials(
+    name: &str,
+    loaded: Option<ClaudeCredentials>,
+) -> Option<ClaudeCredentials> {
+    let Ok(pending_path) = profile_credentials_pending_path(name) else {
+        return loaded;
+    };
+    let Ok(pending_meta) = pending_path.symlink_metadata() else {
+        return loaded; // no sidecar — the common case
+    };
+    let recovered = (|| -> Option<ClaudeCredentials> {
+        let bytes = std::fs::read(&pending_path).ok()?;
+        let pending: ClaudeCredentials = serde_json::from_slice(&bytes).ok()?;
+        pending.claude_ai_oauth.as_ref()?; // must carry an oauth block to matter
+        let cred_path = profile_credentials_path(name).ok()?;
+        // The sidecar is written before the commit, so a clean success leaves
+        // credentials.json at least as new (discard); a failed or interrupted
+        // commit leaves it older or absent (adopt).
+        let adopt = match cred_path.metadata().and_then(|m| m.modified()) {
+            Ok(cred_mtime) => pending_meta
+                .modified()
+                .map(|p| p >= cred_mtime)
+                .unwrap_or(true),
+            Err(_) => true,
+        };
+        if !adopt {
+            return None;
+        }
+        let _ = with_state_lock(|| atomic_write(&cred_path, &bytes).map_err(Into::into));
+        Some(pending)
+    })();
+    // Whether adopted or discarded, the sidecar has served its purpose.
+    let _ = std::fs::remove_file(&pending_path);
+    recovered.or(loaded)
 }
 
 pub(crate) fn load_config() -> Result<AppConfig> {

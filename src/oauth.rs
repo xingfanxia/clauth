@@ -6,7 +6,10 @@ use serde::Deserialize;
 
 use crate::claude::{LinkState, classify_credentials_link};
 use crate::lock::with_state_lock;
-use crate::profile::{AppConfig, OAuthToken, save_app_state, save_profile};
+use crate::profile::{
+    AppConfig, OAuthToken, clear_staged_credentials, save_app_state, save_profile,
+    stage_rotated_credentials,
+};
 use crate::runtime::{RotationGuard, has_live_session};
 use crate::usage::{
     ActivityKind, ActivityStore, LastRotatedWindow, OpResult, OpResultSender, ProfileActivity,
@@ -739,19 +742,27 @@ fn apply_rotated_tokens_or_rollback_cooldown_locked(
             return Ok(false);
         };
         write_token_fields(oauth, tok);
+        // Stage the rotated pair durably before the structured save so a save
+        // failure or crash here is recoverable on next load instead of burning
+        // the single-use chain.
+        if let Some(creds) = profile.credentials.as_ref() {
+            let _ = stage_rotated_credentials(name, creds);
+        }
         if save_profile(profile).is_err() {
-            // Roll back the cooldown so the profile isn't stranded.
+            // Sidecar stays for recovery. Still roll back the cooldown so the
+            // profile retries promptly instead of waiting the full window.
             cfg.state.last_auto_start_at.remove(name);
             let _ = save_app_state(&cfg.state);
             return Ok(false);
         }
+        clear_staged_credentials(name);
         Ok(true)
     })
     .unwrap_or(false)
 }
 
 /// Write a rotated token pair into the named profile's OAuth block and
-/// persist. Takes `&Arc<Mutex<AppConfig>>` so workers can call from a thread
+/// persist. Takes `&crate::profile::ConfigHandle` so workers can call from a thread
 /// without holding the lock across HTTP. Returns true on success. No-op when
 /// the profile or OAuth block is missing — callers that care can refuse to act
 /// on `false`.
@@ -779,9 +790,17 @@ pub(crate) fn apply_rotated_tokens_locked(
             return Ok(false);
         };
         write_token_fields(oauth, tok);
+        // Stage the rotated pair durably before the structured save (see
+        // `stage_rotated_credentials`): a failed save or crash is recovered on
+        // next load rather than stranding a dead single-use refresh chain.
+        if let Some(creds) = profile.credentials.as_ref() {
+            let _ = stage_rotated_credentials(name, creds);
+        }
         if save_profile(profile).is_err() {
+            // Sidecar stays in place; load_profile adopts it on the next start.
             return Ok(false);
         }
+        clear_staged_credentials(name);
         if let Some((lrw, resets_at)) = window_stamp
             && let Ok(mut guard) = lrw.lock()
         {
