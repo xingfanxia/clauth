@@ -1,5 +1,6 @@
+use crate::lockorder::RankedMutex;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::{
     ActivityStore, CACHE_HIT_EPSILON, ConsecutiveCacheHit, ConsecutiveOk, FetchOutcome,
@@ -19,10 +20,10 @@ fn make_learner_maps() -> (
     Last429At,
 ) {
     (
-        Arc::new(Mutex::new(HashMap::new())),
-        Arc::new(Mutex::new(HashMap::new())),
-        Arc::new(Mutex::new(HashMap::new())),
-        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
     )
 }
 
@@ -65,9 +66,9 @@ fn apply_stores() -> (
 ) {
     let (learned, ok, ch, l429) = make_learner_maps();
     (
-        Arc::new(Mutex::new(HashMap::new())),
-        Arc::new(Mutex::new(HashMap::new())),
-        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
         learned,
         ok,
         ch,
@@ -1133,7 +1134,7 @@ fn cache_hit_values_outside_epsilon_count_as_change() {
 
 #[test]
 fn interval_returns_normal_when_no_learned_entry() {
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let entry = token("p", 95.0);
     assert_eq!(
         interval_for(&entry, Some(50.0), &learned),
@@ -1143,7 +1144,7 @@ fn interval_returns_normal_when_no_learned_entry() {
 
 #[test]
 fn interval_returns_learned_value_when_present() {
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     learned.lock().unwrap().insert("p".into(), 17_000);
     let entry = token("p", 95.0);
     assert_eq!(interval_for(&entry, Some(50.0), &learned), 17_000);
@@ -1151,7 +1152,7 @@ fn interval_returns_learned_value_when_present() {
 
 #[test]
 fn interval_clamps_to_floor_at_or_above_near_threshold() {
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     learned
         .lock()
         .unwrap()
@@ -1172,7 +1173,7 @@ fn interval_zero_threshold_is_not_floor_clamped() {
     // threshold == 0.0 (unset/default) must never trigger the near-threshold
     // override regardless of utilization. Without the > NEAR_THRESHOLD_MARGIN
     // guard the RHS (-5.0) is always satisfied by any non-negative utilization.
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     learned
         .lock()
         .unwrap()
@@ -1194,7 +1195,7 @@ fn interval_zero_threshold_is_not_floor_clamped() {
 
 #[test]
 fn interval_just_below_near_threshold_returns_learned() {
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     learned.lock().unwrap().insert("p".into(), 17_000);
     let entry = token("p", 95.0);
     let just_below = 95.0 - NEAR_THRESHOLD_MARGIN - 0.1;
@@ -1203,7 +1204,7 @@ fn interval_just_below_near_threshold_returns_learned() {
 
 #[test]
 fn interval_with_no_5h_data_returns_learned() {
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     learned.lock().unwrap().insert("p".into(), 17_000);
     let entry = token("p", 95.0);
     assert_eq!(interval_for(&entry, None, &learned), 17_000);
@@ -1217,7 +1218,7 @@ fn interval_for_zero_threshold_is_not_clamped_to_floor() {
     // pinned to FLOOR regardless of utilization. Without the > NEAR_THRESHOLD_MARGIN
     // guard the RHS is negative (-5.0), making the comparison true for any
     // non-None utilization and pinning the interval to 10s forever.
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     learned
         .lock()
         .unwrap()
@@ -1248,7 +1249,7 @@ fn interval_for_zero_threshold_is_not_clamped_to_floor() {
 fn interval_for_threshold_below_margin_is_not_clamped_to_floor() {
     // A threshold just below NEAR_THRESHOLD_MARGIN (e.g. 4.9 with margin 5.0)
     // must not trigger the near-threshold override for any utilization.
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     learned.lock().unwrap().insert("p".into(), 17_000);
     let threshold_below_margin = NEAR_THRESHOLD_MARGIN - 0.1;
     let entry = token("p", threshold_below_margin);
@@ -1271,7 +1272,7 @@ fn interval_for_threshold_below_margin_is_not_clamped_to_floor() {
 fn interval_for_threshold_at_margin_is_not_clamped_to_floor() {
     // Threshold exactly equal to NEAR_THRESHOLD_MARGIN (5.0) — the guard is
     // `> NEAR_THRESHOLD_MARGIN` so equality must not trigger the override.
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     learned.lock().unwrap().insert("p".into(), 17_000);
     let entry = token("p", NEAR_THRESHOLD_MARGIN);
 
@@ -1286,7 +1287,7 @@ fn interval_for_threshold_at_margin_is_not_clamped_to_floor() {
 fn interval_for_genuine_threshold_near_match_pins_to_floor() {
     // A profile with threshold 80.0 at 78% utilization (within the 5pp margin)
     // must be clamped to FLOOR.
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     learned
         .lock()
         .unwrap()
@@ -1315,15 +1316,15 @@ fn interval_for_genuine_threshold_near_match_pins_to_floor() {
 // ── partition_due ─────────────────────────────────────────────────────────────
 
 fn empty_activity() -> ActivityStore {
-    Arc::new(Mutex::new(HashMap::new()))
+    Arc::new(RankedMutex::new(HashMap::new()))
 }
 
 #[test]
 fn partition_due_never_fetched_profile_is_due() {
     let snapshot = vec![token("p", 95.0)];
-    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
-    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
 
     let (due, _, per_profile) = partition_due(
@@ -1343,9 +1344,9 @@ fn partition_due_never_fetched_profile_is_due() {
 #[test]
 fn partition_due_recent_fetch_is_not_due() {
     let snapshot = vec![token("p", 95.0)];
-    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
-    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
     let now = now_ms();
     last_fetched.lock().unwrap().insert("p".into(), now);
@@ -1363,9 +1364,9 @@ fn partition_due_recent_fetch_is_not_due() {
 #[test]
 fn partition_due_interval_elapsed_is_due() {
     let snapshot = vec![token("p", 95.0)];
-    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
-    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
     let now = now_ms();
     last_fetched
@@ -1381,9 +1382,9 @@ fn partition_due_interval_elapsed_is_due() {
 #[test]
 fn partition_due_honors_learned_interval() {
     let snapshot = vec![token("p", 95.0)];
-    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
-    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
     let now = now_ms();
     last_fetched
@@ -1406,9 +1407,9 @@ fn partition_due_honors_learned_interval() {
 #[test]
 fn partition_due_near_threshold_overrides_learned_with_floor() {
     let snapshot = vec![token("p", 95.0)];
-    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
-    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
     let now = now_ms();
     last_fetched
@@ -1433,9 +1434,9 @@ fn partition_due_near_threshold_overrides_learned_with_floor() {
 
 #[test]
 fn partition_due_empty_snapshot_returns_empty() {
-    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
-    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
 
     let (due, _, per_profile) =
@@ -1448,9 +1449,9 @@ fn partition_due_empty_snapshot_returns_empty() {
 #[test]
 fn partition_due_excludes_switching_profiles() {
     let snapshot = vec![token("p", 95.0)];
-    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
-    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
     activity
         .lock()
@@ -1474,9 +1475,9 @@ fn partition_due_excludes_switching_profiles() {
 #[test]
 fn partition_due_excludes_refreshing_profiles() {
     let snapshot = vec![token("p", 95.0)];
-    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
-    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
     activity
         .lock()
@@ -1503,9 +1504,9 @@ fn partition_due_bails_on_poisoned_store() {
     // utilization data (which would silently disable the near-threshold FLOOR
     // override — near-limit profiles would poll at NORMAL instead of FLOOR).
     let snapshot = vec![token("p", 95.0)];
-    let store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
-    let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
-    let learned: LearnedIntervals = Arc::new(Mutex::new(HashMap::new()));
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
 
     // Poison the store by panicking inside a lock scope.
@@ -2217,9 +2218,10 @@ fn steady_state_no_cache_hits_under_normal_conditions() {
 #[test]
 fn activity_cleared_on_worker_panic() {
     use super::{ActivityStore, ProfileActivity, clear_activity, mark_activity};
-    use std::sync::{Arc, Mutex};
+    use crate::lockorder::RankedMutex;
+    use std::sync::Arc;
 
-    let activity: ActivityStore = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let name = "test-profile";
 
     // Simulate the mark-before-spawn step.

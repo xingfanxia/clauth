@@ -3,8 +3,9 @@
 //! Tests stay hermetic: no filesystem I/O, no `switch_profile`. All scenarios
 //! construct an in-memory `AppConfig` and assert on `next_target`'s return value.
 
+use crate::lockorder::RankedMutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile};
@@ -133,7 +134,7 @@ fn store_with_utils(pairs: &[(&str, f64)]) -> UsageStore {
             )
         })
         .collect();
-    Arc::new(Mutex::new(map))
+    Arc::new(RankedMutex::new(map))
 }
 
 #[test]

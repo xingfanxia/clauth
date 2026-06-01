@@ -38,6 +38,10 @@ pub(crate) struct StateLock {
     // Non-None only for the outermost acquisition on this thread.
     // Holds THREAD_LOCK for the full closure lifetime; None for reentrant calls.
     _thread_guard: Option<std::sync::MutexGuard<'static, Option<File>>>,
+    // Holds the STATE rank in the global lock order — pushed once on the
+    // outermost acquisition, popped on its drop. None for reentrant calls so
+    // the rank is not double-pushed (it is already held by the outer frame).
+    _rank: Option<crate::lockorder::RankGuard>,
 }
 
 impl StateLock {
@@ -52,6 +56,7 @@ impl StateLock {
             );
             return Ok(Self {
                 _thread_guard: None,
+                _rank: None,
             });
         }
 
@@ -83,8 +88,14 @@ impl StateLock {
 
         DEPTH.set(1);
 
+        // Enter the STATE rank now that this is the outermost hold. `config`
+        // (rank CONFIG) may already be held — STATE sits inside it, so the
+        // assertion in `RankGuard::enter` confirms the documented order.
+        let rank = crate::lockorder::RankGuard::enter(crate::lockorder::rank::STATE);
+
         Ok(Self {
             _thread_guard: Some(guard),
+            _rank: Some(rank),
         })
     }
 }

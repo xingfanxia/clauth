@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -115,12 +115,12 @@ fn kick(access_token: &str) -> Result<()> {
 /// No cooldown gating — the caller is responsible for deduplication via
 /// `LastRotatedWindow`. Does not touch `last_auto_start_at`.
 ///
-/// Takes `Arc<Mutex<AppConfig>>` so the lock is held only across the brief
+/// Takes `crate::profile::ConfigHandle` so the lock is held only across the brief
 /// read/write windows around HTTP, not across the network round trip.
 /// Emits one `OpResult { kind: Refreshing }` on the supplied sender unless
 /// the profile is skipped (no refresh token / live session).
 pub(crate) fn rotate_one(
-    config: &Arc<Mutex<AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     name: &str,
     activity: &ActivityStore,
     sender: &OpResultSender,
@@ -200,7 +200,7 @@ pub(crate) fn rotate_one(
 /// left untouched — `scan_expired_windows` will re-enqueue next tick
 /// (no HTTP, benign).
 pub(crate) fn rotate_one_for_window(
-    config: &Arc<Mutex<AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     name: &str,
     activity: &ActivityStore,
     sender: &OpResultSender,
@@ -296,13 +296,13 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Strin
 /// Pushes each rotated name onto `refetch` so the next scheduler tick
 /// re-fetches usage immediately without waiting for the cadence.
 ///
-/// Takes `&Arc<Mutex<AppConfig>>` so per-profile workers can lock/unlock
+/// Takes `&crate::profile::ConfigHandle` so per-profile workers can lock/unlock
 /// independently around their HTTP calls without ever holding the config
 /// mutex across the network. Each per-profile worker emits one `OpResult`
 /// on `sender` the moment its HTTP completes, so the spinner clears in
 /// arrival order rather than waiting for the slowest sibling.
 pub(crate) fn refresh_all(
-    config: &Arc<Mutex<AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     force: bool,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
@@ -416,7 +416,7 @@ pub(crate) fn refresh_all(
 /// name onto `refetch` so the scheduler re-fetches without waiting for the
 /// cadence.
 pub(crate) fn auto_start_windows(
-    config: &Arc<Mutex<AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
@@ -568,7 +568,7 @@ pub(crate) fn auto_start_windows(
 /// succeeded. Used by both `auto_start_windows` (fan-out) and the single-name
 /// `auto_start_named` path. Never holds the config mutex across HTTP.
 fn run_auto_start(
-    config: &Arc<Mutex<AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     name: &str,
     refresh_token: &str,
 ) -> (Result<()>, bool) {
@@ -611,7 +611,7 @@ fn run_auto_start(
 /// window. Returns true iff the kick HTTP call succeeded. Pushes `name`
 /// onto `refetch` on success.
 pub(crate) fn auto_start_named(
-    config: &Arc<Mutex<AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     name: &str,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
@@ -676,7 +676,7 @@ pub(crate) fn auto_start_named(
 /// `kick` spends only the access token (not the refresh token), so no
 /// `RotationGuard` is needed here.
 pub(crate) fn start_window(
-    config: &Arc<Mutex<AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     name: &str,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
@@ -720,13 +720,13 @@ fn write_token_fields(oauth: &mut OAuthToken, tok: TokenResponse) {
 /// If persist fails, rolls back the `last_auto_start_at` cooldown so the next
 /// run can retry without waiting the full 4.5h. Returns true on success.
 ///
-/// Takes `&Arc<Mutex<AppConfig>>` and locks it only across the brief write
+/// Takes `&crate::profile::ConfigHandle` and locks it only across the brief write
 /// window, so workers can call this without holding the lock during HTTP.
 ///
 /// Lock order: AppConfig in-process mutex first, then state flock. Matches
 /// the existing UI-thread order so workers and the UI thread never invert.
 fn apply_rotated_tokens_or_rollback_cooldown_locked(
-    config: &Arc<Mutex<AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     name: &str,
     tok: TokenResponse,
 ) -> bool {
@@ -773,7 +773,7 @@ fn apply_rotated_tokens_or_rollback_cooldown_locked(
 /// and the stamp can cause a silent chain burn on the next scheduler tick.
 /// Lock order: AppConfig → state flock → LRW leaf mutex.
 pub(crate) fn apply_rotated_tokens_locked(
-    config: &Arc<Mutex<AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     name: &str,
     tok: TokenResponse,
     window_stamp: Option<(&LastRotatedWindow, i64)>,

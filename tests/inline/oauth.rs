@@ -6,6 +6,7 @@
 //! that `force` affects.
 
 use super::*;
+use crate::lockorder::RankedMutex;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, Profile, profile_dir};
 use crate::runtime::open_pid_file;
 use crate::usage::{LastRotatedWindow, is_idle};
@@ -158,8 +159,8 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         .profiles
         .push("test-rotate-one-no-rt".to_string());
 
-    let config = Arc::new(Mutex::new(config));
-    let activity: ActivityStore = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let config = Arc::new(RankedMutex::new(config));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, _rx) = mpsc::channel();
 
     let result = rotate_one(&config, "test-rotate-one-no-rt", &activity, &tx);
@@ -255,8 +256,8 @@ fn switch_rotate_targets_only_active_and_target() {
             make_profile(bystander_name),
         ],
     };
-    let config = Arc::new(Mutex::new(config));
-    let activity: ActivityStore = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let config = Arc::new(RankedMutex::new(config));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, _rx) = mpsc::channel();
 
     // Simulate the new switch logic: rotate active then target (dedup skipped
@@ -308,12 +309,12 @@ fn rotate_one_for_window_no_stamp_when_no_refresh_token() {
         usage: None,
         fetch_status: None,
     };
-    let config = Arc::new(Mutex::new(AppConfig {
+    let config = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
     }));
-    let activity: ActivityStore = Arc::new(Mutex::new(HashMap::new()));
-    let lrw: LastRotatedWindow = Arc::new(Mutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let lrw: LastRotatedWindow = Arc::new(RankedMutex::new(HashMap::new()));
     let (tx, _rx) = mpsc::channel();
     let resets_at: i64 = 9999;
 
@@ -364,12 +365,12 @@ fn rotate_one_for_window_no_stamp_when_live_session() {
         usage: None,
         fetch_status: None,
     };
-    let config = Arc::new(Mutex::new(AppConfig {
+    let config = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
     }));
-    let activity: ActivityStore = Arc::new(Mutex::new(HashMap::new()));
-    let lrw: LastRotatedWindow = Arc::new(Mutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let lrw: LastRotatedWindow = Arc::new(RankedMutex::new(HashMap::new()));
     let (tx, _rx) = mpsc::channel();
     let resets_at: i64 = 8888;
 
@@ -414,11 +415,11 @@ fn switch_dedup_active_equals_target() {
         usage: None,
         fetch_status: None,
     };
-    let config = Arc::new(Mutex::new(AppConfig {
+    let config = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
     }));
-    let activity: ActivityStore = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, _rx) = mpsc::channel();
 
     // active == target: the dedup condition `active != target` is false, so only
@@ -442,16 +443,33 @@ fn switch_dedup_active_equals_target() {
 /// lock is per-profile, so two distinct profiles rotate concurrently. Without
 /// this, fanning `refresh_all` across worker threads would serialize every
 /// profile behind the slowest sibling.
+///
+/// `b` is acquired on a SEPARATE thread because a single thread never holds two
+/// rotation guards at once — the global lock order (`lockorder`) forbids
+/// re-entering the ROTATION rank, and the codebase only ever rotates one
+/// profile per thread (each `refresh_all` worker is its own thread). The real
+/// guarantee is exactly this cross-thread one: a worker rotating `a` must not
+/// stall a worker rotating `b`.
 #[test]
 fn rotation_guard_is_independent_across_profiles() {
     use crate::runtime::RotationGuard;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     let a = "test-rotation-guard-indep-a";
     let b = "test-rotation-guard-indep-b";
     let held_a = RotationGuard::acquire(a).expect("acquire a");
-    // b is a different profile → its lock file is distinct → no blocking.
-    let held_b = RotationGuard::acquire(b).expect("acquire b while a is held");
-    drop(held_b);
+
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        // Distinct profile → distinct lock file → must acquire without blocking.
+        let held_b = RotationGuard::acquire(b).expect("acquire b while a is held");
+        tx.send(()).expect("signal acquired");
+        drop(held_b);
+    });
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("acquiring b must not block on a (per-profile locks are independent)");
+    worker.join().expect("join b worker");
     drop(held_a);
 }
 
@@ -491,13 +509,13 @@ fn auto_start_named_skips_when_live_session() {
         usage: None,
         fetch_status: None,
     };
-    let config = Arc::new(Mutex::new(AppConfig {
+    let config = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
     }));
-    let activity: ActivityStore = Arc::new(Mutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
     let refetch: crate::usage::RefetchQueue =
-        Arc::new(Mutex::new(std::collections::HashSet::new()));
+        Arc::new(RankedMutex::new(std::collections::HashSet::new()));
     let (tx, _rx) = mpsc::channel();
 
     let kicked = auto_start_named(&config, name, &refetch, &activity, &tx);

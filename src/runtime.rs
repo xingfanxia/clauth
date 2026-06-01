@@ -113,7 +113,10 @@ fn rotation_lock_path(name: &str) -> Result<PathBuf> {
 /// Distinct from `~/.clauth/.lock` (global state) and `sessions/<pid>`
 /// (per-session liveness). Blocking `flock`; the holder window is short.
 pub(crate) struct RotationGuard {
+    // Drops before `_rank` (declaration order): the flock releases, then the
+    // ROTATION rank pops — never the reverse.
     _file: File,
+    _rank: crate::lockorder::RankGuard,
 }
 
 impl RotationGuard {
@@ -130,7 +133,10 @@ impl RotationGuard {
             open_pid_file(&path).with_context(|| format!("failed to open {}", path.display()))?;
         file.lock()
             .with_context(|| format!("failed to lock {}", path.display()))?;
-        Ok(Self { _file: file })
+        // ROTATION is the outermost rank — held across the OAuth HTTP round
+        // trip, before `config` and the state flock are ever taken.
+        let _rank = crate::lockorder::RankGuard::enter(crate::lockorder::rank::ROTATION);
+        Ok(Self { _file: file, _rank })
     }
 }
 

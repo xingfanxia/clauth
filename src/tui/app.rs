@@ -10,7 +10,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -28,9 +27,10 @@ use crate::claude::{
 };
 use crate::fallback::{DEFAULT_THRESHOLD, auto_switch_if_needed, threshold_for};
 use crate::lock::with_state_lock;
+use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, Profile, app_state_mtime, load_config, save_app_state, save_profile,
+    AppConfig, ConfigHandle, Profile, app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::usage::{
     ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, Last429At, LastFetchedAt,
@@ -344,7 +344,7 @@ pub(crate) struct App {
     /// and by the background usage refresher when rotating tokens or kicking
     /// auto-start. Hold the guard only across the work that needs it; releasing
     /// before HTTP-heavy operations keeps the refresher from stalling the UI.
-    pub(crate) config: Arc<Mutex<AppConfig>>,
+    pub(crate) config: ConfigHandle,
 
     pub(crate) usage_store: UsageStore,
     pub(crate) usage_status: StatusStore,
@@ -416,24 +416,26 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn new(config: AppConfig) -> Self {
-        let usage_store: UsageStore = Arc::new(Mutex::new(HashMap::new()));
-        let usage_status: StatusStore = Arc::new(Mutex::new(HashMap::new()));
-        let usage_tokens: TokenList = Arc::new(Mutex::new(collect_tokens(&config.profiles)));
-        let next_refresh_per_profile: NextRefreshPerProfile = Arc::new(Mutex::new(HashMap::new()));
-        let activity: ActivityStore = Arc::new(Mutex::new(HashMap::new()));
+        let usage_store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let usage_status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let usage_tokens: TokenList = Arc::new(RankedMutex::new(collect_tokens(&config.profiles)));
+        let next_refresh_per_profile: NextRefreshPerProfile =
+            Arc::new(RankedMutex::new(HashMap::new()));
+        let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
         let (op_sender, op_results) = std::sync::mpsc::channel::<OpResult>();
         let (startup_sender, startup_results) = std::sync::mpsc::channel::<StartupSignal>();
-        let last_fetched: LastFetchedAt = Arc::new(Mutex::new(HashMap::new()));
-        let pending_auto_start: PendingAutoStart = Arc::new(Mutex::new(HashSet::new()));
-        let pending_window_rotation: PendingWindowRotation = Arc::new(Mutex::new(HashMap::new()));
-        let last_rotated_window: LastRotatedWindow = Arc::new(Mutex::new(HashMap::new()));
-        let pending_switch: PendingSwitch = Arc::new(Mutex::new(HashSet::new()));
-        let refetch_queue: RefetchQueue = Arc::new(Mutex::new(HashSet::new()));
+        let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+        let pending_auto_start: PendingAutoStart = Arc::new(RankedMutex::new(HashSet::new()));
+        let pending_window_rotation: PendingWindowRotation =
+            Arc::new(RankedMutex::new(HashMap::new()));
+        let last_rotated_window: LastRotatedWindow = Arc::new(RankedMutex::new(HashMap::new()));
+        let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+        let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
         // Restore AIMD state from disk so cadence survives restarts.
         let learned_intervals: LearnedIntervals =
-            Arc::new(Mutex::new(config.state.learned_intervals_ms.clone()));
+            Arc::new(RankedMutex::new(config.state.learned_intervals_ms.clone()));
         let ok_count: ConsecutiveOk =
-            Arc::new(Mutex::new(config.state.consecutive_ok_count.clone()));
+            Arc::new(RankedMutex::new(config.state.consecutive_ok_count.clone()));
         // Restore cache-hit counters only when learned < TTL — above TTL the
         // counter is irrelevant (polling is slow enough that cache hits can't
         // occur in steady state), and below TTL it captures mid-elimination
@@ -452,11 +454,11 @@ impl App {
             })
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        let cache_hit_count: ConsecutiveCacheHit = Arc::new(Mutex::new(restored_ch));
-        let last_429: Last429At = Arc::new(Mutex::new(config.state.last_429_at.clone()));
+        let cache_hit_count: ConsecutiveCacheHit = Arc::new(RankedMutex::new(restored_ch));
+        let last_429: Last429At = Arc::new(RankedMutex::new(config.state.last_429_at.clone()));
 
         Self {
-            config: Arc::new(Mutex::new(config)),
+            config: Arc::new(RankedMutex::new(config)),
             usage_store,
             usage_status,
             usage_tokens,
@@ -495,7 +497,7 @@ impl App {
     /// Lock the shared AppConfig. Holds the lock for the lifetime of the
     /// returned guard. Order: AppConfig mutex outer, `with_state_lock` inner;
     /// the inner is taken by the actions that mutate disk state.
-    pub(crate) fn config(&self) -> MutexGuard<'_, AppConfig> {
+    pub(crate) fn config(&self) -> RankedGuard<'_, AppConfig> {
         self.config.lock().expect("config mutex poisoned")
     }
 
@@ -2469,9 +2471,10 @@ pub(crate) fn shutdown(app: &mut App) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::lockorder::RankedMutex;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
 
     use crate::usage::{ActivityStore, ProfileActivity, any_busy};
 
@@ -2480,7 +2483,7 @@ mod tests {
         for (name, activity) in entries {
             map.insert(name.to_string(), *activity);
         }
-        Arc::new(Mutex::new(map))
+        Arc::new(RankedMutex::new(map))
     }
 
     fn bootstrap_busy(flag: &Arc<AtomicBool>, activity: &ActivityStore) -> bool {

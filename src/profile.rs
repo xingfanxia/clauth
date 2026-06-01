@@ -132,6 +132,11 @@ pub(crate) struct AppConfig {
     pub(crate) profiles: Vec<Profile>,
 }
 
+/// Shared handle to the process-wide [`AppConfig`], ranked in the global lock
+/// order (`config` is inner of `usage_store`, outer of the state flock).
+pub(crate) type ConfigHandle =
+    std::sync::Arc<crate::lockorder::RankedMutex<AppConfig, { crate::lockorder::rank::CONFIG }>>;
+
 impl AppConfig {
     pub(crate) fn is_active(&self, name: &str) -> bool {
         self.state.active_profile.as_deref() == Some(name)

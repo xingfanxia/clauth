@@ -5,6 +5,7 @@ mod completions;
 mod fallback;
 mod format;
 mod lock;
+mod lockorder;
 mod oauth;
 mod platform;
 mod profile;
@@ -17,12 +18,13 @@ mod ureq_error;
 mod usage;
 mod which;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 
 use crate::actions::{switch_profile, switch_profile_reconciled};
 use crate::claude::{LinkState, classify_credentials_link, is_first_login};
+use crate::lockorder::RankedMutex;
 use crate::profile::{AppConfig, load_config};
 use crate::spinner::Spinner;
 use crate::usage::{ActivityStore, OpResult, RefetchQueue};
@@ -82,11 +84,12 @@ fn main() -> Result<()> {
             let outgoing = config.state.active_profile.clone();
             // No scheduler running — noop_refetch is a throwaway; auto_start_named
             // below still uses it to push kicked names no one reads.
-            let noop_refetch: RefetchQueue = Arc::new(Mutex::new(std::collections::HashSet::new()));
+            let noop_refetch: RefetchQueue =
+                Arc::new(RankedMutex::new(std::collections::HashSet::new()));
             // CLI path has no spinner — pass a throwaway ActivityStore so the
             // shared signature works without printing to stderr.
             let noop_activity: ActivityStore =
-                Arc::new(Mutex::new(std::collections::HashMap::new()));
+                Arc::new(RankedMutex::new(std::collections::HashMap::new()));
             // CLI has no OpResult drain — drop the receiver immediately so
             // workers' `sender.send` returns disconnected-error which they
             // ignore (`let _ = …`). The Arc<Mutex<AppConfig>> wraps the
@@ -110,7 +113,7 @@ fn main() -> Result<()> {
                 None => false,
             };
 
-            let config = Arc::new(Mutex::new(config));
+            let config = Arc::new(RankedMutex::new(config));
             {
                 // Scoped so the spinner stops before the interactive [Y/n]
                 // prompt below — a live spinner during stdin read corrupts it.

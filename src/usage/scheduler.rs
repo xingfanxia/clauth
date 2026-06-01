@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::lockorder::{RankedMutex, rank};
 
 use super::fetch::{
     FetchError, UsageInfo, fetch_raw, iso_to_epoch_secs, load_disk_cache, now_epoch_secs, now_ms,
@@ -71,50 +73,53 @@ const _: () = assert!(
     "two bump_downs from NORMAL must stay at or above the server cache TTL, or the learner oscillates around TTL with a non-zero steady-state cache-hit rate",
 );
 
-pub(crate) type UsageStore = Arc<Mutex<HashMap<String, UsageInfo>>>;
-pub(crate) type StatusStore = Arc<Mutex<HashMap<String, FetchStatus>>>;
-pub(crate) type TokenList = Arc<Mutex<Vec<TokenEntry>>>;
+pub(crate) type UsageStore = Arc<RankedMutex<HashMap<String, UsageInfo>, { rank::USAGE_STORE }>>;
+pub(crate) type StatusStore =
+    Arc<RankedMutex<HashMap<String, FetchStatus>, { rank::USAGE_STATUS }>>;
+pub(crate) type TokenList = Arc<RankedMutex<Vec<TokenEntry>, { rank::TOKENS }>>;
 
 /// Per-profile epoch-ms of the last fetch attempt (cache-rule gating).
-pub(crate) type LastFetchedAt = Arc<Mutex<HashMap<String, u64>>>;
+pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, u64>, { rank::LAST_FETCHED }>>;
 
 /// Names pushed here after a successful token rotation are fetched on the very
 /// next scheduler tick, bypassing the per-profile cadence.
-pub(crate) type RefetchQueue = Arc<Mutex<HashSet<String>>>;
+pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, { rank::REFETCH_QUEUE }>>;
 
 /// Per-profile learned refresh interval in ms (AIMD cadence).
-pub(crate) type LearnedIntervals = Arc<Mutex<HashMap<String, u64>>>;
+pub(crate) type LearnedIntervals = Arc<RankedMutex<HashMap<String, u64>, { rank::LEARNED }>>;
 
 /// How many consecutive non-429 fetches each profile has seen since the last backoff.
-pub(crate) type ConsecutiveOk = Arc<Mutex<HashMap<String, u32>>>;
+pub(crate) type ConsecutiveOk = Arc<RankedMutex<HashMap<String, u32>, { rank::OK_COUNT }>>;
 
 /// How many consecutive Fresh fetches with unchanged utilization each profile
 /// has seen. Used to detect server-side cache hits and back off when polling
 /// faster than the server invalidates. In-memory only; not persisted.
-pub(crate) type ConsecutiveCacheHit = Arc<Mutex<HashMap<String, u32>>>;
+pub(crate) type ConsecutiveCacheHit = Arc<RankedMutex<HashMap<String, u32>, { rank::CACHE_HIT }>>;
 
 /// Epoch-ms of the most recent 429 per profile. Used for quiet-period resets.
-pub(crate) type Last429At = Arc<Mutex<HashMap<String, u64>>>;
+pub(crate) type Last429At = Arc<RankedMutex<HashMap<String, u64>, { rank::LAST_429 }>>;
 
 /// Profiles that need an auto-start kick after the fetch revealed no live 5h
 /// window. Main thread drains this set on every tick.
-pub(crate) type PendingAutoStart = Arc<Mutex<HashSet<String>>>;
+pub(crate) type PendingAutoStart = Arc<RankedMutex<HashSet<String>, { rank::PENDING_AUTO_START }>>;
 
 /// Profiles whose 5h window has just expired and need a token rotation.
 /// Value: the `resets_at` epoch-secs pinned at detection time so the drain
 /// stamps `LastRotatedWindow` with the exact window it acted on, not whatever
 /// the store holds when the drain runs (which may already be a newer window).
-pub(crate) type PendingWindowRotation = Arc<Mutex<HashMap<String, i64>>>;
+pub(crate) type PendingWindowRotation =
+    Arc<RankedMutex<HashMap<String, i64>, { rank::PENDING_WINDOW_ROTATION }>>;
 
 /// Per-profile `resets_at` epoch-secs we already rotated on, so each expiry
 /// fires exactly once.
-pub(crate) type LastRotatedWindow = Arc<Mutex<HashMap<String, i64>>>;
+pub(crate) type LastRotatedWindow =
+    Arc<RankedMutex<HashMap<String, i64>, { rank::LAST_ROTATED_WINDOW }>>;
 
 /// Scheduler-computed auto-switch decisions. Posted by the background scheduler
 /// when it observes the active profile has crossed its fallback threshold; the
 /// UI thread drains in `on_tick` and dispatches a switch worker. Set rather
 /// than Vec so duplicate enqueues collapse and a slow drain can't pile up.
-pub(crate) type PendingSwitch = Arc<Mutex<HashSet<String>>>;
+pub(crate) type PendingSwitch = Arc<RankedMutex<HashSet<String>, { rank::PENDING_SWITCH }>>;
 
 /// Snapshot of one profile's OAuth identity used by the refresher.
 #[derive(Clone)]
@@ -128,7 +133,8 @@ pub(crate) struct TokenEntry {
 /// Per-profile epoch-ms of the next scheduled fetch. Written by the scheduler
 /// after each `partition_due` run so the overview rows can show a countdown
 /// without re-running the partition math on the render thread.
-pub(crate) type NextRefreshPerProfile = Arc<Mutex<HashMap<String, u64>>>;
+pub(crate) type NextRefreshPerProfile =
+    Arc<RankedMutex<HashMap<String, u64>, { rank::NEXT_REFRESH }>>;
 
 /// In-flight blocking operation per profile. The overview row shows a spinner
 /// in the timer slot instead of a countdown whenever a profile's slot is
@@ -137,7 +143,8 @@ pub(crate) type NextRefreshPerProfile = Arc<Mutex<HashMap<String, u64>>>;
 ///
 /// Mutex is leaf-level: never hold across HTTP. Snapshot or per-name
 /// read/write only so the UI render thread isn't blocked by a worker.
-pub(crate) type ActivityStore = Arc<Mutex<HashMap<String, ProfileActivity>>>;
+pub(crate) type ActivityStore =
+    Arc<RankedMutex<HashMap<String, ProfileActivity>, { rank::ACTIVITY }>>;
 
 /// What's currently happening to one profile. `Idle` means no in-flight work;
 /// every other variant is a blocking op the overview row should visualize
@@ -316,7 +323,7 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
 /// for the retry. The caller is responsible for the initial `Fetching` mark
 /// and the final `Idle` clear.
 fn fetch_with_rotation(
-    config: &Arc<Mutex<crate::profile::AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
@@ -689,7 +696,7 @@ struct FetchOutcome {
 
 /// Run a single fetch for one entry.
 fn run_fetch(
-    config: &Arc<Mutex<crate::profile::AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     entry: TokenEntry,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
@@ -810,7 +817,7 @@ fn apply_outcome(
 /// will pick them up from the persisted `credentials.json` shortly.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fetch_all_into(
-    config: &Arc<Mutex<crate::profile::AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     tokens: &[TokenEntry],
     store: &UsageStore,
     status: &StatusStore,
@@ -885,7 +892,7 @@ pub(crate) fn fetch_all_into(
 /// (`with_state_lock` was previously taken on every `on_tick`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_refresher(
-    config: Arc<Mutex<crate::profile::AppConfig>>,
+    config: crate::profile::ConfigHandle,
     tokens: TokenList,
     store: UsageStore,
     status: StatusStore,
@@ -1088,7 +1095,7 @@ pub(crate) fn spawn_refresher(
 /// while taking `usage_store`. Skips when the active profile is already
 /// mid-switch.
 fn scan_auto_switch(
-    config: &Arc<Mutex<crate::profile::AppConfig>>,
+    config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     activity: &ActivityStore,
     pending_switch: &PendingSwitch,
