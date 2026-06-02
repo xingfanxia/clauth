@@ -8,11 +8,13 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use super::super::app::{App, ConfigFocus, ConfigRow, InputState, config_rows};
 use super::super::theme;
-use super::panes::{SELECTOR_WIDTH, section_box};
+use super::panes::{
+    SELECTOR_WIDTH, draw_selector_list, highlight_row, name_color, picker_row, section_box,
+};
 
 /// Padded key column width for the detail rows.
 const KEY_W: usize = 11;
@@ -31,41 +33,33 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// Account picker with a trailing `+ new` row. The cursor lands on `+ new`
 /// when `config_cursor` equals the account count.
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
-    let block = section_box("accounts", focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     let cfg = app.config();
     let count = cfg.profiles.len();
-    let mut items: Vec<ListItem<'_>> = cfg
-        .profiles
-        .iter()
-        .map(|p| {
-            let name_style = if cfg.is_active(&p.name) {
-                Style::default().fg(theme::ACCENT_2)
-            } else {
-                Style::default().fg(theme::TEXT)
-            };
-            ListItem::new(Line::from(Span::styled(p.name.clone(), name_style)))
-        })
-        .collect();
-    items.push(ListItem::new(Line::from(Span::styled(
-        "+ new",
-        theme::accent(),
-    ))));
-
-    let highlight = if focused {
-        theme::selected_row().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme::TEXT_DIM)
-    };
-    let list = List::new(items)
-        .style(theme::base())
-        .highlight_style(highlight)
-        .highlight_symbol("❯ ");
-    let mut state = ListState::default();
-    state.select(Some(app.config_cursor.min(count)));
-    frame.render_stateful_widget(list, inner, &mut state);
+    let sel = app.config_cursor.min(count);
+    draw_selector_list(frame, area, "accounts", focused, sel, |w| {
+        let mut rows: Vec<_> = cfg
+            .profiles
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                picker_row(
+                    i == sel,
+                    focused,
+                    p.name.clone(),
+                    name_color(cfg.is_active(&p.name)),
+                    w,
+                )
+            })
+            .collect();
+        rows.push(picker_row(
+            count == sel,
+            focused,
+            "+ new".to_string(),
+            theme::accent(),
+            w,
+        ));
+        rows
+    });
 }
 
 /// Owned snapshot of one selection, taken under a single short-lived `config`
@@ -144,14 +138,17 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(vec![
-            Span::styled(format!("type{}", " ".repeat(KEY_W - 4)), theme::faint()),
+            Span::styled(
+                format!("type{}", " ".repeat(KEY_W - 4)),
+                Style::default().fg(theme::TEXT),
+            ),
             Span::styled(type_value, type_style),
         ]),
         Line::from(""),
     ];
     for (i, row) in rows.iter().enumerate() {
         let selected = actions_focused && i == cursor;
-        lines.push(detail_row(
+        let line = detail_row(
             *row,
             selected,
             editing == Some(*row),
@@ -160,7 +157,12 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
             &name_in,
             &base_in,
             &key_in,
-        ));
+        );
+        lines.push(if selected {
+            highlight_row(line, inner.width as usize)
+        } else {
+            line
+        });
         // A one-line hint under the focused row, but only when its name isn't
         // self-explanatory and it isn't mid-edit (the edit caret already cues it).
         if selected
@@ -235,7 +237,10 @@ fn kv_field(arrow: Span<'static>, key: &str, input: &InputState, editing: bool) 
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     let mut spans = vec![
         arrow,
-        Span::styled(format!("{key}{}", " ".repeat(pad)), theme::faint()),
+        Span::styled(
+            format!("{key}{}", " ".repeat(pad)),
+            Style::default().fg(theme::TEXT),
+        ),
     ];
     spans.extend(value_spans(input, editing));
     Line::from(spans)
@@ -246,7 +251,10 @@ fn kv_static(arrow: Span<'static>, key: &str, value: String, value_style: Style)
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     Line::from(vec![
         arrow,
-        Span::styled(format!("{key}{}", " ".repeat(pad)), theme::faint()),
+        Span::styled(
+            format!("{key}{}", " ".repeat(pad)),
+            Style::default().fg(theme::TEXT),
+        ),
         Span::styled(value, value_style),
     ])
 }

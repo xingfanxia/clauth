@@ -10,14 +10,16 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ChainItemKind, FALLBACK_ROWS, FallbackFocus, FallbackRow, InputState, chain_candidates,
     chain_items,
 };
 use super::super::theme;
-use super::panes::{SELECTOR_WIDTH, section_box};
+use super::panes::{
+    SELECTOR_WIDTH, draw_selector_list, highlight_row, name_color, section_box, select_line,
+};
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 use crate::profile::AppConfig;
 
@@ -40,65 +42,53 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// Left pane: the ordered chain members plus a trailing `+ add` row. Color marks
 /// the active account; the cursor rides on `❯` only while this pane has focus.
 fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
-    let block = section_box("chain", focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     let items = chain_items(app);
-    if items.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("no accounts yet", theme::muted())))
-                .style(theme::base()),
-            inner,
-        );
-        return;
-    }
-
     let cfg = app.config();
-    let list_items: Vec<ListItem<'_>> = items
-        .iter()
-        .map(|item| match item {
-            ChainItemKind::Member(i) => {
-                let name = cfg
-                    .state
-                    .fallback_chain
-                    .get(*i)
-                    .cloned()
-                    .unwrap_or_default();
-                let style = if cfg.is_active(&name) {
-                    Style::default().fg(theme::ACCENT_2)
-                } else {
-                    Style::default().fg(theme::TEXT)
+    let sel = app.chain_cursor.min(items.len().saturating_sub(1));
+    draw_selector_list(frame, area, "chain", focused, sel, |w| {
+        items
+            .iter()
+            .enumerate()
+            .map(|(row, item)| {
+                let selected = row == sel;
+                let line = match item {
+                    ChainItemKind::Member(i) => {
+                        let name = cfg
+                            .state
+                            .fallback_chain
+                            .get(*i)
+                            .cloned()
+                            .unwrap_or_default();
+                        let style = name_color(cfg.is_active(&name));
+                        // Cursor + ordinal share the leading span so the name
+                        // lands at spans[1] — the item `highlight_row` bolds.
+                        let rail = if selected {
+                            Span::styled(format!("❯ {:>2}  ", i + 1), theme::accent())
+                        } else {
+                            Span::styled(format!("  {:>2}  ", i + 1), theme::faint())
+                        };
+                        Line::from(vec![rail, Span::styled(name, style)])
+                    }
+                    ChainItemKind::Add => {
+                        let arrow = if selected {
+                            Span::styled("❯ ", theme::accent())
+                        } else {
+                            Span::raw("  ")
+                        };
+                        Line::from(vec![arrow, Span::styled("    + add", theme::accent())])
+                    }
                 };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:>2}  ", i + 1), theme::faint()),
-                    Span::styled(name, style),
-                ]))
-            }
-            ChainItemKind::Add => {
-                ListItem::new(Line::from(Span::styled("    + add", theme::accent())))
-            }
-        })
-        .collect();
-
-    let highlight = if focused {
-        theme::selected_row().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme::TEXT_DIM)
-    };
-    let list = List::new(list_items)
-        .style(theme::base())
-        .highlight_style(highlight)
-        .highlight_symbol("❯ ");
-    let mut state = ListState::default();
-    state.select(Some(app.chain_cursor.min(items.len().saturating_sub(1))));
-    frame.render_stateful_widget(list, inner, &mut state);
+                select_line(line, selected, focused, w)
+            })
+            .collect()
+    });
 }
 
 /// Right pane: the member rotation card + inline rows, the add-candidate picker
 /// on the `+ add` row, or an empty-chain explainer.
 fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let detail_focused = app.fallback_focus == FallbackFocus::Detail;
+    let inner_w = section_box("", detail_focused).inner(area).width as usize;
     let items = chain_items(app);
     let selected = items
         .get(app.chain_cursor.min(items.len().saturating_sub(1)))
@@ -122,10 +112,14 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 app.fallback_detail_cursor,
                 app.fallback_armed_remove,
                 app.fallback_threshold_draft.as_ref(),
+                inner_w,
             );
             (name, lines)
         }
-        Some(ChainItemKind::Add) => ("add to chain".to_string(), add_detail(app, detail_focused)),
+        Some(ChainItemKind::Add) => (
+            "add to chain".to_string(),
+            add_detail(app, detail_focused, inner_w),
+        ),
         None => ("chain".to_string(), empty_detail()),
     };
 
@@ -149,6 +143,7 @@ fn member_detail(
     row_cursor: usize,
     armed_remove: bool,
     editing: Option<&InputState>,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let Some(profile) = cfg.find(name) else {
         return vec![Line::from(Span::styled(
@@ -231,13 +226,12 @@ fn member_detail(
         } else {
             None
         };
-        lines.push(detail_row(
-            *row,
-            selected,
-            threshold,
-            armed_remove,
-            row_editing,
-        ));
+        let line = detail_row(*row, selected, threshold, armed_remove, row_editing);
+        lines.push(if selected {
+            highlight_row(line, width)
+        } else {
+            line
+        });
         // Meaning tooltip under the focused threshold row (keybind cues live in
         // the footer, not here).
         if selected && *row == FallbackRow::Threshold && row_editing.is_none() {
@@ -272,7 +266,10 @@ fn detail_row(
             let pad = KEY_W.saturating_sub("threshold".len()).max(1);
             let mut spans = vec![
                 arrow,
-                Span::styled(format!("threshold{}", " ".repeat(pad)), theme::faint()),
+                Span::styled(
+                    format!("threshold{}", " ".repeat(pad)),
+                    Style::default().fg(theme::TEXT),
+                ),
             ];
             match editing {
                 Some(input) => {
@@ -323,7 +320,7 @@ fn value_caret(input: &InputState) -> Vec<Span<'static>> {
 
 /// The `+ add` detail: an explainer plus the candidate picker. The caret only
 /// renders while the right pane holds focus.
-fn add_detail(app: &App, focused: bool) -> Vec<Line<'static>> {
+fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {
     let candidates = chain_candidates(app);
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled(
@@ -360,15 +357,21 @@ fn add_detail(app: &App, focused: bool) -> Vec<Line<'static>> {
         .fallback_detail_cursor
         .min(candidates.len().saturating_sub(1));
     for (i, name) in candidates.iter().enumerate() {
-        let arrow = if i == cursor {
+        let selected = i == cursor;
+        let arrow = if selected {
             Span::styled("❯ ", theme::accent())
         } else {
             Span::raw("  ")
         };
-        lines.push(Line::from(vec![
+        let line = Line::from(vec![
             arrow,
             Span::styled(name.clone(), Style::default().fg(theme::TEXT)),
-        ]));
+        ]);
+        lines.push(if selected {
+            highlight_row(line, width)
+        } else {
+            line
+        });
     }
     lines
 }

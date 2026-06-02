@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 
@@ -12,7 +12,7 @@ use super::format::{
     account_type_label, account_type_style, fixed, fixed_split, name_style, window_summary_parts,
     window_summary_span,
 };
-use super::panes::section_box;
+use super::panes::{section_box, select_line};
 use crate::fallback::threshold_for;
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{ProfileActivity, now_ms};
@@ -61,24 +61,23 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(header).style(theme::base()), chunks[0]);
 
     let items = app.main_items();
+    let sel = app.main_cursor.min(items.len().saturating_sub(1));
+    let width = chunks[1].width;
     let rows: Vec<ListItem<'_>> = items
         .iter()
         .enumerate()
         .map(|(row, item)| match item {
-            MainItemKind::Profile(idx) => ListItem::new(render_overview_row(
-                app,
-                *idx,
-                &widths,
-                row == app.main_cursor,
-            )),
+            MainItemKind::Profile(idx) => {
+                let selected = row == sel;
+                let line = render_overview_row(app, *idx, &widths, selected);
+                ListItem::new(select_line(line, selected, true, width))
+            }
         })
         .collect();
 
-    let list = List::new(rows)
-        .style(theme::base())
-        .highlight_style(theme::selected_row().add_modifier(Modifier::BOLD));
+    let list = List::new(rows).style(theme::base());
     let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(app.main_cursor.min(items.len().saturating_sub(1))));
+    state.select(Some(sel));
     frame.render_stateful_widget(list, chunks[1], &mut state);
 }
 
