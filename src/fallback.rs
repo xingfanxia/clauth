@@ -1,9 +1,21 @@
 use anyhow::Result;
 
-use crate::actions::switch_profile;
+use crate::actions::{switch_off, switch_profile};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile};
 use crate::usage::UsageStore;
+
+/// What the auto-switch evaluator decided to do when the active profile crossed
+/// its threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SwitchAction {
+    /// Switch the active profile to this chain member.
+    To(String),
+    /// Turn off all accounts: clear the live credentials and unset the active
+    /// profile. Emitted only in wrap-off mode when the whole chain is exhausted
+    /// and no 100%-threshold sink exists (every threshold is below 100%).
+    Off,
+}
 
 /// Default 5-hour utilization threshold (percent) applied when a chain member
 /// has no per-profile override.
@@ -41,6 +53,8 @@ pub(crate) struct ChainMember {
 pub(crate) struct ChainSnapshot {
     pub(crate) active: String,
     pub(crate) chain: Vec<ChainMember>,
+    /// Snapshot of `AppState::wrap_off` — drives the switch-off-all decision.
+    pub(crate) wrap_off: bool,
 }
 
 /// Snapshot the active profile + fallback chain + per-member thresholds
@@ -64,7 +78,11 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
                 .unwrap_or(DEFAULT_THRESHOLD),
         })
         .collect();
-    Some(ChainSnapshot { active, chain })
+    Some(ChainSnapshot {
+        active,
+        chain,
+        wrap_off: config.state.wrap_off,
+    })
 }
 
 /// True when the profile's 5h utilization (read from the shared `UsageStore`)
@@ -95,7 +113,10 @@ fn is_exhausted_from_store(name: &str, threshold: f64, store: &UsageStore) -> bo
 ///   2. As a last resort, a member with threshold == 100% — accepted even
 ///      while it's at 100%. Claude Code will show its own "out of 5h limit"
 ///      message on arrival.
-pub(crate) fn next_target(config: &AppConfig) -> Option<String> {
+///   3. Wrap-off only: when no headroom and no sink exist (every threshold is
+///      below 100%) and the active profile is itself exhausted, return
+///      [`SwitchAction::Off`] to halt all usage.
+pub(crate) fn next_target(config: &AppConfig) -> Option<SwitchAction> {
     let active = config.state.active_profile.as_deref()?;
     let chain = &config.state.fallback_chain;
     let active_idx = chain.iter().position(|n| n == active)?;
@@ -117,19 +138,30 @@ pub(crate) fn next_target(config: &AppConfig) -> Option<String> {
         None
     };
 
+    if let Some(name) = walk(&|p| !is_exhausted(p)) {
+        return Some(SwitchAction::To(name));
+    }
+
     // Only fall back to a 100%-threshold sink when the active profile is NOT
     // itself such a sink. Two maxed sinks switching to each other indefinitely
     // gains nothing — one migration is fine, but the next tick must stay put.
     let active_is_sink = config
         .find(active)
         .is_some_and(|p| threshold_for(p) >= 100.0);
+    if active_is_sink {
+        return None;
+    }
+    if let Some(name) = walk(&|p| threshold_for(p) >= 100.0) {
+        return Some(SwitchAction::To(name));
+    }
 
-    walk(&|p| !is_exhausted(p)).or_else(|| {
-        if active_is_sink {
-            return None;
-        }
-        walk(&|p| threshold_for(p) >= 100.0)
-    })
+    // No headroom, no sink anywhere (every threshold < 100%). In wrap-off mode,
+    // turn off all accounts — but only when the active profile is itself
+    // exhausted, since this picker is also exercised on a healthy active.
+    if config.state.wrap_off && config.find(active).is_some_and(is_exhausted) {
+        return Some(SwitchAction::Off);
+    }
+    None
 }
 
 /// Scheduler-side decision: same logic as [`auto_switch_if_needed`] but
@@ -144,7 +176,7 @@ pub(crate) fn next_target(config: &AppConfig) -> Option<String> {
 pub(crate) fn next_auto_switch_target(
     snapshot: &ChainSnapshot,
     store: &UsageStore,
-) -> Option<String> {
+) -> Option<SwitchAction> {
     let active_idx = snapshot
         .chain
         .iter()
@@ -169,19 +201,32 @@ pub(crate) fn next_auto_switch_target(
         None
     };
 
+    if let Some(name) = walk(&|m| !is_exhausted_from_store(&m.name, m.threshold, store)) {
+        return Some(SwitchAction::To(name));
+    }
+
     let active_is_sink = active.threshold >= 100.0;
-    walk(&|m| !is_exhausted_from_store(&m.name, m.threshold, store)).or_else(|| {
-        if active_is_sink {
-            return None;
-        }
-        walk(&|m| m.threshold >= 100.0)
-    })
+    if active_is_sink {
+        return None;
+    }
+    if let Some(name) = walk(&|m| m.threshold >= 100.0) {
+        return Some(SwitchAction::To(name));
+    }
+
+    // No headroom, no sink anywhere (every threshold < 100%), and the active
+    // profile is already exhausted (gated above). In wrap-off mode, halt all
+    // usage instead of staying on the spent profile.
+    if snapshot.wrap_off {
+        return Some(SwitchAction::Off);
+    }
+    None
 }
 
 /// If the active profile is a chain member and its 5h utilization has crossed
-/// its threshold, switch to the next viable chain member. Returns the name
-/// switched to, or None when no action was taken.
-pub(crate) fn auto_switch_if_needed(config: &mut AppConfig) -> Result<Option<String>> {
+/// its threshold, switch to the next viable chain member — or, in wrap-off
+/// mode when the whole chain is spent and no sink exists, turn off all
+/// accounts. Returns the action taken, or None when nothing was warranted.
+pub(crate) fn auto_switch_if_needed(config: &mut AppConfig) -> Result<Option<SwitchAction>> {
     with_state_lock(|| {
         let active_name = config.state.active_profile.clone();
         let Some(active_name) = active_name else {
@@ -202,12 +247,15 @@ pub(crate) fn auto_switch_if_needed(config: &mut AppConfig) -> Result<Option<Str
             return Ok(None);
         }
 
-        let Some(target) = next_target(config) else {
+        let Some(action) = next_target(config) else {
             return Ok(None);
         };
 
-        switch_profile(config, &target)?;
-        Ok(Some(target))
+        match &action {
+            SwitchAction::To(target) => switch_profile(config, target)?,
+            SwitchAction::Off => switch_off(config)?,
+        }
+        Ok(Some(action))
     })
 }
 

@@ -69,7 +69,10 @@ fn non_sink_active_migrates_to_sink_once() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config), Some("b".to_string()));
+    assert_eq!(
+        next_target(&config),
+        Some(SwitchAction::To("b".to_string()))
+    );
 }
 
 // Scenario 2 part B: with B active (threshold 100, at 100%) — next_target returns None.
@@ -95,7 +98,10 @@ fn sink_active_switches_to_member_with_headroom() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config), Some("b".to_string()));
+    assert_eq!(
+        next_target(&config),
+        Some(SwitchAction::To("b".to_string()))
+    );
 }
 
 // Scenario 4: active threshold 95 at 100%, member B threshold 95 at 100% — no sink anywhere.
@@ -192,7 +198,7 @@ fn auto_switch_picks_member_with_headroom() {
     let store = store_with_utils(&[("a", 100.0), ("b", 20.0)]);
     assert_eq!(
         next_auto_switch_target(&snap, &store),
-        Some("b".to_string()),
+        Some(SwitchAction::To("b".to_string())),
     );
 }
 
@@ -225,7 +231,7 @@ fn auto_switch_non_sink_active_migrates_to_sink_once() {
     // Active threshold 95% (not a sink), B is the sink — one migration.
     assert_eq!(
         next_auto_switch_target(&snap, &store),
-        Some("b".to_string()),
+        Some(SwitchAction::To("b".to_string())),
     );
 }
 
@@ -241,5 +247,105 @@ fn auto_switch_missing_util_is_not_exhausted() {
     let snap = snapshot_chain(&config).expect("snapshot");
     // Active has no entry in the store → not exhausted → no switch.
     let store = store_with_utils(&[("b", 10.0)]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+// ── wrap-off mode ───────────────────────────────────────────────────────────
+//
+// When every chain member's threshold is below 100% (no sink) and the whole
+// chain is exhausted, wrap-off turns off all accounts instead of staying put.
+
+// next_target: wrap_off on, no sink anywhere, all exhausted → Off.
+#[test]
+fn wrap_off_switches_off_when_chain_spent() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(95.0), Some(100.0)),
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    assert_eq!(next_target(&config), Some(SwitchAction::Off));
+}
+
+// next_target: wrap_off on but a 100% sink exists → migrate to the sink, not Off.
+#[test]
+fn wrap_off_prefers_sink_over_off() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(100.0), Some(100.0)),
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    assert_eq!(
+        next_target(&config),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+// next_target: wrap_off on but the active still has headroom → no Off.
+#[test]
+fn wrap_off_skips_off_when_active_has_headroom() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(50.0)),
+            profile_with_util("b", Some(95.0), Some(100.0)),
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    // a (active) at 50% < 95% threshold → not exhausted → stay, don't switch off.
+    assert_eq!(next_target(&config), None);
+}
+
+// next_target: same spent chain but wrap_off off → legacy stay-put (None).
+#[test]
+fn wrap_off_disabled_stays_put() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(95.0), Some(100.0)),
+        ],
+        "a",
+    );
+    assert_eq!(next_target(&config), None);
+}
+
+// next_auto_switch_target: scheduler-side wrap-off Off when the chain is spent.
+#[test]
+fn auto_switch_wrap_off_switches_off_when_chain_spent() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert!(snap.wrap_off);
+    // Both at 100% (over their 95% thresholds), no sink → Off.
+    let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::Off),
+    );
+}
+
+// next_auto_switch_target: wrap_off off on a spent chain → legacy None.
+#[test]
+fn auto_switch_wrap_off_disabled_stays_put() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
     assert_eq!(next_auto_switch_target(&snap, &store), None);
 }

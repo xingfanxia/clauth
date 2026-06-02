@@ -403,11 +403,20 @@ fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'s
         lines.push(chain_row(cfg, name, i, last, name_w));
     }
     // Caption only if it won't push a member off-screen: explains the tick + loop.
+    // Wrap-off mode replaces the wrap caption — the chain stops instead of cycling.
     if lines.len() < cap {
-        lines.push(Line::from(vec![
-            Span::styled("     ↺", theme::orange()),
-            Span::styled(" wraps to the top", theme::faint()),
-        ]));
+        let caption = if cfg.state.wrap_off {
+            vec![
+                Span::styled("     ✖", theme::danger()),
+                Span::styled(" switches off when all spent", theme::faint()),
+            ]
+        } else {
+            vec![
+                Span::styled("     ↺", theme::orange()),
+                Span::styled(" wraps to the top", theme::faint()),
+            ]
+        };
+        lines.push(Line::from(caption));
     }
     lines
 }

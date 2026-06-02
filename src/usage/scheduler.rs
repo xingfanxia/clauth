@@ -121,6 +121,12 @@ pub(crate) type LastRotatedWindow =
 /// than Vec so duplicate enqueues collapse and a slow drain can't pile up.
 pub(crate) type PendingSwitch = Arc<RankedMutex<HashSet<String>, { rank::PENDING_SWITCH }>>;
 
+/// Set true by the scheduler when wrap-off mode decides the whole chain is
+/// exhausted with no sink (every threshold below 100%). The UI thread drains it
+/// in `on_tick` and turns off all accounts. A bool rather than a set because
+/// switch-off is a single global act with no target — repeated sets collapse.
+pub(crate) type PendingSwitchOff = Arc<RankedMutex<bool, { rank::PENDING_SWITCH_OFF }>>;
+
 /// Snapshot of one profile's OAuth identity used by the refresher.
 #[derive(Clone)]
 pub(crate) struct TokenEntry {
@@ -902,6 +908,7 @@ pub(crate) fn spawn_refresher(
     pending_window_rotation: PendingWindowRotation,
     last_rotated_window: LastRotatedWindow,
     pending_switch: PendingSwitch,
+    pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
     learned: LearnedIntervals,
     ok_count: ConsecutiveOk,
@@ -1082,7 +1089,13 @@ pub(crate) fn spawn_refresher(
             // which dispatches a switch worker. A Switching profile here
             // means the previous decision is still in flight — skip until
             // the worker completes.
-            scan_auto_switch(&config, &store, &activity, &pending_switch);
+            scan_auto_switch(
+                &config,
+                &store,
+                &activity,
+                &pending_switch,
+                &pending_switch_off,
+            );
         }
     });
 }
@@ -1099,6 +1112,7 @@ fn scan_auto_switch(
     store: &UsageStore,
     activity: &ActivityStore,
     pending_switch: &PendingSwitch,
+    pending_switch_off: &PendingSwitchOff,
 ) {
     // Skip when an auto-switch decision is still pending the UI drain or
     // when any profile is currently Switching — either way the previous
@@ -1109,6 +1123,16 @@ fn scan_auto_switch(
     {
         let Ok(p) = pending_switch.lock() else { return };
         if !p.is_empty() {
+            return;
+        }
+    }
+    {
+        // A pending switch-off hasn't been applied yet — re-deciding would just
+        // re-set the same bool. Skip until the UI drains it.
+        let Ok(off) = pending_switch_off.lock() else {
+            return;
+        };
+        if *off {
             return;
         }
     }
@@ -1132,11 +1156,18 @@ fn scan_auto_switch(
     };
 
     // `config` guard is dropped. Safe to lock `usage_store` now.
-    let Some(name) = crate::fallback::next_auto_switch_target(&snapshot, store) else {
-        return;
-    };
-    if let Ok(mut p) = pending_switch.lock() {
-        p.insert(name);
+    match crate::fallback::next_auto_switch_target(&snapshot, store) {
+        Some(crate::fallback::SwitchAction::To(name)) => {
+            if let Ok(mut p) = pending_switch.lock() {
+                p.insert(name);
+            }
+        }
+        Some(crate::fallback::SwitchAction::Off) => {
+            if let Ok(mut off) = pending_switch_off.lock() {
+                *off = true;
+            }
+        }
+        None => {}
     }
 }
 

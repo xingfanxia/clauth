@@ -74,6 +74,28 @@ pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &str) -> R
     })
 }
 
+/// Turn off all accounts: preserve the active profile's live credentials, then
+/// clear the live `~/.claude` credentials and unset the active profile so
+/// Claude Code can't spend any account. Used by the wrap-off auto-switch mode
+/// when the whole chain is exhausted and no 100%-threshold sink exists. No-op
+/// when no profile is active.
+///
+/// `snapshot_active_credentials` no-ops on a diverged live file (an unsaved
+/// `/login`), so the caller is expected to gate on divergence first — clearing
+/// a diverged file would otherwise drop a fresh login. The TUI auto-switch path
+/// raises its standard Divergence prompt before reaching here.
+pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
+    with_state_lock(|| {
+        if config.state.active_profile.is_none() {
+            return Ok(());
+        }
+        snapshot_active_credentials(config)?;
+        clear_claude_credentials()?;
+        config.state.active_profile = None;
+        save_app_state(&config.state)
+    })
+}
+
 fn finish_switch(config: &mut AppConfig, name: &str) -> Result<()> {
     // Capture prev env keys before active_profile is reassigned so
     // apply_profile_to_claude_settings can clear the outgoing profile's env.

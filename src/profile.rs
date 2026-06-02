@@ -106,6 +106,14 @@ pub(crate) struct AppState {
     /// Ordered list of profile names participating in the auto-switch chain.
     #[serde(default)]
     pub(crate) fallback_chain: Vec<String>,
+    /// Wrap-off mode. When true and every chain member's fallback threshold is
+    /// below 100% with the whole chain exhausted, auto-switch turns OFF all
+    /// accounts (clears the live credentials, unsets the active profile)
+    /// instead of staying on the spent profile — a hard stop on further token
+    /// spend once the chain is dry. Defaults to false (the legacy "stay put"
+    /// behaviour).
+    #[serde(default)]
+    pub(crate) wrap_off: bool,
     /// Per-profile learned refresh interval in ms. Updated by the AIMD cadence
     /// learner in response to 429s and consecutive-ok counts. Advisory — a
     /// missing entry means the profile uses `NORMAL_INTERVAL_MS`.

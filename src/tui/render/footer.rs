@@ -62,6 +62,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("?", "help"),
             ],
             FallbackHint::DetailThresholdEdit => &[("0-9", "type"), ("⏎", "save"), ("⎋", "cancel")],
+            FallbackHint::DetailWrapOff => {
+                &[("↑↓", "row"), ("⏎", "toggle"), ("⎋", "back"), ("?", "help")]
+            }
             FallbackHint::DetailRemove => {
                 &[("↑↓", "row"), ("⏎", "remove"), ("⎋", "back"), ("?", "help")]
             }

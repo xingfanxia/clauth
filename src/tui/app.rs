@@ -24,14 +24,14 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::actions::{
     CaptureSnapshot, capture_into_profile, capture_snapshot, create_blank_profile, delete_profile,
     edit_profile_endpoint, find_matching_oauth_profile, rename_profile, reorder_profile,
-    switch_profile, validate_profile_name,
+    switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, credentials_diverged,
     detach_credentials_link, force_link_profile_credentials, force_snapshot_active_credentials,
     is_first_login, link_profile_credentials, read_claude_credentials, snapshot_active_credentials,
 };
-use crate::fallback::{DEFAULT_THRESHOLD, auto_switch_if_needed, threshold_for};
+use crate::fallback::{DEFAULT_THRESHOLD, SwitchAction, auto_switch_if_needed, threshold_for};
 use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
@@ -41,9 +41,9 @@ use crate::profile::{
 use crate::usage::{
     ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, Last429At, LastFetchedAt,
     LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult, OpResultReceiver,
-    OpResultSender, PendingAutoStart, PendingSwitch, PendingWindowRotation, ProfileActivity,
-    RefetchQueue, SERVER_CACHE_TTL_ESTIMATE_MS, StartupReceiver, StartupSender, StartupSignal,
-    StatusStore, TokenEntry, TokenList, UsageStore, any_busy, clear_activity,
+    OpResultSender, PendingAutoStart, PendingSwitch, PendingSwitchOff, PendingWindowRotation,
+    ProfileActivity, RefetchQueue, SERVER_CACHE_TTL_ESTIMATE_MS, StartupReceiver, StartupSender,
+    StartupSignal, StatusStore, TokenEntry, TokenList, UsageStore, any_busy, clear_activity,
     default_fallback_threshold, fetch_all_into, is_idle, mark_activity, spawn_refresher,
 };
 
@@ -143,6 +143,9 @@ impl InputState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FallbackRow {
     Threshold,
+    /// Chain-global wrap-off toggle. Rendered as a button on every member card
+    /// (the setting is per-chain, not per-member); ⏎ flips it.
+    WrapOff,
     Remove,
 }
 
@@ -393,6 +396,10 @@ pub(crate) struct App {
     /// dispatched to the same switch worker pipeline as user-initiated
     /// switches.
     pub(crate) pending_switch: PendingSwitch,
+    /// Scheduler-posted wrap-off decision. When the whole chain is spent with
+    /// no sink, the scheduler flips this true; `on_tick` drains it and turns
+    /// off all accounts.
+    pub(crate) pending_switch_off: PendingSwitchOff,
     pub(crate) refetch_queue: RefetchQueue,
     pub(crate) learned_intervals: LearnedIntervals,
     pub(crate) ok_count: ConsecutiveOk,
@@ -474,6 +481,7 @@ impl App {
             Arc::new(RankedMutex::new(HashMap::new()));
         let last_rotated_window: LastRotatedWindow = Arc::new(RankedMutex::new(HashMap::new()));
         let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+        let pending_switch_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
         // Restore AIMD state from disk so cadence survives restarts.
         let learned_intervals: LearnedIntervals =
@@ -517,6 +525,7 @@ impl App {
             pending_window_rotation,
             last_rotated_window,
             pending_switch,
+            pending_switch_off,
             refetch_queue,
             learned_intervals,
             ok_count,
@@ -680,6 +689,7 @@ impl App {
             Arc::clone(&self.pending_window_rotation),
             Arc::clone(&self.last_rotated_window),
             Arc::clone(&self.pending_switch),
+            Arc::clone(&self.pending_switch_off),
             Arc::clone(&self.refetch_queue),
             Arc::clone(&self.learned_intervals),
             Arc::clone(&self.ok_count),
@@ -692,8 +702,18 @@ impl App {
             let mut cfg = self.config();
             auto_switch_if_needed(&mut cfg).ok().flatten()
         };
-        if let Some(target) = switched {
-            self.toast(ToastKind::Warning, format!("auto-switched to '{target}'"));
+        match switched {
+            Some(SwitchAction::To(target)) => {
+                self.toast(ToastKind::Warning, format!("auto-switched to '{target}'"));
+            }
+            Some(SwitchAction::Off) => {
+                self.refresh_tokens();
+                self.toast(
+                    ToastKind::Warning,
+                    "all accounts spent — switched off to halt usage".to_string(),
+                );
+            }
+            None => {}
         }
     }
 
@@ -1168,6 +1188,27 @@ fn perform_switch(app: &mut App, name: &str) {
     });
 }
 
+/// True when `active`'s live `.credentials.json` has diverged from its stored
+/// chain (an unsaved `/login`) and it isn't a first-login adoption — i.e. it
+/// must be reconciled before any path that clears or relinks its live creds.
+fn active_diverged_unsaved(active: &str) -> bool {
+    matches!(
+        classify_credentials_link(active).ok(),
+        Some(LinkState::Diverged)
+    ) && !is_first_login(active).unwrap_or(false)
+}
+
+/// Toast and raise the Divergence prompt for `active`. `verb` names the action
+/// the user must resolve before (e.g. "switching", "switching off").
+fn prompt_divergence(app: &mut App, active: String, verb: &str) {
+    app.toast(
+        ToastKind::Warning,
+        format!("'{active}' has unsaved Claude Code credentials — resolve before {verb}"),
+    );
+    app.modals
+        .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+}
+
 /// FS half of the TUI switch: runs on the UI thread when an
 /// `OpResult { kind: Switching, .. }` drains. No HTTP — safe to keep
 /// inline. Clears the Switching marker, runs `switch_profile`, and on
@@ -1185,19 +1226,10 @@ fn finalize_switch(app: &mut App, name: &str) {
     let outgoing = app.config().state.active_profile.clone();
     if let Some(active) = outgoing
         && active != name
-        && matches!(
-            classify_credentials_link(&active).ok(),
-            Some(LinkState::Diverged)
-        )
-        && !is_first_login(&active).unwrap_or(false)
+        && active_diverged_unsaved(&active)
     {
         clear_activity(&app.activity, name);
-        app.toast(
-            ToastKind::Warning,
-            format!("'{active}' has unsaved Claude Code credentials — resolve before switching"),
-        );
-        app.modals
-            .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+        prompt_divergence(app, active, "switching");
         return;
     }
     let result = {
@@ -1212,6 +1244,35 @@ fn finalize_switch(app: &mut App, name: &str) {
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("switch failed: {e}")),
+    }
+}
+
+/// Turn off all accounts on the UI thread — the wrap-off decision drained from
+/// `pending_switch_off`. Mirrors `finalize_switch`'s divergence guard: an
+/// unsaved `/login` on the outgoing active is resolved first, since clearing the
+/// live credentials would otherwise drop the fresh chain. No HTTP, runs inline.
+fn perform_switch_off(app: &mut App) {
+    let Some(active) = app.config().state.active_profile.clone() else {
+        return;
+    };
+    if active_diverged_unsaved(&active) {
+        prompt_divergence(app, active, "switching off");
+        return;
+    }
+    let result = {
+        let mut cfg = app.config();
+        switch_off(&mut cfg)
+    };
+    match result {
+        Ok(()) => {
+            app.refresh_tokens();
+            app.last_state_mtime = app_state_mtime();
+            app.toast(
+                ToastKind::Warning,
+                "all accounts spent — switched off to halt usage".to_string(),
+            );
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("switch-off failed: {e}")),
     }
 }
 
@@ -1270,8 +1331,13 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
     items
 }
 
-/// The two detail rows shown for a chain member, in order.
-pub(crate) const FALLBACK_ROWS: [FallbackRow; 2] = [FallbackRow::Threshold, FallbackRow::Remove];
+/// The detail rows shown for a chain member, in order: threshold stepper, the
+/// chain-global wrap-off toggle, then the danger remove row.
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
+    FallbackRow::Threshold,
+    FallbackRow::WrapOff,
+    FallbackRow::Remove,
+];
 
 /// What the Fallback footer should advertise right now, derived from focus +
 /// selection + edit state so it lists only keys that currently do something.
@@ -1282,6 +1348,7 @@ pub(crate) enum FallbackHint {
     ChainAdd,
     DetailThreshold,
     DetailThresholdEdit,
+    DetailWrapOff,
     DetailRemove,
     DetailRemoveArmed,
     DetailAdd,
@@ -1307,6 +1374,7 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
             let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
             match FALLBACK_ROWS[cursor] {
                 FallbackRow::Threshold => FallbackHint::DetailThreshold,
+                FallbackRow::WrapOff => FallbackHint::DetailWrapOff,
                 FallbackRow::Remove if app.fallback_armed_remove => FallbackHint::DetailRemoveArmed,
                 FallbackRow::Remove => FallbackHint::DetailRemove,
             }
@@ -1348,6 +1416,26 @@ fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => enter_fallback_detail(app),
         _ => {}
     }
+}
+
+/// Flip the "when the whole chain is spent" behaviour and persist it. On =
+/// switch off all accounts (stop usage); off = stay on the last account (keep
+/// using it). Only matters once every member is over its threshold with no
+/// 100% sink to land on.
+fn toggle_wrap_off(app: &mut App) {
+    let enabled = {
+        let mut cfg = app.config();
+        cfg.state.wrap_off = !cfg.state.wrap_off;
+        let _ = save_app_state(&cfg.state);
+        cfg.state.wrap_off
+    };
+    app.last_state_mtime = app_state_mtime();
+    let msg = if enabled {
+        "chain spent → switch off all accounts (stops usage)"
+    } else {
+        "chain spent → stay on last account (keeps using it)"
+    };
+    app.toast(ToastKind::Success, msg.to_string());
 }
 
 /// Right-pane keymap for a member: ↑↓ walks rows, `+` / `-` steps the threshold,
@@ -1497,6 +1585,7 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
                 app.fallback_threshold_draft = Some(InputState::new(&format!("{current:.0}")));
             }
         }
+        FallbackRow::WrapOff => toggle_wrap_off(app),
         FallbackRow::Remove => {
             if app.fallback_armed_remove {
                 remove_chain_member(app);
@@ -2629,6 +2718,23 @@ pub(crate) fn on_tick(app: &mut App) {
         }
         app.toast(ToastKind::Warning, format!("auto-switching to '{name}'"));
         perform_switch(app, &name);
+    }
+
+    // Drain the scheduler's wrap-off decision: the whole chain is spent with no
+    // sink, so turn off all accounts. The bool collapses repeated sets. Only
+    // drain when no modal is open — `perform_switch_off` may raise a Divergence
+    // prompt, and consuming the flag while one is already up would let the
+    // scheduler re-set it and stack duplicate modals. Left set, it retries once
+    // the modal closes.
+    if app.modals.is_empty() {
+        let switch_off_pending = app
+            .pending_switch_off
+            .lock()
+            .map(|mut g| std::mem::replace(&mut *g, false))
+            .unwrap_or(false);
+        if switch_off_pending {
+            perform_switch_off(app);
+        }
     }
 
     drain_startup_signals(app);

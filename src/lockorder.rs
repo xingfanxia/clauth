@@ -56,6 +56,7 @@ pub(crate) mod rank {
     pub(crate) const PENDING_WINDOW_ROTATION: u16 = 1400;
     pub(crate) const PENDING_SWITCH: u16 = 1500;
     pub(crate) const PENDING_AUTO_START: u16 = 1600;
+    pub(crate) const PENDING_SWITCH_OFF: u16 = 1700;
 }
 
 #[cfg(debug_assertions)]

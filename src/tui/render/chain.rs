@@ -217,8 +217,10 @@ fn member_detail(
     }
     lines.push(Line::from(""));
 
-    // Inline rows: threshold stepper / editor, then remove. The caret +
-    // interactivity only render while the right pane holds focus.
+    // Inline rows: threshold stepper / editor, the chain-global wrap-off toggle,
+    // then remove. The caret + interactivity only render while the right pane
+    // holds focus.
+    let wrap_off = cfg.state.wrap_off;
     for (i, row) in FALLBACK_ROWS.iter().enumerate() {
         let selected = focused && i == cursor;
         let row_editing = if *row == FallbackRow::Threshold {
@@ -226,34 +228,46 @@ fn member_detail(
         } else {
             None
         };
-        let line = detail_row(*row, selected, threshold, armed_remove, row_editing);
+        let line = detail_row(
+            *row,
+            selected,
+            threshold,
+            armed_remove,
+            wrap_off,
+            row_editing,
+        );
         lines.push(if selected {
             highlight_row(line, width)
         } else {
             line
         });
-        // Meaning tooltip under the focused threshold row (keybind cues live in
-        // the footer, not here).
-        if selected && *row == FallbackRow::Threshold && row_editing.is_none() {
-            lines.push(Line::from(vec![
-                Span::styled("  └ ", theme::faint()),
-                Span::styled(
-                    "rotate to next account when 5h usage reaches this",
-                    theme::faint(),
-                ),
-            ]));
+        // Meaning tooltip under the focused row (keybind cues live in the footer).
+        if selected && row_editing.is_none() {
+            let tip = match row {
+                FallbackRow::Threshold => Some("rotate to next account when 5h usage reaches this"),
+                FallbackRow::WrapOff => Some("what to do once every member is over its threshold"),
+                FallbackRow::Remove => None,
+            };
+            if let Some(tip) = tip {
+                lines.push(Line::from(vec![
+                    Span::styled("  └ ", theme::faint()),
+                    Span::styled(tip, theme::faint()),
+                ]));
+            }
         }
     }
     lines
 }
 
-/// One member detail row: the threshold stepper / editor or the danger remove
-/// row. `editing` is `Some` only for the threshold row while it's typed into.
+/// One member detail row: the threshold stepper / editor, the chain-global
+/// wrap-off toggle, or the danger remove row. `editing` is `Some` only for the
+/// threshold row while it's typed into.
 fn detail_row(
     row: FallbackRow,
     selected: bool,
     threshold: f64,
     armed_remove: bool,
+    wrap_off: bool,
     editing: Option<&InputState>,
 ) -> Line<'static> {
     let arrow = if selected {
@@ -262,6 +276,24 @@ fn detail_row(
         Span::raw("  ")
     };
     match row {
+        FallbackRow::WrapOff => {
+            let pad = KEY_W.saturating_sub("when spent".len()).max(1);
+            // Spell out the action, not a mode name: the chosen branch reads as
+            // a sentence so "off" is never shown as a bare, confusing value.
+            let (value, style) = if wrap_off {
+                ("switch off all accounts", theme::orange())
+            } else {
+                ("stay on last account", theme::accent())
+            };
+            Line::from(vec![
+                arrow,
+                Span::styled(
+                    format!("when spent{}", " ".repeat(pad)),
+                    Style::default().fg(theme::TEXT),
+                ),
+                Span::styled(value.to_string(), style),
+            ])
+        }
         FallbackRow::Threshold => {
             let pad = KEY_W.saturating_sub("threshold".len()).max(1);
             let mut spans = vec![
