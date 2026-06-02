@@ -126,13 +126,15 @@ clauth start personal -- --model haiku
 # spawns claude with personal's credentials in an isolated CLAUDE_CONFIG_DIR
 ```
 
-Preview the TUI with fake data (no network, no config changes):
+Preview the TUI with fake data for screenshots (dev-only, needs a checkout; no
+network, no config changes). It's a `#[cfg(test)]` showcase, never built into
+the binary:
 
 ```bash
-clauth showcase
+cargo test showcase -- --ignored --nocapture
 ```
 
-The active profile is marked with `◆`. Each row's usage bars refresh on an adaptive per-profile schedule (10–300s, baseline 35s; the row's timer counts down to the next tick) and are cached locally so they stay visible even if the Anthropic API is rate-limited or offline. The 7-day bar is appended only when the terminal is wide enough. `m` opens a per-profile menu (edit / rename / toggle auto-start / delete), `d` opens the detail screen, `f` opens the fallback chain editor, `t` rotates every profile's tokens at once, `?` opens help.
+The active profile is shown in orange. Each row's usage bars refresh on an adaptive per-profile schedule (10–300s, baseline 35s; the row's timer counts down to the next tick) and are cached locally so they stay visible even if the Anthropic API is rate-limited or offline. The 7-day bar is appended only when the terminal is wide enough. Tabs switch between overview, usage, config, and the fallback chain editor; `n` adds an account, `t` rotates every profile's tokens at once, `?` opens help.
 
 ## Profile types
 

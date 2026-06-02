@@ -10,7 +10,6 @@ mod oauth;
 mod platform;
 mod profile;
 mod runtime;
-mod showcase;
 mod spinner;
 mod start;
 mod tui;
@@ -73,9 +72,6 @@ fn main() -> Result<()> {
             let config = load_config()?;
             let canonical = resolve_or_bail(&config, name)?;
             return start::run(&config, &canonical, rest);
-        }
-        [cmd] if cmd == "showcase" => {
-            return showcase::run();
         }
         [name] => {
             platform::init();
@@ -211,7 +207,6 @@ fn print_help() {
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \
            clauth completions install [shell]\n                                  \
          install completions into the user's shell rc\n  \
-           clauth showcase                 launch TUI with demo data (no network/writes)\n  \
            clauth --version                print version\n  \
            clauth --help                   show this help",
         ver = env!("CARGO_PKG_VERSION"),

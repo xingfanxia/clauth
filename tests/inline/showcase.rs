@@ -1,17 +1,71 @@
-//! Showcase mode — populates the TUI with believable fake data so the user
-//! can take README screenshots without touching any real config or network.
+//! Showcase — a fake-data TUI for taking README screenshots. Compiled ONLY
+//! under `#[cfg(test)]` (included via `#[path]` into `crate::tui`), so none of
+//! this ships in the `clauth` binary and it lives outside `src/`.
 //!
-//! `run()` builds an [`AppConfig`] from hard-coded demo values and hands it
-//! to [`crate::tui::run_showcase`], which is a stripped-down event loop that
-//! skips every startup/worker path.
+//! Launch it in a real terminal (it takes over the screen; press q / ⎋ to quit):
+//!
+//! ```text
+//! cargo test showcase -- --ignored --nocapture
+//! ```
+//!
+//! It builds a believable [`AppConfig`] from hard-coded demo values and runs a
+//! stripped-down event loop that skips `reconcile_startup` / `on_tick` /
+//! `shutdown` — no network calls, no filesystem writes, no real config touched.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
+use super::{TICK, Term, app, render, restore_terminal, setup_terminal};
 use crate::profile::{AppConfig, AppState, Profile};
 use crate::usage::{ExtraUsage, FetchStatus, PlanInfo, UsageInfo, UsageWindow};
+
+// ── Launch ──────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "interactive TUI; run with `cargo test showcase -- --ignored --nocapture` in a real terminal"]
+fn showcase() {
+    run(demo_config()).expect("showcase loop");
+}
+
+/// Same terminal setup/teardown as [`super::run`], but a stripped-down loop:
+/// draw + handle keys, no startup/worker paths.
+fn run(config: AppConfig) -> Result<()> {
+    let mut terminal = setup_terminal()?;
+    let outcome = showcase_loop(&mut terminal, config);
+    let restore = restore_terminal(&mut terminal);
+    outcome.and(restore)
+}
+
+fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
+    let mut application = app::App::new(config);
+    let mut last_tick = Instant::now();
+
+    while !application.quit {
+        terminal.draw(|frame| render::draw(frame, &application))?;
+
+        let timeout = TICK.saturating_sub(last_tick.elapsed());
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    app::handle_key(&mut application, key);
+                }
+                Event::Resize(_, _) => {}
+                _ => {}
+            }
+        }
+
+        if last_tick.elapsed() >= TICK {
+            // Advance tick_count so blink/spinner animations still work.
+            application.tick_count = application.tick_count.wrapping_add(1);
+            last_tick = Instant::now();
+        }
+    }
+
+    Ok(())
+}
 
 // ── Time helper ───────────────────────────────────────────────────────────────
 
@@ -25,8 +79,7 @@ fn future_iso(offset: Duration) -> String {
         + offset.as_secs();
     // Manual RFC3339 formatting — no chrono dep needed; matches the
     // `YYYY-MM-DDTHH:MM:SS+00:00` shape that `iso_to_epoch_secs` parses.
-    let s = secs;
-    let (y, mo, d, h, mi, sec) = epoch_to_parts(s);
+    let (y, mo, d, h, mi, sec) = epoch_to_parts(secs);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{sec:02}+00:00")
 }
 
@@ -136,7 +189,7 @@ fn failed_profile(name: &str) -> Profile {
 
 // ── Demo config ───────────────────────────────────────────────────────────────
 
-pub(crate) fn demo_config() -> AppConfig {
+fn demo_config() -> AppConfig {
     let max20 = oauth_profile(
         "personal",
         "claude_max",
@@ -222,51 +275,39 @@ pub(crate) fn demo_config() -> AppConfig {
     }
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
-
-pub(crate) fn run() -> Result<()> {
-    crate::tui::run_showcase(demo_config())
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[test]
+fn demo_config_has_expected_profiles() {
+    let cfg = demo_config();
+    assert_eq!(cfg.profiles.len(), 5);
+    assert_eq!(cfg.state.active_profile.as_deref(), Some("personal"));
+    assert_eq!(cfg.state.fallback_chain.len(), 3);
 
-    #[test]
-    fn demo_config_has_expected_profiles() {
-        let cfg = demo_config();
-        assert_eq!(cfg.profiles.len(), 5);
-        assert_eq!(cfg.state.active_profile.as_deref(), Some("personal"));
-        assert_eq!(cfg.state.fallback_chain.len(), 3);
+    let personal = cfg.profiles.iter().find(|p| p.name == "personal");
+    assert!(personal.is_some_and(|p| p.auto_start && p.base_url.is_none()));
 
-        let personal = cfg.profiles.iter().find(|p| p.name == "personal");
-        assert!(personal.is_some_and(|p| p.auto_start && p.base_url.is_none()));
+    let work = cfg.profiles.iter().find(|p| p.name == "work");
+    assert!(work.is_some_and(|p| {
+        p.fetch_status == Some(FetchStatus::Cached)
+            && p.usage
+                .as_ref()
+                .and_then(|u| u.extra_usage.as_ref())
+                .is_some_and(|e| e.is_enabled)
+    }));
 
-        let work = cfg.profiles.iter().find(|p| p.name == "work");
-        assert!(work.is_some_and(|p| {
-            p.fetch_status == Some(FetchStatus::Cached)
-                && p.usage
-                    .as_ref()
-                    .and_then(|u| u.extra_usage.as_ref())
-                    .is_some_and(|e| e.is_enabled)
-        }));
+    let api = cfg.profiles.iter().find(|p| p.name == "bedrock-dev");
+    assert!(api.is_some_and(|p| !p.is_oauth()));
 
-        let api = cfg.profiles.iter().find(|p| p.name == "bedrock-dev");
-        assert!(api.is_some_and(|p| !p.is_oauth()));
+    let failed = cfg.profiles.iter().find(|p| p.name == "research");
+    assert!(
+        failed.is_some_and(|p| p.fetch_status == Some(FetchStatus::Failed) && p.usage.is_none())
+    );
+}
 
-        let failed = cfg.profiles.iter().find(|p| p.name == "research");
-        assert!(
-            failed
-                .is_some_and(|p| p.fetch_status == Some(FetchStatus::Failed) && p.usage.is_none())
-        );
-    }
-
-    #[test]
-    fn future_iso_parses() {
-        use crate::usage::iso_to_epoch_secs;
-        let s = future_iso(Duration::from_secs(3600));
-        assert!(iso_to_epoch_secs(&s).is_some());
-    }
+#[test]
+fn future_iso_parses() {
+    use crate::usage::iso_to_epoch_secs;
+    let s = future_iso(Duration::from_secs(3600));
+    assert!(iso_to_epoch_secs(&s).is_some());
 }
