@@ -8,20 +8,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use super::super::app::{
-    App, ChainAction, ChainAddState, ChainItemMenuState, ChainThresholdForm, ConfirmAction,
-    ConfirmState, DivergenceChoice, DivergenceForm, InputState, Modal, Tab,
+    App, ConfirmAction, ConfirmState, DivergenceChoice, DivergenceForm, InputState, Modal, Tab,
 };
 use super::super::theme;
-use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
     match modal {
         Modal::Confirm(state) => draw_confirm(frame, area, state),
         Modal::Divergence(form) => draw_divergence(frame, area, form),
         Modal::CaptureName(form) => draw_capture_name(frame, area, form.input.value.as_str()),
-        Modal::ChainItemMenu(state) => draw_chain_item_menu(frame, area, app, state),
-        Modal::ChainAdd(state) => draw_chain_add(frame, area, state),
-        Modal::ChainThreshold(form) => draw_chain_threshold(frame, area, form),
         Modal::Help => draw_help(frame, area, app),
     }
 }
@@ -37,18 +32,24 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// cloudy-tui modal shell: rounded orange (`ACCENT_2`) border, an UPPERCASE
+/// bold+italic dim title, base `BG` fill (no raised tone, no backdrop — the
+/// caller `Clear`s only the modal's own rect).
 fn modal_block(title: impl Into<String>) -> Block<'static> {
     let title_line = Line::from(vec![
         Span::raw(" "),
-        Span::styled(title.into(), theme::dim()),
+        Span::styled(
+            title.into().to_uppercase(),
+            theme::label().add_modifier(Modifier::ITALIC),
+        ),
         Span::raw(" "),
     ]);
     Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(theme::LINE_STRONG))
+        .border_style(Style::default().fg(theme::ACCENT_2))
         .title(title_line)
-        .style(Style::default().bg(theme::BG_RAISED))
+        .style(theme::base())
         .padding(Padding::new(2, 2, 1, 1))
 }
 
@@ -73,32 +74,33 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         lines.push(Line::from(Span::styled(detail.clone(), theme::dim())));
     }
     lines.push(Line::from(""));
-    lines.push(yes_no_line(state.choice));
+    lines.push(choice_buttons(state.choice));
     lines.push(Line::from(""));
     lines.push(modal_footer_hints(&[("← →", "choose"), ("⏎", "apply")]));
 
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
+    let para = Paragraph::new(lines).style(theme::base());
     frame.render_widget(para, inner);
 }
 
-fn yes_no_line(choice: bool) -> Line<'static> {
-    let no = if !choice {
+/// cloudy-tui modal buttons: lowercase action verbs, the focused one in inverse
+/// video (`fg = BG, bg = TEXT, bold`), the other in `TEXT_DIM`.
+fn choice_buttons(choice: bool) -> Line<'static> {
+    Line::from(vec![
+        modal_button(" cancel ", !choice),
+        Span::raw("  "),
+        modal_button(" confirm ", choice),
+    ])
+}
+
+fn modal_button(label: &str, focused: bool) -> Span<'static> {
+    if focused {
         Span::styled(
-            " no ",
+            label.to_string(),
             Style::default().fg(theme::BG).bg(theme::TEXT).bold(),
         )
     } else {
-        Span::styled(" no ", theme::dim())
-    };
-    let yes = if choice {
-        Span::styled(
-            " yes ",
-            Style::default().fg(theme::TEXT).bg(theme::ACCENT).bold(),
-        )
-    } else {
-        Span::styled(" yes ", theme::dim())
-    };
-    Line::from(vec![no, Span::raw("  "), yes])
+        Span::styled(label.to_string(), theme::dim())
+    }
 }
 
 fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
@@ -155,7 +157,7 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
         ("⎋", "dismiss"),
     ]));
 
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
+    let para = Paragraph::new(lines).style(theme::base());
     frame.render_widget(para, inner);
 }
 
@@ -197,131 +199,7 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
         Line::from(""),
         modal_footer_hints(&[("⏎", "capture"), ("⎋", "cancel")]),
     ];
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
-    frame.render_widget(para, inner);
-}
-
-fn draw_chain_item_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &ChainItemMenuState) {
-    let rect = centered(area, 56, 14);
-    frame.render_widget(Clear, rect);
-    let block = modal_block(format!("chain · {}", state.name));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let cfg = app.config();
-    let chain_len = cfg.state.fallback_chain.len();
-    let position = cfg
-        .state
-        .fallback_chain
-        .iter()
-        .position(|n| n == &state.name);
-    let current = cfg
-        .find(&state.name)
-        .map(threshold_for)
-        .unwrap_or(DEFAULT_THRESHOLD);
-    drop(cfg);
-
-    let mut options: Vec<(ChainAction, String)> = vec![(
-        ChainAction::Threshold,
-        format!("Set threshold (current: {current:.0}%)"),
-    )];
-    if matches!(position, Some(p) if p > 0) {
-        options.push((ChainAction::MoveUp, "Move up".to_string()));
-    }
-    if matches!(position, Some(p) if p + 1 < chain_len) {
-        options.push((ChainAction::MoveDown, "Move down".to_string()));
-    }
-    options.push((ChainAction::Remove, "Remove from chain".to_string()));
-    options.push((ChainAction::Back, "← Back".to_string()));
-
-    let cursor = state.cursor.min(options.len().saturating_sub(1));
-    let mut lines: Vec<Line<'_>> = options
-        .iter()
-        .enumerate()
-        .map(|(i, (action, label))| {
-            let arrow = if i == cursor {
-                Span::styled("❯ ", theme::orange())
-            } else {
-                Span::raw("  ")
-            };
-            let body = match action {
-                ChainAction::Remove => Span::styled(label.clone(), theme::danger()),
-                ChainAction::Back => Span::styled(label.clone(), theme::faint()),
-                _ => Span::styled(label.clone(), Style::default().fg(theme::TEXT)),
-            };
-            Line::from(vec![arrow, body])
-        })
-        .collect();
-    lines.push(Line::from(""));
-    lines.push(modal_footer_hints(&[
-        ("↑↓", "nav"),
-        ("⏎", "select"),
-        ("⎋", "back"),
-    ]));
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
-    frame.render_widget(para, inner);
-}
-
-fn draw_chain_add(frame: &mut Frame<'_>, area: Rect, state: &ChainAddState) {
-    let rect = centered(
-        area,
-        50,
-        (state.candidates.len() as u16 + 8).min(area.height),
-    );
-    frame.render_widget(Clear, rect);
-    let block = modal_block("chain · add profile");
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let cursor = state.cursor.min(state.candidates.len().saturating_sub(1));
-    let mut lines: Vec<Line<'_>> = state
-        .candidates
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let arrow = if i == cursor {
-                Span::styled("❯ ", theme::orange())
-            } else {
-                Span::raw("  ")
-            };
-            Line::from(vec![
-                arrow,
-                Span::styled(name.clone(), Style::default().fg(theme::TEXT)),
-            ])
-        })
-        .collect();
-    lines.push(Line::from(""));
-    lines.push(modal_footer_hints(&[
-        ("↑↓", "nav"),
-        ("⏎", "add"),
-        ("⎋", "cancel"),
-    ]));
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
-    frame.render_widget(para, inner);
-}
-
-fn draw_chain_threshold(frame: &mut Frame<'_>, area: Rect, form: &ChainThresholdForm) {
-    let rect = centered(area, 60, 11);
-    frame.render_widget(Clear, rect);
-    let block = modal_block(format!("threshold · {}", form.name));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let lines = vec![
-        Line::from(Span::styled(
-            "Auto-switch off this profile when 5h utilization ≥ this value.",
-            theme::dim(),
-        )),
-        Line::from(Span::styled(
-            "Range 0..=100. 100 marks the profile as a last-resort slot.",
-            theme::dim(),
-        )),
-        Line::from(""),
-        labelled_input("threshold %", &form.input, true),
-        Line::from(""),
-        modal_footer_hints(&[("⏎", "save"), ("⎋", "cancel")]),
-    ];
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
+    let para = Paragraph::new(lines).style(theme::base());
     frame.render_widget(para, inner);
 }
 
@@ -364,8 +242,15 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Tab::Fallback => vec![(
             "fallback chain",
             &[
-                ("\u{2191}\u{2193} / j k", "move cursor"),
-                ("\u{23ce}", "open entry / add account"),
+                ("\u{2191}\u{2193} / j k", "move cursor / detail row"),
+                ("Shift+\u{2191}\u{2193}", "reorder member up / down"),
+                (
+                    "\u{23ce}",
+                    "open \u{00b7} edit threshold \u{00b7} remove \u{00b7} add",
+                ),
+                ("+ / -", "step threshold by 5"),
+                ("0-9 \u{23ce}", "type a threshold, \u{23ce} saves"),
+                ("\u{238b}", "back / cancel edit"),
             ][..],
         )],
     };
@@ -404,7 +289,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     for (key, desc) in global {
         lines.push(help_row(key, desc));
     }
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
+    let para = Paragraph::new(lines).style(theme::base());
     frame.render_widget(para, inner);
 }
 

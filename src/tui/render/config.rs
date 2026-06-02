@@ -73,7 +73,6 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
 /// (which re-locks `config`) afterwards without nesting the non-reentrant mutex.
 struct Snap {
     title: String,
-    is_new: bool,
     name: String,
     base_url: String,
     api_key: String,
@@ -88,7 +87,6 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
         if app.config_cursor >= cfg.profiles.len() {
             Snap {
                 title: "+ new account".to_string(),
-                is_new: true,
                 name: String::new(),
                 base_url: String::new(),
                 api_key: String::new(),
@@ -98,7 +96,6 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
             match cfg.profiles.get(app.config_cursor) {
                 Some(p) => Snap {
                     title: p.name.clone(),
-                    is_new: false,
                     name: p.name.clone(),
                     base_url: p.base_url.clone().unwrap_or_default(),
                     api_key: p.api_key.clone().unwrap_or_default(),
@@ -106,7 +103,6 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 },
                 None => Snap {
                     title: "settings".to_string(),
-                    is_new: false,
                     name: String::new(),
                     base_url: String::new(),
                     api_key: String::new(),
@@ -147,11 +143,6 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let mut lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled(
-            hint(actions_focused, editing.is_some(), &snap),
-            theme::faint(),
-        )),
-        Line::from(""),
         Line::from(vec![
             Span::styled(format!("type{}", " ".repeat(KEY_W - 4)), theme::faint()),
             Span::styled(type_value, type_style),
@@ -194,23 +185,6 @@ fn row_hint(row: ConfigRow) -> Option<&'static str> {
         ConfigRow::ApiKey => Some("x-api-key for a non-oauth endpoint"),
         ConfigRow::AutoStart => Some("launch a session on idle to arm the 5h window"),
         ConfigRow::Name | ConfigRow::Delete | ConfigRow::Create => None,
-    }
-}
-
-fn hint(actions_focused: bool, editing: bool, snap: &Snap) -> &'static str {
-    if !actions_focused {
-        return if snap.is_new {
-            "⏎ to create a new account"
-        } else {
-            "⏎ to configure this account"
-        };
-    }
-    if editing {
-        "type · ⏎ save · ⎋ cancel"
-    } else if snap.is_new {
-        "↑↓ choose · ⏎ edit / create · ⎋ back"
-    } else {
-        "↑↓ choose · ⏎ edit / toggle · ⎋ back"
     }
 }
 

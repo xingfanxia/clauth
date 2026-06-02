@@ -1,7 +1,10 @@
-//! Fallback tab — master-detail, mirroring the Usage / Config layout. Left: the
-//! ordered chain (plus a trailing `+ add` row), cursor = `❯`, color = active.
-//! Right: the selected member's rotation detail — position, threshold, a 5h
-//! gauge with a threshold tick, headroom, and where rotation flows next.
+//! Fallback tab — master-detail, mirroring the Config layout. Left: the ordered
+//! chain (plus a trailing `+ add` row), cursor = `❯`, color = active. Right: the
+//! selected member's rotation card (position, a 5h gauge with a threshold tick,
+//! headroom, next hop) plus inline rows — a threshold stepper and a remove row —
+//! or, on `+ add`, a candidate picker. Editing happens in place: ⏎ on the left
+//! drops focus into the right pane, `+` / `-` step the threshold (or ⏎ on it to
+//! type a value), ⏎ on remove arms then confirms. No popups.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -9,14 +12,19 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use super::super::app::{App, ChainItemKind, chain_items};
+use super::super::app::{
+    App, ChainItemKind, FALLBACK_ROWS, FallbackFocus, FallbackRow, InputState, chain_candidates,
+    chain_items,
+};
 use super::super::theme;
 use super::panes::{SELECTOR_WIDTH, section_box};
-use crate::fallback::threshold_for;
+use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 use crate::profile::AppConfig;
 
 /// Cells in the detail-pane gauges. Wide enough to read a threshold tick.
 const GAUGE_W: usize = 22;
+/// Padded key column width for the detail rows, matching the Config tab.
+const KEY_W: usize = 11;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
@@ -24,14 +32,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Length(SELECTOR_WIDTH), Constraint::Min(20)])
         .split(area);
 
-    draw_chain_selector(frame, cols[0], app);
+    let chain_focused = app.fallback_focus == FallbackFocus::Chain;
+    draw_chain_selector(frame, cols[0], app, chain_focused);
     draw_chain_detail(frame, cols[1], app);
 }
 
-/// Left pane: the ordered chain members plus a trailing `+ add` row. Color
-/// marks the active account; the cursor rides on `❯`.
-fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = section_box("chain", true);
+/// Left pane: the ordered chain members plus a trailing `+ add` row. Color marks
+/// the active account; the cursor rides on `❯` only while this pane has focus.
+fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
+    let block = section_box("chain", focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -72,51 +81,74 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
         })
         .collect();
 
+    let highlight = if focused {
+        theme::selected_row().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::TEXT_DIM)
+    };
     let list = List::new(list_items)
         .style(theme::base())
-        .highlight_style(theme::selected_row().add_modifier(Modifier::BOLD))
+        .highlight_style(highlight)
         .highlight_symbol("❯ ");
     let mut state = ListState::default();
     state.select(Some(app.chain_cursor.min(items.len().saturating_sub(1))));
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
-/// Right pane: rotation detail for the member under the cursor, the add hint on
-/// the `+ add` row, or an empty-chain explainer.
+/// Right pane: the member rotation card + inline rows, the add-candidate picker
+/// on the `+ add` row, or an empty-chain explainer.
 fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let detail_focused = app.fallback_focus == FallbackFocus::Detail;
     let items = chain_items(app);
-    let cfg = app.config();
-    let chain_len = cfg.state.fallback_chain.len();
+    let selected = items
+        .get(app.chain_cursor.min(items.len().saturating_sub(1)))
+        .copied();
 
-    let selected = items.get(app.chain_cursor.min(items.len().saturating_sub(1)));
-
+    // Each arm acquires the `config` guard only for as long as it needs it. The
+    // `Add` arm must NOT hold it — `add_detail` re-locks `config` (via
+    // `chain_candidates`), and the mutex is non-reentrant, so holding it here
+    // would deadlock the whole render loop on the `+ add` row.
     let (title, lines): (String, Vec<Line<'static>>) = match selected {
         Some(ChainItemKind::Member(i)) => {
-            let name = cfg
-                .state
-                .fallback_chain
-                .get(*i)
-                .cloned()
-                .unwrap_or_default();
-            (name.clone(), member_detail(&cfg, &name, *i, chain_len))
+            let cfg = app.config();
+            let chain_len = cfg.state.fallback_chain.len();
+            let name = cfg.state.fallback_chain.get(i).cloned().unwrap_or_default();
+            let lines = member_detail(
+                &cfg,
+                &name,
+                i,
+                chain_len,
+                detail_focused,
+                app.fallback_detail_cursor,
+                app.fallback_armed_remove,
+                app.fallback_threshold_draft.as_ref(),
+            );
+            (name, lines)
         }
-        Some(ChainItemKind::Add) => ("add to chain".to_string(), add_detail()),
+        Some(ChainItemKind::Add) => ("add to chain".to_string(), add_detail(app, detail_focused)),
         None => ("chain".to_string(), empty_detail()),
     };
 
-    let block = section_box(&title, false);
+    let block = section_box(&title, detail_focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
-/// The member rotation card: position, threshold, a 5h gauge with a threshold
-/// tick, the numeric headroom, and the next hop in the rotation.
+/// The member rotation card: position + active state, a 5h gauge with a
+/// threshold tick, the headroom, the next hop, then the inline threshold
+/// stepper / editor and remove rows. Caret + edit affordances appear only when
+/// the right pane holds focus; keybind cues live in the footer.
+#[allow(clippy::too_many_arguments)]
 fn member_detail(
     cfg: &AppConfig,
     name: &str,
     index: usize,
     chain_len: usize,
+    focused: bool,
+    row_cursor: usize,
+    armed_remove: bool,
+    editing: Option<&InputState>,
 ) -> Vec<Line<'static>> {
     let Some(profile) = cfg.find(name) else {
         return vec![Line::from(Span::styled(
@@ -132,11 +164,12 @@ fn member_detail(
         .and_then(|u| u.five_hour.as_ref())
         .map(|w| w.utilization);
     let active = cfg.is_active(name);
+    let cursor = row_cursor.min(FALLBACK_ROWS.len() - 1);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // Position + active state.
-    let pos = Line::from(vec![
+    lines.push(Line::from(vec![
         Span::styled(kv_key("position"), theme::faint()),
         Span::styled(format!("#{} of {chain_len}", index + 1), theme::muted()),
         if active {
@@ -144,13 +177,6 @@ fn member_detail(
         } else {
             Span::raw("")
         },
-    ]);
-    lines.push(pos);
-
-    lines.push(Line::from(vec![
-        Span::styled(kv_key("threshold"), theme::faint()),
-        Span::styled(format!("{threshold:.0}%"), theme::muted()),
-        Span::styled("  rotate off at this 5h utilization", theme::faint()),
     ]));
     lines.push(Line::from(""));
 
@@ -161,7 +187,7 @@ fn member_detail(
         Some(v) => {
             let headroom = (threshold - v).max(0.0);
             (
-                format!("{v:.0}% used · {headroom:.0}% headroom to rotate"),
+                format!("{v:.0}% used · {headroom:.0}% until rotate"),
                 Style::default().fg(health_color(v, threshold)),
             )
         }
@@ -194,17 +220,112 @@ fn member_detail(
             theme::faint(),
         )));
     }
-
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "⏎ reorder · set threshold · remove",
-        theme::faint(),
-    )));
+
+    // Inline rows: threshold stepper / editor, then remove. The caret +
+    // interactivity only render while the right pane holds focus.
+    for (i, row) in FALLBACK_ROWS.iter().enumerate() {
+        let selected = focused && i == cursor;
+        let row_editing = if *row == FallbackRow::Threshold {
+            editing
+        } else {
+            None
+        };
+        lines.push(detail_row(
+            *row,
+            selected,
+            threshold,
+            armed_remove,
+            row_editing,
+        ));
+        // Meaning tooltip under the focused threshold row (keybind cues live in
+        // the footer, not here).
+        if selected && *row == FallbackRow::Threshold && row_editing.is_none() {
+            lines.push(Line::from(vec![
+                Span::styled("  └ ", theme::faint()),
+                Span::styled(
+                    "rotate to next account when 5h usage reaches this",
+                    theme::faint(),
+                ),
+            ]));
+        }
+    }
     lines
 }
 
-fn add_detail() -> Vec<Line<'static>> {
+/// One member detail row: the threshold stepper / editor or the danger remove
+/// row. `editing` is `Some` only for the threshold row while it's typed into.
+fn detail_row(
+    row: FallbackRow,
+    selected: bool,
+    threshold: f64,
+    armed_remove: bool,
+    editing: Option<&InputState>,
+) -> Line<'static> {
+    let arrow = if selected {
+        Span::styled("❯ ", theme::accent())
+    } else {
+        Span::raw("  ")
+    };
+    match row {
+        FallbackRow::Threshold => {
+            let pad = KEY_W.saturating_sub("threshold".len()).max(1);
+            let mut spans = vec![
+                arrow,
+                Span::styled(format!("threshold{}", " ".repeat(pad)), theme::faint()),
+            ];
+            match editing {
+                Some(input) => {
+                    spans.extend(value_caret(input));
+                    spans.push(Span::styled("%", theme::faint()));
+                }
+                None => {
+                    spans.push(Span::styled(format!("{threshold:.0}%"), theme::accent()));
+                    if (threshold - DEFAULT_THRESHOLD).abs() > f64::EPSILON {
+                        spans.push(Span::styled(
+                            format!("   default: {DEFAULT_THRESHOLD:.0}%"),
+                            theme::faint(),
+                        ));
+                    }
+                }
+            }
+            Line::from(spans)
+        }
+        FallbackRow::Remove => {
+            let label = if armed_remove {
+                "remove from chain — ⏎ again to confirm".to_string()
+            } else {
+                "remove from chain".to_string()
+            };
+            Line::from(vec![arrow, Span::styled(label, theme::danger())])
+        }
+    }
+}
+
+/// The typed threshold value with a block caret over a sunken input strip,
+/// matching the Config tab's inline text edit.
+fn value_caret(input: &InputState) -> Vec<Span<'static>> {
+    let (head, tail) = input.value.split_at(input.cursor.min(input.value.len()));
+    let caret_style = Style::default()
+        .fg(theme::TEXT)
+        .bg(theme::ACCENT)
+        .add_modifier(Modifier::BOLD);
+    let body = Style::default().fg(theme::TEXT).bg(theme::BG_SUNKEN);
+    let mut tail_iter = tail.chars();
+    let caret = tail_iter.next().unwrap_or(' ').to_string();
+    let after: String = tail_iter.collect();
     vec![
+        Span::styled(head.to_string(), body),
+        Span::styled(caret, caret_style),
+        Span::styled(after, body),
+    ]
+}
+
+/// The `+ add` detail: an explainer plus the candidate picker. The caret only
+/// renders while the right pane holds focus.
+fn add_detail(app: &App, focused: bool) -> Vec<Line<'static>> {
+    let candidates = chain_candidates(app);
+    let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled(
             "add an account to the rotation",
             theme::muted(),
@@ -219,8 +340,37 @@ fn add_detail() -> Vec<Line<'static>> {
             theme::dim(),
         )),
         Line::from(""),
-        Line::from(Span::styled("⏎ to pick an account", theme::faint())),
-    ]
+    ];
+
+    if candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "every account is already in the chain",
+            theme::faint(),
+        )));
+        return lines;
+    }
+
+    // Blurred: explainer only. The candidate rows (with caret) appear once the
+    // right pane takes focus; the footer carries the keybind cue.
+    if !focused {
+        return lines;
+    }
+
+    let cursor = app
+        .fallback_detail_cursor
+        .min(candidates.len().saturating_sub(1));
+    for (i, name) in candidates.iter().enumerate() {
+        let arrow = if i == cursor {
+            Span::styled("❯ ", theme::accent())
+        } else {
+            Span::raw("  ")
+        };
+        lines.push(Line::from(vec![
+            arrow,
+            Span::styled(name.clone(), Style::default().fg(theme::TEXT)),
+        ]));
+    }
+    lines
 }
 
 fn empty_detail() -> Vec<Line<'static>> {
@@ -277,7 +427,6 @@ fn health_color(pct: f64, threshold: f64) -> Color {
 
 /// Pad a detail key to a fixed gutter so values line up.
 fn kv_key(key: &str) -> String {
-    const KEY_W: usize = 11;
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     format!("{key}{}", " ".repeat(pad))
 }

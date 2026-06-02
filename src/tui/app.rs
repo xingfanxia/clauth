@@ -6,7 +6,10 @@
 //!   - The Config tab is master-detail: an account list (plus a `+ new` row)
 //!     and an inline detail editor (`config_draft`) — no popups for new / edit
 //!     / rename / delete.
-//!   - The chain editor is a second screen with its own cursor.
+//!   - The Fallback tab is master-detail too: the ordered chain (plus a
+//!     `+ add` row) on the left, an inline threshold stepper / remove row (or
+//!     add-candidate picker) on the right — no popups for threshold / reorder
+//!     / remove / add.
 //!   - Modals stack: the top of `modals` owns input; events fall through to
 //!     the screen below only when the stack is empty.
 
@@ -133,13 +136,14 @@ impl InputState {
 
 // ── Modals ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ChainAction {
+/// One interactive line in the Fallback tab's detail pane when a chain member
+/// is selected. Mirrors [`ConfigRow`] — built per member by [`fallback_rows`].
+/// `Threshold` is a stepper (±5 on `+` / `-`); `Remove` arms then confirms,
+/// the same inline arm-to-confirm pattern as the Config delete row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackRow {
     Threshold,
-    MoveUp,
-    MoveDown,
     Remove,
-    Back,
 }
 
 /// One editable line in the Config tab's detail pane. The row set is built per
@@ -250,32 +254,11 @@ impl DivergenceForm {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ChainItemMenuState {
-    pub(crate) name: String,
-    pub(crate) cursor: usize,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ChainAddState {
-    pub(crate) candidates: Vec<String>,
-    pub(crate) cursor: usize,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ChainThresholdForm {
-    pub(crate) name: String,
-    pub(crate) input: InputState,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) enum Modal {
     Confirm(ConfirmState),
     /// Credential divergence prompt — Overwrite / NewProfile / Discard.
     Divergence(DivergenceForm),
     CaptureName(CaptureNameForm),
-    ChainItemMenu(ChainItemMenuState),
-    ChainAdd(ChainAddState),
-    ChainThreshold(ChainThresholdForm),
     Help,
 }
 
@@ -355,6 +338,16 @@ pub(crate) enum ConfigFocus {
     Actions,
 }
 
+/// Which Fallback pane has focus, mirroring [`ConfigFocus`]. `Chain` drives the
+/// ordered list on the left (↑↓ moves, ⇧↑↓ reorders, ⏎ drops in); `Detail`
+/// drives the right pane — the member's threshold stepper + remove row, or the
+/// add-candidate picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackFocus {
+    Chain,
+    Detail,
+}
+
 // ── Overview list items ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
@@ -422,8 +415,21 @@ pub(crate) struct App {
     /// Inline editor for the Config detail pane. `Some` only while the Actions
     /// pane owns focus; built on entry, torn down on the way back to the list.
     pub(crate) config_draft: Option<ConfigDraft>,
-    /// Cursor into `chain_items()` on the Fallback tab.
+    /// Cursor into `chain_items()` on the Fallback tab's left pane.
     pub(crate) chain_cursor: usize,
+    /// Which Fallback pane has focus; gates whether ↑↓ walks the chain or the
+    /// member's detail rows / add candidates.
+    pub(crate) fallback_focus: FallbackFocus,
+    /// Cursor into the right pane on the Fallback tab — `fallback_rows()` for a
+    /// member, or the candidate list for the `+ add` row.
+    pub(crate) fallback_detail_cursor: usize,
+    /// First ⏎ on the remove row arms it; the second confirms. Any cursor move
+    /// or focus change disarms — the inline stand-in for the old remove popup.
+    pub(crate) fallback_armed_remove: bool,
+    /// `Some` while the threshold row is being typed into (⏎ on the row opens
+    /// it). Owns the keyboard like a Config text edit; `+` / `-` still step the
+    /// value when this is `None`.
+    pub(crate) fallback_threshold_draft: Option<InputState>,
 
     pub(crate) toasts: VecDeque<Toast>,
 
@@ -523,6 +529,10 @@ impl App {
             config_cursor: 0,
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
+            fallback_focus: FallbackFocus::Chain,
+            fallback_detail_cursor: 0,
+            fallback_armed_remove: false,
+            fallback_threshold_draft: None,
             config_draft: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
@@ -900,6 +910,16 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The Fallback threshold editor captures keystrokes the same way, so typing
+    // `90` into it can't trip the global `n` / `q` / `r` shortcuts below.
+    if app.tab == Tab::Fallback
+        && app.fallback_focus == FallbackFocus::Detail
+        && app.fallback_threshold_draft.is_some()
+    {
+        handle_fallback_threshold_edit_key(app, key);
+        return;
+    }
+
     // Global keys, available on every tab when no modal owns input.
     match key.code {
         KeyCode::Tab | KeyCode::Right => {
@@ -932,11 +952,13 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             start_new_account(app);
             return;
         }
-        // Esc backs out of a Config sub-focus; otherwise it quits like q.
+        // Esc backs out of a Config / Fallback sub-focus; otherwise it quits.
         KeyCode::Esc => {
             if app.tab == Tab::Config && app.config_focus == ConfigFocus::Actions {
                 app.config_focus = ConfigFocus::Profiles;
                 app.config_draft = None;
+            } else if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
+                leave_fallback_detail(app);
             } else {
                 app.quit = true;
             }
@@ -974,6 +996,10 @@ fn switch_tab(app: &mut App, tab: Tab) {
         }
         Tab::Fallback => {
             app.chain_cursor = 0;
+            app.fallback_focus = FallbackFocus::Chain;
+            app.fallback_detail_cursor = 0;
+            app.fallback_armed_remove = false;
+            app.fallback_threshold_draft = None;
         }
     }
 }
@@ -1244,11 +1270,67 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
     items
 }
 
-fn handle_fallback_key(app: &mut App, key: KeyEvent) {
-    let items = chain_items(app);
-    let last = items.len().saturating_sub(1);
+/// The two detail rows shown for a chain member, in order.
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 2] = [FallbackRow::Threshold, FallbackRow::Remove];
 
+/// What the Fallback footer should advertise right now, derived from focus +
+/// selection + edit state so it lists only keys that currently do something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackHint {
+    Empty,
+    ChainMember,
+    ChainAdd,
+    DetailThreshold,
+    DetailThresholdEdit,
+    DetailRemove,
+    DetailRemoveArmed,
+    DetailAdd,
+}
+
+/// Resolve the footer hint context for the Fallback tab.
+pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
+    if chain_items(app).is_empty() {
+        return FallbackHint::Empty;
+    }
+    match app.fallback_focus {
+        FallbackFocus::Chain => match selected_chain_member(app) {
+            Some(_) => FallbackHint::ChainMember,
+            None => FallbackHint::ChainAdd,
+        },
+        FallbackFocus::Detail => {
+            if selected_chain_member(app).is_none() {
+                return FallbackHint::DetailAdd;
+            }
+            if app.fallback_threshold_draft.is_some() {
+                return FallbackHint::DetailThresholdEdit;
+            }
+            let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
+            match FALLBACK_ROWS[cursor] {
+                FallbackRow::Threshold => FallbackHint::DetailThreshold,
+                FallbackRow::Remove if app.fallback_armed_remove => FallbackHint::DetailRemoveArmed,
+                FallbackRow::Remove => FallbackHint::DetailRemove,
+            }
+        }
+    }
+}
+
+/// Fallback tab keymap. Left pane (`Chain`): ↑↓ walks the chain + `+ add` row,
+/// ⇧↑↓ reorders a member, ⏎ drops focus into the right pane. Right pane
+/// (`Detail`): the member's threshold stepper + remove row, or the add picker.
+fn handle_fallback_key(app: &mut App, key: KeyEvent) {
+    match app.fallback_focus {
+        FallbackFocus::Chain => handle_fallback_chain_key(app, key),
+        FallbackFocus::Detail => handle_fallback_detail_key(app, key),
+    }
+}
+
+fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
+    let last = chain_items(app).len().saturating_sub(1);
     match key.code {
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_chain_member(app, -1),
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            reorder_chain_member(app, 1)
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             app.chain_cursor = if app.chain_cursor == 0 {
                 last
@@ -1263,42 +1345,276 @@ fn handle_fallback_key(app: &mut App, key: KeyEvent) {
                 app.chain_cursor + 1
             };
         }
-        KeyCode::Enter => activate_chain_item(app),
+        KeyCode::Enter => enter_fallback_detail(app),
         _ => {}
     }
 }
 
-fn activate_chain_item(app: &mut App) {
-    let items = chain_items(app);
-    let Some(item) = items.get(app.chain_cursor).copied() else {
+/// Right-pane keymap for a member: ↑↓ walks rows, `+` / `-` steps the threshold,
+/// ⏎ / space on remove arms then confirms. Delegates to the add picker when the
+/// cursor sits on the `+ add` row.
+fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
+    if selected_chain_member(app).is_none() {
+        handle_fallback_add_key(app, key);
+        return;
+    }
+    let last = FALLBACK_ROWS.len() - 1;
+    app.fallback_detail_cursor = app.fallback_detail_cursor.min(last);
+    let on_threshold = FALLBACK_ROWS[app.fallback_detail_cursor] == FallbackRow::Threshold;
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.fallback_armed_remove = false;
+            app.fallback_detail_cursor = if app.fallback_detail_cursor == 0 {
+                last
+            } else {
+                app.fallback_detail_cursor - 1
+            };
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.fallback_armed_remove = false;
+            app.fallback_detail_cursor = if app.fallback_detail_cursor >= last {
+                0
+            } else {
+                app.fallback_detail_cursor + 1
+            };
+        }
+        KeyCode::Char('+' | '=') if on_threshold => adjust_threshold(app, 5.0),
+        KeyCode::Char('-' | '_') if on_threshold => adjust_threshold(app, -5.0),
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            run_fallback_row(app, FALLBACK_ROWS[app.fallback_detail_cursor]);
+        }
+        _ => {}
+    }
+}
+
+/// `+ add` detail: a candidate picker. ↑↓ walks, ⏎ adds and re-homes focus.
+fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
+    let candidates = chain_candidates(app);
+    if candidates.is_empty() {
+        leave_fallback_detail(app);
+        return;
+    }
+    let last = candidates.len() - 1;
+    app.fallback_detail_cursor = app.fallback_detail_cursor.min(last);
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.fallback_detail_cursor = if app.fallback_detail_cursor == 0 {
+                last
+            } else {
+                app.fallback_detail_cursor - 1
+            };
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.fallback_detail_cursor = if app.fallback_detail_cursor >= last {
+                0
+            } else {
+                app.fallback_detail_cursor + 1
+            };
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let name = candidates[app.fallback_detail_cursor].clone();
+            add_chain_candidate(app, &name);
+            app.toast(ToastKind::Success, format!("added '{name}' to chain"));
+            // Adding shrinks the picker; when it empties the `+ add` row is gone,
+            // so land the cursor on the freshly-appended member instead.
+            let remaining = chain_candidates(app);
+            if remaining.is_empty() {
+                leave_fallback_detail(app);
+                app.chain_cursor = chain_items(app).len().saturating_sub(1);
+            } else {
+                app.fallback_detail_cursor = app.fallback_detail_cursor.min(remaining.len() - 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The chain index under the cursor, or `None` when it's on the `+ add` row.
+fn selected_chain_member(app: &App) -> Option<usize> {
+    match chain_items(app).get(app.chain_cursor).copied() {
+        Some(ChainItemKind::Member(i)) => Some(i),
+        _ => None,
+    }
+}
+
+/// Profiles not yet in the chain — the pickable rows for the `+ add` detail.
+pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
+    let cfg = app.config();
+    cfg.profiles
+        .iter()
+        .filter(|p| !cfg.state.fallback_chain.iter().any(|c| c == &p.name))
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// Drop focus into the right pane for the selected chain item. No-op on `+ add`
+/// when nothing's left to add.
+fn enter_fallback_detail(app: &mut App) {
+    match chain_items(app).get(app.chain_cursor).copied() {
+        Some(ChainItemKind::Member(_)) => {}
+        Some(ChainItemKind::Add) if !chain_candidates(app).is_empty() => {}
+        _ => return,
+    }
+    app.fallback_detail_cursor = 0;
+    app.fallback_armed_remove = false;
+    app.fallback_focus = FallbackFocus::Detail;
+}
+
+/// Lift focus back to the chain list, clearing any primed remove or live edit.
+fn leave_fallback_detail(app: &mut App) {
+    app.fallback_focus = FallbackFocus::Chain;
+    app.fallback_armed_remove = false;
+    app.fallback_detail_cursor = 0;
+    app.fallback_threshold_draft = None;
+}
+
+/// ⇧↑↓ on the chain list: move the selected member up / down, following it with
+/// the cursor. No-op on `+ add` or at a boundary. Chain index == cursor for
+/// members (they precede the trailing `+ add` row), so the two move together.
+fn reorder_chain_member(app: &mut App, delta: i32) {
+    let Some(pos) = selected_chain_member(app) else {
         return;
     };
-    match item {
-        ChainItemKind::Member(i) => {
-            let Some(name) = app.config().state.fallback_chain.get(i).cloned() else {
-                return;
-            };
-            app.modals
-                .push(Modal::ChainItemMenu(ChainItemMenuState { name, cursor: 0 }));
+    let target = pos as i32 + delta;
+    {
+        let mut cfg = app.config.lock().expect("config mutex poisoned");
+        if target < 0 || target as usize >= cfg.state.fallback_chain.len() {
+            return;
         }
-        ChainItemKind::Add => {
-            let candidates: Vec<String> = {
-                let cfg = app.config();
-                cfg.profiles
-                    .iter()
-                    .filter(|p| !cfg.state.fallback_chain.iter().any(|c| c == &p.name))
-                    .map(|p| p.name.clone())
-                    .collect()
-            };
-            if candidates.is_empty() {
-                return;
+        cfg.state.fallback_chain.swap(pos, target as usize);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.chain_cursor = target as usize;
+}
+
+/// ⏎ / space on a member detail row: threshold opens the inline editor seeded
+/// with the current value, remove arms on the first press and deletes on the
+/// second.
+fn run_fallback_row(app: &mut App, row: FallbackRow) {
+    match row {
+        FallbackRow::Threshold => {
+            if let Some(current) = selected_threshold(app) {
+                app.fallback_threshold_draft = Some(InputState::new(&format!("{current:.0}")));
             }
-            app.modals.push(Modal::ChainAdd(ChainAddState {
-                candidates,
-                cursor: 0,
-            }));
+        }
+        FallbackRow::Remove => {
+            if app.fallback_armed_remove {
+                remove_chain_member(app);
+            } else {
+                app.fallback_armed_remove = true;
+            }
         }
     }
+}
+
+/// Keystrokes while the threshold field is open. ⏎ parses + saves, ⎋ discards,
+/// everything else edits the buffer.
+fn handle_fallback_threshold_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.fallback_threshold_draft = None,
+        KeyCode::Enter => commit_threshold_edit(app),
+        _ => {
+            if let Some(input) = app.fallback_threshold_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// Validate the typed threshold (a number in 0..=100) and persist it. On a bad
+/// value, toast and keep the editor open so the user can fix it.
+fn commit_threshold_edit(app: &mut App) {
+    let Some(raw) = app.fallback_threshold_draft.as_ref().map(|i| i.trimmed()) else {
+        return;
+    };
+    let value = match raw.parse::<f64>() {
+        Ok(v) if (0.0..=100.0).contains(&v) => v,
+        _ => {
+            app.toast(
+                ToastKind::Danger,
+                "threshold must be a number between 0 and 100",
+            );
+            return;
+        }
+    };
+    write_threshold(app, value);
+    app.fallback_threshold_draft = None;
+}
+
+/// The selected member's effective threshold, or `None` on the `+ add` row.
+fn selected_threshold(app: &App) -> Option<f64> {
+    let pos = selected_chain_member(app)?;
+    let cfg = app.config();
+    let name = cfg.state.fallback_chain.get(pos)?;
+    cfg.find(name).map(threshold_for)
+}
+
+/// Write an absolute threshold for the selected member and persist immediately.
+fn write_threshold(app: &mut App, value: f64) {
+    let Some(pos) = selected_chain_member(app) else {
+        return;
+    };
+    let save_err = {
+        let mut cfg = app.config.lock().expect("config mutex poisoned");
+        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
+            return;
+        };
+        match cfg.find_mut(&name) {
+            Some(profile) => {
+                profile.fallback_threshold = Some(value);
+                save_profile(profile).err()
+            }
+            None => None,
+        }
+    };
+    if let Some(e) = save_err {
+        app.toast(ToastKind::Danger, format!("save failed: {e}"));
+    }
+}
+
+/// Step the selected member's threshold by `delta`, clamped to 0..=100, and
+/// persist immediately (matching the Config auto-start toggle's eager save).
+fn adjust_threshold(app: &mut App, delta: f64) {
+    if let Some(current) = selected_threshold(app) {
+        write_threshold(app, (current + delta).clamp(0.0, 100.0));
+    }
+}
+
+/// Add a profile to the chain, seeding the default threshold if unset, then
+/// persist both the profile and the chain order.
+fn add_chain_candidate(app: &mut App, name: &str) {
+    let mut cfg = app.config.lock().expect("config mutex poisoned");
+    if let Some(profile) = cfg.find_mut(name)
+        && profile.fallback_threshold.is_none()
+    {
+        profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
+        let _ = save_profile(profile);
+    }
+    cfg.state.fallback_chain.push(name.to_string());
+    let _ = save_app_state(&cfg.state);
+}
+
+/// Remove the selected member, persist, and return focus to the list with the
+/// cursor clamped to a valid row.
+fn remove_chain_member(app: &mut App) {
+    let Some(pos) = selected_chain_member(app) else {
+        return;
+    };
+    let name = {
+        let mut cfg = app.config.lock().expect("config mutex poisoned");
+        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
+            return;
+        };
+        cfg.state.fallback_chain.retain(|n| n != &name);
+        let _ = save_app_state(&cfg.state);
+        name
+    };
+    leave_fallback_detail(app);
+    let items_len = chain_items(app).len();
+    if app.chain_cursor >= items_len {
+        app.chain_cursor = items_len.saturating_sub(1);
+    }
+    app.toast(ToastKind::Info, format!("removed '{name}' from chain"));
 }
 
 // ── Modal handling ────────────────────────────────────────────────────────────
@@ -1319,9 +1635,6 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::Confirm(_) => handle_confirm_key(app, key),
         Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
-        Modal::ChainItemMenu(_) => handle_chain_item_menu_key(app, key),
-        Modal::ChainAdd(_) => handle_chain_add_key(app, key),
-        Modal::ChainThreshold(_) => handle_chain_threshold_key(app, key),
     }
 }
 
@@ -2033,203 +2346,6 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("capture failed: {e}")),
             }
-        }
-        _ => apply_input_edit(&mut form.input, key),
-    }
-}
-
-fn handle_chain_item_menu_key(app: &mut App, key: KeyEvent) {
-    let Some(Modal::ChainItemMenu(state)) = app.modals.last_mut() else {
-        return;
-    };
-    let (chain_len, position) = {
-        let cfg = app.config.lock().expect("config mutex poisoned");
-        let chain_len = cfg.state.fallback_chain.len();
-        let position = cfg
-            .state
-            .fallback_chain
-            .iter()
-            .position(|n| n == &state.name);
-        (chain_len, position)
-    };
-    let mut options: Vec<ChainAction> = vec![ChainAction::Threshold];
-    if matches!(position, Some(p) if p > 0) {
-        options.push(ChainAction::MoveUp);
-    }
-    if matches!(position, Some(p) if p + 1 < chain_len) {
-        options.push(ChainAction::MoveDown);
-    }
-    options.push(ChainAction::Remove);
-    options.push(ChainAction::Back);
-    let last = options.len() - 1;
-    if state.cursor > last {
-        state.cursor = last;
-    }
-
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.cursor = if state.cursor == 0 {
-                last
-            } else {
-                state.cursor - 1
-            };
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.cursor = if state.cursor >= last {
-                0
-            } else {
-                state.cursor + 1
-            };
-        }
-        KeyCode::Esc => {
-            app.modals.pop();
-        }
-        KeyCode::Enter => {
-            let name = state.name.clone();
-            let action = options[state.cursor];
-            match action {
-                ChainAction::Threshold => {
-                    let current = app
-                        .config
-                        .lock()
-                        .expect("config mutex poisoned")
-                        .find(&name)
-                        .map(threshold_for)
-                        .unwrap_or(DEFAULT_THRESHOLD);
-                    app.modals.pop();
-                    app.modals.push(Modal::ChainThreshold(ChainThresholdForm {
-                        name,
-                        input: InputState::new(&format!("{current:.0}")),
-                    }));
-                }
-                ChainAction::MoveUp => {
-                    if let Some(p) = position
-                        && p > 0
-                    {
-                        let mut cfg = app.config.lock().expect("config mutex poisoned");
-                        cfg.state.fallback_chain.swap(p - 1, p);
-                        let _ = save_app_state(&cfg.state);
-                        drop(cfg);
-                        if app.chain_cursor > 0 {
-                            app.chain_cursor -= 1;
-                        }
-                    }
-                }
-                ChainAction::MoveDown => {
-                    if let Some(p) = position
-                        && p + 1 < chain_len
-                    {
-                        let mut cfg = app.config.lock().expect("config mutex poisoned");
-                        cfg.state.fallback_chain.swap(p, p + 1);
-                        let _ = save_app_state(&cfg.state);
-                        drop(cfg);
-                        if app.chain_cursor + 1 < chain_items(app).len() {
-                            app.chain_cursor += 1;
-                        }
-                    }
-                }
-                ChainAction::Remove => {
-                    {
-                        let mut cfg = app.config.lock().expect("config mutex poisoned");
-                        cfg.state.fallback_chain.retain(|n| n != &name);
-                        let _ = save_app_state(&cfg.state);
-                    }
-                    app.modals.pop();
-                    let items_len = chain_items(app).len();
-                    if app.chain_cursor >= items_len {
-                        app.chain_cursor = items_len.saturating_sub(1);
-                    }
-                }
-                ChainAction::Back => {
-                    app.modals.pop();
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_chain_add_key(app: &mut App, key: KeyEvent) {
-    let Some(Modal::ChainAdd(state)) = app.modals.last_mut() else {
-        return;
-    };
-    let last = state.candidates.len().saturating_sub(1);
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.cursor = if state.cursor == 0 {
-                last
-            } else {
-                state.cursor - 1
-            };
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.cursor = if state.cursor >= last {
-                0
-            } else {
-                state.cursor + 1
-            };
-        }
-        KeyCode::Esc => {
-            app.modals.pop();
-        }
-        KeyCode::Enter | KeyCode::Char(' ') => {
-            let Some(name) = state.candidates.get(state.cursor).cloned() else {
-                return;
-            };
-            {
-                let mut cfg = app.config.lock().expect("config mutex poisoned");
-                if let Some(profile) = cfg.find_mut(&name)
-                    && profile.fallback_threshold.is_none()
-                {
-                    profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
-                    let _ = save_profile(profile);
-                }
-                cfg.state.fallback_chain.push(name);
-                let _ = save_app_state(&cfg.state);
-            }
-            app.modals.pop();
-        }
-        _ => {}
-    }
-}
-
-fn handle_chain_threshold_key(app: &mut App, key: KeyEvent) {
-    let Some(Modal::ChainThreshold(form)) = app.modals.last_mut() else {
-        return;
-    };
-    match key.code {
-        KeyCode::Esc => {
-            app.modals.pop();
-        }
-        KeyCode::Enter => {
-            let raw = form.input.trimmed();
-            let Ok(value) = raw.parse::<f64>() else {
-                app.toast(ToastKind::Danger, "enter a number between 0 and 100");
-                return;
-            };
-            if !(0.0..=100.0).contains(&value) {
-                app.toast(ToastKind::Danger, "threshold must be between 0 and 100");
-                return;
-            }
-            let name = form.name.clone();
-            let save_result: Option<anyhow::Error> = {
-                let mut cfg = app.config.lock().expect("config mutex poisoned");
-                if let Some(profile) = cfg.find_mut(&name) {
-                    profile.fallback_threshold = Some(value);
-                    save_profile(profile).err()
-                } else {
-                    None
-                }
-            };
-            if let Some(e) = save_result {
-                app.toast(ToastKind::Danger, format!("save failed: {e}"));
-                return;
-            }
-            app.modals.pop();
-            app.toast(
-                ToastKind::Success,
-                format!("threshold for '{name}' set to {value:.0}%"),
-            );
         }
         _ => apply_input_edit(&mut form.input, key),
     }

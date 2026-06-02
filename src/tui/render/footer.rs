@@ -6,7 +6,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, ConfigFocus, Tab};
+use super::super::app::{App, ConfigFocus, FallbackHint, Tab, fallback_hint};
 use super::super::theme;
 
 /// Shown on every tab; the persistent navigation cue.
@@ -44,13 +44,34 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("?", "help"),
             ],
         },
-        Tab::Fallback => &[
-            ("↑↓", "move"),
-            ("⏎", "open"),
-            ("r", "refresh"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
+        Tab::Fallback => match fallback_hint(app) {
+            FallbackHint::Empty => &[("?", "help"), ("q", "quit")],
+            FallbackHint::ChainMember => &[
+                ("↑↓", "move"),
+                ("⇧↑↓", "reorder"),
+                ("⏎", "open"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            FallbackHint::ChainAdd => &[("↑↓", "move"), ("⏎", "add"), ("?", "help"), ("q", "quit")],
+            FallbackHint::DetailThreshold => &[
+                ("↑↓", "row"),
+                ("+ -", "adjust"),
+                ("⏎", "edit"),
+                ("⎋", "back"),
+                ("?", "help"),
+            ],
+            FallbackHint::DetailThresholdEdit => &[("0-9", "type"), ("⏎", "save"), ("⎋", "cancel")],
+            FallbackHint::DetailRemove => {
+                &[("↑↓", "row"), ("⏎", "remove"), ("⎋", "back"), ("?", "help")]
+            }
+            FallbackHint::DetailRemoveArmed => {
+                &[("⏎", "confirm remove"), ("⎋", "cancel"), ("?", "help")]
+            }
+            FallbackHint::DetailAdd => {
+                &[("↑↓", "pick"), ("⏎", "add"), ("⎋", "back"), ("?", "help")]
+            }
+        },
     };
 
     let hints: Vec<(&str, &str)> = std::iter::once(TAB_NAV)
