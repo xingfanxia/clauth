@@ -74,12 +74,21 @@ fn build_usage_lines(profile: &Profile, inner_w: u16) -> Vec<Line<'static>> {
         return lines;
     }
 
-    let bar_width = uniform_bar_width(&stats, inner_w);
+    let max_trailing = stats
+        .iter()
+        .map(|s| s.trailing.chars().count())
+        .max()
+        .unwrap_or(0);
+    let bar_width = bar_width_for(inner_w, max_trailing);
+    // Right-align every % to the far edge of the content so the figures stack
+    // in one column above the trailing "resets in …" text rather than hugging
+    // the bar's right end.
+    let pct_col = (bar_width + max_trailing).min(inner_w as usize);
     for (i, stat) in stats.iter().enumerate() {
         if i > 0 {
             lines.push(Line::from(""));
         }
-        lines.extend(stat.render(bar_width));
+        lines.extend(stat.render(bar_width, pct_col));
     }
     lines
 }
@@ -96,16 +105,33 @@ struct Stat {
 impl Stat {
     /// Two-line block: eyebrow + right-aligned %, then a `bar_width`-cell bar
     /// with the trailing reset/credit suffix. `bar_width` is shared across all
-    /// rows so every bar lines up at the same length.
-    fn render(&self, bar_width: usize) -> Vec<Line<'static>> {
+    /// rows so every bar lines up at the same length; `pct_col` is the column
+    /// the % right-aligns to (the content's far edge, above the reset text).
+    fn render(&self, bar_width: usize, pct_col: usize) -> Vec<Line<'static>> {
         let pct_str = format!("{:>3.0}%", self.pct);
-        let header_pad = bar_width
+        let header_pad = pct_col
             .saturating_sub(self.label.chars().count())
             .saturating_sub(pct_str.chars().count());
 
         let filled = ((self.pct / 100.0) * bar_width as f64).round() as usize;
         let filled = filled.min(bar_width);
         let empty = bar_width - filled;
+
+        let mut bar_line = vec![
+            Span::styled("█".repeat(filled), Style::default().fg(self.color)),
+            Span::styled("░".repeat(empty), Style::default().fg(theme::LINE_STRONG)),
+        ];
+        // Right-align the reset/credit text to the same far column as the %, so
+        // the bar line ends in a clean right column under it.
+        if !self.trailing.is_empty() {
+            let pad = pct_col
+                .saturating_sub(bar_width)
+                .saturating_sub(self.trailing.chars().count());
+            if pad > 0 {
+                bar_line.push(Span::raw(" ".repeat(pad)));
+            }
+            bar_line.push(Span::styled(self.trailing.clone(), theme::faint()));
+        }
 
         vec![
             Line::from(vec![
@@ -116,11 +142,7 @@ impl Stat {
                     Style::default().fg(self.color).add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Line::from(vec![
-                Span::styled("█".repeat(filled), Style::default().fg(self.color)),
-                Span::styled("░".repeat(empty), Style::default().fg(theme::LINE_STRONG)),
-                Span::styled(self.trailing.clone(), theme::faint()),
-            ]),
+            Line::from(bar_line),
         ]
     }
 }
@@ -173,12 +195,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
 
 /// Uniform bar width across all rows: as wide as possible while still leaving
 /// room for the longest trailing suffix, so every bar lines up.
-fn uniform_bar_width(stats: &[Stat], inner_w: u16) -> usize {
-    let max_trailing = stats
-        .iter()
-        .map(|s| s.trailing.chars().count())
-        .max()
-        .unwrap_or(0);
+fn bar_width_for(inner_w: u16, max_trailing: usize) -> usize {
     let avail = (inner_w as usize).saturating_sub(max_trailing);
     if avail >= 10 {
         // Comfortable case: a readable bar with room to spare for the suffix.
