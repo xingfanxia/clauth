@@ -32,6 +32,44 @@ pub(crate) fn run(config: AppConfig) -> Result<()> {
     outcome.and(restore)
 }
 
+/// Showcase variant: same terminal setup/teardown as [`run`], but uses a
+/// stripped-down event loop that skips `reconcile_startup`, `on_tick`, and
+/// `shutdown`. No network calls, no filesystem writes.
+pub(crate) fn run_showcase(config: AppConfig) -> Result<()> {
+    let mut terminal = setup_terminal()?;
+    let outcome = showcase_loop(&mut terminal, config);
+    let restore = restore_terminal(&mut terminal);
+    outcome.and(restore)
+}
+
+fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
+    let mut application = app::App::new(config);
+    let mut last_tick = Instant::now();
+
+    while !application.quit {
+        terminal.draw(|frame| render::draw(frame, &application))?;
+
+        let timeout = TICK.saturating_sub(last_tick.elapsed());
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    app::handle_key(&mut application, key);
+                }
+                Event::Resize(_, _) => {}
+                _ => {}
+            }
+        }
+
+        if last_tick.elapsed() >= TICK {
+            // Advance tick_count so blink/spinner animations still work.
+            application.tick_count = application.tick_count.wrapping_add(1);
+            last_tick = Instant::now();
+        }
+    }
+
+    Ok(())
+}
+
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn setup_terminal() -> Result<Term> {

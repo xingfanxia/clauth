@@ -2,7 +2,8 @@ mod fetch;
 mod scheduler;
 
 pub(crate) use fetch::{
-    PlanInfo, UsageInfo, UsageWindow, humanize_duration, iso_to_epoch_secs, now_epoch_secs, now_ms,
+    ExtraUsage, PlanInfo, UsageInfo, UsageWindow, humanize_duration, iso_to_epoch_secs,
+    now_epoch_secs, now_ms,
 };
 pub(crate) use scheduler::{
     ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, FetchStatus, Last429At,
