@@ -10,13 +10,17 @@
 //!
 //! It builds a believable [`AppConfig`] from hard-coded demo values and runs a
 //! stripped-down event loop that skips `reconcile_startup` / `on_tick` /
-//! `shutdown` — no network calls, no filesystem writes, no real config touched.
+//! `shutdown`. The config is in-memory only and `App::new` does no I/O, so the
+//! sole way real data could be touched is a key action — the loop therefore
+//! forwards ONLY navigation + help keys to `handle_key` and drops every key
+//! that refreshes (network), rotates tokens, or writes config/state to disk.
+//! Net effect: no network, no filesystem writes, no real config touched.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::{TICK, Term, app, render, restore_terminal, setup_terminal};
 use crate::profile::{AppConfig, AppState, Profile};
@@ -50,7 +54,7 @@ fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    app::handle_key(&mut application, key);
+                    handle_showcase_key(&mut application, key);
                 }
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -65,6 +69,43 @@ fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Forward only the keys that can't touch real data. Tab switching, cursor
+/// movement, and the help overlay are pure in-memory; everything destructive
+/// (`r` refresh → network, `t` rotate → spends tokens, `n`/⏎/Shift+↑↓ → config
+/// & state writes) is dropped. Quit is handled here, not via `handle_key`.
+fn handle_showcase_key(app: &mut app::App, key: KeyEvent) {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.quit = true;
+        return;
+    }
+
+    // Only the help overlay can be open (every modal-opening key is blocked
+    // below). Let the usual dismissal keys close it.
+    if !app.modals.is_empty() {
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q')
+        ) {
+            app::handle_key(app, key);
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+        // Tab navigation + help: pure in-memory.
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right | KeyCode::Char('?') => {
+            app::handle_key(app, key);
+        }
+        // Cursor movement, but never Shift+↑↓ (that reorders and writes state).
+        KeyCode::Up | KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app::handle_key(app, key);
+        }
+        KeyCode::Char('j' | 'k') => app::handle_key(app, key),
+        _ => {}
+    }
 }
 
 // ── Time helper ───────────────────────────────────────────────────────────────
@@ -115,8 +156,8 @@ fn oauth_profile(
     fallback_threshold: Option<f64>,
     five_util: f64,
     five_resets_in: Option<Duration>,
-    seven_sonnet: Option<f64>,
-    seven_opus: Option<f64>,
+    seven_sonnet: Option<(f64, Duration)>,
+    seven_opus: Option<(f64, Duration)>,
     extra: Option<ExtraUsage>,
     fetch_status: Option<FetchStatus>,
 ) -> Profile {
@@ -124,13 +165,13 @@ fn oauth_profile(
         utilization: five_util,
         resets_at: five_resets_in.map(future_iso),
     });
-    let seven_day_sonnet = seven_sonnet.map(|u| UsageWindow {
+    let seven_day_sonnet = seven_sonnet.map(|(u, reset)| UsageWindow {
         utilization: u,
-        resets_at: None,
+        resets_at: Some(future_iso(reset)),
     });
-    let seven_day_opus = seven_opus.map(|u| UsageWindow {
+    let seven_day_opus = seven_opus.map(|(u, reset)| UsageWindow {
         utilization: u,
-        resets_at: None,
+        resets_at: Some(future_iso(reset)),
     });
     Profile {
         name: name.to_string(),
@@ -200,8 +241,8 @@ fn demo_config() -> AppConfig {
         Some(80.0),
         64.3,
         Some(Duration::from_secs(2 * 3600 + 17 * 60)), // resets in ~2h17m
-        Some(22.1),
-        Some(8.4),
+        Some((22.1, Duration::from_secs(5 * 86400 + 6 * 3600))), // 7d sonnet ~5d
+        Some((8.4, Duration::from_secs(6 * 86400 + 2 * 3600))), // 7d opus ~6d
         None,
         None, // live / fresh, no underline
     );
@@ -223,8 +264,8 @@ fn demo_config() -> AppConfig {
         Some(90.0),
         88.7,
         Some(Duration::from_secs(45 * 60)), // resets in ~45m
-        Some(61.2),
-        Some(33.9),
+        Some((61.2, Duration::from_secs(3 * 86400 + 9 * 3600))), // 7d sonnet ~3d
+        Some((33.9, Duration::from_secs(6 * 86400 + 3600))), // 7d opus ~6d
         Some(extra),
         Some(FetchStatus::Cached), // warning underline
     );
