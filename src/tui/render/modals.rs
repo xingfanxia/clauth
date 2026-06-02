@@ -1,7 +1,7 @@
 //! Modal dialogs — stacking layer above the screen.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
@@ -32,6 +32,26 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// Render a modal sized to its own content: the box snaps to the widest line
+/// (or the title) and the exact line count, so nothing clusters in a corner of
+/// an oversized frame. Chrome is the rounded border (1) + `modal_block`'s
+/// `Padding::new(2, 2, 1, 1)` — 6 cols and 4 rows. The caller pre-aligns any
+/// line it wants centered (buttons, footer hints).
+fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (content_w + 6)
+        .max(title.chars().count() as u16 + 4)
+        .min(area.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
+
+    let rect = centered(area, w, h);
+    frame.render_widget(Clear, rect);
+    let block = modal_block(title);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+}
+
 /// cloudy-tui modal shell: rounded orange (`ACCENT_2`) border, an UPPERCASE
 /// bold+italic dim title, base `BG` fill (no raised tone, no backdrop — the
 /// caller `Clear`s only the modal's own rect).
@@ -54,17 +74,12 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
 }
 
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
-    let rect = centered(area, 60, 10);
-    frame.render_widget(Clear, rect);
     let title = match state.on_confirm {
         ConfirmAction::CaptureConflict(..) => "confirm · duplicate",
         ConfirmAction::Switch(_) => "confirm · switch",
         ConfirmAction::DiscardDivergence(_) => "confirm · discard new login",
         ConfirmAction::RotateAll => "confirm · rotate all tokens",
     };
-    let block = modal_block(title);
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
 
     let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(
         state.message.clone(),
@@ -74,12 +89,13 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         lines.push(Line::from(Span::styled(detail.clone(), theme::dim())));
     }
     lines.push(Line::from(""));
-    lines.push(choice_buttons(state.choice));
+    lines.push(choice_buttons(state.choice).alignment(Alignment::Center));
     lines.push(Line::from(""));
-    lines.push(modal_footer_hints(&[("← →", "choose"), ("⏎", "apply")]));
+    lines.push(
+        modal_footer_hints(&[("← →", "choose"), ("⏎", "apply")]).alignment(Alignment::Center),
+    );
 
-    let para = Paragraph::new(lines).style(theme::base());
-    frame.render_widget(para, inner);
+    draw_modal(frame, area, title, lines);
 }
 
 /// cloudy-tui modal buttons: lowercase action verbs, the focused one in inverse
@@ -104,12 +120,6 @@ fn modal_button(label: &str, focused: bool) -> Span<'static> {
 }
 
 fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
-    let rect = centered(area, 72, 18);
-    frame.render_widget(Clear, rect);
-    let block = modal_block("credentials · divergence");
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
     let options = DivergenceForm::options();
     let cursor = form.cursor.min(options.len() - 1);
 
@@ -151,14 +161,12 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
     }
 
     lines.push(Line::from(""));
-    lines.push(modal_footer_hints(&[
-        ("↑ ↓", "choose"),
-        ("⏎", "apply"),
-        ("⎋", "dismiss"),
-    ]));
+    lines.push(
+        modal_footer_hints(&[("↑ ↓", "choose"), ("⏎", "apply"), ("⎋", "dismiss")])
+            .alignment(Alignment::Center),
+    );
 
-    let para = Paragraph::new(lines).style(theme::base());
-    frame.render_widget(para, inner);
+    draw_modal(frame, area, "credentials · divergence", lines);
 }
 
 fn divergence_option_text(option: DivergenceChoice, active: &str) -> (String, String) {
@@ -179,12 +187,6 @@ fn divergence_option_text(option: DivergenceChoice, active: &str) -> (String, St
 }
 
 fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
-    let rect = centered(area, 60, 9);
-    frame.render_widget(Clear, rect);
-    let block = modal_block("capture · new profile name");
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
     let input = InputState {
         value: value.to_string(),
         cursor: value.len(),
@@ -197,24 +199,18 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
         Line::from(""),
         labelled_input("name", &input, true),
         Line::from(""),
-        modal_footer_hints(&[("⏎", "capture"), ("⎋", "cancel")]),
+        modal_footer_hints(&[("⏎", "capture"), ("⎋", "cancel")]).alignment(Alignment::Center),
     ];
-    let para = Paragraph::new(lines).style(theme::base());
-    frame.render_widget(para, inner);
+    draw_modal(frame, area, "capture · new profile name", lines);
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let rect = centered(area, 70, 24);
-    frame.render_widget(Clear, rect);
     let title = match app.tab {
         Tab::Overview => "help \u{00b7} overview",
         Tab::Usage => "help \u{00b7} usage",
         Tab::Config => "help \u{00b7} config",
         Tab::Fallback => "help \u{00b7} fallback chain",
     };
-    let block = modal_block(title);
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
 
     let tab_specific: Vec<(&str, &[(&str, &str)])> = match app.tab {
         Tab::Overview => vec![(
@@ -289,8 +285,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     for (key, desc) in global {
         lines.push(help_row(key, desc));
     }
-    let para = Paragraph::new(lines).style(theme::base());
-    frame.render_widget(para, inner);
+    draw_modal(frame, area, title, lines);
 }
 
 fn help_row(key: &str, desc: &str) -> Line<'static> {
