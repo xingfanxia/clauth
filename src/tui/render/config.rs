@@ -41,21 +41,12 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
         .profiles
         .iter()
         .map(|p| {
-            let active = cfg.is_active(&p.name);
-            let dot = if active {
-                Span::styled("◆ ", theme::orange())
-            } else {
-                Span::styled("◇ ", theme::faint())
-            };
-            let name_style = if active {
+            let name_style = if cfg.is_active(&p.name) {
                 Style::default().fg(theme::ACCENT_2)
             } else {
                 Style::default().fg(theme::TEXT)
             };
-            ListItem::new(Line::from(vec![
-                dot,
-                Span::styled(p.name.clone(), name_style),
-            ]))
+            ListItem::new(Line::from(Span::styled(p.name.clone(), name_style)))
         })
         .collect();
     items.push(ListItem::new(Line::from(Span::styled(
@@ -70,7 +61,8 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     };
     let list = List::new(items)
         .style(theme::base())
-        .highlight_style(highlight);
+        .highlight_style(highlight)
+        .highlight_symbol("❯ ");
     let mut state = ListState::default();
     state.select(Some(app.config_cursor.min(count)));
     frame.render_stateful_widget(list, inner, &mut state);
@@ -145,11 +137,25 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let editing = draft.and_then(|d| d.active);
     let armed_delete = draft.map(|d| d.armed_delete).unwrap_or(false);
 
+    // Account type — OAuthed (claude.ai) vs API (a custom base url). Derived
+    // from the effective base-url buffer so it tracks the draft live.
+    let is_api = !base_in.value.trim().is_empty();
+    let (type_value, type_style) = if is_api {
+        ("API", theme::accent())
+    } else {
+        ("OAuthed", Style::default().fg(theme::ACCENT_2))
+    };
+
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled(
             hint(actions_focused, editing.is_some(), &snap),
             theme::faint(),
         )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("type{}", " ".repeat(KEY_W - 4)), theme::faint()),
+            Span::styled(type_value, type_style),
+        ]),
         Line::from(""),
     ];
     for (i, row) in rows.iter().enumerate() {
@@ -164,9 +170,31 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
             &base_in,
             &key_in,
         ));
+        // A one-line hint under the focused row, but only when its name isn't
+        // self-explanatory and it isn't mid-edit (the edit caret already cues it).
+        if selected
+            && editing != Some(*row)
+            && let Some(text) = row_hint(*row)
+        {
+            lines.push(Line::from(vec![
+                Span::styled("  └ ", theme::faint()),
+                Span::styled(text, theme::faint()),
+            ]));
+        }
     }
 
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+}
+
+/// Inline help for a config row whose label doesn't explain itself. Returns
+/// `None` for rows that need no gloss (name, delete, create).
+fn row_hint(row: ConfigRow) -> Option<&'static str> {
+    match row {
+        ConfigRow::BaseUrl => Some("custom api endpoint; empty = claude.ai oauth"),
+        ConfigRow::ApiKey => Some("x-api-key for a non-oauth endpoint"),
+        ConfigRow::AutoStart => Some("launch a session on idle to arm the 5h window"),
+        ConfigRow::Name | ConfigRow::Delete | ConfigRow::Create => None,
+    }
 }
 
 fn hint(actions_focused: bool, editing: bool, snap: &Snap) -> &'static str {
@@ -198,7 +226,7 @@ fn detail_row(
     key_in: &InputState,
 ) -> Line<'static> {
     let arrow = if selected {
-        Span::styled("▸ ", theme::accent())
+        Span::styled("❯ ", theme::accent())
     } else {
         Span::raw("  ")
     };

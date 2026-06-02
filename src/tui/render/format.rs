@@ -43,7 +43,7 @@ pub(super) fn fixed_split(value: &str, width: usize) -> (String, String) {
 }
 
 pub(super) fn name_style(profile: &Profile) -> Style {
-    let base = Style::default().fg(theme::TEXT).bold();
+    let base = Style::default().fg(theme::TEXT);
     if !profile.is_oauth() {
         return base;
     }

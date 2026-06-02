@@ -183,16 +183,16 @@ fn fixed_overview_width(
     gap: usize,
 ) -> usize {
     let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
-    // 4 = cursor + dot + spacer before name; +2 = spacer + auto-start marker after 5h.
-    // Timer slot is rendered in the gap before 5h and does not count as a column.
-    // The kind→timer gap is 4 chars narrower than the standard gap (min 1).
+    // 2 = cursor (`❯ ` / two blanks) before name. Timer slot is rendered in the
+    // gap before 5h and does not count as a column. The kind→timer gap is 4 chars
+    // narrower than the standard gap (min 1).
     let narrow = gap.saturating_sub(4).max(1);
     let standard_gaps = column_count.saturating_sub(2);
-    6 + name + kind + five_hour + seven_day + route + standard_gaps * gap + narrow
+    2 + name + kind + five_hour + seven_day + route + standard_gaps * gap + narrow
 }
 
 fn overview_header(widths: &OverviewWidths) -> Line<'static> {
-    let mut spans = vec![Span::styled("    ", theme::label())];
+    let mut spans = vec![Span::styled("  ", theme::label())];
     spans.push(Span::styled(fixed("account", widths.name), theme::label()));
     spans.push(gap(widths));
     spans.push(Span::styled(fixed("type", widths.kind), theme::label()));
@@ -201,7 +201,6 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
     // over the bar by rendering blanks for the slot width.
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
     spans.push(Span::styled(fixed("5h", widths.five_hour), theme::label()));
-    spans.push(Span::raw("  "));
     if widths.seven_day > 0 {
         spans.push(gap(widths));
         spans.push(Span::styled(fixed("7d", widths.seven_day), theme::label()));
@@ -227,14 +226,9 @@ fn render_overview_row(
     let active = cfg.is_active(&profile.name);
     let name_str = profile.name.clone();
     let cursor = if selected {
-        Span::styled("▸ ", theme::accent())
+        Span::styled("❯ ", theme::accent())
     } else {
         Span::raw("  ")
-    };
-    let dot = if active {
-        Span::styled("◆", theme::orange())
-    } else {
-        Span::styled("◇", theme::faint())
     };
     let (name_text, name_pad) = fixed_split(&profile.name, widths.name);
     let name = Span::styled(
@@ -246,15 +240,6 @@ fn render_overview_row(
         },
     );
     let name_pad = Span::raw(name_pad);
-
-    // Auto-start indicator sits after the 5h column so it reads alongside the
-    // usage that triggers the rotation, with a fixed 1-char slot kept in all
-    // rows so subsequent columns stay aligned.
-    let auto_marker = if profile.auto_start && profile.is_oauth() {
-        Span::styled("↻", theme::accent())
-    } else {
-        Span::raw(" ")
-    };
 
     // Per-profile timer slot: braille spinner during any in-flight activity,
     // seconds countdown when Idle. Right-aligned in TIMER_SLOT-1 chars + 1
@@ -289,7 +274,7 @@ fn render_overview_row(
         }
     };
 
-    let mut spans = vec![cursor, dot, Span::raw(" "), name, name_pad, gap(widths)];
+    let mut spans = vec![cursor, name, name_pad, gap(widths)];
     spans.push(Span::styled(
         fixed(&account_type_label(profile), widths.kind),
         account_type_style(profile),
@@ -303,8 +288,6 @@ fn render_overview_row(
     );
     let five_pad = widths.five_hour.saturating_sub(five_text.chars().count());
     spans.push(Span::styled(five_text, five_style));
-    spans.push(Span::raw(" "));
-    spans.push(auto_marker);
     spans.push(Span::raw(" ".repeat(five_pad)));
     if widths.seven_day > 0 {
         spans.push(gap(widths));
@@ -430,10 +413,10 @@ fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'s
     lines
 }
 
-/// One chain member on its own line: a faint ordering rail, the active marker,
-/// a padded name, then a slim 5h gauge with a threshold tick and the figure.
-/// Color lands only on the gauge fill + the percentage; everything else stays
-/// quiet so the row reads at a glance without shouting.
+/// One chain member on its own line: a faint ordering rail, a padded name, then
+/// a slim 5h gauge with a threshold tick and the figure. Color carries the
+/// active state (orange name) and lands on the gauge fill + the percentage;
+/// everything else stays quiet so the row reads at a glance without shouting.
 fn chain_row(
     cfg: &AppConfig,
     name: &str,
@@ -451,11 +434,7 @@ fn chain_row(
     } else {
         "│"
     };
-    let (marker, marker_style) = if active {
-        ("◆", theme::orange())
-    } else {
-        ("◇", theme::faint())
-    };
+    // No active glyph — color carries the active state (orange name vs dim).
     let name_style = if active {
         Style::default().fg(theme::ACCENT_2)
     } else {
@@ -466,7 +445,6 @@ fn chain_row(
     let mut spans = vec![
         Span::styled(format!(" {rail} "), theme::faint()),
         Span::styled(format!("{} ", index + 1), theme::faint()),
-        Span::styled(format!("{marker} "), marker_style),
         Span::styled(format!("{name}{}  ", " ".repeat(name_pad)), name_style),
     ];
 

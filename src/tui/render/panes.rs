@@ -58,21 +58,12 @@ pub(super) fn draw_profile_selector(
         .profiles
         .iter()
         .map(|p| {
-            let active = cfg.is_active(&p.name);
-            let dot = if active {
-                Span::styled("◆ ", theme::orange())
-            } else {
-                Span::styled("◇ ", theme::faint())
-            };
-            let name_style = if active {
+            let name_style = if cfg.is_active(&p.name) {
                 Style::default().fg(theme::ACCENT_2)
             } else {
                 Style::default().fg(theme::TEXT)
             };
-            ListItem::new(Line::from(vec![
-                dot,
-                Span::styled(p.name.clone(), name_style),
-            ]))
+            ListItem::new(Line::from(Span::styled(p.name.clone(), name_style)))
         })
         .collect();
 
@@ -83,7 +74,8 @@ pub(super) fn draw_profile_selector(
     };
     let list = List::new(items)
         .style(theme::base())
-        .highlight_style(highlight);
+        .highlight_style(highlight)
+        .highlight_symbol("❯ ");
     let mut state = ListState::default();
     state.select(Some(selected.min(cfg.profiles.len().saturating_sub(1))));
     frame.render_stateful_widget(list, inner, &mut state);

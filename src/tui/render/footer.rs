@@ -25,7 +25,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ],
         Tab::Usage => &[
             ("↑↓", "account"),
-            ("⏎", "switch"),
             ("r", "refresh"),
             ("?", "help"),
             ("q", "quit"),

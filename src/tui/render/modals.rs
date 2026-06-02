@@ -240,7 +240,7 @@ fn draw_chain_item_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Ch
         .enumerate()
         .map(|(i, (action, label))| {
             let arrow = if i == cursor {
-                Span::styled("▶ ", theme::orange())
+                Span::styled("❯ ", theme::orange())
             } else {
                 Span::raw("  ")
             };
@@ -280,7 +280,7 @@ fn draw_chain_add(frame: &mut Frame<'_>, area: Rect, state: &ChainAddState) {
         .enumerate()
         .map(|(i, name)| {
             let arrow = if i == cursor {
-                Span::styled("▶ ", theme::orange())
+                Span::styled("❯ ", theme::orange())
             } else {
                 Span::raw("  ")
             };
@@ -349,10 +349,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )],
         Tab::Usage => vec![(
             "usage",
-            &[
-                ("\u{2191}\u{2193} / j k", "pick account"),
-                ("\u{23ce}", "switch to it (confirm)"),
-            ][..],
+            &[("\u{2191}\u{2193} / j k", "pick account to inspect")][..],
         )],
         Tab::Config => vec![(
             "config",

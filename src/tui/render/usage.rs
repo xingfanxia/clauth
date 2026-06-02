@@ -63,39 +63,131 @@ fn build_usage_lines(profile: &Profile, inner_w: u16) -> Vec<Line<'static>> {
         return lines;
     }
 
-    match profile.usage.as_ref() {
-        None => lines.push(Line::from(Span::styled("  loading…", theme::faint()))),
-        Some(usage) => {
-            let windows: &[(&str, Option<&UsageWindow>)] = &[
-                ("5h", usage.five_hour.as_ref()),
-                ("7d all", usage.seven_day.as_ref()),
-                ("7d sonnet", usage.seven_day_sonnet.as_ref()),
-                ("7d opus", usage.seven_day_opus.as_ref()),
-            ];
-            let mut blocks: Vec<Vec<Line<'static>>> = Vec::new();
-            for (label, w) in windows {
-                if let Some(w) = w {
-                    blocks.push(bar_block(label, w, inner_w));
-                }
-            }
-            if let Some(extra) = &usage.extra_usage
-                && extra.is_enabled
-            {
-                blocks.push(extra_block(extra, inner_w));
-            }
-            if blocks.is_empty() {
-                lines.push(Line::from(Span::styled("  loading…", theme::faint())));
-            } else {
-                for (i, block) in blocks.into_iter().enumerate() {
-                    if i > 0 {
-                        lines.push(Line::from(""));
-                    }
-                    lines.extend(block);
-                }
-            }
+    if profile.usage.is_none() {
+        lines.push(Line::from(Span::styled("  loading…", theme::faint())));
+        return lines;
+    }
+
+    let stats = collect_stats(profile);
+    if stats.is_empty() {
+        lines.push(Line::from(Span::styled("  loading…", theme::faint())));
+        return lines;
+    }
+
+    let bar_width = uniform_bar_width(&stats, inner_w);
+    for (i, stat) in stats.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(""));
         }
+        lines.extend(stat.render(bar_width));
     }
     lines
+}
+
+/// One renderable usage row: a window or the extra-credit line, reduced to the
+/// few values the bar needs.
+struct Stat {
+    label: String,
+    pct: f64,
+    color: Color,
+    trailing: String,
+}
+
+impl Stat {
+    /// Two-line block: eyebrow + right-aligned %, then a `bar_width`-cell bar
+    /// with the trailing reset/credit suffix. `bar_width` is shared across all
+    /// rows so every bar lines up at the same length.
+    fn render(&self, bar_width: usize) -> Vec<Line<'static>> {
+        let pct_str = format!("{:>3.0}%", self.pct);
+        let header_pad = bar_width
+            .saturating_sub(self.label.chars().count())
+            .saturating_sub(pct_str.chars().count());
+
+        let filled = ((self.pct / 100.0) * bar_width as f64).round() as usize;
+        let filled = filled.min(bar_width);
+        let empty = bar_width - filled;
+
+        vec![
+            Line::from(vec![
+                Span::styled(self.label.clone(), theme::label()),
+                Span::raw(" ".repeat(header_pad)),
+                Span::styled(
+                    pct_str,
+                    Style::default().fg(self.color).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("█".repeat(filled), Style::default().fg(self.color)),
+                Span::styled("░".repeat(empty), Style::default().fg(theme::LINE_STRONG)),
+                Span::styled(self.trailing.clone(), theme::faint()),
+            ]),
+        ]
+    }
+}
+
+/// Every renderable usage row for the account, in display order.
+fn collect_stats(profile: &Profile) -> Vec<Stat> {
+    let Some(usage) = profile.usage.as_ref() else {
+        return Vec::new();
+    };
+    let windows: &[(&str, Option<&UsageWindow>)] = &[
+        ("5h", usage.five_hour.as_ref()),
+        ("7d all", usage.seven_day.as_ref()),
+        ("7d sonnet", usage.seven_day_sonnet.as_ref()),
+        ("7d opus", usage.seven_day_opus.as_ref()),
+    ];
+    let mut stats: Vec<Stat> = Vec::new();
+    for (label, w) in windows {
+        if let Some(w) = w {
+            let pct = w.utilization.clamp(0.0, 100.0);
+            let trailing = format_reset(w)
+                .map(|r| format!("  resets in {r}"))
+                .unwrap_or_default();
+            stats.push(Stat {
+                label: (*label).to_string(),
+                pct,
+                color: theme::util_color(pct),
+                trailing,
+            });
+        }
+    }
+    if let Some(extra) = &usage.extra_usage
+        && extra.is_enabled
+    {
+        let pct = extra.utilization.unwrap_or(0.0).clamp(0.0, 100.0);
+        let sym = match extra.currency.as_deref() {
+            Some("USD") | None => "$",
+            Some(other) => other,
+        };
+        let used = extra.used_credits.unwrap_or(0.0);
+        let limit = extra.monthly_limit.unwrap_or(0.0);
+        stats.push(Stat {
+            label: "extra".to_string(),
+            pct,
+            color: theme::util_color(pct),
+            trailing: format!("  {sym}{used:.2} / {sym}{limit:.2}"),
+        });
+    }
+    stats
+}
+
+/// Uniform bar width across all rows: as wide as possible while still leaving
+/// room for the longest trailing suffix, so every bar lines up.
+fn uniform_bar_width(stats: &[Stat], inner_w: u16) -> usize {
+    let max_trailing = stats
+        .iter()
+        .map(|s| s.trailing.chars().count())
+        .max()
+        .unwrap_or(0);
+    let avail = (inner_w as usize).saturating_sub(max_trailing);
+    if avail >= 10 {
+        // Comfortable case: a readable bar with room to spare for the suffix.
+        avail
+    } else {
+        // Suffix nearly fills the line — keep whatever room is left rather than
+        // forcing a 10-cell bar that would push the suffix off the edge.
+        avail.max(1)
+    }
 }
 
 /// One-line summary above the bars: the account's plan.
@@ -116,64 +208,4 @@ fn meta_line(profile: &Profile) -> Line<'static> {
         Span::styled("plan  ", theme::faint()),
         Span::styled(plan, theme::muted()),
     ])
-}
-
-/// Two-line stat block: eyebrow + right-aligned %, then a full-width bar with a
-/// trailing reset/credit suffix.
-fn bar_block(label: &str, window: &UsageWindow, inner_w: u16) -> Vec<Line<'static>> {
-    let pct = window.utilization.clamp(0.0, 100.0);
-    let color = theme::util_color(pct);
-    let reset_suffix = format_reset(window)
-        .map(|r| format!("  resets in {r}"))
-        .unwrap_or_default();
-    stat_block(label, pct, color, &reset_suffix, inner_w)
-}
-
-fn extra_block(extra: &crate::usage::ExtraUsage, inner_w: u16) -> Vec<Line<'static>> {
-    let pct = extra.utilization.unwrap_or(0.0).clamp(0.0, 100.0);
-    let color = theme::util_color(pct);
-    let currency_sym = match extra.currency.as_deref() {
-        Some("USD") | None => "$",
-        Some(other) => other,
-    };
-    let used = extra.used_credits.unwrap_or(0.0);
-    let limit = extra.monthly_limit.unwrap_or(0.0);
-    let money = format!("  {currency_sym}{used:.2} / {currency_sym}{limit:.2}");
-    stat_block("extra", pct, color, &money, inner_w)
-}
-
-fn stat_block(
-    label: &str,
-    pct: f64,
-    color: Color,
-    trailing: &str,
-    inner_w: u16,
-) -> Vec<Line<'static>> {
-    let label_span = label.to_string();
-    let pct_str = format!("{pct:>3.0}%");
-    let header_pad = (inner_w as usize)
-        .saturating_sub(label_span.chars().count())
-        .saturating_sub(pct_str.chars().count());
-
-    let trailing_len = trailing.chars().count();
-    let bar_width = (inner_w as usize).saturating_sub(trailing_len).max(10);
-    let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
-    let filled = filled.min(bar_width);
-    let empty = bar_width - filled;
-
-    vec![
-        Line::from(vec![
-            Span::styled(label_span, theme::label()),
-            Span::raw(" ".repeat(header_pad)),
-            Span::styled(
-                pct_str,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("█".repeat(filled), Style::default().fg(color)),
-            Span::styled("░".repeat(empty), Style::default().fg(theme::LINE_STRONG)),
-            Span::styled(trailing.to_string(), theme::faint()),
-        ]),
-    ]
 }

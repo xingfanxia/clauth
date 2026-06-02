@@ -994,8 +994,8 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Up/down selects which account's usage to show; ⏎ switches to it. All editing
-/// lives on the Config tab.
+/// Up/down picks which account's usage to show. The pane is read-only; all
+/// editing lives on the Config tab and switching on the Overview tab.
 fn handle_usage_key(app: &mut App, key: KeyEvent) {
     let count = app.profile_count();
     if count == 0 {
@@ -1015,9 +1015,6 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.usage_cursor + 1
             };
-        }
-        KeyCode::Enter => {
-            request_switch_to(app, app.usage_cursor);
         }
         _ => {}
     }
