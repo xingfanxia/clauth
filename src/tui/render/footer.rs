@@ -33,14 +33,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Tab::Config => match app.config_focus {
             ConfigFocus::Profiles => &[
                 ("↑↓", "account"),
-                ("⏎", "edit"),
+                ("⏎", "configure"),
                 ("n", "new"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
             ConfigFocus::Actions => &[
-                ("↑↓", "setting"),
-                ("⏎", "apply"),
+                ("↑↓", "row"),
+                ("⏎", "edit / toggle"),
                 ("⎋", "back"),
                 ("?", "help"),
             ],

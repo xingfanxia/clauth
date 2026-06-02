@@ -9,17 +9,13 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use super::super::app::{
     App, ChainAction, ChainAddState, ChainItemMenuState, ChainThresholdForm, ConfirmAction,
-    ConfirmState, DivergenceChoice, DivergenceForm, EditProfileForm, EndpointField, InputState,
-    Modal, NewProfileField, NewProfileForm, RenameForm, Tab,
+    ConfirmState, DivergenceChoice, DivergenceForm, InputState, Modal, Tab,
 };
 use super::super::theme;
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
     match modal {
-        Modal::NewProfile(form) => draw_new_profile(frame, area, form),
-        Modal::EditProfile(form) => draw_edit_profile(frame, area, form),
-        Modal::Rename(form) => draw_rename(frame, area, form),
         Modal::Confirm(state) => draw_confirm(frame, area, state),
         Modal::Divergence(form) => draw_divergence(frame, area, form),
         Modal::CaptureName(form) => draw_capture_name(frame, area, form.input.value.as_str()),
@@ -56,93 +52,10 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
         .padding(Padding::new(2, 2, 1, 1))
 }
 
-fn draw_new_profile(frame: &mut Frame<'_>, area: Rect, form: &NewProfileForm) {
-    let rect = centered(area, 64, 14);
-    frame.render_widget(Clear, rect);
-    let block = modal_block("new profile");
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let lines = vec![
-        Line::from(Span::styled(
-            "Create a blank OAuth or API endpoint profile.",
-            theme::dim(),
-        )),
-        Line::from(""),
-        labelled_input("name", &form.name, form.focus == NewProfileField::Name),
-        labelled_input(
-            "base url (blank = oauth)",
-            &form.base_url,
-            form.focus == NewProfileField::BaseUrl,
-        ),
-        labelled_input(
-            "api key (only with base url)",
-            &form.api_key,
-            form.focus == NewProfileField::ApiKey,
-        ),
-        Line::from(""),
-        modal_footer_hints(&[("⇥", "next field"), ("⏎", "submit"), ("⎋", "cancel")]),
-    ];
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
-    frame.render_widget(para, inner);
-}
-
-fn draw_edit_profile(frame: &mut Frame<'_>, area: Rect, form: &EditProfileForm) {
-    let rect = centered(area, 64, 12);
-    frame.render_widget(Clear, rect);
-    let block = modal_block(format!("edit · {}", form.name));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let lines = vec![
-        Line::from(Span::styled(
-            "Empty base URL = OAuth profile. API key only applies with a URL.",
-            theme::dim(),
-        )),
-        Line::from(""),
-        labelled_input(
-            "base url",
-            &form.base_url,
-            form.focus == EndpointField::BaseUrl,
-        ),
-        labelled_input(
-            "api key",
-            &form.api_key,
-            form.focus == EndpointField::ApiKey,
-        ),
-        Line::from(""),
-        modal_footer_hints(&[("⇥", "next"), ("⏎", "save"), ("⎋", "cancel")]),
-    ];
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
-    frame.render_widget(para, inner);
-}
-
-fn draw_rename(frame: &mut Frame<'_>, area: Rect, form: &RenameForm) {
-    let rect = centered(area, 60, 9);
-    frame.render_widget(Clear, rect);
-    let block = modal_block(format!("rename · {}", form.old));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let lines = vec![
-        Line::from(Span::styled(
-            "Letters, digits, '-', '_', '.'  ·  no leading '.'",
-            theme::dim(),
-        )),
-        Line::from(""),
-        labelled_input("new name", &form.input, true),
-        Line::from(""),
-        modal_footer_hints(&[("⏎", "rename"), ("⎋", "cancel")]),
-    ];
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
-    frame.render_widget(para, inner);
-}
-
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let rect = centered(area, 60, 10);
     frame.render_widget(Clear, rect);
     let title = match state.on_confirm {
-        ConfirmAction::Delete(_) => "confirm · delete",
         ConfirmAction::CaptureConflict(..) => "confirm · duplicate",
         ConfirmAction::Switch(_) => "confirm · switch",
         ConfirmAction::DiscardDivergence(_) => "confirm · discard new login",
@@ -444,10 +357,11 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Tab::Config => vec![(
             "config",
             &[
-                ("\u{2191}\u{2193} / j k", "pick account, then setting"),
-                ("\u{23ce}", "focus settings / apply setting"),
-                ("edit / rename / delete", "on the settings rows"),
-                ("\u{238b}", "back to account list"),
+                ("\u{2191}\u{2193} / j k", "pick account / + new, then a row"),
+                ("\u{23ce}", "open settings · edit field · flip toggle"),
+                ("\u{23ce} on a field", "edit inline; \u{23ce} again saves"),
+                ("delete", "\u{23ce} once to arm, again to confirm"),
+                ("\u{238b}", "stop editing / back to account list"),
             ][..],
         )],
         Tab::Fallback => vec![(

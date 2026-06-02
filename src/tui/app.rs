@@ -1,8 +1,11 @@
 //! Application state, keymap, and tick logic.
 //!
 //! Layout invariants:
-//!   - The main menu is a single list with profile rows followed by a small
-//!     set of action rows. Indices into this list live in `main_cursor`.
+//!   - The Overview menu is a read-only list of account rows; `main_cursor`
+//!     indexes it. Account creation and editing live on the Config tab.
+//!   - The Config tab is master-detail: an account list (plus a `+ new` row)
+//!     and an inline detail editor (`config_draft`) — no popups for new / edit
+//!     / rename / delete.
 //!   - The chain editor is a second screen with its own cursor.
 //!   - Modals stack: the top of `modals` owns input; events fall through to
 //!     the screen below only when the stack is empty.
@@ -139,39 +142,49 @@ pub(crate) enum ChainAction {
     Back,
 }
 
+/// One editable line in the Config tab's detail pane. The row set is built per
+/// selection by [`config_rows`]: auto-start shows only for OAuth accounts, and
+/// the trailing row swaps between `delete` (an existing account) and `create`
+/// (the `+ new` draft). `Name` / `BaseUrl` / `ApiKey` are text rows; the rest
+/// are single-press toggles or actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EndpointField {
-    BaseUrl,
-    ApiKey,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NewProfileField {
+pub(crate) enum ConfigRow {
     Name,
     BaseUrl,
     ApiKey,
+    AutoStart,
+    Delete,
+    Create,
 }
 
+impl ConfigRow {
+    /// Text rows capture keystrokes when activated; the rest act on ⏎.
+    pub(crate) fn is_text(self) -> bool {
+        matches!(
+            self,
+            ConfigRow::Name | ConfigRow::BaseUrl | ConfigRow::ApiKey
+        )
+    }
+}
+
+/// Inline editor state for the Config detail pane — the replacement for the old
+/// new / edit / rename popups. One draft is built when focus drops into the
+/// detail pane (from a profile row or the `+ new` row) and torn down when focus
+/// returns to the account list.
 #[derive(Debug, Clone)]
-pub(crate) struct NewProfileForm {
+pub(crate) struct ConfigDraft {
+    /// `None` while creating a new account; `Some(name)` while editing an
+    /// existing one. Existing-account text edits commit per-field on ⏎; the new
+    /// draft buffers all three fields until the `create` row fires.
+    pub(crate) editing_name: Option<String>,
     pub(crate) name: InputState,
     pub(crate) base_url: InputState,
     pub(crate) api_key: InputState,
-    pub(crate) focus: NewProfileField,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct EditProfileForm {
-    pub(crate) name: String,
-    pub(crate) base_url: InputState,
-    pub(crate) api_key: InputState,
-    pub(crate) focus: EndpointField,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RenameForm {
-    pub(crate) old: String,
-    pub(crate) input: InputState,
+    /// `Some(row)` while a text row owns the keyboard (caret visible).
+    pub(crate) active: Option<ConfigRow>,
+    /// First ⏎ on the delete row arms it; the second confirms. Any cursor move
+    /// disarms — an inline stand-in for the old delete-confirm popup.
+    pub(crate) armed_delete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -185,7 +198,6 @@ pub(crate) struct ConfirmState {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ConfirmAction {
-    Delete(String),
     /// `bool` = `from_divergence`, carried through so the conflict path
     /// keeps the deferred-detach semantics of the `NewProfile` divergence flow.
     CaptureConflict(Box<CaptureSnapshot>, bool),
@@ -243,20 +255,6 @@ pub(crate) struct ChainItemMenuState {
     pub(crate) cursor: usize,
 }
 
-/// Rows in the Config tab's actions pane for the selected profile. Order is
-/// produced by [`config_actions`] so context-sensitive entries (auto-start is
-/// OAuth-only) shift without the renderer tracking which row is which.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConfigAction {
-    Edit,
-    Rename,
-    ToggleAutoStart,
-    /// Add to / remove from the fallback chain (ordering + thresholds live on
-    /// the Fallback tab).
-    ToggleChain,
-    Delete,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct ChainAddState {
     pub(crate) candidates: Vec<String>,
@@ -271,9 +269,6 @@ pub(crate) struct ChainThresholdForm {
 
 #[derive(Debug, Clone)]
 pub(crate) enum Modal {
-    NewProfile(NewProfileForm),
-    EditProfile(EditProfileForm),
-    Rename(RenameForm),
     Confirm(ConfirmState),
     /// Credential divergence prompt — Overwrite / NewProfile / Discard.
     Divergence(DivergenceForm),
@@ -365,11 +360,6 @@ pub(crate) enum ConfigFocus {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MainItemKind {
     Profile(usize),
-    /// Visual break between the profile rows and action rows. Cursor steps
-    /// over it and Enter is a no-op.
-    ActionSeparator,
-    NewProfile,
-    CaptureCredentials,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -427,8 +417,11 @@ pub(crate) struct App {
     pub(crate) config_cursor: usize,
     /// Which Config pane has focus; gates whether ↑↓ walks profiles or actions.
     pub(crate) config_focus: ConfigFocus,
-    /// Cursor into the actions list on the Config tab's right pane.
+    /// Cursor into the detail rows on the Config tab's right pane.
     pub(crate) config_action_cursor: usize,
+    /// Inline editor for the Config detail pane. `Some` only while the Actions
+    /// pane owns focus; built on entry, torn down on the way back to the list.
+    pub(crate) config_draft: Option<ConfigDraft>,
     /// Cursor into `chain_items()` on the Fallback tab.
     pub(crate) chain_cursor: usize,
 
@@ -530,6 +523,7 @@ impl App {
             config_cursor: 0,
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
+            config_draft: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
             last_state_mtime: app_state_mtime(),
@@ -779,15 +773,9 @@ impl App {
     // ── Main list ────────────────────────────────────────────────────────────
 
     pub(crate) fn main_items(&self) -> Vec<MainItemKind> {
-        let cfg = self.config();
-        let mut items: Vec<MainItemKind> =
-            (0..cfg.profiles.len()).map(MainItemKind::Profile).collect();
-        if !cfg.profiles.is_empty() {
-            items.push(MainItemKind::ActionSeparator);
-        }
-        items.push(MainItemKind::NewProfile);
-        items.push(MainItemKind::CaptureCredentials);
-        items
+        (0..self.config().profiles.len())
+            .map(MainItemKind::Profile)
+            .collect()
     }
 
     /// Number of profiles; the clamp ceiling for the Usage / Config cursors.
@@ -801,23 +789,8 @@ impl App {
     }
 
     pub(crate) fn clamp_main_cursor(&mut self) {
-        let items = self.main_items();
-        let len = items.len();
-        if len == 0 {
-            self.main_cursor = 0;
-            return;
-        }
-        if self.main_cursor >= len {
-            self.main_cursor = len - 1;
-        }
-        // Slide off the separator if a delete left the cursor on it.
-        while matches!(
-            items.get(self.main_cursor),
-            Some(MainItemKind::ActionSeparator)
-        ) && self.main_cursor > 0
-        {
-            self.main_cursor -= 1;
-        }
+        let len = self.config().profiles.len();
+        self.main_cursor = self.main_cursor.min(len.saturating_sub(1));
     }
 
     pub(crate) fn current_main_item(&self) -> Option<MainItemKind> {
@@ -913,6 +886,20 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // A Config text field that's capturing keystrokes owns the keyboard, the
+    // same way a modal would — otherwise typing `n`/`r`/`q` into a name would
+    // fire the global shortcuts below.
+    if app.tab == Tab::Config
+        && app.config_focus == ConfigFocus::Actions
+        && app
+            .config_draft
+            .as_ref()
+            .is_some_and(|d| d.active.is_some())
+    {
+        handle_config_edit_key(app, key);
+        return;
+    }
+
     // Global keys, available on every tab when no modal owns input.
     match key.code {
         KeyCode::Tab | KeyCode::Right => {
@@ -942,13 +929,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('n') => {
-            open_new_profile(app);
+            start_new_account(app);
             return;
         }
         // Esc backs out of a Config sub-focus; otherwise it quits like q.
         KeyCode::Esc => {
             if app.tab == Tab::Config && app.config_focus == ConfigFocus::Actions {
                 app.config_focus = ConfigFocus::Profiles;
+                app.config_draft = None;
             } else {
                 app.quit = true;
             }
@@ -974,6 +962,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
 /// Fallback).
 fn switch_tab(app: &mut App, tab: Tab) {
     app.tab = tab;
+    // Changing tabs drops any in-flight inline config edit.
+    app.config_draft = None;
     match tab {
         Tab::Overview => app.clamp_main_cursor(),
         Tab::Usage => app.usage_cursor = clamp_profile_cursor(app, app.usage_cursor),
@@ -1033,22 +1023,13 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Move the main cursor by one item, wrapping at both ends and skipping
-/// over non-selectable rows (currently just `ActionSeparator`).
+/// Move the main cursor by one account, wrapping at both ends.
 fn step_main_cursor(app: &mut App, delta: i32) {
-    let items = app.main_items();
-    let len = items.len();
+    let len = app.config().profiles.len();
     if len == 0 {
         return;
     }
-    let mut idx = app.main_cursor as i32;
-    for _ in 0..len {
-        idx = (idx + delta).rem_euclid(len as i32);
-        if !matches!(items.get(idx as usize), Some(MainItemKind::ActionSeparator)) {
-            break;
-        }
-    }
-    app.main_cursor = idx as usize;
+    app.main_cursor = (app.main_cursor as i32 + delta).rem_euclid(len as i32) as usize;
 }
 
 /// Ask to switch to the profile at `idx`. No-ops when already active; otherwise
@@ -1079,9 +1060,6 @@ fn activate_main_item(app: &mut App) {
         // No-op when already active; saves the round-trip through the confirm
         // modal and a redundant token refresh.
         MainItemKind::Profile(idx) => request_switch_to(app, idx),
-        MainItemKind::ActionSeparator => {}
-        MainItemKind::NewProfile => open_new_profile(app),
-        MainItemKind::CaptureCredentials => begin_capture(app, false),
     }
 }
 
@@ -1214,39 +1192,6 @@ fn finalize_switch(app: &mut App, name: &str) {
     }
 }
 
-fn open_new_profile(app: &mut App) {
-    app.modals.push(Modal::NewProfile(NewProfileForm {
-        name: InputState::new(""),
-        base_url: InputState::new(""),
-        api_key: InputState::new(""),
-        focus: NewProfileField::Name,
-    }));
-}
-
-fn open_edit_profile(app: &mut App, name: &str) {
-    let cfg = app.config();
-    let Some(profile) = cfg.find(name) else {
-        return;
-    };
-    let modal = Modal::EditProfile(EditProfileForm {
-        name: name.to_string(),
-        base_url: InputState::new(profile.base_url.as_deref().unwrap_or("")),
-        api_key: InputState::new(profile.api_key.as_deref().unwrap_or("")),
-        focus: EndpointField::BaseUrl,
-    });
-    drop(cfg);
-    app.modals.push(modal);
-}
-
-fn open_delete_confirm(app: &mut App, name: &str) {
-    app.modals.push(Modal::Confirm(ConfirmState {
-        message: format!("Delete '{name}'?"),
-        detail: Some("Profile directory and credentials will be removed.".to_string()),
-        choice: false,
-        on_confirm: ConfirmAction::Delete(name.to_string()),
-    }));
-}
-
 fn begin_capture(app: &mut App, from_divergence: bool) {
     let snapshot = match capture_snapshot() {
         Ok(s) => s,
@@ -1374,9 +1319,6 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 app.modals.pop();
             }
         }
-        Modal::NewProfile(_) => handle_new_profile_key(app, key),
-        Modal::EditProfile(_) => handle_edit_profile_key(app, key),
-        Modal::Rename(_) => handle_rename_key(app, key),
         Modal::Confirm(_) => handle_confirm_key(app, key),
         Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
@@ -1386,53 +1328,46 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Config tab keymap. Two panes: the profile list selects an account, ⏎ drops
-/// focus into its actions list, ↑↓ walks actions, ⏎ runs one. Esc (handled
-/// globally) lifts focus back to the profile list. Tab editing happens through
-/// the same modals the per-profile menu uses.
+/// Config tab keymap. Left pane: the account list plus a trailing `+ new` row,
+/// ⏎ drops focus into the detail pane (building a [`ConfigDraft`]). Right pane:
+/// ↑↓ walks the detail rows, ⏎ edits a text row inline / toggles a switch /
+/// arms delete / creates. Esc (handled globally) lifts focus back to the list.
 fn handle_config_key(app: &mut App, key: KeyEvent) {
-    let count = app.profile_count();
-    if count == 0 {
-        return;
-    }
-    app.config_cursor = app.config_cursor.min(count - 1);
+    // The selector has one row per account plus the trailing `+ new` row.
+    let sel_len = app.profile_count() + 1;
+    app.config_cursor = app.config_cursor.min(sel_len - 1);
 
     match app.config_focus {
         ConfigFocus::Profiles => match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 app.config_cursor = if app.config_cursor == 0 {
-                    count - 1
+                    sel_len - 1
                 } else {
                     app.config_cursor - 1
                 };
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                app.config_cursor = if app.config_cursor + 1 >= count {
+                app.config_cursor = if app.config_cursor + 1 >= sel_len {
                     0
                 } else {
                     app.config_cursor + 1
                 };
             }
-            KeyCode::Enter => {
-                app.config_focus = ConfigFocus::Actions;
-                app.config_action_cursor = 0;
-            }
+            KeyCode::Enter => enter_config_detail(app),
             _ => {}
         },
         ConfigFocus::Actions => {
-            let Some(name) = app.profile_name_at(app.config_cursor) else {
+            let rows = config_rows(app);
+            if rows.is_empty() {
                 app.config_focus = ConfigFocus::Profiles;
-                return;
-            };
-            let actions = config_actions(app, &name);
-            if actions.is_empty() {
-                app.config_focus = ConfigFocus::Profiles;
+                app.config_draft = None;
                 return;
             }
-            let last = actions.len() - 1;
+            let last = rows.len() - 1;
             app.config_action_cursor = app.config_action_cursor.min(last);
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
+                    disarm_delete(app);
                     app.config_action_cursor = if app.config_action_cursor == 0 {
                         last
                     } else {
@@ -1440,6 +1375,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                     };
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
+                    disarm_delete(app);
                     app.config_action_cursor = if app.config_action_cursor >= last {
                         0
                     } else {
@@ -1447,8 +1383,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                     };
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    let action = actions[app.config_action_cursor];
-                    run_config_action(app, &name, action);
+                    run_config_row(app, rows[app.config_action_cursor]);
                 }
                 _ => {}
             }
@@ -1456,60 +1391,352 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Settings rows for one profile on the Config tab. Auto-start is OAuth-only;
-/// everything else applies to any profile.
-pub(crate) fn config_actions(app: &App, name: &str) -> Vec<ConfigAction> {
-    let mut out = Vec::with_capacity(5);
-    let is_oauth = app
-        .config()
-        .find(name)
+/// Detail rows for the current selection. The `+ new` row (cursor past the last
+/// account) yields the create form; an account yields its settings, with
+/// auto-start present only for OAuth accounts.
+pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
+    let cfg = app.config();
+    if app.config_cursor >= cfg.profiles.len() {
+        return vec![
+            ConfigRow::Name,
+            ConfigRow::BaseUrl,
+            ConfigRow::ApiKey,
+            ConfigRow::Create,
+        ];
+    }
+    let is_oauth = cfg
+        .profiles
+        .get(app.config_cursor)
         .map(|p| p.is_oauth())
-        .unwrap_or(false);
-    out.push(ConfigAction::Edit);
-    out.push(ConfigAction::Rename);
+        .unwrap_or(true);
+    let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl, ConfigRow::ApiKey];
     if is_oauth {
-        out.push(ConfigAction::ToggleAutoStart);
+        rows.push(ConfigRow::AutoStart);
     }
-    out.push(ConfigAction::ToggleChain);
-    out.push(ConfigAction::Delete);
-    out
+    rows.push(ConfigRow::Delete);
+    rows
 }
 
-fn run_config_action(app: &mut App, name: &str, action: ConfigAction) {
-    match action {
-        ConfigAction::Edit => open_edit_profile(app, name),
-        ConfigAction::Rename => app.modals.push(Modal::Rename(RenameForm {
-            old: name.to_string(),
-            input: InputState::new(name),
-        })),
-        ConfigAction::ToggleAutoStart => toggle_auto_start(app, name),
-        ConfigAction::ToggleChain => toggle_chain_membership(app, name),
-        ConfigAction::Delete => open_delete_confirm(app, name),
+/// Drop focus into the detail pane, seeding a draft for the current selection.
+fn enter_config_detail(app: &mut App) {
+    app.config_action_cursor = 0;
+    if app.config_cursor >= app.profile_count() {
+        app.config_draft = Some(build_draft_new());
+    } else if let Some(name) = app.profile_name_at(app.config_cursor) {
+        app.config_draft = Some(build_draft_existing(app, &name));
+    } else {
+        return;
+    }
+    app.config_focus = ConfigFocus::Actions;
+}
+
+/// Jump straight into the `+ new` create form from anywhere (the global `n`).
+fn start_new_account(app: &mut App) {
+    switch_tab(app, Tab::Config);
+    app.config_cursor = app.profile_count();
+    app.config_action_cursor = 0;
+    app.config_draft = Some(build_draft_new());
+    app.config_focus = ConfigFocus::Actions;
+}
+
+fn build_draft_new() -> ConfigDraft {
+    ConfigDraft {
+        editing_name: None,
+        name: InputState::new(""),
+        base_url: InputState::new(""),
+        api_key: InputState::new(""),
+        active: None,
+        armed_delete: false,
     }
 }
 
-/// Add the profile to the fallback chain (seeding a default threshold) or drop
-/// it. Ordering and per-member thresholds are tuned on the Fallback tab.
-fn toggle_chain_membership(app: &mut App, name: &str) {
-    let in_chain = app.config().state.fallback_chain.iter().any(|n| n == name);
-    {
-        let mut cfg = app.config();
-        if in_chain {
-            cfg.state.fallback_chain.retain(|n| n != name);
-        } else {
-            if let Some(profile) = cfg.find_mut(name)
-                && profile.fallback_threshold.is_none()
-            {
-                profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
-                let _ = save_profile(profile);
+fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
+    let cfg = app.config();
+    let profile = cfg.find(name);
+    ConfigDraft {
+        editing_name: Some(name.to_string()),
+        name: InputState::new(name),
+        base_url: InputState::new(profile.and_then(|p| p.base_url.as_deref()).unwrap_or("")),
+        api_key: InputState::new(profile.and_then(|p| p.api_key.as_deref()).unwrap_or("")),
+        active: None,
+        armed_delete: false,
+    }
+}
+
+/// Cancel a primed delete the moment the cursor moves off the row.
+fn disarm_delete(app: &mut App) {
+    if let Some(d) = app.config_draft.as_mut() {
+        d.armed_delete = false;
+    }
+}
+
+/// ⏎ / space on a detail row: text rows start capturing keystrokes, toggles
+/// flip in place, delete arms then confirms, create commits the draft.
+fn run_config_row(app: &mut App, row: ConfigRow) {
+    if row.is_text() {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.active = Some(row);
+            match row {
+                ConfigRow::Name => d.name.end(),
+                ConfigRow::BaseUrl => d.base_url.end(),
+                ConfigRow::ApiKey => d.api_key.end(),
+                _ => {}
             }
-            cfg.state.fallback_chain.push(name.to_string());
         }
-        let _ = save_app_state(&cfg.state);
+        return;
     }
-    let verb = if in_chain { "removed" } else { "added" };
-    let prep = if in_chain { "from" } else { "to" };
-    app.toast(ToastKind::Success, format!("{verb} '{name}' {prep} chain"));
+    let name = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone());
+    match row {
+        ConfigRow::AutoStart => {
+            if let Some(name) = name {
+                toggle_auto_start(app, &name);
+            }
+        }
+        ConfigRow::Delete => {
+            let armed = app
+                .config_draft
+                .as_ref()
+                .map(|d| d.armed_delete)
+                .unwrap_or(false);
+            match (armed, name) {
+                (true, Some(name)) => perform_delete(app, &name),
+                _ => disarm_delete_inverse(app),
+            }
+        }
+        ConfigRow::Create => commit_new_account(app),
+        _ => {}
+    }
+}
+
+/// Arm the delete row (first ⏎). Split out so `run_config_row` reads cleanly.
+fn disarm_delete_inverse(app: &mut App) {
+    if let Some(d) = app.config_draft.as_mut() {
+        d.armed_delete = true;
+    }
+}
+
+/// Keystrokes while a text row is active. ⏎ commits, ⎋ reverts, else edits.
+fn handle_config_edit_key(app: &mut App, key: KeyEvent) {
+    let Some(active) = app.config_draft.as_ref().and_then(|d| d.active) else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => cancel_config_edit(app, active),
+        KeyCode::Enter => commit_config_field(app, active),
+        _ => {
+            if let Some(d) = app.config_draft.as_mut() {
+                let input = match active {
+                    ConfigRow::Name => &mut d.name,
+                    ConfigRow::BaseUrl => &mut d.base_url,
+                    ConfigRow::ApiKey => &mut d.api_key,
+                    _ => return,
+                };
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// ⎋ inside a field: existing accounts revert the buffer from the live profile;
+/// the new draft simply keeps what's been typed. Either way, editing ends.
+fn cancel_config_edit(app: &mut App, field: ConfigRow) {
+    let editing_name = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone());
+    if let Some(name) = editing_name {
+        let value = {
+            let cfg = app.config();
+            let profile = cfg.find(&name);
+            match field {
+                ConfigRow::Name => name.clone(),
+                ConfigRow::BaseUrl => profile.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+                ConfigRow::ApiKey => profile.and_then(|p| p.api_key.clone()).unwrap_or_default(),
+                _ => String::new(),
+            }
+        };
+        if let Some(d) = app.config_draft.as_mut() {
+            match field {
+                ConfigRow::Name => d.name = InputState::new(&value),
+                ConfigRow::BaseUrl => d.base_url = InputState::new(&value),
+                ConfigRow::ApiKey => d.api_key = InputState::new(&value),
+                _ => {}
+            }
+        }
+    }
+    if let Some(d) = app.config_draft.as_mut() {
+        d.active = None;
+    }
+}
+
+/// ⏎ inside a field. The new draft buffers fields until `create`; existing
+/// accounts persist per field (name → rename, url/key → endpoint).
+fn commit_config_field(app: &mut App, field: ConfigRow) {
+    let is_new = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.editing_name.is_none())
+        .unwrap_or(true);
+    if is_new {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.active = None;
+        }
+        return;
+    }
+    match field {
+        ConfigRow::Name => commit_rename(app),
+        ConfigRow::BaseUrl | ConfigRow::ApiKey => commit_endpoint(app),
+        _ => {
+            if let Some(d) = app.config_draft.as_mut() {
+                d.active = None;
+            }
+        }
+    }
+}
+
+fn commit_rename(app: &mut App) {
+    let Some(d) = app.config_draft.as_ref() else {
+        return;
+    };
+    let Some(old) = d.editing_name.clone() else {
+        return;
+    };
+    let new = d.name.trimmed().to_string();
+    if new == old {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.active = None;
+        }
+        return;
+    }
+    let validation = {
+        let cfg = app.config();
+        validate_profile_name(&new, &cfg.names(), Some(old.as_str()))
+    };
+    if let Err(e) = validation {
+        // Keep the field in edit mode so the user can fix the name in place.
+        app.toast(ToastKind::Danger, format!("{e}"));
+        return;
+    }
+    let result = {
+        let mut cfg = app.config();
+        rename_profile(&mut cfg, &old, &new)
+    };
+    match result {
+        Ok(()) => {
+            app.refresh_tokens();
+            app.last_state_mtime = app_state_mtime();
+            if let Some(d) = app.config_draft.as_mut() {
+                d.editing_name = Some(new.clone());
+                d.name = InputState::new(&new);
+                d.active = None;
+            }
+            app.toast(ToastKind::Success, format!("renamed '{old}' → '{new}'"));
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("rename failed: {e}")),
+    }
+}
+
+fn commit_endpoint(app: &mut App) {
+    let Some(d) = app.config_draft.as_ref() else {
+        return;
+    };
+    let Some(name) = d.editing_name.clone() else {
+        return;
+    };
+    let base_url = d.base_url.trimmed_some();
+    // An API key only makes sense with a base URL; drop it for OAuth.
+    let api_key = if base_url.is_some() {
+        d.api_key.trimmed_some()
+    } else {
+        None
+    };
+    let result = {
+        let mut cfg = app.config();
+        edit_profile_endpoint(&mut cfg, &name, base_url, api_key)
+    };
+    match result {
+        Ok(()) => {
+            // Reseed from the saved profile — the API key may have been dropped.
+            let (base, key) = {
+                let cfg = app.config();
+                let p = cfg.find(&name);
+                (
+                    p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+                    p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
+                )
+            };
+            if let Some(d) = app.config_draft.as_mut() {
+                d.base_url = InputState::new(&base);
+                d.api_key = InputState::new(&key);
+                d.active = None;
+            }
+            app.toast(ToastKind::Success, format!("updated '{name}'"));
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("edit failed: {e}")),
+    }
+}
+
+fn commit_new_account(app: &mut App) {
+    let Some(d) = app.config_draft.as_ref() else {
+        return;
+    };
+    let name = d.name.trimmed().to_string();
+    let base_url = d.base_url.trimmed_some();
+    let api_key = d.api_key.trimmed_some();
+    let validation = {
+        let cfg = app.config();
+        validate_profile_name(&name, &cfg.names(), None)
+    };
+    if let Err(e) = validation {
+        app.toast(ToastKind::Danger, format!("{e}"));
+        return;
+    }
+    // API key only applies to endpoint profiles.
+    let api_key = if base_url.is_some() { api_key } else { None };
+    let result = {
+        let mut cfg = app.config();
+        create_blank_profile(&mut cfg, name.clone(), base_url, api_key)
+    };
+    match result {
+        Ok(()) => {
+            app.refresh_tokens();
+            app.last_state_mtime = app_state_mtime();
+            // Land the cursor on the freshly created account.
+            let new_idx = app
+                .config()
+                .profiles
+                .iter()
+                .position(|p| p.name == name)
+                .unwrap_or(0);
+            app.config_cursor = new_idx;
+            app.config_focus = ConfigFocus::Profiles;
+            app.config_draft = None;
+            app.toast(ToastKind::Success, format!("created '{name}'"));
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("create failed: {e}")),
+    }
+}
+
+fn perform_delete(app: &mut App, name: &str) {
+    let result = {
+        let mut cfg = app.config();
+        delete_profile(&mut cfg, name)
+    };
+    match result {
+        Ok(()) => {
+            app.refresh_tokens();
+            app.last_state_mtime = app_state_mtime();
+            app.config_focus = ConfigFocus::Profiles;
+            app.config_draft = None;
+            app.config_cursor = app.config_cursor.min(app.profile_count().saturating_sub(1));
+            app.clamp_main_cursor();
+            app.toast(ToastKind::Success, format!("deleted '{name}'"));
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("delete failed: {e}")),
+    }
 }
 
 fn toggle_auto_start(app: &mut App, name: &str) {
@@ -1592,168 +1819,6 @@ fn toggle_auto_start(app: &mut App, name: &str) {
     }
 }
 
-fn handle_new_profile_key(app: &mut App, key: KeyEvent) {
-    let Some(Modal::NewProfile(form)) = app.modals.last_mut() else {
-        return;
-    };
-    match key.code {
-        KeyCode::Esc => {
-            app.modals.pop();
-        }
-        KeyCode::Tab | KeyCode::Down => {
-            form.focus = match form.focus {
-                NewProfileField::Name => NewProfileField::BaseUrl,
-                NewProfileField::BaseUrl => NewProfileField::ApiKey,
-                NewProfileField::ApiKey => NewProfileField::Name,
-            };
-        }
-        KeyCode::BackTab | KeyCode::Up => {
-            form.focus = match form.focus {
-                NewProfileField::Name => NewProfileField::ApiKey,
-                NewProfileField::BaseUrl => NewProfileField::Name,
-                NewProfileField::ApiKey => NewProfileField::BaseUrl,
-            };
-        }
-        KeyCode::Enter => {
-            submit_new_profile(app);
-        }
-        _ => {
-            let input = match form.focus {
-                NewProfileField::Name => &mut form.name,
-                NewProfileField::BaseUrl => &mut form.base_url,
-                NewProfileField::ApiKey => &mut form.api_key,
-            };
-            apply_input_edit(input, key);
-        }
-    }
-}
-
-fn submit_new_profile(app: &mut App) {
-    let Some(Modal::NewProfile(form)) = app.modals.last() else {
-        return;
-    };
-    let name = form.name.trimmed().to_string();
-    let base_url = form.base_url.trimmed_some();
-    let api_key = form.api_key.trimmed_some();
-    let validation = {
-        let cfg = app.config();
-        let existing = cfg.names();
-        validate_profile_name(&name, &existing, None)
-    };
-    if let Err(e) = validation {
-        app.toast(ToastKind::Danger, format!("{e}"));
-        return;
-    }
-    // API key only makes sense for endpoint profiles. Drop it if no URL.
-    let api_key = if base_url.is_some() { api_key } else { None };
-    let result = {
-        let mut cfg = app.config();
-        create_blank_profile(&mut cfg, name.clone(), base_url, api_key)
-    };
-    match result {
-        Ok(()) => {
-            app.refresh_tokens();
-            app.last_state_mtime = app_state_mtime();
-            app.modals.pop();
-            app.toast(ToastKind::Success, format!("created '{name}'"));
-        }
-        Err(e) => app.toast(ToastKind::Danger, format!("create failed: {e}")),
-    }
-}
-
-fn handle_edit_profile_key(app: &mut App, key: KeyEvent) {
-    let Some(Modal::EditProfile(form)) = app.modals.last_mut() else {
-        return;
-    };
-    match key.code {
-        KeyCode::Esc => {
-            app.modals.pop();
-        }
-        KeyCode::Tab | KeyCode::Down | KeyCode::Up | KeyCode::BackTab => {
-            form.focus = match form.focus {
-                EndpointField::BaseUrl => EndpointField::ApiKey,
-                EndpointField::ApiKey => EndpointField::BaseUrl,
-            };
-        }
-        KeyCode::Enter => {
-            submit_edit_profile(app);
-        }
-        _ => {
-            let input = match form.focus {
-                EndpointField::BaseUrl => &mut form.base_url,
-                EndpointField::ApiKey => &mut form.api_key,
-            };
-            apply_input_edit(input, key);
-        }
-    }
-}
-
-fn submit_edit_profile(app: &mut App) {
-    let Some(Modal::EditProfile(form)) = app.modals.last() else {
-        return;
-    };
-    let name = form.name.clone();
-    let base_url = form.base_url.trimmed_some();
-    let api_key = if base_url.is_some() {
-        form.api_key.trimmed_some()
-    } else {
-        None
-    };
-    let result = {
-        let mut cfg = app.config();
-        edit_profile_endpoint(&mut cfg, &name, base_url, api_key)
-    };
-    match result {
-        Ok(()) => {
-            app.modals.pop();
-            app.toast(ToastKind::Success, format!("updated '{name}'"));
-        }
-        Err(e) => app.toast(ToastKind::Danger, format!("edit failed: {e}")),
-    }
-}
-
-fn handle_rename_key(app: &mut App, key: KeyEvent) {
-    let Some(Modal::Rename(form)) = app.modals.last_mut() else {
-        return;
-    };
-    match key.code {
-        KeyCode::Esc => {
-            app.modals.pop();
-        }
-        KeyCode::Enter => {
-            let new = form.input.trimmed().to_string();
-            let old = form.old.clone();
-            if new == old {
-                app.modals.pop();
-                return;
-            }
-            let validation = {
-                let cfg = app.config();
-                let existing = cfg.names();
-                validate_profile_name(&new, &existing, Some(old.as_str()))
-            };
-            if let Err(e) = validation {
-                app.toast(ToastKind::Danger, format!("{e}"));
-                return;
-            }
-            let result = {
-                let mut cfg = app.config();
-                rename_profile(&mut cfg, &old, &new)
-            };
-            match result {
-                Ok(()) => {
-                    app.refresh_tokens();
-                    app.last_state_mtime = app_state_mtime();
-                    app.modals.pop();
-                    app.toast(ToastKind::Success, format!("renamed '{old}' → '{new}'"));
-                }
-                Err(e) => app.toast(ToastKind::Danger, format!("rename failed: {e}")),
-            }
-        }
-        _ => apply_input_edit(&mut form.input, key),
-    }
-}
-
 fn handle_confirm_key(app: &mut App, key: KeyEvent) {
     let Some(Modal::Confirm(state)) = app.modals.last_mut() else {
         return;
@@ -1781,21 +1846,6 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
 
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
-        ConfirmAction::Delete(name) => {
-            let result = {
-                let mut cfg = app.config();
-                delete_profile(&mut cfg, &name)
-            };
-            match result {
-                Ok(()) => {
-                    app.refresh_tokens();
-                    app.last_state_mtime = app_state_mtime();
-                    app.clamp_main_cursor();
-                    app.toast(ToastKind::Success, format!("deleted '{name}'"));
-                }
-                Err(e) => app.toast(ToastKind::Danger, format!("delete failed: {e}")),
-            }
-        }
         ConfirmAction::CaptureConflict(snapshot, from_divergence) => {
             app.modals.push(Modal::CaptureName(CaptureNameForm {
                 snapshot,

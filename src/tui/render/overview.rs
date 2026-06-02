@@ -71,14 +71,6 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 &widths,
                 row == app.main_cursor,
             )),
-            MainItemKind::ActionSeparator => ListItem::new(render_separator_row()),
-            MainItemKind::NewProfile => {
-                ListItem::new(render_action_row("+ new profile", row == app.main_cursor))
-            }
-            MainItemKind::CaptureCredentials => ListItem::new(render_action_row(
-                "+ new from current profile",
-                row == app.main_cursor,
-            )),
         })
         .collect();
 
@@ -351,20 +343,6 @@ fn spinner_style(activity: ProfileActivity) -> Style {
     }
 }
 
-fn render_action_row(label: &'static str, selected: bool) -> Line<'static> {
-    let cursor = if selected {
-        Span::styled("▸ ", theme::accent())
-    } else {
-        Span::raw("  ")
-    };
-    Line::from(vec![cursor, Span::styled(label, theme::dim())])
-}
-
-/// Section break above the action rows. Cursor skips this line.
-fn render_separator_row() -> Line<'static> {
-    Line::from(vec![Span::raw("  "), Span::styled("actions", theme::dim())])
-}
-
 fn gap(widths: &OverviewWidths) -> Span<'static> {
     Span::raw(" ".repeat(widths.gap))
 }
@@ -396,7 +374,7 @@ fn chain_summary(cfg: &AppConfig, profile: &Profile) -> (String, Style) {
 }
 
 fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = section_box("fallback", false);
+    let block = section_box("fallback chain", false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -407,98 +385,162 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(para, inner);
 }
 
-fn fallback_flow_lines(cfg: &AppConfig, width: u16, height: u16) -> Vec<Line<'static>> {
+/// Cells in a member's 5h gauge. Enough resolution to read headroom at a
+/// glance, narrow enough to stay quiet.
+const GAUGE_W: usize = 12;
+
+fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'static>> {
     if cfg.state.fallback_chain.is_empty() {
         return vec![
-            Line::from(Span::styled(
-                "No fallback chain configured.",
-                theme::muted(),
-            )),
+            Line::from(Span::styled("no fallback chain yet", theme::muted())),
             Line::from(vec![
-                Span::styled("Fallback", theme::accent()),
+                Span::styled("fallback", theme::accent()),
                 Span::styled(
-                    " tab adds accounts to rotate automatically when a 5h window crosses its threshold.",
+                    " tab adds accounts that rotate automatically when a 5h window crosses its threshold.",
                     theme::dim(),
                 ),
             ]),
         ];
     }
 
-    if width >= 92 {
-        let mut spans = Vec::new();
-        for (i, name) in cfg.state.fallback_chain.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(" ─▶ ", theme::orange()));
-            }
-            let (label, style) = chain_node(cfg, name, i);
-            spans.push(Span::styled(
-                format!(" {label} "),
-                style.bg(theme::BG_RAISED).bold(),
-            ));
-        }
-        spans.push(Span::styled("  ↺", theme::orange()));
-        return vec![Line::from(spans)];
-    }
+    let chain = &cfg.state.fallback_chain;
+    let name_w = chain
+        .iter()
+        .map(|n| n.chars().count())
+        .max()
+        .unwrap_or(8)
+        .clamp(6, 18);
+    let last = chain.len() - 1;
+    let cap = height as usize;
 
     let mut lines = Vec::new();
-    for (i, name) in cfg.state.fallback_chain.iter().enumerate() {
-        let (label, style) = chain_node(cfg, name, i);
-        lines.push(Line::from(Span::styled(label.to_string(), style.bold())));
-        if i + 1 < cfg.state.fallback_chain.len() && lines.len() + 1 < height as usize {
-            lines.push(Line::from(Span::styled("  ↓", theme::faint())));
-        }
-        if lines.len() >= height as usize {
+    for (i, name) in chain.iter().enumerate() {
+        if lines.len() >= cap {
             break;
         }
+        lines.push(chain_row(cfg, name, i, last, name_w));
     }
-    if lines.len() < height as usize {
-        lines.push(Line::from(Span::styled("  ↺ wraps to top", theme::faint())));
+    // Caption only if it won't push a member off-screen: explains the tick + loop.
+    if lines.len() < cap {
+        lines.push(Line::from(vec![
+            Span::styled("     ↺", theme::orange()),
+            Span::styled(" wraps to the top", theme::faint()),
+        ]));
     }
     lines
 }
 
-fn chain_node(cfg: &AppConfig, name: &str, index: usize) -> (String, Style) {
+/// One chain member on its own line: a faint ordering rail, the active marker,
+/// a padded name, then a slim 5h gauge with a threshold tick and the figure.
+/// Color lands only on the gauge fill + the percentage; everything else stays
+/// quiet so the row reads at a glance without shouting.
+fn chain_row(
+    cfg: &AppConfig,
+    name: &str,
+    index: usize,
+    last: usize,
+    name_w: usize,
+) -> Line<'static> {
     let active = cfg.is_active(name);
-    let marker = if active { "◆" } else { "◇" };
-    let Some(profile) = cfg.find(name) else {
-        return (
-            format!("{} {marker} {name} · missing", index + 1),
-            theme::danger(),
-        );
+    let rail = if index == 0 && last == 0 {
+        "╶"
+    } else if index == 0 {
+        "╭"
+    } else if index == last {
+        "╰"
+    } else {
+        "│"
     };
-    let threshold = threshold_for(profile);
-    let pct = profile
-        .usage
-        .as_ref()
-        .and_then(|u| u.five_hour.as_ref())
-        .map(|w| w.utilization);
-    let status = pct
-        .map(|p| format!("{p:.0}/{threshold:.0}%"))
-        .unwrap_or_else(|| format!("—/{threshold:.0}%"));
-    let style = chain_state_style(
-        profile
-            .usage
-            .as_ref()
-            .and_then(|u| u.five_hour.as_ref())
-            .map(|_| profile),
-        pct.unwrap_or(0.0),
-        threshold,
-    );
-    (
-        format!("{} {marker} {} · {status}", index + 1, profile.name),
-        style,
-    )
+    let (marker, marker_style) = if active {
+        ("◆", theme::orange())
+    } else {
+        ("◇", theme::faint())
+    };
+    let name_style = if active {
+        Style::default().fg(theme::ACCENT_2)
+    } else {
+        theme::dim()
+    };
+    let name_pad = name_w.saturating_sub(name.chars().count());
+
+    let mut spans = vec![
+        Span::styled(format!(" {rail} "), theme::faint()),
+        Span::styled(format!("{} ", index + 1), theme::faint()),
+        Span::styled(format!("{marker} "), marker_style),
+        Span::styled(format!("{name}{}  ", " ".repeat(name_pad)), name_style),
+    ];
+
+    match cfg.find(name) {
+        None => spans.push(Span::styled("missing", theme::danger())),
+        Some(profile) => {
+            let threshold = threshold_for(profile);
+            let pct = profile
+                .usage
+                .as_ref()
+                .and_then(|u| u.five_hour.as_ref())
+                .map(|w| w.utilization);
+            spans.extend(gauge_spans(pct, threshold));
+            let (figure, figure_style) = match pct {
+                Some(v) => (
+                    format!("  {v:>3.0}"),
+                    Style::default().fg(chain_health_color(v, threshold)),
+                ),
+                None => ("    —".to_string(), theme::faint()),
+            };
+            spans.push(Span::styled(figure, figure_style));
+            spans.push(Span::styled(format!(" / {threshold:.0}%"), theme::faint()));
+        }
+    }
+    Line::from(spans)
 }
 
-fn chain_state_style(profile: Option<&Profile>, pct: f64, threshold: f64) -> Style {
-    if profile.is_none() {
-        return theme::danger();
-    }
+/// A `GAUGE_W`-cell bar whose fill tracks usage *relative to the member's own
+/// threshold*: a full bar means it has reached the threshold and is about to
+/// rotate off. Fill is colored by headroom; the empty track stays faint.
+fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
+    let fill = pct
+        .map(|v| {
+            let frac = if threshold > 0.0 {
+                (v / threshold).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            (frac * GAUGE_W as f64).round() as usize
+        })
+        .unwrap_or(0)
+        .min(GAUGE_W);
+    let fill_color = pct
+        .map(|v| chain_health_color(v, threshold))
+        .unwrap_or(theme::TEXT_FAINT);
+
+    (0..GAUGE_W)
+        .map(|i| {
+            if i < fill {
+                Span::styled("▰", Style::default().fg(fill_color))
+            } else {
+                Span::styled("▱", theme::faint())
+            }
+        })
+        .collect()
+}
+
+/// 5h headroom against a member's own threshold: green with room, yellow as it
+/// nears, pink once it crosses — the point at which clauth rotates off it.
+fn chain_health_color(pct: f64, threshold: f64) -> ratatui::style::Color {
     if pct >= threshold {
-        theme::danger()
+        theme::DANGER
     } else if pct >= threshold * 0.8 {
-        theme::warning()
+        theme::WARNING
     } else {
-        Style::default().fg(theme::ACCENT_2)
+        theme::SUCCESS
+    }
+}
+
+/// Style for the Overview table's `route` column. Mirrors the pill health map,
+/// red for a missing profile.
+fn chain_state_style(profile: Option<&Profile>, pct: f64, threshold: f64) -> Style {
+    match profile {
+        None => theme::danger(),
+        Some(_) => Style::default().fg(chain_health_color(pct, threshold)),
     }
 }
