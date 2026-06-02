@@ -207,10 +207,28 @@ struct ProfileConfig {
 #[cfg(test)]
 static HOME_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
+/// The one lock every test that redirects `home_dir()` must hold for its whole
+/// duration — whether it sets [`HOME_OVERRIDE`] or the `$HOME` env var. Both
+/// feed the same `home_dir()` resolution, so two such tests running at once
+/// would clobber each other. Co-located with the override it guards so a single
+/// lock covers both mechanisms across every test module.
+#[cfg(test)]
+pub(crate) static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 pub(crate) fn set_home_override(path: PathBuf) {
     if let Ok(mut guard) = HOME_OVERRIDE.lock() {
         *guard = Some(path);
+    }
+}
+
+/// Drop the home override so subsequent tests fall back to the real `$HOME`
+/// (or their own `$HOME` fake). A test that sets the override must clear it on
+/// the way out, or it shadows `$HOME` for every test that runs afterward.
+#[cfg(test)]
+pub(crate) fn clear_home_override() {
+    if let Ok(mut guard) = HOME_OVERRIDE.lock() {
+        *guard = None;
     }
 }
 

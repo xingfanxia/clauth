@@ -24,10 +24,12 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+};
 
 use super::{TICK, Term, app, render, restore_terminal, setup_terminal};
-use crate::profile::{AppConfig, AppState, Profile, set_home_override};
+use crate::profile::{AppConfig, AppState, Profile, home_dir, set_home_override};
 use crate::usage::{ExtraUsage, FetchStatus, PlanInfo, UsageInfo, UsageWindow};
 
 // ── Launch ──────────────────────────────────────────────────────────────────
@@ -57,6 +59,8 @@ fn run(config: AppConfig) -> Result<()> {
 /// bootstrap/scheduler ever spawns.
 fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
     let mut application = app::App::new(config);
+    // Prime the usage stores so windows show simulated utilization, not `-`.
+    seed_usage(&application);
     let mut last_tick = Instant::now();
 
     while !application.quit {
@@ -290,6 +294,41 @@ fn demo_config() -> AppConfig {
     }
 }
 
+// ── Usage simulation ───────────────────────────────────────────────────────────
+
+/// Seed the live usage stores from the demo profiles' baked-in usage, exactly
+/// as a real fetch worker would. Without this the first `on_tick` → `apply_usage`
+/// reads an empty `usage_store` and blanks every window to `-`; with it the demo
+/// utilization, reset timers and fetch-status underlines render — and survive
+/// every subsequent tick, since `apply_usage` now finds the values it expects.
+///
+/// Reads the config and drops its guard before touching the usage locks, so no
+/// lock is held across another (rank order: `usage_store` → `usage_status` are
+/// both inner of `config`).
+fn seed_usage(application: &app::App) {
+    let snapshot: Vec<(String, Option<UsageInfo>, Option<FetchStatus>)> = {
+        let cfg = application.config();
+        cfg.profiles
+            .iter()
+            .map(|p| (p.name.clone(), p.usage.clone(), p.fetch_status))
+            .collect()
+    };
+    if let Ok(mut store) = application.usage_store.lock() {
+        for (name, usage, _) in &snapshot {
+            if let Some(u) = usage {
+                store.insert(name.clone(), u.clone());
+            }
+        }
+    }
+    if let Ok(mut status) = application.usage_status.lock() {
+        for (name, _, fetch_status) in &snapshot {
+            if let Some(s) = fetch_status {
+                status.insert(name.clone(), *s);
+            }
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -325,4 +364,284 @@ fn future_iso_parses() {
     use crate::usage::iso_to_epoch_secs;
     let s = future_iso(Duration::from_secs(3600));
     assert!(iso_to_epoch_secs(&s).is_some());
+}
+
+// ── Non-interactive driver ──────────────────────────────────────────────────
+//
+// The `showcase` test above is the human-driven version: it takes over a real
+// terminal and waits for keypresses. This one runs the *same* `App` against the
+// *same* demo data, but feeds synthetic key events through the production
+// `handle_key` / `on_tick` so CI can prove every action works — switch, edit,
+// toggle, reorder, set threshold (stepper + inline editor), delete — without a
+// TTY and without ever touching the real `~/.clauth` / `~/.claude`.
+
+/// Clears the home override when it drops, so a redirect can't leak past this
+/// test and shadow `$HOME` for whatever runs next — even on a panic.
+struct HomeOverrideReset;
+impl Drop for HomeOverrideReset {
+    fn drop(&mut self) {
+        crate::profile::clear_home_override();
+    }
+}
+
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::NONE,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    }
+}
+
+fn key_shift(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::SHIFT,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    }
+}
+
+/// Press a bare key through the real dispatcher.
+fn press(app: &mut app::App, code: KeyCode) {
+    app::handle_key(app, key(code));
+}
+
+/// Type a string one `Char` event at a time, exactly as a terminal would.
+fn type_str(app: &mut app::App, s: &str) {
+    for c in s.chars() {
+        app::handle_key(app, key(KeyCode::Char(c)));
+    }
+}
+
+/// Drive `on_tick` until `pred` holds (worker results land asynchronously) or a
+/// generous budget is exhausted. Mirrors the real loop's draw→tick cadence.
+fn settle(app: &mut app::App, what: &str, mut pred: impl FnMut(&app::App) -> bool) {
+    for _ in 0..400 {
+        app::on_tick(app);
+        if pred(app) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("'{what}' never settled after draining ticks");
+}
+
+/// Read a profile's `auto_start` / `base_url` / `fallback_threshold` without
+/// holding the config guard across a later `handle_key` (which re-locks it).
+fn base_url_of(app: &app::App, name: &str) -> Option<String> {
+    app.config().find(name).and_then(|p| p.base_url.clone())
+}
+
+fn auto_start_of(app: &app::App, name: &str) -> bool {
+    app.config()
+        .find(name)
+        .map(|p| p.auto_start)
+        .unwrap_or(false)
+}
+
+fn threshold_of(app: &app::App, name: &str) -> Option<f64> {
+    app.config().find(name).and_then(|p| p.fallback_threshold)
+}
+
+#[test]
+fn demo_data_drives_all_actions() {
+    // Hold the shared home lock for the whole test and reset the override on
+    // exit, so no $HOME-based test races us or sees our (dead) sandbox.
+    let _guard = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _reset = HomeOverrideReset;
+    let sandbox = tempfile::tempdir().expect("create driver sandbox");
+    set_home_override(sandbox.path().to_path_buf());
+
+    // Every read/write the App makes from here on resolves under the sandbox.
+    assert_eq!(
+        home_dir().expect("home dir"),
+        sandbox.path(),
+        "home override must redirect every FS access into the sandbox"
+    );
+
+    let mut app = app::App::new(demo_config());
+    seed_usage(&app); // simulate a fetch so usage windows aren't blanked to `-`
+
+    // reconcile_startup is never called → no bootstrap, no scheduler, no fetch.
+    assert!(!app.reconcile_done && !app.bootstrap_started);
+
+    // ── Tab navigation: ⇥ walks forward and wraps, ⇧⇥ walks back. ──
+    use app::Tab;
+    assert_eq!(app.tab, Tab::Overview);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Usage);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Config);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Fallback);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Overview, "Tab wraps back to Overview");
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(app.tab, Tab::Fallback, "BackTab wraps to the last tab");
+    press(&mut app, KeyCode::BackTab);
+    press(&mut app, KeyCode::BackTab);
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(app.tab, Tab::Overview);
+
+    // ── Switch: Overview → highlight "work" → ⏎ raises confirm → ⏎ commits. ──
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("personal")
+    );
+    press(&mut app, KeyCode::Down); // cursor 0 (personal) → 1 (work)
+    press(&mut app, KeyCode::Enter); // request switch → confirm modal
+    assert_eq!(app.modals.len(), 1, "switch raises a confirm modal");
+    press(&mut app, KeyCode::Enter); // accept (choice defaults to yes)
+    assert!(app.modals.is_empty(), "confirming pops the modal");
+    settle(&mut app, "switch to work", |a| {
+        a.config().state.active_profile.as_deref() == Some("work")
+    });
+
+    // Usage is simulated: on_tick ran apply_usage during the switch, and the
+    // seeded windows survived instead of blanking to `-`.
+    {
+        let cfg = app.config();
+        let util = cfg
+            .find("personal")
+            .and_then(|p| p.usage.as_ref())
+            .and_then(|u| u.five_hour.as_ref())
+            .map(|w| w.utilization);
+        assert_eq!(
+            util,
+            Some(64.3),
+            "seeded 5h utilization must survive on_tick → apply_usage"
+        );
+    }
+
+    // The switch persisted into the sandbox, never the real config.
+    let state_file = sandbox.path().join(".clauth").join("profiles.toml");
+    assert!(
+        state_file.exists(),
+        "switch must write profiles.toml inside the sandbox"
+    );
+
+    // ── Edit: Config → "side-project" → BaseUrl row → type a URL → ⏎ saves. ──
+    press(&mut app, KeyCode::Tab); // Overview → Usage
+    press(&mut app, KeyCode::Tab); // Usage → Config
+    assert_eq!(app.tab, Tab::Config);
+    press(&mut app, KeyCode::Down); // 0 → 1
+    press(&mut app, KeyCode::Down); // 1 → 2 (side-project)
+    press(&mut app, KeyCode::Enter); // focus the detail pane
+    assert_eq!(app.config_focus, app::ConfigFocus::Actions);
+    assert!(app.config_draft.is_some());
+    press(&mut app, KeyCode::Down); // Name → BaseUrl
+    press(&mut app, KeyCode::Enter); // start capturing the field
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        Some(app::ConfigRow::BaseUrl)
+    );
+    type_str(&mut app, "https://proxy.test");
+    press(&mut app, KeyCode::Enter); // commit the field
+    assert_eq!(
+        base_url_of(&app, "side-project").as_deref(),
+        Some("https://proxy.test"),
+        "editing the BaseUrl field must persist it"
+    );
+    press(&mut app, KeyCode::Esc); // back out of the detail pane
+    assert_eq!(app.config_focus, app::ConfigFocus::Profiles);
+
+    // ── Toggle: "personal" auto-start ON → OFF (no worker spawns when off). ──
+    assert!(auto_start_of(&app, "personal"), "demo seeds personal ON");
+    press(&mut app, KeyCode::Up); // cursor 2 (side-project) → 1 (work)
+    press(&mut app, KeyCode::Up); // → 0 (personal)
+    press(&mut app, KeyCode::Enter); // focus detail for personal
+    press(&mut app, KeyCode::Down); // Name → BaseUrl
+    press(&mut app, KeyCode::Down); // → ApiKey
+    press(&mut app, KeyCode::Down); // → AutoStart
+    press(&mut app, KeyCode::Enter); // flip it
+    assert!(
+        !auto_start_of(&app, "personal"),
+        "auto-start must toggle off"
+    );
+    press(&mut app, KeyCode::Esc);
+
+    // ── Reorder: Fallback chain [personal, work, side-project] → ⇧↓ on head. ──
+    press(&mut app, KeyCode::Tab); // Config → Fallback
+    assert_eq!(app.tab, Tab::Fallback);
+    {
+        let cfg = app.config();
+        assert_eq!(
+            cfg.state.fallback_chain,
+            vec!["personal", "work", "side-project"]
+        );
+    }
+    app::handle_key(&mut app, key_shift(KeyCode::Down)); // move head down one
+    {
+        let cfg = app.config();
+        assert_eq!(
+            cfg.state.fallback_chain,
+            vec!["work", "personal", "side-project"],
+            "⇧↓ reorders the chain"
+        );
+    }
+    assert_eq!(app.chain_cursor, 1, "cursor follows the moved member");
+
+    // ── Set threshold (stepper): "personal" is now chain index 1, 80% → 85%. ──
+    assert_eq!(threshold_of(&app, "personal"), Some(80.0));
+    press(&mut app, KeyCode::Enter); // enter the member detail pane
+    assert_eq!(app.fallback_focus, app::FallbackFocus::Detail);
+    press(&mut app, KeyCode::Char('+')); // +5 step
+    assert_eq!(
+        threshold_of(&app, "personal"),
+        Some(85.0),
+        "the + stepper bumps the threshold by 5"
+    );
+
+    // ── Set threshold (inline editor): ⏎ opens it, retype 50, ⏎ commits. ──
+    press(&mut app, KeyCode::Enter); // open the inline editor on the Threshold row
+    assert!(app.fallback_threshold_draft.is_some());
+    press(&mut app, KeyCode::Backspace); // clear "85"
+    press(&mut app, KeyCode::Backspace);
+    type_str(&mut app, "50");
+    press(&mut app, KeyCode::Enter); // commit
+    assert!(app.fallback_threshold_draft.is_none());
+    assert_eq!(
+        threshold_of(&app, "personal"),
+        Some(50.0),
+        "the inline editor sets an absolute threshold"
+    );
+    press(&mut app, KeyCode::Esc); // leave the detail pane
+    assert_eq!(app.fallback_focus, app::FallbackFocus::Chain);
+
+    // ── Delete: Config → "research" → Delete row → ⏎ arms, ⏎ confirms. ──
+    let before = app.profile_count();
+    press(&mut app, KeyCode::BackTab); // Fallback → Config
+    assert_eq!(app.tab, Tab::Config);
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down); // 0 → 4 (research, the last profile)
+    }
+    press(&mut app, KeyCode::Enter); // focus detail
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down); // Name → … → Delete (last row)
+    }
+    press(&mut app, KeyCode::Enter); // arm
+    assert!(
+        app.config_draft
+            .as_ref()
+            .map(|d| d.armed_delete)
+            .unwrap_or(false),
+        "first ⏎ arms the delete row"
+    );
+    press(&mut app, KeyCode::Enter); // confirm
+    assert_eq!(app.profile_count(), before - 1, "delete drops one profile");
+    assert!(
+        app.config().find("research").is_none(),
+        "the deleted profile is gone from the config"
+    );
+
+    // ── Quit. ──
+    press(&mut app, KeyCode::Char('q'));
+    assert!(app.quit, "q quits");
+
+    // Nothing escaped the sandbox: home_dir still points there and the real
+    // tree is untouched (the override is the only path the App ever resolved).
+    assert_eq!(home_dir().expect("home dir"), sandbox.path());
 }

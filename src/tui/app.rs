@@ -768,10 +768,15 @@ impl App {
     }
 
     pub(crate) fn refresh_tokens(&self) {
+        // Collect under the `config` lock and drop it *before* taking
+        // `usage_tokens` — folding both into one assignment would hold `config`
+        // (rank CONFIG) across the `usage_tokens.lock()` (rank TOKENS) acquire,
+        // inverting the global lock order (TOKENS is outer of CONFIG).
+        let tokens = collect_tokens(&self.config().profiles);
         *self
             .usage_tokens
             .lock()
-            .expect("usage_tokens mutex poisoned") = collect_tokens(&self.config().profiles);
+            .expect("usage_tokens mutex poisoned") = tokens;
     }
 
     pub(crate) fn manual_refresh(&self) {

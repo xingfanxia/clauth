@@ -686,9 +686,9 @@ fn detect_link_mode_returns_real_on_unix() {
 // and the in-process HOME variable must not be touched concurrently, so every
 // test here must hold HOME_MUTEX for its entire duration.
 
-use std::sync::{LazyLock, Mutex};
-
-static HOME_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+// One process-wide lock guards every home redirect (override static or $HOME
+// env), shared with the other test modules that do the same — see profile.rs.
+use crate::profile::HOME_TEST_LOCK as HOME_MUTEX;
 
 /// Set $HOME to `root` for the duration of `f`. Callers must hold `HOME_MUTEX`
 /// before invoking so no two tests race on the env var.
