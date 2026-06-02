@@ -189,7 +189,6 @@ fn main() -> Result<()> {
 
     platform::init();
     completions::auto_install_once();
-    update::spawn();
     let config = load_config()?;
     tui::run(config)
 }

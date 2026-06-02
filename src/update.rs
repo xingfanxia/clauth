@@ -1,11 +1,22 @@
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use serde::Deserialize;
 
 const API_URL: &str = "https://api.github.com/repos/uwuclxdy/clauth/releases/latest";
+
+/// Outcome of the background update check, surfaced as a TUI toast. Errors stay
+/// silent (best-effort) — only an actionable result is reported.
+pub(crate) enum UpdateEvent {
+    /// A newer release was downloaded and self-installed; effective next launch.
+    Installed(String),
+    /// A newer release exists but can't be self-applied (cargo install, or no
+    /// prebuilt asset for this platform); the user updates it manually.
+    Available(String),
+}
 
 #[derive(Deserialize)]
 struct Release {
@@ -21,22 +32,49 @@ struct Asset {
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Spawns a background thread that silently checks for and applies an update.
+/// Spawns a background thread that checks for an update, applies it when it can
+/// self-replace, and reports the outcome over `tx` for the TUI to toast.
 /// Returns immediately. All errors are discarded — update is best-effort.
-pub(crate) fn spawn() {
-    if is_cargo_installed() {
-        return;
-    }
-    std::thread::spawn(|| {
-        let _ = try_update();
+pub(crate) fn spawn(tx: Sender<UpdateEvent>) {
+    std::thread::spawn(move || {
+        let _ = try_update(&tx);
     });
 }
 
-fn try_update() -> anyhow::Result<()> {
+fn try_update(tx: &Sender<UpdateEvent>) -> anyhow::Result<()> {
+    let release = fetch_latest()?;
+
+    if !is_newer(&release.tag_name, CURRENT_VERSION) {
+        return Ok(());
+    }
+    let version = release.tag_name.trim_start_matches('v').to_string();
+
+    // A cargo-installed binary can't be self-replaced, and an unsupported
+    // platform has no prebuilt asset — notify only, the user updates manually.
     let Some(asset) = asset_name() else {
+        let _ = tx.send(UpdateEvent::Available(version));
+        return Ok(());
+    };
+    if is_cargo_installed() {
+        let _ = tx.send(UpdateEvent::Available(version));
+        return Ok(());
+    }
+
+    let Some(url) = release
+        .assets
+        .iter()
+        .find(|a| a.name == asset)
+        .map(|a| a.browser_download_url.clone())
+    else {
         return Ok(());
     };
 
+    download_and_replace(&url)?;
+    let _ = tx.send(UpdateEvent::Installed(version));
+    Ok(())
+}
+
+fn fetch_latest() -> anyhow::Result<Release> {
     let api_agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(5)))
         .timeout_recv_response(Some(Duration::from_secs(10)))
@@ -52,22 +90,7 @@ fn try_update() -> anyhow::Result<()> {
         .read_to_string()
         .map_err(crate::ureq_error::into_anyhow)?;
 
-    let release: Release = serde_json::from_str(&text)?;
-
-    if !is_newer(&release.tag_name, CURRENT_VERSION) {
-        return Ok(());
-    }
-
-    let Some(url) = release
-        .assets
-        .iter()
-        .find(|a| a.name == asset)
-        .map(|a| a.browser_download_url.clone())
-    else {
-        return Ok(());
-    };
-
-    download_and_replace(&url)
+    Ok(serde_json::from_str(&text)?)
 }
 
 fn download_and_replace(url: &str) -> anyhow::Result<()> {

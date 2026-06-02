@@ -38,6 +38,7 @@ use crate::oauth;
 use crate::profile::{
     AppConfig, ConfigHandle, Profile, app_state_mtime, load_config, save_app_state, save_profile,
 };
+use crate::update::{self, UpdateEvent};
 use crate::usage::{
     ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, Last429At, LastFetchedAt,
     LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult, OpResultReceiver,
@@ -439,6 +440,9 @@ pub(crate) struct App {
     pub(crate) fallback_threshold_draft: Option<InputState>,
 
     pub(crate) toasts: VecDeque<Toast>,
+    /// Outcome of the startup update check, drained in `on_tick` into a toast.
+    /// Best-effort: the worker stays silent on errors and when up to date.
+    pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
 
     pub(crate) last_state_mtime: Option<SystemTime>,
     pub(crate) started_at: Instant,
@@ -509,6 +513,11 @@ impl App {
         let cache_hit_count: ConsecutiveCacheHit = Arc::new(RankedMutex::new(restored_ch));
         let last_429: Last429At = Arc::new(RankedMutex::new(config.state.last_429_at.clone()));
 
+        // Kick the best-effort update check on its own thread; its verdict lands
+        // in `update_results` and is toasted from `on_tick`.
+        let (update_sender, update_results) = std::sync::mpsc::channel::<UpdateEvent>();
+        update::spawn(update_sender);
+
         Self {
             config: Arc::new(RankedMutex::new(config)),
             usage_store,
@@ -545,6 +554,7 @@ impl App {
             config_draft: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
+            update_results,
             last_state_mtime: app_state_mtime(),
             started_at: Instant::now(),
             tick_count: 0,
@@ -2458,6 +2468,25 @@ fn apply_input_edit(input: &mut InputState, key: KeyEvent) {
 pub(crate) fn on_tick(app: &mut App) {
     // Advance the spinner frame. Wraps naturally on the 10-frame braille set.
     app.tick_count = app.tick_count.wrapping_add(1);
+
+    // Surface the background update check. `try_recv` is non-blocking, and the
+    // worker emits at most one event, so this drains cheaply every tick.
+    while let Ok(ev) = app.update_results.try_recv() {
+        match ev {
+            UpdateEvent::Installed(v) => {
+                app.toast(
+                    ToastKind::Success,
+                    format!("updated to v{v} — restart to apply"),
+                );
+            }
+            UpdateEvent::Available(v) => {
+                app.toast(
+                    ToastKind::Info,
+                    format!("update available: v{v} — run `cargo install clauth`"),
+                );
+            }
+        }
+    }
 
     // Drain completed op results posted by workers. Each result clears the
     // profile's activity slot back to Idle, surfaces errors as toasts, and —
