@@ -1,4 +1,5 @@
-//! Top bar: claude glyph + title block (brand, screen eyebrow).
+//! Top bar: claude glyph on the left; brand, account count, and the tab bar
+//! stacked in the text column to the right. Three rows, no dead space.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -6,9 +7,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, Screen};
+use super::super::app::App;
 use super::super::theme;
-use crate::format::plan_label;
+use super::tabs;
 
 const VERSION_SUFFIX: &str = concat!("  v", env!("CARGO_PKG_VERSION"));
 
@@ -19,73 +20,29 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area);
 
     draw_logo(frame, cols[0], app);
-    draw_title(frame, cols[1], app);
-}
 
-fn draw_title(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let cfg = app.config();
-    let active = cfg.state.active_profile.as_deref();
-    let active_span = match active {
-        Some(name) => Span::styled(format!("active: {name}"), theme::accent()),
-        None => Span::styled("no active profile", theme::warning()),
-    };
+    // Right column: brand, account count, tab bar — one per row, aligned.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(cols[1]);
 
+    let n = app.config().profiles.len();
     let title = Line::from(vec![
         Span::styled("clauth", Style::default().fg(theme::TEXT).bold()),
         Span::styled(VERSION_SUFFIX, theme::faint()),
     ]);
-    let eyebrow = match app.screen {
-        Screen::Overview => {
-            let n = cfg.profiles.len();
-            Line::from(vec![
-                Span::styled("OVERVIEW", theme::label()),
-                Span::raw("  "),
-                active_span,
-                Span::styled(format!("  ·  {n} account{}", plural(n)), theme::faint()),
-            ])
-        }
-        Screen::Chain => {
-            let n = cfg.state.fallback_chain.len();
-            Line::from(vec![
-                Span::styled("FALLBACK CHAIN", theme::label()),
-                Span::raw("  "),
-                Span::styled(format!("{n} profile{}", plural(n)), theme::muted()),
-            ])
-        }
-        Screen::ProfileDetail { profile_index } => {
-            let profile = cfg.profiles.get(profile_index);
-            let name = profile.map(|p| p.name.as_str()).unwrap_or("—");
-            let kind = profile
-                .map(|p| {
-                    if !p.is_oauth() {
-                        "endpoint".to_string()
-                    } else {
-                        p.usage
-                            .as_ref()
-                            .and_then(|u| u.plan.as_ref())
-                            .map(plan_label)
-                            .unwrap_or_else(|| "oauth".to_string())
-                    }
-                })
-                .unwrap_or_else(|| "—".to_string());
-            let active = profile.is_some_and(|p| cfg.is_active(&p.name));
-            Line::from(vec![
-                Span::styled(name.to_string(), Style::default().fg(theme::TEXT).bold()),
-                Span::styled("  ·  ", theme::faint()),
-                Span::styled(kind, theme::faint()),
-                Span::styled("  ·  ", theme::faint()),
-                if active {
-                    Span::styled("active", theme::accent())
-                } else {
-                    Span::styled("inactive", theme::faint())
-                },
-            ])
-        }
-    };
-
-    drop(cfg);
-    let para = Paragraph::new(vec![title, eyebrow]).style(theme::base());
-    frame.render_widget(para, area);
+    let count = Line::from(Span::styled(
+        format!("{n} account{}", plural(n)),
+        theme::faint(),
+    ));
+    frame.render_widget(Paragraph::new(title).style(theme::base()), rows[0]);
+    frame.render_widget(Paragraph::new(count).style(theme::base()), rows[1]);
+    tabs::draw(frame, rows[2], app);
 }
 
 fn plural(n: usize) -> &'static str {

@@ -10,8 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use super::super::app::{
     App, ChainAction, ChainAddState, ChainItemMenuState, ChainThresholdForm, ConfirmAction,
     ConfirmState, DivergenceChoice, DivergenceForm, EditProfileForm, EndpointField, InputState,
-    Modal, NewProfileField, NewProfileForm, ProfileMenuAction, ProfileMenuState, RenameForm,
-    Screen, profile_menu_options,
+    Modal, NewProfileField, NewProfileForm, RenameForm, Tab,
 };
 use super::super::theme;
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
@@ -24,7 +23,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::Confirm(state) => draw_confirm(frame, area, state),
         Modal::Divergence(form) => draw_divergence(frame, area, form),
         Modal::CaptureName(form) => draw_capture_name(frame, area, form.input.value.as_str()),
-        Modal::ProfileMenu(state) => draw_profile_menu(frame, area, app, state),
         Modal::ChainItemMenu(state) => draw_chain_item_menu(frame, area, app, state),
         Modal::ChainAdd(state) => draw_chain_add(frame, area, state),
         Modal::ChainThreshold(form) => draw_chain_threshold(frame, area, form),
@@ -44,10 +42,9 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn modal_block(title: impl Into<String>) -> Block<'static> {
-    let title_text = title.into().to_uppercase();
     let title_line = Line::from(vec![
         Span::raw(" "),
-        Span::styled(title_text, theme::label()),
+        Span::styled(title.into(), theme::dim()),
         Span::raw(" "),
     ]);
     Block::default()
@@ -291,66 +288,6 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
     frame.render_widget(para, inner);
 }
 
-fn draw_profile_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &ProfileMenuState) {
-    let options = profile_menu_options(app, &state.name);
-    let body_height = options.len() as u16 + 4;
-    let rect = centered(area, 56, body_height.max(8));
-    frame.render_widget(Clear, rect);
-    let block = modal_block(format!("profile \u{00b7} {}", state.name));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let cursor = state.cursor.min(options.len().saturating_sub(1));
-    let auto_on = app
-        .config()
-        .find(&state.name)
-        .map(|p| p.auto_start)
-        .unwrap_or(false);
-
-    let mut lines: Vec<Line<'_>> = options
-        .iter()
-        .enumerate()
-        .map(|(i, action)| {
-            let arrow = if i == cursor {
-                Span::styled("\u{25b6} ", theme::orange())
-            } else {
-                Span::raw("  ")
-            };
-            let label = profile_menu_label(*action, auto_on);
-            let style = match action {
-                ProfileMenuAction::Delete => theme::danger(),
-                ProfileMenuAction::Back => theme::faint(),
-                _ => Style::default().fg(theme::TEXT),
-            };
-            Line::from(vec![arrow, Span::styled(label, style)])
-        })
-        .collect();
-    lines.push(Line::from(""));
-    lines.push(modal_footer_hints(&[
-        ("\u{2191}\u{2193}", "nav"),
-        ("\u{23ce}", "select"),
-        ("\u{238b}", "close"),
-    ]));
-    let para = Paragraph::new(lines).style(theme::base().bg(theme::BG_RAISED));
-    frame.render_widget(para, inner);
-}
-
-fn profile_menu_label(action: ProfileMenuAction, auto_on: bool) -> String {
-    match action {
-        ProfileMenuAction::Edit => "Edit endpoint".to_string(),
-        ProfileMenuAction::Rename => "Rename".to_string(),
-        ProfileMenuAction::ToggleAutoStart => {
-            if auto_on {
-                "Auto-start usage: on  \u{2192}  turn off".to_string()
-            } else {
-                "Auto-start usage: off  \u{2192}  turn on".to_string()
-            }
-        }
-        ProfileMenuAction::Delete => "Delete profile".to_string(),
-        ProfileMenuAction::Back => "\u{2190} Back".to_string(),
-    }
-}
-
 fn draw_chain_item_menu(frame: &mut Frame<'_>, area: Rect, app: &App, state: &ChainItemMenuState) {
     let rect = centered(area, 56, 14);
     frame.render_widget(Clear, rect);
@@ -478,65 +415,72 @@ fn draw_chain_threshold(frame: &mut Frame<'_>, area: Rect, form: &ChainThreshold
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rect = centered(area, 70, 24);
     frame.render_widget(Clear, rect);
-    let title = match app.screen {
-        Screen::Overview => "help \u{00b7} overview",
-        Screen::Chain => "help \u{00b7} fallback chain",
-        Screen::ProfileDetail { .. } => "help \u{00b7} profile detail",
+    let title = match app.tab {
+        Tab::Overview => "help \u{00b7} overview",
+        Tab::Usage => "help \u{00b7} usage",
+        Tab::Config => "help \u{00b7} config",
+        Tab::Fallback => "help \u{00b7} fallback chain",
     };
     let block = modal_block(title);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let screen_specific: Vec<(&str, &[(&str, &str)])> = match app.screen {
-        Screen::Overview => vec![
-            (
-                "ACCOUNTS",
-                &[
-                    ("\u{23ce}", "switch to selected profile (confirm)"),
-                    ("m", "open per-profile menu (edit / rename / delete)"),
-                    ("d", "open profile details"),
-                    ("f", "open fallback chain"),
-                    (
-                        "Shift+\u{2191} / Shift+\u{2193}",
-                        "reorder profile up / down",
-                    ),
-                ][..],
-            ),
-            (
-                "LIST",
-                &[
-                    ("\u{2191}\u{2193} / j k", "move cursor"),
-                    ("r", "refresh usage now"),
-                ][..],
-            ),
-        ],
-        Screen::Chain => vec![(
-            "CHAIN",
+    let tab_specific: Vec<(&str, &[(&str, &str)])> = match app.tab {
+        Tab::Overview => vec![(
+            "accounts",
             &[
                 ("\u{2191}\u{2193} / j k", "move cursor"),
-                ("\u{23ce}", "open entry / add profile"),
-                ("\u{238b}", "back to overview"),
-                ("r", "refresh usage now"),
+                ("\u{23ce}", "switch to selected account (confirm)"),
+                ("Shift+\u{2191}\u{2193}", "reorder account up / down"),
             ][..],
         )],
-        Screen::ProfileDetail { .. } => vec![(
-            "PROFILE",
+        Tab::Usage => vec![(
+            "usage",
             &[
-                ("m", "open per-profile menu (edit / rename / delete)"),
-                ("r", "refresh usage now"),
-                ("\u{238b}", "back to overview"),
+                ("\u{2191}\u{2193} / j k", "pick account"),
+                ("\u{23ce}", "switch to it (confirm)"),
+            ][..],
+        )],
+        Tab::Config => vec![(
+            "config",
+            &[
+                ("\u{2191}\u{2193} / j k", "pick account, then setting"),
+                ("\u{23ce}", "focus settings / apply setting"),
+                ("edit / rename / delete", "on the settings rows"),
+                ("\u{238b}", "back to account list"),
+            ][..],
+        )],
+        Tab::Fallback => vec![(
+            "fallback chain",
+            &[
+                ("\u{2191}\u{2193} / j k", "move cursor"),
+                ("\u{23ce}", "open entry / add account"),
             ][..],
         )],
     };
 
+    let nav: &[(&str, &str)] = &[
+        ("\u{21e5} / \u{21e4}", "next / previous tab"),
+        ("\u{2190} \u{2192}", "previous / next tab"),
+    ];
+
     let global: &[(&str, &str)] = &[
+        ("n", "new account"),
+        ("r", "refresh usage now"),
+        ("t", "rotate all tokens"),
         ("?", "toggle this help"),
         ("q", "quit"),
         ("Ctrl+C", "quit from anywhere"),
     ];
 
     let mut lines: Vec<Line<'_>> = Vec::new();
-    for (section, entries) in &screen_specific {
+    lines.push(Line::from(Span::styled("tabs", theme::label())));
+    lines.push(Line::from(""));
+    for (key, desc) in nav {
+        lines.push(help_row(key, desc));
+    }
+    lines.push(Line::from(""));
+    for (section, entries) in &tab_specific {
         lines.push(Line::from(Span::styled(*section, theme::label())));
         lines.push(Line::from(""));
         for (key, desc) in *entries {
@@ -544,7 +488,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(Span::styled("GLOBAL", theme::label())));
+    lines.push(Line::from(Span::styled("global", theme::label())));
     lines.push(Line::from(""));
     for (key, desc) in global {
         lines.push(help_row(key, desc));

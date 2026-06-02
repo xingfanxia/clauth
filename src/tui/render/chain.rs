@@ -1,38 +1,33 @@
-//! Fallback chain editor screen.
+//! Fallback chain editor — the Fallback tab body.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph};
+use ratatui::widgets::{List, ListItem, Paragraph};
 
 use super::super::app::{App, ChainItemKind, chain_items};
 use super::super::theme;
+use super::panes::section_box;
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let items = chain_items(app);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(theme::LINE))
-        .title(Line::from(Span::styled(" FALLBACK CHAIN ", theme::label())))
-        .padding(Padding::new(2, 2, 1, 1));
+    let block = section_box("chain", false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     if app.config().state.fallback_chain.is_empty() {
         let hint = Paragraph::new(vec![
-            Line::from(Span::styled("Chain is empty.", theme::muted())),
+            Line::from(Span::styled("chain is empty", theme::muted())),
             Line::from(""),
             Line::from(Span::styled(
-                "Add a profile to enable auto-switch when its 5h window crosses",
+                "add an account to auto-switch when its 5h window crosses the",
                 theme::dim(),
             )),
             Line::from(Span::styled(
-                "the threshold. clauth will rotate to the next chain member.",
+                "threshold. clauth rotates to the next chain member.",
                 theme::dim(),
             )),
         ])
@@ -116,11 +111,7 @@ fn render_chain_row(app: &App, item: ChainItemKind) -> Line<'static> {
         }
         ChainItemKind::Add => Line::from(vec![
             Span::styled("    + ", theme::orange()),
-            Span::styled("Add profile to chain", theme::muted()),
-        ]),
-        ChainItemKind::Back => Line::from(vec![
-            Span::raw("    "),
-            Span::styled("← Back", theme::faint()),
+            Span::styled("add profile to chain", theme::muted()),
         ]),
     }
 }

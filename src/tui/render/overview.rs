@@ -1,11 +1,10 @@
-//! Overview screen: accounts list + fallback flow widget.
+//! Overview tab: accounts table + fallback flow, inside one content frame.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 
 use super::super::app::{App, MainItemKind};
 use super::super::theme;
@@ -13,6 +12,7 @@ use super::format::{
     account_type_label, account_type_style, fixed, fixed_split, name_style, window_summary_parts,
     window_summary_span,
 };
+use super::panes::section_box;
 use crate::fallback::threshold_for;
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{ProfileActivity, now_ms};
@@ -28,7 +28,7 @@ const TIMER_SLOT: usize = 5;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let target = if area.height >= 18 { 8 } else { 5 };
-    let cap = area.height.saturating_sub(6).max(3);
+    let cap = area.height.saturating_sub(7).max(3);
     let chain_height = target.min(cap);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -40,20 +40,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let title = Line::from(vec![
-        Span::styled(" ACCOUNTS ", theme::label()),
-        Span::styled(
-            format!("{} total", app.config().profiles.len()),
-            theme::faint(),
-        ),
-    ]);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(theme::LINE))
-        .title(title)
-        .padding(Padding::horizontal(1));
+    let block = section_box("accounts", false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -90,10 +77,6 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
             MainItemKind::CaptureCredentials => ListItem::new(render_action_row(
                 "+ new from current profile",
-                row == app.main_cursor,
-            )),
-            MainItemKind::OpenChain => ListItem::new(render_action_row(
-                "→ fallback chain",
                 row == app.main_cursor,
             )),
         })
@@ -379,10 +362,7 @@ fn render_action_row(label: &'static str, selected: bool) -> Line<'static> {
 
 /// Section break above the action rows. Cursor skips this line.
 fn render_separator_row() -> Line<'static> {
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled("ACTIONS", theme::label()),
-    ])
+    Line::from(vec![Span::raw("  "), Span::styled("actions", theme::dim())])
 }
 
 fn gap(widths: &OverviewWidths) -> Span<'static> {
@@ -416,15 +396,7 @@ fn chain_summary(cfg: &AppConfig, profile: &Profile) -> (String, Style) {
 }
 
 fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(theme::LINE))
-        .title(Line::from(vec![
-            Span::styled(" FALLBACK ", Style::default().fg(theme::ACCENT_2).bold()),
-            Span::styled("flow", theme::faint()),
-        ]))
-        .padding(Padding::horizontal(1));
+    let block = section_box("fallback", false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -443,9 +415,9 @@ fn fallback_flow_lines(cfg: &AppConfig, width: u16, height: u16) -> Vec<Line<'st
                 theme::muted(),
             )),
             Line::from(vec![
-                Span::styled("f", theme::accent()),
+                Span::styled("Fallback", theme::accent()),
                 Span::styled(
-                    " opens the chain editor. Add accounts to rotate automatically when a 5h window crosses its threshold.",
+                    " tab adds accounts to rotate automatically when a 5h window crosses its threshold.",
                     theme::dim(),
                 ),
             ]),

@@ -243,22 +243,18 @@ pub(crate) struct ChainItemMenuState {
     pub(crate) cursor: usize,
 }
 
-/// Per-profile actions popup. Cursor is into the list returned by
-/// `profile_menu_options` so disabled / context-sensitive entries shift
-/// without the caller having to remember which row is which.
-#[derive(Debug, Clone)]
-pub(crate) struct ProfileMenuState {
-    pub(crate) name: String,
-    pub(crate) cursor: usize,
-}
-
+/// Rows in the Config tab's actions pane for the selected profile. Order is
+/// produced by [`config_actions`] so context-sensitive entries (auto-start is
+/// OAuth-only) shift without the renderer tracking which row is which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProfileMenuAction {
+pub(crate) enum ConfigAction {
     Edit,
     Rename,
     ToggleAutoStart,
+    /// Add to / remove from the fallback chain (ordering + thresholds live on
+    /// the Fallback tab).
+    ToggleChain,
     Delete,
-    Back,
 }
 
 #[derive(Debug, Clone)]
@@ -282,7 +278,6 @@ pub(crate) enum Modal {
     /// Credential divergence prompt — Overwrite / NewProfile / Discard.
     Divergence(DivergenceForm),
     CaptureName(CaptureNameForm),
-    ProfileMenu(ProfileMenuState),
     ChainItemMenu(ChainItemMenuState),
     ChainAdd(ChainAddState),
     ChainThreshold(ChainThresholdForm),
@@ -315,13 +310,54 @@ const TOAST_CAPACITY: usize = 4;
 /// How long a toast stays visible before fading off the stack.
 const TOAST_TTL: Duration = Duration::from_secs(4);
 
-// ── Screens ───────────────────────────────────────────────────────────────────
+// ── Tabs ──────────────────────────────────────────────────────────────────────
 
+/// Top-level views, switched by ⇥ / ⇧⇥ / ← → and shown in the tab bar. Every
+/// tab shares the same background workers; only the body and keymap change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Screen {
+pub(crate) enum Tab {
+    /// Accounts table + at-a-glance usage; the home view.
     Overview,
-    Chain,
-    ProfileDetail { profile_index: usize },
+    /// Per-account usage breakdown (all windows, reset timers, extra credits).
+    Usage,
+    /// Per-account settings: endpoint, rename, auto-start, chain membership,
+    /// delete. Master-detail: a profile list plus an actions pane.
+    Config,
+    /// Fallback chain editor — ordering and per-member thresholds.
+    Fallback,
+}
+
+impl Tab {
+    pub(crate) const ALL: [Tab; 4] = [Tab::Overview, Tab::Usage, Tab::Config, Tab::Fallback];
+
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Tab::Overview => "Overview",
+            Tab::Usage => "Usage",
+            Tab::Config => "Config",
+            Tab::Fallback => "Fallback",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+
+    pub(crate) fn next(self) -> Tab {
+        Tab::ALL[(self.index() + 1) % Tab::ALL.len()]
+    }
+
+    pub(crate) fn prev(self) -> Tab {
+        Tab::ALL[(self.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
+    }
+}
+
+/// Which pane owns the cursor on the Config tab. `Profiles` selects which
+/// account to configure; `Actions` walks that account's settings list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigFocus {
+    Profiles,
+    Actions,
 }
 
 // ── Overview list items ───────────────────────────────────────────────────────
@@ -334,7 +370,6 @@ pub(crate) enum MainItemKind {
     ActionSeparator,
     NewProfile,
     CaptureCredentials,
-    OpenChain,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -381,10 +416,20 @@ pub(crate) struct App {
     pub(crate) cache_hit_count: ConsecutiveCacheHit,
     pub(crate) last_429: Last429At,
 
-    pub(crate) screen: Screen,
+    pub(crate) tab: Tab,
     pub(crate) modals: Vec<Modal>,
 
+    /// Cursor into `main_items()` on the Overview tab (profiles + action rows).
     pub(crate) main_cursor: usize,
+    /// Selected profile index on the Usage tab.
+    pub(crate) usage_cursor: usize,
+    /// Selected profile index on the Config tab's left pane.
+    pub(crate) config_cursor: usize,
+    /// Which Config pane has focus; gates whether ↑↓ walks profiles or actions.
+    pub(crate) config_focus: ConfigFocus,
+    /// Cursor into the actions list on the Config tab's right pane.
+    pub(crate) config_action_cursor: usize,
+    /// Cursor into `chain_items()` on the Fallback tab.
     pub(crate) chain_cursor: usize,
 
     pub(crate) toasts: VecDeque<Toast>,
@@ -478,9 +523,13 @@ impl App {
             ok_count,
             cache_hit_count,
             last_429,
-            screen: Screen::Overview,
+            tab: Tab::Overview,
             modals: Vec::new(),
             main_cursor: 0,
+            usage_cursor: 0,
+            config_cursor: 0,
+            config_focus: ConfigFocus::Profiles,
+            config_action_cursor: 0,
             chain_cursor: 0,
             toasts: VecDeque::new(),
             last_state_mtime: app_state_mtime(),
@@ -738,8 +787,17 @@ impl App {
         }
         items.push(MainItemKind::NewProfile);
         items.push(MainItemKind::CaptureCredentials);
-        items.push(MainItemKind::OpenChain);
         items
+    }
+
+    /// Number of profiles; the clamp ceiling for the Usage / Config cursors.
+    pub(crate) fn profile_count(&self) -> usize {
+        self.config().profiles.len()
+    }
+
+    /// Name of the profile a tab cursor points at, if any.
+    pub(crate) fn profile_name_at(&self, idx: usize) -> Option<String> {
+        self.config().profiles.get(idx).map(|p| p.name.clone())
     }
 
     pub(crate) fn clamp_main_cursor(&mut self) {
@@ -855,33 +913,24 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    match app.screen {
-        Screen::Overview => handle_main_key(app, key),
-        Screen::Chain => handle_chain_key(app, key),
-        Screen::ProfileDetail { .. } => handle_profile_detail_key(app, key),
-    }
-}
-
-fn handle_main_key(app: &mut App, key: KeyEvent) {
+    // Global keys, available on every tab when no modal owns input.
     match key.code {
-        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
-        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
-        KeyCode::Up | KeyCode::Char('k') => step_main_cursor(app, -1),
-        KeyCode::Down | KeyCode::Char('j') => step_main_cursor(app, 1),
-        KeyCode::Enter => activate_main_item(app),
-        KeyCode::Char('m') => open_profile_menu_at_cursor(app),
-        KeyCode::Char('d') => open_profile_detail_at_cursor(app),
-        KeyCode::Char('f') => {
-            app.screen = Screen::Chain;
-            app.chain_cursor = 0;
+        KeyCode::Tab | KeyCode::Right => {
+            switch_tab(app, app.tab.next());
+            return;
         }
-        KeyCode::Char('q') | KeyCode::Esc => {
-            app.quit = true;
+        KeyCode::BackTab | KeyCode::Left => {
+            switch_tab(app, app.tab.prev());
+            return;
         }
-        KeyCode::Char('?') => app.modals.push(Modal::Help),
+        KeyCode::Char('?') => {
+            app.modals.push(Modal::Help);
+            return;
+        }
         KeyCode::Char('r') => {
             app.manual_refresh();
             app.toast(ToastKind::Info, "refreshing usage…");
+            return;
         }
         KeyCode::Char('t') => {
             app.modals.push(Modal::Confirm(ConfirmState {
@@ -890,6 +939,95 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
                 choice: false,
                 on_confirm: ConfirmAction::RotateAll,
             }));
+            return;
+        }
+        KeyCode::Char('n') => {
+            open_new_profile(app);
+            return;
+        }
+        // Esc backs out of a Config sub-focus; otherwise it quits like q.
+        KeyCode::Esc => {
+            if app.tab == Tab::Config && app.config_focus == ConfigFocus::Actions {
+                app.config_focus = ConfigFocus::Profiles;
+            } else {
+                app.quit = true;
+            }
+            return;
+        }
+        KeyCode::Char('q') => {
+            app.quit = true;
+            return;
+        }
+        _ => {}
+    }
+
+    match app.tab {
+        Tab::Overview => handle_overview_key(app, key),
+        Tab::Usage => handle_usage_key(app, key),
+        Tab::Config => handle_config_key(app, key),
+        Tab::Fallback => handle_fallback_key(app, key),
+    }
+}
+
+/// Switch the active tab and re-seed that tab's cursor so it lands on a valid,
+/// useful row (the active profile for Usage / Config; the chain top for
+/// Fallback).
+fn switch_tab(app: &mut App, tab: Tab) {
+    app.tab = tab;
+    match tab {
+        Tab::Overview => app.clamp_main_cursor(),
+        Tab::Usage => app.usage_cursor = clamp_profile_cursor(app, app.usage_cursor),
+        Tab::Config => {
+            app.config_cursor = clamp_profile_cursor(app, app.config_cursor);
+            app.config_focus = ConfigFocus::Profiles;
+            app.config_action_cursor = 0;
+        }
+        Tab::Fallback => {
+            app.chain_cursor = 0;
+        }
+    }
+}
+
+/// Clamp a profile-index cursor to the current profile count.
+fn clamp_profile_cursor(app: &App, cursor: usize) -> usize {
+    cursor.min(app.profile_count().saturating_sub(1))
+}
+
+fn handle_overview_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
+        KeyCode::Up | KeyCode::Char('k') => step_main_cursor(app, -1),
+        KeyCode::Down | KeyCode::Char('j') => step_main_cursor(app, 1),
+        KeyCode::Enter => activate_main_item(app),
+        _ => {}
+    }
+}
+
+/// Up/down selects which account's usage to show; ⏎ switches to it. All editing
+/// lives on the Config tab.
+fn handle_usage_key(app: &mut App, key: KeyEvent) {
+    let count = app.profile_count();
+    if count == 0 {
+        return;
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.usage_cursor = if app.usage_cursor == 0 {
+                count - 1
+            } else {
+                app.usage_cursor - 1
+            };
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.usage_cursor = if app.usage_cursor + 1 >= count {
+                0
+            } else {
+                app.usage_cursor + 1
+            };
+        }
+        KeyCode::Enter => {
+            request_switch_to(app, app.usage_cursor);
         }
         _ => {}
     }
@@ -913,22 +1051,24 @@ fn step_main_cursor(app: &mut App, delta: i32) {
     app.main_cursor = idx as usize;
 }
 
-fn open_profile_menu_at_cursor(app: &mut App) {
-    let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
+/// Ask to switch to the profile at `idx`. No-ops when already active; otherwise
+/// raises the switch confirm modal. Shared by the Overview, Usage, and Config
+/// tabs so the switch flow is identical everywhere.
+fn request_switch_to(app: &mut App, idx: usize) {
+    let cfg = app.config();
+    let Some(name) = cfg.profiles.get(idx).map(|p| p.name.clone()) else {
         return;
     };
-    let Some(name) = app.config().profiles.get(idx).map(|p| p.name.clone()) else {
+    if cfg.is_active(&name) {
         return;
-    };
-    app.modals
-        .push(Modal::ProfileMenu(ProfileMenuState { name, cursor: 0 }));
-}
-
-fn open_profile_detail_at_cursor(app: &mut App) {
-    let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
-        return;
-    };
-    app.screen = Screen::ProfileDetail { profile_index: idx };
+    }
+    drop(cfg);
+    app.modals.push(Modal::Confirm(ConfirmState {
+        message: format!("Switch to '{name}'?"),
+        detail: None,
+        choice: true,
+        on_confirm: ConfirmAction::Switch(name),
+    }));
 }
 
 fn activate_main_item(app: &mut App) {
@@ -936,31 +1076,12 @@ fn activate_main_item(app: &mut App) {
         return;
     };
     match item {
-        MainItemKind::Profile(idx) => {
-            let cfg = app.config();
-            let Some(name) = cfg.profiles.get(idx).map(|p| p.name.clone()) else {
-                return;
-            };
-            // No-op when already active; saves the round-trip through the
-            // confirm modal and a redundant token refresh.
-            if cfg.is_active(&name) {
-                return;
-            }
-            drop(cfg);
-            app.modals.push(Modal::Confirm(ConfirmState {
-                message: format!("Switch to '{name}'?"),
-                detail: None,
-                choice: true,
-                on_confirm: ConfirmAction::Switch(name),
-            }));
-        }
+        // No-op when already active; saves the round-trip through the confirm
+        // modal and a redundant token refresh.
+        MainItemKind::Profile(idx) => request_switch_to(app, idx),
         MainItemKind::ActionSeparator => {}
         MainItemKind::NewProfile => open_new_profile(app),
         MainItemKind::CaptureCredentials => begin_capture(app, false),
-        MainItemKind::OpenChain => {
-            app.screen = Screen::Chain;
-            app.chain_cursor = 0;
-        }
     }
 }
 
@@ -1160,7 +1281,6 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
 pub(crate) enum ChainItemKind {
     Member(usize),
     Add,
-    Back,
 }
 
 pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
@@ -1179,11 +1299,10 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
     if any_unchained {
         items.push(ChainItemKind::Add);
     }
-    items.push(ChainItemKind::Back);
     items
 }
 
-fn handle_chain_key(app: &mut App, key: KeyEvent) {
+fn handle_fallback_key(app: &mut App, key: KeyEvent) {
     let items = chain_items(app);
     let last = items.len().saturating_sub(1);
 
@@ -1203,14 +1322,6 @@ fn handle_chain_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Enter => activate_chain_item(app),
-        KeyCode::Char('q') | KeyCode::Esc => {
-            app.screen = Screen::Overview;
-        }
-        KeyCode::Char('?') => app.modals.push(Modal::Help),
-        KeyCode::Char('r') => {
-            app.manual_refresh();
-            app.toast(ToastKind::Info, "refreshing usage…");
-        }
         _ => {}
     }
 }
@@ -1245,9 +1356,6 @@ fn activate_chain_item(app: &mut App) {
                 cursor: 0,
             }));
         }
-        ChainItemKind::Back => {
-            app.screen = Screen::Overview;
-        }
     }
 }
 
@@ -1272,41 +1380,136 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::Confirm(_) => handle_confirm_key(app, key),
         Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
-        Modal::ProfileMenu(_) => handle_profile_menu_key(app, key),
         Modal::ChainItemMenu(_) => handle_chain_item_menu_key(app, key),
         Modal::ChainAdd(_) => handle_chain_add_key(app, key),
         Modal::ChainThreshold(_) => handle_chain_threshold_key(app, key),
     }
 }
 
-fn handle_profile_detail_key(app: &mut App, key: KeyEvent) {
-    let Screen::ProfileDetail { profile_index } = app.screen else {
+/// Config tab keymap. Two panes: the profile list selects an account, ⏎ drops
+/// focus into its actions list, ↑↓ walks actions, ⏎ runs one. Esc (handled
+/// globally) lifts focus back to the profile list. Tab editing happens through
+/// the same modals the per-profile menu uses.
+fn handle_config_key(app: &mut App, key: KeyEvent) {
+    let count = app.profile_count();
+    if count == 0 {
         return;
-    };
-    let Some(name) = app
-        .config()
-        .profiles
-        .get(profile_index)
-        .map(|p| p.name.clone())
-    else {
-        app.screen = Screen::Overview;
-        return;
-    };
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.screen = Screen::Overview;
-        }
-        KeyCode::Char('m') => {
-            app.modals
-                .push(Modal::ProfileMenu(ProfileMenuState { name, cursor: 0 }));
-        }
-        KeyCode::Char('r') => {
-            app.manual_refresh();
-            app.toast(ToastKind::Info, "refreshing usage…");
-        }
-        KeyCode::Char('?') => app.modals.push(Modal::Help),
-        _ => {}
     }
+    app.config_cursor = app.config_cursor.min(count - 1);
+
+    match app.config_focus {
+        ConfigFocus::Profiles => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.config_cursor = if app.config_cursor == 0 {
+                    count - 1
+                } else {
+                    app.config_cursor - 1
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.config_cursor = if app.config_cursor + 1 >= count {
+                    0
+                } else {
+                    app.config_cursor + 1
+                };
+            }
+            KeyCode::Enter => {
+                app.config_focus = ConfigFocus::Actions;
+                app.config_action_cursor = 0;
+            }
+            _ => {}
+        },
+        ConfigFocus::Actions => {
+            let Some(name) = app.profile_name_at(app.config_cursor) else {
+                app.config_focus = ConfigFocus::Profiles;
+                return;
+            };
+            let actions = config_actions(app, &name);
+            if actions.is_empty() {
+                app.config_focus = ConfigFocus::Profiles;
+                return;
+            }
+            let last = actions.len() - 1;
+            app.config_action_cursor = app.config_action_cursor.min(last);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.config_action_cursor = if app.config_action_cursor == 0 {
+                        last
+                    } else {
+                        app.config_action_cursor - 1
+                    };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.config_action_cursor = if app.config_action_cursor >= last {
+                        0
+                    } else {
+                        app.config_action_cursor + 1
+                    };
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let action = actions[app.config_action_cursor];
+                    run_config_action(app, &name, action);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Settings rows for one profile on the Config tab. Auto-start is OAuth-only;
+/// everything else applies to any profile.
+pub(crate) fn config_actions(app: &App, name: &str) -> Vec<ConfigAction> {
+    let mut out = Vec::with_capacity(5);
+    let is_oauth = app
+        .config()
+        .find(name)
+        .map(|p| p.is_oauth())
+        .unwrap_or(false);
+    out.push(ConfigAction::Edit);
+    out.push(ConfigAction::Rename);
+    if is_oauth {
+        out.push(ConfigAction::ToggleAutoStart);
+    }
+    out.push(ConfigAction::ToggleChain);
+    out.push(ConfigAction::Delete);
+    out
+}
+
+fn run_config_action(app: &mut App, name: &str, action: ConfigAction) {
+    match action {
+        ConfigAction::Edit => open_edit_profile(app, name),
+        ConfigAction::Rename => app.modals.push(Modal::Rename(RenameForm {
+            old: name.to_string(),
+            input: InputState::new(name),
+        })),
+        ConfigAction::ToggleAutoStart => toggle_auto_start(app, name),
+        ConfigAction::ToggleChain => toggle_chain_membership(app, name),
+        ConfigAction::Delete => open_delete_confirm(app, name),
+    }
+}
+
+/// Add the profile to the fallback chain (seeding a default threshold) or drop
+/// it. Ordering and per-member thresholds are tuned on the Fallback tab.
+fn toggle_chain_membership(app: &mut App, name: &str) {
+    let in_chain = app.config().state.fallback_chain.iter().any(|n| n == name);
+    {
+        let mut cfg = app.config();
+        if in_chain {
+            cfg.state.fallback_chain.retain(|n| n != name);
+        } else {
+            if let Some(profile) = cfg.find_mut(name)
+                && profile.fallback_threshold.is_none()
+            {
+                profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
+                let _ = save_profile(profile);
+            }
+            cfg.state.fallback_chain.push(name.to_string());
+        }
+        let _ = save_app_state(&cfg.state);
+    }
+    let verb = if in_chain { "removed" } else { "added" };
+    let prep = if in_chain { "from" } else { "to" };
+    app.toast(ToastKind::Success, format!("{verb} '{name}' {prep} chain"));
 }
 
 fn toggle_auto_start(app: &mut App, name: &str) {
@@ -1385,88 +1588,6 @@ fn toggle_auto_start(app: &mut App, name: &str) {
         }
         Outcome::SaveFailed(e) => {
             app.toast(ToastKind::Danger, format!("save failed: {e}"));
-        }
-    }
-}
-
-/// Options shown in the per-profile actions menu. Switching and viewing
-/// details are reachable directly from the overview (Enter / d), so this
-/// menu stays focused on mutations.
-pub(crate) fn profile_menu_options(app: &App, name: &str) -> Vec<ProfileMenuAction> {
-    let mut out = Vec::with_capacity(5);
-    let is_oauth = app
-        .config()
-        .find(name)
-        .map(|p| p.is_oauth())
-        .unwrap_or(false);
-
-    out.push(ProfileMenuAction::Edit);
-    out.push(ProfileMenuAction::Rename);
-    if is_oauth {
-        out.push(ProfileMenuAction::ToggleAutoStart);
-    }
-    out.push(ProfileMenuAction::Delete);
-    out.push(ProfileMenuAction::Back);
-    out
-}
-
-fn handle_profile_menu_key(app: &mut App, key: KeyEvent) {
-    let Some(Modal::ProfileMenu(state)) = app.modals.last().cloned() else {
-        return;
-    };
-    let options = profile_menu_options(app, &state.name);
-    let last = options.len().saturating_sub(1);
-    let mut cursor = state.cursor.min(last);
-
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            cursor = if cursor == 0 { last } else { cursor - 1 };
-            if let Some(Modal::ProfileMenu(s)) = app.modals.last_mut() {
-                s.cursor = cursor;
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            cursor = if cursor >= last { 0 } else { cursor + 1 };
-            if let Some(Modal::ProfileMenu(s)) = app.modals.last_mut() {
-                s.cursor = cursor;
-            }
-        }
-        KeyCode::Esc => {
-            app.modals.pop();
-        }
-        KeyCode::Enter | KeyCode::Char(' ') => {
-            let Some(&action) = options.get(cursor) else {
-                return;
-            };
-            run_profile_menu_action(app, &state.name, action);
-        }
-        _ => {}
-    }
-}
-
-fn run_profile_menu_action(app: &mut App, name: &str, action: ProfileMenuAction) {
-    match action {
-        ProfileMenuAction::Edit => {
-            app.modals.pop();
-            open_edit_profile(app, name);
-        }
-        ProfileMenuAction::Rename => {
-            app.modals.pop();
-            app.modals.push(Modal::Rename(RenameForm {
-                old: name.to_string(),
-                input: InputState::new(name),
-            }));
-        }
-        ProfileMenuAction::ToggleAutoStart => {
-            // Stay in the menu so the user can flip several settings.
-            toggle_auto_start(app, name);
-        }
-        ProfileMenuAction::Delete => {
-            app.modals.pop();
-            open_delete_confirm(app, name);
-        }
-        ProfileMenuAction::Back => {
-            app.modals.pop();
         }
     }
 }

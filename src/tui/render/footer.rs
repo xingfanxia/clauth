@@ -6,34 +6,57 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, Screen};
+use super::super::app::{App, ConfigFocus, Tab};
 use super::super::theme;
 
+/// Shown on every tab; the persistent navigation cue.
+const TAB_NAV: (&str, &str) = ("⇥ ←→", "tabs");
+
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let hints: &[(&str, &str)] = match app.screen {
-        Screen::Overview => &[
+    let tail: &[(&str, &str)] = match app.tab {
+        Tab::Overview => &[
+            ("↑↓", "move"),
+            ("⇧↑↓", "reorder"),
             ("⏎", "switch"),
-            ("m", "menu"),
-            ("d", "details"),
-            ("f", "chain"),
+            ("n", "new"),
             ("r", "refresh"),
-            ("t", "rotate all"),
             ("?", "help"),
             ("q", "quit"),
         ],
-        Screen::Chain => &[
+        Tab::Usage => &[
+            ("↑↓", "account"),
+            ("⏎", "switch"),
+            ("r", "refresh"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        Tab::Config => match app.config_focus {
+            ConfigFocus::Profiles => &[
+                ("↑↓", "account"),
+                ("⏎", "edit"),
+                ("n", "new"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            ConfigFocus::Actions => &[
+                ("↑↓", "setting"),
+                ("⏎", "apply"),
+                ("⎋", "back"),
+                ("?", "help"),
+            ],
+        },
+        Tab::Fallback => &[
+            ("↑↓", "move"),
             ("⏎", "open"),
             ("r", "refresh"),
-            ("⎋", "back"),
             ("?", "help"),
-        ],
-        Screen::ProfileDetail { .. } => &[
-            ("m", "menu"),
-            ("r", "refresh"),
-            ("⎋", "back"),
-            ("?", "help"),
+            ("q", "quit"),
         ],
     };
+
+    let hints: Vec<(&str, &str)> = std::iter::once(TAB_NAV)
+        .chain(tail.iter().copied())
+        .collect();
 
     let mut spans: Vec<Span<'_>> = Vec::new();
     for (i, (key, label)) in hints.iter().enumerate() {
