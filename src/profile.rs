@@ -192,7 +192,25 @@ struct ProfileConfig {
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
+/// Test-only home-dir override. The showcase fixture points this at a sandbox
+/// tempdir so it can run the real, fully-interactive TUI — switching, editing,
+/// toggling, deleting — with every read/write redirected away from the user's
+/// real `~/.clauth` and `~/.claude`. Never compiled into the binary.
+#[cfg(test)]
+static HOME_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_home_override(path: PathBuf) {
+    if let Ok(mut guard) = HOME_OVERRIDE.lock() {
+        *guard = Some(path);
+    }
+}
+
 pub(crate) fn home_dir() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = HOME_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
+        return Ok(path);
+    }
     dirs::home_dir().context("Cannot determine home directory")
 }
 

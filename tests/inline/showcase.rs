@@ -8,22 +8,26 @@
 //! cargo test showcase -- --ignored --nocapture
 //! ```
 //!
-//! It builds a believable [`AppConfig`] from hard-coded demo values and runs a
-//! stripped-down event loop that skips `reconcile_startup` / `on_tick` /
-//! `shutdown`. The config is in-memory only and `App::new` does no I/O, so the
-//! sole way real data could be touched is a key action — the loop therefore
-//! forwards ONLY navigation + help keys to `handle_key` and drops every key
-//! that refreshes (network), rotates tokens, or writes config/state to disk.
-//! Net effect: no network, no filesystem writes, no real config touched.
+//! It builds a believable [`AppConfig`] from hard-coded demo values, redirects
+//! the home dir at a throwaway tempdir, and runs the **real, fully-interactive**
+//! TUI loop. Every action works for real — switch, edit, toggle, reorder, set
+//! threshold, delete — but `home_dir()` is overridden so all reads/writes land
+//! in the sandbox, never the user's real `~/.clauth` / `~/.claude`. The sandbox
+//! tempdir is removed when it drops at the end of the run.
+//!
+//! `reconcile_startup` is deliberately never called, so `on_tick` never spawns
+//! the bootstrap/scheduler (gated on `reconcile_done`) — no background worker,
+//! no network. The demo profiles carry no credentials, so even the manual
+//! refresh / rotate paths have no token to use and stay inert.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use anyhow::{Context, Result};
+use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 use super::{TICK, Term, app, render, restore_terminal, setup_terminal};
-use crate::profile::{AppConfig, AppState, Profile};
+use crate::profile::{AppConfig, AppState, Profile, set_home_override};
 use crate::usage::{ExtraUsage, FetchStatus, PlanInfo, UsageInfo, UsageWindow};
 
 // ── Launch ──────────────────────────────────────────────────────────────────
@@ -34,15 +38,23 @@ fn showcase() {
     run(demo_config()).expect("showcase loop");
 }
 
-/// Same terminal setup/teardown as [`super::run`], but a stripped-down loop:
-/// draw + handle keys, no startup/worker paths.
+/// Same terminal setup/teardown as [`super::run`], but redirects the home dir
+/// at a sandbox tempdir first so the real loop's writes never escape it.
 fn run(config: AppConfig) -> Result<()> {
+    let sandbox = tempfile::tempdir().context("create showcase sandbox dir")?;
+    set_home_override(sandbox.path().to_path_buf());
+
     let mut terminal = setup_terminal()?;
     let outcome = showcase_loop(&mut terminal, config);
     let restore = restore_terminal(&mut terminal);
+    // `sandbox` drops here → the tempdir and everything written to it is removed.
     outcome.and(restore)
 }
 
+/// The real event loop minus startup reconciliation: draw, dispatch keys
+/// through the production `handle_key`, and run `on_tick` so worker results
+/// (e.g. a switch) drain and spinners clear. No `reconcile_startup`, so no
+/// bootstrap/scheduler ever spawns.
 fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
     let mut application = app::App::new(config);
     let mut last_tick = Instant::now();
@@ -54,7 +66,7 @@ fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    handle_showcase_key(&mut application, key);
+                    app::handle_key(&mut application, key);
                 }
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -62,50 +74,12 @@ fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
         }
 
         if last_tick.elapsed() >= TICK {
-            // Advance tick_count so blink/spinner animations still work.
-            application.tick_count = application.tick_count.wrapping_add(1);
+            app::on_tick(&mut application);
             last_tick = Instant::now();
         }
     }
 
     Ok(())
-}
-
-/// Forward only the keys that can't touch real data. Tab switching, cursor
-/// movement, and the help overlay are pure in-memory; everything destructive
-/// (`r` refresh → network, `t` rotate → spends tokens, `n`/⏎/Shift+↑↓ → config
-/// & state writes) is dropped. Quit is handled here, not via `handle_key`.
-fn handle_showcase_key(app: &mut app::App, key: KeyEvent) {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.quit = true;
-        return;
-    }
-
-    // Only the help overlay can be open (every modal-opening key is blocked
-    // below). Let the usual dismissal keys close it.
-    if !app.modals.is_empty() {
-        if matches!(
-            key.code,
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q')
-        ) {
-            app::handle_key(app, key);
-        }
-        return;
-    }
-
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
-        // Tab navigation + help: pure in-memory.
-        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right | KeyCode::Char('?') => {
-            app::handle_key(app, key);
-        }
-        // Cursor movement, but never Shift+↑↓ (that reorders and writes state).
-        KeyCode::Up | KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-            app::handle_key(app, key);
-        }
-        KeyCode::Char('j' | 'k') => app::handle_key(app, key),
-        _ => {}
-    }
 }
 
 // ── Time helper ───────────────────────────────────────────────────────────────

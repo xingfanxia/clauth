@@ -126,9 +126,11 @@ clauth start personal -- --model haiku
 # spawns claude with personal's credentials in an isolated CLAUDE_CONFIG_DIR
 ```
 
-Preview the TUI with fake data for screenshots (dev-only, needs a checkout; no
-network, no config changes). It's a `#[cfg(test)]` showcase, never built into
-the binary:
+Preview the TUI with fake data for screenshots (dev-only, needs a checkout).
+It's a `#[cfg(test)]` showcase, never built into the binary — it runs the real,
+fully-interactive TUI (switch, edit, toggle, reorder all work) with the home dir
+redirected to a throwaway tempdir, so nothing touches your real `~/.clauth` /
+`~/.claude` and no network is used:
 
 ```bash
 cargo test showcase -- --ignored --nocapture
