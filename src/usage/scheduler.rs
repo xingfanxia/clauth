@@ -1026,6 +1026,222 @@ pub(crate) fn fetch_all_into(
 /// posted to `pending_switch` for the UI thread to dispatch a switch worker.
 /// Computing the decision here keeps the 100 ms UI tick free of FS access
 /// (`with_state_lock` was previously taken on every `on_tick`).
+/// Shared handles the background scheduler thread reads on every tick. Holds
+/// **cloned `Arc`s only** — never a live lock guard — so the struct itself
+/// carries no lock rank and constructing or passing it can't violate the
+/// lock-order discipline in `lockorder.rs`. `tick` borrows it and acquires the
+/// individual mutexes in the same order the inline loop did.
+pub(crate) struct SchedulerState {
+    config: crate::profile::ConfigHandle,
+    tokens: TokenList,
+    store: UsageStore,
+    status: StatusStore,
+    next_refresh_per_profile: NextRefreshPerProfile,
+    activity: ActivityStore,
+    last_fetched: LastFetchedAt,
+    pending_window_rotation: PendingWindowRotation,
+    last_rotated_window: LastRotatedWindow,
+    pending_switch: PendingSwitch,
+    pending_switch_off: PendingSwitchOff,
+    refetch_queue: RefetchQueue,
+    learned: LearnedIntervals,
+    ok_count: ConsecutiveOk,
+    cache_hit_count: ConsecutiveCacheHit,
+    last_429: Last429At,
+}
+
+/// Run one scheduler tick: drain forced refetches, partition the due set, scan
+/// for expired windows, fan out parallel fetches, propagate rotated tokens, and
+/// evaluate the auto-switch chain. Returns at each early-bail point (the inline
+/// loop used `continue` for the same effect). Lock acquisition order and the
+/// `RotationGuard` boundary (inside `run_fetch` → `fetch_with_rotation`) are
+/// unchanged from the inline version — this only relocates the body.
+fn tick(state: &SchedulerState) {
+    let snapshot: Vec<TokenEntry> = match state.tokens.lock() {
+        Ok(t) => t.clone(),
+        Err(_) => return,
+    };
+    if snapshot.is_empty() {
+        return;
+    }
+
+    // Drain names pushed by rotation paths so they bypass the cadence
+    // and get fresh numbers on this tick instead of waiting up to 45s.
+    let forced: HashSet<String> = state
+        .refetch_queue
+        .lock()
+        .ok()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default();
+
+    // Decide which entries are due this tick. Per-profile intervals
+    // come from the AIMD learner held in `learned`.
+    let now = now_ms();
+    let (mut due, mut per_profile_next) = partition_due(
+        &snapshot,
+        now,
+        &state.store,
+        &state.last_fetched,
+        &state.learned,
+        &state.activity,
+    );
+
+    // Merge forced entries that aren't already scheduled this tick and
+    // reflect them in the published map as "due now" (zero countdown).
+    // Forced entries still skip Switching and Refreshing profiles — the
+    // switch worker owns the TokenList write window, and a concurrent
+    // rotate_one holds the single-use refresh token.
+    if !forced.is_empty() {
+        let switching: HashSet<String> = match state.activity.lock() {
+            Ok(a) => a
+                .iter()
+                .filter(|(_, v)| {
+                    matches!(v, ProfileActivity::Switching | ProfileActivity::Refreshing)
+                })
+                .map(|(n, _)| n.clone())
+                .collect(),
+            Err(_) => snapshot.iter().map(|e| e.name.clone()).collect(),
+        };
+        let mut extras: Vec<TokenEntry> = Vec::with_capacity(forced.len());
+        for entry in snapshot.iter().filter(|e| {
+            forced.contains(&e.name)
+                && !switching.contains(&e.name)
+                && !due.iter().any(|d| d.name == e.name)
+        }) {
+            per_profile_next.insert(entry.name.clone(), now);
+            extras.push(entry.clone());
+        }
+        due.extend(extras);
+    }
+
+    // Publish the per-profile next times AFTER the forced merge so the
+    // UI countdown doesn't show "in Xs" for a profile that is in fact
+    // fetching this very tick.
+    if let Ok(mut nrpp) = state.next_refresh_per_profile.lock() {
+        nrpp.clone_from(&per_profile_next);
+    }
+
+    // Snapshot each profile's 5h `resets_at` as it stands BEFORE this
+    // tick's fetches run. A fetch that crosses the boundary returns a
+    // fresh window (resets_at ~5h out); reading the store AFTER the fetch
+    // would overwrite the expired value and never observe the expiry.
+    // Scanning here — above the `due.is_empty()` bail — also covers idle
+    // ticks that cross a boundary no fetch would otherwise report.
+    let pre_fetch_resets: HashMap<String, i64> = match state.store.lock() {
+        Ok(st) => snapshot
+            .iter()
+            .filter_map(|entry| {
+                let resets_at_str = st
+                    .get(&entry.name)
+                    .and_then(|u| u.five_hour.as_ref())
+                    .and_then(|w| w.resets_at.as_deref())?;
+                Some((entry.name.clone(), iso_to_epoch_secs(resets_at_str)?))
+            })
+            .collect(),
+        Err(_) => HashMap::new(),
+    };
+    scan_expired_windows(
+        &pre_fetch_resets,
+        &state.activity,
+        &state.last_rotated_window,
+        &state.pending_window_rotation,
+    );
+
+    if due.is_empty() {
+        return;
+    }
+
+    // Mark profiles as in-flight so the overview row shows a spinner.
+    // Per-name leaf write — the lock is never held across the HTTP
+    // round trips below.
+    for entry in &due {
+        mark_activity(&state.activity, &entry.name, ProfileActivity::Fetching);
+    }
+
+    let handles: Vec<_> = due
+        .into_iter()
+        .map(|entry| {
+            let name = entry.name.clone();
+            let config = Arc::clone(&state.config);
+            let refetch_queue = Arc::clone(&state.refetch_queue);
+            let activity = Arc::clone(&state.activity);
+            let h =
+                std::thread::spawn(move || run_fetch(&config, entry, &refetch_queue, &activity));
+            (name, h)
+        })
+        .collect();
+    for (name, h) in handles {
+        match h.join() {
+            Ok(outcome) => {
+                // Clear the in-flight marker before writing results so the
+                // overview row transitions from spinner → fresh countdown atomically
+                // from the render thread's perspective (it reads both under separate
+                // locks, but a brief flicker to "no spinner + stale timer" is acceptable).
+                clear_activity(&state.activity, &outcome.name);
+                // Propagate any rotated OAuth pair back into the live snapshot
+                // before the next tick — otherwise tick N+1 reuses the stale
+                // access token, 401s, rotates again, and burns the refresh-token
+                // chain while waiting for the mtime watch to reload AppConfig.
+                if let Some((new_access, new_refresh)) = &outcome.rotated
+                    && let Ok(mut t) = state.tokens.lock()
+                    && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
+                {
+                    entry.access_token = new_access.clone();
+                    entry.refresh_token = new_refresh.clone();
+                }
+                apply_outcome(
+                    outcome,
+                    &state.store,
+                    &state.status,
+                    &state.last_fetched,
+                    &state.learned,
+                    &state.ok_count,
+                    &state.cache_hit_count,
+                    &state.last_429,
+                );
+            }
+            Err(_) => {
+                // Worker panicked. Clear the activity slot so the spinner
+                // doesn't freeze permanently and `any_busy` can resolve.
+                clear_activity(&state.activity, &name);
+            }
+        }
+    }
+
+    // Recompute per-profile next times AFTER fetches have updated
+    // `last_fetched` so the overview countdowns reflect fresh deadlines.
+    // `activity` is passed so a profile that became Switching mid-tick
+    // gets the same exclusion treatment here as in the pre-fetch call —
+    // its countdown is recomputed from current `last_fetched` rather
+    // than carrying a stale pre-fetch value for one extra tick.
+    let (_, per_profile_after) = partition_due(
+        &snapshot,
+        now_ms(),
+        &state.store,
+        &state.last_fetched,
+        &state.learned,
+        &state.activity,
+    );
+    if let Ok(mut nrpp) = state.next_refresh_per_profile.lock() {
+        nrpp.clone_from(&per_profile_after);
+    }
+
+    // Auto-switch decision: read the live chain + thresholds under
+    // the config mutex (NOT across HTTP, NOT across with_state_lock)
+    // and consult `store` for utilization. Posting the target to
+    // `pending_switch` defers the actual relink to the UI thread,
+    // which dispatches a switch worker. A Switching profile here
+    // means the previous decision is still in flight — skip until
+    // the worker completes.
+    scan_auto_switch(
+        &state.config,
+        &state.store,
+        &state.activity,
+        &state.pending_switch,
+        &state.pending_switch_off,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_refresher(
     config: crate::profile::ConfigHandle,
@@ -1045,187 +1261,28 @@ pub(crate) fn spawn_refresher(
     cache_hit_count: ConsecutiveCacheHit,
     last_429: Last429At,
 ) {
+    let state = SchedulerState {
+        config,
+        tokens,
+        store,
+        status,
+        next_refresh_per_profile,
+        activity,
+        last_fetched,
+        pending_window_rotation,
+        last_rotated_window,
+        pending_switch,
+        pending_switch_off,
+        refetch_queue,
+        learned,
+        ok_count,
+        cache_hit_count,
+        last_429,
+    };
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(TICK_INTERVAL);
-
-            let snapshot: Vec<TokenEntry> = match tokens.lock() {
-                Ok(t) => t.clone(),
-                Err(_) => continue,
-            };
-            if snapshot.is_empty() {
-                continue;
-            }
-
-            // Drain names pushed by rotation paths so they bypass the cadence
-            // and get fresh numbers on this tick instead of waiting up to 45s.
-            let forced: HashSet<String> = refetch_queue
-                .lock()
-                .ok()
-                .map(|mut q| std::mem::take(&mut *q))
-                .unwrap_or_default();
-
-            // Decide which entries are due this tick. Per-profile intervals
-            // come from the AIMD learner held in `learned`.
-            let now = now_ms();
-            let (mut due, mut per_profile_next) =
-                partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
-
-            // Merge forced entries that aren't already scheduled this tick and
-            // reflect them in the published map as "due now" (zero countdown).
-            // Forced entries still skip Switching and Refreshing profiles — the
-            // switch worker owns the TokenList write window, and a concurrent
-            // rotate_one holds the single-use refresh token.
-            if !forced.is_empty() {
-                let switching: HashSet<String> = match activity.lock() {
-                    Ok(a) => a
-                        .iter()
-                        .filter(|(_, v)| {
-                            matches!(v, ProfileActivity::Switching | ProfileActivity::Refreshing)
-                        })
-                        .map(|(n, _)| n.clone())
-                        .collect(),
-                    Err(_) => snapshot.iter().map(|e| e.name.clone()).collect(),
-                };
-                let mut extras: Vec<TokenEntry> = Vec::with_capacity(forced.len());
-                for entry in snapshot.iter().filter(|e| {
-                    forced.contains(&e.name)
-                        && !switching.contains(&e.name)
-                        && !due.iter().any(|d| d.name == e.name)
-                }) {
-                    per_profile_next.insert(entry.name.clone(), now);
-                    extras.push(entry.clone());
-                }
-                due.extend(extras);
-            }
-
-            // Publish the per-profile next times AFTER the forced merge so the
-            // UI countdown doesn't show "in Xs" for a profile that is in fact
-            // fetching this very tick.
-            if let Ok(mut nrpp) = next_refresh_per_profile.lock() {
-                nrpp.clone_from(&per_profile_next);
-            }
-
-            // Snapshot each profile's 5h `resets_at` as it stands BEFORE this
-            // tick's fetches run. A fetch that crosses the boundary returns a
-            // fresh window (resets_at ~5h out); reading the store AFTER the fetch
-            // would overwrite the expired value and never observe the expiry.
-            // Scanning here — above the `due.is_empty()` bail — also covers idle
-            // ticks that cross a boundary no fetch would otherwise report.
-            let pre_fetch_resets: HashMap<String, i64> = match store.lock() {
-                Ok(st) => snapshot
-                    .iter()
-                    .filter_map(|entry| {
-                        let resets_at_str = st
-                            .get(&entry.name)
-                            .and_then(|u| u.five_hour.as_ref())
-                            .and_then(|w| w.resets_at.as_deref())?;
-                        Some((entry.name.clone(), iso_to_epoch_secs(resets_at_str)?))
-                    })
-                    .collect(),
-                Err(_) => HashMap::new(),
-            };
-            scan_expired_windows(
-                &pre_fetch_resets,
-                &activity,
-                &last_rotated_window,
-                &pending_window_rotation,
-            );
-
-            if due.is_empty() {
-                continue;
-            }
-
-            // Mark profiles as in-flight so the overview row shows a spinner.
-            // Per-name leaf write — the lock is never held across the HTTP
-            // round trips below.
-            for entry in &due {
-                mark_activity(&activity, &entry.name, ProfileActivity::Fetching);
-            }
-
-            let handles: Vec<_> = due
-                .into_iter()
-                .map(|entry| {
-                    let name = entry.name.clone();
-                    let config = Arc::clone(&config);
-                    let refetch_queue = Arc::clone(&refetch_queue);
-                    let activity = Arc::clone(&activity);
-                    let h = std::thread::spawn(move || {
-                        run_fetch(&config, entry, &refetch_queue, &activity)
-                    });
-                    (name, h)
-                })
-                .collect();
-            for (name, h) in handles {
-                match h.join() {
-                    Ok(outcome) => {
-                        // Clear the in-flight marker before writing results so the
-                        // overview row transitions from spinner → fresh countdown atomically
-                        // from the render thread's perspective (it reads both under separate
-                        // locks, but a brief flicker to "no spinner + stale timer" is acceptable).
-                        clear_activity(&activity, &outcome.name);
-                        // Propagate any rotated OAuth pair back into the live snapshot
-                        // before the next tick — otherwise tick N+1 reuses the stale
-                        // access token, 401s, rotates again, and burns the refresh-token
-                        // chain while waiting for the mtime watch to reload AppConfig.
-                        if let Some((new_access, new_refresh)) = &outcome.rotated
-                            && let Ok(mut t) = tokens.lock()
-                            && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
-                        {
-                            entry.access_token = new_access.clone();
-                            entry.refresh_token = new_refresh.clone();
-                        }
-                        apply_outcome(
-                            outcome,
-                            &store,
-                            &status,
-                            &last_fetched,
-                            &learned,
-                            &ok_count,
-                            &cache_hit_count,
-                            &last_429,
-                        );
-                    }
-                    Err(_) => {
-                        // Worker panicked. Clear the activity slot so the spinner
-                        // doesn't freeze permanently and `any_busy` can resolve.
-                        clear_activity(&activity, &name);
-                    }
-                }
-            }
-
-            // Recompute per-profile next times AFTER fetches have updated
-            // `last_fetched` so the overview countdowns reflect fresh deadlines.
-            // `activity` is passed so a profile that became Switching mid-tick
-            // gets the same exclusion treatment here as in the pre-fetch call —
-            // its countdown is recomputed from current `last_fetched` rather
-            // than carrying a stale pre-fetch value for one extra tick.
-            let (_, per_profile_after) = partition_due(
-                &snapshot,
-                now_ms(),
-                &store,
-                &last_fetched,
-                &learned,
-                &activity,
-            );
-            if let Ok(mut nrpp) = next_refresh_per_profile.lock() {
-                nrpp.clone_from(&per_profile_after);
-            }
-
-            // Auto-switch decision: read the live chain + thresholds under
-            // the config mutex (NOT across HTTP, NOT across with_state_lock)
-            // and consult `store` for utilization. Posting the target to
-            // `pending_switch` defers the actual relink to the UI thread,
-            // which dispatches a switch worker. A Switching profile here
-            // means the previous decision is still in flight — skip until
-            // the worker completes.
-            scan_auto_switch(
-                &config,
-                &store,
-                &activity,
-                &pending_switch,
-                &pending_switch_off,
-            );
+            tick(&state);
         }
     });
 }
