@@ -90,14 +90,19 @@ fn kick(access_token: &str) -> Result<()> {
         "messages": [{ "role": "user", "content": "x" }],
     }))?;
 
-    AGENT
+    let status = AGENT
         .post(MESSAGES_ENDPOINT)
         .header("Content-Type", "application/json")
         .header("Authorization", &format!("Bearer {access_token}"))
         .header("anthropic-version", "2023-06-01")
         .header("anthropic-beta", "oauth-2025-04-20")
         .send(&body)
-        .map_err(crate::ureq_error::into_anyhow)?;
+        .map_err(crate::ureq_error::into_anyhow)?
+        .status()
+        .as_u16();
+    if status >= 400 {
+        return Err(anyhow::anyhow!("HTTP {status}"));
+    }
     Ok(())
 }
 
