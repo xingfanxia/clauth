@@ -396,7 +396,7 @@ fn fetch_with_rotation(
     // the in-memory AppConfig in step with the on-disk credentials.
     let access = tok.access_token.clone();
     let refresh = tok.refresh_token.clone();
-    if !crate::oauth::apply_rotated_tokens_locked(config, name, tok, None) {
+    if crate::oauth::apply_rotated_tokens_locked(config, name, tok, None).is_err() {
         let (info, status) = load_cached_with_status(name, fallback_status);
         return (info, status, None);
     }
