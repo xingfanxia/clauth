@@ -779,6 +779,10 @@ impl App {
             .expect("usage_tokens mutex poisoned") = tokens;
     }
 
+    /// Queue every profile for an immediate background re-fetch. The Overview
+    /// tab's `r` uses this; it's a fan-out over `manual_refresh_one` so the
+    /// single-account (Usage) and all-accounts (Overview) refreshes drive the
+    /// identical per-profile codepath — same queue insert, same instant spinner.
     pub(crate) fn manual_refresh(&self) {
         let names: Vec<String> = self
             .usage_tokens
@@ -787,10 +791,25 @@ impl App {
             .iter()
             .map(|e| e.name.clone())
             .collect();
+        for name in names {
+            self.manual_refresh_one(&name);
+        }
+    }
+
+    /// Queue a single profile for an immediate background re-fetch. The Usage
+    /// tab's `r` uses this so a refresh only spends a request on the account in
+    /// view, unlike `manual_refresh` which queues every profile.
+    pub(crate) fn manual_refresh_one(&self, name: &str) {
+        // Light the spinner now so the Usage status line reflects the keypress
+        // instead of waiting up to a scheduler tick. Mirrors the scheduler's own
+        // pre-fetch `Fetching` mark; the forced-refetch path runs and clears it.
+        // Only when idle — never clobber an in-flight switch/refresh, whose
+        // marker the forced merge relies on to keep skipping the profile.
+        if is_idle(&self.activity, name) {
+            mark_activity(&self.activity, name, ProfileActivity::Fetching);
+        }
         if let Ok(mut q) = self.refetch_queue.lock() {
-            for name in names {
-                q.insert(name);
-            }
+            q.insert(name.to_string());
         }
     }
 
@@ -970,8 +989,30 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('r') => {
-            app.manual_refresh();
-            app.toast(ToastKind::Info, "refreshing usage…");
+            // On the Usage tab `r` refreshes only the account in view; every
+            // other tab keeps the all-profiles refresh.
+            if app.tab == Tab::Usage {
+                let selected = {
+                    let cfg = app.config();
+                    cfg.profiles
+                        .get(app.usage_cursor)
+                        .map(|p| (p.name.clone(), p.is_oauth()))
+                };
+                match selected {
+                    // Only oauth profiles have a usage endpoint to refresh.
+                    Some((name, true)) => {
+                        app.manual_refresh_one(&name);
+                        app.toast(ToastKind::Info, format!("refreshing '{name}'…"));
+                    }
+                    Some((name, false)) => {
+                        app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
+                    }
+                    None => {}
+                }
+            } else {
+                app.manual_refresh();
+                app.toast(ToastKind::Info, "refreshing usage…");
+            }
             return;
         }
         KeyCode::Char('t') => {

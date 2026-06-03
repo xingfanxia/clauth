@@ -1,5 +1,6 @@
 //! Usage tab — account picker on the left, the selected account's full usage
-//! breakdown (every window, reset timers, extra credits) on the right.
+//! breakdown on the right: a header (plan, active marker, per-account refresh
+//! status / countdown), then every window, reset timers, and extra credits.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -9,11 +10,23 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::App;
 use super::super::theme;
-use super::format::format_reset;
+use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
 use super::panes::{SELECTOR_WIDTH, draw_profile_selector, section_box};
 use crate::format::plan_label;
 use crate::profile::Profile;
-use crate::usage::UsageWindow;
+use crate::usage::{FetchStatus, ProfileActivity, UsageWindow, now_ms};
+
+/// Key column width for the header rows (`plan`, `status`).
+const KEY_W: usize = 8;
+
+/// Per-account runtime state shown in the usage detail header — gathered once
+/// under the locks in `draw_usage_detail` so the line builders stay lock-free.
+struct HeaderState {
+    is_active: bool,
+    activity: ProfileActivity,
+    next_refresh_ms: Option<u64>,
+    tick: u64,
+}
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
@@ -46,13 +59,32 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let lines = build_usage_lines(profile, inner.width);
+    // Per-account runtime state, read under the activity / refresh-timer locks.
+    // `config` (held via `cfg`) is outer of both in the global lock order, so
+    // taking them here is safe.
+    let header = HeaderState {
+        is_active: cfg.is_active(&profile.name),
+        activity: app
+            .activity
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&profile.name).copied())
+            .unwrap_or(ProfileActivity::Idle),
+        next_refresh_ms: app
+            .next_refresh_per_profile
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&profile.name).copied()),
+        tick: app.tick_count,
+    };
+
+    let lines = build_usage_lines(profile, inner.width, &header);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
-fn build_usage_lines(profile: &Profile, inner_w: u16) -> Vec<Line<'static>> {
+fn build_usage_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(meta_line(profile));
+    lines.extend(header_lines(profile, header));
     lines.push(Line::from(""));
 
     if !profile.is_oauth() {
@@ -207,8 +239,10 @@ fn bar_width_for(inner_w: u16, max_trailing: usize) -> usize {
     }
 }
 
-/// One-line summary above the bars: the account's plan.
-fn meta_line(profile: &Profile) -> Line<'static> {
+/// Header above the bars: the account's plan (with an `● active` marker when
+/// this is the live profile), then a per-account status line carrying the live
+/// activity spinner, fetch health, and the countdown to the next auto-refresh.
+fn header_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
     let plan = profile
         .usage
         .as_ref()
@@ -221,8 +255,71 @@ fn meta_line(profile: &Profile) -> Line<'static> {
                 "api".into()
             }
         });
-    Line::from(vec![
-        Span::styled("plan  ", theme::faint()),
-        Span::styled(plan, theme::muted()),
-    ])
+    let mut plan_spans = vec![key_span("plan"), Span::styled(plan, theme::muted())];
+    if header.is_active {
+        plan_spans.push(Span::raw("   "));
+        plan_spans.push(Span::styled("● active", theme::orange()));
+    }
+
+    let mut lines = vec![Line::from(plan_spans)];
+    // Usage windows (and thus refresh scheduling) only exist for oauth profiles.
+    if profile.is_oauth() {
+        lines.push(status_line(profile, header));
+    }
+    lines
+}
+
+/// The `status` row: a live spinner while an op is in flight, otherwise the
+/// fetch health plus the seconds remaining until the next scheduled refresh.
+fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
+    let key = key_span("status");
+
+    if !matches!(header.activity, ProfileActivity::Idle) {
+        let frame = spinner_frame(header.tick);
+        let verb = activity_verb(header.activity);
+        return Line::from(vec![
+            key,
+            Span::styled(format!("{frame} {verb}…"), spinner_style(header.activity)),
+        ]);
+    }
+
+    let countdown = header.next_refresh_ms.map(|next| {
+        let secs = ((next as i64 - now_ms() as i64) / 1000).max(0);
+        format!("{secs}s")
+    });
+
+    let mut spans = vec![key];
+    match profile.fetch_status {
+        Some(FetchStatus::Failed) => {
+            spans.push(Span::styled("✖ fetch failed", theme::danger()));
+            if let Some(c) = countdown {
+                spans.push(Span::styled(format!("  · retry in {c}"), theme::faint()));
+            }
+        }
+        Some(FetchStatus::Cached) => {
+            spans.push(Span::styled("⚠ cached", theme::warning()));
+            if let Some(c) = countdown {
+                spans.push(Span::styled(format!("  · refresh in {c}"), theme::faint()));
+            }
+        }
+        Some(FetchStatus::RateLimited) => {
+            spans.push(Span::styled("⚠ rate limited", theme::danger()));
+            if let Some(c) = countdown {
+                spans.push(Span::styled(format!("  · retry in {c}"), theme::faint()));
+            }
+        }
+        _ => match countdown {
+            Some(c) => spans.push(Span::styled(format!("↻ refresh in {c}"), theme::faint())),
+            None => spans.push(Span::styled("↻ up to date", theme::faint())),
+        },
+    }
+    Line::from(spans)
+}
+
+/// A padded eyebrow key cell for the header rows — same `label` treatment as
+/// the usage bars' eyebrows just below, so the whole pane's label column reads
+/// in one style.
+fn key_span(key: &str) -> Span<'static> {
+    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
+    Span::styled(format!("{key}{}", " ".repeat(pad)), theme::label())
 }

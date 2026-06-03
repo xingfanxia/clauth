@@ -11,7 +11,7 @@ use ratatui::text::Span;
 use super::super::theme;
 use crate::format::endpoint_label;
 use crate::profile::Profile;
-use crate::usage::{FetchStatus, UsageWindow, iso_to_epoch_secs, now_epoch_secs};
+use crate::usage::{FetchStatus, ProfileActivity, UsageWindow, iso_to_epoch_secs, now_epoch_secs};
 
 pub(super) fn fixed(value: &str, width: usize) -> String {
     let (mut content, pad) = fixed_split(value, width);
@@ -127,4 +127,46 @@ pub(super) fn window_summary_parts(
         format!("{pct:>2.0}%")
     };
     (text, Style::default().fg(color))
+}
+
+/// Braille spinner frames — the set most CLI tools use. Index by `tick_count`
+/// so each render frame advances one step. Shared by the Overview row timer
+/// slot and the Usage detail status line.
+pub(super) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Spinner frame for the current tick.
+pub(super) fn spinner_frame(tick: u64) -> &'static str {
+    SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
+}
+
+/// Color for an in-flight activity's spinner. Each state gets a distinct tint so
+/// a refresh inside a fetch, a switch, or an auto-start kick read differently at
+/// a glance. `Idle` falls back to faint (callers usually special-case it first).
+pub(super) fn spinner_style(activity: ProfileActivity) -> Style {
+    match activity {
+        // Sapphire primary — the routine "pulling fresh numbers" state.
+        ProfileActivity::Fetching => theme::accent(),
+        // Info cyan — a refresh inside a fetch reads different from a plain fetch.
+        ProfileActivity::Refreshing => theme::info(),
+        // Claude orange — switching is the rare, user-visible state.
+        ProfileActivity::Switching => theme::orange(),
+        // Warning yellow — a launching session is a transient mid-state.
+        ProfileActivity::Starting => theme::warning(),
+        // Catppuccin green — a successful auto-start arms the 5h window.
+        ProfileActivity::AutoStarting => theme::success(),
+        ProfileActivity::Idle => theme::faint(),
+    }
+}
+
+/// Present-tense verb for an activity, for status lines that pair the spinner
+/// with a word (`⠹ refreshing…`).
+pub(super) fn activity_verb(activity: ProfileActivity) -> &'static str {
+    match activity {
+        ProfileActivity::Fetching => "fetching",
+        ProfileActivity::Refreshing => "refreshing",
+        ProfileActivity::Switching => "switching",
+        ProfileActivity::Starting => "starting",
+        ProfileActivity::AutoStarting => "auto-starting",
+        ProfileActivity::Idle => "idle",
+    }
 }
