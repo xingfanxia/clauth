@@ -41,6 +41,39 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
     config
 }
 
+/// RAII home sandbox: holds `HOME_TEST_LOCK` and redirects `home_dir()` into a
+/// tempdir for the test's whole duration, clearing the override on drop (even
+/// on panic). Every test that creates sessions dirs, pid files, or rotation
+/// locks — including indirectly via `rotate_one*` / `RotationGuard::acquire`,
+/// which `create_dir_all` before any short-circuit — must hold one, or those
+/// paths land in the user's real `~/.clauth`.
+struct HomeSandbox {
+    // Declaration order is the drop order after `Drop::drop` clears the
+    // override: tempdir removed first, shared lock released last.
+    _tmp: tempfile::TempDir,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl HomeSandbox {
+    fn new() -> Self {
+        let guard = crate::profile::HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("create home sandbox");
+        crate::profile::set_home_override(tmp.path().to_path_buf());
+        Self {
+            _tmp: tmp,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for HomeSandbox {
+    fn drop(&mut self) {
+        crate::profile::clear_home_override();
+    }
+}
+
 #[test]
 fn no_live_session_included_with_force_false() {
     // A unique name that has no sessions dir on disk — has_live_session returns false.
@@ -61,6 +94,7 @@ fn no_live_session_included_with_force_true() {
 
 #[test]
 fn live_session_excluded_when_force_false() {
+    let _home = HomeSandbox::new();
     // Create a real locked pid file so has_live_session returns true.
     let name = "test-oauth-live-session-guard";
     let sessions = profile_dir(name).expect("profile_dir").join("sessions");
@@ -76,12 +110,13 @@ fn live_session_excluded_when_force_false() {
         "force=false should exclude a profile with a live session"
     );
 
-    // Release lock — sessions dir and file left behind but harmless.
+    // Release lock — sessions dir and file vanish with the sandbox tempdir.
     drop(file);
 }
 
 #[test]
 fn live_session_included_when_force_true() {
+    let _home = HomeSandbox::new();
     // Same setup: locked pid file makes has_live_session return true.
     let name = "test-oauth-live-session-force";
     let sessions = profile_dir(name).expect("profile_dir").join("sessions");
@@ -130,6 +165,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
     use std::collections::BTreeMap;
     use std::sync::mpsc;
 
+    let _home = HomeSandbox::new();
     // Profile with OAuth block but no refresh token.
     let profile = Profile {
         name: "test-rotate-one-no-rt".into(),
@@ -219,6 +255,8 @@ fn switch_rotate_targets_only_active_and_target() {
     use std::collections::BTreeMap;
     use std::sync::mpsc;
 
+    let _home = HomeSandbox::new();
+
     fn make_profile(name: &str) -> Profile {
         Profile {
             name: name.into(),
@@ -286,6 +324,7 @@ fn rotate_one_for_window_no_stamp_when_no_refresh_token() {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::mpsc;
 
+    let _home = HomeSandbox::new();
     let name = "test-rotate-window-no-rt";
     let profile = Profile {
         name: name.into(),
@@ -336,6 +375,7 @@ fn rotate_one_for_window_no_stamp_when_live_session() {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::mpsc;
 
+    let _home = HomeSandbox::new();
     let name = "test-rotate-window-live-session";
     let sessions = profile_dir(name).expect("profile_dir").join("sessions");
     std::fs::create_dir_all(&sessions).expect("create sessions dir");
@@ -392,6 +432,7 @@ fn switch_dedup_active_equals_target() {
     use std::collections::BTreeMap;
     use std::sync::mpsc;
 
+    let _home = HomeSandbox::new();
     let name = "switch-dedup-same";
     let profile = Profile {
         name: name.into(),
@@ -453,6 +494,9 @@ fn rotation_guard_is_independent_across_profiles() {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    // HOME_OVERRIDE is process-global (not thread-local), so the worker
+    // thread's `RotationGuard::acquire(b)` below resolves into the sandbox too.
+    let _home = HomeSandbox::new();
     let a = "test-rotation-guard-indep-a";
     let b = "test-rotation-guard-indep-b";
     let held_a = RotationGuard::acquire(a).expect("acquire a");
@@ -479,6 +523,7 @@ fn start_window_skips_when_live_session() {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::mpsc;
 
+    let _home = HomeSandbox::new();
     let name = "test-auto-start-named-live-session";
     let sessions = profile_dir(name).expect("profile_dir").join("sessions");
     std::fs::create_dir_all(&sessions).expect("create sessions dir");
