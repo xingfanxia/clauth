@@ -2570,120 +2570,7 @@ pub(crate) fn on_tick(app: &mut App) {
         }
     }
 
-    // Drain completed op results posted by workers. Each result clears the
-    // profile's activity slot back to Idle, surfaces errors as toasts, and —
-    // for op kinds where the user wants confirmation — emits a success toast
-    // and any follow-up bookkeeping that touches `AppConfig` (refresh tokens,
-    // kick off a usage re-fetch).
-    let mut drained: Vec<OpResult> = Vec::new();
-    while let Ok(result) = app.op_results.try_recv() {
-        drained.push(result);
-    }
-    // Set when any Refreshing or AutoStarting OpResult succeeded; triggers
-    // `refresh_tokens()` to rebuild the scheduler's TokenList snapshot so
-    // the next fetch uses the rotated access tokens.
-    let mut needs_token_snapshot_rebuild = false;
-    // Names of profiles whose auto-start completed successfully this tick.
-    // These are pushed into RefetchQueue rather than triggering an all-profile
-    // manual_refresh — only the auto-started profiles need an immediate re-fetch,
-    // and the scheduler's forced-merge path respects Switching/Refreshing
-    // exclusions, keeping AIMD the single cadence authority.
-    let mut auto_started_names: Vec<String> = Vec::new();
-    // Names whose `Switching` OpResult arrived — the FS half runs after the
-    // drain loop so the per-name `Refreshing` toasts/clears for the same
-    // tick have already been processed and the spinner stays Switching
-    // through the relink. (The worker re-stamps Switching after
-    // `refresh_all` returns; the drain's conditional clear below preserves
-    // that re-stamp against late `Refreshing` results.)
-    let mut switch_finalize: Vec<String> = Vec::new();
-    for OpResult {
-        name,
-        kind,
-        outcome,
-    } in drained
-    {
-        // Only clear the slot when it still reflects this op's kind. The
-        // switch worker re-stamps Switching after `refresh_all` returns; an
-        // in-flight Refreshing result for the same name must not clobber
-        // that stamp, or the spinner would blink Idle between the refresh
-        // leg and the relink leg.
-        //
-        // Invariant: `ActivityKind::Fetching` is NEVER sent through OpResult.
-        // `fetch_with_rotation` and `run_fetch` manage the Fetching activity
-        // slot directly (mark before spawn, clear in join loop) without going
-        // through the OpResult channel. Valid kinds in OpResult: Refreshing,
-        // AutoStarting, Switching.
-        if matches!(kind, ActivityKind::Fetching) {
-            unreachable!(
-                "ActivityKind::Fetching must never be sent via OpResult; \
-                 the Fetching slot is managed by the join loop directly"
-            );
-        }
-        if let Ok(mut a) = app.activity.lock()
-            && a.get(&name).copied() == Some(kind.as_activity())
-        {
-            a.remove(&name);
-        }
-        match outcome {
-            Ok(()) => match kind {
-                ActivityKind::AutoStarting => {
-                    needs_token_snapshot_rebuild = true;
-                    auto_started_names.push(name.clone());
-                    app.toast(
-                        ToastKind::Info,
-                        format!("auto-started usage window for '{name}'"),
-                    );
-                }
-                ActivityKind::Refreshing => {
-                    needs_token_snapshot_rebuild = true;
-                    app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
-                }
-                ActivityKind::Switching => {
-                    switch_finalize.push(name.clone());
-                }
-                _ => {}
-            },
-            Err(e) => {
-                let verb = match kind {
-                    ActivityKind::Fetching => {
-                        unreachable!("ActivityKind::Fetching must never be sent via OpResult")
-                    }
-                    ActivityKind::Refreshing => "refresh",
-                    ActivityKind::Switching => "switch",
-                    ActivityKind::Starting => "start",
-                    ActivityKind::AutoStarting => "auto-start",
-                };
-                app.toast(
-                    ToastKind::Danger,
-                    format!("{verb} for '{name}' failed: {e}"),
-                );
-            }
-        }
-    }
-    // Run the FS half for every successful Switching result. `finalize_switch`
-    // clears the Switching marker, runs `switch_profile`, and on success bumps
-    // mtime + refreshes the token snapshot. A no-op target is harmless —
-    // `switch_profile` returns early when already active.
-    for name in switch_finalize {
-        finalize_switch(app, &name);
-    }
-    if needs_token_snapshot_rebuild {
-        app.refresh_tokens();
-    }
-    // Route auto-start re-fetches through RefetchQueue so only the auto-started
-    // profiles get an immediate re-fetch, not every profile. The scheduler's
-    // forced-merge path picks them up on the next tick, respecting
-    // Switching/Refreshing exclusions and keeping AIMD the single cadence
-    // authority. This replaces the prior all-profile manual_refresh which was
-    // a full double-fetch that raced the scheduler's next tick and injected a
-    // false cache-hit signal.
-    if !auto_started_names.is_empty()
-        && let Ok(mut q) = app.refetch_queue.lock()
-    {
-        for n in auto_started_names {
-            q.insert(n);
-        }
-    }
+    drain_op_results(app);
 
     if app.reload_if_state_changed() {
         app.clamp_main_cursor();
@@ -2711,9 +2598,7 @@ pub(crate) fn on_tick(app: &mut App) {
             .lock()
             .map(|mut g| {
                 g.extend(candidates);
-                let v: Vec<String> = g.iter().cloned().collect();
-                g.clear();
-                v
+                g.drain().collect()
             })
             .unwrap_or_default()
     };
@@ -2821,22 +2706,7 @@ pub(crate) fn on_tick(app: &mut App) {
         perform_switch(app, &name);
     }
 
-    // Drain the scheduler's wrap-off decision: the whole chain is spent with no
-    // sink, so turn off all accounts. The bool collapses repeated sets. Only
-    // drain when no modal is open — `perform_switch_off` may raise a Divergence
-    // prompt, and consuming the flag while one is already up would let the
-    // scheduler re-set it and stack duplicate modals. Left set, it retries once
-    // the modal closes.
-    if app.modals.is_empty() {
-        let switch_off_pending = app
-            .pending_switch_off
-            .lock()
-            .map(|mut g| std::mem::replace(&mut *g, false))
-            .unwrap_or(false);
-        if switch_off_pending {
-            perform_switch_off(app);
-        }
-    }
+    drain_pending_switch_off(app);
 
     drain_startup_signals(app);
     maybe_spawn_bootstrap(app);
@@ -2844,6 +2714,137 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_credentials_divergence(app);
 
     app.prune_toasts();
+}
+
+/// Drain completed op results posted by workers. Each result clears the
+/// profile's activity slot back to Idle, surfaces errors as toasts, and —
+/// for op kinds where the user wants confirmation — emits a success toast
+/// and any follow-up bookkeeping that touches `AppConfig` (refresh tokens,
+/// kick off a usage re-fetch).
+fn drain_op_results(app: &mut App) {
+    // Set when any Refreshing or AutoStarting OpResult succeeded; triggers
+    // `refresh_tokens()` to rebuild the scheduler's TokenList snapshot so
+    // the next fetch uses the rotated access tokens.
+    let mut needs_token_snapshot_rebuild = false;
+    // Names of profiles whose auto-start completed successfully this tick.
+    // These are pushed into RefetchQueue rather than triggering an all-profile
+    // manual_refresh — only the auto-started profiles need an immediate re-fetch,
+    // and the scheduler's forced-merge path respects Switching/Refreshing
+    // exclusions, keeping AIMD the single cadence authority.
+    let mut auto_started_names: Vec<String> = Vec::new();
+    // Names whose `Switching` OpResult arrived — the FS half runs after the
+    // drain loop so the per-name `Refreshing` toasts/clears for the same
+    // tick have already been processed and the spinner stays Switching
+    // through the relink. (The worker re-stamps Switching after
+    // `refresh_all` returns; the drain's conditional clear below preserves
+    // that re-stamp against late `Refreshing` results.)
+    let mut switch_finalize: Vec<String> = Vec::new();
+    while let Ok(OpResult {
+        name,
+        kind,
+        outcome,
+    }) = app.op_results.try_recv()
+    {
+        // Only clear the slot when it still reflects this op's kind. The
+        // switch worker re-stamps Switching after `refresh_all` returns; an
+        // in-flight Refreshing result for the same name must not clobber
+        // that stamp, or the spinner would blink Idle between the refresh
+        // leg and the relink leg.
+        //
+        // Invariant: `ActivityKind::Fetching` is NEVER sent through OpResult.
+        // `fetch_with_rotation` and `run_fetch` manage the Fetching activity
+        // slot directly (mark before spawn, clear in join loop) without going
+        // through the OpResult channel. Valid kinds in OpResult: Refreshing,
+        // AutoStarting, Switching.
+        if matches!(kind, ActivityKind::Fetching) {
+            unreachable!(
+                "ActivityKind::Fetching must never be sent via OpResult; \
+                 the Fetching slot is managed by the join loop directly"
+            );
+        }
+        if let Ok(mut a) = app.activity.lock()
+            && a.get(&name).copied() == Some(kind.as_activity())
+        {
+            a.remove(&name);
+        }
+        match outcome {
+            Ok(()) => match kind {
+                ActivityKind::AutoStarting => {
+                    needs_token_snapshot_rebuild = true;
+                    auto_started_names.push(name.clone());
+                    app.toast(
+                        ToastKind::Info,
+                        format!("auto-started usage window for '{name}'"),
+                    );
+                }
+                ActivityKind::Refreshing => {
+                    needs_token_snapshot_rebuild = true;
+                    app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
+                }
+                ActivityKind::Switching => {
+                    switch_finalize.push(name.clone());
+                }
+                _ => {}
+            },
+            Err(e) => {
+                let verb = match kind {
+                    ActivityKind::Fetching => {
+                        unreachable!("ActivityKind::Fetching must never be sent via OpResult")
+                    }
+                    ActivityKind::Refreshing => "refresh",
+                    ActivityKind::Switching => "switch",
+                    ActivityKind::Starting => "start",
+                    ActivityKind::AutoStarting => "auto-start",
+                };
+                app.toast(
+                    ToastKind::Danger,
+                    format!("{verb} for '{name}' failed: {e}"),
+                );
+            }
+        }
+    }
+    // Run the FS half for every successful Switching result. `finalize_switch`
+    // clears the Switching marker, runs `switch_profile`, and on success bumps
+    // mtime + refreshes the token snapshot. A no-op target is harmless —
+    // `switch_profile` returns early when already active.
+    for name in switch_finalize {
+        finalize_switch(app, &name);
+    }
+    if needs_token_snapshot_rebuild {
+        app.refresh_tokens();
+    }
+    // Route auto-start re-fetches through RefetchQueue so only the auto-started
+    // profiles get an immediate re-fetch, not every profile. The scheduler's
+    // forced-merge path picks them up on the next tick, respecting
+    // Switching/Refreshing exclusions and keeping AIMD the single cadence
+    // authority. This replaces the prior all-profile manual_refresh which was
+    // a full double-fetch that raced the scheduler's next tick and injected a
+    // false cache-hit signal.
+    if !auto_started_names.is_empty()
+        && let Ok(mut q) = app.refetch_queue.lock()
+    {
+        q.extend(auto_started_names.drain(..));
+    }
+}
+
+/// Drain the scheduler's wrap-off decision: the whole chain is spent with no
+/// sink, so turn off all accounts. The bool collapses repeated sets. Only
+/// drain when no modal is open — `perform_switch_off` may raise a Divergence
+/// prompt, and consuming the flag while one is already up would let the
+/// scheduler re-set it and stack duplicate modals. Left set, it retries once
+/// the modal closes.
+fn drain_pending_switch_off(app: &mut App) {
+    if !app.modals.is_empty() {
+        return;
+    }
+    let switch_off_pending = app
+        .pending_switch_off
+        .lock()
+        .map(|mut g| std::mem::replace(&mut *g, false))
+        .unwrap_or(false);
+    if switch_off_pending {
+        perform_switch_off(app);
+    }
 }
 
 /// Drain the startup phase signals posted by the reconcile / bootstrap
