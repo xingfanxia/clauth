@@ -376,11 +376,17 @@ fn load_profile(name: &str) -> Result<Profile> {
         fetch_status: None,
     };
 
-    // Refresh config.toml when its semantic content drifts from what we'd
-    // render today. Comment-only or whitespace-only differences shouldn't
-    // trigger a rewrite — the TUI reloads on every state-file change and we
-    // don't want to thrash disk on every reload.
-    let rendered = render_config_toml(&profile);
+    maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
+
+    Ok(profile)
+}
+
+/// Refresh config.toml when its semantic content drifts from what we'd render
+/// today. Comment-only or whitespace-only differences shouldn't trigger a
+/// rewrite — the TUI reloads on every state-file change and we don't want to
+/// thrash disk on every reload.
+fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Profile) {
+    let rendered = render_config_toml(profile);
     let needs_rewrite = match toml::from_str::<ProfileConfig>(&rendered) {
         Ok(canonical) => {
             let on_disk = ProfileConfig {
@@ -396,12 +402,10 @@ fn load_profile(name: &str) -> Result<Profile> {
     };
     if needs_rewrite {
         let _ = with_state_lock(|| {
-            let _ = atomic_write(&config_path, &rendered);
+            let _ = atomic_write(config_path, &rendered);
             Ok(())
         });
     }
-
-    Ok(profile)
 }
 
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
