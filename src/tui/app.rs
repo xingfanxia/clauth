@@ -469,6 +469,56 @@ pub(crate) struct App {
     pub(crate) bootstrap_active: Arc<AtomicBool>,
 }
 
+/// The shared state the background scheduler thread needs, bundled into one
+/// bag so [`App::start_scheduler`] can hand it to [`spawn_refresher`] without a
+/// wall of `Arc::clone` calls at the call site.
+///
+/// Holds *cloned `Arc`s only* — never a live `RankGuard`. The bag therefore
+/// carries no lock rank and is safe to construct while holding any lock; the
+/// scheduler locks each handle itself, under the global order.
+struct WorkerHandles {
+    config: ConfigHandle,
+    usage_tokens: TokenList,
+    usage_store: UsageStore,
+    usage_status: StatusStore,
+    next_refresh_per_profile: NextRefreshPerProfile,
+    activity: ActivityStore,
+    last_fetched: LastFetchedAt,
+    pending_window_rotation: PendingWindowRotation,
+    last_rotated_window: LastRotatedWindow,
+    pending_switch: PendingSwitch,
+    pending_switch_off: PendingSwitchOff,
+    refetch_queue: RefetchQueue,
+    learned_intervals: LearnedIntervals,
+    ok_count: ConsecutiveOk,
+    cache_hit_count: ConsecutiveCacheHit,
+    last_429: Last429At,
+}
+
+impl WorkerHandles {
+    /// Clone every `Arc` the scheduler shares with the UI thread out of `app`.
+    fn from_app(app: &App) -> Self {
+        Self {
+            config: Arc::clone(&app.config),
+            usage_tokens: Arc::clone(&app.usage_tokens),
+            usage_store: Arc::clone(&app.usage_store),
+            usage_status: Arc::clone(&app.usage_status),
+            next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
+            activity: Arc::clone(&app.activity),
+            last_fetched: Arc::clone(&app.last_fetched),
+            pending_window_rotation: Arc::clone(&app.pending_window_rotation),
+            last_rotated_window: Arc::clone(&app.last_rotated_window),
+            pending_switch: Arc::clone(&app.pending_switch),
+            pending_switch_off: Arc::clone(&app.pending_switch_off),
+            refetch_queue: Arc::clone(&app.refetch_queue),
+            learned_intervals: Arc::clone(&app.learned_intervals),
+            ok_count: Arc::clone(&app.ok_count),
+            cache_hit_count: Arc::clone(&app.cache_hit_count),
+            last_429: Arc::clone(&app.last_429),
+        }
+    }
+}
+
 impl App {
     pub(crate) fn new(config: AppConfig) -> Self {
         let usage_store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -664,26 +714,7 @@ impl App {
     /// auto-switch. No HTTP — all of this is lock-scoped or in-process.
     fn finish_bootstrap(&mut self) {
         self.refresh_tokens();
-
-        spawn_refresher(
-            Arc::clone(&self.config),
-            Arc::clone(&self.usage_tokens),
-            Arc::clone(&self.usage_store),
-            Arc::clone(&self.usage_status),
-            Arc::clone(&self.next_refresh_per_profile),
-            Arc::clone(&self.activity),
-            Arc::clone(&self.last_fetched),
-            Arc::clone(&self.pending_window_rotation),
-            Arc::clone(&self.last_rotated_window),
-            Arc::clone(&self.pending_switch),
-            Arc::clone(&self.pending_switch_off),
-            Arc::clone(&self.refetch_queue),
-            Arc::clone(&self.learned_intervals),
-            Arc::clone(&self.ok_count),
-            Arc::clone(&self.cache_hit_count),
-            Arc::clone(&self.last_429),
-        );
-
+        self.start_scheduler();
         self.apply_usage();
         let switched = {
             let mut cfg = self.config();
@@ -702,6 +733,31 @@ impl App {
             }
             None => {}
         }
+    }
+
+    /// Bundle the scheduler's shared `Arc`s into a [`WorkerHandles`] and launch
+    /// the background refresher. Split out of `finish_bootstrap` so the spawn
+    /// site is one move instead of a wall of `Arc::clone` calls.
+    fn start_scheduler(&self) {
+        let h = WorkerHandles::from_app(self);
+        spawn_refresher(
+            h.config,
+            h.usage_tokens,
+            h.usage_store,
+            h.usage_status,
+            h.next_refresh_per_profile,
+            h.activity,
+            h.last_fetched,
+            h.pending_window_rotation,
+            h.last_rotated_window,
+            h.pending_switch,
+            h.pending_switch_off,
+            h.refetch_queue,
+            h.learned_intervals,
+            h.ok_count,
+            h.cache_hit_count,
+            h.last_429,
+        );
     }
 
     pub(crate) fn apply_usage(&mut self) {
