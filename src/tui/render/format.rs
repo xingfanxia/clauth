@@ -143,8 +143,9 @@ pub(super) fn health_color(pct: f64, threshold: f64) -> ratatui::style::Color {
 
 /// Braille spinner frames — the set most CLI tools use. Index by `tick_count`
 /// so each render frame advances one step. Shared by the Overview row timer
-/// slot and the Usage detail status line.
-pub(super) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// slot and the Usage detail status line. Single source of truth lives in
+/// [`crate::spinner`]; re-exported here for the render helpers.
+use crate::spinner::SPINNER_FRAMES;
 
 /// Spinner frame for the current tick.
 pub(super) fn spinner_frame(tick: u64) -> &'static str {

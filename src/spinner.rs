@@ -8,11 +8,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Braille spinner frames — the set most CLI tools use. Single source of truth;
+/// the TUI re-exports this through `tui::render::format`.
+pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u64 = 80;
 
 pub(crate) struct Spinner {
-    stop: Arc<AtomicBool>,
+    /// Shared stop flag — `Some` only on the TTY path where the worker thread
+    /// reads it. The non-TTY no-op path leaves it `None` and allocates nothing.
+    stop: Option<Arc<AtomicBool>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -20,7 +24,7 @@ impl Spinner {
     pub(crate) fn start(message: &str) -> Self {
         if !std::io::stderr().is_terminal() {
             return Self {
-                stop: Arc::new(AtomicBool::new(true)),
+                stop: None,
                 handle: None,
             };
         }
@@ -39,7 +43,7 @@ impl Spinner {
             }
         });
         Self {
-            stop,
+            stop: Some(stop),
             handle: Some(handle),
         }
     }
@@ -47,7 +51,9 @@ impl Spinner {
 
 impl Drop for Spinner {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        if let Some(stop) = &self.stop {
+            stop.store(true, Ordering::Relaxed);
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
             // Clear the spinner line: carriage return + clear-to-EOL so the
