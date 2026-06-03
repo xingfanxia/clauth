@@ -473,13 +473,12 @@ fn rotation_guard_is_independent_across_profiles() {
     drop(held_a);
 }
 
-/// `auto_start_named` must return false (no token spent) when a live
-/// `clauth start` session holds the chain. Selection-time `has_live_session`
-/// short-circuits before any HTTP; the in-guard re-check in `run_auto_start`
-/// is the second layer for the post-selection race window. Network-free: the
-/// live-session gate fires before any refresh.
+/// `start_window` must return false (no kick fired) when a live `clauth start`
+/// session holds the chain. The live-session gate short-circuits before any
+/// HTTP and before the cooldown is stamped, so a live session never costs a
+/// ping. Network-free: the gate fires before the kick.
 #[test]
-fn auto_start_named_skips_when_live_session() {
+fn start_window_skips_when_live_session() {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::mpsc;
 
@@ -518,11 +517,11 @@ fn auto_start_named_skips_when_live_session() {
         Arc::new(RankedMutex::new(std::collections::HashSet::new()));
     let (tx, _rx) = mpsc::channel();
 
-    let kicked = auto_start_named(&config, name, &refetch, &activity, &tx);
+    let kicked = start_window(&config, name, &refetch, &activity, &tx);
 
     assert!(
         !kicked,
-        "auto_start_named must skip (no token spent) when a live session holds the chain"
+        "start_window must skip (no kick fired) when a live session holds the chain"
     );
     assert!(
         is_idle(&activity, name),

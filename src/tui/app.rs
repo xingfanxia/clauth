@@ -465,7 +465,7 @@ pub(crate) struct App {
     /// True while the bootstrap worker is still running (set before spawn,
     /// cleared inside the worker on every exit path). `ConfirmAction::RotateAll`
     /// consults this alongside `any_busy` to block a concurrent rotate-all
-    /// from racing the bootstrap's `auto_start_windows` leg.
+    /// from racing the bootstrap's `refresh_all` leg.
     pub(crate) bootstrap_active: Arc<AtomicBool>,
 }
 
@@ -575,15 +575,14 @@ impl App {
 
     /// Spawn the startup bootstrap onto a background thread so it never blocks
     /// the first paint. The worker re-links the active profile's credentials,
-    /// rotates every profile's OAuth pair (`refresh_all`), runs the initial
-    /// usage fetch, and kicks any opted-in 5h windows (`auto_start_windows`).
-    /// All of this is HTTP-heavy and used to run on the UI thread before the
-    /// event loop ever painted.
+    /// rotates every profile's OAuth pair (`refresh_all`), and runs the initial
+    /// usage fetch. All of this is HTTP-heavy and used to run on the UI thread
+    /// before the event loop ever painted. Arming opted-in 5h windows is left
+    /// to the recurring windowless scan in `on_tick`.
     ///
     /// Per-profile spinners light up from inside `refresh_all` / `fetch_all_into`
-    /// / `auto_start_windows` (they mark `Refreshing` / `Fetching` /
-    /// `AutoStarting`), and per-profile completion toasts ride the existing
-    /// `OpResult` drain. When the worker finishes it posts
+    /// (they mark `Refreshing` / `Fetching`), and per-profile completion toasts
+    /// ride the existing `OpResult` drain. When the worker finishes it posts
     /// `StartupSignal::BootstrapDone`; the UI thread then rebuilds the token
     /// snapshot, spawns the scheduler, applies usage, and runs the one-shot
     /// startup auto-switch — all fast, lock-scoped, network-free work.
@@ -640,33 +639,11 @@ impl App {
                     &last_429,
                 );
 
-                let started = oauth::auto_start_windows(
-                    &config,
-                    &usage_store,
-                    &refetch_queue,
-                    &activity,
-                    &op_sender,
-                );
-                if !started.is_empty() {
-                    let retry: Vec<TokenEntry> =
-                        collect_tokens(&config.lock().expect("config mutex poisoned").profiles)
-                            .into_iter()
-                            .filter(|e| started.contains(&e.name))
-                            .collect();
-                    fetch_all_into(
-                        &config,
-                        &retry,
-                        &usage_store,
-                        &usage_status,
-                        &last_fetched,
-                        &refetch_queue,
-                        &activity,
-                        &learned_intervals,
-                        &ok_count,
-                        &cache_hit_count,
-                        &last_429,
-                    );
-                }
+                // Opted-in 5h windows are armed by the recurring windowless
+                // scan in `on_tick` once bootstrap clears `bootstrap_active` —
+                // no startup-only kick pass. That single path also covers
+                // background profiles whose first kick fails or that lose a
+                // window mid-session.
 
                 bootstrap_active.store(false, Ordering::SeqCst);
                 let _ = startup_sender.send(StartupSignal::BootstrapDone);
@@ -2228,38 +2205,16 @@ fn toggle_auto_start(app: &mut App, name: &str) {
             "auto-start usage only applies to OAuth profiles",
         ),
         Outcome::Saved(now_on) => {
-            // Turning auto-start ON kicks the 5h window right away when the
-            // profile has no live window. Toggling is an explicit user action,
-            // so clear the 4.5h cooldown first — otherwise a prior (possibly
-            // failed) auto-start stamp makes `auto_start_named` silently skip.
-            // Then enqueue into `pending_auto_start`; the on_tick drain spawns
-            // the AutoStarting worker (refresh + Haiku kick + usage re-fetch).
-            // A profile that already has a live window is left alone — the
-            // window-expiry rotation path re-arms it when it next resets.
+            // Turning auto-start ON is an explicit user action, so clear the
+            // 4.5h cooldown — otherwise a prior (possibly failed) auto-start
+            // stamp would make the next windowless scan skip this profile for
+            // hours. The scan in `on_tick` then arms it on the next tick if it
+            // has no live 5h window; a profile that already has one is left
+            // alone by the scan's window check.
             if now_on {
-                let has_window = app
-                    .usage_store
-                    .lock()
-                    .ok()
-                    .and_then(|s| {
-                        s.get(name).map(|u| {
-                            u.five_hour
-                                .as_ref()
-                                .and_then(|w| w.resets_at.as_ref())
-                                .is_some()
-                        })
-                    })
-                    .unwrap_or(false);
-                if !has_window {
-                    {
-                        let mut cfg = app.config();
-                        cfg.state.last_auto_start_at.remove(name);
-                        let _ = save_app_state(&cfg.state);
-                    }
-                    if let Ok(mut q) = app.pending_auto_start.lock() {
-                        q.insert(name.to_string());
-                    }
-                }
+                let mut cfg = app.config();
+                cfg.state.last_auto_start_at.remove(name);
+                let _ = save_app_state(&cfg.state);
             }
             let body = if now_on {
                 format!("auto-start usage on for '{name}'")
@@ -2325,9 +2280,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // worker would step on per-profile work or duplicate a refresh
             // already mid-rotation. Bootstrap is a whole-worker busy signal
             // separate from per-profile activity: between the last Refreshing
-            // slot clearing and the first AutoStarting slot setting there is a
-            // window where activity_store is empty but the bootstrap worker is
-            // still running auto_start_windows. The flag covers that gap.
+            // slot clearing and the next fetch's slot setting there is a window
+            // where activity_store is empty but the bootstrap worker is still
+            // running. The flag covers that gap.
             if app.bootstrap_active.load(Ordering::SeqCst) || any_busy(&app.activity) {
                 app.toast(
                     ToastKind::Warning,
@@ -2654,23 +2609,27 @@ pub(crate) fn on_tick(app: &mut App) {
     }
     app.apply_usage();
 
-    // Drain the auto-start queue the refresher fills when a successful fetch
-    // shows no live 5h window. Each pending name is handed to a worker thread
-    // so the HTTP runs off the UI thread; the result is surfaced through the
-    // standard OpResult channel (drained at the top of the next tick) so the
-    // spinner clears in arrival order. `auto_start_named` enforces its own
-    // per-profile cooldown, so a duplicate enqueue is a no-op.
+    // Arm opted-in profiles that have no live 5h window. The windowless scan
+    // enqueues every eligible background profile each tick (the active one gets
+    // its window from Claude Code itself), merged with any names a toggle just
+    // pushed. Each is handed to a worker so the kick HTTP runs off the UI
+    // thread; the result is surfaced through the standard OpResult channel
+    // (drained at the top of the next tick) so the spinner clears in arrival
+    // order. `start_window` claims the per-profile cooldown before kicking, so
+    // a duplicate enqueue is a no-op and a failed kick retries once per window.
     //
-    // Skip the entire drain while the bootstrap worker is running: it may be
-    // mid-`auto_start_windows` for these same profiles, and draining here
-    // would race on the same single-use refresh tokens. Entries left in the
-    // mutex are picked up on the next tick once the flag clears.
+    // Skip both the scan and the drain while the bootstrap worker is running:
+    // it is mid-`refresh_all` for these same profiles, and the access tokens it
+    // rotates must land before we kick. Entries left in the mutex are picked up
+    // on the next tick once the flag clears.
     let pending: Vec<String> = if app.bootstrap_active.load(Ordering::SeqCst) {
         Vec::new()
     } else {
+        let candidates = oauth::windowless_auto_start_candidates(&app.config, &app.usage_store);
         app.pending_auto_start
             .lock()
             .map(|mut g| {
+                g.extend(candidates);
                 let v: Vec<String> = g.iter().cloned().collect();
                 g.clear();
                 v
@@ -2690,7 +2649,7 @@ pub(crate) fn on_tick(app: &mut App) {
         let sender_for_panic = app.op_sender.clone();
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = oauth::auto_start_named(&config, &name, &refetch, &activity, &sender);
+                let _ = oauth::start_window(&config, &name, &refetch, &activity, &sender);
             }));
             if result.is_err() {
                 clear_activity(&activity_for_panic, &name_for_panic);
@@ -2746,21 +2705,11 @@ pub(crate) fn on_tick(app: &mut App) {
                     epoch,
                 );
                 if rotated {
-                    // The 5h window just expired and the token was refreshed.
-                    // Opted-in OAuth profiles re-arm the window immediately with
-                    // the freshly rotated access token (kick-only, no second
-                    // refresh): `start_window` shows the AutoStarting spinner,
-                    // fires the Haiku ping, and re-fetches usage on success.
-                    // Non-opted-in profiles just re-fetch as before.
-                    let auto = {
-                        let cfg = config.lock().expect("config mutex poisoned");
-                        cfg.find(&name)
-                            .map(|p| p.auto_start && p.is_oauth())
-                            .unwrap_or(false)
-                    };
-                    if auto {
-                        oauth::start_window(&config, &name, &refetch, &activity, &sender);
-                    } else if let Ok(mut q) = refetch.lock() {
+                    // The 5h window expired and the chain rotated. Re-fetch so
+                    // the fresh numbers land; the windowless scan in `on_tick`
+                    // re-arms opted-in profiles on a later tick (the single kick
+                    // path), so this worker never kicks.
+                    if let Ok(mut q) = refetch.lock() {
                         q.insert(name);
                     }
                 }

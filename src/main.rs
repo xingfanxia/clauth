@@ -82,7 +82,7 @@ fn main() -> Result<()> {
             // refresh token on every switch is unnecessary and widens races with
             // the scheduler.
             let outgoing = config.state.active_profile.clone();
-            // No scheduler running — noop_refetch is a throwaway; auto_start_named
+            // No scheduler running — noop_refetch is a throwaway; start_window
             // below still uses it to push kicked names no one reads.
             let noop_refetch: RefetchQueue =
                 Arc::new(RankedMutex::new(std::collections::HashSet::new()));
@@ -170,7 +170,7 @@ fn main() -> Result<()> {
             // from re-kicking inside the same window.
             {
                 let _spinner = Spinner::start("clauth: priming usage window…");
-                let _ = oauth::auto_start_named(
+                let _ = oauth::start_window(
                     &config,
                     &canonical,
                     &noop_refetch,

@@ -40,16 +40,9 @@ const KICK_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI 
 /// Sized just under the 5-hour window so a ping whose follow-up usage fetch
 /// failed (network blip, stale endpoint) doesn't cause us to re-fire on
 /// every refresh, while still allowing a fresh ping once the window has
-/// elapsed. Used by the single-name `auto_start_named` path.
+/// elapsed. Claimed by `start_window` before each kick and used by
+/// `windowless_auto_start_candidates` to pre-filter.
 const AUTO_START_COOLDOWN_MS: u64 = 4 * 3600 * 1000 + 30 * 60 * 1000;
-
-/// Startup-only dedup window for `auto_start_windows`. The 5h-window check
-/// (`has_active_window`) is the real "already armed" guard, so this only needs
-/// to be long enough to stop two clauth instances launched within the same
-/// startup burst from both kicking (and double-spending the refresh token).
-/// Deliberately short — a fresh launch must re-arm a windowless opted-in
-/// account even if a prior session pinged it minutes ago.
-const STARTUP_DEDUP_MS: u64 = 60 * 1000;
 
 #[derive(Deserialize)]
 pub(crate) struct TokenResponse {
@@ -407,27 +400,27 @@ pub(crate) fn refresh_all(
     refreshed
 }
 
-/// For every profile that opted in via `auto_start = true` and currently has
-/// no 5-hour usage window, refreshes its OAuth tokens (rotated pair saved to
-/// disk) and fires a 1-token Haiku ping to start the window.
+/// Names of opted-in OAuth profiles that currently have NO live 5-hour window
+/// and are eligible for an auto-start kick: not active-with-a-diverged-link, no
+/// live `clauth start` session, and past the auto-start cooldown. The caller
+/// enqueues these into `pending_auto_start`; the on-tick drain kicks each
+/// through [`start_window`].
 ///
-/// Returns the names of profiles whose ping succeeded so the caller can
-/// re-fetch usage and confirm the window now shows up. Pushes each kicked
-/// name onto `refetch` so the scheduler re-fetches without waiting for the
-/// cadence.
-pub(crate) fn auto_start_windows(
+/// This is the single steady-state arming path, and the fix for background
+/// (non-active) accounts: the active profile gets its 5-hour window for free
+/// (Claude Code starts one on use), so without a recurring scan an opted-in
+/// background profile would only ever be armed by the one-shot startup pass — a
+/// profile whose startup kick failed, or that lost its window mid-session,
+/// would never be re-armed. Running this every tick re-arms them as soon as
+/// they fall idle and windowless.
+///
+/// Reads the usage store BEFORE the config lock: `apply_usage` holds
+/// `usage_store` then `config`, so taking them in the other order here would
+/// invert the global lock rank and deadlock.
+pub(crate) fn windowless_auto_start_candidates(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
-    refetch: &RefetchQueue,
-    activity: &ActivityStore,
-    sender: &OpResultSender,
 ) -> Vec<String> {
-    // Snapshot which profiles already have an active 5h window BEFORE taking
-    // the config lock. `apply_usage` on the UI thread holds `usage_store` then
-    // acquires `config`; taking `config` first and then `store` inside
-    // `with_state_lock` would invert that order and deadlock. Reading into an
-    // owned map here keeps the lock order consistent: store snapshot first,
-    // config lock second.
     let has_active_window: std::collections::HashMap<String, bool> = store
         .lock()
         .ok()
@@ -445,236 +438,47 @@ pub(crate) fn auto_start_windows(
         })
         .unwrap_or_default();
 
-    // Claim dedup slots under the lock BEFORE any network work. A competing
-    // clauth process that starts up within `STARTUP_DEDUP_MS` will observe our
-    // recorded `last_auto_start_at` and skip the same profile, so the refresh
-    // token rotates exactly once even when two instances race startup. The
-    // window is short on purpose: every fresh launch must re-arm an opted-in
-    // account that has no live 5h window, regardless of how long ago a prior
-    // session pinged it — `has_active_window` already skips accounts that are
-    // already armed.
-    //
-    // Holding the lock during the OAuth/messages HTTP round trips would stall
-    // every other instance for seconds, so we release between claim and work.
-    let snapshots: Vec<(String, String)> = {
-        let mut cfg = config.lock().expect("config mutex poisoned");
-        match with_state_lock(|| {
-            let skip_active = active_link_diverged(&cfg);
-            let now = now_ms();
-            let mut claimed = Vec::new();
-            for profile in &cfg.profiles {
-                if !profile.auto_start {
-                    continue;
-                }
-                if skip_active && cfg.is_active(&profile.name) {
-                    continue;
-                }
-                if has_live_session(&profile.name) {
-                    continue;
-                }
-                if *has_active_window.get(&profile.name).unwrap_or(&false) {
-                    continue;
-                }
-                let last = cfg
-                    .state
-                    .last_auto_start_at
-                    .get(&profile.name)
-                    .copied()
-                    .unwrap_or(0);
-                if now.saturating_sub(last) < STARTUP_DEDUP_MS {
-                    continue;
-                }
-                let Some(token) = profile.refresh_token().map(str::to_string) else {
-                    continue;
-                };
-                claimed.push((profile.name.clone(), token));
-            }
-
-            // Stamp the dedup slots before releasing the lock. A competing
-            // clauth process starting within `STARTUP_DEDUP_MS` will observe
-            // these timestamps and skip the same profiles so the token rotates
-            // exactly once even when two instances race startup.
-            for (name, _) in &claimed {
-                cfg.state.last_auto_start_at.insert(name.clone(), now);
-            }
-            if !claimed.is_empty() {
-                let _ = save_app_state(&cfg.state);
-            }
-            Ok::<_, anyhow::Error>(claimed)
-        }) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        }
-    };
-
-    // Refresh and kick are reported separately. Anthropic rotates the refresh
-    // token on every successful refresh, so the new pair MUST be persisted
-    // before the kick is attempted — otherwise a kick-only failure leaves the
-    // stored refresh token permanently invalid.
-    //
-    // Spinner-wise: AutoStarting covers refresh + persist + kick for the full
-    // window. Each worker stamps its own slot AutoStarting before the network
-    // round trip, posts an OpResult on completion, and clears its slot so
-    // the spinner drops at HTTP completion rather than waiting for the
-    // slowest sibling.
-    for (name, _) in &snapshots {
-        mark_activity(activity, name, ProfileActivity::AutoStarting);
-    }
-    // Pair each handle with the profile name so the join loop can clear the
-    // activity slot on panic — the name is consumed by the closure.
-    let handles: Vec<(String, _)> = snapshots
-        .into_iter()
-        .map(|(name, rt)| {
-            let config = Arc::clone(config);
-            let activity = Arc::clone(activity);
-            let sender = sender.clone();
-            let name_for_handle = name.clone();
-            let h = std::thread::spawn(move || {
-                let (outcome, kicked) = run_auto_start(&config, &name, &rt);
-                clear_activity(&activity, &name);
-                let _ = sender.send(OpResult {
-                    name: name.clone(),
-                    kind: ActivityKind::AutoStarting,
-                    outcome,
-                });
-                (name, kicked)
-            });
-            (name_for_handle, h)
-        })
-        .collect();
-
-    let mut kicked = Vec::new();
-    for (name, h) in handles {
-        match h.join() {
-            Ok((n, true)) => kicked.push(n),
-            Ok(_) => {}
-            Err(_) => {
-                // Worker panicked before calling `clear_activity`. Clear the slot
-                // here so the spinner doesn't freeze and `any_busy` can resolve.
-                clear_activity(activity, &name);
-            }
-        }
-    }
-    if let Ok(mut q) = refetch.lock() {
-        for name in &kicked {
-            q.insert(name.clone());
-        }
-    }
-    kicked
-}
-
-/// Per-profile auto-start work: refresh tokens, persist, kick the 5h window.
-/// Returns `(outcome, kicked)` where `kicked` is true iff the messages POST
-/// succeeded. Used by both `auto_start_windows` (fan-out) and the single-name
-/// `auto_start_named` path. Never holds the config mutex across HTTP.
-fn run_auto_start(
-    config: &crate::profile::ConfigHandle,
-    name: &str,
-    refresh_token: &str,
-) -> (Result<()>, bool) {
-    // Per-profile rotation lock across the refresh HTTP window so an external
-    // `clauth start <name>` cannot double-spend this single-use token mid-kick
-    // (same template as `rotate_one`). Both auto-start callers already skip
-    // live sessions at selection time; the in-guard re-check closes the window
-    // between that selection and this refresh — a session that won the acquire
-    // race has stamped its PID file before releasing the guard, so the read is
-    // authoritative.
-    let _rotation_guard = match RotationGuard::acquire(name) {
-        Ok(g) => g,
-        Err(e) => return (Err(e), false),
-    };
-    if has_live_session(name) {
-        return (Err(anyhow::anyhow!("live session holds the chain")), false);
-    }
-    let tok = match refresh(refresh_token) {
-        Ok(t) => t,
-        Err(e) => return (Err(e), false),
-    };
-    let access_token = tok.access_token.clone();
-    if !apply_rotated_tokens_or_rollback_cooldown_locked(config, name, tok) {
-        return (
-            Err(anyhow::anyhow!("failed to persist rotated tokens")),
-            false,
-        );
-    }
-    match kick(&access_token) {
-        Ok(()) => (Ok(()), true),
-        Err(e) => (Err(e), false),
-    }
-}
-
-/// Refresh tokens and kick the 5h window for one named profile. Same
-/// cooldown + persistence semantics as `auto_start_windows`, just scoped to
-/// a single name and without a usage-store check — callers use this where
-/// no fresh `UsageStore` is on hand (e.g. one-shot CLI switch). The 4.5h
-/// cooldown stops repeated invocations from re-firing inside an open
-/// window. Returns true iff the kick HTTP call succeeded. Pushes `name`
-/// onto `refetch` on success.
-pub(crate) fn auto_start_named(
-    config: &crate::profile::ConfigHandle,
-    name: &str,
-    refetch: &RefetchQueue,
-    activity: &ActivityStore,
-    sender: &OpResultSender,
-) -> bool {
+    let cfg = config.lock().expect("config mutex poisoned");
+    let skip_active = active_link_diverged(&cfg);
     let now = now_ms();
-    let token = {
-        let mut cfg = config.lock().expect("config mutex poisoned");
-        match with_state_lock(|| {
-            let Some(profile) = cfg.find(name) else {
-                return Ok::<_, anyhow::Error>(None);
-            };
-            if !profile.auto_start {
-                return Ok(None);
-            }
-            if active_link_diverged(&cfg) && cfg.is_active(name) {
-                return Ok(None);
-            }
-            if has_live_session(name) {
-                return Ok(None);
-            }
-            let last = cfg.state.last_auto_start_at.get(name).copied().unwrap_or(0);
-            if now.saturating_sub(last) < AUTO_START_COOLDOWN_MS {
-                return Ok(None);
-            }
-            let Some(rt) = profile.refresh_token().map(str::to_string) else {
-                return Ok(None);
-            };
-            cfg.state.last_auto_start_at.insert(name.to_string(), now);
-            let _ = save_app_state(&cfg.state);
-            Ok(Some(rt))
-        }) {
-            Ok(Some(t)) => t,
-            _ => return false,
-        }
-    };
-
-    // AutoStarting spinner covers the full refresh + persist + kick window.
-    // Never held across `with_state_lock`; cleared in every exit path.
-    mark_activity(activity, name, ProfileActivity::AutoStarting);
-    let (outcome, kicked) = run_auto_start(config, name, &token);
-    clear_activity(activity, name);
-    let _ = sender.send(OpResult {
-        name: name.to_string(),
-        kind: ActivityKind::AutoStarting,
-        outcome,
-    });
-    if kicked && let Ok(mut q) = refetch.lock() {
-        q.insert(name.to_string());
-    }
-    kicked
+    cfg.profiles
+        .iter()
+        .filter(|p| {
+            p.auto_start
+                && p.is_oauth()
+                && !(skip_active && cfg.is_active(&p.name))
+                && !has_live_session(&p.name)
+                && !*has_active_window.get(&p.name).unwrap_or(&false)
+                && now.saturating_sub(
+                    cfg.state
+                        .last_auto_start_at
+                        .get(&p.name)
+                        .copied()
+                        .unwrap_or(0),
+                ) >= AUTO_START_COOLDOWN_MS
+        })
+        .map(|p| p.name.clone())
+        .collect()
 }
 
-/// Kick the 5h usage window for `name` using its CURRENT (already-rotated)
-/// access token — NO token refresh, so this is safe to call right after a
-/// window-expiry rotation without double-spending the single-use refresh
-/// token. Marks `AutoStarting` so the overview shows the starting spinner,
-/// fires the 1-token Haiku ping, sends one `OpResult`, and on a successful
-/// kick pushes `name` onto `refetch` so usage re-fetches and the freshly
-/// armed window shows up. Returns true iff the kick succeeded.
+/// The single auto-start codepath: fire the 1-token Haiku ping that opens a
+/// profile's 5-hour usage window, using its CURRENT access token. NEVER
+/// refreshes the OAuth chain — the access token is kept valid by the fetch
+/// path's 401-rotation, so auto-start can never double-spend the single-use
+/// refresh token and needs no `RotationGuard`.
 ///
-/// `kick` spends only the access token (not the refresh token), so no
-/// `RotationGuard` is needed here.
+/// Gates on opt-in, OAuth, a diverged active link, a live `clauth start`
+/// session, and the auto-start cooldown so every caller (the on-tick windowless
+/// scan and the CLI switch) shares one rule set. The cooldown slot is claimed
+/// (stamped `last_auto_start_at`) before the kick so a failed ping throttles to
+/// one retry per window instead of re-firing every tick; the cooldown is sized
+/// just under 5h so the next window expiry re-arms. The "already has a window"
+/// check lives in [`windowless_auto_start_candidates`], where the usage store
+/// is on hand.
+///
+/// Marks `AutoStarting`, sends one `OpResult`, and on a successful kick pushes
+/// `name` onto `refetch` so usage re-fetches and the freshly armed window shows
+/// up. Returns true iff the kick succeeded.
 pub(crate) fn start_window(
     config: &crate::profile::ConfigHandle,
     name: &str,
@@ -683,12 +487,35 @@ pub(crate) fn start_window(
     sender: &OpResultSender,
 ) -> bool {
     let access_token = {
-        let cfg = config.lock().expect("config mutex poisoned");
-        cfg.find(name)
-            .and_then(|p| p.access_token().map(str::to_string))
-    };
-    let Some(access_token) = access_token else {
-        return false;
+        let mut cfg = config.lock().expect("config mutex poisoned");
+        match with_state_lock(|| {
+            let Some(profile) = cfg.find(name) else {
+                return Ok::<_, anyhow::Error>(None);
+            };
+            if !profile.is_oauth() || !profile.auto_start {
+                return Ok(None);
+            }
+            let Some(token) = profile.access_token().map(str::to_string) else {
+                return Ok(None);
+            };
+            if active_link_diverged(&cfg) && cfg.is_active(name) {
+                return Ok(None);
+            }
+            if has_live_session(name) {
+                return Ok(None);
+            }
+            let now = now_ms();
+            let last = cfg.state.last_auto_start_at.get(name).copied().unwrap_or(0);
+            if now.saturating_sub(last) < AUTO_START_COOLDOWN_MS {
+                return Ok(None);
+            }
+            cfg.state.last_auto_start_at.insert(name.to_string(), now);
+            let _ = save_app_state(&cfg.state);
+            Ok(Some(token))
+        }) {
+            Ok(Some(t)) => t,
+            _ => return false,
+        }
     };
 
     mark_activity(activity, name, ProfileActivity::AutoStarting);
@@ -714,51 +541,6 @@ fn write_token_fields(oauth: &mut OAuthToken, tok: TokenResponse) {
     if let Some(scope) = tok.scope {
         oauth.scopes = Some(scope.split_whitespace().map(String::from).collect());
     }
-}
-
-/// Write a rotated token pair into the named profile's OAuth block and persist.
-/// If persist fails, rolls back the `last_auto_start_at` cooldown so the next
-/// run can retry without waiting the full 4.5h. Returns true on success.
-///
-/// Takes `&crate::profile::ConfigHandle` and locks it only across the brief write
-/// window, so workers can call this without holding the lock during HTTP.
-///
-/// Lock order: AppConfig in-process mutex first, then state flock. Matches
-/// the existing UI-thread order so workers and the UI thread never invert.
-fn apply_rotated_tokens_or_rollback_cooldown_locked(
-    config: &crate::profile::ConfigHandle,
-    name: &str,
-    tok: TokenResponse,
-) -> bool {
-    let mut cfg = config.lock().expect("config mutex poisoned");
-    with_state_lock(|| {
-        let Some(profile) = cfg.find_mut(name) else {
-            return Ok::<_, anyhow::Error>(false);
-        };
-        let Some(creds) = profile.credentials.as_mut() else {
-            return Ok(false);
-        };
-        let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
-            return Ok(false);
-        };
-        write_token_fields(oauth, tok);
-        // Stage the rotated pair durably before the structured save so a save
-        // failure or crash here is recoverable on next load instead of burning
-        // the single-use chain.
-        if let Some(creds) = profile.credentials.as_ref() {
-            let _ = stage_rotated_credentials(name, creds);
-        }
-        if save_profile(profile).is_err() {
-            // Sidecar stays for recovery. Still roll back the cooldown so the
-            // profile retries promptly instead of waiting the full window.
-            cfg.state.last_auto_start_at.remove(name);
-            let _ = save_app_state(&cfg.state);
-            return Ok(false);
-        }
-        clear_staged_credentials(name);
-        Ok(true)
-    })
-    .unwrap_or(false)
 }
 
 /// Write a rotated token pair into the named profile's OAuth block and
