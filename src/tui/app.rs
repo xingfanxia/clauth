@@ -1166,6 +1166,41 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
     }
 }
 
+/// Spawn a detached worker thread that runs `work` under `catch_unwind` and
+/// owns the panic path: on a panic it clears `name`'s activity slot and emits a
+/// failure `OpResult { name, kind, .. }` carrying `panic_msg`, so a panic before
+/// the closure's own `sender.send` can never strand the slot (which would wedge
+/// `any_busy`). The `AssertUnwindSafe` wrap is intentional — the closure's
+/// captured Arcs are shared-mutable cells with their own locks; a panic inside
+/// it can't violate a per-thread invariant for other threads.
+///
+/// Touches no locks itself beyond the panic-path `clear_activity` / `send`; it
+/// only orchestrates the thread and the unwind. Callers clone solely what
+/// `work` captures — the panic twins of `name`, `activity`, and `sender` live
+/// here.
+fn spawn_profile_worker<F>(
+    name: String,
+    kind: ActivityKind,
+    panic_msg: &'static str,
+    activity: ActivityStore,
+    sender: OpResultSender,
+    work: F,
+) where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        if result.is_err() {
+            clear_activity(&activity, &name);
+            let _ = sender.send(OpResult {
+                name,
+                kind,
+                outcome: Err(anyhow::anyhow!(panic_msg)),
+            });
+        }
+    });
+}
+
 /// Kick off a TUI switch to `name`. Marks the target `Switching` and spawns a
 /// worker that rotates the outgoing active and incoming target profiles via
 /// `rotate_one`, then emits `OpResult { kind: Switching, outcome }`. The drain in `on_tick`
@@ -1180,15 +1215,15 @@ fn perform_switch(app: &mut App, name: &str) {
     // Read the outgoing active profile before mutating anything — worker only
     // rotates active + target, not every profile.
     let outgoing = app.config().state.active_profile.clone();
-    std::thread::spawn(move || {
-        // `catch_unwind` ensures the Switching slot is cleared even when a
-        // panic fires before the `sender.send` below. Without this, a panic
-        // leaves the slot set forever: `any_busy` stays true and ALL future
-        // switches are blocked for the lifetime of the process. The
-        // `AssertUnwindSafe` wrappers are intentional — these Arcs are
-        // shared-mutable cells with their own locks; no per-thread invariant
-        // can be violated for other threads by a panic inside this closure.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let work_activity = Arc::clone(&activity);
+    let work_sender = sender.clone();
+    spawn_profile_worker(
+        target.clone(),
+        ActivityKind::Switching,
+        "switch worker panicked",
+        activity,
+        sender,
+        move || {
             // Rotate only the outgoing active and incoming target profiles.
             // Every other profile's single-use refresh token is left untouched.
             // `rotate_one` returns false (no HTTP) when there is no refresh
@@ -1196,29 +1231,19 @@ fn perform_switch(app: &mut App, name: &str) {
             if let Some(ref active) = outgoing
                 && active != &target
             {
-                oauth::rotate_one(&config, active, &activity, &sender);
+                oauth::rotate_one(&config, active, &work_activity, &work_sender);
             }
-            oauth::rotate_one(&config, &target, &activity, &sender);
+            oauth::rotate_one(&config, &target, &work_activity, &work_sender);
             // Re-stamp Switching so the spinner stays up through the FS leg
             // the UI thread runs next (rotate_one leaves the slot as Idle).
-            mark_activity(&activity, &target, ProfileActivity::Switching);
-            let _ = sender.send(OpResult {
+            mark_activity(&work_activity, &target, ProfileActivity::Switching);
+            let _ = work_sender.send(OpResult {
                 name: target.clone(),
                 kind: ActivityKind::Switching,
                 outcome: Ok(()),
             });
-        }));
-        if result.is_err() {
-            // Panic path: clear the slot and send a failure result so the UI
-            // thread can toast the error and the switch operation is unblocked.
-            clear_activity(&activity, &target);
-            let _ = sender.send(OpResult {
-                name: target,
-                kind: ActivityKind::Switching,
-                outcome: Err(anyhow::anyhow!("switch worker panicked")),
-            });
-        }
-    });
+        },
+    );
 }
 
 /// True when `active`'s live `.credentials.json` has diverged from its stored
@@ -2642,24 +2667,25 @@ pub(crate) fn on_tick(app: &mut App) {
         }
         let config = Arc::clone(&app.config);
         let refetch = Arc::clone(&app.refetch_queue);
-        let activity = Arc::clone(&app.activity);
-        let sender = app.op_sender.clone();
-        let name_for_panic = name.clone();
-        let activity_for_panic = Arc::clone(&app.activity);
-        let sender_for_panic = app.op_sender.clone();
-        std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = oauth::start_window(&config, &name, &refetch, &activity, &sender);
-            }));
-            if result.is_err() {
-                clear_activity(&activity_for_panic, &name_for_panic);
-                let _ = sender_for_panic.send(OpResult {
-                    name: name_for_panic,
-                    kind: ActivityKind::AutoStarting,
-                    outcome: Err(anyhow::anyhow!("auto-start worker panicked")),
-                });
-            }
-        });
+        let work_name = name.clone();
+        let work_activity = Arc::clone(&app.activity);
+        let work_sender = app.op_sender.clone();
+        spawn_profile_worker(
+            name,
+            ActivityKind::AutoStarting,
+            "auto-start worker panicked",
+            Arc::clone(&app.activity),
+            app.op_sender.clone(),
+            move || {
+                let _ = oauth::start_window(
+                    &config,
+                    &work_name,
+                    &refetch,
+                    &work_activity,
+                    &work_sender,
+                );
+            },
+        );
     }
 
     // Drain 5h-window-expiry rotation requests posted by the scheduler. Each
@@ -2687,20 +2713,23 @@ pub(crate) fn on_tick(app: &mut App) {
             continue;
         }
         let config = Arc::clone(&app.config);
-        let activity = Arc::clone(&app.activity);
         let refetch = Arc::clone(&app.refetch_queue);
         let last_rotated = Arc::clone(&app.last_rotated_window);
-        let sender = app.op_sender.clone();
-        let name_for_panic = name.clone();
-        let activity_for_panic = Arc::clone(&app.activity);
-        let sender_for_panic = app.op_sender.clone();
-        std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let work_name = name.clone();
+        let work_activity = Arc::clone(&app.activity);
+        let work_sender = app.op_sender.clone();
+        spawn_profile_worker(
+            name,
+            ActivityKind::Refreshing,
+            "window-rotation worker panicked",
+            Arc::clone(&app.activity),
+            app.op_sender.clone(),
+            move || {
                 let rotated = oauth::rotate_one_for_window(
                     &config,
-                    &name,
-                    &activity,
-                    &sender,
+                    &work_name,
+                    &work_activity,
+                    &work_sender,
                     &last_rotated,
                     epoch,
                 );
@@ -2710,19 +2739,11 @@ pub(crate) fn on_tick(app: &mut App) {
                     // re-arms opted-in profiles on a later tick (the single kick
                     // path), so this worker never kicks.
                     if let Ok(mut q) = refetch.lock() {
-                        q.insert(name);
+                        q.insert(work_name);
                     }
                 }
-            }));
-            if result.is_err() {
-                clear_activity(&activity_for_panic, &name_for_panic);
-                let _ = sender_for_panic.send(OpResult {
-                    name: name_for_panic,
-                    kind: ActivityKind::Refreshing,
-                    outcome: Err(anyhow::anyhow!("window-rotation worker panicked")),
-                });
-            }
-        });
+            },
+        );
     }
 
     // Drain scheduler-posted auto-switch decisions. Each entry was computed
