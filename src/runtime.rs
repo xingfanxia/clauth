@@ -480,12 +480,16 @@ fn materialize_entry(src: &Path, dst: &Path, mode: LinkMode) -> Result<()> {
 /// the lock is never released; threads only parallelize the copy. Each
 /// subtree is disjoint, so the per-entry contract (no shared dst) is intact;
 /// credential reconciliation still runs serially after this returns.
+fn serialize_entries(pending: &[(PathBuf, PathBuf)], mode: LinkMode) -> Result<()> {
+    for (src, dst) in pending {
+        materialize_entry(src, dst, mode)?;
+    }
+    Ok(())
+}
+
 fn materialize_entries(pending: Vec<(PathBuf, PathBuf)>, mode: LinkMode) -> Result<()> {
     if mode == LinkMode::Real || pending.len() < 2 {
-        for (src, dst) in &pending {
-            materialize_entry(src, dst, mode)?;
-        }
-        return Ok(());
+        return serialize_entries(&pending, mode);
     }
 
     let workers = std::thread::available_parallelism()
@@ -493,10 +497,7 @@ fn materialize_entries(pending: Vec<(PathBuf, PathBuf)>, mode: LinkMode) -> Resu
         .unwrap_or(1)
         .min(pending.len());
     if workers < 2 {
-        for (src, dst) in &pending {
-            materialize_entry(src, dst, mode)?;
-        }
-        return Ok(());
+        return serialize_entries(&pending, mode);
     }
 
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -532,9 +533,7 @@ fn reconcile_credentials(runtime_path: &Path, canonical: &Path, mode: LinkMode) 
         LinkMode::Real => {
             sync_credentials_unlocked(runtime_path, canonical)?;
             let meta = runtime_path.symlink_metadata().ok();
-            if meta.as_ref().is_some_and(|m| m.file_type().is_symlink())
-                || meta.as_ref().is_some_and(|m| m.is_file())
-            {
+            if meta.is_some_and(|m| m.file_type().is_symlink() || m.is_file()) {
                 return Ok(());
             }
             if canonical.exists() {
@@ -707,27 +706,22 @@ fn mirror_credentials(runtime_path: &Path, canonical: &Path) -> Result<()> {
     let runtime_meta = runtime_path.metadata().ok();
     let canonical_meta = canonical.metadata().ok();
 
-    match (runtime_meta, canonical_meta) {
-        (Some(rm), Some(cm)) => {
-            let rt_time = rm.modified().ok();
-            let ca_time = cm.modified().ok();
-            match (rt_time, ca_time) {
-                (Some(rt), Some(ca)) if rt > ca => {
-                    copy_if_valid_creds(runtime_path, canonical)?;
-                }
-                (Some(rt), Some(ca)) if ca > rt => {
-                    copy_if_valid_creds(canonical, runtime_path)?;
-                }
-                _ => {}
-            }
-        }
-        (Some(_), None) => {
-            copy_if_valid_creds(runtime_path, canonical)?;
-        }
-        (None, Some(_)) => {
-            copy_if_valid_creds(canonical, runtime_path)?;
-        }
-        (None, None) => {}
+    // Pick the newer side to copy from, or `None` when there is nothing to do:
+    // both present with comparable mtimes -> latest wins (tie/unknown mtime is a
+    // noop); exactly one present -> seed the other; neither -> noop.
+    let copy: Option<(&Path, &Path)> = match (runtime_meta, canonical_meta) {
+        (Some(rm), Some(cm)) => match rm.modified().ok().zip(cm.modified().ok()) {
+            Some((rt, ca)) if rt > ca => Some((runtime_path, canonical)),
+            Some((rt, ca)) if ca > rt => Some((canonical, runtime_path)),
+            _ => None,
+        },
+        (Some(_), None) => Some((runtime_path, canonical)),
+        (None, Some(_)) => Some((canonical, runtime_path)),
+        (None, None) => None,
+    };
+
+    if let Some((src, dst)) = copy {
+        copy_if_valid_creds(src, dst)?;
     }
     Ok(())
 }
