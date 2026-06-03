@@ -38,7 +38,7 @@ use anyhow::{Context, Result};
 
 use crate::claude::{build_claude_settings_json, create_symlink};
 use crate::lock::with_state_lock;
-use crate::profile::{ClaudeCredentials, Profile, atomic_write, home_dir, profile_dir};
+use crate::profile::{ClaudeCredentials, Profile, atomic_write, claude_dir, profile_subpath};
 
 /// Watchdog tick. 1s instead of a longer interval because fake-symlink mode
 /// needs a tight upper bound on how long a session can read stale credentials
@@ -63,11 +63,11 @@ enum LinkMode {
 }
 
 fn runtime_dir(name: &str) -> Result<PathBuf> {
-    Ok(profile_dir(name)?.join("runtime"))
+    profile_subpath(name, "runtime")
 }
 
 fn sessions_dir(name: &str) -> Result<PathBuf> {
-    Ok(profile_dir(name)?.join("sessions"))
+    profile_subpath(name, "sessions")
 }
 
 /// True iff the profile currently has at least one live `clauth start` session.
@@ -85,11 +85,11 @@ pub(crate) fn has_live_session(name: &str) -> bool {
 }
 
 fn canonical_credentials(name: &str) -> Result<PathBuf> {
-    Ok(profile_dir(name)?.join("credentials.json"))
+    profile_subpath(name, "credentials.json")
 }
 
 fn rotation_lock_path(name: &str) -> Result<PathBuf> {
-    Ok(profile_dir(name)?.join("rotation.lock"))
+    profile_subpath(name, "rotation.lock")
 }
 
 /// Cross-process advisory lock serializing a token rotation against a
@@ -174,7 +174,7 @@ pub(crate) struct ProfileRuntime {
 impl ProfileRuntime {
     pub(crate) fn acquire(profile: &Profile) -> Result<Self> {
         let name = &profile.name;
-        let claude_home = home_dir()?.join(".claude");
+        let claude_home = claude_dir()?;
         if !claude_home.exists() {
             anyhow::bail!("~/.claude not found; install Claude Code first");
         }

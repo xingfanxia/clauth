@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::lock::with_state_lock;
@@ -244,6 +245,10 @@ pub(crate) fn clauth_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".clauth"))
 }
 
+pub(crate) fn claude_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".claude"))
+}
+
 pub(crate) fn app_state_mtime() -> Option<SystemTime> {
     let path = app_state_path().ok()?;
     std::fs::metadata(&path).ok()?.modified().ok()
@@ -261,16 +266,22 @@ pub(crate) fn profile_dir(name: &str) -> Result<PathBuf> {
     Ok(profiles_root()?.join(name))
 }
 
+/// `~/.clauth/profiles/<name>/<sub>`. Single join point for every per-profile
+/// file and subdirectory so callers don't re-derive `profile_dir(name)?.join`.
+pub(crate) fn profile_subpath(name: &str, sub: &str) -> Result<PathBuf> {
+    Ok(profile_dir(name)?.join(sub))
+}
+
 fn profile_config_path(name: &str) -> Result<PathBuf> {
-    Ok(profile_dir(name)?.join("config.toml"))
+    profile_subpath(name, "config.toml")
 }
 
 fn profile_credentials_path(name: &str) -> Result<PathBuf> {
-    Ok(profile_dir(name)?.join("credentials.json"))
+    profile_subpath(name, "credentials.json")
 }
 
 fn profile_credentials_pending_path(name: &str) -> Result<PathBuf> {
-    Ok(profile_dir(name)?.join("credentials.json.pending"))
+    profile_subpath(name, "credentials.json.pending")
 }
 
 /// Write `content` to `path` via tempfile + rename so concurrent readers see
@@ -297,13 +308,28 @@ pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::R
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
+/// Read and JSON-deserialize a file, contextualizing both the read and the
+/// parse failure with the path.
+pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    serde_json::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
+}
+
+/// Read and TOML-deserialize a file, contextualizing both the read and the
+/// parse failure with the path.
+pub(crate) fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
+}
+
 fn load_app_state() -> Result<AppState> {
     let path = app_state_path()?;
     if !path.exists() {
         return Ok(AppState::default());
     }
-    let content = std::fs::read_to_string(&path).context("Failed to read profiles.toml")?;
-    toml::from_str(&content).context("Failed to parse profiles.toml")
+    read_toml_file(&path)
 }
 
 pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
@@ -330,12 +356,7 @@ fn load_profile(name: &str) -> Result<Profile> {
 
     let cred_path = profile_credentials_path(name)?;
     let credentials = if cred_path.exists() {
-        let content = std::fs::read_to_string(&cred_path)
-            .with_context(|| format!("Failed to read {name}/credentials.json"))?;
-        Some(
-            serde_json::from_str(&content)
-                .with_context(|| format!("Failed to parse {name}/credentials.json"))?,
-        )
+        Some(read_json_file(&cred_path)?)
     } else {
         None
     };

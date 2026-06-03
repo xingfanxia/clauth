@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::format::endpoint_label;
-use crate::profile::{AppConfig, ClaudeCredentials, Profile, home_dir, load_config};
+use crate::profile::{AppConfig, ClaudeCredentials, Profile, claude_dir, load_config};
 
 pub(crate) fn run(json: bool) -> Result<()> {
     let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
@@ -46,7 +46,7 @@ pub(crate) fn run(json: bool) -> Result<()> {
 fn credentials_path(config_dir: Option<&Path>) -> Result<PathBuf> {
     match config_dir {
         Some(dir) => Ok(dir.join(".credentials.json")),
-        None => Ok(home_dir()?.join(".claude").join(".credentials.json")),
+        None => Ok(claude_dir()?.join(".credentials.json")),
     }
 }
 

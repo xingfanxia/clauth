@@ -4,15 +4,16 @@ use anyhow::{Context, Result};
 
 use crate::lock::with_state_lock;
 use crate::profile::{
-    AppConfig, ClaudeCredentials, Profile, atomic_write, home_dir, profile_dir, save_profile,
+    AppConfig, ClaudeCredentials, Profile, atomic_write, claude_dir, profile_dir, read_json_file,
+    save_profile,
 };
 
 fn claude_credentials_path() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".claude").join(".credentials.json"))
+    Ok(claude_dir()?.join(".credentials.json"))
 }
 
 fn claude_settings_path() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".claude").join("settings.json"))
+    Ok(claude_dir()?.join("settings.json"))
 }
 
 /// State of `~/.claude/.credentials.json` relative to a profile's stored
@@ -100,10 +101,7 @@ pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
     if !path.exists() {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(&path).context("Failed to read .credentials.json")?;
-    serde_json::from_str(&content)
-        .context("Failed to parse .credentials.json")
-        .map(Some)
+    read_json_file(&path).map(Some)
 }
 
 #[cfg(unix)]
@@ -186,9 +184,7 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
             api_key: None,
         });
     }
-    let content = std::fs::read_to_string(&path).context("Failed to read settings.json")?;
-    let settings: serde_json::Value =
-        serde_json::from_str(&content).context("Failed to parse settings.json")?;
+    let settings: serde_json::Value = read_json_file(&path)?;
     Ok(ClaudeEndpoint {
         base_url: settings["env"]["ANTHROPIC_BASE_URL"]
             .as_str()
@@ -242,8 +238,7 @@ pub(crate) fn build_claude_settings_json(
     prev_env_keys: &[String],
 ) -> Result<String> {
     let mut settings: serde_json::Value = if base_path.exists() {
-        let content = std::fs::read_to_string(base_path).context("Failed to read settings.json")?;
-        serde_json::from_str(&content).context("Failed to parse settings.json")?
+        read_json_file(base_path)?
     } else {
         serde_json::json!({})
     };
