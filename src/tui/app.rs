@@ -897,7 +897,7 @@ impl App {
 
 // ── Token snapshot ────────────────────────────────────────────────────────────
 
-pub(crate) fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
+fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
     profiles
         .iter()
         .filter_map(|p| {
@@ -933,7 +933,7 @@ pub(crate) fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
 /// takes the live creds, NewProfile captures them into a new profile, Discard
 /// relinks the stored creds as-is); a kept-but-stale stored access token is
 /// refreshed lazily on the next real fetch, when the user is actually using it.
-pub(crate) fn reconcile_startup(app: &mut App) {
+pub(super) fn reconcile_startup(app: &mut App) {
     let Some(active) = app.config().state.active_profile.clone() else {
         let _ = app.startup_sender.send(StartupSignal::ReconcileDone);
         return;
