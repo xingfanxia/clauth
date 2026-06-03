@@ -216,7 +216,7 @@ fn finish_switch(config: &mut AppConfig, name: &str) -> Result<()> {
         .unwrap_or_default();
     let profile = config.find(name).context("Profile not found")?;
     apply_profile_to_claude_settings(profile, &prev_env_keys)?;
-    config.state.active_profile = Some(name.to_string());
+    config.state.active_profile = Some(name.into());
     save_app_state(&config.state)
 }
 
@@ -353,7 +353,7 @@ pub(crate) fn capture_into_profile(
 
         if config.state.active_profile.is_none() {
             link_profile_credentials(&name)?;
-            config.state.active_profile = Some(name);
+            config.state.active_profile = Some(name.into());
         }
         save_app_state(&config.state)
     })

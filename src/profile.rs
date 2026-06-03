@@ -11,6 +11,84 @@ use crate::usage::{FetchStatus, UsageInfo};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+/// A profile's name. A `#[serde(transparent)]` newtype over `String`, so the
+/// on-disk `profiles.toml` (the `profiles` Vec, `active_profile`, and the
+/// `fallback_chain`) stays byte-identical to the bare-string format. The type
+/// exists so `rename_all_occurrences` / `sync_state_profiles` and every
+/// name-list mutation are compiler-checked: a rename that misses a `Vec` or the
+/// active marker is a type error, not a silent data drift. Derefs to `str`, so
+/// it slots into the existing `&str`-keyed lookups and HashMaps unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ProfileName(String);
+
+impl ProfileName {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ProfileName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for ProfileName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for ProfileName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProfileName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for ProfileName {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for ProfileName {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl PartialEq<str> for ProfileName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ProfileName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<ProfileName> for str {
+    fn eq(&self, other: &ProfileName) -> bool {
+        self == other.0
+    }
+}
+
+impl PartialEq<String> for ProfileName {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ClaudeCredentials {
@@ -44,7 +122,7 @@ pub(crate) struct OAuthToken {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Profile {
-    pub(crate) name: String,
+    pub(crate) name: ProfileName,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
     /// When true, clauth fires a 1-token Haiku ping at startup and on every
@@ -66,7 +144,7 @@ pub(crate) struct Profile {
 impl Profile {
     pub(crate) fn new(name: String, base_url: Option<String>, api_key: Option<String>) -> Self {
         Self {
-            name,
+            name: name.into(),
             base_url,
             api_key,
             auto_start: false,
@@ -95,8 +173,8 @@ impl Profile {
 /// Credentials and endpoint config live in per-profile subdirectories.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub(crate) struct AppState {
-    pub(crate) active_profile: Option<String>,
-    pub(crate) profiles: Vec<String>,
+    pub(crate) active_profile: Option<ProfileName>,
+    pub(crate) profiles: Vec<ProfileName>,
     /// Epoch-ms of the last successful auto-start ping per profile. Used to
     /// skip re-pinging a profile whose previous ping should still be inside
     /// its 5-hour window. Field stays `last_kick_at` on disk for back-compat
@@ -106,7 +184,7 @@ pub(crate) struct AppState {
     pub(crate) last_auto_start_at: HashMap<String, u64>,
     /// Ordered list of profile names participating in the auto-switch chain.
     #[serde(default)]
-    pub(crate) fallback_chain: Vec<String>,
+    pub(crate) fallback_chain: Vec<ProfileName>,
     /// Wrap-off mode. When true and every chain member's fallback threshold is
     /// below 100% with the whole chain exhausted, auto-switch turns OFF all
     /// accounts (clears the live credentials, unsets the active profile)
@@ -178,8 +256,8 @@ impl AppConfig {
 
     pub(crate) fn remove(&mut self, name: &str) {
         self.profiles.retain(|p| p.name != name);
-        self.state.profiles.retain(|n| n != name);
-        self.state.fallback_chain.retain(|n| n != name);
+        self.state.profiles.retain(|n| n.as_str() != name);
+        self.state.fallback_chain.retain(|n| n.as_str() != name);
         if self.is_active(name) {
             self.state.active_profile = None;
         }
@@ -197,10 +275,10 @@ impl AppConfig {
     /// marker. Single point of truth so a rename can't silently miss a list.
     pub(crate) fn rename_all_occurrences(&mut self, old: &str, new: &str) {
         if let Some(profile) = self.find_mut(old) {
-            profile.name = new.to_string();
+            profile.name = new.into();
         }
         if let Some(slot) = self.state.profiles.iter_mut().find(|n| n.as_str() == old) {
-            *slot = new.to_string();
+            *slot = new.into();
         }
         if let Some(slot) = self
             .state
@@ -208,10 +286,10 @@ impl AppConfig {
             .iter_mut()
             .find(|n| n.as_str() == old)
         {
-            *slot = new.to_string();
+            *slot = new.into();
         }
         if self.is_active(old) {
-            self.state.active_profile = Some(new.to_string());
+            self.state.active_profile = Some(new.into());
         }
     }
 }
@@ -395,7 +473,7 @@ fn load_profile(name: &str) -> Result<Profile> {
     let credentials = recover_pending_credentials(name, credentials);
 
     let profile = Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: config.base_url,
         api_key: config.api_key,
         auto_start: config.auto_start,

@@ -145,7 +145,7 @@ pub(super) fn draw_profile_selector(
                 picker_row(
                     i == sel,
                     focused,
-                    p.name.clone(),
+                    p.name.to_string(),
                     name_color(cfg.is_active(&p.name)),
                     w,
                 )

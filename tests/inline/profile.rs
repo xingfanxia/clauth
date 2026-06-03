@@ -23,6 +23,71 @@ fn profile_config_reads_auto_start_directly() {
 }
 
 #[test]
+fn profile_name_is_serde_transparent() {
+    // The `ProfileName` newtype must serialize as a bare string so profiles.toml
+    // stays byte-identical to the pre-newtype format. A non-transparent newtype
+    // would wrap it (e.g. a single-field table), silently migrating every
+    // user's state file. Round-trip a hand-written bare-string state and assert
+    // the re-rendered TOML matches what the loader produced.
+    let toml = r#"active_profile = "work"
+profiles = ["work", "play"]
+fallback_chain = ["work"]
+"#;
+    let state: AppState = toml::from_str(toml).expect("parse bare-string state");
+    assert_eq!(state.active_profile.as_deref(), Some("work"));
+    assert_eq!(state.profiles, ["work", "play"]);
+    assert_eq!(state.fallback_chain, ["work"]);
+
+    // Re-serialize and confirm the name lists are still bare strings (no
+    // newtype wrapper appears anywhere in the rendered output).
+    let rendered = toml::to_string_pretty(&state).expect("render state");
+    let reparsed: AppState = toml::from_str(&rendered).expect("reparse");
+    assert_eq!(reparsed.active_profile.as_deref(), Some("work"));
+    assert_eq!(reparsed.profiles, ["work", "play"]);
+    assert_eq!(reparsed.fallback_chain, ["work"]);
+    assert!(
+        rendered.contains("active_profile = \"work\""),
+        "active_profile must render as a bare string, got:\n{rendered}"
+    );
+    // A transparent newtype renders each name as a bare quoted string; a
+    // non-transparent wrapper would emit a nested table/struct instead.
+    assert!(
+        rendered.contains("\"work\"") && rendered.contains("\"play\""),
+        "profile names must render as bare strings, got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("ProfileName") && !rendered.contains("[profiles."),
+        "no newtype wrapper may appear on disk, got:\n{rendered}"
+    );
+
+    // Byte-for-byte: a `ProfileName`-typed AppState renders identically to a
+    // String-typed control with the same data. This is the load-bearing
+    // "no format migration" guarantee.
+    // Field order and serde attrs mirror `AppState` exactly so the rendered
+    // TOML is directly comparable.
+    #[derive(serde::Serialize, Default)]
+    struct BareState {
+        active_profile: Option<String>,
+        profiles: Vec<String>,
+        #[serde(rename = "last_kick_at")]
+        last_auto_start_at: std::collections::HashMap<String, u64>,
+        fallback_chain: Vec<String>,
+        wrap_off: bool,
+    }
+    let control = BareState {
+        active_profile: Some("work".to_string()),
+        profiles: vec!["work".to_string(), "play".to_string()],
+        fallback_chain: vec!["work".to_string()],
+        ..Default::default()
+    };
+    assert_eq!(
+        rendered,
+        toml::to_string_pretty(&control).expect("render control"),
+        "ProfileName AppState must serialize byte-identically to a String one"
+    );
+}
+
+#[test]
 fn app_state_reads_last_kick_at_as_last_auto_start_at() {
     let toml = r#"
 profiles = ["work"]

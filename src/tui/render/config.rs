@@ -45,7 +45,7 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
                 picker_row(
                     i == sel,
                     focused,
-                    p.name.clone(),
+                    p.name.to_string(),
                     name_color(cfg.is_active(&p.name)),
                     w,
                 )
@@ -100,9 +100,9 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
     }
     match cfg.profiles.get(app.config_cursor) {
         Some(p) => Snap {
-            title: p.name.clone(),
+            title: p.name.to_string(),
             name: if with_text {
-                p.name.clone()
+                p.name.to_string()
             } else {
                 String::new()
             },

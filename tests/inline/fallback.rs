@@ -8,13 +8,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::*;
-use crate::profile::{AppConfig, AppState, Profile};
+use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::usage::{UsageInfo, UsageStore, UsageWindow};
 
 fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64>) -> Profile {
     use std::collections::BTreeMap;
     Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -33,10 +33,10 @@ fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64
 }
 
 fn config_with_chain(profiles: Vec<Profile>, active: &str) -> AppConfig {
-    let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     AppConfig {
         state: AppState {
-            active_profile: Some(active.to_string()),
+            active_profile: Some(active.into()),
             profiles: names.clone(),
             fallback_chain: names,
             ..AppState::default()

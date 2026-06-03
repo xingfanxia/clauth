@@ -273,7 +273,7 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Strin
             if !force && has_live_session(&p.name) {
                 return None;
             }
-            Some((p.name.clone(), p.refresh_token()?.to_string()))
+            Some((p.name.to_string(), p.refresh_token()?.to_string()))
         })
         .collect()
 }
@@ -430,16 +430,16 @@ pub(crate) fn windowless_auto_start_candidates(
                 && p.is_oauth()
                 && !(skip_active && cfg.is_active(&p.name))
                 && !has_live_session(&p.name)
-                && !*has_active_window.get(&p.name).unwrap_or(&false)
+                && !*has_active_window.get(p.name.as_str()).unwrap_or(&false)
                 && now.saturating_sub(
                     cfg.state
                         .last_auto_start_at
-                        .get(&p.name)
+                        .get(p.name.as_str())
                         .copied()
                         .unwrap_or(0),
                 ) >= AUTO_START_COOLDOWN_MS
         })
-        .map(|p| p.name.clone())
+        .map(|p| p.name.to_string())
         .collect()
 }
 

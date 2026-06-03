@@ -219,7 +219,7 @@ fn render_overview_row(
     };
 
     let active = cfg.is_active(&profile.name);
-    let name_str = profile.name.clone();
+    let name_str = profile.name.to_string();
     let cursor = if selected {
         Span::styled("❯ ", theme::accent())
     } else {

@@ -71,7 +71,7 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     let chain = chain
         .iter()
         .map(|name| ChainMember {
-            name: name.clone(),
+            name: name.to_string(),
             threshold: config
                 .find(name)
                 .map(threshold_for)
@@ -150,7 +150,7 @@ pub(crate) fn next_target(config: &AppConfig) -> Option<SwitchAction> {
         let pick = walk_chain(active_idx, len, &skip, &|i| {
             config.find(&chain[i]).is_some_and(&accept)
         });
-        pick.map(|i| chain[i].clone())
+        pick.map(|i| chain[i].to_string())
     };
 
     if let Some(name) = walk(&|p| !is_exhausted(p)) {

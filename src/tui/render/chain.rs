@@ -58,7 +58,7 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                             .state
                             .fallback_chain
                             .get(*i)
-                            .cloned()
+                            .map(|n| n.to_string())
                             .unwrap_or_default();
                         let style = name_color(cfg.is_active(&name));
                         // Cursor + ordinal share the leading span so the name
@@ -103,7 +103,12 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Some(ChainItemKind::Member(i)) => {
             let cfg = app.config();
             let chain_len = cfg.state.fallback_chain.len();
-            let name = cfg.state.fallback_chain.get(i).cloned().unwrap_or_default();
+            let name = cfg
+                .state
+                .fallback_chain
+                .get(i)
+                .map(|n| n.to_string())
+                .unwrap_or_default();
             let lines = member_detail(
                 &cfg,
                 &name,
@@ -199,7 +204,7 @@ fn member_detail(
             .state
             .fallback_chain
             .get(next)
-            .cloned()
+            .map(|n| n.to_string())
             .unwrap_or_default();
         let arrow = if next == 0 {
             Span::styled("↺ wraps to ", theme::orange())

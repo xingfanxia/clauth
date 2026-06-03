@@ -71,7 +71,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
 #[cfg(test)]
 mod render_smoke {
     use super::*;
-    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
     use crate::tui::app::{App, ConfigFocus};
     use crate::usage::{UsageInfo, UsageWindow};
     use ratatui::Terminal;
@@ -80,7 +80,7 @@ mod render_smoke {
 
     fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         Profile {
-            name: name.to_string(),
+            name: name.into(),
             base_url: None,
             api_key: None,
             auto_start: auto,
@@ -127,12 +127,12 @@ mod render_smoke {
             oauth("work", 12.0, 3.0, false),
             oauth("spare", 0.0, 0.0, false),
         ];
-        let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+        let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
         let config = AppConfig {
             state: AppState {
-                active_profile: Some("uwuclxdy".to_string()),
+                active_profile: Some("uwuclxdy".into()),
                 profiles: names.clone(),
-                fallback_chain: vec!["uwuclxdy".to_string(), "work".to_string()],
+                fallback_chain: vec!["uwuclxdy".into(), "work".into()],
                 ..AppState::default()
             },
             profiles,

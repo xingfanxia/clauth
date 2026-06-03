@@ -15,7 +15,7 @@ use crate::usage::{LastRotatedWindow, is_idle};
 fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -37,7 +37,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
     };
-    config.state.profiles.push(name.to_string());
+    config.state.profiles.push(name.into());
     config
 }
 
@@ -132,7 +132,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
 
     // Profile with OAuth block but no refresh token.
     let profile = Profile {
-        name: "test-rotate-one-no-rt".to_string(),
+        name: "test-rotate-one-no-rt".into(),
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -154,10 +154,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         state: AppState::default(),
         profiles: vec![profile],
     };
-    config
-        .state
-        .profiles
-        .push("test-rotate-one-no-rt".to_string());
+    config.state.profiles.push("test-rotate-one-no-rt".into());
 
     let config = Arc::new(RankedMutex::new(config));
     let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
@@ -179,7 +176,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
 fn profile_without_refresh_token_excluded() {
     use std::collections::BTreeMap;
     let profile = Profile {
-        name: "test-oauth-no-rt".to_string(),
+        name: "test-oauth-no-rt".into(),
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -202,7 +199,7 @@ fn profile_without_refresh_token_excluded() {
         state: AppState::default(),
         profiles: vec![profile],
     };
-    config.state.profiles.push("test-oauth-no-rt".to_string());
+    config.state.profiles.push("test-oauth-no-rt".into());
     // No refresh token → excluded regardless of force.
     assert!(rotation_candidates(&config, false).is_empty());
     assert!(rotation_candidates(&config, true).is_empty());
@@ -224,7 +221,7 @@ fn switch_rotate_targets_only_active_and_target() {
 
     fn make_profile(name: &str) -> Profile {
         Profile {
-            name: name.to_string(),
+            name: name.into(),
             base_url: None,
             api_key: None,
             auto_start: false,
@@ -291,7 +288,7 @@ fn rotate_one_for_window_no_stamp_when_no_refresh_token() {
 
     let name = "test-rotate-window-no-rt";
     let profile = Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -347,7 +344,7 @@ fn rotate_one_for_window_no_stamp_when_live_session() {
     file.lock().expect("lock pid file");
 
     let profile = Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -397,7 +394,7 @@ fn switch_dedup_active_equals_target() {
 
     let name = "switch-dedup-same";
     let profile = Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -490,7 +487,7 @@ fn start_window_skips_when_live_session() {
     file.lock().expect("lock pid file");
 
     let profile = Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: None,
         api_key: None,
         auto_start: true,

@@ -786,10 +786,10 @@ impl App {
         let mut cfg = self.config();
         for p in &mut cfg.profiles {
             if let Some(s) = info_map.as_ref() {
-                p.usage = s.get(&p.name).cloned();
+                p.usage = s.get(p.name.as_str()).cloned();
             }
             if let Some(s) = status_map.as_ref() {
-                p.fetch_status = s.get(&p.name).copied();
+                p.fetch_status = s.get(p.name.as_str()).copied();
             }
         }
     }
@@ -896,7 +896,7 @@ impl App {
 
     /// Name of the profile a tab cursor points at, if any.
     pub(crate) fn profile_name_at(&self, idx: usize) -> Option<String> {
-        self.config().profiles.get(idx).map(|p| p.name.clone())
+        self.config().profiles.get(idx).map(|p| p.name.to_string())
     }
 
     pub(crate) fn clamp_main_cursor(&mut self) {
@@ -917,7 +917,7 @@ fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
         .filter_map(|p| {
             let oauth = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
             Some(TokenEntry {
-                name: p.name.clone(),
+                name: p.name.to_string(),
                 access_token: oauth.access_token.clone(),
                 refresh_token: oauth.refresh_token.clone(),
                 fallback_threshold: p
@@ -976,7 +976,9 @@ pub(super) fn reconcile_startup(app: &mut App) {
     // resolves divergence. Inline send keeps startup off the network path.
     let _ = app
         .startup_sender
-        .send(StartupSignal::ReconcileNeedsPrompt { active });
+        .send(StartupSignal::ReconcileNeedsPrompt {
+            active: active.to_string(),
+        });
 }
 
 // ── Event handling ────────────────────────────────────────────────────────────
@@ -1183,7 +1185,7 @@ fn step_main_cursor(app: &mut App, delta: i32) {
 /// tabs so the switch flow is identical everywhere.
 fn request_switch_to(app: &mut App, idx: usize) {
     let cfg = app.config();
-    let Some(name) = cfg.profiles.get(idx).map(|p| p.name.clone()) else {
+    let Some(name) = cfg.profiles.get(idx).map(|p| p.name.to_string()) else {
         return;
     };
     if cfg.is_active(&name) {
@@ -1357,7 +1359,7 @@ fn finalize_switch(app: &mut App, name: &str) {
         && active_diverged_unsaved(&active)
     {
         clear_activity(&app.activity, name);
-        prompt_divergence(app, active, "switching");
+        prompt_divergence(app, active.to_string(), "switching");
         return;
     }
     let result = {
@@ -1384,7 +1386,7 @@ fn perform_switch_off(app: &mut App) {
         return;
     };
     if active_diverged_unsaved(&active) {
-        prompt_divergence(app, active, "switching off");
+        prompt_divergence(app, active.to_string(), "switching off");
         return;
     }
     let result = {
@@ -1659,7 +1661,7 @@ pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
     cfg.profiles
         .iter()
         .filter(|p| !cfg.state.fallback_chain.iter().any(|c| c == &p.name))
-        .map(|p| p.name.clone())
+        .map(|p| p.name.to_string())
         .collect()
 }
 
@@ -1807,7 +1809,7 @@ fn add_chain_candidate(app: &mut App, name: &str) {
         profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
         let _ = save_profile(profile);
     }
-    cfg.state.fallback_chain.push(name.to_string());
+    cfg.state.fallback_chain.push(name.into());
     let _ = save_app_state(&cfg.state);
 }
 
@@ -2910,7 +2912,13 @@ fn poll_credentials_divergence(app: &mut App) {
     if !app.modals.is_empty() {
         return;
     }
-    let Some(active) = app.config().state.active_profile.clone() else {
+    let Some(active) = app
+        .config()
+        .state
+        .active_profile
+        .as_deref()
+        .map(str::to_string)
+    else {
         return;
     };
     if !matches!(

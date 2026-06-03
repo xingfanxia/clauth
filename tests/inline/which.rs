@@ -1,11 +1,11 @@
 use super::*;
 use std::collections::BTreeMap;
 
-use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
+use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, ProfileName};
 
 fn oauth_profile(name: &str, refresh: &str) -> Profile {
     Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -27,7 +27,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
 
 fn endpoint_profile(name: &str) -> Profile {
     Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: Some("https://example.test".to_string()),
         api_key: Some("sk-x".to_string()),
         auto_start: false,
@@ -41,7 +41,7 @@ fn endpoint_profile(name: &str) -> Profile {
 
 fn blank_profile(name: &str) -> Profile {
     Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -66,10 +66,10 @@ fn live_oauth(refresh: Option<&str>) -> ClaudeCredentials {
 }
 
 fn config_with(profiles: Vec<Profile>, active: Option<&str>) -> AppConfig {
-    let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     AppConfig {
         state: AppState {
-            active_profile: active.map(str::to_string),
+            active_profile: active.map(Into::into),
             profiles: names,
             ..Default::default()
         },

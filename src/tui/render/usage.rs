@@ -68,13 +68,13 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .activity
             .lock()
             .ok()
-            .and_then(|g| g.get(&profile.name).copied())
+            .and_then(|g| g.get(profile.name.as_str()).copied())
             .unwrap_or(ProfileActivity::Idle),
         next_refresh_ms: app
             .next_refresh_per_profile
             .lock()
             .ok()
-            .and_then(|m| m.get(&profile.name).copied()),
+            .and_then(|m| m.get(profile.name.as_str()).copied()),
         tick: app.tick_count,
     };
 

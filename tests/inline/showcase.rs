@@ -29,7 +29,7 @@ use ratatui::crossterm::event::{
 };
 
 use super::{TICK, Term, app, render, restore_terminal, setup_terminal};
-use crate::profile::{AppConfig, AppState, Profile, home_dir, set_home_override};
+use crate::profile::{AppConfig, AppState, Profile, ProfileName, home_dir, set_home_override};
 use crate::usage::{
     ExtraUsage, FetchStatus, PlanInfo, ProfileActivity, UsageInfo, UsageWindow, now_ms,
 };
@@ -156,7 +156,7 @@ fn oauth_profile(
         resets_at: Some(future_iso(reset)),
     });
     Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: None,
         api_key: None,
         auto_start,
@@ -182,7 +182,7 @@ fn oauth_profile(
 
 fn api_profile(name: &str) -> Profile {
     Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some(
             "sk-ant-api03-demo0000000000000000000000000000000000000000000000".to_string(),
@@ -198,7 +198,7 @@ fn api_profile(name: &str) -> Profile {
 
 fn failed_profile(name: &str) -> Profile {
     Profile {
-        name: name.to_string(),
+        name: name.into(),
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -272,7 +272,7 @@ fn demo_config() -> AppConfig {
 
     let stale = failed_profile("research");
 
-    let names: Vec<String> = [
+    let names: Vec<ProfileName> = [
         "personal",
         "work",
         "side-project",
@@ -280,18 +280,14 @@ fn demo_config() -> AppConfig {
         "research",
     ]
     .iter()
-    .map(|s| s.to_string())
+    .map(|s| (*s).into())
     .collect();
 
     AppConfig {
         state: AppState {
-            active_profile: Some("personal".to_string()),
+            active_profile: Some("personal".into()),
             profiles: names,
-            fallback_chain: vec![
-                "personal".to_string(),
-                "work".to_string(),
-                "side-project".to_string(),
-            ],
+            fallback_chain: vec!["personal".into(), "work".into(), "side-project".into()],
             ..AppState::default()
         },
         profiles: vec![max20, max5, pro, api, stale],
@@ -314,7 +310,7 @@ fn seed_usage(application: &app::App) {
         let cfg = application.config();
         cfg.profiles
             .iter()
-            .map(|p| (p.name.clone(), p.usage.clone(), p.fetch_status))
+            .map(|p| (p.name.to_string(), p.usage.clone(), p.fetch_status))
             .collect()
     };
     if let Ok(mut store) = application.usage_store.lock() {
