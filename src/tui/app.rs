@@ -1598,7 +1598,7 @@ fn reorder_chain_member(app: &mut App, delta: i32) {
     };
     let target = pos as i32 + delta;
     {
-        let mut cfg = app.config.lock().expect("config mutex poisoned");
+        let mut cfg = app.config();
         if target < 0 || target as usize >= cfg.state.fallback_chain.len() {
             return;
         }
@@ -1677,7 +1677,7 @@ fn write_threshold(app: &mut App, value: f64) {
         return;
     };
     let save_err = {
-        let mut cfg = app.config.lock().expect("config mutex poisoned");
+        let mut cfg = app.config();
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
@@ -1705,7 +1705,7 @@ fn adjust_threshold(app: &mut App, delta: f64) {
 /// Add a profile to the chain, seeding the default threshold if unset, then
 /// persist both the profile and the chain order.
 fn add_chain_candidate(app: &mut App, name: &str) {
-    let mut cfg = app.config.lock().expect("config mutex poisoned");
+    let mut cfg = app.config();
     if let Some(profile) = cfg.find_mut(name)
         && profile.fallback_threshold.is_none()
     {
@@ -1723,7 +1723,7 @@ fn remove_chain_member(app: &mut App) {
         return;
     };
     let name = {
-        let mut cfg = app.config.lock().expect("config mutex poisoned");
+        let mut cfg = app.config();
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
