@@ -36,13 +36,16 @@ const KICK_MODEL: &str = "claude-haiku-4-5-20251001";
 /// the call as an unauthorized non-CC inference.
 const KICK_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// Refuse to re-ping a profile until this long after its last auto-start.
-/// Sized just under the 5-hour window so a ping whose follow-up usage fetch
-/// failed (network blip, stale endpoint) doesn't cause us to re-fire on
-/// every refresh, while still allowing a fresh ping once the window has
-/// elapsed. Claimed by `start_window` before each kick and used by
-/// `windowless_auto_start_candidates` to pre-filter.
+/// Refuse to re-ping a profile until this long after its last SUCCESSFUL
+/// auto-start. Sized just under the 5-hour window so we don't re-kick a
+/// profile that just opened a window. Claimed pre-kick (concurrency guard)
+/// and kept on success; overwritten to a shorter backoff on failure.
 const AUTO_START_COOLDOWN_MS: u64 = 4 * 3600 * 1000 + 30 * 60 * 1000;
+
+/// How long to wait before retrying after a failed kick. Short enough to
+/// recover from a transient API error or a just-rotated token, but not so
+/// short that a persistent failure hammers the endpoint.
+const AUTO_START_RETRY_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Deserialize)]
 pub(crate) struct TokenResponse {
@@ -457,11 +460,14 @@ pub(crate) fn windowless_auto_start_candidates(
 /// Gates on opt-in, OAuth, a diverged active link, a live `clauth start`
 /// session, and the auto-start cooldown so every caller (the on-tick windowless
 /// scan and the CLI switch) shares one rule set. The cooldown slot is claimed
-/// (stamped `last_auto_start_at`) before the kick so a failed ping throttles to
-/// one retry per window instead of re-firing every tick; the cooldown is sized
-/// just under 5h so the next window expiry re-arms. The "already has a window"
-/// check lives in [`windowless_auto_start_candidates`], where the usage store
-/// is on hand.
+/// (stamped `last_auto_start_at`) before the kick as a concurrency guard so a
+/// second tick can't spawn a duplicate worker in the gap between the `is_idle`
+/// check and the worker thread starting. On success the stamp is left as-is
+/// (full 4.5 h cooldown). On failure it is overwritten with a backoff stamp
+/// that allows a retry after `AUTO_START_RETRY_MS` (5 min) so a transient
+/// error or a just-rotated token recovers without waiting for the next window.
+/// The "already has a window" check lives in [`windowless_auto_start_candidates`],
+/// where the usage store is on hand.
 ///
 /// Marks `AutoStarting`, sends one `OpResult`, and on a successful kick pushes
 /// `name` onto `refetch` so usage re-fetches and the freshly armed window shows
@@ -516,6 +522,20 @@ pub(crate) fn start_window(
     }
     let outcome = kick(&access_token);
     let kicked = outcome.is_ok();
+    // On failure: overwrite the pre-kick stamp with a backoff so the profile
+    // retries after AUTO_START_RETRY_MS instead of the full 4.5 h cooldown.
+    if !kicked {
+        let mut cfg = config.lock().expect("config mutex poisoned");
+        let _ = with_state_lock(|| {
+            let backoff =
+                now_ms().saturating_sub(AUTO_START_COOLDOWN_MS.saturating_sub(AUTO_START_RETRY_MS));
+            cfg.state
+                .last_auto_start_at
+                .insert(name.to_string(), backoff);
+            let _ = save_app_state(&cfg.state);
+            Ok::<_, anyhow::Error>(())
+        });
+    }
     if let Some(activity) = activity {
         clear_activity(activity, name);
     }
