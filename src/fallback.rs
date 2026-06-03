@@ -236,19 +236,13 @@ pub(crate) fn next_auto_switch_target(
 /// accounts. Returns the action taken, or None when nothing was warranted.
 pub(crate) fn auto_switch_if_needed(config: &mut AppConfig) -> Result<Option<SwitchAction>> {
     with_state_lock(|| {
-        let active_name = config.state.active_profile.clone();
-        let Some(active_name) = active_name else {
+        let Some(active_name) = config.state.active_profile.as_deref() else {
             return Ok(None);
         };
-        if !config
-            .state
-            .fallback_chain
-            .iter()
-            .any(|n| n == &active_name)
-        {
+        if !config.state.fallback_chain.iter().any(|n| n == active_name) {
             return Ok(None);
         }
-        let Some(active) = config.find(&active_name) else {
+        let Some(active) = config.find(active_name) else {
             return Ok(None);
         };
         if !is_exhausted(active) {
