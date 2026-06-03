@@ -16,7 +16,7 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Fixed per-profile refresh interval. Every profile is re-fetched this long
 /// after its last fetch — there is no adaptive backoff.
-pub(crate) const REFRESH_INTERVAL_MS: u64 = 40_000;
+pub(crate) const REFRESH_INTERVAL_MS: u64 = 60_000;
 
 /// A wall-clock instant in epoch-milliseconds (the unit produced by `now_ms`).
 /// Newtype so an epoch timestamp can never be confused with a duration in the

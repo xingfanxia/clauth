@@ -60,7 +60,7 @@ cargo build --release
 
 - **One-key switching** — pick a profile, ⏎, confirm. Or `clauth <profile>` straight from the shell.
 - **Automatic token refresh** — every profile's OAuth pair is refreshed in parallel on launch and on switch (same as Claude Code does on startup), and rotated when a 5-hour window expires, so usage queries never run with a stale token.
-- **Live usage bars** — 5h utilization from the Anthropic API, refreshed every 40 seconds and color-coded with the next reset time. Max accounts also get a 7-day bar (Pro accounts don't have it in ther API respone).
+- **Live usage bars** — 5h utilization from the Anthropic API, refreshed every 45 seconds and color-coded with the next reset time. Max accounts also get a 7-day bar (Pro accounts don't have it in ther API respone).
 - **Per-row activity** — each account shows a countdown to its next refresh or a color-coded spinner: sapphire fetch, cyan token refresh, orange switch, green auto-start.
 - **Plan detection** — `/api/oauth/profile` identifies the tier: Pro, Max (5x / 20x), Team, Enterprise.
 - **Per-account breakdown** — the Usage tab lays out every window (5h, 7d, 7d sonnet, 7d opus, any paid extra-usage spend) plus the endpoint, fallback threshold, and merged env keys.
@@ -119,7 +119,7 @@ redirected to a throwaway tempdir, so nothing touches your real `~/.clauth` /
 cargo test showcase -- --ignored --nocapture
 ```
 
-The active profile is shown in orange. Each row's usage bars refreshes every 40 seconds and are cached locally so they stay visible even if the Anthropic API is rate-limited or offline. The 7-day bar is also shown when possible.
+The active profile is shown in orange. Each row's usage bars refreshes every 45 seconds and are cached locally so they stay visible even if the Anthropic API is rate-limited or offline. The 7-day bar is also shown when possible.
 
 `Tab` / arrows move between the four tabs — **Overview** (switch and reorder accounts), **Usage** (per-account window breakdown), **Config** (edit endpoint, key, env, auto-start), and **Fallback** (chain editor). See hints at the bottom or `?` for more.
 
