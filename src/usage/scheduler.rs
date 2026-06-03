@@ -351,10 +351,17 @@ fn fetch_with_rotation(
     } else {
         FetchStatus::Cached
     };
+    // Single early-return path for every rotation-leg bail-out: resolve the
+    // on-disk cache against `fallback_status` and carry the (already-rotated or
+    // not) token pair back. `fallback_status` is computed once above; this keeps
+    // the eight branches that abort to cache from drifting apart.
+    let bail_to_cache = |rotated: Option<RotatedTokens>| {
+        let (info, status) = load_cached_with_status(name, fallback_status);
+        (info, status, rotated)
+    };
 
     let Some(rt) = refresh_token else {
-        let (info, status) = load_cached_with_status(name, fallback_status);
-        return (info, status, None);
+        return bail_to_cache(None);
     };
     // Per-profile rotation lock across the refresh HTTP window so an external
     // `clauth start <name>` cannot double-spend this single-use token while our
@@ -364,8 +371,7 @@ fn fetch_with_rotation(
     // the scheduler already holds, and the rotation holder window is short.
     // On acquire failure, fall back to cache rather than refreshing unguarded.
     let Ok(_rotation_guard) = crate::runtime::RotationGuard::acquire(name) else {
-        let (info, status) = load_cached_with_status(name, fallback_status);
-        return (info, status, None);
+        return bail_to_cache(None);
     };
     // Re-check liveness under the guard: a live session holds the chain and
     // will refresh it itself; rotating here would spend the same single-use
@@ -374,8 +380,7 @@ fn fetch_with_rotation(
     // PID file before releasing). `partition_due` already excludes
     // `Refreshing`/`Switching`, but nothing excludes a *live external session*.
     if crate::runtime::has_live_session(name) {
-        let (info, status) = load_cached_with_status(name, fallback_status);
-        return (info, status, None);
+        return bail_to_cache(None);
     }
     // Refresh leg: surface a refresh spinner during the network round trip,
     // then drop back to Fetching for the retry. `Idle` is only reached on the
@@ -385,10 +390,7 @@ fn fetch_with_rotation(
     mark_activity(activity, name, ProfileActivity::Fetching);
     let tok = match refresh_result {
         Ok(t) => t,
-        Err(_) => {
-            let (info, status) = load_cached_with_status(name, fallback_status);
-            return (info, status, None);
-        }
+        Err(_) => return bail_to_cache(None),
     };
     // Persist under the AppConfig mutex AND state lock together — matches
     // every other rotation site so a concurrent `rotate_one` writer can't
@@ -397,8 +399,7 @@ fn fetch_with_rotation(
     let access = tok.access_token.clone();
     let refresh = tok.refresh_token.clone();
     if crate::oauth::apply_rotated_tokens_locked(config, name, tok, None).is_err() {
-        let (info, status) = load_cached_with_status(name, fallback_status);
-        return (info, status, None);
+        return bail_to_cache(None);
     }
     let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
     match fetch_raw(&access) {
@@ -429,8 +430,7 @@ fn fetch_with_rotation(
             if let Ok(mut q) = refetch.lock() {
                 q.insert(name.to_string());
             }
-            let (info, status) = load_cached_with_status(name, fallback_status);
-            (info, status, rotated)
+            bail_to_cache(rotated)
         }
     }
 }
