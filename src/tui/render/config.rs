@@ -65,6 +65,10 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
 /// Owned snapshot of one selection, taken under a single short-lived `config`
 /// guard. Decoupling the read from the render lets us call `config_rows`
 /// (which re-locks `config`) afterwards without nesting the non-reentrant mutex.
+///
+/// The text fields (`name`/`base_url`/`api_key`) are only filled when no
+/// `config_draft` is active: while editing, the draft buffers supply those
+/// values and the snapshot copies would be dead clones taken every frame.
 struct Snap {
     title: String,
     name: String,
@@ -73,38 +77,53 @@ struct Snap {
     auto_start: bool,
 }
 
-fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let actions_focused = app.config_focus == ConfigFocus::Actions;
-
-    let snap = {
-        let cfg = app.config();
-        if app.config_cursor >= cfg.profiles.len() {
-            Snap {
-                title: "+ new account".to_string(),
-                name: String::new(),
-                base_url: String::new(),
-                api_key: String::new(),
-                auto_start: false,
-            }
+/// Read the selected account into a `Snap` under one short-lived `config` guard.
+/// `with_text` gates the field clones: skip them when a draft is active, since
+/// only `title` and `auto_start` are read in that case.
+fn build_snap(app: &App, with_text: bool) -> Snap {
+    let text = |s: &Option<String>| {
+        if with_text {
+            s.clone().unwrap_or_default()
         } else {
-            match cfg.profiles.get(app.config_cursor) {
-                Some(p) => Snap {
-                    title: p.name.clone(),
-                    name: p.name.clone(),
-                    base_url: p.base_url.clone().unwrap_or_default(),
-                    api_key: p.api_key.clone().unwrap_or_default(),
-                    auto_start: p.auto_start,
-                },
-                None => Snap {
-                    title: "settings".to_string(),
-                    name: String::new(),
-                    base_url: String::new(),
-                    api_key: String::new(),
-                    auto_start: false,
-                },
-            }
+            String::new()
         }
     };
+    let cfg = app.config();
+    if app.config_cursor >= cfg.profiles.len() {
+        return Snap {
+            title: "+ new account".to_string(),
+            name: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            auto_start: false,
+        };
+    }
+    match cfg.profiles.get(app.config_cursor) {
+        Some(p) => Snap {
+            title: p.name.clone(),
+            name: if with_text {
+                p.name.clone()
+            } else {
+                String::new()
+            },
+            base_url: text(&p.base_url),
+            api_key: text(&p.api_key),
+            auto_start: p.auto_start,
+        },
+        None => Snap {
+            title: "settings".to_string(),
+            name: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            auto_start: false,
+        },
+    }
+}
+
+fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let actions_focused = app.config_focus == ConfigFocus::Actions;
+    let draft = app.config_draft.as_ref();
+    let snap = build_snap(app, draft.is_none());
 
     let block = section_box(&snap.title, actions_focused);
     let inner = block.inner(area);
@@ -114,7 +133,20 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = config_rows(app);
     let cursor = app.config_action_cursor.min(rows.len().saturating_sub(1));
 
-    // Effective text buffers: the live draft while editing, else the snapshot.
+    draw_settings_rows(frame, inner, app, &rows, cursor, &snap, actions_focused);
+}
+
+/// Render the detail rows (type line + each `ConfigRow`) into `inner`. The text
+/// buffers come from the live draft while editing, else from the snapshot.
+fn draw_settings_rows(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    app: &App,
+    rows: &[ConfigRow],
+    cursor: usize,
+    snap: &Snap,
+    actions_focused: bool,
+) {
     let draft = app.config_draft.as_ref();
     let (name_in, base_in, key_in) = match draft {
         Some(d) => (d.name.clone(), d.base_url.clone(), d.api_key.clone()),
@@ -153,7 +185,7 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
             selected,
             editing == Some(*row),
             armed_delete,
-            &snap,
+            snap,
             &name_in,
             &base_in,
             &key_in,

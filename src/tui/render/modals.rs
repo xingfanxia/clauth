@@ -266,26 +266,29 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ];
 
     let mut lines: Vec<Line<'_>> = Vec::new();
-    lines.push(Line::from(Span::styled("tabs", theme::label())));
-    lines.push(Line::from(""));
-    for (key, desc) in nav {
-        lines.push(help_row(key, desc));
-    }
-    lines.push(Line::from(""));
+    lines.extend(key_section("tabs", nav));
     for (section, entries) in &tab_specific {
-        lines.push(Line::from(Span::styled(*section, theme::label())));
-        lines.push(Line::from(""));
-        for (key, desc) in *entries {
-            lines.push(help_row(key, desc));
-        }
-        lines.push(Line::from(""));
+        lines.extend(key_section(section, entries));
     }
-    lines.push(Line::from(Span::styled("global", theme::label())));
-    lines.push(Line::from(""));
-    for (key, desc) in global {
+    lines.extend(key_section("global", global));
+    // Trim the trailing blank line every section appends.
+    lines.pop();
+    draw_modal(frame, area, title, lines);
+}
+
+/// One help block: a `label`-styled title, a blank line, a `help_row` per pair,
+/// and a trailing blank line that separates it from the next block (the caller
+/// drops the last one).
+fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(title.to_string(), theme::label())),
+        Line::from(""),
+    ];
+    for (key, desc) in pairs {
         lines.push(help_row(key, desc));
     }
-    draw_modal(frame, area, title, lines);
+    lines.push(Line::from(""));
+    lines
 }
 
 fn help_row(key: &str, desc: &str) -> Line<'static> {
