@@ -184,6 +184,36 @@ impl AppConfig {
             self.state.active_profile = None;
         }
     }
+
+    /// Rebuild `state.profiles` from the in-memory `profiles` list so the two
+    /// can't drift out of sync (e.g. after a partial save in a prior session
+    /// left a length mismatch).
+    pub(crate) fn sync_state_profiles(&mut self) {
+        self.state.profiles = self.profiles.iter().map(|p| p.name.clone()).collect();
+    }
+
+    /// Replace `old` with `new` in every profile-name list — the in-memory
+    /// profiles, `state.profiles`, `state.fallback_chain`, and the active
+    /// marker. Single point of truth so a rename can't silently miss a list.
+    pub(crate) fn rename_all_occurrences(&mut self, old: &str, new: &str) {
+        if let Some(profile) = self.find_mut(old) {
+            profile.name = new.to_string();
+        }
+        if let Some(slot) = self.state.profiles.iter_mut().find(|n| n.as_str() == old) {
+            *slot = new.to_string();
+        }
+        if let Some(slot) = self
+            .state
+            .fallback_chain
+            .iter_mut()
+            .find(|n| n.as_str() == old)
+        {
+            *slot = new.to_string();
+        }
+        if self.is_active(old) {
+            self.state.active_profile = Some(new.to_string());
+        }
+    }
 }
 
 /// On-disk format for ~/.clauth/profiles/<name>/config.toml

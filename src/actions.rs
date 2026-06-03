@@ -141,24 +141,8 @@ pub(crate) fn rename_profile(config: &mut AppConfig, old: &str, new: &str) -> Re
                 .with_context(|| format!("Failed to rename profile directory to '{new}'"))?;
         }
 
-        if let Some(profile) = config.find_mut(old) {
-            profile.name = new.to_string();
-        }
-        if let Some(slot) = config.state.profiles.iter_mut().find(|n| n.as_str() == old) {
-            *slot = new.to_string();
-        }
-        if let Some(slot) = config
-            .state
-            .fallback_chain
-            .iter_mut()
-            .find(|n| n.as_str() == old)
-        {
-            *slot = new.to_string();
-        }
         let was_active = config.is_active(old);
-        if was_active {
-            config.state.active_profile = Some(new.to_string());
-        }
+        config.rename_all_occurrences(old, new);
 
         save_app_state(&config.state)?;
 
@@ -275,7 +259,7 @@ pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) ->
         // Defensive: resync state.profiles from the in-memory list so a
         // partial save in a prior session can't cause a length mismatch panic
         // here.
-        config.state.profiles = config.profiles.iter().map(|p| p.name.clone()).collect();
+        config.sync_state_profiles();
         let profile = config.profiles.remove(from);
         config.profiles.insert(to, profile);
         let name = config.state.profiles.remove(from);
