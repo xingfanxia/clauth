@@ -129,6 +129,18 @@ pub(super) fn window_summary_parts(
     (text, Style::default().fg(color))
 }
 
+/// 5h headroom against a member's own threshold: green with room, yellow as it
+/// nears, pink once it crosses — the point at which clauth rotates off it.
+pub(super) fn health_color(pct: f64, threshold: f64) -> ratatui::style::Color {
+    if pct >= threshold {
+        theme::DANGER
+    } else if pct >= threshold * 0.8 {
+        theme::WARNING
+    } else {
+        theme::SUCCESS
+    }
+}
+
 /// Braille spinner frames — the set most CLI tools use. Index by `tick_count`
 /// so each render frame advances one step. Shared by the Overview row timer
 /// slot and the Usage detail status line.

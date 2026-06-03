@@ -9,8 +9,8 @@ use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::format::{
-    account_type_label, account_type_style, fixed, fixed_split, name_style, spinner_frame,
-    spinner_style, window_summary_parts, window_summary_span,
+    account_type_label, account_type_style, fixed, fixed_split, health_color, name_style,
+    spinner_frame, spinner_style, window_summary_parts, window_summary_span,
 };
 use super::panes::{section_box, select_line};
 use crate::fallback::threshold_for;
@@ -445,7 +445,7 @@ fn chain_row(
             let (figure, figure_style) = match pct {
                 Some(v) => (
                     format!("  {v:>3.0}"),
-                    Style::default().fg(chain_health_color(v, threshold)),
+                    Style::default().fg(health_color(v, threshold)),
                 ),
                 None => ("    —".to_string(), theme::faint()),
             };
@@ -472,7 +472,7 @@ fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
         .unwrap_or(0)
         .min(GAUGE_W);
     let fill_color = pct
-        .map(|v| chain_health_color(v, threshold))
+        .map(|v| health_color(v, threshold))
         .unwrap_or(theme::TEXT_FAINT);
 
     (0..GAUGE_W)
@@ -486,23 +486,11 @@ fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// 5h headroom against a member's own threshold: green with room, yellow as it
-/// nears, pink once it crosses — the point at which clauth rotates off it.
-fn chain_health_color(pct: f64, threshold: f64) -> ratatui::style::Color {
-    if pct >= threshold {
-        theme::DANGER
-    } else if pct >= threshold * 0.8 {
-        theme::WARNING
-    } else {
-        theme::SUCCESS
-    }
-}
-
 /// Style for the Overview table's `route` column. Mirrors the pill health map,
 /// red for a missing profile.
 fn chain_state_style(profile: Option<&Profile>, pct: f64, threshold: f64) -> Style {
     match profile {
         None => theme::danger(),
-        Some(_) => Style::default().fg(chain_health_color(pct, threshold)),
+        Some(_) => Style::default().fg(health_color(pct, threshold)),
     }
 }

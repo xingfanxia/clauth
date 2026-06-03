@@ -8,7 +8,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -17,6 +17,7 @@ use super::super::app::{
     chain_items,
 };
 use super::super::theme;
+use super::format::health_color;
 use super::panes::{
     SELECTOR_WIDTH, draw_selector_list, highlight_row, name_color, section_box, select_line,
 };
@@ -287,10 +288,7 @@ fn detail_row(
             };
             Line::from(vec![
                 arrow,
-                Span::styled(
-                    format!("when spent{}", " ".repeat(pad)),
-                    Style::default().fg(theme::TEXT),
-                ),
+                Span::styled(format!("when spent{}", " ".repeat(pad)), theme::body()),
                 Span::styled(value.to_string(), style),
             ])
         }
@@ -298,10 +296,7 @@ fn detail_row(
             let pad = KEY_W.saturating_sub("threshold".len()).max(1);
             let mut spans = vec![
                 arrow,
-                Span::styled(
-                    format!("threshold{}", " ".repeat(pad)),
-                    Style::default().fg(theme::TEXT),
-                ),
+                Span::styled(format!("threshold{}", " ".repeat(pad)), theme::body()),
             ];
             match editing {
                 Some(input) => {
@@ -395,10 +390,7 @@ fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {
         } else {
             Span::raw("  ")
         };
-        let line = Line::from(vec![
-            arrow,
-            Span::styled(name.clone(), Style::default().fg(theme::TEXT)),
-        ]);
+        let line = Line::from(vec![arrow, Span::styled(name.clone(), theme::body())]);
         lines.push(if selected {
             highlight_row(line, width)
         } else {
@@ -437,27 +429,15 @@ fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static
     let mut spans = vec![Span::raw("[")];
     for i in 0..GAUGE_W {
         if Some(i) == tick {
-            spans.push(Span::styled("┊", Style::default().fg(theme::TEXT)));
+            spans.push(Span::styled("┊", theme::body()));
         } else if i < fill {
             spans.push(Span::styled("█", Style::default().fg(fill_color)));
         } else {
-            spans.push(Span::styled("░", Style::default().fg(theme::LINE_STRONG)));
+            spans.push(Span::styled("░", theme::line_strong()));
         }
     }
     spans.push(Span::raw("]"));
     spans
-}
-
-/// 5h headroom against the member's own threshold: green with room, yellow as
-/// it nears, pink once it crosses — the point clauth rotates off it.
-fn health_color(pct: f64, threshold: f64) -> Color {
-    if pct >= threshold {
-        theme::DANGER
-    } else if pct >= threshold * 0.8 {
-        theme::WARNING
-    } else {
-        theme::SUCCESS
-    }
 }
 
 /// Pad a detail key to a fixed gutter so values line up.

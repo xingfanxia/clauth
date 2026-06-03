@@ -40,6 +40,18 @@ pub(crate) fn base() -> Style {
     Style::default().fg(TEXT).bg(BG)
 }
 
+/// Plain body text — foreground only, no background. The default span tint for
+/// keys and labels that sit on the surface the parent block already paints.
+pub(crate) fn body() -> Style {
+    Style::default().fg(TEXT)
+}
+
+/// Stronger line color — the empty-gauge track and other structural fills that
+/// need to read a step above `LINE`.
+pub(crate) fn line_strong() -> Style {
+    Style::default().fg(LINE_STRONG)
+}
+
 pub(crate) fn dim() -> Style {
     Style::default().fg(TEXT_DIM)
 }
