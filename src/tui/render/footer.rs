@@ -87,7 +87,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             spans.push(Span::styled("  ", theme::faint()));
         }
         spans.push(Span::styled(
-            (*key).to_string(),
+            *key,
             Style::default().fg(theme::ACCENT).bold(),
         ));
         spans.push(Span::styled(format!(" {label}"), theme::dim()));
