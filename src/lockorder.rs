@@ -19,10 +19,9 @@
 //! holding in the codebase:
 //!
 //! - `RotationGuard` is held across the OAuth HTTP round trip — outermost.
-//! - `partition_due`: `last_fetched` → `usage_store` → `activity` → `learned`.
+//! - `partition_due`: `last_fetched` → `activity`.
 //! - `apply_usage`: `usage_store` → `usage_status` → `config`.
 //! - rotation/save sites: `config` → state flock → `activity`.
-//! - `update_learner`: `learned` → `ok_count` → `cache_hit` → `last_429`.
 //!
 //! Standalone leaves (`refetch_queue`, the `pending_*` sets, …) are never nested
 //! with another tracked lock; they are ranked above the rest so that a future
@@ -81,10 +80,6 @@ pub(crate) mod rank {
         /// `with_state_lock` (cross-process state flock). Inner of `config`.
         State = 500;
         Activity = 600;
-        Learned = 700;
-        OkCount = 800;
-        CacheHit = 900;
-        Last429 = 1000;
         // Standalone leaves — never nested with another tracked lock.
         NextRefresh = 1100;
         RefetchQueue = 1200;

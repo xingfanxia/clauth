@@ -40,13 +40,11 @@ use crate::profile::{
 };
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, EpochMs, IntervalMs,
-    Last429At, LastFetchedAt, LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult,
+    ActivityKind, ActivityStore, LastFetchedAt, LastRotatedWindow, NextRefreshPerProfile, OpResult,
     OpResultReceiver, OpResultSender, PendingAutoStart, PendingSwitch, PendingSwitchOff,
-    PendingWindowRotation, ProfileActivity, RefetchQueue, SERVER_CACHE_TTL_ESTIMATE_MS,
-    StartupReceiver, StartupSender, StartupSignal, StatusStore, TokenEntry, TokenList, UsageStore,
-    any_busy, clear_activity, default_fallback_threshold, fetch_all_into, is_idle, mark_activity,
-    spawn_refresher,
+    PendingWindowRotation, ProfileActivity, RefetchQueue, StartupReceiver, StartupSender,
+    StartupSignal, StatusStore, TokenEntry, TokenList, UsageStore, any_busy, clear_activity,
+    fetch_all_into, is_idle, mark_activity, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -403,10 +401,6 @@ pub(crate) struct App {
     /// off all accounts.
     pub(crate) pending_switch_off: PendingSwitchOff,
     pub(crate) refetch_queue: RefetchQueue,
-    pub(crate) learned_intervals: LearnedIntervals,
-    pub(crate) ok_count: ConsecutiveOk,
-    pub(crate) cache_hit_count: ConsecutiveCacheHit,
-    pub(crate) last_429: Last429At,
 
     pub(crate) tab: Tab,
     pub(crate) modals: Vec<Modal>,
@@ -490,10 +484,6 @@ struct WorkerHandles {
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
-    learned_intervals: LearnedIntervals,
-    ok_count: ConsecutiveOk,
-    cache_hit_count: ConsecutiveCacheHit,
-    last_429: Last429At,
 }
 
 impl WorkerHandles {
@@ -512,10 +502,6 @@ impl WorkerHandles {
             pending_switch: Arc::clone(&app.pending_switch),
             pending_switch_off: Arc::clone(&app.pending_switch_off),
             refetch_queue: Arc::clone(&app.refetch_queue),
-            learned_intervals: Arc::clone(&app.learned_intervals),
-            ok_count: Arc::clone(&app.ok_count),
-            cache_hit_count: Arc::clone(&app.cache_hit_count),
-            last_429: Arc::clone(&app.last_429),
         }
     }
 }
@@ -538,44 +524,6 @@ impl App {
         let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_switch_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
-        // Restore AIMD state from disk so cadence survives restarts.
-        let learned_intervals: LearnedIntervals = Arc::new(RankedMutex::new(
-            config
-                .state
-                .learned_intervals_ms
-                .iter()
-                .map(|(name, &ms)| (name.clone(), IntervalMs::from_millis(ms)))
-                .collect(),
-        ));
-        let ok_count: ConsecutiveOk =
-            Arc::new(RankedMutex::new(config.state.consecutive_ok_count.clone()));
-        // Restore cache-hit counters only when learned < TTL — above TTL the
-        // counter is irrelevant (polling is slow enough that cache hits can't
-        // occur in steady state), and below TTL it captures mid-elimination
-        // state that would otherwise need another hit-pair to correct.
-        let restored_ch: HashMap<String, u32> = config
-            .state
-            .consecutive_cache_hit_count
-            .iter()
-            .filter(|(name, _)| {
-                config
-                    .state
-                    .learned_intervals_ms
-                    .get(*name)
-                    .copied()
-                    .is_some_and(|l| l < SERVER_CACHE_TTL_ESTIMATE_MS)
-            })
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        let cache_hit_count: ConsecutiveCacheHit = Arc::new(RankedMutex::new(restored_ch));
-        let last_429: Last429At = Arc::new(RankedMutex::new(
-            config
-                .state
-                .last_429_at
-                .iter()
-                .map(|(name, &ms)| (name.clone(), EpochMs::from_millis(ms)))
-                .collect(),
-        ));
 
         // Kick the best-effort update check on its own thread; its verdict lands
         // in `update_results` and is toasted from `on_tick`.
@@ -600,10 +548,6 @@ impl App {
             pending_switch,
             pending_switch_off,
             refetch_queue,
-            learned_intervals,
-            ok_count,
-            cache_hit_count,
-            last_429,
             tab: Tab::Overview,
             modals: Vec::new(),
             main_cursor: 0,
@@ -657,10 +601,6 @@ impl App {
         let last_fetched = Arc::clone(&self.last_fetched);
         let refetch_queue = Arc::clone(&self.refetch_queue);
         let activity = Arc::clone(&self.activity);
-        let learned_intervals = Arc::clone(&self.learned_intervals);
-        let ok_count = Arc::clone(&self.ok_count);
-        let cache_hit_count = Arc::clone(&self.cache_hit_count);
-        let last_429 = Arc::clone(&self.last_429);
         let op_sender = self.op_sender.clone();
         let startup_sender = self.startup_sender.clone();
         let bootstrap_active = Arc::clone(&self.bootstrap_active);
@@ -697,10 +637,6 @@ impl App {
                     &last_fetched,
                     &refetch_queue,
                     &activity,
-                    &learned_intervals,
-                    &ok_count,
-                    &cache_hit_count,
-                    &last_429,
                 );
 
                 // Opted-in 5h windows are armed by the recurring windowless
@@ -767,10 +703,6 @@ impl App {
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,
-            h.learned_intervals,
-            h.ok_count,
-            h.cache_hit_count,
-            h.last_429,
         );
     }
 
@@ -920,9 +852,6 @@ fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
                 name: p.name.to_string(),
                 access_token: oauth.access_token.clone(),
                 refresh_token: oauth.refresh_token.clone(),
-                fallback_threshold: p
-                    .fallback_threshold
-                    .unwrap_or_else(default_fallback_threshold),
             })
         })
         .collect()
@@ -2746,7 +2675,7 @@ fn drain_op_results(app: &mut App) {
     // These are pushed into RefetchQueue rather than triggering an all-profile
     // manual_refresh — only the auto-started profiles need an immediate re-fetch,
     // and the scheduler's forced-merge path respects Switching/Refreshing
-    // exclusions, keeping AIMD the single cadence authority.
+    // exclusions, keeping the scheduler the single cadence authority.
     let mut auto_started_names: Vec<String> = Vec::new();
     // Names whose `Switching` OpResult arrived — the FS half runs after the
     // drain loop so the per-name `Refreshing` toasts/clears for the same
@@ -2832,10 +2761,9 @@ fn drain_op_results(app: &mut App) {
     // Route auto-start re-fetches through RefetchQueue so only the auto-started
     // profiles get an immediate re-fetch, not every profile. The scheduler's
     // forced-merge path picks them up on the next tick, respecting
-    // Switching/Refreshing exclusions and keeping AIMD the single cadence
-    // authority. This replaces the prior all-profile manual_refresh which was
-    // a full double-fetch that raced the scheduler's next tick and injected a
-    // false cache-hit signal.
+    // Switching/Refreshing exclusions and keeping the scheduler the single
+    // cadence authority. This replaces the prior all-profile manual_refresh
+    // which was a full double-fetch that raced the scheduler's next tick.
     if !auto_started_names.is_empty()
         && let Ok(mut q) = app.refetch_queue.lock()
     {
@@ -2954,33 +2882,10 @@ fn poll_credentials_divergence(app: &mut App) {
 /// symlink with a plain copy. After shutdown any external write to
 /// ~/.claude/.credentials.json lands in that standalone file instead of
 /// mutating the active profile's storage through the link.
-///
-/// AIMD learner state is persisted here — the maps are advisory so writing
-/// only on clean shutdown is sufficient; a crash just means the next startup
-/// relearns from NORMAL.
 pub(crate) fn shutdown(app: &mut App) -> Result<()> {
     {
         let mut cfg = app.config();
         let _ = snapshot_active_credentials(&mut cfg);
-        // Flush AIMD learner state so cadence survives clean restarts.
-        if let Ok(li) = app.learned_intervals.lock() {
-            cfg.state.learned_intervals_ms = li
-                .iter()
-                .map(|(name, interval)| (name.clone(), interval.as_millis()))
-                .collect();
-        }
-        if let Ok(ok) = app.ok_count.lock() {
-            cfg.state.consecutive_ok_count = ok.clone();
-        }
-        if let Ok(l4) = app.last_429.lock() {
-            cfg.state.last_429_at = l4
-                .iter()
-                .map(|(name, at)| (name.clone(), at.as_millis()))
-                .collect();
-        }
-        if let Ok(ch) = app.cache_hit_count.lock() {
-            cfg.state.consecutive_cache_hit_count = ch.clone();
-        }
         let _ = save_app_state(&cfg.state);
     }
     let _ = detach_credentials_link();

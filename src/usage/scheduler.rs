@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::lockorder::{RankedMutex, rank};
 
@@ -10,80 +9,25 @@ use super::fetch::{
     FetchError, UsageInfo, fetch_raw, iso_to_epoch_secs, load_disk_cache, now_epoch_secs, now_ms,
     write_disk_cache,
 };
-// Re-exported into the scheduler namespace so the inline test module (which
-// references `super::UsageWindow`) resolves it through this module instead of
-// reaching across the parent. Test-only because no scheduler code needs the
-// type directly — it flows through `UsageInfo`.
-#[cfg(test)]
-#[allow(unused_imports)]
-use super::fetch::UsageWindow;
 
 /// Default scheduler tick. `spawn_refresher` wakes every second and only
-/// performs network work for profiles whose per-profile interval has elapsed.
+/// performs network work for profiles whose refresh interval has elapsed.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Baseline refresh interval. Used as the default when no learned value exists
-/// and as the quiet-period reset target.
-pub(crate) const NORMAL_INTERVAL_MS: u64 = 35_000;
-
-/// AIMD learner bounds and step. The learned value is clamped to [FLOOR, CEILING]
-/// after every bump; STEP is the additive decrease per recovery round.
-pub(crate) const LEARNED_FLOOR_MS: u64 = 10_000;
-pub(crate) const LEARNED_CEILING_MS: u64 = 300_000;
-pub(crate) const LEARNED_STEP_MS: u64 = 5_000;
-
-/// After this many ms without a 429, a raised learned interval resets to
-/// NORMAL_INTERVAL_MS so a single spike doesn't permanently raise the floor.
-pub(crate) const LEARNED_QUIET_RESET_MS: u64 = 5 * 60 * 1_000;
-
-/// Default fallback threshold (must match `fallback::DEFAULT_THRESHOLD`).
-const DEFAULT_FALLBACK_THRESHOLD: f64 = 95.0;
-
-/// Distance below the fallback threshold at which the refresher clamps to
-/// LEARNED_FLOOR_MS regardless of the learned value.
-const NEAR_THRESHOLD_MARGIN: f64 = 5.0;
-
-/// Tolerance for "same five-hour utilization" comparison when deciding a
-/// Fresh response is actually a server-side cache hit. Well below display
-/// precision but above any plausible f64 round-trip jitter.
-const CACHE_HIT_EPSILON: f64 = 1e-9;
-
-/// Estimated TTL of the Anthropic `/usage` server-side cache. Two consecutive
-/// Fresh responses with identical five-hour utilization only count as a
-/// "server cache hit" when the second one landed within this window — beyond
-/// it, an unchanged value just means the user isn't burning tokens, and that
-/// must not pull the learner back up toward NORMAL.
-pub(crate) const SERVER_CACHE_TTL_ESTIMATE_MS: u64 = 25_000;
-
-// Cache-hit elimination invariant: the cache-hit backoff cap (NORMAL) must
-// sit strictly above the server-cache-TTL gate (SERVER_CACHE_TTL_ESTIMATE_MS)
-// used by `detect_cache_hit`. If NORMAL ≤ TTL, a profile converging to
-// NORMAL would still poll inside the cache window and register hits forever,
-// making cache-hit elimination impossible in steady state.
-const _: () = assert!(
-    NORMAL_INTERVAL_MS > SERVER_CACHE_TTL_ESTIMATE_MS,
-    "NORMAL_INTERVAL_MS must exceed SERVER_CACHE_TTL_ESTIMATE_MS for cache-hit elimination to terminate",
-);
-// Stronger invariant: two consecutive bump_downs from NORMAL must keep `learned`
-// at or above the server-cache TTL gate. Without this, the learner oscillates
-// between NORMAL and (NORMAL - 2*STEP), repeatedly crossing TTL and producing
-// a non-zero steady-state cache-hit rate in idle conditions.
-const _: () = assert!(
-    NORMAL_INTERVAL_MS.saturating_sub(2 * LEARNED_STEP_MS) >= SERVER_CACHE_TTL_ESTIMATE_MS,
-    "two bump_downs from NORMAL must stay at or above the server cache TTL, or the learner oscillates around TTL with a non-zero steady-state cache-hit rate",
-);
+/// Fixed per-profile refresh interval. Every profile is re-fetched this long
+/// after its last fetch — there is no adaptive backoff.
+pub(crate) const REFRESH_INTERVAL_MS: u64 = 40_000;
 
 /// A wall-clock instant in epoch-milliseconds (the unit produced by `now_ms`).
 /// Newtype so an epoch timestamp can never be confused with a duration in the
-/// learner arithmetic: subtracting two `EpochMs` yields an [`IntervalMs`], and
-/// the only way to get an `EpochMs` from a bare `u64` is the explicit
-/// constructor. `#[repr(transparent)]` so the on-disk `u64` representation and
-/// any `HashMap<String, u64>` round-trip is layout-identical.
+/// cadence arithmetic. The only way to get an `EpochMs` from a bare `u64` is the
+/// explicit constructor. `#[repr(transparent)]` so the on-disk `u64`
+/// representation and any `HashMap<String, u64>` round-trip is layout-identical.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub(crate) struct EpochMs(u64);
 
-/// A span of time in milliseconds — a learned refresh interval or any elapsed
+/// A span of time in milliseconds — the refresh interval or any elapsed
 /// duration. Distinct from [`EpochMs`] so "instant" and "span" can't be mixed
 /// up. `#[repr(transparent)]` keeps it layout-identical to the persisted `u64`.
 #[repr(transparent)]
@@ -101,13 +45,6 @@ impl EpochMs {
         self.0
     }
 
-    /// Duration elapsed since `earlier`, saturating at zero (instant − instant
-    /// = span). Returns an [`IntervalMs`] so the result can't be re-used as a
-    /// timestamp by accident.
-    pub(crate) const fn saturating_duration_since(self, earlier: EpochMs) -> IntervalMs {
-        IntervalMs(self.0.saturating_sub(earlier.0))
-    }
-
     /// Instant `interval` after this one, saturating (instant + span = instant).
     pub(crate) const fn saturating_add(self, interval: IntervalMs) -> EpochMs {
         EpochMs(self.0.saturating_add(interval.0))
@@ -118,11 +55,6 @@ impl IntervalMs {
     /// Wrap a raw millisecond span (a const interval or a value from disk).
     pub(crate) const fn from_millis(ms: u64) -> Self {
         Self(ms)
-    }
-
-    /// Raw millisecond span, for persistence and TTL comparisons.
-    pub(crate) const fn as_millis(self) -> u64 {
-        self.0
     }
 }
 
@@ -136,20 +68,6 @@ pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, EpochMs>, rank::
 /// Names pushed here after a successful token rotation are fetched on the very
 /// next scheduler tick, bypassing the per-profile cadence.
 pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, rank::RefetchQueue>>;
-
-/// Per-profile learned refresh interval in ms (AIMD cadence).
-pub(crate) type LearnedIntervals = Arc<RankedMutex<HashMap<String, IntervalMs>, rank::Learned>>;
-
-/// How many consecutive non-429 fetches each profile has seen since the last backoff.
-pub(crate) type ConsecutiveOk = Arc<RankedMutex<HashMap<String, u32>, rank::OkCount>>;
-
-/// How many consecutive Fresh fetches with unchanged utilization each profile
-/// has seen. Used to detect server-side cache hits and back off when polling
-/// faster than the server invalidates. In-memory only; not persisted.
-pub(crate) type ConsecutiveCacheHit = Arc<RankedMutex<HashMap<String, u32>, rank::CacheHit>>;
-
-/// Epoch-ms of the most recent 429 per profile. Used for quiet-period resets.
-pub(crate) type Last429At = Arc<RankedMutex<HashMap<String, EpochMs>, rank::Last429>>;
 
 /// Profiles that need an auto-start kick after the fetch revealed no live 5h
 /// window. Main thread drains this set on every tick.
@@ -184,7 +102,6 @@ pub(crate) struct TokenEntry {
     pub(crate) name: String,
     pub(crate) access_token: String,
     pub(crate) refresh_token: Option<String>,
-    pub(crate) fallback_threshold: f64,
 }
 
 /// Per-profile epoch-ms of the next scheduled fetch. Written by the scheduler
@@ -343,7 +260,7 @@ pub(crate) enum FetchStatus {
     Failed,
     /// The API returned 429 on the initial call (the signal was observed this
     /// tick regardless of whether the retry after token rotation succeeded).
-    /// The AIMD learner uses this to bump the per-profile interval up.
+    /// Surfaced to the overview row as a distinct rate-limited status.
     RateLimited,
 }
 
@@ -365,9 +282,9 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
 
 /// One profile's fetch + rotate + retry path. On 401/429 we refresh the OAuth
 /// pair, persist it, and retry once. A 429 on the initial call sets
-/// `RateLimited` so the AIMD learner can back off; a successful retry still
-/// records it because the rate-limit signal was observed this tick. Any other
-/// error falls back to the on-disk cache. Pushes `name` onto `refetch` when
+/// `RateLimited`; a successful retry still records it because the rate-limit
+/// signal was observed this tick. Any other error falls back to the on-disk
+/// cache. Pushes `name` onto `refetch` when
 /// rotation succeeds but the follow-up fetch failed, so the next scheduler
 /// tick re-fetches with the new token. Returns the rotated pair on success
 /// so the caller can update the live `TokenList`.
@@ -454,8 +371,7 @@ fn fetch_with_rotation(
     match fetch_raw(&access) {
         Ok(info) => {
             // Token rotated and fresh numbers are in hand. A 429 was still
-            // observed this tick, so report RateLimited so the learner backs
-            // off even though we recovered.
+            // observed this tick, so report RateLimited even though we recovered.
             let status = if saw_429 {
                 FetchStatus::RateLimited
             } else {
@@ -464,344 +380,23 @@ fn fetch_with_rotation(
             (Some(info), status, rotated)
         }
         Err(FetchError::Status(429)) => {
-            // Rotation succeeded, but the retry itself got rate-limited. Let the
-            // AIMD learner's RateLimited→bump_up path govern the next poll cadence;
-            // pushing to RefetchQueue here would schedule a 1s-floor re-fetch that
-            // fights the backoff and risks cycling: rotate→retry-429→enqueue→rotate.
-            // The learner's backoff must win — no forced refetch on a 429 retry.
+            // Rotation succeeded, but the retry itself got rate-limited. Don't
+            // force a refetch on the next tick: pushing to RefetchQueue here would
+            // schedule an immediate re-fetch that risks cycling on a persistent
+            // 429 (rotate→retry-429→enqueue→rotate). The fixed cadence governs the
+            // next poll instead.
             let (info, _) = load_cached_with_status(name, FetchStatus::RateLimited);
             (info, FetchStatus::RateLimited, rotated)
         }
         Err(_) => {
             // Rotation succeeded but a non-429 transient error stopped the retry.
             // Force a re-fetch on the next tick so we pick up with the new token
-            // as soon as possible without waiting the full learned interval.
+            // as soon as possible without waiting the full refresh interval.
             if let Ok(mut q) = refetch.lock() {
                 q.insert(name.to_string());
             }
             bail_to_cache(rotated)
         }
-    }
-}
-
-fn five_hour_utilization(info: &UsageInfo) -> Option<f64> {
-    info.five_hour.as_ref().map(|w| w.utilization)
-}
-
-/// Process-wide counter mixed into the bump-up jitter seed so two profiles
-/// bumping in the same tick get distinct jitter — `subsec_nanos` alone often
-/// collides under burst load, defeating the whole point of jittering.
-static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn jitter_seed() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let counter = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mixed = nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    mixed
-        .wrapping_mul(6_364_136_223_846_793_005)
-        .wrapping_add(1_442_695_040_888_963_407)
-}
-
-/// Multiplicative-increase: multiply current by 1.5 and add ±10% jitter,
-/// clamped to ceiling. At saturation the result pins to CEILING with no
-/// jitter — applying jitter after the clamp would let continued 429s drift
-/// the effective ceiling down by half the jitter range.
-///
-/// The saturation guard fires when `raised + margin >= CEILING` (equivalently
-/// `raised >= CEILING * 10 / 11`), not just when `raised >= CEILING`. This
-/// ensures jitter is only applied when the full ±10% window fits under the
-/// ceiling — without this, upward jitter gets clipped by `.min()` while
-/// downward jitter passes through, shifting the mean below `raised`.
-pub(crate) fn bump_up(current: u64) -> u64 {
-    let raised = current.saturating_mul(3) / 2;
-    let margin = raised / 10;
-    // Pin to CEILING (no jitter) when the full ±margin window would straddle
-    // the ceiling. `LEARNED_CEILING_MS * 10 / 11` is the equivalent threshold.
-    if raised.saturating_add(margin) >= LEARNED_CEILING_MS {
-        return LEARNED_CEILING_MS;
-    }
-    let jitter = if margin == 0 {
-        0i64
-    } else {
-        i64::try_from(jitter_seed() % (margin * 2 + 1)).unwrap_or(0)
-            - i64::try_from(margin).unwrap_or(0)
-    };
-    ((raised as i64 + jitter).max(LEARNED_FLOOR_MS as i64) as u64).min(LEARNED_CEILING_MS)
-}
-
-/// Additive-decrease: subtract LEARNED_STEP_MS, clamp to floor.
-pub(crate) fn bump_down(current: u64) -> u64 {
-    current
-        .saturating_sub(LEARNED_STEP_MS)
-        .max(LEARNED_FLOOR_MS)
-}
-
-/// True when an unchanged five-hour utilization should be attributed to the
-/// server-side /usage cache rather than to genuine idle. Three conditions:
-/// status must be Fresh (other statuses can't carry a "same as last" signal);
-/// the poll must have landed inside the server cache window (slower polls
-/// would see invalidated cache, so unchanged values mean the user just wasn't
-/// burning tokens); both prev and new utilizations must be present and equal
-/// within `CACHE_HIT_EPSILON`.
-fn detect_cache_hit(
-    status: FetchStatus,
-    elapsed_ms: u64,
-    prev_util: Option<f64>,
-    new_util: Option<f64>,
-) -> bool {
-    if !matches!(status, FetchStatus::Fresh) {
-        return false;
-    }
-    // `>=` is correct: at exactly the TTL boundary the server has had time to
-    // invalidate its cache, so equal values mean idle, not a cache hit. This
-    // boundary is what makes cache-hit elimination terminate — once the learned
-    // interval reaches SERVER_CACHE_TTL_ESTIMATE_MS, polls stop registering as
-    // cache hits and the backoff arm stops firing.
-    if elapsed_ms >= SERVER_CACHE_TTL_ESTIMATE_MS {
-        return false;
-    }
-    match (prev_util, new_util) {
-        (Some(a), Some(b)) => (a - b).abs() < CACHE_HIT_EPSILON,
-        _ => false,
-    }
-}
-
-/// Resolve the effective refresh interval for one profile. Near-threshold always
-/// wins with FLOOR (highest urgency). Otherwise returns the learned interval,
-/// defaulting to NORMAL when no learned value exists.
-///
-/// The near-threshold override pins FLOOR (10s), which is below the server
-/// cache TTL (25s), so cache hits are intentionally NOT eliminated when a
-/// profile is within NEAR_THRESHOLD_MARGIN of its configured fallback threshold.
-/// This is the one accepted exception to the "eliminate cache hits in steady
-/// state" goal — traded for responsiveness as a profile approaches its fallback
-/// limit. It only fires for profiles with a genuinely-configured threshold
-/// (> NEAR_THRESHOLD_MARGIN); a zero/unset threshold (0.0) does not trigger it.
-fn interval_for(
-    entry: &TokenEntry,
-    last_5h: Option<f64>,
-    learned_intervals: &LearnedIntervals,
-) -> IntervalMs {
-    // Guard: only apply the near-threshold override when the threshold is
-    // genuinely configured (> NEAR_THRESHOLD_MARGIN). Without this guard,
-    // a zero/unset threshold (0.0) produces a negative RHS, making the
-    // comparison true for any utilization — pinning every such profile to
-    // FLOOR (10s) forever and defeating the AIMD learner entirely.
-    let near = entry.fallback_threshold > NEAR_THRESHOLD_MARGIN
-        && matches!(last_5h, Some(u) if u >= entry.fallback_threshold - NEAR_THRESHOLD_MARGIN);
-    if near {
-        return IntervalMs::from_millis(LEARNED_FLOOR_MS);
-    }
-    learned_intervals
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&entry.name).copied())
-        .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
-}
-
-/// `interval_for` but returning a raw `u64` for the inline test module, which
-/// asserts against bare-`u64` cadence constants. Pure unwrap of the newtype.
-#[cfg(test)]
-fn interval_for_ms(
-    entry: &TokenEntry,
-    last_5h: Option<f64>,
-    learned_intervals: &LearnedIntervals,
-) -> u64 {
-    interval_for(entry, last_5h, learned_intervals).as_millis()
-}
-
-/// Which AIMD transition a fetch outcome maps to, computed from
-/// `(status, cache_hit, util_changed)` with no locks held. Resolving this
-/// before locking keeps the critical section in `update_learner` minimal and
-/// makes the five transitions auditable in one place.
-///
-/// Each variant corresponds 1:1 to an old `match status` arm; the locked
-/// region only reads/writes the shared maps, it no longer re-derives the
-/// branch from the inputs.
-enum LearnerSignal {
-    /// `RateLimited`: multiplicative bump-up, reset both counters, stamp 429.
-    RateLimit,
-    /// `Fresh` + server-cache hit: accumulate cache-hit count, jump above TTL
-    /// on the second consecutive hit.
-    CacheHit,
-    /// `Fresh` + genuinely-changed utilization: the recovery signal; accumulate
-    /// ok-count, `bump_down` on the second consecutive change.
-    Recovery,
-    /// Neutral: idle Fresh at >= TTL, Cached, or Failed. Leave every map alone.
-    Neutral,
-}
-
-impl LearnerSignal {
-    fn classify(status: FetchStatus, cache_hit: bool, util_changed: bool) -> Self {
-        match status {
-            FetchStatus::RateLimited => Self::RateLimit,
-            FetchStatus::Fresh if cache_hit => Self::CacheHit,
-            FetchStatus::Fresh if util_changed => Self::Recovery,
-            FetchStatus::Fresh => Self::Neutral,
-            FetchStatus::Cached | FetchStatus::Failed => Self::Neutral,
-        }
-    }
-}
-
-/// Update the AIMD learner maps for one profile based on the fetch outcome.
-/// Called from the scheduler thread; all four maps are shared with the main
-/// thread via `Arc<Mutex<...>>` and persisted to `AppState` on shutdown
-/// (except `cache_hit_count`, which is in-memory only).
-///
-/// `cache_hit` is true when a Fresh response carried the same five-hour
-/// utilization as the previously stored value AND the poll landed inside the
-/// server cache window — the Anthropic usage API has a ~30s server-side cache,
-/// so unchanged numbers at FLOOR (10s) mean we're polling faster than the
-/// server invalidates, not that the API is healthy.
-///
-/// `util_changed` is true when this Fresh response carried a five-hour
-/// utilization that genuinely differs from the previously stored value (beyond
-/// `CACHE_HIT_EPSILON`). It is the recovery signal: only a Fresh whose data
-/// actually moved counts as evidence the API is healthy and the interval can
-/// be tightened. A Fresh with unchanged utilization at elapsed >= TTL (an idle
-/// profile burning no tokens) is NOT a cache hit AND NOT a recovery signal — it
-/// is neutral, so the learner leaves it untouched. Without this gate the bare
-/// recovery arm fired `bump_down` on every idle poll above TTL, walking the
-/// interval down until it dropped below TTL where the cache-hit arm snapped it
-/// back up — a permanent oscillation for any genuinely idle profile.
-#[allow(clippy::too_many_arguments)]
-fn update_learner(
-    name: &str,
-    status: FetchStatus,
-    cache_hit: bool,
-    util_changed: bool,
-    learned: &LearnedIntervals,
-    ok_count: &ConsecutiveOk,
-    cache_hit_count: &ConsecutiveCacheHit,
-    last_429: &Last429At,
-) {
-    let now = EpochMs::from_millis(now_ms());
-
-    // Resolve the transition before taking any lock so the critical section
-    // below only touches the shared maps. Pure function of the fetch outcome.
-    let signal = LearnerSignal::classify(status, cache_hit, util_changed);
-
-    let (Ok(mut learned_g), Ok(mut ok_g), Ok(mut ch_g), Ok(mut l429_g)) = (
-        learned.lock(),
-        ok_count.lock(),
-        cache_hit_count.lock(),
-        last_429.lock(),
-    ) else {
-        return;
-    };
-
-    // Quiet-period reset only fires on a confirmed Fresh: a 5-minute network
-    // outage shouldn't undo legitimate backoff from prior 429s. Always remove
-    // the stale 429 stamp when the quiet window has elapsed, even if the
-    // learner is already at or below NORMAL — otherwise the entry lingers
-    // forever on disk.
-    //
-    // `t429 != 0` guards against a zero sentinel from `now_ms()` returning 0
-    // on a badly-skewed clock — a stored 0 would satisfy the elapsed check and
-    // spuriously wipe legitimate 429 backoff.
-    if matches!(status, FetchStatus::Fresh)
-        && let Some(&t429) = l429_g.get(name)
-        && t429 != EpochMs::from_millis(0)
-        && now.saturating_duration_since(t429).as_millis() >= LEARNED_QUIET_RESET_MS
-    {
-        let current = learned_g
-            .get(name)
-            .copied()
-            .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
-            .as_millis();
-        if current > NORMAL_INTERVAL_MS {
-            learned_g.insert(
-                name.to_string(),
-                IntervalMs::from_millis(NORMAL_INTERVAL_MS),
-            );
-        }
-        l429_g.remove(name);
-    }
-
-    match signal {
-        LearnerSignal::RateLimit => {
-            let current = learned_g
-                .get(name)
-                .copied()
-                .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
-                .as_millis();
-            learned_g.insert(name.to_string(), IntervalMs::from_millis(bump_up(current)));
-            ok_g.insert(name.to_string(), 0);
-            ch_g.insert(name.to_string(), 0);
-            l429_g.insert(name.to_string(), now);
-        }
-        // A Fresh response with the same utilization is a server-side cache hit:
-        // jump the interval above SERVER_CACHE_TTL_ESTIMATE_MS so the very next
-        // poll lands outside the cache window and cache-hit detection stops firing.
-        // Convergence guarantee: from FLOOR, at most two consecutive cache-hit polls
-        // drive `learned` strictly above SERVER_CACHE_TTL_ESTIMATE_MS; once there,
-        // `detect_cache_hit` returns false (elapsed >= TTL) and the arm stops firing.
-        // Ceiling is NORMAL, not LEARNED_CEILING — cache hits mean "polling too fast",
-        // not "server overloaded". Only ever raise `learned` here; if we're already
-        // above the target (e.g. post-429 backoff held above NORMAL), leave it alone.
-        // `ConsecutiveOk` is intentionally NOT reset here — cache hits are neutral
-        // evidence about API health, so zeroing ok_count would discard post-429
-        // recovery progress and require an extra bump_down cycle.
-        LearnerSignal::CacheHit => {
-            let hits = ch_g.get(name).copied().unwrap_or(0) + 1;
-            if hits >= 2 {
-                let current = learned_g
-                    .get(name)
-                    .copied()
-                    .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
-                    .as_millis();
-                // Jump strictly above the server-cache TTL so the next poll's elapsed
-                // >= TTL and detect_cache_hit returns false. Clamp to NORMAL so cache
-                // hits never push above the baseline. Never lower the interval here —
-                // a 429-backed raised value above NORMAL must be preserved.
-                let target =
-                    (SERVER_CACHE_TTL_ESTIMATE_MS + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS);
-                let bumped = current.max(target);
-                learned_g.insert(name.to_string(), IntervalMs::from_millis(bumped));
-                ch_g.insert(name.to_string(), 0);
-                // `ok_g` is deliberately left unchanged — only `RateLimited` resets
-                // ConsecutiveOk. Cache hits carry no information about API health.
-            } else {
-                ch_g.insert(name.to_string(), hits);
-            }
-        }
-        // A Fresh response that carried genuinely changed utilization is the
-        // only recovery signal: the API answered AND the user is actively
-        // burning tokens, so the interval can be tightened. Two consecutive
-        // change-events fire `bump_down`. A real change also wipes the cache-hit
-        // accumulator so it can't bridge across an intervening change.
-        LearnerSignal::Recovery => {
-            let count = ok_g.get(name).copied().unwrap_or(0) + 1;
-            if count >= 2 {
-                let current = learned_g
-                    .get(name)
-                    .copied()
-                    .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
-                    .as_millis();
-                learned_g.insert(
-                    name.to_string(),
-                    IntervalMs::from_millis(bump_down(current)),
-                );
-                ok_g.insert(name.to_string(), 0);
-            } else {
-                ok_g.insert(name.to_string(), count);
-            }
-            ch_g.insert(name.to_string(), 0);
-        }
-        // Neutral evidence, leave every counter and the learned interval
-        // untouched. Three origins collapse here:
-        // - Fresh, not a cache hit, unchanged utilization: an idle poll at
-        //   elapsed >= TTL (the user simply isn't burning tokens). The interval
-        //   settles at its current value instead of oscillating. `ConsecutiveOk`
-        //   is preserved (a real change later still counts toward recovery); `ch`
-        //   is left alone (cache hits only accumulate at <TTL, never reached here).
-        // - Cached / Failed: network failures and cache fallbacks neither confirm
-        //   nor refute API health, so a single blip doesn't wipe legitimate
-        //   recovery progress accumulated from prior Fresh responses.
-        LearnerSignal::Neutral => {}
     }
 }
 
@@ -845,26 +440,12 @@ fn run_fetch(
 /// Write one outcome into the shared stores. Disk cache is updated on every
 /// successful API response so a later process restart can still surface
 /// numbers without a fresh API call.
-#[allow(clippy::too_many_arguments)]
 fn apply_outcome(
     outcome: FetchOutcome,
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
-    learned: &LearnedIntervals,
-    ok_count: &ConsecutiveOk,
-    cache_hit_count: &ConsecutiveCacheHit,
-    last_429: &Last429At,
 ) {
-    // Single clock snapshot at function entry, before any I/O. Using one
-    // `now_ms()` call here ensures `elapsed_ms` measures the true inter-poll
-    // interval rather than inter-poll-plus-disk-write, preventing
-    // non-deterministic misclassification near the TTL boundary on slow or
-    // variable-latency storage. Also prevents the double-read race under
-    // concurrent `fetch_all_into` fan-out: if two `apply_outcome` calls for
-    // the same profile interleave, the second would otherwise read the
-    // timestamp just written by the first → near-zero `elapsed_ms` → false
-    // cache-hit → spurious upward bump.
     let now = EpochMs::from_millis(now_ms());
 
     let is_fresh = matches!(
@@ -875,71 +456,26 @@ fn apply_outcome(
         write_disk_cache(&outcome.name, info);
     }
 
-    // Read prev_util and write the new entry in a single lock acquisition so
-    // no concurrent apply_outcome for the same name can slip a write between
-    // the two operations and produce a stale prev_util for detect_cache_hit.
-    let (prev_util, new_util): (Option<f64>, Option<f64>) = if let Ok(mut s) = store.lock() {
-        let prev = s.get(&outcome.name).and_then(five_hour_utilization);
-        let new_u = outcome.info.as_ref().and_then(five_hour_utilization);
-        if let Some(info) = &outcome.info {
-            // Don't clobber newer Fresh data with older Cached snapshots loaded
-            // from disk by `fetch_with_rotation`'s fallback path. Cached only
-            // fills the store when no entry exists (cold start without network).
-            if is_fresh || !s.contains_key(&outcome.name) {
-                s.insert(outcome.name.clone(), info.clone());
-            }
-        }
-        (prev, new_u)
-    } else {
-        (None, outcome.info.as_ref().and_then(five_hour_utilization))
-    };
-
-    // Snapshot the previous `last_fetched` value BEFORE any write so
-    // `elapsed_ms` is measured against the prior fetch, not the just-written
-    // timestamp from an earlier call in the same concurrent batch.
-    let elapsed_ms: IntervalMs = last_fetched
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&outcome.name).copied())
-        .map(|prev| now.saturating_duration_since(prev))
-        .unwrap_or(IntervalMs::from_millis(u64::MAX));
-
-    let cache_hit = detect_cache_hit(outcome.status, elapsed_ms.as_millis(), prev_util, new_util);
-
-    // Recovery signal: the five-hour utilization genuinely moved since the last
-    // stored value (beyond `CACHE_HIT_EPSILON`). Requires both a prior and a new
-    // value — a cold start (no prior) carries no change evidence, so it is not a
-    // recovery signal. A Fresh with unchanged util is neutral, not recovery; this
-    // is what keeps an idle profile from walking its interval down forever.
-    let util_changed = matches!(
-        (prev_util, new_util),
-        (Some(a), Some(b)) if (a - b).abs() >= CACHE_HIT_EPSILON
-    );
-
-    // Stamp last_fetched and status together, each in its own short critical
-    // section so only one leaf lock is held at a time (never two leaves at
-    // once). Acquired in ascending rank order LAST_FETCHED(200) <
-    // USAGE_STATUS(350) so the sequence stays consistent with the global order
-    // even if a future edit nests them. Both are released before
-    // `update_learner` takes LEARNED.
+    if let Ok(mut s) = store.lock()
+        && let Some(info) = &outcome.info
     {
-        if let Ok(mut lf) = last_fetched.lock() {
-            lf.insert(outcome.name.clone(), now);
-        }
-        if let Ok(mut st) = status.lock() {
-            st.insert(outcome.name.clone(), outcome.status);
+        // Don't clobber newer Fresh data with older Cached snapshots loaded
+        // from disk by `fetch_with_rotation`'s fallback path. Cached only
+        // fills the store when no entry exists (cold start without network).
+        if is_fresh || !s.contains_key(&outcome.name) {
+            s.insert(outcome.name.clone(), info.clone());
         }
     }
-    update_learner(
-        &outcome.name,
-        outcome.status,
-        cache_hit,
-        util_changed,
-        learned,
-        ok_count,
-        cache_hit_count,
-        last_429,
-    );
+
+    // Stamp last_fetched and status, each in its own short critical section so
+    // only one leaf lock is held at a time (never two leaves at once). Acquired
+    // in ascending rank order LAST_FETCHED(200) < USAGE_STATUS(350).
+    if let Ok(mut lf) = last_fetched.lock() {
+        lf.insert(outcome.name.clone(), now);
+    }
+    if let Ok(mut st) = status.lock() {
+        st.insert(outcome.name.clone(), outcome.status);
+    }
 }
 
 /// Force-fetch every entry right now in parallel and write the results into
@@ -947,7 +483,6 @@ fn apply_outcome(
 /// worker and `manual_refresh`. Blocks until all fetches complete. One-shot, so any
 /// `rotated` tokens are dropped — the main thread's `reload_if_state_changed`
 /// will pick them up from the persisted `credentials.json` shortly.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn fetch_all_into(
     config: &crate::profile::ConfigHandle,
     tokens: &[TokenEntry],
@@ -956,10 +491,6 @@ pub(crate) fn fetch_all_into(
     last_fetched: &LastFetchedAt,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
-    learned: &LearnedIntervals,
-    ok_count: &ConsecutiveOk,
-    cache_hit_count: &ConsecutiveCacheHit,
-    last_429: &Last429At,
 ) {
     if tokens.is_empty() {
         return;
@@ -990,16 +521,7 @@ pub(crate) fn fetch_all_into(
         match h.join() {
             Ok(outcome) => {
                 clear_activity(activity, &outcome.name);
-                apply_outcome(
-                    outcome,
-                    store,
-                    status,
-                    last_fetched,
-                    learned,
-                    ok_count,
-                    cache_hit_count,
-                    last_429,
-                );
+                apply_outcome(outcome, store, status, last_fetched);
             }
             Err(_) => {
                 // Worker panicked. Clear the activity slot so the spinner doesn't
@@ -1012,10 +534,7 @@ pub(crate) fn fetch_all_into(
 }
 
 /// Background scheduler. Wakes every second and fans out parallel fetches for
-/// every profile whose per-profile interval has elapsed. The effective interval
-/// per profile comes from the AIMD learner (stored in `learned`): FLOOR when
-/// near the configured fallback threshold, the learned value otherwise, falling
-/// back to NORMAL when no learned value exists.
+/// every profile whose fixed `REFRESH_INTERVAL_MS` cadence has elapsed.
 ///
 /// Also evaluates the fallback chain at the end of every tick. When the active
 /// profile has crossed its threshold and a viable target exists, the name is
@@ -1040,10 +559,6 @@ pub(crate) struct SchedulerState {
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
-    learned: LearnedIntervals,
-    ok_count: ConsecutiveOk,
-    cache_hit_count: ConsecutiveCacheHit,
-    last_429: Last429At,
 }
 
 /// Run one scheduler tick: drain forced refetches, partition the due set, scan
@@ -1062,7 +577,7 @@ fn tick(state: &SchedulerState) {
     }
 
     // Drain names pushed by rotation paths so they bypass the cadence
-    // and get fresh numbers on this tick instead of waiting up to 45s.
+    // and get fresh numbers on this tick instead of waiting the full interval.
     let forced: HashSet<String> = state
         .refetch_queue
         .lock()
@@ -1070,17 +585,11 @@ fn tick(state: &SchedulerState) {
         .map(|mut q| std::mem::take(&mut *q))
         .unwrap_or_default();
 
-    // Decide which entries are due this tick. Per-profile intervals
-    // come from the AIMD learner held in `learned`.
+    // Decide which entries are due this tick. Every profile uses the same
+    // fixed `REFRESH_INTERVAL_MS` cadence.
     let now = now_ms();
-    let (mut due, mut per_profile_next) = partition_due(
-        &snapshot,
-        now,
-        &state.store,
-        &state.last_fetched,
-        &state.learned,
-        &state.activity,
-    );
+    let (mut due, mut per_profile_next) =
+        partition_due(&snapshot, now, &state.last_fetched, &state.activity);
 
     // Merge forced entries that aren't already scheduled this tick and
     // reflect them in the published map as "due now" (zero countdown).
@@ -1185,16 +694,7 @@ fn tick(state: &SchedulerState) {
                     entry.access_token = new_access.clone();
                     entry.refresh_token = new_refresh.clone();
                 }
-                apply_outcome(
-                    outcome,
-                    &state.store,
-                    &state.status,
-                    &state.last_fetched,
-                    &state.learned,
-                    &state.ok_count,
-                    &state.cache_hit_count,
-                    &state.last_429,
-                );
+                apply_outcome(outcome, &state.store, &state.status, &state.last_fetched);
             }
             Err(_) => {
                 // Worker panicked. Clear the activity slot so the spinner
@@ -1210,14 +710,8 @@ fn tick(state: &SchedulerState) {
     // gets the same exclusion treatment here as in the pre-fetch call —
     // its countdown is recomputed from current `last_fetched` rather
     // than carrying a stale pre-fetch value for one extra tick.
-    let (_, per_profile_after) = partition_due(
-        &snapshot,
-        now_ms(),
-        &state.store,
-        &state.last_fetched,
-        &state.learned,
-        &state.activity,
-    );
+    let (_, per_profile_after) =
+        partition_due(&snapshot, now_ms(), &state.last_fetched, &state.activity);
     if let Ok(mut nrpp) = state.next_refresh_per_profile.lock() {
         nrpp.clone_from(&per_profile_after);
     }
@@ -1252,10 +746,6 @@ pub(crate) fn spawn_refresher(
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
-    learned: LearnedIntervals,
-    ok_count: ConsecutiveOk,
-    cache_hit_count: ConsecutiveCacheHit,
-    last_429: Last429At,
 ) {
     let state = SchedulerState {
         config,
@@ -1270,10 +760,6 @@ pub(crate) fn spawn_refresher(
         pending_switch,
         pending_switch_off,
         refetch_queue,
-        learned,
-        ok_count,
-        cache_hit_count,
-        last_429,
     };
     std::thread::spawn(move || {
         loop {
@@ -1457,23 +943,16 @@ fn scan_expired_windows(
 fn partition_due(
     snapshot: &[TokenEntry],
     now: u64,
-    store: &UsageStore,
     last_fetched: &LastFetchedAt,
-    learned: &LearnedIntervals,
     activity: &ActivityStore,
 ) -> (Vec<TokenEntry>, HashMap<String, u64>) {
     let now = EpochMs::from_millis(now);
     let Ok(lf) = last_fetched.lock() else {
         return (Vec::new(), HashMap::new());
     };
-    // Poisoned store: bail the same way as poisoned last_fetched. Proceeding
-    // with no utilization data silently disables the near-threshold FLOOR
-    // override — profiles near the limit would poll at NORMAL instead of FLOOR.
-    let Ok(st) = store.lock() else {
-        return (Vec::new(), HashMap::new());
-    };
     let act = activity.lock();
 
+    let interval = IntervalMs::from_millis(REFRESH_INTERVAL_MS);
     let mut due = Vec::new();
     let mut per_profile = HashMap::with_capacity(snapshot.len());
     for entry in snapshot {
@@ -1481,8 +960,6 @@ fn partition_due(
             .get(&entry.name)
             .copied()
             .unwrap_or(EpochMs::from_millis(0));
-        let last_5h = st.get(&entry.name).and_then(five_hour_utilization);
-        let interval = interval_for(entry, last_5h, learned);
         let next = last.saturating_add(interval);
         per_profile.insert(entry.name.clone(), next.as_millis());
         // Profiles mid-switch or mid-refresh are excluded from this tick's due
@@ -1509,13 +986,6 @@ fn partition_due(
     (due, per_profile)
 }
 
-/// Default fallback threshold used when a profile leaves it unset. Public so
-/// `App::collect_tokens` can resolve once at snapshot time instead of every
-/// scheduler tick.
-pub(crate) const fn default_fallback_threshold() -> f64 {
-    DEFAULT_FALLBACK_THRESHOLD
-}
-
 #[cfg(test)]
-#[path = "../../tests/inline/learned_cadence.rs"]
+#[path = "../../tests/inline/scheduler.rs"]
 mod tests;
