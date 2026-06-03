@@ -938,7 +938,7 @@ pub(crate) fn spawn_refresher(
             // Decide which entries are due this tick. Per-profile intervals
             // come from the AIMD learner held in `learned`.
             let now = now_ms();
-            let (mut due, _soonest_next, mut per_profile_next) =
+            let (mut due, mut per_profile_next) =
                 partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
             // Merge forced entries that aren't already scheduled this tick and
@@ -1070,7 +1070,7 @@ pub(crate) fn spawn_refresher(
             // gets the same exclusion treatment here as in the pre-fetch call —
             // its countdown is recomputed from current `last_fetched` rather
             // than carrying a stale pre-fetch value for one extra tick.
-            let (_, _, per_profile_after) = partition_due(
+            let (_, per_profile_after) = partition_due(
                 &snapshot,
                 now_ms(),
                 &store,
@@ -1262,9 +1262,8 @@ fn scan_expired_windows(
     }
 }
 
-/// Split `snapshot` into the subset due this tick, the soonest epoch-ms at
-/// which any non-due entry will become due, and a per-profile map of next
-/// fetch epoch-ms. A poisoned `last_fetched` returns empty rather than
+/// Split `snapshot` into the subset due this tick and a per-profile map of
+/// next fetch epoch-ms. A poisoned `last_fetched` returns empty rather than
 /// falling back to `last=0` (which would mark every profile due → fetch storm).
 ///
 /// `activity` is consulted to exclude profiles currently `Switching`: a
@@ -1279,20 +1278,19 @@ fn partition_due(
     last_fetched: &LastFetchedAt,
     learned: &LearnedIntervals,
     activity: &ActivityStore,
-) -> (Vec<TokenEntry>, u64, HashMap<String, u64>) {
+) -> (Vec<TokenEntry>, HashMap<String, u64>) {
     let Ok(lf) = last_fetched.lock() else {
-        return (Vec::new(), now + NORMAL_INTERVAL_MS, HashMap::new());
+        return (Vec::new(), HashMap::new());
     };
     // Poisoned store: bail the same way as poisoned last_fetched. Proceeding
     // with no utilization data silently disables the near-threshold FLOOR
     // override — profiles near the limit would poll at NORMAL instead of FLOOR.
     let Ok(st) = store.lock() else {
-        return (Vec::new(), now + NORMAL_INTERVAL_MS, HashMap::new());
+        return (Vec::new(), HashMap::new());
     };
     let act = activity.lock();
 
     let mut due = Vec::new();
-    let mut soonest_next = now + NORMAL_INTERVAL_MS;
     let mut per_profile = HashMap::with_capacity(snapshot.len());
     for entry in snapshot {
         let last = lf.get(&entry.name).copied().unwrap_or(0);
@@ -1319,11 +1317,9 @@ fn partition_due(
         }
         if now >= next {
             due.push(entry.clone());
-        } else if next < soonest_next {
-            soonest_next = next;
         }
     }
-    (due, soonest_next, per_profile)
+    (due, per_profile)
 }
 
 /// Default fallback threshold used when a profile leaves it unset. Public so

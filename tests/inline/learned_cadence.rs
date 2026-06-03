@@ -1327,7 +1327,7 @@ fn partition_due_never_fetched_profile_is_due() {
     let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
 
-    let (due, _, per_profile) = partition_due(
+    let (due, per_profile) = partition_due(
         &snapshot,
         now_ms(),
         &store,
@@ -1351,7 +1351,7 @@ fn partition_due_recent_fetch_is_not_due() {
     let now = now_ms();
     last_fetched.lock().unwrap().insert("p".into(), now);
 
-    let (due, _, per_profile) =
+    let (due, per_profile) =
         partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
     assert!(due.is_empty());
@@ -1374,7 +1374,7 @@ fn partition_due_interval_elapsed_is_due() {
         .unwrap()
         .insert("p".into(), now - NORMAL_INTERVAL_MS);
 
-    let (due, _, _) = partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
+    let (due, _) = partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
     assert_eq!(due.len(), 1);
 }
@@ -1393,7 +1393,7 @@ fn partition_due_honors_learned_interval() {
         .insert("p".into(), now - 15_000);
     learned.lock().unwrap().insert("p".into(), 20_000);
 
-    let (due, _, per_profile) =
+    let (due, per_profile) =
         partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
     // 15s elapsed, learned interval 20s → 5s remaining.
@@ -1427,7 +1427,7 @@ fn partition_due_near_threshold_overrides_learned_with_floor() {
         .unwrap()
         .insert("p".into(), LEARNED_CEILING_MS);
 
-    let (due, _, _) = partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
+    let (due, _) = partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
     assert_eq!(due.len(), 1, "near-threshold must override learned CEILING");
 }
@@ -1439,7 +1439,7 @@ fn partition_due_empty_snapshot_returns_empty() {
     let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
 
-    let (due, _, per_profile) =
+    let (due, per_profile) =
         partition_due(&[], now_ms(), &store, &last_fetched, &learned, &activity);
 
     assert!(due.is_empty());
@@ -1458,7 +1458,7 @@ fn partition_due_excludes_switching_profiles() {
         .unwrap()
         .insert("p".into(), ProfileActivity::Switching);
 
-    let (due, _, per_profile) = partition_due(
+    let (due, per_profile) = partition_due(
         &snapshot,
         now_ms(),
         &store,
@@ -1484,7 +1484,7 @@ fn partition_due_excludes_refreshing_profiles() {
         .unwrap()
         .insert("p".into(), ProfileActivity::Refreshing);
 
-    let (due, _, per_profile) = partition_due(
+    let (due, per_profile) = partition_due(
         &snapshot,
         now_ms(),
         &store,
@@ -1516,7 +1516,7 @@ fn partition_due_bails_on_poisoned_store() {
         panic!("poison");
     });
 
-    let (due, _, per_profile) = partition_due(
+    let (due, per_profile) = partition_due(
         &snapshot,
         now_ms(),
         &store,
