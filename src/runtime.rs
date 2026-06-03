@@ -135,7 +135,7 @@ impl RotationGuard {
             .with_context(|| format!("failed to lock {}", path.display()))?;
         // ROTATION is the outermost rank — held across the OAuth HTTP round
         // trip, before `config` and the state flock are ever taken.
-        let _rank = crate::lockorder::RankGuard::enter(crate::lockorder::rank::ROTATION);
+        let _rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::Rotation>();
         Ok(Self { _file: file, _rank })
     }
 }

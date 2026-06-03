@@ -32,31 +32,68 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::{LockResult, Mutex, PoisonError};
 
+/// Sealed so only the rank markers defined in [`rank`] can implement [`Rank`].
+/// Nothing outside this module can name a fresh `Rank` type, which is what makes
+/// arbitrary-rank [`RankedMutex`] / [`RankGuard`] construction impossible.
+mod sealed {
+    pub(crate) trait Sealed {}
+}
+
+/// A position in the global lock order. Implemented only by the zero-sized
+/// markers in [`rank`]; the sealed supertrait blocks any other implementation.
+/// `VALUE` is the rank's u16 weight — lower = acquired earlier (outer).
+pub(crate) trait Rank: sealed::Sealed {
+    // Only read inside the `cfg(debug_assertions)` rank check in
+    // `RankGuard::enter`; release builds compile that read out, leaving the
+    // const unreferenced. The order it encodes is still load-bearing.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    const VALUE: u16;
+}
+
 /// Global lock order. Lower value = acquired earlier (outer). Gaps leave room to
 /// insert future locks without renumbering; only the relative order matters.
+/// Each rank is an uninhabited marker type implementing [`Rank`]; the raw u16
+/// weights are private to this module so the order can't be forged elsewhere.
 pub(crate) mod rank {
-    /// `RotationGuard` (per-profile rotation flock). Held across HTTP, outermost.
-    pub(crate) const ROTATION: u16 = 100;
-    pub(crate) const LAST_FETCHED: u16 = 200;
-    pub(crate) const TOKENS: u16 = 250;
-    pub(crate) const USAGE_STORE: u16 = 300;
-    pub(crate) const USAGE_STATUS: u16 = 350;
-    pub(crate) const CONFIG: u16 = 400;
-    /// `with_state_lock` (cross-process state flock). Inner of `config`.
-    pub(crate) const STATE: u16 = 500;
-    pub(crate) const ACTIVITY: u16 = 600;
-    pub(crate) const LEARNED: u16 = 700;
-    pub(crate) const OK_COUNT: u16 = 800;
-    pub(crate) const CACHE_HIT: u16 = 900;
-    pub(crate) const LAST_429: u16 = 1000;
-    // Standalone leaves — never nested with another tracked lock.
-    pub(crate) const NEXT_REFRESH: u16 = 1100;
-    pub(crate) const REFETCH_QUEUE: u16 = 1200;
-    pub(crate) const LAST_ROTATED_WINDOW: u16 = 1300;
-    pub(crate) const PENDING_WINDOW_ROTATION: u16 = 1400;
-    pub(crate) const PENDING_SWITCH: u16 = 1500;
-    pub(crate) const PENDING_AUTO_START: u16 = 1600;
-    pub(crate) const PENDING_SWITCH_OFF: u16 = 1700;
+    use super::{Rank, sealed::Sealed};
+
+    /// Defines one uninhabited rank marker, its `Rank::VALUE`, and the sealing
+    /// `Sealed` impl in one shot so a new rank can never be added half-sealed.
+    macro_rules! ranks {
+        ($($(#[$m:meta])* $name:ident = $value:literal;)*) => {$(
+            $(#[$m])*
+            pub(crate) enum $name {}
+            impl Sealed for $name {}
+            impl Rank for $name {
+                const VALUE: u16 = $value;
+            }
+        )*};
+    }
+
+    ranks! {
+        /// `RotationGuard` (per-profile rotation flock). Held across HTTP, outermost.
+        Rotation = 100;
+        LastFetched = 200;
+        Tokens = 250;
+        UsageStore = 300;
+        UsageStatus = 350;
+        Config = 400;
+        /// `with_state_lock` (cross-process state flock). Inner of `config`.
+        State = 500;
+        Activity = 600;
+        Learned = 700;
+        OkCount = 800;
+        CacheHit = 900;
+        Last429 = 1000;
+        // Standalone leaves — never nested with another tracked lock.
+        NextRefresh = 1100;
+        RefetchQueue = 1200;
+        LastRotatedWindow = 1300;
+        PendingWindowRotation = 1400;
+        PendingSwitch = 1500;
+        PendingAutoStart = 1600;
+        PendingSwitchOff = 1700;
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -75,23 +112,26 @@ pub(crate) struct RankGuard {
 }
 
 impl RankGuard {
-    /// Enter `rank`, asserting it is strictly greater than the highest rank the
-    /// current thread already holds. No-op in release builds.
+    /// Enter rank `R`, asserting it is strictly greater than the highest rank the
+    /// current thread already holds. No-op in release builds. `R` can only name a
+    /// marker from [`rank`], so the rank entered is always a real position in the
+    /// global order.
     #[inline]
-    pub(crate) fn enter(_rank: u16) -> Self {
+    pub(crate) fn enter<R: Rank>() -> Self {
         #[cfg(debug_assertions)]
         {
+            let rank = R::VALUE;
             HELD.with(|h| {
                 let mut h = h.borrow_mut();
                 debug_assert!(
-                    h.last().is_none_or(|&top| _rank > top),
-                    "lock-order violation: acquiring rank {_rank} while holding {:?} \
+                    h.last().is_none_or(|&top| rank > top),
+                    "lock-order violation: acquiring rank {rank} while holding {:?} \
                      (would invert the global lock order and risk deadlock)",
                     h.as_slice(),
                 );
-                h.push(_rank);
+                h.push(rank);
             });
-            Self { rank: _rank }
+            Self { rank }
         }
         #[cfg(not(debug_assertions))]
         {
@@ -119,21 +159,23 @@ impl Drop for RankGuard {
 /// enters the rank (asserting order) before acquiring the inner mutex and holds
 /// it for the guard's lifetime. Drop-in for [`std::sync::Mutex`]: `lock()`
 /// returns a [`LockResult`] and the guard derefs to `T`.
-pub(crate) struct RankedMutex<T, const RANK: u16> {
+pub(crate) struct RankedMutex<T, R: Rank> {
     inner: Mutex<T>,
+    _rank: std::marker::PhantomData<R>,
 }
 
-impl<T, const RANK: u16> RankedMutex<T, RANK> {
+impl<T, R: Rank> RankedMutex<T, R> {
     pub(crate) fn new(value: T) -> Self {
         Self {
             inner: Mutex::new(value),
+            _rank: std::marker::PhantomData,
         }
     }
 
     /// Acquire the lock. Enters the rank first, so a misordered acquisition
     /// trips the debug assertion before it can block on the inner mutex.
     pub(crate) fn lock(&self) -> LockResult<RankedGuard<'_, T>> {
-        let rank = RankGuard::enter(RANK);
+        let rank = RankGuard::enter::<R>();
         match self.inner.lock() {
             Ok(guard) => Ok(RankedGuard { guard, _rank: rank }),
             Err(poison) => Err(PoisonError::new(RankedGuard {

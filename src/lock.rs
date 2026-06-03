@@ -91,7 +91,7 @@ impl StateLock {
         // Enter the STATE rank now that this is the outermost hold. `config`
         // (rank CONFIG) may already be held — STATE sits inside it, so the
         // assertion in `RankGuard::enter` confirms the documented order.
-        let rank = crate::lockorder::RankGuard::enter(crate::lockorder::rank::STATE);
+        let rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::State>();
 
         Ok(Self {
             _thread_guard: Some(guard),

@@ -126,59 +126,57 @@ impl IntervalMs {
     }
 }
 
-pub(crate) type UsageStore = Arc<RankedMutex<HashMap<String, UsageInfo>, { rank::USAGE_STORE }>>;
-pub(crate) type StatusStore =
-    Arc<RankedMutex<HashMap<String, FetchStatus>, { rank::USAGE_STATUS }>>;
-pub(crate) type TokenList = Arc<RankedMutex<Vec<TokenEntry>, { rank::TOKENS }>>;
+pub(crate) type UsageStore = Arc<RankedMutex<HashMap<String, UsageInfo>, rank::UsageStore>>;
+pub(crate) type StatusStore = Arc<RankedMutex<HashMap<String, FetchStatus>, rank::UsageStatus>>;
+pub(crate) type TokenList = Arc<RankedMutex<Vec<TokenEntry>, rank::Tokens>>;
 
 /// Per-profile epoch-ms of the last fetch attempt (cache-rule gating).
-pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, EpochMs>, { rank::LAST_FETCHED }>>;
+pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, EpochMs>, rank::LastFetched>>;
 
 /// Names pushed here after a successful token rotation are fetched on the very
 /// next scheduler tick, bypassing the per-profile cadence.
-pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, { rank::REFETCH_QUEUE }>>;
+pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, rank::RefetchQueue>>;
 
 /// Per-profile learned refresh interval in ms (AIMD cadence).
-pub(crate) type LearnedIntervals = Arc<RankedMutex<HashMap<String, IntervalMs>, { rank::LEARNED }>>;
+pub(crate) type LearnedIntervals = Arc<RankedMutex<HashMap<String, IntervalMs>, rank::Learned>>;
 
 /// How many consecutive non-429 fetches each profile has seen since the last backoff.
-pub(crate) type ConsecutiveOk = Arc<RankedMutex<HashMap<String, u32>, { rank::OK_COUNT }>>;
+pub(crate) type ConsecutiveOk = Arc<RankedMutex<HashMap<String, u32>, rank::OkCount>>;
 
 /// How many consecutive Fresh fetches with unchanged utilization each profile
 /// has seen. Used to detect server-side cache hits and back off when polling
 /// faster than the server invalidates. In-memory only; not persisted.
-pub(crate) type ConsecutiveCacheHit = Arc<RankedMutex<HashMap<String, u32>, { rank::CACHE_HIT }>>;
+pub(crate) type ConsecutiveCacheHit = Arc<RankedMutex<HashMap<String, u32>, rank::CacheHit>>;
 
 /// Epoch-ms of the most recent 429 per profile. Used for quiet-period resets.
-pub(crate) type Last429At = Arc<RankedMutex<HashMap<String, EpochMs>, { rank::LAST_429 }>>;
+pub(crate) type Last429At = Arc<RankedMutex<HashMap<String, EpochMs>, rank::Last429>>;
 
 /// Profiles that need an auto-start kick after the fetch revealed no live 5h
 /// window. Main thread drains this set on every tick.
-pub(crate) type PendingAutoStart = Arc<RankedMutex<HashSet<String>, { rank::PENDING_AUTO_START }>>;
+pub(crate) type PendingAutoStart = Arc<RankedMutex<HashSet<String>, rank::PendingAutoStart>>;
 
 /// Profiles whose 5h window has just expired and need a token rotation.
 /// Value: the `resets_at` epoch-secs pinned at detection time so the drain
 /// stamps `LastRotatedWindow` with the exact window it acted on, not whatever
 /// the store holds when the drain runs (which may already be a newer window).
 pub(crate) type PendingWindowRotation =
-    Arc<RankedMutex<HashMap<String, i64>, { rank::PENDING_WINDOW_ROTATION }>>;
+    Arc<RankedMutex<HashMap<String, i64>, rank::PendingWindowRotation>>;
 
 /// Per-profile `resets_at` epoch-secs we already rotated on, so each expiry
 /// fires exactly once.
-pub(crate) type LastRotatedWindow =
-    Arc<RankedMutex<HashMap<String, i64>, { rank::LAST_ROTATED_WINDOW }>>;
+pub(crate) type LastRotatedWindow = Arc<RankedMutex<HashMap<String, i64>, rank::LastRotatedWindow>>;
 
 /// Scheduler-computed auto-switch decisions. Posted by the background scheduler
 /// when it observes the active profile has crossed its fallback threshold; the
 /// UI thread drains in `on_tick` and dispatches a switch worker. Set rather
 /// than Vec so duplicate enqueues collapse and a slow drain can't pile up.
-pub(crate) type PendingSwitch = Arc<RankedMutex<HashSet<String>, { rank::PENDING_SWITCH }>>;
+pub(crate) type PendingSwitch = Arc<RankedMutex<HashSet<String>, rank::PendingSwitch>>;
 
 /// Set true by the scheduler when wrap-off mode decides the whole chain is
 /// exhausted with no sink (every threshold below 100%). The UI thread drains it
 /// in `on_tick` and turns off all accounts. A bool rather than a set because
 /// switch-off is a single global act with no target — repeated sets collapse.
-pub(crate) type PendingSwitchOff = Arc<RankedMutex<bool, { rank::PENDING_SWITCH_OFF }>>;
+pub(crate) type PendingSwitchOff = Arc<RankedMutex<bool, rank::PendingSwitchOff>>;
 
 /// Snapshot of one profile's OAuth identity used by the refresher.
 #[derive(Clone)]
@@ -192,8 +190,7 @@ pub(crate) struct TokenEntry {
 /// Per-profile epoch-ms of the next scheduled fetch. Written by the scheduler
 /// after each `partition_due` run so the overview rows can show a countdown
 /// without re-running the partition math on the render thread.
-pub(crate) type NextRefreshPerProfile =
-    Arc<RankedMutex<HashMap<String, u64>, { rank::NEXT_REFRESH }>>;
+pub(crate) type NextRefreshPerProfile = Arc<RankedMutex<HashMap<String, u64>, rank::NextRefresh>>;
 
 /// In-flight blocking operation per profile. The overview row shows a spinner
 /// in the timer slot instead of a countdown whenever a profile's slot is
@@ -202,8 +199,7 @@ pub(crate) type NextRefreshPerProfile =
 ///
 /// Mutex is leaf-level: never hold across HTTP. Snapshot or per-name
 /// read/write only so the UI render thread isn't blocked by a worker.
-pub(crate) type ActivityStore =
-    Arc<RankedMutex<HashMap<String, ProfileActivity>, { rank::ACTIVITY }>>;
+pub(crate) type ActivityStore = Arc<RankedMutex<HashMap<String, ProfileActivity>, rank::Activity>>;
 
 /// What's currently happening to one profile. `Idle` means no in-flight work;
 /// every other variant is a blocking op the overview row should visualize
