@@ -30,7 +30,9 @@ use ratatui::crossterm::event::{
 
 use super::{TICK, Term, app, render, restore_terminal, setup_terminal};
 use crate::profile::{AppConfig, AppState, Profile, home_dir, set_home_override};
-use crate::usage::{ExtraUsage, FetchStatus, PlanInfo, UsageInfo, UsageWindow};
+use crate::usage::{
+    ExtraUsage, FetchStatus, PlanInfo, ProfileActivity, UsageInfo, UsageWindow, now_ms,
+};
 
 // ── Launch ──────────────────────────────────────────────────────────────────
 
@@ -59,8 +61,10 @@ fn run(config: AppConfig) -> Result<()> {
 /// bootstrap/scheduler ever spawns.
 fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
     let mut application = app::App::new(config);
-    // Prime the usage stores so windows show simulated utilization, not `-`.
+    // Prime the usage stores so windows show simulated utilization, not `-`,
+    // and the timer stores so rows show a spinner / refresh countdown.
     seed_usage(&application);
+    seed_timers(&application);
     let mut last_tick = Instant::now();
 
     while !application.quit {
@@ -329,6 +333,27 @@ fn seed_usage(application: &app::App) {
     }
 }
 
+/// Seed the timer slot's two data sources so the overview shows a live spinner
+/// and refresh countdowns — exactly what a running scheduler would write. The
+/// slot renders a braille spinner when a profile's `activity` is anything but
+/// `Idle`, otherwise a `next_refresh_per_profile` countdown, otherwise blank.
+/// The demo never starts the scheduler (see the module header), so without this
+/// every row's slot stays empty and the feature is invisible in screenshots.
+///
+/// Both stores are leaf-rank mutexes touched in-memory only — no disk, no
+/// network. `personal` (the active profile) shows a Fetching spinner; the other
+/// OAuth profiles show staggered countdowns to their next fetch.
+fn seed_timers(application: &app::App) {
+    let now = now_ms();
+    if let Ok(mut next) = application.next_refresh_per_profile.lock() {
+        next.insert("work".to_string(), now + 43_000); // ~43s
+        next.insert("side-project".to_string(), now + 78_000); // ~78s
+    }
+    if let Ok(mut activity) = application.activity.lock() {
+        activity.insert("personal".to_string(), ProfileActivity::Fetching);
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -464,9 +489,25 @@ fn demo_data_drives_all_actions() {
 
     let mut app = app::App::new(demo_config());
     seed_usage(&app); // simulate a fetch so usage windows aren't blanked to `-`
+    seed_timers(&app); // light up the spinner + refresh countdowns in the timer slot
 
     // reconcile_startup is never called → no bootstrap, no scheduler, no fetch.
     assert!(!app.reconcile_done && !app.bootstrap_started);
+
+    // The timer slot has live sources: a spinner for the active profile and a
+    // countdown for an idle one. (Workers mutate these later; assert pre-drive.)
+    assert_eq!(
+        app.activity.lock().unwrap().get("personal").copied(),
+        Some(ProfileActivity::Fetching),
+        "active profile must show a spinner in the timer slot"
+    );
+    assert!(
+        app.next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key("work"),
+        "idle profiles must show a refresh countdown in the timer slot"
+    );
 
     // ── Tab navigation: ⇥ walks forward and wraps, ⇧⇥ walks back. ──
     use app::Tab;

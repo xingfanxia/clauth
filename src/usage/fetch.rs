@@ -200,12 +200,13 @@ pub(crate) fn write_disk_cache(name: &str, info: &UsageInfo) {
 }
 
 fn cache_path(profile_name: &str) -> Option<PathBuf> {
-    dirs::home_dir().map(|h| {
-        h.join(".clauth")
-            .join("profiles")
-            .join(profile_name)
-            .join("usage_cache.json")
-    })
+    // Route through `profile_dir` (override-aware `home_dir`) rather than raw
+    // `dirs::home_dir`, so the cache honors the test/showcase home override and
+    // never reads or writes the user's real `~/.clauth` under `#[cfg(test)]`.
+    // Same path in production, where the override is compiled out.
+    crate::profile::profile_dir(profile_name)
+        .ok()
+        .map(|p| p.join("usage_cache.json"))
 }
 
 pub(crate) fn now_ms() -> u64 {
