@@ -163,7 +163,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, _rx) = mpsc::channel();
 
-    let result = rotate_one(&config, "test-rotate-one-no-rt", &activity, &tx);
+    let result = rotate_one(&config, "test-rotate-one-no-rt", Some(&activity), &tx);
 
     assert!(
         !result,
@@ -262,8 +262,8 @@ fn switch_rotate_targets_only_active_and_target() {
 
     // Simulate the new switch logic: rotate active then target (dedup skipped
     // here since they differ), never the bystander.
-    rotate_one(&config, active_name, &activity, &tx);
-    rotate_one(&config, target_name, &activity, &tx);
+    rotate_one(&config, active_name, Some(&activity), &tx);
+    rotate_one(&config, target_name, Some(&activity), &tx);
 
     // All three should be Idle: active and target have no refresh token so
     // rotate_one short-circuits before stamping; bystander was never called.
@@ -429,9 +429,9 @@ fn switch_dedup_active_equals_target() {
     if let Some(ref a) = active
         && a != &target
     {
-        rotate_one(&config, a, &activity, &tx);
+        rotate_one(&config, a, Some(&activity), &tx);
     }
-    rotate_one(&config, &target, &activity, &tx);
+    rotate_one(&config, &target, Some(&activity), &tx);
 
     assert!(
         is_idle(&activity, name),
@@ -517,7 +517,7 @@ fn start_window_skips_when_live_session() {
         Arc::new(RankedMutex::new(std::collections::HashSet::new()));
     let (tx, _rx) = mpsc::channel();
 
-    let kicked = start_window(&config, name, &refetch, &activity, &tx);
+    let kicked = start_window(&config, name, Some(&refetch), Some(&activity), &tx);
 
     assert!(
         !kicked,

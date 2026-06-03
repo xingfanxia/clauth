@@ -1287,9 +1287,9 @@ fn perform_switch(app: &mut App, name: &str) {
             if let Some(ref active) = outgoing
                 && active != &target
             {
-                oauth::rotate_one(&config, active, &work_activity, &work_sender);
+                oauth::rotate_one(&config, active, Some(&work_activity), &work_sender);
             }
-            oauth::rotate_one(&config, &target, &work_activity, &work_sender);
+            oauth::rotate_one(&config, &target, Some(&work_activity), &work_sender);
             // Re-stamp Switching so the spinner stays up through the FS leg
             // the UI thread runs next (rotate_one leaves the slot as Idle).
             mark_activity(&work_activity, &target, ProfileActivity::Switching);
@@ -2621,8 +2621,8 @@ pub(crate) fn on_tick(app: &mut App) {
                 let _ = oauth::start_window(
                     &config,
                     &work_name,
-                    &refetch,
-                    &work_activity,
+                    Some(&refetch),
+                    Some(&work_activity),
                     &work_sender,
                 );
             },

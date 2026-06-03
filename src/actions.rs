@@ -20,7 +20,7 @@ use crate::profile::{
     AppConfig, ClaudeCredentials, Profile, profile_dir, save_app_state, save_profile,
 };
 use crate::spinner::Spinner;
-use crate::usage::{ActivityStore, OpResult, RefetchQueue};
+use crate::usage::OpResult;
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
@@ -91,12 +91,11 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     // refresh token on every switch is unnecessary and widens races with
     // the scheduler.
     let outgoing = config.state.active_profile.clone();
-    // No scheduler running — noop_refetch is a throwaway; start_window
-    // below still uses it to push kicked names no one reads.
-    let noop_refetch: RefetchQueue = Arc::new(RankedMutex::new(std::collections::HashSet::new()));
-    // CLI path has no spinner — pass a throwaway ActivityStore so the
-    // shared signature works without printing to stderr.
-    let noop_activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    // No scheduler running: pass `None` for the refetch queue and activity
+    // store side-channels (nothing drains the queue, no spinner to drive), so
+    // the CLI switch allocates no throwaway mutexes just to satisfy the shared
+    // `rotate_one` / `start_window` signatures.
+    //
     // CLI has no OpResult drain — drop the receiver immediately so
     // workers' `sender.send` returns disconnected-error which they
     // ignore (`let _ = …`). The Arc<Mutex<AppConfig>> wraps the
@@ -132,9 +131,9 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
             && active != canonical
             && !reconciled
         {
-            oauth::rotate_one(&config, active, &noop_activity, &op_sender);
+            oauth::rotate_one(&config, active, None, &op_sender);
         }
-        oauth::rotate_one(&config, canonical, &noop_activity, &op_sender);
+        oauth::rotate_one(&config, canonical, None, &op_sender);
     }
 
     // When the outgoing active profile has a diverged live credentials
@@ -177,13 +176,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     // from re-kicking inside the same window.
     {
         let _spinner = Spinner::start("clauth: priming usage window…");
-        let _ = oauth::start_window(
-            &config,
-            canonical,
-            &noop_refetch,
-            &noop_activity,
-            &op_sender,
-        );
+        let _ = oauth::start_window(&config, canonical, None, None, &op_sender);
     }
     println!("switched to '{canonical}'");
     Ok(())

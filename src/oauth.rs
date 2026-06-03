@@ -112,10 +112,14 @@ fn kick(access_token: &str) -> Result<()> {
 /// read/write windows around HTTP, not across the network round trip.
 /// Emits one `OpResult { kind: Refreshing }` on the supplied sender unless
 /// the profile is skipped (no refresh token / live session).
+///
+/// `activity` is the optional spinner side-channel: the scheduler/TUI pass
+/// `Some` to drive the overview spinner, the no-scheduler CLI switch passes
+/// `None` so it allocates no throwaway store.
 pub(crate) fn rotate_one(
     config: &crate::profile::ConfigHandle,
     name: &str,
-    activity: &ActivityStore,
+    activity: Option<&ActivityStore>,
     sender: &OpResultSender,
 ) -> bool {
     matches!(
@@ -167,7 +171,7 @@ enum RotateOutcome {
 fn rotate_one_inner(
     config: &crate::profile::ConfigHandle,
     name: &str,
-    activity: &ActivityStore,
+    activity: Option<&ActivityStore>,
     sender: &OpResultSender,
     force: bool,
     window_stamp: Option<(&LastRotatedWindow, i64)>,
@@ -184,7 +188,9 @@ fn rotate_one_inner(
             let rt = cfg
                 .find(name)
                 .and_then(|p| p.refresh_token().map(str::to_string));
-            if rt.is_some() {
+            if rt.is_some()
+                && let Some(activity) = activity
+            {
                 // Stamp Refreshing under the state lock so partition_due cannot
                 // observe this profile as Idle between the credential read and
                 // the HTTP call. Lock order (AppConfig → state → leaf) is preserved:
@@ -203,7 +209,9 @@ fn rotate_one_inner(
     let outcome =
         refresh(&rt).and_then(|tok| apply_rotated_tokens_locked(config, name, tok, window_stamp));
     let applied = outcome.is_ok();
-    clear_activity(activity, name);
+    if let Some(activity) = activity {
+        clear_activity(activity, name);
+    }
     let _ = sender.send(OpResult {
         name: name.to_string(),
         kind: ActivityKind::Refreshing,
@@ -237,7 +245,7 @@ pub(crate) fn rotate_one_for_window(
         rotate_one_inner(
             config,
             name,
-            activity,
+            Some(activity),
             sender,
             false,
             Some((lrw, resets_at))
@@ -330,7 +338,8 @@ pub(crate) fn refresh_all(
                 // bypasses the `has_live_session` SKIP (we still want to rotate
                 // the token) but NOT the mutual exclusion: a forced rotate must
                 // still not race a live session's own refresh of the same chain.
-                let outcome = rotate_one_inner(&config, &name, &activity, &sender, force, None);
+                let outcome =
+                    rotate_one_inner(&config, &name, Some(&activity), &sender, force, None);
                 (name, outcome)
             });
             (name_for_handle, h)
@@ -452,11 +461,17 @@ pub(crate) fn windowless_auto_start_candidates(
 /// Marks `AutoStarting`, sends one `OpResult`, and on a successful kick pushes
 /// `name` onto `refetch` so usage re-fetches and the freshly armed window shows
 /// up. Returns true iff the kick succeeded.
+///
+/// `refetch` and `activity` are the optional scheduler side-channels: the TUI
+/// passes `Some` to re-fetch usage and drive the spinner, the no-scheduler CLI
+/// switch passes `None` (nothing drains the refetch queue, no spinner) so it
+/// allocates no throwaway mutexes. Spends only the access token, so it still
+/// takes no `RotationGuard`.
 pub(crate) fn start_window(
     config: &crate::profile::ConfigHandle,
     name: &str,
-    refetch: &RefetchQueue,
-    activity: &ActivityStore,
+    refetch: Option<&RefetchQueue>,
+    activity: Option<&ActivityStore>,
     sender: &OpResultSender,
 ) -> bool {
     let access_token = {
@@ -491,16 +506,23 @@ pub(crate) fn start_window(
         }
     };
 
-    mark_activity(activity, name, ProfileActivity::AutoStarting);
+    if let Some(activity) = activity {
+        mark_activity(activity, name, ProfileActivity::AutoStarting);
+    }
     let outcome = kick(&access_token);
     let kicked = outcome.is_ok();
-    clear_activity(activity, name);
+    if let Some(activity) = activity {
+        clear_activity(activity, name);
+    }
     let _ = sender.send(OpResult {
         name: name.to_string(),
         kind: ActivityKind::AutoStarting,
         outcome,
     });
-    if kicked && let Ok(mut q) = refetch.lock() {
+    if kicked
+        && let Some(refetch) = refetch
+        && let Ok(mut q) = refetch.lock()
+    {
         q.insert(name.to_string());
     }
     kicked
