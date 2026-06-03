@@ -553,6 +553,39 @@ fn interval_for(
         .unwrap_or(NORMAL_INTERVAL_MS)
 }
 
+/// Which AIMD transition a fetch outcome maps to, computed from
+/// `(status, cache_hit, util_changed)` with no locks held. Resolving this
+/// before locking keeps the critical section in `update_learner` minimal and
+/// makes the five transitions auditable in one place.
+///
+/// Each variant corresponds 1:1 to an old `match status` arm; the locked
+/// region only reads/writes the shared maps, it no longer re-derives the
+/// branch from the inputs.
+enum LearnerSignal {
+    /// `RateLimited`: multiplicative bump-up, reset both counters, stamp 429.
+    RateLimit,
+    /// `Fresh` + server-cache hit: accumulate cache-hit count, jump above TTL
+    /// on the second consecutive hit.
+    CacheHit,
+    /// `Fresh` + genuinely-changed utilization: the recovery signal; accumulate
+    /// ok-count, `bump_down` on the second consecutive change.
+    Recovery,
+    /// Neutral: idle Fresh at >= TTL, Cached, or Failed. Leave every map alone.
+    Neutral,
+}
+
+impl LearnerSignal {
+    fn classify(status: FetchStatus, cache_hit: bool, util_changed: bool) -> Self {
+        match status {
+            FetchStatus::RateLimited => Self::RateLimit,
+            FetchStatus::Fresh if cache_hit => Self::CacheHit,
+            FetchStatus::Fresh if util_changed => Self::Recovery,
+            FetchStatus::Fresh => Self::Neutral,
+            FetchStatus::Cached | FetchStatus::Failed => Self::Neutral,
+        }
+    }
+}
+
 /// Update the AIMD learner maps for one profile based on the fetch outcome.
 /// Called from the scheduler thread; all four maps are shared with the main
 /// thread via `Arc<Mutex<...>>` and persisted to `AppState` on shutdown
@@ -587,6 +620,10 @@ fn update_learner(
 ) {
     let now = now_ms();
 
+    // Resolve the transition before taking any lock so the critical section
+    // below only touches the shared maps. Pure function of the fetch outcome.
+    let signal = LearnerSignal::classify(status, cache_hit, util_changed);
+
     let (Ok(mut learned_g), Ok(mut ok_g), Ok(mut ch_g), Ok(mut l429_g)) = (
         learned.lock(),
         ok_count.lock(),
@@ -617,8 +654,8 @@ fn update_learner(
         l429_g.remove(name);
     }
 
-    match status {
-        FetchStatus::RateLimited => {
+    match signal {
+        LearnerSignal::RateLimit => {
             let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
             learned_g.insert(name.to_string(), bump_up(current));
             ok_g.insert(name.to_string(), 0);
@@ -637,7 +674,7 @@ fn update_learner(
         // `ConsecutiveOk` is intentionally NOT reset here — cache hits are neutral
         // evidence about API health, so zeroing ok_count would discard post-429
         // recovery progress and require an extra bump_down cycle.
-        FetchStatus::Fresh if cache_hit => {
+        LearnerSignal::CacheHit => {
             let hits = ch_g.get(name).copied().unwrap_or(0) + 1;
             if hits >= 2 {
                 let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
@@ -661,7 +698,7 @@ fn update_learner(
         // burning tokens, so the interval can be tightened. Two consecutive
         // change-events fire `bump_down`. A real change also wipes the cache-hit
         // accumulator so it can't bridge across an intervening change.
-        FetchStatus::Fresh if util_changed => {
+        LearnerSignal::Recovery => {
             let count = ok_g.get(name).copied().unwrap_or(0) + 1;
             if count >= 2 {
                 let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
@@ -672,18 +709,17 @@ fn update_learner(
             }
             ch_g.insert(name.to_string(), 0);
         }
-        // Fresh, not a cache hit, unchanged utilization: an idle poll at
-        // elapsed >= TTL (the user simply isn't burning tokens). Neutral
-        // evidence — leave every counter and the learned interval untouched so
-        // the interval settles at its current value instead of oscillating.
-        // `ConsecutiveOk` is preserved (a real change later still counts toward
-        // recovery); `ch` is left alone (cache hits only accumulate at <TTL,
-        // which this arm never reaches).
-        FetchStatus::Fresh => {}
-        // Network failures and cache fallbacks neither confirm nor refute API
-        // health — leave the counters alone so a single blip doesn't wipe
-        // legitimate recovery progress accumulated from prior Fresh responses.
-        FetchStatus::Cached | FetchStatus::Failed => {}
+        // Neutral evidence, leave every counter and the learned interval
+        // untouched. Three origins collapse here:
+        // - Fresh, not a cache hit, unchanged utilization: an idle poll at
+        //   elapsed >= TTL (the user simply isn't burning tokens). The interval
+        //   settles at its current value instead of oscillating. `ConsecutiveOk`
+        //   is preserved (a real change later still counts toward recovery); `ch`
+        //   is left alone (cache hits only accumulate at <TTL, never reached here).
+        // - Cached / Failed: network failures and cache fallbacks neither confirm
+        //   nor refute API health, so a single blip doesn't wipe legitimate
+        //   recovery progress accumulated from prior Fresh responses.
+        LearnerSignal::Neutral => {}
     }
 }
 
