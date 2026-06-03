@@ -104,6 +104,29 @@ fn is_exhausted_from_store(name: &str, threshold: f64, store: &UsageStore) -> bo
     util >= threshold
 }
 
+/// Generic three-phase chain walk shared by [`next_target`] and
+/// [`next_auto_switch_target`]. Scans every other slot starting one after
+/// `idx` and wrapping. `skip_pred(i)` is true for slots to skip (the active
+/// profile, or a member with no resolvable profile); `accept_pred(i)` selects
+/// the first matching slot, whose index is returned.
+fn walk_chain(
+    idx: usize,
+    len: usize,
+    skip_pred: &dyn Fn(usize) -> bool,
+    accept_pred: &dyn Fn(usize) -> bool,
+) -> Option<usize> {
+    for offset in 1..=len {
+        let i = (idx + offset) % len;
+        if skip_pred(i) {
+            continue;
+        }
+        if accept_pred(i) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// Picks the next chain member to switch to, starting one slot after the
 /// active profile and wrapping. Returns None when nothing is viable.
 ///
@@ -122,20 +145,12 @@ pub(crate) fn next_target(config: &AppConfig) -> Option<SwitchAction> {
     let active_idx = chain.iter().position(|n| n == active)?;
     let len = chain.len();
 
+    let skip = |i: usize| chain[i] == active || config.find(&chain[i]).is_none();
     let walk = |accept: &dyn Fn(&Profile) -> bool| -> Option<String> {
-        for offset in 1..=len {
-            let candidate = &chain[(active_idx + offset) % len];
-            if candidate == active {
-                continue;
-            }
-            let Some(profile) = config.find(candidate) else {
-                continue;
-            };
-            if accept(profile) {
-                return Some(candidate.clone());
-            }
-        }
-        None
+        let pick = walk_chain(active_idx, len, &skip, &|i| {
+            config.find(&chain[i]).is_some_and(&accept)
+        });
+        pick.map(|i| chain[i].clone())
     };
 
     if let Some(name) = walk(&|p| !is_exhausted(p)) {
@@ -188,17 +203,10 @@ pub(crate) fn next_auto_switch_target(
         return None;
     }
 
+    let skip = |i: usize| snapshot.chain[i].name == active.name;
     let walk = |accept: &dyn Fn(&ChainMember) -> bool| -> Option<String> {
-        for offset in 1..=len {
-            let candidate = &snapshot.chain[(active_idx + offset) % len];
-            if candidate.name == active.name {
-                continue;
-            }
-            if accept(candidate) {
-                return Some(candidate.name.clone());
-            }
-        }
-        None
+        let pick = walk_chain(active_idx, len, &skip, &|i| accept(&snapshot.chain[i]));
+        pick.map(|i| snapshot.chain[i].name.clone())
     };
 
     if let Some(name) = walk(&|m| !is_exhausted_from_store(&m.name, m.threshold, store)) {
