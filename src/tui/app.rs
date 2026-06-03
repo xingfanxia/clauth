@@ -40,12 +40,13 @@ use crate::profile::{
 };
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, Last429At, LastFetchedAt,
-    LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult, OpResultReceiver,
-    OpResultSender, PendingAutoStart, PendingSwitch, PendingSwitchOff, PendingWindowRotation,
-    ProfileActivity, RefetchQueue, SERVER_CACHE_TTL_ESTIMATE_MS, StartupReceiver, StartupSender,
-    StartupSignal, StatusStore, TokenEntry, TokenList, UsageStore, any_busy, clear_activity,
-    default_fallback_threshold, fetch_all_into, is_idle, mark_activity, spawn_refresher,
+    ActivityKind, ActivityStore, ConsecutiveCacheHit, ConsecutiveOk, EpochMs, IntervalMs,
+    Last429At, LastFetchedAt, LastRotatedWindow, LearnedIntervals, NextRefreshPerProfile, OpResult,
+    OpResultReceiver, OpResultSender, PendingAutoStart, PendingSwitch, PendingSwitchOff,
+    PendingWindowRotation, ProfileActivity, RefetchQueue, SERVER_CACHE_TTL_ESTIMATE_MS,
+    StartupReceiver, StartupSender, StartupSignal, StatusStore, TokenEntry, TokenList, UsageStore,
+    any_busy, clear_activity, default_fallback_threshold, fetch_all_into, is_idle, mark_activity,
+    spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -538,8 +539,14 @@ impl App {
         let pending_switch_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
         // Restore AIMD state from disk so cadence survives restarts.
-        let learned_intervals: LearnedIntervals =
-            Arc::new(RankedMutex::new(config.state.learned_intervals_ms.clone()));
+        let learned_intervals: LearnedIntervals = Arc::new(RankedMutex::new(
+            config
+                .state
+                .learned_intervals_ms
+                .iter()
+                .map(|(name, &ms)| (name.clone(), IntervalMs::from_millis(ms)))
+                .collect(),
+        ));
         let ok_count: ConsecutiveOk =
             Arc::new(RankedMutex::new(config.state.consecutive_ok_count.clone()));
         // Restore cache-hit counters only when learned < TTL — above TTL the
@@ -561,7 +568,14 @@ impl App {
             .map(|(k, v)| (k.clone(), *v))
             .collect();
         let cache_hit_count: ConsecutiveCacheHit = Arc::new(RankedMutex::new(restored_ch));
-        let last_429: Last429At = Arc::new(RankedMutex::new(config.state.last_429_at.clone()));
+        let last_429: Last429At = Arc::new(RankedMutex::new(
+            config
+                .state
+                .last_429_at
+                .iter()
+                .map(|(name, &ms)| (name.clone(), EpochMs::from_millis(ms)))
+                .collect(),
+        ));
 
         // Kick the best-effort update check on its own thread; its verdict lands
         // in `update_results` and is toasted from `on_tick`.
@@ -2942,13 +2956,19 @@ pub(crate) fn shutdown(app: &mut App) -> Result<()> {
         let _ = snapshot_active_credentials(&mut cfg);
         // Flush AIMD learner state so cadence survives clean restarts.
         if let Ok(li) = app.learned_intervals.lock() {
-            cfg.state.learned_intervals_ms = li.clone();
+            cfg.state.learned_intervals_ms = li
+                .iter()
+                .map(|(name, interval)| (name.clone(), interval.as_millis()))
+                .collect();
         }
         if let Ok(ok) = app.ok_count.lock() {
             cfg.state.consecutive_ok_count = ok.clone();
         }
         if let Ok(l4) = app.last_429.lock() {
-            cfg.state.last_429_at = l4.clone();
+            cfg.state.last_429_at = l4
+                .iter()
+                .map(|(name, at)| (name.clone(), at.as_millis()))
+                .collect();
         }
         if let Ok(ch) = app.cache_hit_count.lock() {
             cfg.state.consecutive_cache_hit_count = ch.clone();

@@ -73,20 +73,73 @@ const _: () = assert!(
     "two bump_downs from NORMAL must stay at or above the server cache TTL, or the learner oscillates around TTL with a non-zero steady-state cache-hit rate",
 );
 
+/// A wall-clock instant in epoch-milliseconds (the unit produced by `now_ms`).
+/// Newtype so an epoch timestamp can never be confused with a duration in the
+/// learner arithmetic: subtracting two `EpochMs` yields an [`IntervalMs`], and
+/// the only way to get an `EpochMs` from a bare `u64` is the explicit
+/// constructor. `#[repr(transparent)]` so the on-disk `u64` representation and
+/// any `HashMap<String, u64>` round-trip is layout-identical.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub(crate) struct EpochMs(u64);
+
+/// A span of time in milliseconds — a learned refresh interval or any elapsed
+/// duration. Distinct from [`EpochMs`] so "instant" and "span" can't be mixed
+/// up. `#[repr(transparent)]` keeps it layout-identical to the persisted `u64`.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub(crate) struct IntervalMs(u64);
+
+impl EpochMs {
+    /// Wrap a raw epoch-ms count (e.g. a value loaded from disk).
+    pub(crate) const fn from_millis(ms: u64) -> Self {
+        Self(ms)
+    }
+
+    /// Raw epoch-ms count, for persistence and render-side countdown math.
+    pub(crate) const fn as_millis(self) -> u64 {
+        self.0
+    }
+
+    /// Duration elapsed since `earlier`, saturating at zero (instant − instant
+    /// = span). Returns an [`IntervalMs`] so the result can't be re-used as a
+    /// timestamp by accident.
+    pub(crate) const fn saturating_duration_since(self, earlier: EpochMs) -> IntervalMs {
+        IntervalMs(self.0.saturating_sub(earlier.0))
+    }
+
+    /// Instant `interval` after this one, saturating (instant + span = instant).
+    pub(crate) const fn saturating_add(self, interval: IntervalMs) -> EpochMs {
+        EpochMs(self.0.saturating_add(interval.0))
+    }
+}
+
+impl IntervalMs {
+    /// Wrap a raw millisecond span (a const interval or a value from disk).
+    pub(crate) const fn from_millis(ms: u64) -> Self {
+        Self(ms)
+    }
+
+    /// Raw millisecond span, for persistence and TTL comparisons.
+    pub(crate) const fn as_millis(self) -> u64 {
+        self.0
+    }
+}
+
 pub(crate) type UsageStore = Arc<RankedMutex<HashMap<String, UsageInfo>, { rank::USAGE_STORE }>>;
 pub(crate) type StatusStore =
     Arc<RankedMutex<HashMap<String, FetchStatus>, { rank::USAGE_STATUS }>>;
 pub(crate) type TokenList = Arc<RankedMutex<Vec<TokenEntry>, { rank::TOKENS }>>;
 
 /// Per-profile epoch-ms of the last fetch attempt (cache-rule gating).
-pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, u64>, { rank::LAST_FETCHED }>>;
+pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, EpochMs>, { rank::LAST_FETCHED }>>;
 
 /// Names pushed here after a successful token rotation are fetched on the very
 /// next scheduler tick, bypassing the per-profile cadence.
 pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, { rank::REFETCH_QUEUE }>>;
 
 /// Per-profile learned refresh interval in ms (AIMD cadence).
-pub(crate) type LearnedIntervals = Arc<RankedMutex<HashMap<String, u64>, { rank::LEARNED }>>;
+pub(crate) type LearnedIntervals = Arc<RankedMutex<HashMap<String, IntervalMs>, { rank::LEARNED }>>;
 
 /// How many consecutive non-429 fetches each profile has seen since the last backoff.
 pub(crate) type ConsecutiveOk = Arc<RankedMutex<HashMap<String, u32>, { rank::OK_COUNT }>>;
@@ -97,7 +150,7 @@ pub(crate) type ConsecutiveOk = Arc<RankedMutex<HashMap<String, u32>, { rank::OK
 pub(crate) type ConsecutiveCacheHit = Arc<RankedMutex<HashMap<String, u32>, { rank::CACHE_HIT }>>;
 
 /// Epoch-ms of the most recent 429 per profile. Used for quiet-period resets.
-pub(crate) type Last429At = Arc<RankedMutex<HashMap<String, u64>, { rank::LAST_429 }>>;
+pub(crate) type Last429At = Arc<RankedMutex<HashMap<String, EpochMs>, { rank::LAST_429 }>>;
 
 /// Profiles that need an auto-start kick after the fetch revealed no live 5h
 /// window. Main thread drains this set on every tick.
@@ -535,7 +588,7 @@ fn interval_for(
     entry: &TokenEntry,
     last_5h: Option<f64>,
     learned_intervals: &LearnedIntervals,
-) -> u64 {
+) -> IntervalMs {
     // Guard: only apply the near-threshold override when the threshold is
     // genuinely configured (> NEAR_THRESHOLD_MARGIN). Without this guard,
     // a zero/unset threshold (0.0) produces a negative RHS, making the
@@ -544,13 +597,24 @@ fn interval_for(
     let near = entry.fallback_threshold > NEAR_THRESHOLD_MARGIN
         && matches!(last_5h, Some(u) if u >= entry.fallback_threshold - NEAR_THRESHOLD_MARGIN);
     if near {
-        return LEARNED_FLOOR_MS;
+        return IntervalMs::from_millis(LEARNED_FLOOR_MS);
     }
     learned_intervals
         .lock()
         .ok()
         .and_then(|m| m.get(&entry.name).copied())
-        .unwrap_or(NORMAL_INTERVAL_MS)
+        .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
+}
+
+/// `interval_for` but returning a raw `u64` for the inline test module, which
+/// asserts against bare-`u64` cadence constants. Pure unwrap of the newtype.
+#[cfg(test)]
+fn interval_for_ms(
+    entry: &TokenEntry,
+    last_5h: Option<f64>,
+    learned_intervals: &LearnedIntervals,
+) -> u64 {
+    interval_for(entry, last_5h, learned_intervals).as_millis()
 }
 
 /// Which AIMD transition a fetch outcome maps to, computed from
@@ -618,7 +682,7 @@ fn update_learner(
     cache_hit_count: &ConsecutiveCacheHit,
     last_429: &Last429At,
 ) {
-    let now = now_ms();
+    let now = EpochMs::from_millis(now_ms());
 
     // Resolve the transition before taking any lock so the critical section
     // below only touches the shared maps. Pure function of the fetch outcome.
@@ -644,20 +708,31 @@ fn update_learner(
     // spuriously wipe legitimate 429 backoff.
     if matches!(status, FetchStatus::Fresh)
         && let Some(&t429) = l429_g.get(name)
-        && t429 != 0
-        && now.saturating_sub(t429) >= LEARNED_QUIET_RESET_MS
+        && t429 != EpochMs::from_millis(0)
+        && now.saturating_duration_since(t429).as_millis() >= LEARNED_QUIET_RESET_MS
     {
-        let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
+        let current = learned_g
+            .get(name)
+            .copied()
+            .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
+            .as_millis();
         if current > NORMAL_INTERVAL_MS {
-            learned_g.insert(name.to_string(), NORMAL_INTERVAL_MS);
+            learned_g.insert(
+                name.to_string(),
+                IntervalMs::from_millis(NORMAL_INTERVAL_MS),
+            );
         }
         l429_g.remove(name);
     }
 
     match signal {
         LearnerSignal::RateLimit => {
-            let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
-            learned_g.insert(name.to_string(), bump_up(current));
+            let current = learned_g
+                .get(name)
+                .copied()
+                .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
+                .as_millis();
+            learned_g.insert(name.to_string(), IntervalMs::from_millis(bump_up(current)));
             ok_g.insert(name.to_string(), 0);
             ch_g.insert(name.to_string(), 0);
             l429_g.insert(name.to_string(), now);
@@ -677,7 +752,11 @@ fn update_learner(
         LearnerSignal::CacheHit => {
             let hits = ch_g.get(name).copied().unwrap_or(0) + 1;
             if hits >= 2 {
-                let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
+                let current = learned_g
+                    .get(name)
+                    .copied()
+                    .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
+                    .as_millis();
                 // Jump strictly above the server-cache TTL so the next poll's elapsed
                 // >= TTL and detect_cache_hit returns false. Clamp to NORMAL so cache
                 // hits never push above the baseline. Never lower the interval here —
@@ -685,7 +764,7 @@ fn update_learner(
                 let target =
                     (SERVER_CACHE_TTL_ESTIMATE_MS + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS);
                 let bumped = current.max(target);
-                learned_g.insert(name.to_string(), bumped);
+                learned_g.insert(name.to_string(), IntervalMs::from_millis(bumped));
                 ch_g.insert(name.to_string(), 0);
                 // `ok_g` is deliberately left unchanged — only `RateLimited` resets
                 // ConsecutiveOk. Cache hits carry no information about API health.
@@ -701,8 +780,15 @@ fn update_learner(
         LearnerSignal::Recovery => {
             let count = ok_g.get(name).copied().unwrap_or(0) + 1;
             if count >= 2 {
-                let current = learned_g.get(name).copied().unwrap_or(NORMAL_INTERVAL_MS);
-                learned_g.insert(name.to_string(), bump_down(current));
+                let current = learned_g
+                    .get(name)
+                    .copied()
+                    .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
+                    .as_millis();
+                learned_g.insert(
+                    name.to_string(),
+                    IntervalMs::from_millis(bump_down(current)),
+                );
                 ok_g.insert(name.to_string(), 0);
             } else {
                 ok_g.insert(name.to_string(), count);
@@ -783,7 +869,7 @@ fn apply_outcome(
     // the same profile interleave, the second would otherwise read the
     // timestamp just written by the first → near-zero `elapsed_ms` → false
     // cache-hit → spurious upward bump.
-    let now = now_ms();
+    let now = EpochMs::from_millis(now_ms());
 
     let is_fresh = matches!(
         outcome.status,
@@ -815,14 +901,14 @@ fn apply_outcome(
     // Snapshot the previous `last_fetched` value BEFORE any write so
     // `elapsed_ms` is measured against the prior fetch, not the just-written
     // timestamp from an earlier call in the same concurrent batch.
-    let elapsed_ms: u64 = last_fetched
+    let elapsed_ms: IntervalMs = last_fetched
         .lock()
         .ok()
         .and_then(|m| m.get(&outcome.name).copied())
-        .map(|prev| now.saturating_sub(prev))
-        .unwrap_or(u64::MAX);
+        .map(|prev| now.saturating_duration_since(prev))
+        .unwrap_or(IntervalMs::from_millis(u64::MAX));
 
-    let cache_hit = detect_cache_hit(outcome.status, elapsed_ms, prev_util, new_util);
+    let cache_hit = detect_cache_hit(outcome.status, elapsed_ms.as_millis(), prev_util, new_util);
 
     // Recovery signal: the five-hour utilization genuinely moved since the last
     // stored value (beyond `CACHE_HIT_EPSILON`). Requires both a prior and a new
@@ -1323,6 +1409,7 @@ fn partition_due(
     learned: &LearnedIntervals,
     activity: &ActivityStore,
 ) -> (Vec<TokenEntry>, HashMap<String, u64>) {
+    let now = EpochMs::from_millis(now);
     let Ok(lf) = last_fetched.lock() else {
         return (Vec::new(), HashMap::new());
     };
@@ -1337,11 +1424,14 @@ fn partition_due(
     let mut due = Vec::new();
     let mut per_profile = HashMap::with_capacity(snapshot.len());
     for entry in snapshot {
-        let last = lf.get(&entry.name).copied().unwrap_or(0);
+        let last = lf
+            .get(&entry.name)
+            .copied()
+            .unwrap_or(EpochMs::from_millis(0));
         let last_5h = st.get(&entry.name).and_then(five_hour_utilization);
         let interval = interval_for(entry, last_5h, learned);
         let next = last.saturating_add(interval);
-        per_profile.insert(entry.name.clone(), next);
+        per_profile.insert(entry.name.clone(), next.as_millis());
         // Profiles mid-switch or mid-refresh are excluded from this tick's due
         // set so the scheduler can't race the switch worker on the same
         // TokenList write, and can't race `rotate_one` / `fetch_with_rotation`'s

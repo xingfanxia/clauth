@@ -3,12 +3,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::{
-    ActivityStore, CACHE_HIT_EPSILON, ConsecutiveCacheHit, ConsecutiveOk, FetchOutcome,
-    FetchStatus, LEARNED_CEILING_MS, LEARNED_FLOOR_MS, LEARNED_QUIET_RESET_MS, LEARNED_STEP_MS,
-    Last429At, LastFetchedAt, LearnedIntervals, NEAR_THRESHOLD_MARGIN, NORMAL_INTERVAL_MS,
-    ProfileActivity, SERVER_CACHE_TTL_ESTIMATE_MS, StatusStore, TokenEntry, UsageInfo, UsageStore,
-    UsageWindow, apply_outcome, bump_down, bump_up, detect_cache_hit, interval_for, now_ms,
-    partition_due, update_learner,
+    ActivityStore, CACHE_HIT_EPSILON, ConsecutiveCacheHit, ConsecutiveOk, EpochMs, FetchOutcome,
+    FetchStatus, IntervalMs, LEARNED_CEILING_MS, LEARNED_FLOOR_MS, LEARNED_QUIET_RESET_MS,
+    LEARNED_STEP_MS, Last429At, LastFetchedAt, LearnedIntervals, NEAR_THRESHOLD_MARGIN,
+    NORMAL_INTERVAL_MS, ProfileActivity, SERVER_CACHE_TTL_ESTIMATE_MS, StatusStore, TokenEntry,
+    UsageInfo, UsageStore, UsageWindow, apply_outcome, bump_down, bump_up, detect_cache_hit,
+    interval_for_ms, now_ms, partition_due, update_learner,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -230,7 +230,7 @@ fn rate_limited_bumps_up_stamps_429_and_resets_counters() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
     ok.lock().unwrap().insert("p".into(), 1);
     ch.lock().unwrap().insert("p".into(), 1);
 
@@ -245,7 +245,13 @@ fn rate_limited_bumps_up_stamps_429_and_resets_counters() {
         &l429,
     );
 
-    let result = learned.lock().unwrap().get("p").copied().unwrap();
+    let result = learned
+        .lock()
+        .unwrap()
+        .get("p")
+        .copied()
+        .unwrap()
+        .as_millis();
     assert!(
         result > NORMAL_INTERVAL_MS,
         "RateLimited must raise the learned interval",
@@ -265,7 +271,7 @@ fn rate_limited_at_ceiling_stays_pinned() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), LEARNED_CEILING_MS);
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_CEILING_MS));
 
     for _ in 0..10 {
         update_learner(
@@ -281,7 +287,13 @@ fn rate_limited_at_ceiling_stays_pinned() {
     }
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         LEARNED_CEILING_MS,
         "repeated RateLimited at CEILING must not drift down",
     );
@@ -301,7 +313,13 @@ fn rate_limited_without_prior_learned_uses_normal_as_baseline() {
         &l429,
     );
 
-    let result = learned.lock().unwrap().get("p").copied().unwrap();
+    let result = learned
+        .lock()
+        .unwrap()
+        .get("p")
+        .copied()
+        .unwrap()
+        .as_millis();
     let center = NORMAL_INTERVAL_MS * 3 / 2;
     let margin = center / 10;
     assert!(
@@ -339,7 +357,7 @@ fn two_genuine_fresh_trigger_bump_down() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
 
     update_learner(
         "p",
@@ -363,7 +381,13 @@ fn two_genuine_fresh_trigger_bump_down() {
     );
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         bump_down(NORMAL_INTERVAL_MS),
     );
     assert_eq!(ok.lock().unwrap().get("p").copied().unwrap(), 0);
@@ -393,7 +417,10 @@ fn fresh_no_change_resets_cache_hit_counter() {
 #[test]
 fn bump_down_at_floor_stays_at_floor() {
     let (learned, ok, ch, l429) = make_learner_maps();
-    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_FLOOR_MS));
 
     update_learner(
         "p",
@@ -417,7 +444,13 @@ fn bump_down_at_floor_stays_at_floor() {
     );
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         LEARNED_FLOOR_MS,
     );
 }
@@ -434,7 +467,7 @@ fn idle_unchanged_fresh_does_not_bump_down() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
 
     for _ in 0..10 {
         update_learner(
@@ -450,7 +483,13 @@ fn idle_unchanged_fresh_does_not_bump_down() {
     }
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         NORMAL_INTERVAL_MS,
         "idle Fresh (no cache hit, no util change) must never bump the interval",
     );
@@ -470,7 +509,7 @@ fn idle_unchanged_fresh_preserves_in_progress_recovery() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
 
     update_learner(
         "p",
@@ -513,7 +552,13 @@ fn idle_unchanged_fresh_preserves_in_progress_recovery() {
         &l429,
     );
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         bump_down(NORMAL_INTERVAL_MS),
     );
 }
@@ -528,7 +573,10 @@ fn two_cache_hits_at_floor_jump_above_server_cache_ttl() {
     // the very next poll's elapsed >= SERVER_CACHE_TTL_ESTIMATE_MS so
     // detect_cache_hit returns false. One pair is all it takes from FLOOR.
     let (learned, ok, ch, l429) = make_learner_maps();
-    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_FLOOR_MS));
 
     update_learner(
         "p",
@@ -541,7 +589,13 @@ fn two_cache_hits_at_floor_jump_above_server_cache_ttl() {
         &l429,
     );
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         LEARNED_FLOOR_MS,
         "first cache-hit must not bump",
     );
@@ -559,7 +613,13 @@ fn two_cache_hits_at_floor_jump_above_server_cache_ttl() {
     let target = (SERVER_CACHE_TTL_ESTIMATE_MS + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS);
     let expected = LEARNED_FLOOR_MS.max(target);
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         expected,
         "after one cache-hit pair the learned interval must jump to the convergence target",
     );
@@ -576,7 +636,10 @@ fn two_cache_hits_at_below_ttl_jump_to_convergence_target() {
     // jumps to the convergence target, not just one STEP at a time.
     let (learned, ok, ch, l429) = make_learner_maps();
     let start = 20_000u64; // below SERVER_CACHE_TTL_ESTIMATE_MS (25_000)
-    learned.lock().unwrap().insert("p".into(), start);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(start));
 
     update_learner(
         "p",
@@ -601,7 +664,13 @@ fn two_cache_hits_at_below_ttl_jump_to_convergence_target() {
 
     let target = (SERVER_CACHE_TTL_ESTIMATE_MS + LEARNED_STEP_MS).min(NORMAL_INTERVAL_MS);
     let expected = start.max(target);
-    let result = learned.lock().unwrap().get("p").copied().unwrap();
+    let result = learned
+        .lock()
+        .unwrap()
+        .get("p")
+        .copied()
+        .unwrap()
+        .as_millis();
     assert_eq!(result, expected);
     assert!(
         result > SERVER_CACHE_TTL_ESTIMATE_MS,
@@ -621,7 +690,7 @@ fn cache_hits_at_normal_stay_at_normal() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
 
     for _ in 0..6 {
         update_learner(
@@ -637,7 +706,13 @@ fn cache_hits_at_normal_stay_at_normal() {
     }
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         NORMAL_INTERVAL_MS,
     );
 }
@@ -649,7 +724,10 @@ fn cache_hit_then_change_event_resumes_recovery() {
     // second genuine Fresh triggers bump_down. The cache-hit does not interfere
     // with recovery because it no longer resets ConsecutiveOk.
     let (learned, ok, ch, l429) = make_learner_maps();
-    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_FLOOR_MS));
 
     update_learner(
         "p",
@@ -687,7 +765,13 @@ fn cache_hit_then_change_event_resumes_recovery() {
         &l429,
     );
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         bump_down(LEARNED_FLOOR_MS),
     );
 }
@@ -700,7 +784,7 @@ fn cached_does_not_touch_any_counter() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
     ok.lock().unwrap().insert("p".into(), 1);
     ch.lock().unwrap().insert("p".into(), 1);
 
@@ -716,7 +800,13 @@ fn cached_does_not_touch_any_counter() {
     );
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         NORMAL_INTERVAL_MS,
     );
     assert_eq!(ok.lock().unwrap().get("p").copied().unwrap(), 1);
@@ -729,7 +819,7 @@ fn failed_does_not_touch_any_counter() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
     ok.lock().unwrap().insert("p".into(), 1);
     ch.lock().unwrap().insert("p".into(), 1);
 
@@ -745,7 +835,13 @@ fn failed_does_not_touch_any_counter() {
     );
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         NORMAL_INTERVAL_MS,
     );
     assert_eq!(ok.lock().unwrap().get("p").copied().unwrap(), 1);
@@ -761,7 +857,7 @@ fn intermittent_failure_preserves_recovery_progress() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
 
     update_learner(
         "p",
@@ -795,7 +891,13 @@ fn intermittent_failure_preserves_recovery_progress() {
     );
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         bump_down(NORMAL_INTERVAL_MS),
     );
 }
@@ -808,9 +910,11 @@ fn quiet_reset_fires_on_fresh_after_window() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), LEARNED_CEILING_MS);
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_CEILING_MS));
     let stale = now_ms().saturating_sub(LEARNED_QUIET_RESET_MS + 1_000);
-    l429.lock().unwrap().insert("p".into(), stale);
+    l429.lock()
+        .unwrap()
+        .insert("p".into(), EpochMs::from_millis(stale));
 
     update_learner(
         "p",
@@ -824,7 +928,13 @@ fn quiet_reset_fires_on_fresh_after_window() {
     );
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         NORMAL_INTERVAL_MS,
     );
     assert!(
@@ -839,9 +949,11 @@ fn quiet_reset_does_not_fire_on_cached() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), LEARNED_CEILING_MS);
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_CEILING_MS));
     let stale = now_ms().saturating_sub(LEARNED_QUIET_RESET_MS + 1_000);
-    l429.lock().unwrap().insert("p".into(), stale);
+    l429.lock()
+        .unwrap()
+        .insert("p".into(), EpochMs::from_millis(stale));
 
     update_learner(
         "p",
@@ -855,7 +967,13 @@ fn quiet_reset_does_not_fire_on_cached() {
     );
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         LEARNED_CEILING_MS,
         "a 5-min network outage must not undo legitimate 429 backoff",
     );
@@ -868,9 +986,11 @@ fn quiet_reset_does_not_fire_on_failed() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), LEARNED_CEILING_MS);
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_CEILING_MS));
     let stale = now_ms().saturating_sub(LEARNED_QUIET_RESET_MS + 1_000);
-    l429.lock().unwrap().insert("p".into(), stale);
+    l429.lock()
+        .unwrap()
+        .insert("p".into(), EpochMs::from_millis(stale));
 
     update_learner(
         "p",
@@ -884,7 +1004,13 @@ fn quiet_reset_does_not_fire_on_failed() {
     );
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         LEARNED_CEILING_MS,
     );
     assert!(l429.lock().unwrap().contains_key("p"));
@@ -898,9 +1024,11 @@ fn quiet_reset_does_not_fire_on_rate_limited() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), LEARNED_CEILING_MS);
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_CEILING_MS));
     let stale = now_ms().saturating_sub(LEARNED_QUIET_RESET_MS + 1_000);
-    l429.lock().unwrap().insert("p".into(), stale);
+    l429.lock()
+        .unwrap()
+        .insert("p".into(), EpochMs::from_millis(stale));
 
     update_learner(
         "p",
@@ -914,10 +1042,16 @@ fn quiet_reset_does_not_fire_on_rate_limited() {
     );
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         LEARNED_CEILING_MS,
     );
-    let fresh_stamp = l429.lock().unwrap().get("p").copied().unwrap();
+    let fresh_stamp = l429.lock().unwrap().get("p").copied().unwrap().as_millis();
     assert!(
         fresh_stamp > stale,
         "RateLimited must overwrite the stale stamp with a current one",
@@ -930,9 +1064,11 @@ fn quiet_reset_does_not_fire_before_window_elapses() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), LEARNED_CEILING_MS);
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_CEILING_MS));
     let recent = now_ms().saturating_sub(1_000);
-    l429.lock().unwrap().insert("p".into(), recent);
+    l429.lock()
+        .unwrap()
+        .insert("p".into(), EpochMs::from_millis(recent));
 
     update_learner(
         "p",
@@ -946,7 +1082,13 @@ fn quiet_reset_does_not_fire_before_window_elapses() {
     );
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         LEARNED_CEILING_MS,
     );
     assert!(l429.lock().unwrap().contains_key("p"));
@@ -961,9 +1103,11 @@ fn quiet_reset_clears_stale_429_stamp_even_when_already_at_normal() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
     let stale = now_ms().saturating_sub(LEARNED_QUIET_RESET_MS + 1_000);
-    l429.lock().unwrap().insert("p".into(), stale);
+    l429.lock()
+        .unwrap()
+        .insert("p".into(), EpochMs::from_millis(stale));
 
     update_learner(
         "p",
@@ -977,7 +1121,13 @@ fn quiet_reset_clears_stale_429_stamp_even_when_already_at_normal() {
     );
 
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         NORMAL_INTERVAL_MS,
     );
     assert!(
@@ -992,7 +1142,7 @@ fn quiet_reset_without_429_stamp_is_noop() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), LEARNED_CEILING_MS);
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_CEILING_MS));
 
     update_learner(
         "p",
@@ -1007,7 +1157,13 @@ fn quiet_reset_without_429_stamp_is_noop() {
 
     // No 429 stamp → reset doesn't fire → learned untouched, Fresh arm runs.
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         LEARNED_CEILING_MS,
     );
     assert_eq!(ok.lock().unwrap().get("p").copied().unwrap(), 1);
@@ -1137,7 +1293,7 @@ fn interval_returns_normal_when_no_learned_entry() {
     let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let entry = token("p", 95.0);
     assert_eq!(
-        interval_for(&entry, Some(50.0), &learned),
+        interval_for_ms(&entry, Some(50.0), &learned),
         NORMAL_INTERVAL_MS,
     );
 }
@@ -1145,9 +1301,12 @@ fn interval_returns_normal_when_no_learned_entry() {
 #[test]
 fn interval_returns_learned_value_when_present() {
     let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
-    learned.lock().unwrap().insert("p".into(), 17_000);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(17_000));
     let entry = token("p", 95.0);
-    assert_eq!(interval_for(&entry, Some(50.0), &learned), 17_000);
+    assert_eq!(interval_for_ms(&entry, Some(50.0), &learned), 17_000);
 }
 
 #[test]
@@ -1156,16 +1315,22 @@ fn interval_clamps_to_floor_at_or_above_near_threshold() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), LEARNED_CEILING_MS);
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_CEILING_MS));
     let entry = token("p", 95.0);
 
     // At the boundary (threshold - margin) and above: clamp to FLOOR.
     assert_eq!(
-        interval_for(&entry, Some(95.0 - NEAR_THRESHOLD_MARGIN), &learned),
+        interval_for_ms(&entry, Some(95.0 - NEAR_THRESHOLD_MARGIN), &learned),
         LEARNED_FLOOR_MS,
     );
-    assert_eq!(interval_for(&entry, Some(94.9), &learned), LEARNED_FLOOR_MS);
-    assert_eq!(interval_for(&entry, Some(99.0), &learned), LEARNED_FLOOR_MS);
+    assert_eq!(
+        interval_for_ms(&entry, Some(94.9), &learned),
+        LEARNED_FLOOR_MS
+    );
+    assert_eq!(
+        interval_for_ms(&entry, Some(99.0), &learned),
+        LEARNED_FLOOR_MS
+    );
 }
 
 #[test]
@@ -1177,18 +1342,18 @@ fn interval_zero_threshold_is_not_floor_clamped() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
     let entry = token("p", 0.0);
     assert_eq!(
-        interval_for(&entry, Some(0.0), &learned),
+        interval_for_ms(&entry, Some(0.0), &learned),
         NORMAL_INTERVAL_MS
     );
     assert_eq!(
-        interval_for(&entry, Some(50.0), &learned),
+        interval_for_ms(&entry, Some(50.0), &learned),
         NORMAL_INTERVAL_MS
     );
     assert_eq!(
-        interval_for(&entry, Some(99.0), &learned),
+        interval_for_ms(&entry, Some(99.0), &learned),
         NORMAL_INTERVAL_MS
     );
 }
@@ -1196,18 +1361,24 @@ fn interval_zero_threshold_is_not_floor_clamped() {
 #[test]
 fn interval_just_below_near_threshold_returns_learned() {
     let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
-    learned.lock().unwrap().insert("p".into(), 17_000);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(17_000));
     let entry = token("p", 95.0);
     let just_below = 95.0 - NEAR_THRESHOLD_MARGIN - 0.1;
-    assert_eq!(interval_for(&entry, Some(just_below), &learned), 17_000);
+    assert_eq!(interval_for_ms(&entry, Some(just_below), &learned), 17_000);
 }
 
 #[test]
 fn interval_with_no_5h_data_returns_learned() {
     let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
-    learned.lock().unwrap().insert("p".into(), 17_000);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(17_000));
     let entry = token("p", 95.0);
-    assert_eq!(interval_for(&entry, None, &learned), 17_000);
+    assert_eq!(interval_for_ms(&entry, None, &learned), 17_000);
 }
 
 // ── interval_for: zero/unset threshold (H1 regression) ───────────────────────
@@ -1222,24 +1393,24 @@ fn interval_for_zero_threshold_is_not_clamped_to_floor() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
     let entry = token("p", 0.0);
 
     // At 0% utilization — should still use learned.
     assert_eq!(
-        interval_for(&entry, Some(0.0), &learned),
+        interval_for_ms(&entry, Some(0.0), &learned),
         NORMAL_INTERVAL_MS,
         "threshold 0.0 with util 0.0 must not pin to FLOOR",
     );
     // At 100% utilization — should still use learned (no configured threshold).
     assert_eq!(
-        interval_for(&entry, Some(100.0), &learned),
+        interval_for_ms(&entry, Some(100.0), &learned),
         NORMAL_INTERVAL_MS,
         "threshold 0.0 with util 100.0 must not pin to FLOOR",
     );
     // No utilization data — must use learned.
     assert_eq!(
-        interval_for(&entry, None, &learned),
+        interval_for_ms(&entry, None, &learned),
         NORMAL_INTERVAL_MS,
         "threshold 0.0 with no util must not pin to FLOOR",
     );
@@ -1250,19 +1421,22 @@ fn interval_for_threshold_below_margin_is_not_clamped_to_floor() {
     // A threshold just below NEAR_THRESHOLD_MARGIN (e.g. 4.9 with margin 5.0)
     // must not trigger the near-threshold override for any utilization.
     let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
-    learned.lock().unwrap().insert("p".into(), 17_000);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(17_000));
     let threshold_below_margin = NEAR_THRESHOLD_MARGIN - 0.1;
     let entry = token("p", threshold_below_margin);
 
     // Utilization at 100% (well above threshold) — override must not fire.
     assert_eq!(
-        interval_for(&entry, Some(100.0), &learned),
+        interval_for_ms(&entry, Some(100.0), &learned),
         17_000,
         "threshold below margin must not pin to FLOOR even at 100% util",
     );
     // Utilization at or above threshold.
     assert_eq!(
-        interval_for(&entry, Some(threshold_below_margin), &learned),
+        interval_for_ms(&entry, Some(threshold_below_margin), &learned),
         17_000,
         "threshold below margin must not pin to FLOOR at threshold util",
     );
@@ -1273,11 +1447,14 @@ fn interval_for_threshold_at_margin_is_not_clamped_to_floor() {
     // Threshold exactly equal to NEAR_THRESHOLD_MARGIN (5.0) — the guard is
     // `> NEAR_THRESHOLD_MARGIN` so equality must not trigger the override.
     let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
-    learned.lock().unwrap().insert("p".into(), 17_000);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(17_000));
     let entry = token("p", NEAR_THRESHOLD_MARGIN);
 
     assert_eq!(
-        interval_for(&entry, Some(100.0), &learned),
+        interval_for_ms(&entry, Some(100.0), &learned),
         17_000,
         "threshold == NEAR_THRESHOLD_MARGIN must not pin to FLOOR",
     );
@@ -1291,23 +1468,23 @@ fn interval_for_genuine_threshold_near_match_pins_to_floor() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), LEARNED_CEILING_MS);
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_CEILING_MS));
     let entry = token("p", 80.0);
 
     assert_eq!(
-        interval_for(&entry, Some(78.0), &learned),
+        interval_for_ms(&entry, Some(78.0), &learned),
         LEARNED_FLOOR_MS,
         "threshold 80 at 78% util must pin to FLOOR",
     );
     // At threshold itself.
     assert_eq!(
-        interval_for(&entry, Some(80.0), &learned),
+        interval_for_ms(&entry, Some(80.0), &learned),
         LEARNED_FLOOR_MS,
         "threshold 80 at 80% util must pin to FLOOR",
     );
     // Well below the margin — must use learned.
     assert_eq!(
-        interval_for(&entry, Some(74.9), &learned),
+        interval_for_ms(&entry, Some(74.9), &learned),
         LEARNED_CEILING_MS,
         "threshold 80 at 74.9% util is outside near margin, must use learned",
     );
@@ -1349,7 +1526,10 @@ fn partition_due_recent_fetch_is_not_due() {
     let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
     let now = now_ms();
-    last_fetched.lock().unwrap().insert("p".into(), now);
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert("p".into(), EpochMs::from_millis(now));
 
     let (due, per_profile) =
         partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
@@ -1372,7 +1552,7 @@ fn partition_due_interval_elapsed_is_due() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("p".into(), now - NORMAL_INTERVAL_MS);
+        .insert("p".into(), EpochMs::from_millis(now - NORMAL_INTERVAL_MS));
 
     let (due, _) = partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
@@ -1390,8 +1570,11 @@ fn partition_due_honors_learned_interval() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("p".into(), now - 15_000);
-    learned.lock().unwrap().insert("p".into(), 20_000);
+        .insert("p".into(), EpochMs::from_millis(now - 15_000));
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(20_000));
 
     let (due, per_profile) =
         partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
@@ -1412,10 +1595,10 @@ fn partition_due_near_threshold_overrides_learned_with_floor() {
     let learned: LearnedIntervals = Arc::new(RankedMutex::new(HashMap::new()));
     let activity = empty_activity();
     let now = now_ms();
-    last_fetched
-        .lock()
-        .unwrap()
-        .insert("p".into(), now - LEARNED_FLOOR_MS - 100);
+    last_fetched.lock().unwrap().insert(
+        "p".into(),
+        EpochMs::from_millis(now - LEARNED_FLOOR_MS - 100),
+    );
     // Util at 91% with threshold=95% → within the 5pp near margin.
     store.lock().unwrap().insert(
         "p".into(),
@@ -1425,7 +1608,7 @@ fn partition_due_near_threshold_overrides_learned_with_floor() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), LEARNED_CEILING_MS);
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_CEILING_MS));
 
     let (due, _) = partition_due(&snapshot, now, &store, &last_fetched, &learned, &activity);
 
@@ -1600,7 +1783,7 @@ fn apply_outcome_idle_at_normal_settles_without_oscillating() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
 
     // First Fresh seeds the store and stamps last_fetched.
     apply_outcome(
@@ -1621,7 +1804,7 @@ fn apply_outcome_idle_at_normal_settles_without_oscillating() {
         last_fetched
             .lock()
             .unwrap()
-            .insert("p".into(), now - NORMAL_INTERVAL_MS);
+            .insert("p".into(), EpochMs::from_millis(now - NORMAL_INTERVAL_MS));
 
         apply_outcome(
             outcome("p", FetchStatus::Fresh, 42.0),
@@ -1643,7 +1826,13 @@ fn apply_outcome_idle_at_normal_settles_without_oscillating() {
     );
     // The learned interval must remain pinned at NORMAL — idle is a no-op.
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         NORMAL_INTERVAL_MS,
         "an idle profile at NORMAL must settle, not walk its interval down",
     );
@@ -1654,7 +1843,10 @@ fn apply_outcome_rapid_poll_with_same_value_registers_cache_hit() {
     // Same-value Fresh inside the server cache window (e.g. polling at FLOOR)
     // is a true cache hit and must back off via the cache-hit arm.
     let (store, status, last_fetched, learned, ok, ch, l429) = apply_stores();
-    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_FLOOR_MS));
 
     apply_outcome(
         outcome("p", FetchStatus::Fresh, 42.0),
@@ -1669,7 +1861,10 @@ fn apply_outcome_rapid_poll_with_same_value_registers_cache_hit() {
 
     // Next poll lands well inside the cache window.
     let now = now_ms();
-    last_fetched.lock().unwrap().insert("p".into(), now - 1_000);
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert("p".into(), EpochMs::from_millis(now - 1_000));
 
     apply_outcome(
         outcome("p", FetchStatus::Fresh, 42.0),
@@ -1699,11 +1894,17 @@ fn apply_outcome_elapsed_uses_prior_last_fetched_not_just_written() {
     // the M5 single-snapshot fix, the second call would read the value the first
     // just wrote → near-zero elapsed → false cache-hit classification.
     let (store, status, last_fetched, learned, ok, ch, l429) = apply_stores();
-    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_FLOOR_MS));
 
     // Simulate a prior fetch well outside the cache window so elapsed is large.
     let prior = now_ms().saturating_sub(NORMAL_INTERVAL_MS);
-    last_fetched.lock().unwrap().insert("p".into(), prior);
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert("p".into(), EpochMs::from_millis(prior));
 
     // First call: elapsed ~ NORMAL_INTERVAL_MS → not a cache hit.
     apply_outcome(
@@ -1747,11 +1948,14 @@ fn apply_outcome_elapsed_uses_prior_last_fetched_not_just_written() {
     learned2
         .lock()
         .unwrap()
-        .insert("q".into(), LEARNED_FLOOR_MS);
+        .insert("q".into(), IntervalMs::from_millis(LEARNED_FLOOR_MS));
 
     // Seed with a timestamp that is OUTSIDE the server cache TTL.
     let old_ts = now_ms().saturating_sub(NORMAL_INTERVAL_MS);
-    last_fetched2.lock().unwrap().insert("q".into(), old_ts);
+    last_fetched2
+        .lock()
+        .unwrap()
+        .insert("q".into(), EpochMs::from_millis(old_ts));
 
     apply_outcome(
         outcome("q", FetchStatus::Fresh, 77.0),
@@ -1842,9 +2046,11 @@ fn quiet_reset_does_not_fire_when_last_429_at_is_zero() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), LEARNED_CEILING_MS);
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_CEILING_MS));
     // Explicitly insert 0 — simulates what happens when `now_ms()` fails.
-    l429.lock().unwrap().insert("p".into(), 0u64);
+    l429.lock()
+        .unwrap()
+        .insert("p".into(), EpochMs::from_millis(0u64));
 
     update_learner(
         "p",
@@ -1859,7 +2065,13 @@ fn quiet_reset_does_not_fire_when_last_429_at_is_zero() {
 
     // With the L1 fix, the reset must NOT fire — backoff must be preserved.
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         LEARNED_CEILING_MS,
         "quiet-period reset must not fire when last_429_at == 0",
     );
@@ -1873,7 +2085,10 @@ fn cache_hit_pair_does_not_reset_consecutive_ok() {
     // information about API health, so discarding recovery progress would force
     // an extra bump_down cycle after 429 backoff unwinds.
     let (learned, ok, ch, l429) = make_learner_maps();
-    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_FLOOR_MS));
     // Pre-load ok_count with 1 (first step of a recovery sequence).
     ok.lock().unwrap().insert("p".into(), 1);
 
@@ -1900,7 +2115,13 @@ fn cache_hit_pair_does_not_reset_consecutive_ok() {
     );
 
     // The cache-hit arm fired — interval must have been raised.
-    let result = learned.lock().unwrap().get("p").copied().unwrap();
+    let result = learned
+        .lock()
+        .unwrap()
+        .get("p")
+        .copied()
+        .unwrap()
+        .as_millis();
     assert!(
         result > LEARNED_FLOOR_MS,
         "cache-hit pair must raise the learned interval",
@@ -1981,7 +2202,10 @@ fn cache_hits_from_floor_exceed_server_cache_ttl_within_one_pair() {
     // Convergence guarantee: at most one pair needed from any starting point
     // at or below SERVER_CACHE_TTL_ESTIMATE_MS.
     let (learned, ok, ch, l429) = make_learner_maps();
-    learned.lock().unwrap().insert("p".into(), LEARNED_FLOOR_MS);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(LEARNED_FLOOR_MS));
     const {
         assert!(
             LEARNED_FLOOR_MS <= SERVER_CACHE_TTL_ESTIMATE_MS,
@@ -2010,7 +2234,13 @@ fn cache_hits_from_floor_exceed_server_cache_ttl_within_one_pair() {
         &l429,
     );
 
-    let result = learned.lock().unwrap().get("p").copied().unwrap();
+    let result = learned
+        .lock()
+        .unwrap()
+        .get("p")
+        .copied()
+        .unwrap()
+        .as_millis();
     assert!(
         result > SERVER_CACHE_TTL_ESTIMATE_MS,
         "after one cache-hit pair from FLOOR, learned ({result}ms) must exceed \
@@ -2026,7 +2256,10 @@ fn cache_hit_convergence_never_exceeds_normal() {
 
     // Start just below NORMAL to verify the NORMAL cap holds.
     let start = NORMAL_INTERVAL_MS - 1;
-    learned.lock().unwrap().insert("p".into(), start);
+    learned
+        .lock()
+        .unwrap()
+        .insert("p".into(), IntervalMs::from_millis(start));
 
     update_learner(
         "p",
@@ -2049,7 +2282,13 @@ fn cache_hit_convergence_never_exceeds_normal() {
         &l429,
     );
 
-    let result = learned.lock().unwrap().get("p").copied().unwrap();
+    let result = learned
+        .lock()
+        .unwrap()
+        .get("p")
+        .copied()
+        .unwrap()
+        .as_millis();
     assert!(
         result <= NORMAL_INTERVAL_MS,
         "cache-hit backoff must not exceed NORMAL_INTERVAL_MS (got {result}ms)",
@@ -2067,7 +2306,7 @@ fn cache_hit_backoff_does_not_lower_already_raised_interval() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
 
     update_learner(
         "p",
@@ -2092,7 +2331,13 @@ fn cache_hit_backoff_does_not_lower_already_raised_interval() {
 
     // Learned must not be lowered below NORMAL — it was already there.
     assert_eq!(
-        learned.lock().unwrap().get("p").copied().unwrap(),
+        learned
+            .lock()
+            .unwrap()
+            .get("p")
+            .copied()
+            .unwrap()
+            .as_millis(),
         NORMAL_INTERVAL_MS,
         "cache-hit arm must not lower an already-at-NORMAL learned interval",
     );
@@ -2124,7 +2369,7 @@ fn steady_state_no_cache_hits_under_normal_conditions() {
     learned
         .lock()
         .unwrap()
-        .insert("p".into(), NORMAL_INTERVAL_MS);
+        .insert("p".into(), IntervalMs::from_millis(NORMAL_INTERVAL_MS));
 
     // Two changed-util Fresh polls trigger one bump_down (ok_count 0→1→2→reset).
     update_learner(
@@ -2153,7 +2398,8 @@ fn steady_state_no_cache_hits_under_normal_conditions() {
         .unwrap()
         .get("p")
         .copied()
-        .unwrap_or(NORMAL_INTERVAL_MS);
+        .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
+        .as_millis();
 
     assert!(
         after_first_pair >= SERVER_CACHE_TTL_ESTIMATE_MS,
@@ -2187,7 +2433,8 @@ fn steady_state_no_cache_hits_under_normal_conditions() {
         .unwrap()
         .get("p")
         .copied()
-        .unwrap_or(NORMAL_INTERVAL_MS);
+        .unwrap_or(IntervalMs::from_millis(NORMAL_INTERVAL_MS))
+        .as_millis();
 
     // This is the load-bearing assertion: NORMAL - 2*STEP >= TTL.
     // With old constants: 20_000 < 25_000 → fails.
