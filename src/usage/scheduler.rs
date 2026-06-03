@@ -798,11 +798,19 @@ fn apply_outcome(
         (Some(a), Some(b)) if (a - b).abs() >= CACHE_HIT_EPSILON
     );
 
-    if let Ok(mut st) = status.lock() {
-        st.insert(outcome.name.clone(), outcome.status);
-    }
-    if let Ok(mut lf) = last_fetched.lock() {
-        lf.insert(outcome.name.clone(), now);
+    // Stamp last_fetched and status together, each in its own short critical
+    // section so only one leaf lock is held at a time (never two leaves at
+    // once). Acquired in ascending rank order LAST_FETCHED(200) <
+    // USAGE_STATUS(350) so the sequence stays consistent with the global order
+    // even if a future edit nests them. Both are released before
+    // `update_learner` takes LEARNED.
+    {
+        if let Ok(mut lf) = last_fetched.lock() {
+            lf.insert(outcome.name.clone(), now);
+        }
+        if let Ok(mut st) = status.lock() {
+            st.insert(outcome.name.clone(), outcome.status);
+        }
     }
     update_learner(
         &outcome.name,
