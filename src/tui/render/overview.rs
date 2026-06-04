@@ -57,7 +57,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(header).style(theme::base()), chunks[0]);
 
     let items = app.main_items();
-    let sel = app.main_cursor.min(items.len().saturating_sub(1));
+    let sel = app.profile_cursor.min(items.len().saturating_sub(1));
     let width = chunks[1].width;
     let rows: Vec<ListItem<'_>> = items
         .iter()

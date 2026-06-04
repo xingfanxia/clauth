@@ -31,11 +31,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// Account picker with a trailing `+ new` row. The cursor lands on `+ new`
-/// when `config_cursor` equals the account count.
+/// when `profile_cursor` equals the account count.
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     let cfg = app.config();
     let count = cfg.profiles.len();
-    let sel = app.config_cursor.min(count);
+    let sel = app.profile_cursor.min(count);
     draw_selector_list(frame, area, "accounts", focused, sel, |w| {
         let mut rows: Vec<_> = cfg
             .profiles
@@ -89,7 +89,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
         }
     };
     let cfg = app.config();
-    if app.config_cursor >= cfg.profiles.len() {
+    if app.profile_cursor >= cfg.profiles.len() {
         return Snap {
             title: "+ new account".to_string(),
             name: String::new(),
@@ -98,7 +98,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             auto_start: false,
         };
     }
-    match cfg.profiles.get(app.config_cursor) {
+    match cfg.profiles.get(app.profile_cursor) {
         Some(p) => Snap {
             title: p.name.to_string(),
             name: if with_text {

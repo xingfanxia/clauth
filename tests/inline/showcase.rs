@@ -561,10 +561,12 @@ fn demo_data_drives_all_actions() {
     );
 
     // ── Edit: Config → "side-project" → BaseUrl row → type a URL → ⏎ saves. ──
+    // Account selection is shared across tabs: the switch above left the cursor on
+    // "work" (1), so one ↓ reaches "side-project" (2).
     press(&mut app, KeyCode::Tab); // Overview → Usage
     press(&mut app, KeyCode::Tab); // Usage → Config
     assert_eq!(app.tab, Tab::Config);
-    press(&mut app, KeyCode::Down); // 0 → 1
+    assert_eq!(app.profile_cursor, 1, "cursor carried over from the switch");
     press(&mut app, KeyCode::Down); // 1 → 2 (side-project)
     press(&mut app, KeyCode::Enter); // focus the detail pane
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);

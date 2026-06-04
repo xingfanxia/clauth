@@ -1,8 +1,10 @@
 //! Application state, keymap, and tick logic.
 //!
 //! Layout invariants:
-//!   - The Overview menu is a read-only list of account rows; `main_cursor`
-//!     indexes it. Account creation and editing live on the Config tab.
+//!   - The Overview menu is a read-only list of account rows. A single shared
+//!     `profile_cursor` indexes the selected account on the Overview, Usage, and
+//!     Config tabs, so the highlight stays put across tab switches. Account
+//!     creation and editing live on the Config tab.
 //!   - The Config tab is master-detail: an account list (plus a `+ new` row)
 //!     and an inline detail editor (`config_draft`) — no popups for new / edit
 //!     / rename / delete.
@@ -405,12 +407,10 @@ pub(crate) struct App {
     pub(crate) tab: Tab,
     pub(crate) modals: Vec<Modal>,
 
-    /// Cursor into `main_items()` on the Overview tab (profiles + action rows).
-    pub(crate) main_cursor: usize,
-    /// Selected profile index on the Usage tab.
-    pub(crate) usage_cursor: usize,
-    /// Selected profile index on the Config tab's left pane.
-    pub(crate) config_cursor: usize,
+    /// Selected account index, shared across the Overview, Usage, and Config
+    /// tabs so the highlighted account stays put when you switch tabs. On the
+    /// Config tab it may also rest on the trailing `+ new` row (== profile_count).
+    pub(crate) profile_cursor: usize,
     /// Which Config pane has focus; gates whether ↑↓ walks profiles or actions.
     pub(crate) config_focus: ConfigFocus,
     /// Cursor into the detail rows on the Config tab's right pane.
@@ -550,9 +550,7 @@ impl App {
             refetch_queue,
             tab: Tab::Overview,
             modals: Vec::new(),
-            main_cursor: 0,
-            usage_cursor: 0,
-            config_cursor: 0,
+            profile_cursor: 0,
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
             fallback_focus: FallbackFocus::Chain,
@@ -831,13 +829,14 @@ impl App {
         self.config().profiles.get(idx).map(|p| p.name.to_string())
     }
 
-    pub(crate) fn clamp_main_cursor(&mut self) {
-        let len = self.config().profiles.len();
-        self.main_cursor = self.main_cursor.min(len.saturating_sub(1));
+    /// Clamp `profile_cursor` into the account range (`0..profile_count`).
+    pub(crate) fn clamp_profile_cursor(&mut self) {
+        let max = self.profile_count().saturating_sub(1);
+        self.profile_cursor = self.profile_cursor.min(max);
     }
 
     pub(crate) fn current_main_item(&self) -> Option<MainItemKind> {
-        self.main_items().get(self.main_cursor).copied()
+        self.main_items().get(self.profile_cursor).copied()
     }
 }
 
@@ -973,7 +972,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 let selected = {
                     let cfg = app.config();
                     cfg.profiles
-                        .get(app.usage_cursor)
+                        .get(app.profile_cursor)
                         .map(|p| (p.name.clone(), p.is_oauth()))
                 };
                 match selected {
@@ -1040,11 +1039,12 @@ fn switch_tab(app: &mut App, tab: Tab) {
     app.tab = tab;
     // Changing tabs drops any in-flight inline config edit.
     app.config_draft = None;
+    // The shared account cursor follows along; clamp it back into the account
+    // range so a Config `+ new` selection lands on a real account elsewhere.
+    app.clamp_profile_cursor();
     match tab {
-        Tab::Overview => app.clamp_main_cursor(),
-        Tab::Usage => app.usage_cursor = clamp_profile_cursor(app, app.usage_cursor),
+        Tab::Overview | Tab::Usage => {}
         Tab::Config => {
-            app.config_cursor = clamp_profile_cursor(app, app.config_cursor);
             app.config_focus = ConfigFocus::Profiles;
             app.config_action_cursor = 0;
         }
@@ -1058,17 +1058,22 @@ fn switch_tab(app: &mut App, tab: Tab) {
     }
 }
 
-/// Clamp a profile-index cursor to the current profile count.
-fn clamp_profile_cursor(app: &App, cursor: usize) -> usize {
-    cursor.min(app.profile_count().saturating_sub(1))
+/// Move `profile_cursor` by `delta`, wrapping within `0..len`. Shared by every
+/// tab; the caller passes the row count so Config can include its `+ new` row.
+fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
+    if len == 0 {
+        return;
+    }
+    app.profile_cursor = (app.profile_cursor as i32 + delta).rem_euclid(len as i32) as usize;
 }
 
 fn handle_overview_key(app: &mut App, key: KeyEvent) {
+    let count = app.profile_count();
     match key.code {
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
-        KeyCode::Up | KeyCode::Char('k') => step_main_cursor(app, -1),
-        KeyCode::Down | KeyCode::Char('j') => step_main_cursor(app, 1),
+        KeyCode::Up | KeyCode::Char('k') => step_profile_cursor(app, -1, count),
+        KeyCode::Down | KeyCode::Char('j') => step_profile_cursor(app, 1, count),
         KeyCode::Enter => activate_main_item(app),
         _ => {}
     }
@@ -1078,35 +1083,11 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
 /// editing lives on the Config tab and switching on the Overview tab.
 fn handle_usage_key(app: &mut App, key: KeyEvent) {
     let count = app.profile_count();
-    if count == 0 {
-        return;
-    }
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.usage_cursor = if app.usage_cursor == 0 {
-                count - 1
-            } else {
-                app.usage_cursor - 1
-            };
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.usage_cursor = if app.usage_cursor + 1 >= count {
-                0
-            } else {
-                app.usage_cursor + 1
-            };
-        }
+        KeyCode::Up | KeyCode::Char('k') => step_profile_cursor(app, -1, count),
+        KeyCode::Down | KeyCode::Char('j') => step_profile_cursor(app, 1, count),
         _ => {}
     }
-}
-
-/// Move the main cursor by one account, wrapping at both ends.
-fn step_main_cursor(app: &mut App, delta: i32) {
-    let len = app.config().profiles.len();
-    if len == 0 {
-        return;
-    }
-    app.main_cursor = (app.main_cursor as i32 + delta).rem_euclid(len as i32) as usize;
 }
 
 /// Ask to switch to the profile at `idx`. No-ops when already active; otherwise
@@ -1160,10 +1141,10 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         return;
     }
     // Cursor follows the moved row so the user can keep nudging it.
-    if delta < 0 && app.main_cursor > 0 {
-        app.main_cursor -= 1;
+    if delta < 0 && app.profile_cursor > 0 {
+        app.profile_cursor -= 1;
     } else if delta > 0 {
-        app.main_cursor += 1;
+        app.profile_cursor += 1;
     }
 }
 
@@ -1793,24 +1774,12 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
 fn handle_config_key(app: &mut App, key: KeyEvent) {
     // The selector has one row per account plus the trailing `+ new` row.
     let sel_len = app.profile_count() + 1;
-    app.config_cursor = app.config_cursor.min(sel_len - 1);
+    app.profile_cursor = app.profile_cursor.min(sel_len - 1);
 
     match app.config_focus {
         ConfigFocus::Profiles => match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.config_cursor = if app.config_cursor == 0 {
-                    sel_len - 1
-                } else {
-                    app.config_cursor - 1
-                };
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                app.config_cursor = if app.config_cursor + 1 >= sel_len {
-                    0
-                } else {
-                    app.config_cursor + 1
-                };
-            }
+            KeyCode::Up | KeyCode::Char('k') => step_profile_cursor(app, -1, sel_len),
+            KeyCode::Down | KeyCode::Char('j') => step_profile_cursor(app, 1, sel_len),
             KeyCode::Enter => enter_config_detail(app),
             _ => {}
         },
@@ -1854,7 +1823,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
 /// auto-start present only for OAuth accounts.
 pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     let cfg = app.config();
-    if app.config_cursor >= cfg.profiles.len() {
+    if app.profile_cursor >= cfg.profiles.len() {
         return vec![
             ConfigRow::Name,
             ConfigRow::BaseUrl,
@@ -1864,7 +1833,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     }
     let is_oauth = cfg
         .profiles
-        .get(app.config_cursor)
+        .get(app.profile_cursor)
         .map(|p| p.is_oauth())
         .unwrap_or(true);
     let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl, ConfigRow::ApiKey];
@@ -1878,9 +1847,9 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
 /// Drop focus into the detail pane, seeding a draft for the current selection.
 fn enter_config_detail(app: &mut App) {
     app.config_action_cursor = 0;
-    if app.config_cursor >= app.profile_count() {
+    if app.profile_cursor >= app.profile_count() {
         app.config_draft = Some(build_draft_new());
-    } else if let Some(name) = app.profile_name_at(app.config_cursor) {
+    } else if let Some(name) = app.profile_name_at(app.profile_cursor) {
         app.config_draft = Some(build_draft_existing(app, &name));
     } else {
         return;
@@ -1891,7 +1860,7 @@ fn enter_config_detail(app: &mut App) {
 /// Jump straight into the `+ new` create form from anywhere (the global `n`).
 fn start_new_account(app: &mut App) {
     switch_tab(app, Tab::Config);
-    app.config_cursor = app.profile_count();
+    app.profile_cursor = app.profile_count();
     app.config_action_cursor = 0;
     app.config_draft = Some(build_draft_new());
     app.config_focus = ConfigFocus::Actions;
@@ -2169,7 +2138,7 @@ fn commit_new_account(app: &mut App) {
                 .iter()
                 .position(|p| p.name == name)
                 .unwrap_or(0);
-            app.config_cursor = new_idx;
+            app.profile_cursor = new_idx;
             app.config_focus = ConfigFocus::Profiles;
             app.config_draft = None;
             app.toast(ToastKind::Success, format!("created '{name}'"));
@@ -2189,8 +2158,7 @@ fn perform_delete(app: &mut App, name: &str) {
             app.last_state_mtime = app_state_mtime();
             app.config_focus = ConfigFocus::Profiles;
             app.config_draft = None;
-            app.config_cursor = app.config_cursor.min(app.profile_count().saturating_sub(1));
-            app.clamp_main_cursor();
+            app.clamp_profile_cursor();
             app.toast(ToastKind::Success, format!("deleted '{name}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("delete failed: {e}")),
@@ -2518,7 +2486,7 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_op_results(app);
 
     if app.reload_if_state_changed() {
-        app.clamp_main_cursor();
+        app.clamp_profile_cursor();
     }
     app.apply_usage();
 

@@ -34,7 +34,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Length(SELECTOR_WIDTH), Constraint::Min(20)])
         .split(area);
 
-    draw_profile_selector(frame, cols[0], app, app.usage_cursor, true);
+    draw_profile_selector(frame, cols[0], app, app.profile_cursor, true);
     draw_usage_detail(frame, cols[1], app);
 }
 
@@ -42,7 +42,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cfg = app.config();
     let profile = cfg
         .profiles
-        .get(app.usage_cursor.min(cfg.profiles.len().saturating_sub(1)));
+        .get(app.profile_cursor.min(cfg.profiles.len().saturating_sub(1)));
 
     let title = profile.map(|p| p.name.as_str()).unwrap_or("usage");
     let block = section_box(title, false);
