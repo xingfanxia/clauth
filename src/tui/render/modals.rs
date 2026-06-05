@@ -55,7 +55,9 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
         Span::raw(" "),
         Span::styled(
             title.into().to_uppercase(),
-            theme::label().add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme::TEXT_DIM)
+                .add_modifier(Modifier::ITALIC),
         ),
         Span::raw(" "),
     ]);
@@ -70,10 +72,10 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
 
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let title = match state.on_confirm {
-        ConfirmAction::CaptureConflict(..) => "confirm · duplicate",
-        ConfirmAction::Switch(_) => "confirm · switch",
-        ConfirmAction::DiscardDivergence(_) => "confirm · discard new login",
-        ConfirmAction::RotateAll => "confirm · rotate all tokens",
+        ConfirmAction::CaptureConflict(..) => "CONFIRM",
+        ConfirmAction::Switch(_) => "CONFIRM",
+        ConfirmAction::DiscardDivergence(_) => "CONFIRM",
+        ConfirmAction::RotateAll => "CONFIRM",
     };
 
     let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(
@@ -104,8 +106,8 @@ fn choice_buttons(choice: bool) -> Line<'static> {
 fn modal_button(label: &str, focused: bool) -> Span<'static> {
     if focused {
         Span::styled(
-            label.to_string(),
-            Style::default().fg(theme::BG).bg(theme::TEXT).bold(),
+            format!("\u{2590}{label}\u{258c}"),
+            Style::default().fg(theme::BG).bg(theme::TEXT),
         )
     } else {
         Span::styled(label.to_string(), theme::dim())
@@ -136,7 +138,7 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
     for (i, option) in options.iter().enumerate() {
         let selected = i == cursor;
         let arrow = if selected {
-            Span::styled("\u{25b6} ", theme::orange())
+            Span::styled("\u{276f} ", theme::accent())
         } else {
             Span::raw("  ")
         };
@@ -159,7 +161,7 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
             .alignment(Alignment::Center),
     );
 
-    draw_modal(frame, area, "credentials · divergence", lines);
+    draw_modal(frame, area, "DIVERGENCE", lines);
 }
 
 fn divergence_option_text(option: DivergenceChoice, active: &str) -> (String, String) {
@@ -194,16 +196,11 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
         Line::from(""),
         modal_footer_hints(&[("⏎", "capture"), ("⎋", "cancel")]).alignment(Alignment::Center),
     ];
-    draw_modal(frame, area, "capture · new profile name", lines);
+    draw_modal(frame, area, "CAPTURE", lines);
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let title = match app.tab {
-        Tab::Overview => "help \u{00b7} overview",
-        Tab::Usage => "help \u{00b7} usage",
-        Tab::Config => "help \u{00b7} config",
-        Tab::Fallback => "help \u{00b7} fallback chain",
-    };
+    let title = "KEYS";
 
     let tab_specific: Vec<(&str, &[(&str, &str)])> = match app.tab {
         Tab::Overview => vec![(
@@ -267,7 +264,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from(Span::styled(title.to_string(), theme::label())),
+        Line::from(Span::styled(
+            title.to_uppercase(),
+            Style::default().fg(theme::TEXT_DIM),
+        )),
         Line::from(""),
     ];
     for (key, desc) in pairs {
@@ -286,7 +286,7 @@ fn help_row(key: &str, desc: &str) -> Line<'static> {
             format!("  {key}{}", " ".repeat(pad)),
             Style::default().fg(theme::ACCENT).bold(),
         ),
-        Span::styled(desc.to_string(), theme::dim()),
+        Span::styled(desc.to_string(), Style::default().fg(theme::TEXT)),
     ])
 }
 
