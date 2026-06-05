@@ -84,7 +84,7 @@ fn build_normal(app: &App, _avail: usize) -> Vec<Span<'static>> {
             spans.push(Span::styled(
                 label,
                 Style::default()
-                    .fg(theme::ACCENT)
+                    .fg(theme::accent_color())
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             ));
         } else {
@@ -112,7 +112,7 @@ fn build_overflow(app: &App) -> Vec<Span<'static>> {
     spans.push(Span::styled(
         label,
         Style::default()
-            .fg(theme::ACCENT)
+            .fg(theme::accent_color())
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
     ));
 
@@ -128,11 +128,11 @@ fn build_overflow(app: &App) -> Vec<Span<'static>> {
 /// (the standard inactive tab color).
 fn activity_color(activity: Option<ToastKind>) -> Color {
     match activity {
-        None => theme::TEXT_DIM,
-        Some(ToastKind::Success) => theme::SUCCESS,
-        Some(ToastKind::Danger) => theme::DANGER,
-        Some(ToastKind::Warning) => theme::WARNING,
-        Some(ToastKind::Info) => theme::TEXT,
+        None => theme::text_dim_color(),
+        Some(ToastKind::Success) => theme::success_color(),
+        Some(ToastKind::Danger) => theme::danger_color(),
+        Some(ToastKind::Warning) => theme::warning_color(),
+        Some(ToastKind::Info) => theme::text_color(),
     }
 }
 

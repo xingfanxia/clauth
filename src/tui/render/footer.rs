@@ -130,7 +130,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         spans.push(Span::styled(
             *key,
-            Style::default().fg(theme::ACCENT).bold(),
+            Style::default().fg(theme::accent_color()).bold(),
         ));
         spans.push(Span::styled(format!(" {label}"), theme::dim()));
     }
@@ -148,7 +148,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_alert(frame: &mut Frame<'_>, area: Rect, alert: &FooterAlert) {
     let FooterAlert::Warn(msg) = alert;
     let spans = vec![
-        Span::styled("! ", Style::default().fg(theme::WARNING)),
+        Span::styled("! ", Style::default().fg(theme::warning_color())),
         Span::styled(msg.as_str(), theme::dim()),
     ];
     frame.render_widget(

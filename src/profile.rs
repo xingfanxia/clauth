@@ -158,6 +158,15 @@ impl Profile {
     }
 }
 
+/// Theme tier stored in `profiles.toml`. Serialized as a lowercase string so
+/// the file stays human-readable: `theme = "full"` / `theme = "compatible"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ThemeName {
+    Full,
+    Compatible,
+}
+
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
 /// Credentials and endpoint config live in per-profile subdirectories.
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -174,6 +183,10 @@ pub(crate) struct AppState {
     /// credentials and unsets the active profile instead of staying put.
     #[serde(default)]
     pub(crate) wrap_off: bool,
+    /// Config-file theme override. CLI `--theme` flag takes priority; auto-
+    /// detect applies when this is `None` and no flag was passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) theme: Option<ThemeName>,
 }
 
 pub(crate) struct AppConfig {

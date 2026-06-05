@@ -164,14 +164,14 @@ fn draw_settings_rows(
     let (type_value, type_style) = if is_api {
         ("API", theme::accent())
     } else {
-        ("OAuthed", Style::default().fg(theme::ACCENT_2))
+        ("OAuthed", Style::default().fg(theme::accent_2_color()))
     };
 
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(vec![
             Span::styled(
                 format!("type{}", " ".repeat(KEY_W - 4)),
-                Style::default().fg(theme::TEXT),
+                Style::default().fg(theme::text_color()),
             ),
             Span::styled(type_value, type_style),
         ]),
@@ -267,9 +267,9 @@ fn detail_row(
         ConfigRow::ApiKey => kv_field(arrow, "api key", key_in, editing),
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
-                ("on".to_string(), theme::accent())
+                (theme::toggle_on().to_string(), theme::accent())
             } else {
-                ("off".to_string(), theme::faint())
+                (theme::toggle_off().to_string(), theme::faint())
             };
             kv_static(arrow, "auto-start", value, style)
         }
@@ -293,7 +293,7 @@ fn kv_field(arrow: Span<'static>, key: &str, input: &InputState, editing: bool) 
         arrow,
         Span::styled(
             format!("{key}{}", " ".repeat(pad)),
-            Style::default().fg(theme::TEXT),
+            Style::default().fg(theme::text_color()),
         ),
     ];
     spans.extend(value_spans(input, editing));
@@ -306,7 +306,7 @@ fn kv_static(arrow: Span<'static>, key: &str, value: String, value_style: Style)
         arrow,
         Span::styled(
             format!("{key}{}", " ".repeat(pad)),
-            Style::default().fg(theme::TEXT),
+            Style::default().fg(theme::text_color()),
         ),
         Span::styled(value, value_style),
     ])
@@ -321,6 +321,8 @@ fn value_spans(input: &InputState, editing: bool) -> Vec<Span<'static>> {
     }
     // In edit mode the terminal cursor (set via frame.set_cursor_position) owns
     // the caret glyph — no simulated block highlight needed.
-    let body = Style::default().fg(theme::TEXT).bg(theme::BG_SUNKEN);
+    let body = Style::default()
+        .fg(theme::text_color())
+        .bg(theme::bg_sunken());
     vec![Span::styled(input.value.clone(), body)]
 }

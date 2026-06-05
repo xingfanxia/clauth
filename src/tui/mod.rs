@@ -3,7 +3,7 @@
 
 mod app;
 mod render;
-mod theme;
+pub(crate) mod theme;
 
 use std::io;
 use std::time::{Duration, Instant};

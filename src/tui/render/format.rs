@@ -38,16 +38,16 @@ pub(super) fn fixed_split(value: &str, width: usize) -> (String, String) {
 }
 
 pub(super) fn name_style(profile: &Profile) -> Style {
-    let base = Style::default().fg(theme::TEXT);
+    let base = Style::default().fg(theme::text_color());
     if !profile.is_oauth() {
         return base;
     }
     match profile.fetch_status {
         Some(FetchStatus::Cached) => base
-            .underline_color(theme::WARNING)
+            .underline_color(theme::warning_color())
             .add_modifier(Modifier::UNDERLINED),
         Some(FetchStatus::Failed) => base
-            .underline_color(theme::DANGER)
+            .underline_color(theme::danger_color())
             .add_modifier(Modifier::UNDERLINED),
         _ => base,
     }
@@ -122,11 +122,11 @@ pub(super) fn window_summary_parts(
 /// Green/yellow/red headroom against a member's threshold (crossing = rotate).
 pub(super) fn health_color(pct: f64, threshold: f64) -> ratatui::style::Color {
     if pct >= threshold {
-        theme::DANGER
+        theme::danger_color()
     } else if pct >= threshold * 0.8 {
-        theme::WARNING
+        theme::warning_color()
     } else {
-        theme::SUCCESS
+        theme::success_color()
     }
 }
 

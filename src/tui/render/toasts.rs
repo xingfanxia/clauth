@@ -39,17 +39,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     for toast in &toasts {
         let color = match toast.kind {
-            ToastKind::Info => theme::INFO,
-            ToastKind::Success => theme::SUCCESS,
-            ToastKind::Warning => theme::WARNING,
-            ToastKind::Danger => theme::DANGER,
+            ToastKind::Info => theme::info_color(),
+            ToastKind::Success => theme::success_color(),
+            ToastKind::Warning => theme::warning_color(),
+            ToastKind::Danger => theme::danger_color(),
         };
-        let bar_style = Style::default().fg(color).bg(theme::BG_SUNKEN);
+        let bar_style = Style::default().fg(color).bg(theme::bg_sunken());
         let title_style = Style::default()
-            .fg(theme::TEXT)
-            .bg(theme::BG_SUNKEN)
+            .fg(theme::text_color())
+            .bg(theme::bg_sunken())
             .add_modifier(Modifier::BOLD);
-        let detail_style = Style::default().fg(theme::TEXT_DIM).bg(theme::BG_SUNKEN);
+        let detail_style = Style::default()
+            .fg(theme::text_dim_color())
+            .bg(theme::bg_sunken());
 
         let mut lines_iter = toast.body.lines();
         let first = lines_iter.next().unwrap_or("");
@@ -76,7 +78,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         if fits_in(area, rect) {
             frame.render_widget(Clear, rect);
             frame.render_widget(
-                Paragraph::new(render_lines).style(Style::default().bg(theme::BG_SUNKEN)),
+                Paragraph::new(render_lines).style(Style::default().bg(theme::bg_sunken())),
                 rect,
             );
         }

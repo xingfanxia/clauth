@@ -337,7 +337,9 @@ fn detail_row(
 fn value_caret(input: &InputState) -> Vec<Span<'static>> {
     // The terminal cursor (set via frame.set_cursor_position) owns the caret
     // glyph — render the whole buffer with uniform body styling.
-    let body = Style::default().fg(theme::TEXT).bg(theme::BG_SUNKEN);
+    let body = Style::default()
+        .fg(theme::text_color())
+        .bg(theme::bg_sunken());
     vec![Span::styled(input.value.clone(), body)]
 }
 
@@ -417,8 +419,8 @@ fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static
     });
     let fill_color = match (pct, threshold) {
         (Some(v), Some(t)) => health_color(v, t),
-        (Some(_), None) => theme::ACCENT,
-        _ => theme::TEXT_FAINT,
+        (Some(_), None) => theme::accent_color(),
+        _ => theme::text_faint_color(),
     };
 
     let mut spans = vec![];

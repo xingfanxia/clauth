@@ -58,7 +58,7 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
         Span::styled(
             title.into().to_uppercase(),
             Style::default()
-                .fg(theme::TEXT_DIM)
+                .fg(theme::text_dim_color())
                 .add_modifier(Modifier::ITALIC),
         ),
         Span::raw(" "),
@@ -66,7 +66,7 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
-        .border_style(Style::default().fg(theme::ACCENT_2))
+        .border_style(Style::default().fg(theme::accent_2_color()))
         .title(title_line)
         .style(theme::base())
         .padding(Padding::new(2, 2, 1, 1))
@@ -109,7 +109,7 @@ fn modal_button(label: &str, focused: bool) -> Span<'static> {
     if focused {
         Span::styled(
             format!("\u{2590}{label}\u{258c}"),
-            Style::default().fg(theme::BG).bg(theme::TEXT),
+            Style::default().fg(theme::bg()).bg(theme::text_color()),
         )
     } else {
         Span::styled(label.to_string(), theme::dim())
@@ -126,7 +126,7 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
             Span::styled(" no longer points to ", theme::dim()),
             Span::styled(
                 format!("'{}'", form.active),
-                Style::default().fg(theme::ACCENT),
+                Style::default().fg(theme::accent_color()),
             ),
             Span::styled(".", theme::dim()),
         ]),
@@ -296,7 +296,7 @@ fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(
             title.to_uppercase(),
-            Style::default().fg(theme::TEXT_DIM),
+            Style::default().fg(theme::text_dim_color()),
         )),
         Line::from(""),
     ];
@@ -314,9 +314,9 @@ fn help_row(key: &str, desc: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("  {key}{}", " ".repeat(pad)),
-            Style::default().fg(theme::ACCENT).bold(),
+            Style::default().fg(theme::accent_color()).bold(),
         ),
-        Span::styled(desc.to_string(), Style::default().fg(theme::TEXT)),
+        Span::styled(desc.to_string(), Style::default().fg(theme::text_color())),
     ])
 }
 
@@ -328,7 +328,7 @@ fn modal_footer_hints(hints: &[(&str, &str)]) -> Line<'static> {
         }
         spans.push(Span::styled(
             (*key).to_string(),
-            Style::default().fg(theme::ACCENT).bold(),
+            Style::default().fg(theme::accent_color()).bold(),
         ));
         spans.push(Span::styled(format!(" {label}"), theme::dim()));
     }
@@ -339,9 +339,11 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
     // When focused the native terminal cursor owns the caret — no block highlight.
     // Unfocused fields still render with plain text styling (no BG_SUNKEN tint).
     let value_style = if focused {
-        Style::default().fg(theme::TEXT).bg(theme::BG_SUNKEN)
+        Style::default()
+            .fg(theme::text_color())
+            .bg(theme::bg_sunken())
     } else {
-        Style::default().fg(theme::TEXT)
+        Style::default().fg(theme::text_color())
     };
     Line::from(vec![
         Span::styled(label.to_string(), theme::label()),
@@ -402,17 +404,17 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         };
 
         let label_style = if focused {
-            Style::default().fg(theme::TEXT).bold()
+            Style::default().fg(theme::text_color()).bold()
         } else {
-            Style::default().fg(theme::TEXT)
+            Style::default().fg(theme::text_color())
         };
         let row_bg = if focused {
-            Style::default().bg(theme::BG_HOVER)
+            Style::default().bg(theme::bg_hover())
         } else {
             theme::base()
         };
         let glyph = if focused {
-            Span::styled("❯ ", Style::default().fg(theme::ACCENT).bold())
+            Span::styled("❯ ", Style::default().fg(theme::accent_color()).bold())
         } else {
             Span::styled("  ", Style::default())
         };
@@ -424,8 +426,11 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
             .saturating_sub(HOTKEY_W);
         let padding = Span::styled(" ".repeat(pad as usize), Style::default());
         let hotkey_span = match item.hotkey {
-            Some(c) => Span::styled(c.to_string(), Style::default().fg(theme::TEXT_DIM)),
-            None => Span::styled(" ".to_string(), Style::default().fg(theme::TEXT_DIM)),
+            Some(c) => Span::styled(c.to_string(), Style::default().fg(theme::text_dim_color())),
+            None => Span::styled(
+                " ".to_string(),
+                Style::default().fg(theme::text_dim_color()),
+            ),
         };
         let line = Line::from(vec![
             glyph,

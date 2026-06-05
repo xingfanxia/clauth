@@ -230,7 +230,7 @@ fn render_overview_row(
     let name = Span::styled(
         name_text,
         if active {
-            name_style(profile).fg(theme::ACCENT_2)
+            name_style(profile).fg(theme::accent_2_color())
         } else {
             name_style(profile)
         },
@@ -416,7 +416,7 @@ fn chain_row(
     };
     // Color carries active state — no glyph needed.
     let name_style = if active {
-        Style::default().fg(theme::ACCENT_2)
+        Style::default().fg(theme::accent_2_color())
     } else {
         theme::dim()
     };
@@ -467,7 +467,7 @@ fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
         .min(GAUGE_W);
     let fill_color = pct
         .map(|v| health_color(v, threshold))
-        .unwrap_or(theme::TEXT_FAINT);
+        .unwrap_or(theme::text_faint_color());
 
     (0..GAUGE_W)
         .map(|i| {

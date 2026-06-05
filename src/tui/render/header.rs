@@ -40,7 +40,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Pad between brand and version so the version sits flush at the right edge.
     let gap = info_width.saturating_sub(brand.len() + ver.len());
     let title = Line::from(vec![
-        Span::styled(brand, Style::default().fg(theme::ACCENT_2).bold()),
+        Span::styled(brand, Style::default().fg(theme::accent_2_color()).bold()),
         Span::styled(" ".repeat(gap), theme::base()),
         Span::styled(ver, theme::dim()),
     ]);
@@ -63,7 +63,7 @@ fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let elapsed = app.started_at.elapsed().as_millis() as u64;
     let blink = (elapsed % 6000) < 200;
 
-    let style = Style::default().fg(theme::ACCENT_2);
+    let style = Style::default().fg(theme::accent_2_color());
 
     let logo_top = if blink {
         " ▐█████▌ "

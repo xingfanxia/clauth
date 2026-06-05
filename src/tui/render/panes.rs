@@ -53,9 +53,9 @@ pub(super) fn select_line(
 /// Orange for the active profile, plain text otherwise.
 pub(super) fn name_color(active: bool) -> Style {
     if active {
-        Style::default().fg(theme::ACCENT_2)
+        Style::default().fg(theme::accent_2_color())
     } else {
-        Style::default().fg(theme::TEXT)
+        Style::default().fg(theme::text_color())
     }
 }
 
@@ -90,7 +90,7 @@ pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'
         Block::default()
             .borders(Borders::ALL)
             .border_set(border::ROUNDED)
-            .border_style(Style::default().fg(theme::LINE)),
+            .border_style(Style::default().fg(theme::line_color())),
     )
     .style(theme::base())
     .wrap(Wrap { trim: false })
@@ -132,10 +132,10 @@ pub(super) fn draw_scrollbar(
         if let Some(cell) = cell {
             if row >= thumb_top && row < thumb_end {
                 cell.set_symbol("█");
-                cell.set_style(Style::default().fg(theme::TEXT_DIM));
+                cell.set_style(Style::default().fg(theme::text_dim_color()));
             } else {
                 cell.set_symbol("░");
-                cell.set_style(Style::default().fg(theme::LINE));
+                cell.set_style(Style::default().fg(theme::line_color()));
             }
         }
     }
@@ -178,14 +178,14 @@ pub(super) fn draw_selector_list(
 /// Color: `ACCENT_2` for the first bordered panel on the screen body, `TEXT_DIM` for the rest.
 pub(super) fn section_box(title: &str, focused: bool, first: bool) -> Block<'static> {
     let border_style = if focused {
-        Style::default().fg(theme::LINE_STRONG)
+        Style::default().fg(theme::line_strong_color())
     } else {
-        Style::default().fg(theme::LINE)
+        Style::default().fg(theme::line_color())
     };
     let title_color = if first {
-        theme::ACCENT_2
+        theme::accent_2_color()
     } else {
-        theme::TEXT_DIM
+        theme::text_dim_color()
     };
     let title_style = {
         let base = Style::default()
