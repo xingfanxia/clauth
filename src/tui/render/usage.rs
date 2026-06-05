@@ -81,7 +81,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn build_usage_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.extend(header_lines(profile, header));
+    lines.extend(header_lines(profile, inner_w, header));
     lines.push(Line::from(""));
 
     if !profile.is_oauth() {
@@ -223,7 +223,7 @@ fn bar_width_for(inner_w: u16, max_trailing: usize) -> usize {
     }
 }
 
-fn header_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
+fn header_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Line<'static>> {
     let plan = profile
         .usage
         .as_ref()
@@ -236,9 +236,15 @@ fn header_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
                 "api".into()
             }
         });
-    let mut plan_spans = vec![key_span("plan"), Span::styled(plan, theme::body())];
+    let mut plan_spans = vec![key_span("plan"), Span::styled(plan.clone(), theme::body())];
     if header.is_active {
-        plan_spans.push(Span::raw("   "));
+        // "● active" = 8 chars; left side = KEY_W + plan chars; pad the gap.
+        let left_w = KEY_W + plan.chars().count();
+        let indicator_w = "● active".chars().count(); // 8
+        let pad = (inner_w as usize)
+            .saturating_sub(left_w)
+            .saturating_sub(indicator_w);
+        plan_spans.push(Span::raw(" ".repeat(pad)));
         plan_spans.push(Span::styled("●", theme::success()));
         plan_spans.push(Span::styled(" active", theme::dim()));
     }

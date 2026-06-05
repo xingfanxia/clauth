@@ -380,8 +380,8 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     let w = (content_w + 6)
         .max(title.chars().count() as u16 + 4)
         .min(area.width.saturating_sub(4));
-    // items rows + 1 blank separator + 1 hint row + 4 chrome (border + padding)
-    let h = (state.items.len() as u16 + 2 + 4).min(area.height.saturating_sub(4));
+    // items rows + 4 chrome (border + padding)
+    let h = (state.items.len() as u16 + 4).min(area.height.saturating_sub(4));
 
     let rect = centered(area, w, h);
     frame.render_widget(Clear, rect);
@@ -440,22 +440,5 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         ])
         .style(row_bg);
         frame.render_widget(Paragraph::new(line).style(row_bg), row_area);
-    }
-
-    // Footer hint — placed one row after the last item (blank separator + hint).
-    let hint_y = inner.y + state.items.len() as u16 + 1;
-    if hint_y < inner.y + inner.height {
-        let hint_area = Rect {
-            y: hint_y,
-            height: 1,
-            ..inner
-        };
-        let hint = modal_footer_hints(&[("↑↓", "move"), ("⏎", "pick"), ("⎋", "close")]);
-        frame.render_widget(
-            Paragraph::new(hint)
-                .style(theme::base())
-                .alignment(Alignment::Center),
-            hint_area,
-        );
     }
 }
