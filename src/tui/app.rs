@@ -266,8 +266,9 @@ pub(crate) struct Toast {
 
 const ROTATE_ALL_MSG: &str = "rotate tokens for all accounts?";
 const ROTATE_ALL_DETAIL: &str = "accounts with a live session might be logged out.";
-const TOAST_CAPACITY: usize = 4;
-const TOAST_TTL: Duration = Duration::from_secs(4);
+const TOAST_CAPACITY: usize = 3;
+const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
+const TOAST_TTL_DANGER: Duration = Duration::from_secs(6);
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
@@ -697,7 +698,12 @@ impl App {
 
     pub(crate) fn prune_toasts(&mut self) {
         while let Some(front) = self.toasts.front() {
-            if front.born.elapsed() >= TOAST_TTL {
+            let ttl = if front.kind == ToastKind::Danger {
+                TOAST_TTL_DANGER
+            } else {
+                TOAST_TTL_NORMAL
+            };
+            if front.born.elapsed() >= ttl {
                 self.toasts.pop_front();
             } else {
                 break;

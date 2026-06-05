@@ -1,8 +1,8 @@
-//! Transient toast stack — bottom-right above the footer.
+//! Transient toast stack — top-right, floating, no border.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
@@ -14,43 +14,73 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
     let toasts: Vec<&Toast> = app.toasts.iter().collect();
-    let count = toasts.len() as u16;
-    let max_width = toasts
+
+    // Max content width: min(36, terminal_width − 2); the −2 accounts for the
+    // 1-cell inset on each side.
+    let content_cap = 36_u16.min(area.width.saturating_sub(2));
+
+    // Each toast can be multi-line (newline-split body). Measure the widest
+    // rendered line across all toasts to size the column consistently.
+    let max_content_width = toasts
         .iter()
-        .map(|t| t.body.chars().count() as u16 + 4)
+        .flat_map(|t| t.body.lines().map(|l| l.chars().count() as u16))
         .max()
-        .unwrap_or(20)
-        .min(area.width.saturating_sub(4));
+        .unwrap_or(0)
+        .min(content_cap);
 
-    let x = area.x + area.width.saturating_sub(max_width + 2);
-    let y = area.y.saturating_add(area.height.saturating_sub(count + 4));
+    // +2: 1 for the bar glyph cell, 1 for the space after it.
+    let col_width = max_content_width + 2;
 
-    for (i, toast) in toasts.iter().enumerate() {
-        let rect = Rect {
-            x,
-            y: y + i as u16,
-            width: max_width,
-            height: 1,
-        };
-        if !fits_in(area, rect) {
-            continue;
-        }
+    // Anchor: 1-cell inset from the right edge.
+    let x = area.x + area.width.saturating_sub(col_width + 1);
+
+    // Count total rows needed to place the stack top-down from row 1.
+    let mut row = area.y + 1;
+
+    for toast in &toasts {
         let color = match toast.kind {
             ToastKind::Info => theme::INFO,
             ToastKind::Success => theme::SUCCESS,
             ToastKind::Warning => theme::WARNING,
             ToastKind::Danger => theme::DANGER,
         };
-        let para = Paragraph::new(Line::from(vec![
-            Span::styled("▍ ", Style::default().fg(color)),
-            Span::styled(
-                toast.body.clone(),
-                Style::default().fg(theme::TEXT).bg(theme::BG_RAISED),
-            ),
-        ]))
-        .style(Style::default().bg(theme::BG_RAISED));
-        frame.render_widget(Clear, rect);
-        frame.render_widget(para, rect);
+        let bar_style = Style::default().fg(color).bg(theme::BG_SUNKEN);
+        let title_style = Style::default()
+            .fg(theme::TEXT)
+            .bg(theme::BG_SUNKEN)
+            .add_modifier(Modifier::BOLD);
+        let detail_style = Style::default().fg(theme::TEXT_DIM).bg(theme::BG_SUNKEN);
+
+        let mut lines_iter = toast.body.lines();
+        let first = lines_iter.next().unwrap_or("");
+
+        // Build all rendered lines for this toast.
+        let mut render_lines: Vec<Line<'_>> = vec![Line::from(vec![
+            Span::styled("┃ ", bar_style),
+            Span::styled(first.to_owned(), title_style),
+        ])];
+        for detail in lines_iter {
+            render_lines.push(Line::from(vec![
+                Span::styled("┃ ", bar_style),
+                Span::styled(detail.to_owned(), detail_style),
+            ]));
+        }
+
+        let height = render_lines.len() as u16;
+        let rect = Rect {
+            x,
+            y: row,
+            width: col_width,
+            height,
+        };
+        if fits_in(area, rect) {
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(render_lines).style(Style::default().bg(theme::BG_SUNKEN)),
+                rect,
+            );
+        }
+        row += height;
     }
 }
 
