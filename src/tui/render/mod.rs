@@ -8,6 +8,7 @@
 //!   - new modal → `modals.rs`
 //!   - shared formatters → `format.rs`; shared widgets → `panes.rs`
 
+mod banner;
 mod chain;
 mod config;
 mod footer;
@@ -45,11 +46,24 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         .split(area);
 
     header::draw(frame, chunks[0], app);
+
+    // When a banner is active, carve one row off the top of the body area.
+    let body_area = if let Some(b) = &app.banner {
+        let body_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(chunks[1]);
+        banner::draw(frame, body_chunks[0], b);
+        body_chunks[1]
+    } else {
+        chunks[1]
+    };
+
     match app.tab {
-        Tab::Overview => overview::draw(frame, chunks[1], app),
-        Tab::Usage => usage::draw(frame, chunks[1], app),
-        Tab::Config => config::draw(frame, chunks[1], app),
-        Tab::Fallback => chain::draw(frame, chunks[1], app),
+        Tab::Overview => overview::draw(frame, body_area, app),
+        Tab::Usage => usage::draw(frame, body_area, app),
+        Tab::Config => config::draw(frame, body_area, app),
+        Tab::Fallback => chain::draw(frame, body_area, app),
     }
     footer::draw(frame, chunks[2], app);
 
@@ -153,5 +167,44 @@ mod render_smoke {
             app.tab = tab;
             assert!(dump(&app, 90, 20).contains("clauth"));
         }
+    }
+
+    /// Banner row renders without panic and its message text is visible.
+    /// Also confirms the banner is absent when no condition holds.
+    #[test]
+    fn banner_renders() {
+        use crate::tui::app::{Banner, BannerSeverity};
+
+        let profiles = vec![oauth("alpha", 99.0, 50.0, true)];
+        let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+        let config = AppConfig {
+            state: AppState {
+                // active_profile = None + profiles present → all-spent condition
+                active_profile: None,
+                profiles: names,
+                ..AppState::default()
+            },
+            profiles,
+        };
+        let mut app = App::new(config);
+        app.banner = Some(Banner {
+            severity: BannerSeverity::Danger,
+            message: "all accounts spent · switch to a profile to resume".to_string(),
+        });
+
+        let screen = dump(&app, 90, 20);
+        assert!(screen.contains("all accounts spent"), "banner text missing");
+        assert!(
+            screen.contains("clauth"),
+            "header missing with banner active"
+        );
+
+        // No banner → message absent.
+        app.banner = None;
+        let screen_no_banner = dump(&app, 90, 20);
+        assert!(
+            !screen_no_banner.contains("all accounts spent"),
+            "banner text present when banner is None"
+        );
     }
 }

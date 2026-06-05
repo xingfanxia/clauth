@@ -434,6 +434,24 @@ pub(crate) enum FooterAlert {
     Warn(String),
 }
 
+// ── Banner ────────────────────────────────────────────────────────────────────
+
+/// Severity for the full-width body banner.
+/// Add `Warning` back when a real warning-level sticky condition exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BannerSeverity {
+    Danger,
+}
+
+/// A sticky system-wide condition rendered as a full-width row at the top of
+/// the body (below the header, above the screen content). Computed from app
+/// state each frame; not stored as a notification and not user-dismissable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Banner {
+    pub(crate) severity: BannerSeverity,
+    pub(crate) message: String,
+}
+
 // ── Overview list items ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
@@ -516,6 +534,9 @@ pub(crate) struct App {
     /// Live footer alert; replaces the hint bar in place while `Some`.
     /// Cleared on disarm, tab switch, or explicit `x` dismiss.
     pub(crate) footer_alert: Option<FooterAlert>,
+    /// Active banner; recomputed each tick from sticky system conditions.
+    /// `None` when no condition holds (banner row absent from layout).
+    pub(crate) banner: Option<Banner>,
     /// Last time the 1Hz divergence poll ran.
     pub(crate) last_divergence_check: Instant,
     /// Set once reconcile reports back; gates bootstrap spawn.
@@ -623,6 +644,7 @@ impl App {
             quit: false,
             armed_quit: false,
             footer_alert: None,
+            banner: None,
             last_divergence_check: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
@@ -2801,7 +2823,28 @@ pub(crate) fn on_tick(app: &mut App) {
 
     poll_credentials_divergence(app);
 
+    update_banner(app);
     app.prune_toasts();
+}
+
+/// Recompute the sticky banner from current app state. Called every tick.
+/// Winner ordering: `DANGER` > `WARNING`; ties broken by whichever condition
+/// is checked first. One condition per `if` block in priority order.
+fn update_banner(app: &mut App) {
+    // All accounts switched off because the fallback chain is exhausted.
+    // Condition: profiles exist but none is active (set by `perform_switch_off`).
+    let cfg = app.config();
+    let all_spent = !cfg.profiles.is_empty() && cfg.state.active_profile.is_none();
+    drop(cfg);
+
+    app.banner = if all_spent {
+        Some(Banner {
+            severity: BannerSeverity::Danger,
+            message: "all accounts spent · switch to a profile to resume".to_string(),
+        })
+    } else {
+        None
+    };
 }
 
 /// Drain worker op results: clear activity slots, toast errors/successes,

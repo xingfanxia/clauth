@@ -32,6 +32,10 @@ pub(crate) const WARNING: Color = Color::Rgb(249, 226, 175);
 pub(crate) const DANGER: Color = Color::Rgb(243, 139, 168);
 pub(crate) const INFO: Color = Color::Rgb(116, 199, 236);
 
+// ── Banner background tints ───────────────────────────────────────────────────
+/// DANGER wash blended into BG — banner background for critical conditions.
+pub(crate) const BG_DANGER: Color = Color::Rgb(75, 35, 44);
+
 // ── Style helpers ─────────────────────────────────────────────────────────────
 
 pub(crate) fn base() -> Style {
