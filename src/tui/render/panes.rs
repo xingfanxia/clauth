@@ -174,7 +174,7 @@ pub(super) fn draw_selector_list(
 /// Rounded box with contract-compliant chrome.
 ///
 /// Border: `LINE_STRONG` when focused, `LINE` when blurred.
-/// Title: always italic; bold added only when focused.
+/// Title: always italic, always UPPERCASE; bold added only when focused.
 /// Color: `ACCENT_2` for the first bordered panel on the screen body, `TEXT_DIM` for the rest.
 pub(super) fn section_box(title: &str, focused: bool, first: bool) -> Block<'static> {
     let border_style = if focused {
@@ -201,7 +201,10 @@ pub(super) fn section_box(title: &str, focused: bool, first: bool) -> Block<'sta
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
         .border_style(border_style)
-        .title(Line::from(Span::styled(format!(" {title} "), title_style)))
+        .title(Line::from(Span::styled(
+            format!(" {} ", title.to_uppercase()),
+            title_style,
+        )))
         .padding(Padding::horizontal(1))
 }
 
