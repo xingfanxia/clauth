@@ -11,7 +11,7 @@ use super::super::app::App;
 use super::super::theme;
 use super::tabs;
 
-const VERSION_SUFFIX: &str = concat!("  v", env!("CARGO_PKG_VERSION"));
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
@@ -31,10 +31,20 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(cols[1]);
 
     let n = app.config().profiles.len();
+
+    // Row 0: brand (ACCENT_2 + bold) left; version (TEXT_DIM) right-aligned to
+    // the info column's edge, per the ASCII-art header contract.
+    let info_width = rows[0].width as usize;
+    let brand = "clauth";
+    let ver = format!("v{VERSION}");
+    // Pad between brand and version so the version sits flush at the right edge.
+    let gap = info_width.saturating_sub(brand.len() + ver.len());
     let title = Line::from(vec![
-        Span::styled("clauth", Style::default().fg(theme::TEXT).bold()),
-        Span::styled(VERSION_SUFFIX, theme::faint()),
+        Span::styled(brand, Style::default().fg(theme::ACCENT_2).bold()),
+        Span::styled(" ".repeat(gap), theme::base()),
+        Span::styled(ver, theme::dim()),
     ]);
+
     let count = Line::from(Span::styled(
         format!("{n} account{}", plural(n)),
         theme::faint(),

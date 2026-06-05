@@ -412,6 +412,10 @@ pub(crate) struct App {
     /// `ConfirmAction::RotateAll` checks this alongside `any_busy` to block a
     /// concurrent rotate-all from racing the bootstrap's relink + initial fetch.
     pub(crate) bootstrap_active: Arc<AtomicBool>,
+    /// Per-tab background-event indicator; `None` = no pending activity.
+    /// Set when a background event fires on a tab that isn't currently active;
+    /// cleared in `switch_tab` when the user visits that tab.
+    pub(crate) tab_activity: [Option<ToastKind>; 4],
 }
 
 /// Cloned `Arc`s bundled for [`spawn_refresher`]; carries no lock rank and is
@@ -507,6 +511,7 @@ impl App {
             reconcile_done: false,
             bootstrap_started: false,
             bootstrap_active: Arc::new(AtomicBool::new(false)),
+            tab_activity: [None; 4],
         }
     }
 
@@ -708,6 +713,26 @@ impl App {
             } else {
                 break;
             }
+        }
+    }
+
+    /// Mark a background tab with an activity color. Only sets if `tab` is not
+    /// the currently-active tab; visiting the tab (via `switch_tab`) clears it.
+    /// Higher-severity kinds override lower ones (Danger > Warning > Success > Info).
+    pub(crate) fn set_tab_activity(&mut self, tab: Tab, kind: ToastKind) {
+        if tab == self.tab {
+            return;
+        }
+        let idx = tab.index();
+        let prev = self.tab_activity[idx];
+        let severity = |k: ToastKind| match k {
+            ToastKind::Danger => 3,
+            ToastKind::Warning => 2,
+            ToastKind::Success => 1,
+            ToastKind::Info => 0,
+        };
+        if prev.is_none_or(|p| severity(kind) > severity(p)) {
+            self.tab_activity[idx] = Some(kind);
         }
     }
 
@@ -948,6 +973,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
 /// Switch the active tab and reset that tab's cursor to a sensible default.
 fn switch_tab(app: &mut App, tab: Tab) {
     app.tab = tab;
+    app.tab_activity[tab.index()] = None;
     app.config_draft = None;
     // Clamp cursor: a Config `+ new` selection must land on a real account.
     app.clamp_profile_cursor();
@@ -2389,6 +2415,7 @@ pub(crate) fn on_tick(app: &mut App) {
             continue;
         }
         app.toast(ToastKind::Warning, format!("auto-switching to '{name}'"));
+        app.set_tab_activity(Tab::Overview, ToastKind::Warning);
         perform_switch(app, &name);
     }
 
@@ -2436,10 +2463,12 @@ fn drain_op_results(app: &mut App) {
                         ToastKind::Info,
                         format!("auto-started usage window for '{name}'"),
                     );
+                    app.set_tab_activity(Tab::Usage, ToastKind::Info);
                 }
                 ActivityKind::Refreshing => {
                     needs_token_snapshot_rebuild = true;
                     app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
+                    app.set_tab_activity(Tab::Usage, ToastKind::Info);
                 }
                 _ => {}
             },
@@ -2457,6 +2486,13 @@ fn drain_op_results(app: &mut App) {
                     ToastKind::Danger,
                     format!("{verb} for '{name}' failed: {e}"),
                 );
+                // Route the failure to the relevant tab.
+                let failure_tab = match kind {
+                    ActivityKind::Refreshing | ActivityKind::AutoStarting => Tab::Usage,
+                    ActivityKind::Switching | ActivityKind::Starting => Tab::Overview,
+                    _ => Tab::Overview,
+                };
+                app.set_tab_activity(failure_tab, ToastKind::Danger);
             }
         }
     }
