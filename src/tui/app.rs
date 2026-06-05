@@ -403,6 +403,9 @@ pub(crate) struct App {
     pub(crate) fallback_threshold_draft: Option<InputState>,
 
     pub(crate) toasts: VecDeque<Toast>,
+    /// Whether the terminal is currently too short for the normal layout (< 14 rows).
+    /// Tracked across frames so the "too small" toast fires only on the transition in.
+    pub(crate) compact: bool,
     /// Startup update check result; drained in `on_tick`. Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
 
@@ -515,6 +518,7 @@ impl App {
             config_draft: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
+            compact: false,
             update_results,
             last_state_mtime: app_state_mtime(),
             started_at: Instant::now(),
@@ -738,6 +742,19 @@ impl App {
                 break;
             }
         }
+    }
+
+    /// Called each frame with the current terminal height. Transitions compact
+    /// state and emits the one-shot "too small" toast on the first entry.
+    pub(crate) fn update_compact(&mut self, terminal_height: u16) {
+        let now_compact = terminal_height < 14;
+        if now_compact && !self.compact {
+            self.toast(
+                ToastKind::Danger,
+                "terminal too small · enlarge for full layout",
+            );
+        }
+        self.compact = now_compact;
     }
 
     /// Mark a background tab with an activity color. Only sets if `tab` is not
@@ -2746,5 +2763,63 @@ mod tests {
         let ready = debounce_live_candidates(&mut since, Vec::new(), &live, 9_000_000);
         assert!(ready.is_empty());
         assert!(since.is_empty(), "stale timer pruned");
+    }
+
+    // ── compact mode ─────────────────────────────────────────────────────────
+
+    use super::{App, ToastKind};
+
+    fn bare_app() -> App {
+        use crate::profile::{AppConfig, AppState};
+        App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        })
+    }
+
+    /// First entry into compact (< 14 rows) sets the flag and queues exactly
+    /// one DANGER toast with the contract's exact message.
+    #[test]
+    fn compact_entry_emits_danger_toast() {
+        let mut app = bare_app();
+        app.update_compact(13);
+        assert!(app.compact);
+        assert_eq!(app.toasts.len(), 1);
+        let t = &app.toasts[0];
+        assert_eq!(t.kind, ToastKind::Danger);
+        assert_eq!(t.body, "terminal too small · enlarge for full layout");
+    }
+
+    /// Staying in compact must not repeat the toast.
+    #[test]
+    fn compact_no_repeat_toast() {
+        let mut app = bare_app();
+        app.update_compact(13);
+        app.update_compact(13);
+        assert_eq!(app.toasts.len(), 1, "no second toast while still compact");
+    }
+
+    /// Growing back above threshold clears the compact flag; no toast emitted.
+    #[test]
+    fn compact_exit_clears_flag_no_toast() {
+        let mut app = bare_app();
+        app.update_compact(13);
+        app.toasts.clear();
+        app.update_compact(14);
+        assert!(!app.compact);
+        assert!(app.toasts.is_empty());
+    }
+
+    /// Re-entering compact after a return to normal re-arms the toast.
+    #[test]
+    fn compact_rearm_after_exit() {
+        let mut app = bare_app();
+        app.update_compact(13);
+        app.toasts.clear();
+        app.update_compact(14); // exit
+        app.update_compact(13); // re-enter → toast fires again
+        assert!(app.compact);
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts[0].kind, ToastKind::Danger);
     }
 }
