@@ -13,6 +13,7 @@ mod chain;
 mod config;
 mod footer;
 mod format;
+mod global_config;
 mod header;
 mod modals;
 mod overview;
@@ -62,8 +63,9 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     match app.tab {
         Tab::Overview => overview::draw(frame, body_area, app),
         Tab::Usage => usage::draw(frame, body_area, app),
-        Tab::Config => config::draw(frame, body_area, app),
+        Tab::Setup => config::draw(frame, body_area, app),
         Tab::Fallback => chain::draw(frame, body_area, app),
+        Tab::Config => global_config::draw(frame, body_area, app),
     }
     footer::draw(frame, chunks[2], app);
 
@@ -146,9 +148,10 @@ mod render_smoke {
         for (tab, focus) in [
             (Tab::Overview, ConfigFocus::Profiles),
             (Tab::Usage, ConfigFocus::Profiles),
-            (Tab::Config, ConfigFocus::Profiles),
-            (Tab::Config, ConfigFocus::Actions),
+            (Tab::Setup, ConfigFocus::Profiles),
+            (Tab::Setup, ConfigFocus::Actions),
             (Tab::Fallback, ConfigFocus::Profiles),
+            (Tab::Config, ConfigFocus::Profiles),
         ] {
             app.tab = tab;
             app.config_focus = focus;

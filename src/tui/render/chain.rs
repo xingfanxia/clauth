@@ -26,7 +26,7 @@ use crate::profile::AppConfig;
 
 /// Wide enough to read a threshold tick.
 const GAUGE_W: usize = 22;
-/// Key column width, matching the Config tab.
+/// Key column width, matching the Setup tab.
 const KEY_W: usize = 11;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {

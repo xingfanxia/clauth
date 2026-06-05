@@ -195,33 +195,35 @@ mod tab_overflow_tests {
 
     #[test]
     fn normal_form_shows_all_tabs() {
-        // full strip: "overview   usage   config   fallback" = 8+3+5+3+6+3+8 = 36
+        // full strip: "overview   usage   setup   fallback   config"
+        // = 8+3+5+3+5+3+8+3+6 = 44
         let app = empty_app(Tab::Overview);
         let s = render_tabs(&app, 60);
         assert!(s.contains("overview"), "active tab missing");
         assert!(s.contains("usage"), "inactive tab missing");
-        assert!(s.contains("config"), "inactive tab missing");
+        assert!(s.contains("setup"), "inactive tab missing");
         assert!(s.contains("fallback"), "inactive tab missing");
+        assert!(s.contains("config"), "inactive tab missing");
     }
 
     #[test]
     fn normal_form_labels_untruncated_at_tight_boundary() {
-        // width=36 is the minimum that passes fits_normal; labels must be full, not "overv…"
+        // width=44 is the minimum that passes fits_normal; labels must be full, not "overv…"
         let app = empty_app(Tab::Overview);
-        let s = render_tabs(&app, 36);
+        let s = render_tabs(&app, 44);
         assert!(
             s.contains("overview"),
             "overview must not be truncated at tight boundary"
         );
         assert!(
-            s.contains("fallback"),
-            "fallback must not be truncated at tight boundary"
+            s.contains("config"),
+            "config must not be truncated at tight boundary"
         );
     }
 
     #[test]
     fn overflow_form_shows_only_active() {
-        // width=10 — too narrow for all tabs (36 cols needed)
+        // width=10 — too narrow for all tabs (44 cols needed)
         let app = empty_app(Tab::Usage);
         let s = render_tabs(&app, 10);
         assert!(
@@ -241,7 +243,7 @@ mod tab_overflow_tests {
     #[test]
     fn overflow_chevrons_at_middle_tab() {
         // Middle tab — both ‹ and › present.
-        let app = empty_app(Tab::Usage); // index 1, last=3
+        let app = empty_app(Tab::Usage); // index 1, last=4
         let s = render_tabs(&app, 15);
         assert!(
             s.contains('‹'),
@@ -266,7 +268,7 @@ mod tab_overflow_tests {
 
     #[test]
     fn overflow_no_right_chevron_at_last_tab() {
-        let app = empty_app(Tab::Fallback); // index 3, last=3
+        let app = empty_app(Tab::Config); // index 4, last=4
         let s = render_tabs(&app, 12);
         assert!(
             s.contains('‹'),

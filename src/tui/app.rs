@@ -33,9 +33,11 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ConfigHandle, Profile, app_state_mtime, load_config, save_app_state, save_profile,
+    AppConfig, ConfigHandle, Profile, ThemeName, app_state_mtime, load_config, save_app_state,
+    save_profile,
 };
 use crate::runtime::has_live_session;
+use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
     ActivityKind, ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
@@ -144,7 +146,7 @@ pub(crate) enum FallbackRow {
     Remove,
 }
 
-/// One editable line in the Config tab's detail pane. Built per selection by
+/// One editable line in the Setup tab's detail pane. Built per selection by
 /// [`config_rows`]: auto-start only for OAuth; trailing row is `delete` or
 /// `create`. `Name`/`BaseUrl`/`ApiKey` are text rows; the rest are toggles/actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +167,18 @@ impl ConfigRow {
             ConfigRow::Name | ConfigRow::BaseUrl | ConfigRow::ApiKey
         )
     }
+}
+
+/// One row on the program-wide Config tab. These back real persisted globals in
+/// [`AppState`] — no decorative toggles. ⏎/space cycles or flips in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlobalConfigRow {
+    /// Color-depth tier: `full` (truecolor) / `compatible` (xterm-256).
+    /// Persists to `[theme]` and live-swaps the active palette.
+    Theme,
+    /// Chain-wide "when spent" behavior (`AppState.wrap_off`) — surfaced here as
+    /// a program-wide default alongside the Fallback detail row.
+    WrapOff,
 }
 
 /// Inline editor state for the Config detail pane. Built on entry, torn down
@@ -274,6 +288,8 @@ pub(crate) enum ActionMenuAction {
     DeleteProfile,
     CreateProfile,
     EditField,
+    // Program-wide Config tab
+    CycleTheme,
 }
 
 /// State for the action-menu modal.
@@ -329,6 +345,7 @@ impl ActionMenuAction {
             Self::DeleteProfile => "delete profile",
             Self::CreateProfile => "create profile",
             Self::EditField => "edit field",
+            Self::CycleTheme => "cycle theme",
         }
     }
 }
@@ -378,20 +395,29 @@ pub(crate) enum Tab {
     /// Per-account usage breakdown.
     Usage,
     /// Per-account settings (endpoint, rename, auto-start, delete).
-    Config,
+    Setup,
     /// Fallback chain editor — ordering and per-member thresholds.
     Fallback,
+    /// Program-wide settings: theme tier and global defaults.
+    Config,
 }
 
 impl Tab {
-    pub(crate) const ALL: [Tab; 4] = [Tab::Overview, Tab::Usage, Tab::Config, Tab::Fallback];
+    pub(crate) const ALL: [Tab; 5] = [
+        Tab::Overview,
+        Tab::Usage,
+        Tab::Setup,
+        Tab::Fallback,
+        Tab::Config,
+    ];
 
     pub(crate) fn title(self) -> &'static str {
         match self {
             Tab::Overview => "Overview",
             Tab::Usage => "Usage",
-            Tab::Config => "Config",
+            Tab::Setup => "Setup",
             Tab::Fallback => "Fallback",
+            Tab::Config => "Config",
         }
     }
 
@@ -496,12 +522,12 @@ pub(crate) struct App {
     pub(crate) tab: Tab,
     pub(crate) modals: Vec<Modal>,
 
-    /// Selected account index, shared across Overview/Usage/Config tabs.
-    /// On Config may also rest on the trailing `+ new` row (== profile_count).
+    /// Selected account index, shared across Overview/Usage/Setup tabs.
+    /// On Setup may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
-    /// Which Config pane has focus.
+    /// Which Setup pane has focus.
     pub(crate) config_focus: ConfigFocus,
-    /// Cursor into the detail rows on the Config tab's right pane.
+    /// Cursor into the detail rows on the Setup tab's right pane.
     pub(crate) config_action_cursor: usize,
     /// Inline editor for the Config detail pane; `Some` only while Actions has focus.
     pub(crate) config_draft: Option<ConfigDraft>,
@@ -516,6 +542,8 @@ pub(crate) struct App {
     /// `Some` while the threshold field is open (⏎ opens, owns keyboard).
     /// `+`/`-` still step the value when `None`.
     pub(crate) fallback_threshold_draft: Option<InputState>,
+    /// Cursor into [`GLOBAL_CONFIG_ROWS`] on the program-wide Config tab.
+    pub(crate) global_config_cursor: usize,
 
     pub(crate) toasts: VecDeque<Toast>,
     /// Whether the terminal is currently too short for the normal layout (< 14 rows).
@@ -550,7 +578,7 @@ pub(crate) struct App {
     /// Per-tab background-event indicator; `None` = no pending activity.
     /// Set when a background event fires on a tab that isn't currently active;
     /// cleared in `switch_tab` when the user visits that tab.
-    pub(crate) tab_activity: [Option<ToastKind>; 4],
+    pub(crate) tab_activity: [Option<ToastKind>; Tab::ALL.len()],
 }
 
 /// Cloned `Arc`s bundled for [`spawn_refresher`]; carries no lock rank and is
@@ -633,6 +661,7 @@ impl App {
             fallback_detail_cursor: 0,
             fallback_armed_remove: false,
             fallback_threshold_draft: None,
+            global_config_cursor: 0,
             config_draft: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
@@ -649,7 +678,7 @@ impl App {
             reconcile_done: false,
             bootstrap_started: false,
             bootstrap_active: Arc::new(AtomicBool::new(false)),
-            tab_activity: [None; 4],
+            tab_activity: [None; Tab::ALL.len()],
         }
     }
 
@@ -1004,7 +1033,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
 
     // Config text field capturing keystrokes owns keyboard (like a modal)
     // so typing into a name can't fire global shortcuts.
-    if app.tab == Tab::Config
+    if app.tab == Tab::Setup
         && app.config_focus == ConfigFocus::Actions
         && app
             .config_draft
@@ -1094,7 +1123,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // Esc backs out of sub-focus; no-op at the top level.
         KeyCode::Esc => {
             app.disarm_quit();
-            if app.tab == Tab::Config && app.config_focus == ConfigFocus::Actions {
+            if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
                 app.config_focus = ConfigFocus::Profiles;
                 app.config_draft = None;
             } else if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
@@ -1106,12 +1135,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // First `q` at the top level arms the 2-step quit; second confirms.
         // When there is a sub-focus to back out of, `q` ascends instead.
         KeyCode::Char('q') => {
-            let has_sub_focus = (app.tab == Tab::Config
-                && app.config_focus == ConfigFocus::Actions)
+            let has_sub_focus = (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
                 || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail);
             if has_sub_focus {
                 app.disarm_quit();
-                if app.tab == Tab::Config {
+                if app.tab == Tab::Setup {
                     app.config_focus = ConfigFocus::Profiles;
                     app.config_draft = None;
                 } else {
@@ -1148,8 +1176,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     match app.tab {
         Tab::Overview => handle_overview_key(app, key),
         Tab::Usage => handle_usage_key(app, key),
-        Tab::Config => handle_config_key(app, key),
+        Tab::Setup => handle_config_key(app, key),
         Tab::Fallback => handle_fallback_key(app, key),
+        Tab::Config => handle_global_config_key(app, key),
     }
 }
 
@@ -1162,7 +1191,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
     app.clamp_profile_cursor();
     match tab {
         Tab::Overview | Tab::Usage => {}
-        Tab::Config => {
+        Tab::Setup => {
             app.config_focus = ConfigFocus::Profiles;
             app.config_action_cursor = 0;
         }
@@ -1172,6 +1201,9 @@ fn switch_tab(app: &mut App, tab: Tab) {
             app.fallback_detail_cursor = 0;
             app.fallback_armed_remove = false;
             app.fallback_threshold_draft = None;
+        }
+        Tab::Config => {
+            app.global_config_cursor = 0;
         }
     }
 }
@@ -1432,6 +1464,69 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
     FallbackRow::WrapOff,
     FallbackRow::Remove,
 ];
+
+/// Rows on the program-wide Config tab, in display order.
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 2] =
+    [GlobalConfigRow::Theme, GlobalConfigRow::WrapOff];
+
+/// Config tab keymap: ↑↓ walks rows, ⏎/space cycles the theme or flips wrap-off.
+fn handle_global_config_key(app: &mut App, key: KeyEvent) {
+    let last = GLOBAL_CONFIG_ROWS.len() - 1;
+    app.global_config_cursor = app.global_config_cursor.min(last);
+    match key.code {
+        KeyCode::Up => {
+            app.global_config_cursor = if app.global_config_cursor == 0 {
+                last
+            } else {
+                app.global_config_cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            app.global_config_cursor = if app.global_config_cursor >= last {
+                0
+            } else {
+                app.global_config_cursor + 1
+            };
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            run_global_config_row(app, GLOBAL_CONFIG_ROWS[app.global_config_cursor]);
+        }
+        _ => {}
+    }
+}
+
+/// Apply ⏎/space on a Config-tab row: cycle the theme tier or flip wrap-off.
+fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
+    match row {
+        GlobalConfigRow::Theme => cycle_theme(app),
+        GlobalConfigRow::WrapOff => toggle_wrap_off(app),
+    }
+}
+
+/// Cycle the active theme tier, persist it to `[theme]`, and live-swap the
+/// palette so the next frame renders in the new tier without a restart.
+fn cycle_theme(app: &mut App) {
+    let next = match theme::tier() {
+        theme::Tier::Full => theme::Tier::Compatible,
+        theme::Tier::Compatible => theme::Tier::Full,
+    };
+    let name = match next {
+        theme::Tier::Full => ThemeName::Full,
+        theme::Tier::Compatible => ThemeName::Compatible,
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.theme = Some(name);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+    theme::set_tier(next);
+    let label = match next {
+        theme::Tier::Full => "full · 24-bit truecolor",
+        theme::Tier::Compatible => "compatible · xterm-256",
+    };
+    app.toast(ToastKind::Success, format!("theme → {label}"));
+}
 
 /// Fallback footer hint derived from current focus + selection + edit state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1836,7 +1931,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
         Tab::Usage => {
             actions.push(RefreshUsage);
         }
-        Tab::Config => match app.config_focus {
+        Tab::Setup => match app.config_focus {
             ConfigFocus::Profiles => {
                 if app.profile_cursor < app.profile_count() {
                     actions.push(ConfigureSelected);
@@ -1880,6 +1975,14 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 }
             }
         },
+        Tab::Config => {
+            if let Some(&row) = GLOBAL_CONFIG_ROWS.get(app.global_config_cursor) {
+                match row {
+                    GlobalConfigRow::Theme => actions.push(CycleTheme),
+                    GlobalConfigRow::WrapOff => actions.push(ToggleWrapOff),
+                }
+            }
+        }
     }
 
     ActionMenuState::new(actions)
@@ -2016,10 +2119,11 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                 run_config_row(app, row);
             }
         }
+        ActionMenuAction::CycleTheme => cycle_theme(app),
     }
 }
 
-/// Config tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
+/// Setup tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
 /// edits/toggles/arms/creates. Esc (global) returns to list.
 fn handle_config_key(app: &mut App, key: KeyEvent) {
     // Selector includes the trailing `+ new` row.
@@ -2108,7 +2212,7 @@ fn enter_config_detail(app: &mut App) {
 
 /// Jump to the `+ new` create form (global `n`).
 fn start_new_account(app: &mut App) {
-    switch_tab(app, Tab::Config);
+    switch_tab(app, Tab::Setup);
     app.profile_cursor = app.profile_count();
     app.config_action_cursor = 0;
     app.config_draft = Some(build_draft_new());
@@ -3183,5 +3287,59 @@ mod tests {
         assert!(app.compact);
         assert_eq!(app.toasts.len(), 1);
         assert_eq!(app.toasts[0].kind, ToastKind::Danger);
+    }
+
+    // ── global config tab ────────────────────────────────────────────────────
+
+    use super::theme::{self, Tier};
+    use super::{GLOBAL_CONFIG_ROWS, KeyCode, KeyEvent, KeyModifiers, Tab};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// The live-swap holder round-trips so a re-selection re-renders in the new
+    /// tier without a restart.
+    #[test]
+    fn theme_set_tier_round_trips() {
+        theme::set_tier(Tier::Full);
+        assert_eq!(theme::tier(), Tier::Full);
+        theme::set_tier(Tier::Compatible);
+        assert_eq!(theme::tier(), Tier::Compatible);
+        theme::set_tier(Tier::Full);
+        assert_eq!(theme::tier(), Tier::Full);
+    }
+
+    /// ↑↓ on the Config tab wraps through the global rows in both directions.
+    #[test]
+    fn global_config_cursor_wraps() {
+        let mut app = bare_app();
+        app.tab = Tab::Config;
+        let last = GLOBAL_CONFIG_ROWS.len() - 1;
+
+        assert_eq!(app.global_config_cursor, 0);
+        super::handle_global_config_key(&mut app, key(KeyCode::Up));
+        assert_eq!(
+            app.global_config_cursor, last,
+            "Up from first wraps to last"
+        );
+        super::handle_global_config_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.global_config_cursor, 0, "Down from last wraps to first");
+    }
+
+    /// Every Config-tab row maps to a non-empty action-menu entry, so `a` is
+    /// never a dead key on this tab.
+    #[test]
+    fn global_config_rows_have_actions() {
+        for (i, _row) in GLOBAL_CONFIG_ROWS.iter().enumerate() {
+            let mut app = bare_app();
+            app.tab = Tab::Config;
+            app.global_config_cursor = i;
+            let menu = super::build_action_menu(&app);
+            assert!(
+                !menu.items.is_empty(),
+                "row {i} must surface at least one action"
+            );
+        }
     }
 }

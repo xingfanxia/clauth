@@ -7,10 +7,12 @@
 //!
 //! # Initialization
 //!
-//! Call [`init`] exactly once before the TUI starts. The tier is locked for the
-//! process lifetime — renders read it via the accessor fns below.
+//! Call [`init`] once before the TUI starts to seed the tier from the CLI flag
+//! or config file. The Config tab can later [`set_tier`] live — the holder is an
+//! atomic so a re-selection re-renders in the new palette on the next frame
+//! without a process restart. Renders read it via the accessor fns below.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -26,8 +28,28 @@ pub(crate) enum Tier {
     Compatible,
 }
 
-/// Process-global tier, set once at startup by [`init`].
-static TIER: OnceLock<Tier> = OnceLock::new();
+impl Tier {
+    /// Stable atomic encoding. `0` doubles as "uninitialized" so the accessor
+    /// can fall back to auto-detect before [`init`] runs.
+    fn as_code(self) -> u8 {
+        match self {
+            Tier::Full => 1,
+            Tier::Compatible => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Tier> {
+        match code {
+            1 => Some(Tier::Full),
+            2 => Some(Tier::Compatible),
+            _ => None,
+        }
+    }
+}
+
+/// Process-global tier as an atomic code (`0` = unset → auto-detect). Seeded by
+/// [`init`] and swappable at runtime via [`set_tier`] for the live theme picker.
+static TIER: AtomicU8 = AtomicU8::new(0);
 
 /// Detect the tier from `$COLORTERM` per the cloudy-tui contract:
 /// `truecolor` or `24bit` → [`Tier::Full`]; anything else → [`Tier::Compatible`].
@@ -42,18 +64,22 @@ pub(crate) fn detect() -> Tier {
     }
 }
 
-/// Lock the process tier. Call exactly once before the first render.
+/// Seed the process tier at startup.
 /// Precedence (highest first): explicit override → auto-detect.
-/// A second call is silently ignored (the first caller wins).
 pub(crate) fn init(override_tier: Option<Tier>) {
-    let tier = override_tier.unwrap_or_else(detect);
-    let _ = TIER.set(tier);
+    set_tier(override_tier.unwrap_or_else(detect));
+}
+
+/// Swap the active tier at runtime. The next render reads the new value, so the
+/// Config tab's theme selector applies immediately.
+pub(crate) fn set_tier(tier: Tier) {
+    TIER.store(tier.as_code(), Ordering::Relaxed);
 }
 
 /// Return the active tier. Falls back to auto-detect if [`init`] was not called.
 #[inline]
 pub(crate) fn tier() -> Tier {
-    *TIER.get_or_init(detect)
+    Tier::from_code(TIER.load(Ordering::Relaxed)).unwrap_or_else(detect)
 }
 
 // ── Palette tables ────────────────────────────────────────────────────────────

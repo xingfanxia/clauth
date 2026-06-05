@@ -1,4 +1,4 @@
-//! Config tab — account picker (plus a trailing `+ new` row) on the left, the
+//! Setup tab — account picker (plus a trailing `+ new` row) on the left, the
 //! selected account's settings on the right. Editing happens inline in the
 //! right pane: ⏎ on the left drops focus into the detail rows, ⏎ on a text row
 //! opens an inline caret, ⏎ on a toggle flips it, and `+ new` turns the right

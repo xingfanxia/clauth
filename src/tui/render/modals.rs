@@ -245,14 +245,21 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "usage",
             &[("\u{2191}\u{2193}", "pick account to inspect")][..],
         )],
-        Tab::Config => vec![(
-            "config",
+        Tab::Setup => vec![(
+            "setup",
             &[
                 ("\u{2191}\u{2193}", "pick account / + new, then a row"),
                 ("\u{23ce}", "open settings · edit field · flip toggle"),
                 ("\u{23ce} on a field", "edit inline; \u{23ce} again saves"),
                 ("delete", "\u{23ce} once to arm, again to confirm"),
                 ("\u{238b}", "stop editing / back to account list"),
+            ][..],
+        )],
+        Tab::Config => vec![(
+            "config",
+            &[
+                ("\u{2191}\u{2193}", "move between settings"),
+                ("\u{23ce}", "cycle theme · flip wrap-off"),
             ][..],
         )],
         Tab::Fallback => vec![(

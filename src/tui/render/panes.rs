@@ -1,5 +1,5 @@
 //! Shared widgets: the bordered section box every pane uses, and the account
-//! picker shared by the Usage and Config tabs.
+//! picker shared by the Usage and Setup tabs.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

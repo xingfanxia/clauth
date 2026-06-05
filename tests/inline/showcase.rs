@@ -469,13 +469,16 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Usage);
     press(&mut app, KeyCode::Right);
-    assert_eq!(app.tab, Tab::Config);
+    assert_eq!(app.tab, Tab::Setup);
     press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Fallback);
     press(&mut app, KeyCode::Right);
+    assert_eq!(app.tab, Tab::Config);
+    press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Overview, "→ wraps back to Overview");
     press(&mut app, KeyCode::Left);
-    assert_eq!(app.tab, Tab::Fallback, "← wraps to the last tab");
+    assert_eq!(app.tab, Tab::Config, "← wraps to the last tab");
+    press(&mut app, KeyCode::Left);
     press(&mut app, KeyCode::Left);
     press(&mut app, KeyCode::Left);
     press(&mut app, KeyCode::Left);
@@ -518,8 +521,8 @@ fn demo_data_drives_all_actions() {
 
     // ── Edit ── (cursor at "work"/1 after switch; one ↓ → "side-project"/2)
     press(&mut app, KeyCode::Right); // Overview → Usage
-    press(&mut app, KeyCode::Right); // Usage → Config
-    assert_eq!(app.tab, Tab::Config);
+    press(&mut app, KeyCode::Right); // Usage → Setup
+    assert_eq!(app.tab, Tab::Setup);
     assert_eq!(app.profile_cursor, 1, "cursor carried over from the switch");
     press(&mut app, KeyCode::Down); // 1 → 2 (side-project)
     press(&mut app, KeyCode::Enter); // focus the detail pane
@@ -606,8 +609,8 @@ fn demo_data_drives_all_actions() {
 
     // ── Delete ──
     let before = app.profile_count();
-    press(&mut app, KeyCode::Left); // Fallback → Config
-    assert_eq!(app.tab, Tab::Config);
+    press(&mut app, KeyCode::Left); // Fallback → Setup
+    assert_eq!(app.tab, Tab::Setup);
     for _ in 0..4 {
         press(&mut app, KeyCode::Down); // 0 → 4 ("research")
     }

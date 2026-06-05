@@ -22,7 +22,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // `q` label: "back" in a sub-focus, "quit" at top level.
     // (While armed the alert row shows instead, so this label stays "quit".)
-    let has_sub_focus = (app.tab == Tab::Config && app.config_focus == ConfigFocus::Actions)
+    let has_sub_focus = (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
         || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail);
     let q_label: &str = if has_sub_focus { "back" } else { "quit" };
 
@@ -42,7 +42,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ("a", "actions"),
             ("?", "help"),
         ],
-        Tab::Config => match app.config_focus {
+        Tab::Setup => match app.config_focus {
             ConfigFocus::Profiles => &[
                 ("↑↓", "account"),
                 ("⏎", "configure"),
@@ -58,6 +58,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("?", "help"),
             ],
         },
+        Tab::Config => &[
+            ("↑↓", "row"),
+            ("⏎", "cycle / toggle"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
         Tab::Fallback => match fallback_hint(app) {
             FallbackHint::Empty => &[("?", "help")],
             FallbackHint::ChainMember => &[
