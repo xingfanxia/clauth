@@ -115,7 +115,8 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let draft = app.config_draft.as_ref();
     let snap = build_snap(app, draft.is_none());
 
-    let block = section_box(&snap.title, actions_focused);
+    // Detail pane: second panel on this screen.
+    let block = section_box(&snap.title, actions_focused, false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

@@ -12,7 +12,7 @@ use super::format::{
     account_type_label, account_type_style, fixed, fixed_split, health_color, name_style,
     spinner_frame, spinner_style, window_summary_parts, window_summary_span,
 };
-use super::panes::{section_box, select_line};
+use super::panes::{empty_state, section_box, select_line};
 use crate::fallback::threshold_for;
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{ProfileActivity, now_ms};
@@ -34,14 +34,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = section_box("accounts", false);
+    // Sole interactive content panel on this screen — always focused.
+    let focused = true;
+    let block = section_box("accounts", focused, true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     if app.config().profiles.is_empty() {
-        let empty = Paragraph::new(Line::from(Span::styled("no accounts yet", theme::muted())))
-            .style(theme::base());
-        frame.render_widget(empty, inner);
+        frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
 
@@ -63,8 +63,8 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|(row, item)| match item {
             MainItemKind::Profile(idx) => {
                 let selected = row == sel;
-                let line = render_overview_row(app, *idx, &widths, selected);
-                ListItem::new(select_line(line, selected, true, width))
+                let line = render_overview_row(app, *idx, &widths, selected, focused);
+                ListItem::new(select_line(line, selected, focused, width))
             }
         })
         .collect();
@@ -207,6 +207,7 @@ fn render_overview_row(
     idx: usize,
     widths: &OverviewWidths,
     selected: bool,
+    focused: bool,
 ) -> Line<'static> {
     let cfg = app.config();
     let Some(profile) = cfg.profiles.get(idx) else {
@@ -215,7 +216,8 @@ fn render_overview_row(
 
     let active = cfg.is_active(&profile.name);
     let name_str = profile.name.to_string();
-    let cursor = if selected {
+    // Caret only in the focused pane.
+    let cursor = if selected && focused {
         Span::styled("❯ ", theme::accent())
     } else {
         Span::raw("  ")
@@ -325,7 +327,8 @@ fn chain_summary(cfg: &AppConfig, profile: &Profile) -> (String, Style) {
 }
 
 fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = section_box("fallback chain", false);
+    // Read-only detail pane — focus never descends here from the overview screen.
+    let block = section_box("fallback chain", false, false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

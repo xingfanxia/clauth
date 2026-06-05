@@ -43,7 +43,8 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .get(app.profile_cursor.min(cfg.profiles.len().saturating_sub(1)));
 
     let title = profile.map(|p| p.name.as_str()).unwrap_or("usage");
-    let block = section_box(title, false);
+    // Detail pane: read-only, focus never descends into it; second panel on screen.
+    let block = section_box(title, false, false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

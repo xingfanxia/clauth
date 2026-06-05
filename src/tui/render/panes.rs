@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
 use super::super::app::App;
 use super::super::theme;
@@ -27,7 +27,7 @@ pub(super) fn highlight_row(mut line: Line<'static>, width: usize) -> Line<'stat
     line
 }
 
-/// Selected-row treatment: bold+bar when focused, dim wash when blurred.
+/// Selected-row treatment: bold+bar+caret when focused, hover-tint-only when blurred.
 pub(super) fn select_line(
     line: Line<'static>,
     selected: bool,
@@ -39,7 +39,14 @@ pub(super) fn select_line(
     } else if focused {
         highlight_row(line, width as usize)
     } else {
-        line.patch_style(Style::default().fg(theme::TEXT_DIM))
+        // Keep BG_HOVER tint so the user sees where they were; drop caret + bold.
+        // Filler must carry the tint too — bare Span::raw paints Color::Reset holes.
+        let pad = (width as usize).saturating_sub(line.width());
+        let mut line = line.style(theme::selected_row());
+        if pad > 0 {
+            line.push_span(Span::styled(" ".repeat(pad), theme::selected_row()));
+        }
+        line
     }
 }
 
@@ -59,13 +66,34 @@ pub(super) fn picker_row(
     name_style: Style,
     width: u16,
 ) -> Line<'static> {
-    let arrow = if selected {
+    // Caret only in the focused pane; blurred rows keep BG_HOVER via select_line.
+    let arrow = if selected && focused {
         Span::styled("❯ ", theme::accent())
     } else {
         Span::raw("  ")
     };
     let line = Line::from(vec![arrow, Span::styled(name, name_style)]);
     select_line(line, selected, focused, width)
+}
+
+/// Empty-state widget: rounded frame in `LINE`, hint on first line `TEXT_DIM`,
+/// hotkey `ACCENT` + action on second line.
+pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'static> {
+    Paragraph::new(vec![
+        Line::from(Span::styled(hint.to_string(), theme::dim())),
+        Line::from(vec![
+            Span::styled(hotkey.to_string(), theme::accent()),
+            Span::styled(format!(" {action}"), theme::dim()),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(border::ROUNDED)
+            .border_style(Style::default().fg(theme::LINE)),
+    )
+    .style(theme::base())
+    .wrap(Wrap { trim: false })
 }
 
 /// Bordered selector list; `build_rows` receives the inner width for the selection bar.
@@ -77,17 +105,13 @@ pub(super) fn draw_selector_list(
     sel: usize,
     build_rows: impl FnOnce(u16) -> Vec<Line<'static>>,
 ) {
-    let block = section_box(title, focused);
+    let block = section_box(title, focused, true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let rows = build_rows(inner.width);
     if rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("no accounts yet", theme::muted())))
-                .style(theme::base()),
-            inner,
-        );
+        frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
 
@@ -98,18 +122,37 @@ pub(super) fn draw_selector_list(
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
-/// Rounded box with dim title; border turns sapphire when focused.
-pub(super) fn section_box(title: &str, focused: bool) -> Block<'static> {
+/// Rounded box with contract-compliant chrome.
+///
+/// Border: `LINE_STRONG` when focused, `LINE` when blurred.
+/// Title: always italic; bold added only when focused.
+/// Color: `ACCENT_2` for the first bordered panel on the screen body, `TEXT_DIM` for the rest.
+pub(super) fn section_box(title: &str, focused: bool, first: bool) -> Block<'static> {
     let border_style = if focused {
-        Style::default().fg(theme::ACCENT)
+        Style::default().fg(theme::LINE_STRONG)
     } else {
         Style::default().fg(theme::LINE)
+    };
+    let title_color = if first {
+        theme::ACCENT_2
+    } else {
+        theme::TEXT_DIM
+    };
+    let title_style = {
+        let base = Style::default()
+            .fg(title_color)
+            .add_modifier(Modifier::ITALIC);
+        if focused {
+            base.add_modifier(Modifier::BOLD)
+        } else {
+            base
+        }
     };
     Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
         .border_style(border_style)
-        .title(Line::from(Span::styled(format!(" {title} "), theme::dim())))
+        .title(Line::from(Span::styled(format!(" {title} "), title_style)))
         .padding(Padding::horizontal(1))
 }
 

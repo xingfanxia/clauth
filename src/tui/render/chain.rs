@@ -44,6 +44,7 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
     let items = chain_items(app);
     let cfg = app.config();
     let sel = app.chain_cursor.min(items.len().saturating_sub(1));
+    // Selector is the first (and only) bordered panel in the left column.
     draw_selector_list(frame, area, "chain", focused, sel, |w| {
         items
             .iter()
@@ -61,7 +62,8 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                         let style = name_color(cfg.is_active(&name));
                         // Cursor + ordinal share the leading span so the name
                         // lands at spans[1] — the item `highlight_row` bolds.
-                        let rail = if selected {
+                        // Caret only in the focused pane.
+                        let rail = if selected && focused {
                             Span::styled(format!("❯ {:>2}  ", i + 1), theme::accent())
                         } else {
                             Span::styled(format!("  {:>2}  ", i + 1), theme::faint())
@@ -69,7 +71,7 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                         Line::from(vec![rail, Span::styled(name, style)])
                     }
                     ChainItemKind::Add => {
-                        let arrow = if selected {
+                        let arrow = if selected && focused {
                             Span::styled("❯ ", theme::accent())
                         } else {
                             Span::raw("  ")
@@ -85,7 +87,7 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
 
 fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let detail_focused = app.fallback_focus == FallbackFocus::Detail;
-    let inner_w = section_box("", detail_focused).inner(area).width as usize;
+    let inner_w = section_box("", detail_focused, false).inner(area).width as usize;
     let items = chain_items(app);
     let selected = items
         .get(app.chain_cursor.min(items.len().saturating_sub(1)))
@@ -123,7 +125,8 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         None => ("chain".to_string(), empty_detail()),
     };
 
-    let block = section_box(&title, detail_focused);
+    // Detail is the second panel on this screen — not first.
+    let block = section_box(&title, detail_focused, false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
