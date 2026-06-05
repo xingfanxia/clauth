@@ -59,15 +59,15 @@ cargo build --release
 ## Features
 
 - **One-key switching** — pick a profile, ⏎, confirm. Or `clauth <profile>` straight from the shell.
-- **Automatic token refresh** — every profile's OAuth pair is refreshed in parallel on launch and on switch (same as Claude Code does on startup), and rotated when a 5-hour window expires, so usage queries never run with a stale token.
+- **Automatic token refresh** — the OAuth refresh token is single-use, so rotation is lazy: a stale access token is rotated on the spot the moment a usage query returns a 401, never proactively. Usage queries never run with a stale token, and `t` force-rotates every account on demand.
 - **Live usage bars** — 5h utilization from the Anthropic API, refreshed every 60 seconds and color-coded with the next reset time. Max accounts also get a 7-day bar (Pro accounts don't have it in ther API respone).
-- **Per-row activity** — each account shows a countdown to its next refresh or a color-coded spinner: sapphire fetch, cyan token refresh, orange switch, green auto-start.
+- **Per-row activity** — each account shows a countdown to its next refresh or a color-coded spinner: sapphire fetch, cyan token refresh, green auto-start. (Switching is an instant relink, no spinner.)
 - **Plan detection** — `/api/oauth/profile` identifies the tier: Pro, Max (5x / 20x), Team, Enterprise.
 - **Per-account breakdown** — the Usage tab lays out every window (5h, 7d, 7d sonnet, 7d opus, any paid extra-usage spend) plus the endpoint, fallback threshold, and merged env keys.
 - **Auto-switch on exhaustion** — opt accounts into an ordered fallback chain with per-profile thresholds; when the active one crosses its 5h limit (95% default), clauth hops to the next member with headroom. Needs clauth open.
 - **Stale-data cues** — the account name underlines yellow when the row is served from cache and red when there's no data at all.
 - **Account-change detection** — if Claude Code signed into a different account while clauth was closed, both the TUI and CLI notice on next launch and prompt `[Y/n]` before overwriting stored tokens.
-- **Multi-instance safe** — several clauth processes coexist; state writes serialize through a file lock and each instance reloads when another rewrites `profiles.toml`. Switching, rotate-all, and refresh run off the UI thread.
+- **Multi-instance safe** — several clauth processes coexist; state writes serialize through a file lock and each instance reloads when another rewrites `profiles.toml`. Rotate-all and usage refresh run off the UI thread; switching is an instant on-thread relink.
 - **Non-destructive** — only touches the API-related keys plus the profile's declared `env` block in `settings.json`; everything else is preserved.
 - **Isolated launch** — `clauth start <profile> [claude args...]` runs `claude` in a per-call `CLAUDE_CONFIG_DIR` mirroring `~/.claude` via symlinks (copies on Windows without symlink privilege), with this profile's credentials, merged settings, and its own `.claude.json` — so cached account identity and billing caches don't leak between profiles.
 - **Status-line aware** — `clauth which [--json]` prints which profile owns the loaded `credentials.json`.

@@ -114,7 +114,8 @@ pub(crate) enum ProfileActivity {
     Fetching,
     /// OAuth refresh (rotate access + refresh tokens) in flight.
     Refreshing,
-    /// CLI/TUI account switch in flight (relink + pre-switch refresh).
+    /// Account switch in flight (pure FS relink; no token rotation). Latent:
+    /// the switch now runs synchronously on the UI thread, so this is never set.
     Switching,
     /// One-shot `clauth start` launch path. Phase 1 doesn't drive this from
     /// any path (`start::run` runs in a separate process); Phase 2 wires it
