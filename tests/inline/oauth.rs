@@ -284,60 +284,41 @@ fn rotation_guard_is_independent_across_profiles() {
     drop(held_a);
 }
 
-/// `start_window` must return false (no kick fired) when a live `clauth start`
-/// session holds the chain. The live-session gate short-circuits before any
-/// HTTP and before the cooldown is stamped, so a live session never costs a
-/// ping. Network-free: the gate fires before the kick.
+/// A live `clauth start` session must NOT exclude a windowless profile from the
+/// auto-start scan. A running Claude Code holds the session lock but only opens
+/// a 5h window when it sends a message, so an idle (or just-reset) session has a
+/// live lock and no window — exactly the case that needs arming. The kick spends
+/// only the access token, so it's token-safe to fire alongside a live session.
+/// Regression guard for the "CC open on a background account, usage never
+/// started" bug.
 #[test]
-fn start_window_skips_when_live_session() {
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::mpsc;
+fn windowless_candidate_even_with_live_session() {
+    use std::collections::HashMap;
 
     let _home = HomeSandbox::new();
-    let name = "test-auto-start-named-live-session";
+    let name = "test-windowless-live-session";
+
+    // Simulate a live session: a locked pid file under the profile's sessions
+    // dir makes `has_live_session` return true for its lifetime.
     let sessions = profile_dir(name).expect("profile_dir").join("sessions");
     std::fs::create_dir_all(&sessions).expect("create sessions dir");
-    let pid_file = sessions.join("test-pid-autostart");
+    let pid_file = sessions.join("test-pid-live");
     let file = open_pid_file(&pid_file).expect("open pid file");
     file.lock().expect("lock pid file");
 
-    let profile = Profile {
-        name: name.into(),
-        base_url: None,
-        api_key: None,
-        auto_start: true,
-        env: BTreeMap::new(),
-        fallback_threshold: None,
-        credentials: Some(ClaudeCredentials {
-            claude_ai_oauth: Some(OAuthToken {
-                access_token: "at".to_string(),
-                refresh_token: Some("rt-autostart-live".to_string()),
-                expires_at: None,
-                scopes: None,
-                subscription_type: None,
-            }),
-        }),
-        usage: None,
-        fetch_status: None,
-    };
-    let config = Arc::new(RankedMutex::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![profile],
-    }));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
-    let refetch: crate::usage::RefetchQueue =
-        Arc::new(RankedMutex::new(std::collections::HashSet::new()));
-    let (tx, _rx) = mpsc::channel();
+    let mut config = single_profile_config(name, "rt-live-session");
+    config.profiles[0].auto_start = true;
+    let config = Arc::new(RankedMutex::new(config));
 
-    let kicked = start_window(&config, name, Some(&refetch), Some(&activity), &tx);
+    // Empty store → no 5h window → windowless. The live session must not change
+    // the verdict.
+    let store: crate::usage::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
 
-    assert!(
-        !kicked,
-        "start_window must skip (no kick fired) when a live session holds the chain"
-    );
-    assert!(
-        is_idle(&activity, name),
-        "activity slot must remain Idle when skipped at the live-session gate"
+    let candidates = windowless_auto_start_candidates(&config, &store);
+    assert_eq!(
+        candidates,
+        vec![name.to_string()],
+        "a windowless profile must be re-armed even while a live session holds its lock"
     );
 
     drop(file);

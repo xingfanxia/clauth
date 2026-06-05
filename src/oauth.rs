@@ -322,10 +322,9 @@ pub(crate) fn refresh_all(
 }
 
 /// Names of opted-in OAuth profiles that currently have NO live 5-hour window
-/// and are eligible for an auto-start kick: not active-with-a-diverged-link, no
-/// live `clauth start` session, and past the auto-start cooldown. The caller
-/// enqueues these into `pending_auto_start`; the on-tick drain kicks each
-/// through [`start_window`].
+/// and are eligible for an auto-start kick: not active-with-a-diverged-link and
+/// past the auto-start cooldown. The caller enqueues these into
+/// `pending_auto_start`; the on-tick drain kicks each through [`start_window`].
 ///
 /// This is the single steady-state arming path, and the fix for background
 /// (non-active) accounts: the active profile gets its 5-hour window for free
@@ -334,6 +333,16 @@ pub(crate) fn refresh_all(
 /// profile whose startup kick failed, or that lost its window mid-session,
 /// would never be re-armed. Running this every tick re-arms them as soon as
 /// they fall idle and windowless.
+///
+/// A live `clauth start` session is NOT a reason to skip: a running Claude Code
+/// process holds the session lock but only opens a 5-hour window when it
+/// actually sends a message, so an idle (or just-reset) session has a live lock
+/// and no window — exactly the case that needs arming. Liveness is the wrong
+/// signal here; `resets_at` is the right one, and `has_active_window` already
+/// excludes a session that does hold an open window. Kicking is token-safe
+/// regardless: it spends only the access token, never the single-use refresh
+/// token, so it can't race a session's chain (unlike the rotate paths, which
+/// still gate on `has_live_session`).
 ///
 /// Reads the usage store BEFORE the config lock: `apply_usage` holds
 /// `usage_store` then `config`, so taking them in the other order here would
@@ -376,7 +385,6 @@ pub(crate) fn windowless_auto_start_candidates(
             p.auto_start
                 && p.is_oauth()
                 && !(skip_active && cfg.is_active(&p.name))
-                && !has_live_session(&p.name)
                 && !*has_active_window.get(p.name.as_str()).unwrap_or(&false)
                 && now.saturating_sub(
                     cfg.state
@@ -396,9 +404,12 @@ pub(crate) fn windowless_auto_start_candidates(
 /// path's 401-rotation, so auto-start can never double-spend the single-use
 /// refresh token and needs no `RotationGuard`.
 ///
-/// Gates on opt-in, OAuth, a diverged active link, a live `clauth start`
-/// session, and the auto-start cooldown so every caller (the on-tick windowless
-/// scan and the CLI switch) shares one rule set. The cooldown slot is claimed
+/// Gates on opt-in, OAuth, a diverged active link, and the auto-start cooldown
+/// so every caller (the on-tick windowless scan and the CLI switch) shares one
+/// rule set. Deliberately does NOT gate on `has_live_session`: a kick spends
+/// only the access token, and a live session that lacks a window (idle, or just
+/// reset) is precisely what needs arming — see
+/// [`windowless_auto_start_candidates`]. The cooldown slot is claimed
 /// (stamped `last_auto_start_at`) before the kick as a concurrency guard so a
 /// second tick can't spawn a duplicate worker in the gap between the `is_idle`
 /// check and the worker thread starting. On success the stamp is left as-is
@@ -437,9 +448,6 @@ pub(crate) fn start_window(
                 return Ok(None);
             };
             if active_link_diverged(&cfg) && cfg.is_active(name) {
-                return Ok(None);
-            }
-            if has_live_session(name) {
                 return Ok(None);
             }
             let now = now_ms();

@@ -40,13 +40,14 @@ use crate::oauth;
 use crate::profile::{
     AppConfig, ConfigHandle, Profile, app_state_mtime, load_config, save_app_state, save_profile,
 };
+use crate::runtime::has_live_session;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
     ActivityKind, ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
     OpResultSender, PendingAutoStart, PendingSwitch, PendingSwitchOff, ProfileActivity,
     RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, TokenEntry,
     TokenList, UsageStore, any_busy, clear_activity, fetch_all_into, is_idle, mark_activity,
-    spawn_refresher,
+    now_ms, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -392,6 +393,13 @@ pub(crate) struct App {
     pub(crate) startup_sender: StartupSender,
     pub(crate) last_fetched: LastFetchedAt,
     pub(crate) pending_auto_start: PendingAutoStart,
+    /// UI-thread-only debounce for auto-starting profiles that have a live
+    /// `clauth start` session: name → epoch-ms first seen windowless. A running
+    /// Claude Code can open a 5h window our usage store hasn't fetched yet, so we
+    /// wait out one refresh interval of windowlessness before kicking, else the
+    /// kick double-fires on an account CC already armed. Pruned each tick to the
+    /// current live-session candidate set.
+    pub(crate) auto_start_windowless_since: HashMap<String, u64>,
     /// Scheduler-posted auto-switch decisions. Drained inside `on_tick` and
     /// dispatched to the same switch worker pipeline as user-initiated
     /// switches.
@@ -534,6 +542,7 @@ impl App {
             startup_sender,
             last_fetched,
             pending_auto_start,
+            auto_start_windowless_since: HashMap::new(),
             pending_switch,
             pending_switch_off,
             refetch_queue,
@@ -2170,6 +2179,60 @@ fn toggle_auto_start(app: &mut App, name: &str) {
     }
 }
 
+/// Minimum time a profile with a live `clauth start` session must read
+/// windowless before auto-start kicks it. Comfortably above the 60s usage
+/// refresh interval so a 5h window Claude Code just opened lands in our store
+/// (flipping the profile out of the candidate set) before the timer elapses —
+/// without it, the kick double-fires on an account CC already armed.
+const AUTO_START_LIVE_SESSION_DEBOUNCE_MS: u64 = 90_000;
+
+/// Filter windowless, cooldown-eligible auto-start `candidates` down to the ones
+/// ready to kick now. A candidate with no live session has no external
+/// window-opener and passes straight through. A candidate WITH a live session is
+/// held until it has read windowless for `AUTO_START_LIVE_SESSION_DEBOUNCE_MS`,
+/// since a running Claude Code may have opened a 5h window our usage store hasn't
+/// fetched yet. First-seen-windowless timestamps live in
+/// `auto_start_windowless_since`, pruned to the current live-session candidate
+/// set each call so a window appearing (or a kick landing → cooldown) restarts
+/// the debounce cleanly.
+fn ready_auto_start(app: &mut App, candidates: Vec<String>) -> Vec<String> {
+    let live: HashSet<String> = candidates
+        .iter()
+        .filter(|name| has_live_session(name))
+        .cloned()
+        .collect();
+    debounce_live_candidates(
+        &mut app.auto_start_windowless_since,
+        candidates,
+        &live,
+        now_ms(),
+    )
+}
+
+/// Pure core of [`ready_auto_start`], split out so the debounce is testable
+/// without an `App` or the filesystem (`has_live_session`). `live` is the subset
+/// of `candidates` that currently hold a live session; `since` tracks when each
+/// was first seen windowless and is pruned to `live` so non-live or no-longer-
+/// candidate names can't keep a stale timer.
+fn debounce_live_candidates(
+    since: &mut HashMap<String, u64>,
+    candidates: Vec<String>,
+    live: &HashSet<String>,
+    now: u64,
+) -> Vec<String> {
+    since.retain(|name, _| live.contains(name));
+    candidates
+        .into_iter()
+        .filter(|name| {
+            if !live.contains(name) {
+                return true;
+            }
+            let first = *since.entry(name.clone()).or_insert(now);
+            now.saturating_sub(first) >= AUTO_START_LIVE_SESSION_DEBOUNCE_MS
+        })
+        .collect()
+}
+
 fn handle_confirm_key(app: &mut App, key: KeyEvent) {
     let Some(Modal::Confirm(state)) = app.modals.last_mut() else {
         return;
@@ -2454,13 +2517,18 @@ pub(crate) fn on_tick(app: &mut App) {
         Vec::new()
     } else {
         let candidates = oauth::windowless_auto_start_candidates(&app.config, &app.usage_store);
-        app.pending_auto_start
+        let raw: Vec<String> = app
+            .pending_auto_start
             .lock()
             .map(|mut g| {
                 g.extend(candidates);
                 g.drain().collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Hold off on live-session candidates until they've read windowless long
+        // enough that a window CC just opened would have been fetched; non-live
+        // candidates pass straight through.
+        ready_auto_start(app, raw)
     };
     for name in pending {
         if !is_idle(&app.activity, &name) {
@@ -2779,5 +2847,56 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let activity = make_activity(&[("alice", ProfileActivity::Refreshing)]);
         assert!(bootstrap_busy(&flag, &activity));
+    }
+
+    use super::{AUTO_START_LIVE_SESSION_DEBOUNCE_MS, debounce_live_candidates};
+    use std::collections::HashSet;
+
+    /// A candidate with no live session has no external window-opener, so it is
+    /// armed immediately — the debounce only applies to live sessions.
+    #[test]
+    fn debounce_passes_non_live_candidate_through() {
+        let mut since = HashMap::new();
+        let live = HashSet::new();
+        let ready = debounce_live_candidates(&mut since, vec!["bg".to_string()], &live, 1_000_000);
+        assert_eq!(ready, vec!["bg".to_string()]);
+        assert!(since.is_empty(), "no timer for a non-live candidate");
+    }
+
+    /// A live-session candidate seen windowless for the first time is held, not
+    /// kicked — a running CC may have opened a window we haven't fetched yet.
+    #[test]
+    fn debounce_holds_live_candidate_on_first_sight() {
+        let mut since = HashMap::new();
+        let live = HashSet::from(["cc".to_string()]);
+        let ready = debounce_live_candidates(&mut since, vec!["cc".to_string()], &live, 1_000_000);
+        assert!(
+            ready.is_empty(),
+            "live candidate must wait out the debounce"
+        );
+        assert_eq!(since.get("cc"), Some(&1_000_000), "first-seen stamped");
+    }
+
+    /// Once a live-session candidate has read windowless past the debounce, it
+    /// is armed — the genuinely idle (or just-reset) session that needs a kick.
+    #[test]
+    fn debounce_arms_live_candidate_after_window() {
+        let now = 5_000_000;
+        let mut since =
+            HashMap::from([("cc".to_string(), now - AUTO_START_LIVE_SESSION_DEBOUNCE_MS)]);
+        let live = HashSet::from(["cc".to_string()]);
+        let ready = debounce_live_candidates(&mut since, vec!["cc".to_string()], &live, now);
+        assert_eq!(ready, vec!["cc".to_string()]);
+    }
+
+    /// A name that drops out of the live-candidate set (window appeared, or the
+    /// kick landed → cooldown) is pruned so its timer restarts clean next time.
+    #[test]
+    fn debounce_prunes_stale_timers() {
+        let mut since = HashMap::from([("gone".to_string(), 1)]);
+        let live = HashSet::new();
+        let ready = debounce_live_candidates(&mut since, Vec::new(), &live, 9_000_000);
+        assert!(ready.is_empty());
+        assert!(since.is_empty(), "stale timer pruned");
     }
 }
