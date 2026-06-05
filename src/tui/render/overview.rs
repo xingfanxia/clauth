@@ -12,7 +12,7 @@ use super::format::{
     account_type_label, account_type_style, fixed, fixed_split, health_color, name_style,
     spinner_frame, spinner_style, window_summary_parts, window_summary_span,
 };
-use super::panes::{empty_state, section_box, select_line};
+use super::panes::{draw_scrollbar, empty_state, section_box, select_line};
 use crate::fallback::threshold_for;
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{ProfileActivity, now_ms};
@@ -69,10 +69,14 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         })
         .collect();
 
+    let total = items.len();
     let list = List::new(rows).style(theme::base());
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(sel));
     frame.render_stateful_widget(list, chunks[1], &mut state);
+
+    let viewport = chunks[1].height as usize;
+    draw_scrollbar(frame, chunks[1], total, state.offset(), viewport);
 }
 
 #[derive(Debug, Clone, Copy)]

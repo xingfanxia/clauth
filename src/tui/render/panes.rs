@@ -96,6 +96,51 @@ pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'
     .wrap(Wrap { trim: false })
 }
 
+/// Renders a scrollbar into the 1-cell right-padding column of a panel.
+///
+/// Track: `░` in `LINE`. Thumb: `█` in `TEXT_DIM`.
+/// Only renders when `total > viewport` (content overflows). The column sits
+/// flush against the content area's right edge — it reuses the padding cell
+/// `section_box` already reserves, so content width is unchanged.
+pub(super) fn draw_scrollbar(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    total: usize,
+    offset: usize,
+    viewport: usize,
+) {
+    if total <= viewport || viewport == 0 || inner.height == 0 {
+        return;
+    }
+    // Right-padding column: one cell to the right of the content rect.
+    let col_x = inner.x + inner.width;
+    let col_y = inner.y;
+    let col_h = inner.height as usize;
+
+    // Thumb length: proportional to viewport / total, at least 1.
+    let thumb_len = ((col_h * viewport) / total).max(1).min(col_h);
+    // Thumb start: proportional to scroll offset.
+    let max_offset = total.saturating_sub(viewport);
+    let thumb_top = ((col_h - thumb_len) * offset)
+        .checked_div(max_offset)
+        .unwrap_or(0);
+    let thumb_end = thumb_top + thumb_len;
+
+    let buf = frame.buffer_mut();
+    for row in 0..col_h {
+        let cell = buf.cell_mut((col_x, col_y + row as u16));
+        if let Some(cell) = cell {
+            if row >= thumb_top && row < thumb_end {
+                cell.set_symbol("█");
+                cell.set_style(Style::default().fg(theme::TEXT_DIM));
+            } else {
+                cell.set_symbol("░");
+                cell.set_style(Style::default().fg(theme::LINE));
+            }
+        }
+    }
+}
+
 /// Bordered selector list; `build_rows` receives the inner width for the selection bar.
 pub(super) fn draw_selector_list(
     frame: &mut Frame<'_>,
@@ -115,11 +160,15 @@ pub(super) fn draw_selector_list(
         return;
     }
 
+    let total = rows.len();
     let list =
         List::new(rows.into_iter().map(ListItem::new).collect::<Vec<_>>()).style(theme::base());
     let mut state = ListState::default();
     state.select(Some(sel));
     frame.render_stateful_widget(list, inner, &mut state);
+
+    let viewport = inner.height as usize;
+    draw_scrollbar(frame, inner, total, state.offset(), viewport);
 }
 
 /// Rounded box with contract-compliant chrome.
