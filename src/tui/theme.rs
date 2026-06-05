@@ -8,7 +8,6 @@ use ratatui::style::{Color, Modifier, Style};
 
 // ── Surfaces ──────────────────────────────────────────────────────────────────
 pub(crate) const BG: Color = Color::Rgb(30, 30, 46);
-pub(crate) const BG_RAISED: Color = Color::Rgb(24, 24, 37);
 pub(crate) const BG_SUNKEN: Color = Color::Rgb(17, 17, 27);
 pub(crate) const BG_HOVER: Color = Color::Rgb(40, 40, 56);
 
