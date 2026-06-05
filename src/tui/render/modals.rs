@@ -196,7 +196,35 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
         Line::from(""),
         modal_footer_hints(&[("⏎", "capture"), ("⎋", "cancel")]).alignment(Alignment::Center),
     ];
-    draw_modal(frame, area, "CAPTURE", lines);
+
+    // Replicate draw_modal's geometry to place the native terminal cursor on the
+    // input line (index 2 in the vec).  Chrome = border (1) + padding (2 left, 1 top).
+    let title = "CAPTURE";
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (content_w + 6)
+        .max(title.chars().count() as u16 + 4)
+        .min(area.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let rect = {
+        let cw = w.min(area.width.saturating_sub(4));
+        let ch = h.min(area.height.saturating_sub(4));
+        Rect {
+            x: area.x + (area.width.saturating_sub(cw)) / 2,
+            y: area.y + (area.height.saturating_sub(ch)) / 2,
+            width: cw,
+            height: ch,
+        }
+    };
+    // inner = rect + border (1) + padding left/top (2, 1)
+    let inner_x = rect.x.saturating_add(3);
+    let inner_y = rect.y.saturating_add(2);
+
+    draw_modal(frame, area, title, lines);
+
+    // x = label "name" (4) + " " (1) + cols before caret
+    let cx = inner_x.saturating_add(4 + 1 + head_cols(&input) as u16);
+    let cy = inner_y.saturating_add(2); // line index 2
+    frame.set_cursor_position((cx, cy));
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -306,26 +334,23 @@ fn modal_footer_hints(hints: &[(&str, &str)]) -> Line<'static> {
 }
 
 fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'static> {
-    let (head, tail) = input.value.split_at(input.cursor.min(input.value.len()));
-    let caret_style = if focused {
-        Style::default()
-            .fg(theme::TEXT)
-            .bg(theme::ACCENT)
-            .add_modifier(Modifier::BOLD)
+    // When focused the native terminal cursor owns the caret — no block highlight.
+    // Unfocused fields still render with plain text styling (no BG_SUNKEN tint).
+    let value_style = if focused {
+        Style::default().fg(theme::TEXT).bg(theme::BG_SUNKEN)
     } else {
         Style::default().fg(theme::TEXT)
     };
-    let body_style = Style::default().fg(theme::TEXT).bg(theme::BG_SUNKEN);
-
-    let mut tail_iter = tail.chars();
-    let caret_char = tail_iter.next().unwrap_or(' ').to_string();
-    let after: String = tail_iter.collect();
-
     Line::from(vec![
         Span::styled(label.to_string(), theme::label()),
         Span::raw(" "),
-        Span::styled(head.to_string(), body_style),
-        Span::styled(caret_char, caret_style),
-        Span::styled(after, body_style),
+        Span::styled(input.value.clone(), value_style),
     ])
+}
+
+/// Display columns before the caret in `input` (char count of the pre-caret slice).
+fn head_cols(input: &InputState) -> usize {
+    input.value[..input.cursor.min(input.value.len())]
+        .chars()
+        .count()
 }

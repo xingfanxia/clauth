@@ -6,9 +6,21 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+
+// ── display-column helpers ────────────────────────────────────────────────────
+// `InputState::cursor` is a byte offset; for screen-column math we need the
+// char count of the text before the caret. All fields here are ASCII-only in
+// practice, so `.chars().count()` equals display columns.
+
+/// Number of display columns occupied by the text before the caret.
+fn head_cols(input: &InputState) -> usize {
+    input.value[..input.cursor.min(input.value.len())]
+        .chars()
+        .count()
+}
 
 use super::super::app::{App, ConfigFocus, ConfigRow, InputState, config_rows};
 use super::super::theme;
@@ -165,35 +177,62 @@ fn draw_settings_rows(
         ]),
         Line::from(""),
     ];
+    // Track which absolute line index the editing row occupies so we can set
+    // the native terminal cursor after rendering.
+    let mut edit_line_y: Option<u16> = None;
+    // `lines` starts with [type, blank] = 2 entries before the loop.
+    let mut line_idx: u16 = 2;
+
     for (i, row) in rows.iter().enumerate() {
         let selected = actions_focused && i == cursor;
+        let is_editing = editing == Some(*row);
         let line = detail_row(
             *row,
             selected,
-            editing == Some(*row),
+            is_editing,
             armed_delete,
             snap,
             &name_in,
             &base_in,
             &key_in,
         );
+        if is_editing {
+            edit_line_y = Some(line_idx);
+        }
         lines.push(if selected {
             highlight_row(line, inner.width as usize)
         } else {
             line
         });
+        line_idx += 1;
         if selected
-            && editing != Some(*row)
+            && !is_editing
             && let Some(text) = row_hint(*row)
         {
             lines.push(Line::from(vec![
                 Span::styled("  └ ", theme::faint()),
                 Span::styled(text, theme::faint()),
             ]));
+            line_idx += 1;
         }
     }
 
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+
+    // Position the native terminal cursor at the caret when a field is active.
+    if let (Some(row), Some(ly)) = (editing, edit_line_y) {
+        let input = match row {
+            ConfigRow::Name => &name_in,
+            ConfigRow::BaseUrl => &base_in,
+            ConfigRow::ApiKey => &key_in,
+            _ => return,
+        };
+        // x = "❯ " (2) + key + pad (always KEY_W + 1 cols) + cols before caret
+        let prefix_cols = 2 + KEY_W + 1 + head_cols(input);
+        let cx = inner.x.saturating_add(prefix_cols as u16);
+        let cy = inner.y.saturating_add(ly);
+        frame.set_cursor_position((cx, cy));
+    }
 }
 
 /// Inline help for rows whose labels don't self-describe.
@@ -280,18 +319,8 @@ fn value_spans(input: &InputState, editing: bool) -> Vec<Span<'static>> {
         }
         return vec![Span::styled(input.value.clone(), theme::body())];
     }
-    let (head, tail) = input.value.split_at(input.cursor.min(input.value.len()));
-    let caret_style = Style::default()
-        .fg(theme::TEXT)
-        .bg(theme::ACCENT)
-        .add_modifier(Modifier::BOLD);
+    // In edit mode the terminal cursor (set via frame.set_cursor_position) owns
+    // the caret glyph — no simulated block highlight needed.
     let body = Style::default().fg(theme::TEXT).bg(theme::BG_SUNKEN);
-    let mut tail_iter = tail.chars();
-    let caret = tail_iter.next().unwrap_or(' ').to_string();
-    let after: String = tail_iter.collect();
-    vec![
-        Span::styled(head.to_string(), body),
-        Span::styled(caret, caret_style),
-        Span::styled(after, body),
-    ]
+    vec![Span::styled(input.value.clone(), body)]
 }

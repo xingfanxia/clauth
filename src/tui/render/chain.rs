@@ -8,7 +8,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -130,6 +130,22 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+
+    // Position the native terminal cursor when the threshold field is being typed.
+    // The threshold row is always FALLBACK_ROWS[0]; member_detail pushes exactly
+    // 8 fixed lines before the loop (position, blank, label, gauge, figure,
+    // blank, next-hop-or-only-member, blank).
+    if detail_focused
+        && let Some(ChainItemKind::Member(_)) = selected
+        && let Some(draft) = &app.fallback_threshold_draft
+    {
+        // x = "❯ " (2) + "threshold" (9) + pad (KEY_W - 9 + 1 = 3) + cols before caret
+        // = 2 + KEY_W + 1 + head_cols  =  14 + head_cols
+        let prefix_cols = 2 + KEY_W + 1 + head_cols(draft);
+        let cx = inner.x.saturating_add(prefix_cols as u16);
+        let cy = inner.y.saturating_add(8);
+        frame.set_cursor_position((cx, cy));
+    }
 }
 
 /// Position + active state, 5h gauge with threshold tick, headroom, next hop,
@@ -319,20 +335,17 @@ fn detail_row(
 }
 
 fn value_caret(input: &InputState) -> Vec<Span<'static>> {
-    let (head, tail) = input.value.split_at(input.cursor.min(input.value.len()));
-    let caret_style = Style::default()
-        .fg(theme::TEXT)
-        .bg(theme::ACCENT)
-        .add_modifier(Modifier::BOLD);
+    // The terminal cursor (set via frame.set_cursor_position) owns the caret
+    // glyph — render the whole buffer with uniform body styling.
     let body = Style::default().fg(theme::TEXT).bg(theme::BG_SUNKEN);
-    let mut tail_iter = tail.chars();
-    let caret = tail_iter.next().unwrap_or(' ').to_string();
-    let after: String = tail_iter.collect();
-    vec![
-        Span::styled(head.to_string(), body),
-        Span::styled(caret, caret_style),
-        Span::styled(after, body),
-    ]
+    vec![Span::styled(input.value.clone(), body)]
+}
+
+/// Display columns occupied by the text before the caret in `input`.
+fn head_cols(input: &InputState) -> usize {
+    input.value[..input.cursor.min(input.value.len())]
+        .chars()
+        .count()
 }
 
 fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {
