@@ -395,8 +395,11 @@ fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'s
             ]
         } else {
             vec![
-                Span::styled("     ↺", theme::orange()),
-                Span::styled(" wraps to the top", theme::faint()),
+                Span::raw("  "),
+                Span::styled("[ ", theme::dim()),
+                Span::styled("wraps", theme::orange().add_modifier(Modifier::BOLD)),
+                Span::styled(" ]", theme::dim()),
+                Span::styled(" wraps to the top when all spent", theme::faint()),
             ]
         };
         lines.push(Line::from(caption));
