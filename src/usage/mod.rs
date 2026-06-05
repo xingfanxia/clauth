@@ -4,9 +4,7 @@ mod scheduler;
 pub(crate) use fetch::{
     PlanInfo, UsageInfo, UsageWindow, humanize_duration, iso_to_epoch_secs, now_epoch_secs, now_ms,
 };
-// Only the `#[cfg(test)]` showcase names this type directly; elsewhere it's
-// reached through the `UsageInfo::extra_usage` field, so the re-export would be
-// an unused import in a normal build.
+// Named directly only in `#[cfg(test)]` showcase; the field access path is enough in prod.
 #[cfg(test)]
 pub(crate) use fetch::ExtraUsage;
 pub(crate) use scheduler::{

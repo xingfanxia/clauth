@@ -1,19 +1,14 @@
 //! Application state, keymap, and tick logic.
 //!
 //! Layout invariants:
-//!   - The Overview menu is a read-only list of account rows. A single shared
-//!     `profile_cursor` indexes the selected account on the Overview, Usage, and
-//!     Config tabs, so the highlight stays put across tab switches. Account
-//!     creation and editing live on the Config tab.
-//!   - The Config tab is master-detail: an account list (plus a `+ new` row)
-//!     and an inline detail editor (`config_draft`) — no popups for new / edit
-//!     / rename / delete.
-//!   - The Fallback tab is master-detail too: the ordered chain (plus a
-//!     `+ add` row) on the left, an inline threshold stepper / remove row (or
-//!     add-candidate picker) on the right — no popups for threshold / reorder
-//!     / remove / add.
-//!   - Modals stack: the top of `modals` owns input; events fall through to
-//!     the screen below only when the stack is empty.
+//!   - Overview: read-only account list; `profile_cursor` is shared with Usage
+//!     and Config so the highlight follows across tab switches.
+//!   - Config: master-detail — account list + `+ new` row + inline editor
+//!     (`config_draft`). No popups for create / edit / rename / delete.
+//!   - Fallback: master-detail — ordered chain + `+ add` on the left; inline
+//!     threshold stepper / remove / add-picker on the right. No popups.
+//!   - Modals stack: top of `modals` owns input; events reach the screen below
+//!     only when the stack is empty.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -139,24 +134,19 @@ impl InputState {
 
 // ── Modals ────────────────────────────────────────────────────────────────────
 
-/// One interactive line in the Fallback tab's detail pane when a chain member
-/// is selected. Mirrors [`ConfigRow`] — built per member by [`fallback_rows`].
-/// `Threshold` is a stepper (±5 on `+` / `-`); `Remove` arms then confirms,
-/// the same inline arm-to-confirm pattern as the Config delete row.
+/// One interactive line in the Fallback tab's detail pane for a chain member.
+/// `Threshold` is a stepper (±5 on `+`/`-`); `Remove` arms then confirms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FallbackRow {
     Threshold,
-    /// Chain-global wrap-off toggle. Rendered as a button on every member card
-    /// (the setting is per-chain, not per-member); ⏎ flips it.
+    /// Chain-global wrap-off toggle (per-chain, not per-member); ⏎ flips it.
     WrapOff,
     Remove,
 }
 
-/// One editable line in the Config tab's detail pane. The row set is built per
-/// selection by [`config_rows`]: auto-start shows only for OAuth accounts, and
-/// the trailing row swaps between `delete` (an existing account) and `create`
-/// (the `+ new` draft). `Name` / `BaseUrl` / `ApiKey` are text rows; the rest
-/// are single-press toggles or actions.
+/// One editable line in the Config tab's detail pane. Built per selection by
+/// [`config_rows`]: auto-start only for OAuth; trailing row is `delete` or
+/// `create`. `Name`/`BaseUrl`/`ApiKey` are text rows; the rest are toggles/actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigRow {
     Name,
@@ -168,7 +158,7 @@ pub(crate) enum ConfigRow {
 }
 
 impl ConfigRow {
-    /// Text rows capture keystrokes when activated; the rest act on ⏎.
+    /// Text rows capture keystrokes; the rest act on ⏎.
     pub(crate) fn is_text(self) -> bool {
         matches!(
             self,
@@ -177,23 +167,19 @@ impl ConfigRow {
     }
 }
 
-/// Inline editor state for the Config detail pane — the replacement for the old
-/// new / edit / rename popups. One draft is built when focus drops into the
-/// detail pane (from a profile row or the `+ new` row) and torn down when focus
-/// returns to the account list.
+/// Inline editor state for the Config detail pane. Built on entry, torn down
+/// when focus returns to the account list.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigDraft {
-    /// `None` while creating a new account; `Some(name)` while editing an
-    /// existing one. Existing-account text edits commit per-field on ⏎; the new
-    /// draft buffers all three fields until the `create` row fires.
+    /// `None` while creating; `Some(name)` while editing. Existing accounts
+    /// commit per-field on ⏎; new drafts buffer until the `create` row fires.
     pub(crate) editing_name: Option<String>,
     pub(crate) name: InputState,
     pub(crate) base_url: InputState,
     pub(crate) api_key: InputState,
-    /// `Some(row)` while a text row owns the keyboard (caret visible).
+    /// `Some(row)` while a text row owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
-    /// First ⏎ on the delete row arms it; the second confirms. Any cursor move
-    /// disarms — an inline stand-in for the old delete-confirm popup.
+    /// First ⏎ on delete arms it; second confirms. Any cursor move disarms.
     pub(crate) armed_delete: bool,
 }
 
@@ -201,22 +187,19 @@ pub(crate) struct ConfigDraft {
 pub(crate) struct ConfirmState {
     pub(crate) message: String,
     pub(crate) detail: Option<String>,
-    /// Currently highlighted choice; false = no/cancel, true = yes/confirm.
+    /// Highlighted choice: false = cancel, true = confirm.
     pub(crate) choice: bool,
     pub(crate) on_confirm: ConfirmAction,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum ConfirmAction {
-    /// `bool` = `from_divergence`, carried through so the conflict path
-    /// keeps the deferred-detach semantics of the `NewProfile` divergence flow.
+    /// `bool` = `from_divergence`, carried through for deferred-detach semantics.
     CaptureConflict(Box<CaptureSnapshot>, bool),
     Switch(String),
-    /// Confirm step before discarding CC's freshly-written credentials and
-    /// re-linking the live path to the named profile's stored creds.
+    /// Confirm before discarding CC's freshly-written credentials and relinking.
     DiscardDivergence(String),
-    /// Force-rotate every profile's refresh token, bypassing the live-session
-    /// guard. Profiles with an active `clauth start` session may be logged out.
+    /// Force-rotate all refresh tokens; active sessions may be logged out.
     RotateAll,
 }
 
@@ -224,10 +207,8 @@ pub(crate) enum ConfirmAction {
 pub(crate) struct CaptureNameForm {
     pub(crate) snapshot: Box<CaptureSnapshot>,
     pub(crate) input: InputState,
-    /// Set when the capture was initiated by the `NewProfile` divergence
-    /// choice. Deferring the destructive detach + deactivate of the
-    /// previously-active profile to the capture's success arm keeps that
-    /// profile linked and active if the user cancels the name modal.
+    /// Set when initiated by `NewProfile` divergence. Detach + deactivate of
+    /// the prior profile is deferred to the success arm so cancel leaves it intact.
     pub(crate) from_divergence: bool,
 }
 
@@ -238,11 +219,9 @@ pub(crate) enum DivergenceChoice {
     Discard,
 }
 
-/// Modal state for the credential-divergence prompt. Shown both at startup
-/// and whenever the 1Hz runtime poll detects the live .credentials.json no
-/// longer resolves to the active profile's stored creds. Three explicit
-/// actions: take CC's new creds into the active profile, save them as a
-/// new profile, or discard them and restore the profile's stored identity.
+/// Credential-divergence prompt. Shown at startup and on the 1Hz poll when
+/// `.credentials.json` no longer matches the active profile's stored creds.
+/// Three actions: Overwrite, NewProfile, or Discard.
 #[derive(Debug, Clone)]
 pub(crate) struct DivergenceForm {
     pub(crate) active: String,
@@ -262,7 +241,7 @@ impl DivergenceForm {
 #[derive(Debug, Clone)]
 pub(crate) enum Modal {
     Confirm(ConfirmState),
-    /// Credential divergence prompt — Overwrite / NewProfile / Discard.
+    /// Credential divergence prompt.
     Divergence(DivergenceForm),
     CaptureName(CaptureNameForm),
     Help,
@@ -285,27 +264,22 @@ pub(crate) struct Toast {
     pub(crate) born: Instant,
 }
 
-/// Confirm modal copy for the force-rotate-all action.
 const ROTATE_ALL_MSG: &str = "rotate tokens for all accounts?";
 const ROTATE_ALL_DETAIL: &str = "accounts with a live session might be logged out.";
-
-/// Maximum on-screen toasts at any one time; older expire to make room.
 const TOAST_CAPACITY: usize = 4;
-/// How long a toast stays visible before fading off the stack.
 const TOAST_TTL: Duration = Duration::from_secs(4);
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
-/// Top-level views, switched by ⇥ / ⇧⇥ / ← → and shown in the tab bar. Every
-/// tab shares the same background workers; only the body and keymap change.
+/// Top-level views (⇥/⇧⇥/←→). All tabs share background workers; only the
+/// body and keymap differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
-    /// Accounts table + at-a-glance usage; the home view.
+    /// Accounts table + at-a-glance usage.
     Overview,
-    /// Per-account usage breakdown (all windows, reset timers, extra credits).
+    /// Per-account usage breakdown.
     Usage,
-    /// Per-account settings: endpoint, rename, auto-start, chain membership,
-    /// delete. Master-detail: a profile list plus an actions pane.
+    /// Per-account settings (endpoint, rename, auto-start, delete).
     Config,
     /// Fallback chain editor — ordering and per-member thresholds.
     Fallback,
@@ -336,18 +310,15 @@ impl Tab {
     }
 }
 
-/// Which pane owns the cursor on the Config tab. `Profiles` selects which
-/// account to configure; `Actions` walks that account's settings list.
+/// Which Config pane owns the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigFocus {
     Profiles,
     Actions,
 }
 
-/// Which Fallback pane has focus, mirroring [`ConfigFocus`]. `Chain` drives the
-/// ordered list on the left (↑↓ moves, ⇧↑↓ reorders, ⏎ drops in); `Detail`
-/// drives the right pane — the member's threshold stepper + remove row, or the
-/// add-candidate picker.
+/// Which Fallback pane has focus. `Chain`: ordered list (↑↓, ⇧↑↓ reorders, ⏎
+/// enters). `Detail`: threshold stepper + remove row, or add-candidate picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FallbackFocus {
     Chain,
@@ -364,119 +335,84 @@ pub(crate) enum MainItemKind {
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub(crate) struct App {
-    /// Shared mutable state — locked by the main thread on every read/write
-    /// and by the background usage refresher when rotating tokens or kicking
-    /// auto-start. Hold the guard only across the work that needs it; releasing
-    /// before HTTP-heavy operations keeps the refresher from stalling the UI.
+    /// Shared config; locked by the UI thread and the background refresher.
+    /// Release before HTTP to avoid stalling the UI.
     pub(crate) config: ConfigHandle,
 
     pub(crate) usage_store: UsageStore,
     pub(crate) usage_status: StatusStore,
     pub(crate) usage_tokens: TokenList,
     pub(crate) next_refresh_per_profile: NextRefreshPerProfile,
-    /// One source of truth for "what's happening to profile X right now",
-    /// shared between the scheduler thread, oauth refresh paths, and the TUI
-    /// render loop. The render loop reads it on every frame to drive the
-    /// spinner; workers write per-name. Never held across HTTP.
+    /// Per-profile activity state; read by the render loop for spinners, written
+    /// by workers. Never held across HTTP.
     pub(crate) activity: ActivityStore,
-    /// Drained inside `on_tick`. Each result clears its profile's
-    /// `ActivityStore` slot and surfaces any error as a danger toast.
+    /// Drained in `on_tick`; each result clears the activity slot and surfaces errors.
     pub(crate) op_results: OpResultReceiver,
-    /// Sender side. Cloned into workers (and passed to refresh/rotation
-    /// helpers) so they can report completion without holding any lock.
+    /// Sender side; cloned into workers so they can report without holding a lock.
     pub(crate) op_sender: OpResultSender,
-    /// Startup phase signals from the reconcile / bootstrap background workers.
-    /// Drained inside `on_tick`; sequences the event loop through reconcile →
-    /// bootstrap without blocking the first paint on HTTP or an FS walk.
+    /// Startup signals from reconcile/bootstrap workers; drained in `on_tick`.
     pub(crate) startup_results: StartupReceiver,
-    /// Sender side, cloned into the two startup workers.
+    /// Sender side for startup workers.
     pub(crate) startup_sender: StartupSender,
     pub(crate) last_fetched: LastFetchedAt,
     pub(crate) pending_auto_start: PendingAutoStart,
-    /// UI-thread-only debounce for auto-starting profiles that have a live
-    /// `clauth start` session: name → epoch-ms first seen windowless. A running
-    /// Claude Code can open a 5h window our usage store hasn't fetched yet, so we
-    /// wait out one refresh interval of windowlessness before kicking, else the
-    /// kick double-fires on an account CC already armed. Pruned each tick to the
-    /// current live-session candidate set.
+    /// name → epoch-ms first seen windowless; debounces live-session candidates.
+    /// Pruned each tick to the current candidate set.
     pub(crate) auto_start_windowless_since: HashMap<String, u64>,
-    /// Scheduler-posted auto-switch decisions. Drained inside `on_tick` and
-    /// dispatched to the same switch worker pipeline as user-initiated
-    /// switches.
+    /// Scheduler-posted auto-switch decisions; drained in `on_tick`.
     pub(crate) pending_switch: PendingSwitch,
-    /// Scheduler-posted wrap-off decision. When the whole chain is spent with
-    /// no sink, the scheduler flips this true; `on_tick` drains it and turns
-    /// off all accounts.
+    /// Set by the scheduler when the whole chain is spent; `on_tick` drains it
+    /// and turns off all accounts.
     pub(crate) pending_switch_off: PendingSwitchOff,
     pub(crate) refetch_queue: RefetchQueue,
 
     pub(crate) tab: Tab,
     pub(crate) modals: Vec<Modal>,
 
-    /// Selected account index, shared across the Overview, Usage, and Config
-    /// tabs so the highlighted account stays put when you switch tabs. On the
-    /// Config tab it may also rest on the trailing `+ new` row (== profile_count).
+    /// Selected account index, shared across Overview/Usage/Config tabs.
+    /// On Config may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
-    /// Which Config pane has focus; gates whether ↑↓ walks profiles or actions.
+    /// Which Config pane has focus.
     pub(crate) config_focus: ConfigFocus,
     /// Cursor into the detail rows on the Config tab's right pane.
     pub(crate) config_action_cursor: usize,
-    /// Inline editor for the Config detail pane. `Some` only while the Actions
-    /// pane owns focus; built on entry, torn down on the way back to the list.
+    /// Inline editor for the Config detail pane; `Some` only while Actions has focus.
     pub(crate) config_draft: Option<ConfigDraft>,
-    /// Cursor into `chain_items()` on the Fallback tab's left pane.
+    /// Cursor into `chain_items()` on the Fallback left pane.
     pub(crate) chain_cursor: usize,
-    /// Which Fallback pane has focus; gates whether ↑↓ walks the chain or the
-    /// member's detail rows / add candidates.
+    /// Which Fallback pane has focus.
     pub(crate) fallback_focus: FallbackFocus,
-    /// Cursor into the right pane on the Fallback tab — `fallback_rows()` for a
-    /// member, or the candidate list for the `+ add` row.
+    /// Cursor into the Fallback right pane (member rows or add-candidate list).
     pub(crate) fallback_detail_cursor: usize,
-    /// First ⏎ on the remove row arms it; the second confirms. Any cursor move
-    /// or focus change disarms — the inline stand-in for the old remove popup.
+    /// First ⏎ on remove arms it; second confirms. Cursor move or focus change disarms.
     pub(crate) fallback_armed_remove: bool,
-    /// `Some` while the threshold row is being typed into (⏎ on the row opens
-    /// it). Owns the keyboard like a Config text edit; `+` / `-` still step the
-    /// value when this is `None`.
+    /// `Some` while the threshold field is open (⏎ opens, owns keyboard).
+    /// `+`/`-` still step the value when `None`.
     pub(crate) fallback_threshold_draft: Option<InputState>,
 
     pub(crate) toasts: VecDeque<Toast>,
-    /// Outcome of the startup update check, drained in `on_tick` into a toast.
-    /// Best-effort: the worker stays silent on errors and when up to date.
+    /// Startup update check result; drained in `on_tick`. Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
 
     pub(crate) last_state_mtime: Option<SystemTime>,
     pub(crate) started_at: Instant,
-    /// Monotonically increasing render-tick counter used to advance the
-    /// activity spinner frame. Bumped once per `on_tick`.
+    /// Tick counter; advances the activity spinner frame each `on_tick`.
     pub(crate) tick_count: u64,
     pub(crate) quit: bool,
-    /// Last time the 1Hz divergence poll ran. Re-checks whether
-    /// `~/.claude/.credentials.json` still points at the active profile and
-    /// pushes a Divergence modal when CC has overwritten the symlink
-    /// (typically by `/login`). Defers behind any open modal.
+    /// Last time the 1Hz divergence poll ran.
     pub(crate) last_divergence_check: Instant,
-    /// True once the startup reconcile worker has reported back. Gates the
-    /// bootstrap spawn so token rotation never races a soon-to-be-disowned
-    /// profile (the reconcile prompt must be resolved first).
+    /// Set once reconcile reports back; gates bootstrap spawn.
     pub(crate) reconcile_done: bool,
-    /// True once `spawn_bootstrap` has been dispatched. Guards against a
-    /// second dispatch on subsequent ticks.
+    /// Set once `spawn_bootstrap` is dispatched; prevents double-dispatch.
     pub(crate) bootstrap_started: bool,
-    /// True while the bootstrap worker is still running (set before spawn,
-    /// cleared inside the worker on every exit path). `ConfirmAction::RotateAll`
-    /// consults this alongside `any_busy` to block a concurrent rotate-all
-    /// from racing the bootstrap's `refresh_all` leg.
+    /// Set before bootstrap spawn, cleared on every worker exit path.
+    /// `ConfirmAction::RotateAll` checks this alongside `any_busy` to block a
+    /// concurrent rotate-all from racing the bootstrap's relink + initial fetch.
     pub(crate) bootstrap_active: Arc<AtomicBool>,
 }
 
-/// The shared state the background scheduler thread needs, bundled into one
-/// bag so [`App::start_scheduler`] can hand it to [`spawn_refresher`] without a
-/// wall of `Arc::clone` calls at the call site.
-///
-/// Holds *cloned `Arc`s only* — never a live `RankGuard`. The bag therefore
-/// carries no lock rank and is safe to construct while holding any lock; the
-/// scheduler locks each handle itself, under the global order.
+/// Cloned `Arc`s bundled for [`spawn_refresher`]; carries no lock rank and is
+/// safe to construct while holding any lock.
 struct WorkerHandles {
     config: ConfigHandle,
     usage_tokens: TokenList,
@@ -491,7 +427,7 @@ struct WorkerHandles {
 }
 
 impl WorkerHandles {
-    /// Clone every `Arc` the scheduler shares with the UI thread out of `app`.
+    /// Clone every scheduler `Arc` out of `app`.
     fn from_app(app: &App) -> Self {
         Self {
             config: Arc::clone(&app.config),
@@ -570,26 +506,16 @@ impl App {
         }
     }
 
-    /// Lock the shared AppConfig. Holds the lock for the lifetime of the
-    /// returned guard. Order: AppConfig mutex outer, `with_state_lock` inner;
-    /// the inner is taken by the actions that mutate disk state.
+    /// Lock the shared AppConfig. Order: AppConfig outer, `with_state_lock` inner.
     pub(crate) fn config(&self) -> RankedGuard<'_, AppConfig> {
         self.config.lock().expect("config mutex poisoned")
     }
 
-    /// Spawn the startup bootstrap onto a background thread so it never blocks
-    /// the first paint. The worker re-links the active profile's credentials and
-    /// runs the initial usage fetch. No proactive token rotation: the fetch
-    /// path's 401-recovery rotates any stale access token lazily, on the first
-    /// poll that needs it. Arming opted-in 5h windows is left to the recurring
-    /// windowless scan in `on_tick`.
-    ///
-    /// Per-profile spinners light up from inside `fetch_all_into` (it marks
-    /// `Fetching`), and per-profile completion toasts ride the existing
-    /// `OpResult` drain. When the worker finishes it posts
-    /// `StartupSignal::BootstrapDone`; the UI thread then rebuilds the token
-    /// snapshot, spawns the scheduler, applies usage, and runs the one-shot
-    /// startup auto-switch — all fast, lock-scoped, network-free work.
+    /// Spawn the bootstrap on a background thread (never blocks first paint).
+    /// Re-links credentials, runs initial usage fetch; no proactive token rotation
+    /// (401-recovery is lazy). Posts `StartupSignal::BootstrapDone` when done;
+    /// the UI thread then rebuilds the token snapshot, starts the scheduler,
+    /// applies usage, and runs the startup auto-switch.
     pub(crate) fn spawn_bootstrap(&self) {
         let config = Arc::clone(&self.config);
         let usage_store = Arc::clone(&self.usage_store);
@@ -604,9 +530,8 @@ impl App {
         let bootstrap_active_for_panic = Arc::clone(&bootstrap_active);
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Re-establish the credentials symlink that the previous shutdown
-                // replaced with a plain file. Without this, in-session Claude Code
-                // refreshes write to a standalone file instead of the profile.
+                // Re-establish the credentials symlink (shutdown replaced it with
+                // a plain file); without this, CC refreshes bypass the profile.
                 let active = config
                     .lock()
                     .expect("config mutex poisoned")
@@ -629,29 +554,22 @@ impl App {
                     &activity,
                 );
 
-                // Opted-in 5h windows are armed by the recurring windowless
-                // scan in `on_tick` once bootstrap clears `bootstrap_active` —
-                // no startup-only kick pass. That single path also covers
-                // background profiles whose first kick fails or that lose a
-                // window mid-session.
+                // 5h windows are armed by the windowless scan in `on_tick` after
+                // bootstrap clears `bootstrap_active` — no startup-only kick pass.
 
                 bootstrap_active.store(false, Ordering::SeqCst);
                 let _ = startup_sender.send(StartupSignal::BootstrapDone);
             }));
             if result.is_err() {
-                // Panic path: clear flag and send BootstrapDone so the scheduler
-                // still starts rather than hanging forever waiting for the signal.
+                // Panic path: clear flag and unblock the scheduler.
                 bootstrap_active_for_panic.store(false, Ordering::SeqCst);
                 let _ = startup_sender_for_panic.send(StartupSignal::BootstrapDone);
             }
         });
     }
 
-    /// UI-thread tail of the bootstrap, run when `StartupSignal::BootstrapDone`
-    /// drains. Rebuilds the scheduler's token snapshot from the (now rotated)
-    /// config, starts the background refresher, applies the freshly fetched
-    /// usage into the profile rows, and performs the one-shot startup
-    /// auto-switch. No HTTP — all of this is lock-scoped or in-process.
+    /// UI-thread tail of bootstrap: rebuilds token snapshot, starts scheduler,
+    /// applies usage, runs startup auto-switch. No HTTP.
     fn finish_bootstrap(&mut self) {
         self.refresh_tokens();
         self.start_scheduler();
@@ -675,9 +593,7 @@ impl App {
         }
     }
 
-    /// Bundle the scheduler's shared `Arc`s into a [`WorkerHandles`] and launch
-    /// the background refresher. Split out of `finish_bootstrap` so the spawn
-    /// site is one move instead of a wall of `Arc::clone` calls.
+    /// Bundle scheduler `Arc`s and launch the background refresher.
     fn start_scheduler(&self) {
         let h = WorkerHandles::from_app(self);
         spawn_refresher(
@@ -695,12 +611,8 @@ impl App {
     }
 
     pub(crate) fn apply_usage(&mut self) {
-        // Fail-safe on a poisoned lock: a fetch worker that panicked under the
-        // store lock must not blank every profile's usage. Skip the field whose
-        // lock errored and keep the prior value, matching the "poison == no new
-        // info" direction used by partition_due / scan_auto_switch. A blanked
-        // map here would run every tick (poison is permanent) and blind
-        // auto-switch forever.
+        // Poisoned lock: keep prior value rather than blanking all usage.
+        // A blank map would blind auto-switch permanently.
         let info_map = self.usage_store.lock().ok();
         let status_map = self.usage_status.lock().ok();
         let mut cfg = self.config();
@@ -714,8 +626,7 @@ impl App {
         }
     }
 
-    /// Pick up state edits from a concurrent clauth instance (or hand edits
-    /// in ~/.clauth/). Returns true if a reload happened.
+    /// Reload config if state mtime changed. Returns true on reload.
     pub(crate) fn reload_if_state_changed(&mut self) -> bool {
         let current = app_state_mtime();
         if current == self.last_state_mtime {
@@ -735,10 +646,8 @@ impl App {
     }
 
     pub(crate) fn refresh_tokens(&self) {
-        // Collect under the `config` lock and drop it *before* taking
-        // `usage_tokens` — folding both into one assignment would hold `config`
-        // (rank CONFIG) across the `usage_tokens.lock()` (rank TOKENS) acquire,
-        // inverting the global lock order (TOKENS is outer of CONFIG).
+        // Drop `config` lock before taking `usage_tokens` — folding them would
+        // invert lock order (TOKENS is outer of CONFIG).
         let tokens = collect_tokens(&self.config().profiles);
         *self
             .usage_tokens
@@ -746,10 +655,7 @@ impl App {
             .expect("usage_tokens mutex poisoned") = tokens;
     }
 
-    /// Queue every profile for an immediate background re-fetch. The Overview
-    /// tab's `r` uses this; it's a fan-out over `manual_refresh_one` so the
-    /// single-account (Usage) and all-accounts (Overview) refreshes drive the
-    /// identical per-profile codepath — same queue insert, same instant spinner.
+    /// Queue every profile for an immediate re-fetch (Overview `r`).
     pub(crate) fn manual_refresh(&self) {
         let names: Vec<String> = self
             .usage_tokens
@@ -763,15 +669,10 @@ impl App {
         }
     }
 
-    /// Queue a single profile for an immediate background re-fetch. The Usage
-    /// tab's `r` uses this so a refresh only spends a request on the account in
-    /// view, unlike `manual_refresh` which queues every profile.
+    /// Queue a single profile for an immediate re-fetch (Usage `r`).
     pub(crate) fn manual_refresh_one(&self, name: &str) {
-        // Light the spinner now so the Usage status line reflects the keypress
-        // instead of waiting up to a scheduler tick. Mirrors the scheduler's own
-        // pre-fetch `Fetching` mark; the forced-refetch path runs and clears it.
-        // Only when idle — never clobber an in-flight switch/refresh, whose
-        // marker the forced merge relies on to keep skipping the profile.
+        // Light the spinner immediately so the UI reflects the keypress.
+        // Only when idle — don't clobber an in-flight switch/refresh marker.
         if is_idle(&self.activity, name) {
             mark_activity(&self.activity, name, ProfileActivity::Fetching);
         }
@@ -809,17 +710,17 @@ impl App {
             .collect()
     }
 
-    /// Number of profiles; the clamp ceiling for the Usage / Config cursors.
+    /// Number of profiles.
     pub(crate) fn profile_count(&self) -> usize {
         self.config().profiles.len()
     }
 
-    /// Name of the profile a tab cursor points at, if any.
+    /// Profile name at `idx`, if any.
     pub(crate) fn profile_name_at(&self, idx: usize) -> Option<String> {
         self.config().profiles.get(idx).map(|p| p.name.to_string())
     }
 
-    /// Clamp `profile_cursor` into the account range (`0..profile_count`).
+    /// Clamp `profile_cursor` to `0..profile_count`.
     pub(crate) fn clamp_profile_cursor(&mut self) {
         let max = self.profile_count().saturating_sub(1);
         self.profile_cursor = self.profile_cursor.min(max);
@@ -848,31 +749,23 @@ fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
 
 // ── Startup reconciliation ────────────────────────────────────────────────────
 
-/// Kick off startup credential reconciliation without blocking the first
-/// paint. The fast, network-free decision runs inline on the UI thread:
-/// read the live `~/.claude/.credentials.json`, compare it to the active
-/// profile's stored credentials. In the common no-divergence case we snapshot
-/// and signal `ReconcileDone` immediately.
+/// Startup credential reconciliation, non-blocking. Compares the live
+/// `~/.claude/.credentials.json` to the active profile's stored creds inline.
+/// No divergence → snapshot + `ReconcileDone` immediately.
 ///
-/// When the bytes diverge we cannot tell from them alone whether Claude Code
-/// silently refreshed (rotating the stored chain) or did a fresh `/login` on a
-/// separate chain. The only authoritative liveness test for the stored chain is
-/// an OAuth refresh, but a refresh *spends* the single-use refresh token
-/// server-side — so probing here would rotate the stored identity on every
-/// diverged startup, even when the user goes on to keep it. We therefore never
-/// probe: divergence always hands the verdict to the user via the Divergence
-/// modal. None of its actions spend the stored token as a side effect (Overwrite
-/// takes the live creds, NewProfile captures them into a new profile, Discard
-/// relinks the stored creds as-is); a kept-but-stale stored access token is
-/// refreshed lazily on the next real fetch, when the user is actually using it.
+/// On divergence we never probe the stored chain via OAuth refresh — a refresh
+/// *spends* the single-use refresh token server-side and would rotate the stored
+/// identity on every diverged startup. Instead the Divergence modal hands the
+/// verdict to the user. None of its actions spend the stored token (Overwrite
+/// takes live creds, NewProfile captures them, Discard relinks as-is); a stale
+/// access token is refreshed lazily on the next fetch.
 pub(super) fn reconcile_startup(app: &mut App) {
     let Some(active) = app.config().state.active_profile.clone() else {
         let _ = app.startup_sender.send(StartupSignal::ReconcileDone);
         return;
     };
 
-    // Read the live credentials under the same lock that mutators use, so a
-    // concurrent clauth process mid-rotation can't expose a torn snapshot.
+    // Read live credentials under the state lock to avoid torn snapshots.
     let live = with_state_lock(|| Ok(read_claude_credentials().ok().flatten()))
         .ok()
         .flatten();
@@ -889,9 +782,7 @@ pub(super) fn reconcile_startup(app: &mut App) {
         return;
     }
 
-    // Diverged: hand the verdict to the user without spending the stored
-    // refresh token. No network, no FS write here — the chosen modal action
-    // resolves divergence. Inline send keeps startup off the network path.
+    // Diverged: hand the verdict to the user. No network, no FS write here.
     let _ = app
         .startup_sender
         .send(StartupSignal::ReconcileNeedsPrompt {
@@ -906,7 +797,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Ctrl-C always exits. Modal stack and screens be damned.
+    // Ctrl-C always exits.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.quit = true;
         return;
@@ -917,9 +808,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // A Config text field that's capturing keystrokes owns the keyboard, the
-    // same way a modal would — otherwise typing `n`/`r`/`q` into a name would
-    // fire the global shortcuts below.
+    // Config text field capturing keystrokes owns keyboard (like a modal)
+    // so typing into a name can't fire global shortcuts.
     if app.tab == Tab::Config
         && app.config_focus == ConfigFocus::Actions
         && app
@@ -931,8 +821,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // The Fallback threshold editor captures keystrokes the same way, so typing
-    // `90` into it can't trip the global `n` / `q` / `r` shortcuts below.
+    // Same for the threshold editor: owns keyboard so digits can't trip globals.
     if app.tab == Tab::Fallback
         && app.fallback_focus == FallbackFocus::Detail
         && app.fallback_threshold_draft.is_some()
@@ -941,7 +830,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Global keys, available on every tab when no modal owns input.
+    // Global keys (no modal owns input).
     match key.code {
         KeyCode::Tab | KeyCode::Right => {
             switch_tab(app, app.tab.next());
@@ -956,8 +845,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('r') => {
-            // On the Usage tab `r` refreshes only the account in view; every
-            // other tab keeps the all-profiles refresh.
+            // Usage `r` refreshes only the current account.
             if app.tab == Tab::Usage {
                 let selected = {
                     let cfg = app.config();
@@ -966,7 +854,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                         .map(|p| (p.name.clone(), p.is_oauth()))
                 };
                 match selected {
-                    // Only oauth profiles have a usage endpoint to refresh.
+                    // Only oauth profiles have a usage endpoint.
                     Some((name, true)) => {
                         app.manual_refresh_one(&name);
                         app.toast(ToastKind::Info, format!("refreshing '{name}'…"));
@@ -995,7 +883,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             start_new_account(app);
             return;
         }
-        // Esc backs out of a Config / Fallback sub-focus; otherwise it quits.
+        // Esc backs out of sub-focus, otherwise quits.
         KeyCode::Esc => {
             if app.tab == Tab::Config && app.config_focus == ConfigFocus::Actions {
                 app.config_focus = ConfigFocus::Profiles;
@@ -1022,15 +910,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Switch the active tab and re-seed that tab's cursor so it lands on a valid,
-/// useful row (the active profile for Usage / Config; the chain top for
-/// Fallback).
+/// Switch the active tab and reset that tab's cursor to a sensible default.
 fn switch_tab(app: &mut App, tab: Tab) {
     app.tab = tab;
-    // Changing tabs drops any in-flight inline config edit.
     app.config_draft = None;
-    // The shared account cursor follows along; clamp it back into the account
-    // range so a Config `+ new` selection lands on a real account elsewhere.
+    // Clamp cursor: a Config `+ new` selection must land on a real account.
     app.clamp_profile_cursor();
     match tab {
         Tab::Overview | Tab::Usage => {}
@@ -1048,8 +932,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
     }
 }
 
-/// Move `profile_cursor` by `delta`, wrapping within `0..len`. Shared by every
-/// tab; the caller passes the row count so Config can include its `+ new` row.
+/// Move `profile_cursor` by `delta`, wrapping in `0..len`.
 fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
     if len == 0 {
         return;
@@ -1069,8 +952,7 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Up/down picks which account's usage to show. The pane is read-only; all
-/// editing lives on the Config tab and switching on the Overview tab.
+/// Usage tab: up/down picks the account. Read-only pane.
 fn handle_usage_key(app: &mut App, key: KeyEvent) {
     let count = app.profile_count();
     match key.code {
@@ -1080,9 +962,7 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Ask to switch to the profile at `idx`. No-ops when already active; otherwise
-/// raises the switch confirm modal. Shared by the Overview, Usage, and Config
-/// tabs so the switch flow is identical everywhere.
+/// Request switch to profile at `idx`; no-ops if already active.
 fn request_switch_to(app: &mut App, idx: usize) {
     let cfg = app.config();
     let Some(name) = cfg.profiles.get(idx).map(|p| p.name.to_string()) else {
@@ -1105,15 +985,13 @@ fn activate_main_item(app: &mut App) {
         return;
     };
     match item {
-        // No-op when already active; saves the round-trip through the confirm
-        // modal and a redundant token refresh.
+        // No-op when already active.
         MainItemKind::Profile(idx) => request_switch_to(app, idx),
     }
 }
 
 fn reorder_main_cursor(app: &mut App, delta: i32) {
-    // Reorder only acts on real profile rows. Action rows stay anchored at
-    // the bottom, regardless of profile count.
+    // Only reorder real profile rows, not the action rows.
     let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
         return;
     };
@@ -1130,7 +1008,7 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         app.toast(ToastKind::Danger, format!("reorder failed: {e}"));
         return;
     }
-    // Cursor follows the moved row so the user can keep nudging it.
+    // Cursor follows the moved row.
     if delta < 0 && app.profile_cursor > 0 {
         app.profile_cursor -= 1;
     } else if delta > 0 {
@@ -1138,18 +1016,10 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
     }
 }
 
-/// Spawn a detached worker thread that runs `work` under `catch_unwind` and
-/// owns the panic path: on a panic it clears `name`'s activity slot and emits a
-/// failure `OpResult { name, kind, .. }` carrying `panic_msg`, so a panic before
-/// the closure's own `sender.send` can never strand the slot (which would wedge
-/// `any_busy`). The `AssertUnwindSafe` wrap is intentional — the closure's
-/// captured Arcs are shared-mutable cells with their own locks; a panic inside
-/// it can't violate a per-thread invariant for other threads.
-///
-/// Touches no locks itself beyond the panic-path `clear_activity` / `send`; it
-/// only orchestrates the thread and the unwind. Callers clone solely what
-/// `work` captures — the panic twins of `name`, `activity`, and `sender` live
-/// here.
+/// Spawn a worker under `catch_unwind`. On panic, clears the activity slot and
+/// emits a failure `OpResult` so a panic before `sender.send` never strands the
+/// slot (which would wedge `any_busy`). `AssertUnwindSafe` is intentional —
+/// captured Arcs have their own locks; a panic can't violate other threads.
 fn spawn_profile_worker<F>(
     name: String,
     kind: ActivityKind,
@@ -1173,20 +1043,14 @@ fn spawn_profile_worker<F>(
     });
 }
 
-/// Switch the active profile to `name`. Pure filesystem relink — no token
-/// rotation. The switch used to rotate the outgoing + incoming chains over HTTP
-/// on a worker thread; that is gone. Claude Code refreshes the chain itself on
-/// launch and the scheduler's 401-recovery rotates any stale access token
-/// lazily, so the switch is network-free and runs synchronously on the UI
-/// thread via [`finalize_switch`]. Refusal on a non-idle target is the caller's
-/// responsibility.
+/// Switch the active profile to `name`. Pure filesystem relink, no token
+/// rotation (401-recovery handles that lazily). Runs on the UI thread.
 fn perform_switch(app: &mut App, name: &str) {
     finalize_switch(app, name);
 }
 
-/// True when `active`'s live `.credentials.json` has diverged from its stored
-/// chain (an unsaved `/login`) and it isn't a first-login adoption — i.e. it
-/// must be reconciled before any path that clears or relinks its live creds.
+/// True when the live credentials diverge from the stored chain and it's not a
+/// first-login adoption (must be reconciled before clearing/relinking).
 fn active_diverged_unsaved(active: &str) -> bool {
     matches!(
         classify_credentials_link(active).ok(),
@@ -1194,8 +1058,7 @@ fn active_diverged_unsaved(active: &str) -> bool {
     ) && !is_first_login(active).unwrap_or(false)
 }
 
-/// Toast and raise the Divergence prompt for `active`. `verb` names the action
-/// the user must resolve before (e.g. "switching", "switching off").
+/// Toast and raise the Divergence prompt for `active` (`verb` = blocked action).
 fn prompt_divergence(app: &mut App, active: String, verb: &str) {
     app.toast(
         ToastKind::Warning,
@@ -1205,20 +1068,13 @@ fn prompt_divergence(app: &mut App, active: String, verb: &str) {
         .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
 }
 
-/// The TUI switch: runs synchronously on the UI thread from
-/// [`perform_switch`]. No HTTP. Clears any Switching marker, runs
-/// `switch_profile`, and on success refreshes the scheduler's token snapshot
-/// and bumps state mtime.
+/// Synchronous UI-thread switch. No HTTP; clears the Switching marker, runs
+/// `switch_profile`, refreshes token snapshot on success.
 fn finalize_switch(app: &mut App, name: &str) {
-    // Guard a diverged outgoing active before `switch_profile` runs blind.
-    // `switch_profile` would no-op the snapshot of the diverged live creds and
-    // then `link_profile_credentials(target)` would bail on the regular file,
-    // failing the switch and stranding the outgoing profile's fresh `/login`
-    // chain (later overwritten by relink/shutdown). The auto-switch path has no
-    // other divergence check, so raise the same Divergence modal the 1Hz poll
-    // and CLI use: the user resolves the outgoing creds (Overwrite / NewProfile
-    // / Discard) and re-triggers the switch from the now-clean link. First-login
-    // adoption stays a clean switch (`switch_profile` adopts it).
+    // Guard a diverged outgoing active: `switch_profile` would no-op the
+    // snapshot and then `link_profile_credentials` would bail on the regular
+    // file, stranding the fresh `/login` chain. Raise the Divergence modal so
+    // the user cleans up first; first-login adoption stays a clean switch.
     let outgoing = app.config().state.active_profile.clone();
     if let Some(active) = outgoing
         && active != name
@@ -1243,10 +1099,9 @@ fn finalize_switch(app: &mut App, name: &str) {
     }
 }
 
-/// Turn off all accounts on the UI thread — the wrap-off decision drained from
-/// `pending_switch_off`. Mirrors `finalize_switch`'s divergence guard: an
-/// unsaved `/login` on the outgoing active is resolved first, since clearing the
-/// live credentials would otherwise drop the fresh chain. No HTTP, runs inline.
+/// Turn off all accounts on the UI thread. Mirrors `finalize_switch`'s
+/// divergence guard: an unsaved `/login` must be resolved before clearing live
+/// credentials. No HTTP.
 fn perform_switch_off(app: &mut App) {
     let Some(active) = app.config().state.active_profile.clone() else {
         return;
@@ -1327,16 +1182,14 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
     items
 }
 
-/// The detail rows shown for a chain member, in order: threshold stepper, the
-/// chain-global wrap-off toggle, then the danger remove row.
+/// Detail rows for a chain member: threshold stepper, wrap-off toggle, remove.
 pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
     FallbackRow::Threshold,
     FallbackRow::WrapOff,
     FallbackRow::Remove,
 ];
 
-/// What the Fallback footer should advertise right now, derived from focus +
-/// selection + edit state so it lists only keys that currently do something.
+/// Fallback footer hint derived from current focus + selection + edit state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FallbackHint {
     Empty,
@@ -1350,7 +1203,7 @@ pub(crate) enum FallbackHint {
     DetailAdd,
 }
 
-/// Resolve the footer hint context for the Fallback tab.
+/// Resolve the Fallback tab's footer hint.
 pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
     if chain_items(app).is_empty() {
         return FallbackHint::Empty;
@@ -1378,9 +1231,7 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
     }
 }
 
-/// Fallback tab keymap. Left pane (`Chain`): ↑↓ walks the chain + `+ add` row,
-/// ⇧↑↓ reorders a member, ⏎ drops focus into the right pane. Right pane
-/// (`Detail`): the member's threshold stepper + remove row, or the add picker.
+/// Fallback tab keymap; delegates to chain or detail handler.
 fn handle_fallback_key(app: &mut App, key: KeyEvent) {
     match app.fallback_focus {
         FallbackFocus::Chain => handle_fallback_chain_key(app, key),
@@ -1414,10 +1265,7 @@ fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Flip the "when the whole chain is spent" behaviour and persist it. On =
-/// switch off all accounts (stop usage); off = stay on the last account (keep
-/// using it). Only matters once every member is over its threshold with no
-/// 100% sink to land on.
+/// Toggle wrap-off: on = switch off all when chain is spent; off = stay on last.
 fn toggle_wrap_off(app: &mut App) {
     let enabled = {
         let mut cfg = app.config();
@@ -1434,9 +1282,8 @@ fn toggle_wrap_off(app: &mut App) {
     app.toast(ToastKind::Success, msg.to_string());
 }
 
-/// Right-pane keymap for a member: ↑↓ walks rows, `+` / `-` steps the threshold,
-/// ⏎ / space on remove arms then confirms. Delegates to the add picker when the
-/// cursor sits on the `+ add` row.
+/// Right-pane keymap for a member: ↑↓ walks rows, `+`/`-` steps the threshold,
+/// ⏎/space on remove arms then confirms. Delegates to add picker on `+ add`.
 fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
     if selected_chain_member(app).is_none() {
         handle_fallback_add_key(app, key);
@@ -1499,8 +1346,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
             let name = candidates[app.fallback_detail_cursor].clone();
             add_chain_candidate(app, &name);
             app.toast(ToastKind::Success, format!("added '{name}' to chain"));
-            // Adding shrinks the picker; when it empties the `+ add` row is gone,
-            // so land the cursor on the freshly-appended member instead.
+            // When the picker empties, `+ add` disappears — land on the new member.
             let remaining = chain_candidates(app);
             if remaining.is_empty() {
                 leave_fallback_detail(app);
@@ -1513,7 +1359,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// The chain index under the cursor, or `None` when it's on the `+ add` row.
+/// Chain index under the cursor, or `None` on `+ add`.
 fn selected_chain_member(app: &App) -> Option<usize> {
     match chain_items(app).get(app.chain_cursor).copied() {
         Some(ChainItemKind::Member(i)) => Some(i),
@@ -1521,7 +1367,7 @@ fn selected_chain_member(app: &App) -> Option<usize> {
     }
 }
 
-/// Profiles not yet in the chain — the pickable rows for the `+ add` detail.
+/// Profiles not yet in the chain (add-picker candidates).
 pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
     let cfg = app.config();
     cfg.profiles
@@ -1531,8 +1377,7 @@ pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
         .collect()
 }
 
-/// Drop focus into the right pane for the selected chain item. No-op on `+ add`
-/// when nothing's left to add.
+/// Enter right pane for the selected chain item. No-op on `+ add` when empty.
 fn enter_fallback_detail(app: &mut App) {
     match chain_items(app).get(app.chain_cursor).copied() {
         Some(ChainItemKind::Member(_)) => {}
@@ -1544,7 +1389,7 @@ fn enter_fallback_detail(app: &mut App) {
     app.fallback_focus = FallbackFocus::Detail;
 }
 
-/// Lift focus back to the chain list, clearing any primed remove or live edit.
+/// Return focus to the chain list, clearing any armed remove or live edit.
 fn leave_fallback_detail(app: &mut App) {
     app.fallback_focus = FallbackFocus::Chain;
     app.fallback_armed_remove = false;
@@ -1552,9 +1397,8 @@ fn leave_fallback_detail(app: &mut App) {
     app.fallback_threshold_draft = None;
 }
 
-/// ⇧↑↓ on the chain list: move the selected member up / down, following it with
-/// the cursor. No-op on `+ add` or at a boundary. Chain index == cursor for
-/// members (they precede the trailing `+ add` row), so the two move together.
+/// ⇧↑↓: move the selected member up/down, cursor follows. No-op on `+ add`
+/// or at boundary. Chain index == cursor for members (they precede `+ add`).
 fn reorder_chain_member(app: &mut App, delta: i32) {
     let Some(pos) = selected_chain_member(app) else {
         return;
@@ -1571,9 +1415,8 @@ fn reorder_chain_member(app: &mut App, delta: i32) {
     app.chain_cursor = target as usize;
 }
 
-/// ⏎ / space on a member detail row: threshold opens the inline editor seeded
-/// with the current value, remove arms on the first press and deletes on the
-/// second.
+/// ⏎/space on a member detail row: threshold opens inline editor; remove arms
+/// then deletes on second press.
 fn run_fallback_row(app: &mut App, row: FallbackRow) {
     match row {
         FallbackRow::Threshold => {
@@ -1592,8 +1435,7 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
     }
 }
 
-/// Keystrokes while the threshold field is open. ⏎ parses + saves, ⎋ discards,
-/// everything else edits the buffer.
+/// Keystrokes while the threshold field is open: ⏎ saves, ⎋ discards.
 fn handle_fallback_threshold_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.fallback_threshold_draft = None,
@@ -1606,8 +1448,7 @@ fn handle_fallback_threshold_edit_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Validate the typed threshold (a number in 0..=100) and persist it. On a bad
-/// value, toast and keep the editor open so the user can fix it.
+/// Parse and persist the typed threshold (0..=100); toast on bad input.
 fn commit_threshold_edit(app: &mut App) {
     let Some(raw) = app.fallback_threshold_draft.as_ref().map(|i| i.trimmed()) else {
         return;
@@ -1626,7 +1467,7 @@ fn commit_threshold_edit(app: &mut App) {
     app.fallback_threshold_draft = None;
 }
 
-/// The selected member's effective threshold, or `None` on the `+ add` row.
+/// Effective threshold for the selected member, or `None` on `+ add`.
 fn selected_threshold(app: &App) -> Option<f64> {
     let pos = selected_chain_member(app)?;
     let cfg = app.config();
@@ -1634,7 +1475,7 @@ fn selected_threshold(app: &App) -> Option<f64> {
     cfg.find(name).map(threshold_for)
 }
 
-/// Write an absolute threshold for the selected member and persist immediately.
+/// Write threshold for the selected member and persist.
 fn write_threshold(app: &mut App, value: f64) {
     let Some(pos) = selected_chain_member(app) else {
         return;
@@ -1657,16 +1498,14 @@ fn write_threshold(app: &mut App, value: f64) {
     }
 }
 
-/// Step the selected member's threshold by `delta`, clamped to 0..=100, and
-/// persist immediately (matching the Config auto-start toggle's eager save).
+/// Step the threshold by `delta`, clamped to 0..=100, and persist.
 fn adjust_threshold(app: &mut App, delta: f64) {
     if let Some(current) = selected_threshold(app) {
         write_threshold(app, (current + delta).clamp(0.0, 100.0));
     }
 }
 
-/// Add a profile to the chain, seeding the default threshold if unset, then
-/// persist both the profile and the chain order.
+/// Add a profile to the chain (seeding default threshold if unset) and persist.
 fn add_chain_candidate(app: &mut App, name: &str) {
     let mut cfg = app.config();
     if let Some(profile) = cfg.find_mut(name)
@@ -1679,8 +1518,7 @@ fn add_chain_candidate(app: &mut App, name: &str) {
     let _ = save_app_state(&cfg.state);
 }
 
-/// Remove the selected member, persist, and return focus to the list with the
-/// cursor clamped to a valid row.
+/// Remove the selected member, persist, and return focus to the list.
 fn remove_chain_member(app: &mut App) {
     let Some(pos) = selected_chain_member(app) else {
         return;
@@ -1723,12 +1561,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Config tab keymap. Left pane: the account list plus a trailing `+ new` row,
-/// ⏎ drops focus into the detail pane (building a [`ConfigDraft`]). Right pane:
-/// ↑↓ walks the detail rows, ⏎ edits a text row inline / toggles a switch /
-/// arms delete / creates. Esc (handled globally) lifts focus back to the list.
+/// Config tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
+/// edits/toggles/arms/creates. Esc (global) returns to list.
 fn handle_config_key(app: &mut App, key: KeyEvent) {
-    // The selector has one row per account plus the trailing `+ new` row.
+    // Selector includes the trailing `+ new` row.
     let sel_len = app.profile_count() + 1;
     app.profile_cursor = app.profile_cursor.min(sel_len - 1);
 
@@ -1774,9 +1610,8 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Detail rows for the current selection. The `+ new` row (cursor past the last
-/// account) yields the create form; an account yields its settings, with
-/// auto-start present only for OAuth accounts.
+/// Detail rows for the current selection. `+ new` → create form; account →
+/// settings (auto-start only for OAuth).
 pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     let cfg = app.config();
     if app.profile_cursor >= cfg.profiles.len() {
@@ -1800,7 +1635,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     rows
 }
 
-/// Drop focus into the detail pane, seeding a draft for the current selection.
+/// Enter the detail pane, seeding a draft for the current selection.
 fn enter_config_detail(app: &mut App) {
     app.config_action_cursor = 0;
     if app.profile_cursor >= app.profile_count() {
@@ -1813,7 +1648,7 @@ fn enter_config_detail(app: &mut App) {
     app.config_focus = ConfigFocus::Actions;
 }
 
-/// Jump straight into the `+ new` create form from anywhere (the global `n`).
+/// Jump to the `+ new` create form (global `n`).
 fn start_new_account(app: &mut App) {
     switch_tab(app, Tab::Config);
     app.profile_cursor = app.profile_count();
@@ -1846,15 +1681,14 @@ fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
     }
 }
 
-/// Cancel a primed delete the moment the cursor moves off the row.
+/// Disarm delete when the cursor moves off the row.
 fn disarm_delete(app: &mut App) {
     if let Some(d) = app.config_draft.as_mut() {
         d.armed_delete = false;
     }
 }
 
-/// ⏎ / space on a detail row: text rows start capturing keystrokes, toggles
-/// flip in place, delete arms then confirms, create commits the draft.
+/// ⏎/space on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
 fn run_config_row(app: &mut App, row: ConfigRow) {
     if row.is_text() {
         if let Some(d) = app.config_draft.as_mut() {
@@ -1894,14 +1728,14 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
     }
 }
 
-/// Arm the delete row (first ⏎). Split out so `run_config_row` reads cleanly.
+/// Arm the delete row (first ⏎).
 fn disarm_delete_inverse(app: &mut App) {
     if let Some(d) = app.config_draft.as_mut() {
         d.armed_delete = true;
     }
 }
 
-/// Keystrokes while a text row is active. ⏎ commits, ⎋ reverts, else edits.
+/// Keystrokes while a text row is active: ⏎ commits, ⎋ reverts.
 fn handle_config_edit_key(app: &mut App, key: KeyEvent) {
     let Some(active) = app.config_draft.as_ref().and_then(|d| d.active) else {
         return;
@@ -1923,8 +1757,8 @@ fn handle_config_edit_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// ⎋ inside a field: existing accounts revert the buffer from the live profile;
-/// the new draft simply keeps what's been typed. Either way, editing ends.
+/// ⎋ inside a field: existing accounts revert from the live profile;
+/// new drafts keep the typed value. Either way, editing ends.
 fn cancel_config_edit(app: &mut App, field: ConfigRow) {
     let editing_name = app
         .config_draft
@@ -1955,8 +1789,7 @@ fn cancel_config_edit(app: &mut App, field: ConfigRow) {
     }
 }
 
-/// ⏎ inside a field. The new draft buffers fields until `create`; existing
-/// accounts persist per field (name → rename, url/key → endpoint).
+/// ⏎ inside a field: new draft buffers; existing accounts persist per field.
 fn commit_config_field(app: &mut App, field: ConfigRow) {
     let is_new = app
         .config_draft
@@ -1999,7 +1832,7 @@ fn commit_rename(app: &mut App) {
         validate_profile_name(&new, &cfg.names(), Some(old.as_str()))
     };
     if let Err(e) = validation {
-        // Keep the field in edit mode so the user can fix the name in place.
+        // Keep edit mode open so the user can fix the name.
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
     }
@@ -2042,7 +1875,7 @@ fn commit_endpoint(app: &mut App) {
     };
     match result {
         Ok(()) => {
-            // Reseed from the saved profile — the API key may have been dropped.
+            // Reseed from the saved profile (API key may have been dropped).
             let (base, key) = {
                 let cfg = app.config();
                 let p = cfg.find(&name);
@@ -2155,12 +1988,9 @@ fn toggle_auto_start(app: &mut App, name: &str) {
             "auto-start usage only applies to OAuth profiles",
         ),
         Outcome::Saved(now_on) => {
-            // Turning auto-start ON is an explicit user action, so clear the
-            // 4.5h cooldown — otherwise a prior (possibly failed) auto-start
-            // stamp would make the next windowless scan skip this profile for
-            // hours. The scan in `on_tick` then arms it on the next tick if it
-            // has no live 5h window; a profile that already has one is left
-            // alone by the scan's window check.
+            // Clear the 4.5h cooldown on explicit ON so a prior failed kick
+            // doesn't block the scan for hours. The scan arms on the next tick
+            // if there's no live window; an existing window is left alone.
             if now_on {
                 let mut cfg = app.config();
                 cfg.state.last_auto_start_at.remove(name);
@@ -2179,22 +2009,13 @@ fn toggle_auto_start(app: &mut App, name: &str) {
     }
 }
 
-/// Minimum time a profile with a live `clauth start` session must read
-/// windowless before auto-start kicks it. Comfortably above the 60s usage
-/// refresh interval so a 5h window Claude Code just opened lands in our store
-/// (flipping the profile out of the candidate set) before the timer elapses —
-/// without it, the kick double-fires on an account CC already armed.
+/// Debounce before kicking a live-session candidate. Exceeds the 60s refresh
+/// interval so a CC-opened 5h window lands in the store first.
 const AUTO_START_LIVE_SESSION_DEBOUNCE_MS: u64 = 90_000;
 
-/// Filter windowless, cooldown-eligible auto-start `candidates` down to the ones
-/// ready to kick now. A candidate with no live session has no external
-/// window-opener and passes straight through. A candidate WITH a live session is
-/// held until it has read windowless for `AUTO_START_LIVE_SESSION_DEBOUNCE_MS`,
-/// since a running Claude Code may have opened a 5h window our usage store hasn't
-/// fetched yet. First-seen-windowless timestamps live in
-/// `auto_start_windowless_since`, pruned to the current live-session candidate
-/// set each call so a window appearing (or a kick landing → cooldown) restarts
-/// the debounce cleanly.
+/// Filter windowless candidates to those ready to kick. Non-live pass through
+/// immediately; live candidates are held for `AUTO_START_LIVE_SESSION_DEBOUNCE_MS`.
+/// Timestamps pruned to the live set each call so debounce restarts cleanly.
 fn ready_auto_start(app: &mut App, candidates: Vec<String>) -> Vec<String> {
     let live: HashSet<String> = candidates
         .iter()
@@ -2209,11 +2030,8 @@ fn ready_auto_start(app: &mut App, candidates: Vec<String>) -> Vec<String> {
     )
 }
 
-/// Pure core of [`ready_auto_start`], split out so the debounce is testable
-/// without an `App` or the filesystem (`has_live_session`). `live` is the subset
-/// of `candidates` that currently hold a live session; `since` tracks when each
-/// was first seen windowless and is pruned to `live` so non-live or no-longer-
-/// candidate names can't keep a stale timer.
+/// Testable core of [`ready_auto_start`]. `since` tracks first-seen-windowless
+/// timestamps and is pruned to `live` so stale timers can't linger.
 fn debounce_live_candidates(
     since: &mut HashMap<String, u64>,
     candidates: Vec<String>,
@@ -2268,7 +2086,6 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }));
         }
         ConfirmAction::Switch(name) => {
-            // Block a second switch while the previous one is still mid-flight.
             if !is_idle(&app.activity, &name) {
                 app.toast(
                     ToastKind::Warning,
@@ -2280,13 +2097,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         ConfirmAction::DiscardDivergence(name) => run_discard_divergence(app, &name),
         ConfirmAction::RotateAll => {
-            // Refuse if anything is already in flight — a parallel rotate-all
-            // worker would step on per-profile work or duplicate a refresh
-            // already mid-rotation. Bootstrap is a whole-worker busy signal
-            // separate from per-profile activity: between the last Refreshing
-            // slot clearing and the next fetch's slot setting there is a window
-            // where activity_store is empty but the bootstrap worker is still
-            // running. The flag covers that gap.
+            // Refuse if anything is in-flight. Bootstrap is a whole-worker
+            // signal separate from per-profile activity; the flag covers the
+            // gap between the last Refreshing slot clearing and the next fetch.
             if app.bootstrap_active.load(Ordering::SeqCst) || any_busy(&app.activity) {
                 app.toast(
                     ToastKind::Warning,
@@ -2294,12 +2107,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 );
                 return;
             }
-            // Spawn the rotate-all worker so HTTP runs off the UI thread.
-            // The worker locks the config only across its brief snapshot /
-            // persist windows; per-profile spinners clear as each profile's
-            // HTTP completes via the OpResult channel drained in on_tick.
-            // A toast confirms the kick-off; per-profile errors surface
-            // through the standard drain.
+            // Spawn the rotate-all worker (HTTP off the UI thread).
             let config = Arc::clone(&app.config);
             let refetch = Arc::clone(&app.refetch_queue);
             let activity = Arc::clone(&app.activity);
@@ -2336,8 +2144,7 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Esc => {
-            // Esc dismisses without acting. The 1Hz poll re-pushes the modal
-            // on the next tick if the divergence persists.
+            // Esc dismisses; the 1Hz poll re-pushes if divergence persists.
             app.modals.pop();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
@@ -2372,11 +2179,8 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
             );
         }
         DivergenceChoice::NewProfile => {
-            // Defer detaching the live link and deactivating the
-            // previously-active profile until the capture actually succeeds
-            // (handled in `handle_capture_name_key`'s success arm). Doing it
-            // here would silently deactivate the active profile and drop the
-            // live link if the user cancels the name modal with Esc.
+            // Defer detach+deactivate to the capture's success arm so cancel
+            // (Esc on the name modal) leaves the prior profile intact.
             begin_capture(app, true);
         }
         DivergenceChoice::Discard => {
@@ -2422,16 +2226,13 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 app.toast(ToastKind::Danger, format!("{e}"));
                 return;
             }
-            // Consume the boxed snapshot out of the modal.
             let Some(Modal::CaptureName(form)) = app.modals.pop() else {
                 return;
             };
             let snapshot = *form.snapshot;
-            // Divergence-originated capture: only now that the name is
-            // confirmed do we detach the live link and deactivate the
-            // previously-active profile, so `capture_into_profile` observes
-            // `active_profile.is_none()` and links + activates the new one.
-            // On Esc/cancel this never ran, so the prior profile stays linked.
+            // Divergence capture: detach + deactivate only after name is
+            // confirmed so `capture_into_profile` sees `active_profile.is_none()`
+            // and links the new one. On Esc this never runs.
             if form.from_divergence {
                 let _ = detach_credentials_link();
                 let mut cfg = app.config();
@@ -2471,11 +2272,9 @@ fn apply_input_edit(input: &mut InputState, key: KeyEvent) {
 // ── Per-tick maintenance ──────────────────────────────────────────────────────
 
 pub(crate) fn on_tick(app: &mut App) {
-    // Advance the spinner frame. Wraps naturally on the 10-frame braille set.
     app.tick_count = app.tick_count.wrapping_add(1);
 
-    // Surface the background update check. `try_recv` is non-blocking, and the
-    // worker emits at most one event, so this drains cheaply every tick.
+    // Drain update check result (worker emits at most one event).
     while let Ok(ev) = app.update_results.try_recv() {
         match ev {
             UpdateEvent::Installed(v) => {
@@ -2500,19 +2299,8 @@ pub(crate) fn on_tick(app: &mut App) {
     }
     app.apply_usage();
 
-    // Arm opted-in profiles that have no live 5h window. The windowless scan
-    // enqueues every eligible background profile each tick (the active one gets
-    // its window from Claude Code itself), merged with any names a toggle just
-    // pushed. Each is handed to a worker so the kick HTTP runs off the UI
-    // thread; the result is surfaced through the standard OpResult channel
-    // (drained at the top of the next tick) so the spinner clears in arrival
-    // order. `start_window` claims the per-profile cooldown before kicking, so
-    // a duplicate enqueue is a no-op and a failed kick retries once per window.
-    //
-    // Skip both the scan and the drain while the bootstrap worker is running:
-    // it is mid-`refresh_all` for these same profiles, and the access tokens it
-    // rotates must land before we kick. Entries left in the mutex are picked up
-    // on the next tick once the flag clears.
+    // Arm opted-in profiles with no live 5h window. Skip while bootstrap is
+    // running — it's mid-`refresh_all` and rotated tokens must land first.
     let pending: Vec<String> = if app.bootstrap_active.load(Ordering::SeqCst) {
         Vec::new()
     } else {
@@ -2525,9 +2313,7 @@ pub(crate) fn on_tick(app: &mut App) {
                 g.drain().collect()
             })
             .unwrap_or_default();
-        // Hold off on live-session candidates until they've read windowless long
-        // enough that a window CC just opened would have been fetched; non-live
-        // candidates pass straight through.
+        // Debounce live-session candidates.
         ready_auto_start(app, raw)
     };
     for name in pending {
@@ -2557,12 +2343,7 @@ pub(crate) fn on_tick(app: &mut App) {
         );
     }
 
-    // Drain scheduler-posted auto-switch decisions. Each entry was computed
-    // by `scan_auto_switch` in the scheduler thread; the UI thread just
-    // dispatches the standard switch worker pipeline so the refresh + relink
-    // run off the main loop. Skip dispatch when the target is non-idle —
-    // either someone clicked switch already or a previous decision is still
-    // mid-flight.
+    // Drain scheduler auto-switch decisions; skip non-idle targets.
     let auto_switch_targets: Vec<String> = app
         .pending_switch
         .lock()
@@ -2586,21 +2367,10 @@ pub(crate) fn on_tick(app: &mut App) {
     app.prune_toasts();
 }
 
-/// Drain completed op results posted by workers. Each result clears the
-/// profile's activity slot back to Idle, surfaces errors as toasts, and —
-/// for op kinds where the user wants confirmation — emits a success toast
-/// and any follow-up bookkeeping that touches `AppConfig` (refresh tokens,
-/// kick off a usage re-fetch).
+/// Drain worker op results: clear activity slots, toast errors/successes,
+/// rebuild token snapshot on Refreshing/AutoStarting success.
 fn drain_op_results(app: &mut App) {
-    // Set when any Refreshing or AutoStarting OpResult succeeded; triggers
-    // `refresh_tokens()` to rebuild the scheduler's TokenList snapshot so
-    // the next fetch uses the rotated access tokens.
     let mut needs_token_snapshot_rebuild = false;
-    // Names of profiles whose auto-start completed successfully this tick.
-    // These are pushed into RefetchQueue rather than triggering an all-profile
-    // manual_refresh — only the auto-started profiles need an immediate re-fetch,
-    // and the scheduler's forced-merge path respects Switching/Refreshing
-    // exclusions, keeping the scheduler the single cadence authority.
     let mut auto_started_names: Vec<String> = Vec::new();
     while let Ok(OpResult {
         name,
@@ -2608,15 +2378,9 @@ fn drain_op_results(app: &mut App) {
         outcome,
     }) = app.op_results.try_recv()
     {
-        // Only clear the slot when it still reflects this op's kind, so an
-        // in-flight result for one op can't clobber a fresher mark for another.
-        //
-        // Invariant: `ActivityKind::Fetching` is NEVER sent through OpResult.
-        // `fetch_with_rotation` and `run_fetch` manage the Fetching activity
-        // slot directly (mark before spawn, clear in join loop) without going
-        // through the OpResult channel. The switch is now a synchronous
-        // UI-thread relink (no worker), so `Switching` never arrives here
-        // either. Valid kinds in OpResult: Refreshing, AutoStarting.
+        // Only clear when the slot still reflects this op's kind.
+        // Invariant: `Fetching` is NEVER sent via OpResult (managed by the
+        // join loop directly); `Switching` never arrives either (UI-thread relink).
         if matches!(kind, ActivityKind::Fetching) {
             unreachable!(
                 "ActivityKind::Fetching must never be sent via OpResult; \
@@ -2664,12 +2428,7 @@ fn drain_op_results(app: &mut App) {
     if needs_token_snapshot_rebuild {
         app.refresh_tokens();
     }
-    // Route auto-start re-fetches through RefetchQueue so only the auto-started
-    // profiles get an immediate re-fetch, not every profile. The scheduler's
-    // forced-merge path picks them up on the next tick, respecting
-    // Switching/Refreshing exclusions and keeping the scheduler the single
-    // cadence authority. This replaces the prior all-profile manual_refresh
-    // which was a full double-fetch that raced the scheduler's next tick.
+    // Route auto-start re-fetches through RefetchQueue (not all-profile refresh).
     if !auto_started_names.is_empty()
         && let Ok(mut q) = app.refetch_queue.lock()
     {
@@ -2677,12 +2436,9 @@ fn drain_op_results(app: &mut App) {
     }
 }
 
-/// Drain the scheduler's wrap-off decision: the whole chain is spent with no
-/// sink, so turn off all accounts. The bool collapses repeated sets. Only
-/// drain when no modal is open — `perform_switch_off` may raise a Divergence
-/// prompt, and consuming the flag while one is already up would let the
-/// scheduler re-set it and stack duplicate modals. Left set, it retries once
-/// the modal closes.
+/// Drain the wrap-off flag. Only drain when no modal is open — `perform_switch_off`
+/// may raise a Divergence prompt; consuming the flag while one is open would
+/// let the scheduler re-set it and stack duplicates.
 fn drain_pending_switch_off(app: &mut App) {
     if !app.modals.is_empty() {
         return;
@@ -2697,9 +2453,7 @@ fn drain_pending_switch_off(app: &mut App) {
     }
 }
 
-/// Drain the startup phase signals posted by the reconcile / bootstrap
-/// workers. Reconcile signals flip `reconcile_done` (and may push the
-/// Divergence prompt); the bootstrap-done signal runs the UI-thread tail.
+/// Drain startup signals from reconcile/bootstrap workers.
 fn drain_startup_signals(app: &mut App) {
     while let Ok(signal) = app.startup_results.try_recv() {
         match signal {
@@ -2718,10 +2472,7 @@ fn drain_startup_signals(app: &mut App) {
     }
 }
 
-/// Spawn the background bootstrap once reconciliation has settled and any
-/// reconcile prompt has been answered. Mirrors the old `!bootstrapped &&
-/// modals.is_empty()` gate, now keyed off the async reconcile verdict so the
-/// HTTP never blocks the first paint.
+/// Spawn bootstrap once reconcile is done and no modal is open.
 fn maybe_spawn_bootstrap(app: &mut App) {
     if app.bootstrap_started || !app.reconcile_done || !app.modals.is_empty() {
         return;
@@ -2731,10 +2482,8 @@ fn maybe_spawn_bootstrap(app: &mut App) {
     app.spawn_bootstrap();
 }
 
-/// 1Hz check that the live `.credentials.json` still points at the active
-/// profile's stored credentials. Pushes a Divergence modal when CC has
-/// overwritten the symlink (typically by `/login`). Skips when any modal is
-/// already open so we don't stack on top of work the user has in flight.
+/// 1Hz check: push Divergence modal if `.credentials.json` no longer matches
+/// the active profile's stored creds. Skips when a modal is already open.
 fn poll_credentials_divergence(app: &mut App) {
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -2761,8 +2510,7 @@ fn poll_credentials_divergence(app: &mut App) {
     ) {
         return;
     }
-    // A credential-less profile's first login isn't a real divergence — adopt
-    // Claude Code's write into the profile silently instead of prompting.
+    // First login on a credential-less profile: adopt silently, don't prompt.
     if is_first_login(&active).unwrap_or(false) {
         let result = {
             let mut cfg = app.config();
@@ -2784,10 +2532,8 @@ fn poll_credentials_divergence(app: &mut App) {
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────
 
-/// Persist whatever Claude Code wrote during this session, then replace the
-/// symlink with a plain copy. After shutdown any external write to
-/// ~/.claude/.credentials.json lands in that standalone file instead of
-/// mutating the active profile's storage through the link.
+/// Snapshot active credentials and detach the symlink. After shutdown, external
+/// writes to `.credentials.json` land in the standalone file, not the profile.
 pub(crate) fn shutdown(app: &mut App) -> Result<()> {
     {
         let mut cfg = app.config();
@@ -2852,8 +2598,6 @@ mod tests {
     use super::{AUTO_START_LIVE_SESSION_DEBOUNCE_MS, debounce_live_candidates};
     use std::collections::HashSet;
 
-    /// A candidate with no live session has no external window-opener, so it is
-    /// armed immediately — the debounce only applies to live sessions.
     #[test]
     fn debounce_passes_non_live_candidate_through() {
         let mut since = HashMap::new();
@@ -2863,8 +2607,6 @@ mod tests {
         assert!(since.is_empty(), "no timer for a non-live candidate");
     }
 
-    /// A live-session candidate seen windowless for the first time is held, not
-    /// kicked — a running CC may have opened a window we haven't fetched yet.
     #[test]
     fn debounce_holds_live_candidate_on_first_sight() {
         let mut since = HashMap::new();
@@ -2877,8 +2619,6 @@ mod tests {
         assert_eq!(since.get("cc"), Some(&1_000_000), "first-seen stamped");
     }
 
-    /// Once a live-session candidate has read windowless past the debounce, it
-    /// is armed — the genuinely idle (or just-reset) session that needs a kick.
     #[test]
     fn debounce_arms_live_candidate_after_window() {
         let now = 5_000_000;
@@ -2889,8 +2629,6 @@ mod tests {
         assert_eq!(ready, vec!["cc".to_string()]);
     }
 
-    /// A name that drops out of the live-candidate set (window appeared, or the
-    /// kick landed → cooldown) is pruned so its timer restarts clean next time.
     #[test]
     fn debounce_prunes_stale_timers() {
         let mut since = HashMap::from([("gone".to_string(), 1)]);

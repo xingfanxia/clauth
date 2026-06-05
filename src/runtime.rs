@@ -70,10 +70,8 @@ fn sessions_dir(name: &str) -> Result<PathBuf> {
     profile_subpath(name, "sessions")
 }
 
-/// True iff the profile currently has at least one live `clauth start` session.
-///
-/// Reads the sessions dir and tests each entry with `is_session_alive`. A
-/// missing or unreadable sessions dir returns false — the profile is idle.
+/// True iff the profile has at least one live `clauth start` session. A missing
+/// or unreadable sessions dir returns false (the profile is idle).
 pub(crate) fn has_live_session(name: &str) -> bool {
     let Ok(dir) = sessions_dir(name) else {
         return false;
@@ -121,8 +119,8 @@ pub(crate) struct RotationGuard {
 
 impl RotationGuard {
     /// Acquire the per-profile rotation lock, blocking until any in-flight
-    /// rotation or acquire for this profile releases it. The directory is
-    /// created if missing (a profile with no session yet has no `sessions/`).
+    /// rotation or acquire for this profile releases it. Creates the directory
+    /// if missing (a profile with no session yet has no `sessions/`).
     pub(crate) fn acquire(name: &str) -> Result<Self> {
         let path = rotation_lock_path(name)?;
         if let Some(parent) = path.parent() {
@@ -184,9 +182,9 @@ impl ProfileRuntime {
         let canonical = canonical_credentials(name)?;
 
         // Hold the per-profile rotation lock across the session-stamp window so
-        // a concurrent `oauth::rotate_one` for this profile cannot spend the
+        // a concurrent `oauth::rotate_one_inner` for this profile cannot spend the
         // single-use refresh token while we are starting up. Ordering rule
-        // (matches `oauth::rotate_one`): RotationGuard OUTERMOST, then the
+        // (matches `oauth::rotate_one_inner`): RotationGuard OUTERMOST, then the
         // state flock inside. Dropped right after the PID file is locked — from
         // then on the PID flock itself signals liveness, and rotate's in-lock
         // `has_live_session` re-check observes it.
@@ -196,9 +194,8 @@ impl ProfileRuntime {
             std::fs::create_dir_all(&sessions)
                 .with_context(|| format!("failed to create {}", sessions.display()))?;
             let active = prune_stale_sessions(&sessions)?;
-            // No live siblings — rebuild the tree from scratch so stale
-            // symlinks/copies to entries that have since vanished from
-            // ~/.claude/ don't carry over.
+            // No live siblings — rebuild from scratch so stale symlinks/copies
+            // to entries that have since vanished from ~/.claude/ don't carry over.
             if active == 0 && runtime.symlink_metadata().is_ok() {
                 std::fs::remove_dir_all(&runtime)
                     .with_context(|| format!("failed to clear {}", runtime.display()))?;
@@ -264,7 +261,7 @@ impl ProfileRuntime {
 
 impl Drop for ProfileRuntime {
     fn drop(&mut self) {
-        // Drop the sender first to signal the watchdog, then join.
+        // Drop the sender to signal the watchdog, then join.
         // SAFETY: field is never used after this point.
         unsafe { ManuallyDrop::drop(&mut self.watchdog_signal) };
         if let Some(h) = self.watchdog_handle.take() {
@@ -336,10 +333,9 @@ fn try_real_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
     ))
 }
 
-/// Walk `sessions/`, drop entries whose owner has died, return the live
-/// count. Caller holds the cross-process state lock so two simultaneous
-/// starts can't both conclude "no other sessions" and tear down the
-/// runtime under each other.
+/// Walk `sessions/`, drop entries whose owner has died, return the live count.
+/// Caller holds the cross-process state lock so two simultaneous starts can't
+/// both conclude "no other sessions" and tear down the runtime under each other.
 fn prune_stale_sessions(sessions: &Path) -> Result<usize> {
     let entries = match std::fs::read_dir(sessions) {
         Ok(e) => e,
@@ -371,10 +367,10 @@ fn is_session_alive(pid_file: &Path) -> bool {
 
 /// Build or incrementally update the runtime tree.
 ///
-/// Called on every `acquire`, including when `active > 0` (live siblings
-/// already built the tree). The walk always runs; entries whose runtime
-/// counterpart already exists are skipped, so new `~/.claude/` additions
-/// after the first session's build are picked up without disturbing the rest.
+/// Called on every `acquire`, including when `active > 0` (siblings already
+/// built the tree). The walk always runs; entries whose runtime counterpart
+/// already exists are skipped, so `~/.claude/` additions after the first build
+/// are picked up without disturbing the rest.
 ///
 /// Shared vs. per-profile layout:
 /// - **Shared via symlink/copy across all profiles:** every top-level entry
@@ -398,8 +394,8 @@ fn build_runtime_dir(
     canonical: &Path,
     mode: LinkMode,
 ) -> Result<()> {
-    // Re-walk on every acquire so entries added to ~/.claude/ after the
-    // first session's build are picked up. Existing entries stay as-is.
+    // Re-walk every acquire so entries added to ~/.claude/ after the first
+    // build are picked up. Existing entries stay as-is.
     let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(claude_home)
         .with_context(|| format!("failed to read {}", claude_home.display()))?
@@ -473,12 +469,11 @@ fn materialize_entry(src: &Path, dst: &Path, mode: LinkMode) -> Result<()> {
 
 /// Materialize the pending top-level entries into the runtime tree.
 ///
-/// Real mode creates symlinks (near-free) serially. Fake mode is a recursive
-/// byte copy, so the independent top-level subtrees are fanned across a
-/// bounded worker pool to cut acquire wall-time on a large `~/.claude/`. This
-/// stays inside the single `with_state_lock` hold the caller already owns —
-/// the lock is never released; threads only parallelize the copy. Each
-/// subtree is disjoint, so the per-entry contract (no shared dst) is intact;
+/// Real mode creates symlinks serially (near-free). Fake mode is a recursive
+/// byte copy, so the independent top-level subtrees are fanned across a bounded
+/// worker pool to cut acquire wall-time on a large `~/.claude/`. Stays inside
+/// the caller's single `with_state_lock` hold — the lock is never released;
+/// threads only parallelize the copy. Each subtree is disjoint (no shared dst);
 /// credential reconciliation still runs serially after this returns.
 fn serialize_entries(pending: &[(PathBuf, PathBuf)], mode: LinkMode) -> Result<()> {
     for (src, dst) in pending {
@@ -547,9 +542,8 @@ fn reconcile_credentials(runtime_path: &Path, canonical: &Path, mode: LinkMode) 
     Ok(())
 }
 
-/// Recursive `std::fs::copy`. Directories are created at the destination
-/// and walked; files are copied byte-for-byte. Used in fake-symlink mode
-/// when the OS won't grant the process symlink creation rights.
+/// Recursive copy: directories created and walked, files copied byte-for-byte.
+/// Used in fake-symlink mode when the OS denies symlink creation rights.
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     let meta = src
         .symlink_metadata()
@@ -571,9 +565,9 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     }
 }
 
-/// One watchdog iteration. Real mode only repairs `.credentials.json`
-/// (the rest of the runtime is symlinks that need no maintenance). Fake
-/// mode reconciles every tree file by mtime and the credentials file too.
+/// One watchdog iteration. Real mode only repairs `.credentials.json` (the rest
+/// is symlinks needing no maintenance). Fake mode reconciles every tree file by
+/// mtime, plus the credentials file.
 fn tick(mode: LinkMode, runtime: &Path, claude_home: &Path, canonical: &Path) -> Result<()> {
     match mode {
         LinkMode::Real => {
@@ -581,28 +575,27 @@ fn tick(mode: LinkMode, runtime: &Path, claude_home: &Path, canonical: &Path) ->
             Ok(())
         }
         LinkMode::Fake => {
-            // The bulk tree walk + copies run WITHOUT the state lock. On a
-            // large ~/.claude/ tree holding the lock across the whole walk
-            // stalled every concurrent acquire / CLI switch for hundreds of ms
-            // each tick. The walk is safe to run lockless: every per-file merge
-            // is independent, self-converging under "latest mtime wins" + the
-            // byte-equality skip, and never deletes — so a file changing in the
-            // TOCTOU window between snapshot and copy just re-converges on the
-            // next 1s tick. settings.json / .credentials.json are skipped by
-            // mirror_tree, so it never races build_runtime_dir's per-profile
-            // writes. Only credential reconciliation, which must not interleave
-            // with acquire / switch credential writes, stays under the lock.
+            // Bulk tree walk + copies run WITHOUT the state lock: on a large
+            // ~/.claude/ holding the lock across the walk stalled every
+            // concurrent acquire / CLI switch for hundreds of ms per tick.
+            // Lockless-safe: every per-file merge is independent, self-converging
+            // under "latest mtime wins" + byte-equality skip, and never deletes
+            // — a file changing in the TOCTOU window re-converges next tick.
+            // mirror_tree skips settings.json / .credentials.json, so it never
+            // races build_runtime_dir's per-profile writes. Only credential
+            // reconciliation (must not interleave with acquire/switch credential
+            // writes) stays under the lock.
             mirror_tree(claude_home, runtime)?;
             with_state_lock(|| mirror_credentials(&runtime.join(".credentials.json"), canonical))
         }
     }
 }
 
-/// If Claude Code's internal refresh has replaced `<runtime>/.credentials.json`
-/// with a regular file, copy its bytes into the profile's canonical creds
-/// and swap the file back to a symlink so canonical stays the single source
-/// of truth. Returns `true` when bytes were actually written. Real-symlink
-/// mode only — fake-symlink mode uses [`mirror_credentials`].
+/// If Claude Code's internal refresh replaced `<runtime>/.credentials.json` with
+/// a regular file, copy its bytes into canonical creds and swap the file back to
+/// a symlink so canonical stays the single source of truth. Returns `true` when
+/// bytes were written. Real-symlink mode only — fake mode uses
+/// [`mirror_credentials`].
 pub(crate) fn sync_credentials(runtime: &Path, canonical: &Path) -> Result<bool> {
     let link_path = runtime.join(".credentials.json");
     with_state_lock(|| sync_credentials_unlocked(&link_path, canonical))
@@ -630,22 +623,20 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     let mut wrote_canonical = false;
     if differs {
         // Bytes differ: the TUI/scheduler may have rotated canonical while CC
-        // wrote a fresh interactive re-login into the runtime regular file.
-        // These can be two INDEPENDENT, both-valid refresh-token chains, so
-        // `expires_at` is the wrong tie-break — it is a property of the token,
-        // not a signal of which login the user actually performed last. A
-        // forced rotate-all (`t` key, `has_live_session` bypassed) can stamp a
-        // canonical token whose `expires_at` is marginally later than CC's
-        // fresh login; keeping canonical there would silently discard the
-        // user's just-completed interactive login and burn its chain.
+        // wrote a fresh interactive re-login into the runtime file. These can be
+        // two INDEPENDENT, both-valid refresh-token chains, so `expires_at` is
+        // the wrong tie-break — it's a property of the token, not a signal of
+        // which login the user performed last. A forced rotate-all (`t` key)
+        // can stamp a canonical token whose `expires_at` is marginally later
+        // than CC's fresh login; keeping canonical there silently discards the
+        // user's just-completed login and burns its chain.
         //
-        // Use write recency (file mtime) as the primary signal instead: CC's
-        // `unlink+write` re-login and our `atomic_write` both bump mtime, so
-        // "most recently written wins" reflects which login is actually the
-        // intended-live one. `expires_at` survives only as the tie-break when
-        // mtimes are equal or unavailable (e.g. clock granularity), and a full
-        // tie keeps canonical (missing/unparseable canonical → runtime wins by
-        // default, handled above by `canonical_bytes`/`canonical_exp` = None).
+        // Primary signal is write recency (file mtime): CC's `unlink+write`
+        // re-login and our `atomic_write` both bump mtime, so "most recently
+        // written wins" reflects the intended-live login. `expires_at` is only
+        // the tie-break when mtimes are equal/unavailable, and a full tie keeps
+        // canonical (missing/unparseable canonical → runtime wins by default,
+        // handled above via `canonical_bytes`/`canonical_exp` = None).
         let canonical_exp = canonical_bytes.as_deref().and_then(|cb| {
             let c = serde_json::from_slice::<ClaudeCredentials>(cb).ok()?;
             Some(c.claude_ai_oauth?.expires_at.unwrap_or(0))
@@ -660,10 +651,10 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
         let runtime_mtime = meta.modified().ok();
         let canonical_wins = match (canonical_exp, runtime_exp) {
             // Canonical present and parseable: mtime is the primary signal —
-            // trust the most recently written file regardless of token expiry.
-            // This is what fixes the silent discard of CC's fresh re-login.
-            // expires_at is the tie-break only when mtimes are equal or
-            // unavailable; canonical wins that fallback tie.
+            // trust the most recently written file regardless of token expiry
+            // (fixes the silent discard of CC's fresh re-login). expires_at is
+            // the tie-break only when mtimes are equal/unavailable; canonical
+            // wins that fallback tie.
             (Some(ce), Some(re)) => match (canonical_mtime, runtime_mtime) {
                 (Some(cm), Some(rm)) if cm != rm => cm > rm,
                 _ => ce >= re,
@@ -675,8 +666,8 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
             _ => false,
         };
         if canonical_wins {
-            // Canonical was written at/after the runtime re-login (or wins the
-            // mtime tie-break); do not overwrite it with the runtime bytes.
+            // Canonical written at/after the runtime re-login (or wins the
+            // tie-break); don't overwrite it with the runtime bytes.
             eprintln!(
                 "clauth: watchdog kept canonical credentials \
                  (canonical written more recently than runtime); \
@@ -698,17 +689,15 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     Ok(wrote_canonical)
 }
 
-/// Bidirectional mtime-based mirror between `runtime/.credentials.json` and
-/// the profile's canonical creds. "Latest mtime wins": the newer side is
-/// copied over the older. Skips partial writes (invalid JSON). Used in
-/// fake-symlink mode only.
+/// Bidirectional mtime mirror between `runtime/.credentials.json` and canonical
+/// creds: "latest mtime wins", newer side copied over older. Skips partial
+/// writes (invalid JSON). Fake-symlink mode only.
 fn mirror_credentials(runtime_path: &Path, canonical: &Path) -> Result<()> {
     let runtime_meta = runtime_path.metadata().ok();
     let canonical_meta = canonical.metadata().ok();
 
-    // Pick the newer side to copy from, or `None` when there is nothing to do:
-    // both present with comparable mtimes -> latest wins (tie/unknown mtime is a
-    // noop); exactly one present -> seed the other; neither -> noop.
+    // Newer side copies from; None when nothing to do (tie/unknown mtime is a
+    // noop; exactly one present seeds the other; neither is a noop).
     let copy: Option<(&Path, &Path)> = match (runtime_meta, canonical_meta) {
         (Some(rm), Some(cm)) => match rm.modified().ok().zip(cm.modified().ok()) {
             Some((rt, ca)) if rt > ca => Some((runtime_path, canonical)),
@@ -742,17 +731,14 @@ fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<()> {
     atomic_write(dst, &bytes).with_context(|| format!("failed to write {}", dst.display()))
 }
 
-/// Walk both `~/.claude/` and the runtime tree; for any file present on
-/// one or both sides, copy the newer bytes onto the older. Files that exist
-/// on only one side are seeded onto the other — Claude Code may create
-/// state under the runtime tree (new project history, scratch files) and
-/// the user may add entries under `~/.claude/` between ticks, both of
-/// which must propagate. **No deletion**: a file missing from one side is
-/// treated as "not yet seen", never as "intentionally removed", so a
-/// content-only mirror never destroys data. Top-level `settings.json` and
-/// `.credentials.json` are skipped — settings is intentionally a rewritten
-/// copy and credentials has its own mirror with stricter validation.
-/// Used in fake-symlink mode only.
+/// Walk both `~/.claude/` and the runtime tree; copy the newer bytes onto the
+/// older, seeding one-sided files onto the other — CC may create runtime-side
+/// state (project history, scratch files) and the user may add `~/.claude/`
+/// entries between ticks, both must propagate. **No deletion**: a file missing
+/// from one side is "not yet seen", never "intentionally removed", so the mirror
+/// never destroys data. Top-level `settings.json` / `.credentials.json` are
+/// skipped (settings is a rewritten copy; credentials has its own stricter
+/// mirror). Fake-symlink mode only.
 fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
     // `.claude.json` is a per-profile copy reconciled by `crate::claude_json`,
     // not part of the `~/.claude/` tree — skip it here so the tree mirror never
@@ -769,9 +755,8 @@ fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Unioned child-name set of two directories. Either side absent or
-/// unreadable contributes an empty set. Returned names are sorted for
-/// deterministic test output and stable iteration order.
+/// Unioned child-name set of two directories. Absent/unreadable side
+/// contributes nothing. Names sorted for deterministic, stable iteration.
 fn union_children(a: &Path, b: &Path) -> Vec<std::ffi::OsString> {
     let mut names: HashSet<std::ffi::OsString> = HashSet::new();
     for dir in [a, b] {
@@ -849,12 +834,11 @@ fn files_match(a: &Path, b: &Path) -> Result<bool> {
 }
 
 /// Copy `src` onto `dst` via a PID-suffixed tmp + atomic rename. `mirror_tree`
-/// now runs lockless, so a concurrent reader (a sibling session, the user, or
-/// `build_runtime_dir`) could observe `dst` mid-write. A raw `std::fs::copy`
-/// truncates then streams bytes — not atomic — so it could be seen torn. The
-/// rename makes the swap atomic on POSIX: any observer sees either the old or
-/// the complete new file. The PID suffix keeps two processes from colliding on
-/// the same tmp name.
+/// runs lockless, so a concurrent reader (sibling session, user, or
+/// `build_runtime_dir`) could observe `dst` mid-write; a raw `std::fs::copy`
+/// truncates-then-streams (non-atomic, seen torn). The rename makes the swap
+/// atomic on POSIX (observer sees old or complete-new); the PID suffix keeps two
+/// processes off the same tmp name.
 fn copy_file(src: &Path, dst: &Path) -> Result<()> {
     let bytes = std::fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
     atomic_write(dst, &bytes)

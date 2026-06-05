@@ -14,10 +14,7 @@ use super::super::theme;
 /// Width of the account picker column on the master-detail tabs.
 pub(super) const SELECTOR_WIDTH: u16 = 24;
 
-/// Paint a full-width selection bar across `line` — the shared selected-row
-/// treatment for the account pickers and the Config / Fallback detail rows.
-/// Bolds only the label item (`spans[1]`, after the leading cursor span); the
-/// rest just rides the soft bar. `width` stretches the bar across.
+/// Full-width selection bar: bolds `spans[1]` (after the cursor span), stretches to `width`.
 pub(super) fn highlight_row(mut line: Line<'static>, width: usize) -> Line<'static> {
     let pad = width.saturating_sub(line.width());
     if let Some(label) = line.spans.get_mut(1) {
@@ -30,10 +27,7 @@ pub(super) fn highlight_row(mut line: Line<'static>, width: usize) -> Line<'stat
     line
 }
 
-/// Apply the selected-row treatment to a pre-built row: the bar with its first
-/// label bolded when the pane holds focus, a dim wash when blurred, untouched
-/// otherwise. The single entry point every list / picker funnels its selected
-/// row through, so they all read identically.
+/// Selected-row treatment: bold+bar when focused, dim wash when blurred.
 pub(super) fn select_line(
     line: Line<'static>,
     selected: bool,
@@ -49,8 +43,7 @@ pub(super) fn select_line(
     }
 }
 
-/// Account name color: Claude orange while it's the active profile, plain text
-/// otherwise. Shared by every picker that lists account names.
+/// Orange for the active profile, plain text otherwise.
 pub(super) fn name_color(active: bool) -> Style {
     if active {
         Style::default().fg(theme::ACCENT_2)
@@ -59,8 +52,6 @@ pub(super) fn name_color(active: bool) -> Style {
     }
 }
 
-/// One account-picker row: a leading cursor span then the styled name, routed
-/// through `select_line`. Shared by every "accounts" picker so they match.
 pub(super) fn picker_row(
     selected: bool,
     focused: bool,
@@ -77,9 +68,7 @@ pub(super) fn picker_row(
     select_line(line, selected, focused, width)
 }
 
-/// Master-detail left selector: the bordered box, an empty-state line, then a
-/// scrolling list of `build_rows` (handed the inner width for `select_line`'s
-/// bar). Shared by the accounts and chain pickers; `sel` is the cursor index.
+/// Bordered selector list; `build_rows` receives the inner width for the selection bar.
 pub(super) fn draw_selector_list(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -109,9 +98,7 @@ pub(super) fn draw_selector_list(
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
-/// Bordered section box: rounded hairline, lowercase dim title, a one-column
-/// left/right margin (no vertical padding). The border turns sapphire when the
-/// pane holds focus — the "active pane" indicator.
+/// Rounded box with dim title; border turns sapphire when focused.
 pub(super) fn section_box(title: &str, focused: bool) -> Block<'static> {
     let border_style = if focused {
         Style::default().fg(theme::ACCENT)
@@ -126,8 +113,6 @@ pub(super) fn section_box(title: &str, focused: bool) -> Block<'static> {
         .padding(Padding::horizontal(1))
 }
 
-/// Account picker box. `focused` accents the border and the selection bar so
-/// it's obvious which pane ↑↓ drives.
 pub(super) fn draw_profile_selector(
     frame: &mut Frame<'_>,
     area: Rect,

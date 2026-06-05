@@ -2,9 +2,7 @@ use super::*;
 use std::fs::{self, OpenOptions};
 use std::time::{Duration, SystemTime};
 
-// Minimal valid ClaudeCredentials JSON — has claudeAiOauth.accessToken.
-// V1 has an earlier expires_at than V2 so real-mode tests can assert the
-// newer side wins without ambiguity.
+// V1 expires_at < V2 so tie-break tests can assert which side wins unambiguously.
 const CREDS_V1: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok1","expiresAt":1000}}"#;
 const CREDS_V2: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok2","expiresAt":2000}}"#;
 
@@ -53,7 +51,7 @@ fn sync_skips_invalid_json() {
     fs::write(&canonical, CREDS_V1).expect("write canonical");
     assert!(!sync_credentials_unlocked(&link_path, &canonical).expect("sync"));
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
-    // Link stayed a regular file — we wait for CC's write to complete.
+    // link stayed a regular file — waiting for CC's write to complete
     let meta = link_path.symlink_metadata().expect("meta");
     assert!(!meta.file_type().is_symlink());
 }
@@ -63,7 +61,7 @@ fn sync_skips_empty_credentials() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let canonical = tmp.path().join("canonical.json");
     let link_path = tmp.path().join(".credentials.json");
-    // {} parses as ClaudeCredentials but has no OAuth token — treat as partial.
+    // {} parses as ClaudeCredentials but carries no OAuth token — treat as partial
     fs::write(&link_path, b"{}").expect("write link");
     fs::write(&canonical, CREDS_V1).expect("write canonical");
     assert!(!sync_credentials_unlocked(&link_path, &canonical).expect("sync"));
@@ -96,8 +94,7 @@ fn sync_writes_canonical_when_differs() {
     let link_path = tmp.path().join(".credentials.json");
     fs::write(&link_path, CREDS_V2).expect("write link");
     fs::write(&canonical, CREDS_V1).expect("write canonical");
-    // Runtime is the more recent write, so it wins under the mtime tie-break.
-    let base = SystemTime::now();
+    let base = SystemTime::now(); // runtime is newer → wins mtime tie-break
     set_mtime(&canonical, base);
     set_mtime(&link_path, base + Duration::from_secs(5));
     assert!(sync_credentials_unlocked(&link_path, &canonical).expect("sync"));
@@ -130,9 +127,8 @@ fn sync_creates_canonical_when_missing() {
     );
 }
 
-// ── M6: expires_at tie-breaking in sync_credentials_unlocked ─────────────────
+// ── expires_at tie-breaking in sync_credentials_unlocked ─────────────────────
 
-// When canonical and runtime are byte-identical, no write should occur.
 #[test]
 fn sync_no_write_when_bytes_identical() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -146,8 +142,7 @@ fn sync_no_write_when_bytes_identical() {
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
 }
 
-// Canonical written more recently than runtime → canonical wins, runtime is
-// re-linked. mtime is the primary tie-break; expires_at agrees here (V2 > V1).
+// Canonical newer → canonical wins; mtime is primary (expires_at agrees: V2 > V1).
 #[test]
 fn sync_canonical_wins_when_written_more_recently() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -155,8 +150,7 @@ fn sync_canonical_wins_when_written_more_recently() {
     let link_path = tmp.path().join(".credentials.json");
     fs::write(&link_path, CREDS_V1).expect("write runtime (stale)");
     fs::write(&canonical, CREDS_V2).expect("write canonical (rotated)");
-    // Pin canonical strictly newer than runtime.
-    let base = SystemTime::now();
+    let base = SystemTime::now(); // canonical strictly newer
     set_mtime(&link_path, base);
     set_mtime(&canonical, base + Duration::from_secs(5));
 
@@ -177,8 +171,7 @@ fn sync_canonical_wins_when_written_more_recently() {
     );
 }
 
-// Runtime written more recently than canonical → runtime wins, canonical
-// overwritten. mtime is primary; expires_at agrees here (V2 > V1).
+// Runtime newer → runtime wins; mtime is primary (expires_at agrees: V2 > V1).
 #[test]
 fn sync_runtime_wins_when_written_more_recently() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -198,18 +191,15 @@ fn sync_runtime_wins_when_written_more_recently() {
     assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
 }
 
-// THE BUG FIX: a forced rotate-all can stamp a canonical token whose
-// expires_at is marginally LATER than CC's fresh interactive re-login, yet the
-// re-login (a different, still-valid chain) was written AFTER. mtime, not
-// expires_at, must decide — otherwise the watchdog silently discards the
-// user's just-completed login and burns its chain.
+// Bug fix: rotate-all can stamp a canonical token with later expires_at than a
+// fresh CC re-login written after. mtime must decide — not expires_at — or the
+// watchdog silently discards the user's just-completed login and burns its chain.
 #[test]
 fn sync_runtime_wins_when_newer_mtime_despite_lower_expires_at() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let canonical = tmp.path().join("canonical.json");
     let link_path = tmp.path().join(".credentials.json");
-    // Canonical (rotated) carries the LATER expires_at (V2 = 2000); runtime
-    // (CC re-login) carries the earlier one (V1 = 1000) but was written last.
+    // canonical (rotated) has later expires_at (V2=2000); runtime (CC re-login) has V1=1000 but written last
     fs::write(&canonical, CREDS_V2).expect("write canonical (rotated, later exp)");
     fs::write(&link_path, CREDS_V1).expect("write runtime (fresh re-login)");
     let base = SystemTime::now();
@@ -228,9 +218,7 @@ fn sync_runtime_wins_when_newer_mtime_despite_lower_expires_at() {
     );
 }
 
-// mtime tie (or unavailable) → fall back to expires_at, canonical on the
-// stronger side. Here canonical V2 > runtime V1 with equal mtimes, so
-// canonical keeps and runtime is re-linked.
+// mtime tie → fall back to expires_at; canonical V2 > V1 wins, runtime re-linked.
 #[test]
 fn sync_falls_back_to_expires_at_on_equal_mtime() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -250,7 +238,7 @@ fn sync_falls_back_to_expires_at_on_equal_mtime() {
     assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
 }
 
-// When canonical is missing, runtime always wins regardless of expires_at.
+// Canonical absent → runtime always wins.
 #[test]
 fn sync_runtime_wins_when_canonical_missing_expires_at() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -266,7 +254,7 @@ fn sync_runtime_wins_when_canonical_missing_expires_at() {
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
 }
 
-// When canonical cannot be parsed as JSON, runtime wins (safer than losing it).
+// Canonical unparseable → runtime wins (safer than discarding it).
 #[test]
 fn sync_runtime_wins_when_canonical_unparseable() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -370,8 +358,7 @@ fn mirror_credentials_skips_invalid_json() {
     set_mtime(&runtime, now);
 
     mirror_credentials(&runtime, &canonical).expect("mirror");
-    // Canonical untouched; partial JSON ignored.
-    assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
+    assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1); // canonical untouched; partial JSON ignored
 }
 
 #[test]
@@ -380,7 +367,7 @@ fn mirror_credentials_skips_empty_credentials() {
     let canonical = tmp.path().join("canonical.json");
     let runtime = tmp.path().join(".credentials.json");
     fs::write(&canonical, CREDS_V1).expect("write canonical");
-    // {} parses as valid JSON and as ClaudeCredentials, but has no OAuth token.
+    // {} parses as ClaudeCredentials but has no OAuth token
     fs::write(&runtime, b"{}").expect("write runtime");
     let past = SystemTime::now() - Duration::from_secs(60);
     let now = SystemTime::now();
@@ -411,10 +398,9 @@ fn mirror_tree_propagates_runtime_edit_to_canonical() {
     fs::create_dir_all(&runtime).expect("mkdir runtime");
     fs::write(claude.join("todos.json"), b"[]").expect("write canonical");
 
-    // Bootstrap the runtime copy so both sides hold the same byte stream.
     copy_tree(&claude, &runtime).expect("copy");
 
-    // Simulate Claude Code rewriting the runtime copy.
+    // simulate CC rewriting the runtime copy
     fs::write(runtime.join("todos.json"), br#"[{"id":1}]"#).expect("write runtime");
     let past = SystemTime::now() - Duration::from_secs(60);
     let now = SystemTime::now();
@@ -442,7 +428,6 @@ fn mirror_tree_skips_top_level_settings_and_credentials() {
 
     mirror_tree(&claude, &runtime).expect("mirror");
 
-    // Both sides keep their own settings.json and .credentials.json.
     assert_eq!(
         fs::read(claude.join("settings.json")).expect("read"),
         br#"{"home":true}"#
@@ -515,8 +500,7 @@ fn mirror_tree_seeds_runtime_only_file_to_canonical() {
         fs::read(claude.join("runtime-only.json")).expect("read"),
         br#"{"who":"cc"}"#
     );
-    // Runtime side is preserved — no data loss.
-    assert!(runtime.join("runtime-only.json").exists());
+    assert!(runtime.join("runtime-only.json").exists()); // runtime side preserved
 }
 
 #[test]
@@ -614,19 +598,16 @@ fn copy_file_leaves_no_tmp_artifact() {
 
     copy_file(&src, &dst).expect("copy_file");
 
-    // atomic_write uses a `.<name>.tmp.<pid>` sidecar that must be renamed away.
+    // `.<name>.tmp.<pid>` sidecar must be renamed away after atomic write
     let stray = tmp
         .path()
         .join(format!(".dst.json.tmp.{}", std::process::id()));
     assert!(!stray.exists(), "atomic copy must not leave a tmp file");
 }
 
-// A reader racing copy_file must never observe a torn/partial file — only the
-// old or the complete new bytes. This is the invariant that lets mirror_tree
-// run lockless: the rename in copy_file is the atomicity boundary, so a
-// concurrent acquire/switch/sibling reading the same path can't see a half
-// written copy. A non-atomic `std::fs::copy` (truncate-then-stream) would let
-// this assertion fail intermittently.
+// A racing reader must never see a torn file — only old or complete-new bytes.
+// This is the invariant that lets mirror_tree run lockless: rename is the
+// atomicity boundary. A non-atomic copy (truncate-then-stream) would fail this.
 #[test]
 fn copy_file_visible_state_is_never_torn() {
     use std::sync::Arc;
@@ -648,8 +629,7 @@ fn copy_file_visible_state_is_never_torn() {
     let new_clone = new.clone();
     let reader = std::thread::spawn(move || {
         while !reader_stop.load(Ordering::Relaxed) {
-            // Mid-rename the path may momentarily not resolve; that read error
-            // is fine. Any successful read must be the old or complete-new file.
+            // mid-rename: path may not resolve; any successful read must be old or complete-new
             if let Ok(bytes) = fs::read(reader_dst.as_ref()) {
                 assert!(
                     bytes == old_clone || bytes == new_clone,
@@ -672,8 +652,7 @@ fn copy_file_visible_state_is_never_torn() {
 fn detect_link_mode_returns_real_on_unix() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mode = detect_link_mode(tmp.path()).expect("detect");
-    // Unix CI always grants symlinks; Windows depends on dev mode.
-    #[cfg(unix)]
+    #[cfg(unix)] // Unix CI always grants symlinks; Windows depends on dev mode
     assert_eq!(mode, LinkMode::Real);
     #[cfg(not(unix))]
     let _ = mode;
@@ -681,20 +660,14 @@ fn detect_link_mode_returns_real_on_unix() {
 
 // ── HOME-mutating tests ────────────────────────────────────────────────────────
 //
-// These tests override $HOME so profile_dir / clauth_dir / home_dir all
-// resolve under a tempdir. The global clauth state lock (lock.rs LOCK static)
-// and the in-process HOME variable must not be touched concurrently, so every
-// test here must hold HOME_MUTEX for its entire duration.
-
-// One process-wide lock guards every home redirect (override static or $HOME
-// env), shared with the other test modules that do the same — see profile.rs.
+// These override $HOME so all path helpers resolve under a tempdir. HOME_MUTEX
+// must be held for the entire test to avoid races on the env var.
 use crate::profile::HOME_TEST_LOCK as HOME_MUTEX;
 
-/// Set $HOME to `root` for the duration of `f`. Callers must hold `HOME_MUTEX`
-/// before invoking so no two tests race on the env var.
+/// Set $HOME to `root` for the duration of `f`. Caller must hold `HOME_MUTEX`.
 fn with_fake_home<T>(root: &Path, f: impl FnOnce() -> T) -> T {
     let prev = std::env::var_os("HOME");
-    // SAFETY: single-threaded access ensured by the caller holding HOME_MUTEX.
+    // SAFETY: caller holds HOME_MUTEX — single-threaded access on HOME.
     unsafe { std::env::set_var("HOME", root) };
     let result = f();
     match prev {
@@ -704,7 +677,7 @@ fn with_fake_home<T>(root: &Path, f: impl FnOnce() -> T) -> T {
     result
 }
 
-/// Build a fake home with `~/.claude/` present (required by `acquire`).
+/// Build `~/.claude/` (required by `acquire`).
 fn fake_claude_home(root: &Path) -> PathBuf {
     let claude = root.join(".claude");
     fs::create_dir_all(&claude).expect("mkdir .claude");
@@ -714,8 +687,6 @@ fn fake_claude_home(root: &Path) -> PathBuf {
 fn make_profile(name: &str) -> crate::profile::Profile {
     crate::profile::Profile::new(name.to_string(), None, None)
 }
-
-// ── build_runtime_dir ─────────────────────────────────────────────────────────
 
 #[test]
 fn build_runtime_dir_writes_settings_not_symlink() {
@@ -737,14 +708,12 @@ fn build_runtime_dir_writes_settings_not_symlink() {
             .expect("build");
 
         let settings_dst = runtime.join("settings.json");
-        // Must be a regular file, not a symlink.
         let meta = settings_dst.symlink_metadata().expect("settings present");
         assert!(
             !meta.file_type().is_symlink(),
             "settings.json must not be a symlink"
         );
 
-        // Content must match what build_claude_settings_json would produce.
         let expected =
             build_claude_settings_json(&claude_home.join("settings.json"), &profile, &[])
                 .expect("build_claude_settings_json");
@@ -759,18 +728,16 @@ fn build_runtime_dir_credentials_not_from_claude_home() {
     let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
-        // Put a .credentials.json in ~/.claude/ — it must NOT appear in runtime.
+        // ~/.claude/.credentials.json must NOT appear in runtime
         fs::write(claude_home.join(".credentials.json"), CREDS_V1).expect("write creds");
         let runtime = tmp.path().join("runtime");
         fs::create_dir_all(&runtime).expect("mkdir runtime");
         let profile = make_profile("test");
-        // No canonical creds — so runtime/.credentials.json should be absent.
-        let canonical = tmp.path().join("profile-creds.json");
+        let canonical = tmp.path().join("profile-creds.json"); // no canonical → runtime creds absent
 
         build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
             .expect("build");
 
-        // The ~/.claude/.credentials.json entry was skipped; runtime has none.
         let runtime_creds = runtime.join(".credentials.json");
         assert!(
             !runtime_creds.exists(),
@@ -877,8 +844,7 @@ fn build_runtime_dir_other_entries_materialized() {
         build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
             .expect("build");
 
-        // Fake mode: entries are copied, not symlinked.
-        assert!(runtime.join("projects").is_dir(), "projects dir copied");
+        assert!(runtime.join("projects").is_dir(), "projects dir copied"); // Fake mode: copied, not symlinked
         assert!(
             runtime.join("history.jsonl").exists(),
             "history.jsonl copied"
@@ -919,7 +885,7 @@ fn build_runtime_dir_links_claude_json_from_parent() {
     let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
-        // ~/.claude.json sits next to ~/.claude/
+        // ~/.claude.json sits next to ~/.claude/, not inside it
         fs::write(tmp.path().join(".claude.json"), br#"{"userId":"u1"}"#)
             .expect("write .claude.json");
         let runtime = tmp.path().join("runtime");
@@ -940,15 +906,12 @@ fn build_runtime_dir_links_claude_json_from_parent() {
     });
 }
 
-// ── has_live_session ──────────────────────────────────────────────────────────
-
 #[test]
 fn has_live_session_false_when_no_sessions_dir() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
-        // No sessions dir created — must return false, not error.
-        assert!(!has_live_session("ghost"));
+        assert!(!has_live_session("ghost")); // no sessions dir → false, not error
     });
 }
 
@@ -957,7 +920,6 @@ fn has_live_session_false_when_sessions_dir_empty() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
-        // Create an empty sessions dir.
         let sessions = tmp
             .path()
             .join(".clauth")
@@ -981,8 +943,7 @@ fn has_live_session_false_when_all_sessions_dead() {
             .join("dead")
             .join("sessions");
         fs::create_dir_all(&sessions).expect("mkdir sessions");
-        // Unlocked file = dead session.
-        fs::write(sessions.join("99999"), b"").expect("write dead pid");
+        fs::write(sessions.join("99999"), b"").expect("write dead pid"); // unlocked file = dead
         assert!(!has_live_session("dead"));
     });
 }
@@ -1020,18 +981,14 @@ fn has_live_session_true_with_mixed_alive_and_dead() {
             .join("mixed")
             .join("sessions");
         fs::create_dir_all(&sessions).expect("mkdir sessions");
-        // One dead entry.
-        fs::write(sessions.join("11111"), b"").expect("write dead pid");
-        // One live entry.
-        let live_path = sessions.join("22222");
+        fs::write(sessions.join("11111"), b"").expect("write dead pid"); // dead
+        let live_path = sessions.join("22222"); // live
         let file = open_pid_file(&live_path).expect("open live pid");
         file.lock().expect("lock live pid");
         assert!(has_live_session("mixed"));
         drop(file);
     });
 }
-
-// ── ProfileRuntime acquire / drop lifecycle ───────────────────────────────────
 
 #[test]
 fn acquire_creates_runtime_and_pid_file() {
@@ -1043,13 +1000,11 @@ fn acquire_creates_runtime_and_pid_file() {
 
         let rt = ProfileRuntime::acquire(&profile).expect("acquire");
 
-        // Runtime dir exists.
         assert!(
             rt.config_dir().is_dir(),
             "runtime dir must exist after acquire"
         );
 
-        // PID file exists under sessions/<pid>.
         let pid = std::process::id().to_string();
         let sessions = tmp
             .path()
@@ -1058,14 +1013,11 @@ fn acquire_creates_runtime_and_pid_file() {
             .join("lifecycle")
             .join("sessions");
         assert!(sessions.join(&pid).exists(), "PID file must exist");
-
-        // PID file is flock-held while the runtime is alive.
         assert!(
             is_session_alive(&sessions.join(&pid)),
             "PID file must be flock-held while runtime is alive"
         );
 
-        // config_dir() points into ~/.clauth/profiles/<name>/runtime/.
         let expected_runtime = tmp
             .path()
             .join(".clauth")
@@ -1074,7 +1026,6 @@ fn acquire_creates_runtime_and_pid_file() {
             .join("runtime");
         assert_eq!(rt.config_dir(), expected_runtime);
 
-        // settings.json written into the runtime.
         assert!(
             rt.config_dir().join("settings.json").exists(),
             "settings.json must be written"
@@ -1082,7 +1033,6 @@ fn acquire_creates_runtime_and_pid_file() {
 
         drop(rt);
 
-        // After drop: PID file removed, runtime torn down, sessions dir removed.
         assert!(!sessions.join(&pid).exists(), "PID file removed on drop");
         assert!(
             !expected_runtime.exists(),
@@ -1095,13 +1045,9 @@ fn acquire_creates_runtime_and_pid_file() {
     });
 }
 
-// ── Multi-session ref-count ───────────────────────────────────────────────────
-
-/// Test that `build_runtime_dir` re-walk picks up entries added between two
-/// acquires. Uses the underlying functions directly because two
-/// `ProfileRuntime::acquire` calls in the same process would deadlock on the
-/// PID flock (`flock(LOCK_EX)` blocks when the same process opens the same
-/// path a second time via a new fd).
+/// `build_runtime_dir` re-walk must pick up entries added between two acquires.
+/// Uses underlying functions directly — two `ProfileRuntime::acquire` calls in
+/// the same process deadlock on the PID flock (`flock(LOCK_EX)` on same path).
 #[test]
 fn build_runtime_dir_rewalk_picks_up_late_entries() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1114,7 +1060,6 @@ fn build_runtime_dir_rewalk_picks_up_late_entries() {
         let profile = make_profile("rewalk");
         let canonical = tmp.path().join("creds.json");
 
-        // First build — existing.txt is materialized.
         build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
             .expect("first build");
         assert!(
@@ -1122,28 +1067,25 @@ fn build_runtime_dir_rewalk_picks_up_late_entries() {
             "first build: existing.txt present"
         );
 
-        // Simulate a new file added to ~/.claude/ after the first build.
         fs::write(claude_home.join("late_entry.txt"), b"new").expect("write late entry");
 
-        // Second build (simulating a second session's acquire) — late entry picked up.
+        // second build (second session's acquire) — late entry must appear
         build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
             .expect("second build");
         assert!(
             runtime.join("late_entry.txt").exists(),
             "second build must pick up late_entry.txt"
         );
-        // Existing entry still present — re-walk is additive, not destructive.
         assert!(
+            // re-walk is additive, not destructive
             runtime.join("existing.txt").exists(),
             "second build must preserve existing.txt"
         );
     });
 }
 
-/// Test that `prune_stale_sessions` correctly counts live vs dead sessions
-/// so a second live session prevents teardown. Uses direct calls to
-/// `open_pid_file` / `prune_stale_sessions` rather than two `ProfileRuntime`
-/// acquires (which would deadlock via `flock` on the shared PID path).
+/// A second live session must prevent teardown. Direct calls only — two
+/// `ProfileRuntime::acquire` in the same process deadlock via `flock`.
 #[test]
 fn prune_with_two_live_sessions_returns_two() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1173,12 +1115,10 @@ fn prune_with_two_live_sessions_returns_two() {
 
 // ── sync_credentials_unlocked concurrent contention (Unix) ───────────────────
 //
-// Two threads call sync_credentials_unlocked on the same link_path
-// simultaneously (barrier-synchronized). Both share the same PID-suffixed tmp
-// name. The requirement: regardless of which thread wins the rename race, the
-// final state is consistent — link_path is a valid symlink and canonical holds
-// the expected bytes. Neither thread should leave a dangling tmp or corrupt the
-// canonical file.
+// Two barrier-synchronized threads call sync on the same link_path (same
+// PID-suffixed tmp). Regardless of which wins the rename race, end state must
+// be consistent: link_path is a symlink, canonical holds the right bytes, no
+// dangling tmp.
 
 #[cfg(unix)]
 #[test]
@@ -1209,12 +1149,11 @@ fn sync_credentials_unlocked_concurrent_same_link_consistent_end_state() {
         sync_credentials_unlocked(&lp2, &ca2)
     });
 
-    // One or both may error (same-PID tmp collision); what matters is end state.
+    // one or both may error (same-PID tmp collision); end state is what matters
     let _ = t1.join().expect("thread 1 panicked");
     let _ = t2.join().expect("thread 2 panicked");
 
-    // link_path must be a symlink — not a dangling regular file — after both
-    // threads complete. The rename is atomic on POSIX so at least one wins.
+    // rename is atomic on POSIX — at least one thread wins; link_path must be a symlink
     assert!(
         link_path
             .symlink_metadata()
@@ -1224,14 +1163,12 @@ fn sync_credentials_unlocked_concurrent_same_link_consistent_end_state() {
         "link_path must be a symlink after concurrent sync"
     );
 
-    // canonical must hold the content that was in link_path.
     assert_eq!(
         fs::read(canonical.as_ref()).expect("read canonical"),
         CREDS_V1,
         "canonical must hold link content"
     );
 
-    // The PID-suffixed tmp must be cleaned up — no leftover temp file.
     let tmp_name =
         link_path.with_file_name(format!(".credentials.json.tmp.{}", std::process::id()));
     assert!(

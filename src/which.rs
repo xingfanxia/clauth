@@ -50,11 +50,8 @@ fn credentials_path(config_dir: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// When `CLAUDE_CONFIG_DIR` points at a `clauth start` runtime
-/// (`~/.clauth/profiles/<name>/runtime`), the started profile name is encoded
-/// in the path. The runtime tree is per-profile, so that profile owns the
-/// loaded credentials regardless of what is stored yet. Returns the `<name>`
-/// segment; `None` for any other path shape.
+/// Extract the `<name>` from a `clauth start` runtime path
+/// (`~/.clauth/profiles/<name>/runtime`). Returns `None` for any other shape.
 fn session_profile_from_config_dir(dir: &Path) -> Option<String> {
     if dir.file_name()? != "runtime" {
         return None;
@@ -71,17 +68,15 @@ fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
     serde_json::from_str(&content).ok()
 }
 
-/// Resolve the loaded credentials to a stored profile.
+/// Resolve loaded credentials to a stored profile.
 ///
 /// Order: (1) exact refresh-token match; (2) inside a `clauth start` runtime,
-/// the started profile named by `CLAUDE_CONFIG_DIR` (it owns the per-profile
-/// runtime, so it owns these credentials even before its first login is
-/// stored); (3) for a non-runtime caller, the credential-less active profile a
-/// fresh login was just written into.
+/// the profile named by `CLAUDE_CONFIG_DIR` owns the session even before its
+/// first login is stored; (3) for a non-runtime caller, the credential-less
+/// active profile a fresh login was just written into.
 ///
-/// `in_session` is true when `CLAUDE_CONFIG_DIR` is set. A `CLAUDE_CONFIG_DIR`
-/// that isn't a clauth runtime (so `session_profile` is `None`) gets step 1
-/// only — its credentials don't belong to the global active profile.
+/// A `CLAUDE_CONFIG_DIR` that isn't a clauth runtime gets step 1 only — its
+/// credentials don't belong to the global active profile.
 fn resolve_profile<'a>(
     config: &'a AppConfig,
     creds: Option<&ClaudeCredentials>,
@@ -103,11 +98,9 @@ fn resolve_profile<'a>(
     creds.and_then(|c| match_credential_less_active(config, c))
 }
 
-/// Read-time counterpart to first-login adoption: a freshly-activated blank
-/// profile that Claude Code just logged into holds no stored token yet, so no
-/// `refreshToken` match exists — but the live login is unambiguously the
-/// active profile's. Only fires when the active profile owns no credentials
-/// and the loaded file carries a completed OAuth login.
+/// Matches a fresh first-login to the credential-less active profile.
+/// Fires only when the active profile has no stored token but the loaded file
+/// has a completed OAuth login — no `refreshToken` match is possible yet.
 fn match_credential_less_active<'a>(
     config: &'a AppConfig,
     creds: &ClaudeCredentials,

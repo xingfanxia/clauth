@@ -5,8 +5,8 @@ use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile};
 use crate::usage::UsageStore;
 
-/// What the auto-switch evaluator decided to do when the active profile crossed
-/// its threshold.
+/// What the auto-switch evaluator decided when the active profile crossed its
+/// threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SwitchAction {
     /// Switch the active profile to this chain member.
@@ -33,22 +33,20 @@ fn is_exhausted(profile: &Profile) -> bool {
     window.utilization >= threshold_for(profile)
 }
 
-/// One chain member as observed at the moment a `ChainSnapshot` was built.
-/// Holds enough to evaluate the fallback decision without re-locking
-/// `AppConfig` — caller snapshots once under the config mutex and then
-/// reads `UsageStore` separately, avoiding the `config ↔ store` lock
-/// inversion against `App::apply_usage` (which holds `usage_store` then
-/// takes `config`).
+/// One chain member as observed when a `ChainSnapshot` was built. Holds enough
+/// to evaluate the fallback decision without re-locking `AppConfig` — caller
+/// snapshots once under the config mutex then reads `UsageStore` separately,
+/// avoiding the `config ↔ store` lock inversion against `App::apply_usage`
+/// (which holds `usage_store` then takes `config`).
 #[derive(Debug, Clone)]
 pub(crate) struct ChainMember {
     pub(crate) name: String,
     pub(crate) threshold: f64,
 }
 
-/// In-memory snapshot of just the fields `next_auto_switch_target` needs:
-/// the active profile name and the ordered chain with each member's
-/// resolved threshold. Built under the `AppConfig` mutex by
-/// [`snapshot_chain`], then evaluated lock-free.
+/// In-memory snapshot of the fields `next_auto_switch_target` needs: active
+/// profile name + ordered chain with each member's resolved threshold. Built
+/// under the `AppConfig` mutex by [`snapshot_chain`], then evaluated lock-free.
 #[derive(Debug, Clone)]
 pub(crate) struct ChainSnapshot {
     pub(crate) active: String,
@@ -57,11 +55,10 @@ pub(crate) struct ChainSnapshot {
     pub(crate) wrap_off: bool,
 }
 
-/// Snapshot the active profile + fallback chain + per-member thresholds
-/// out of `AppConfig`. Returns `None` when there's no active profile, the
-/// active isn't a chain member, or the chain is empty — every case where
-/// `next_auto_switch_target` would short-circuit anyway, so callers can
-/// skip the chain evaluation entirely on `None`.
+/// Snapshot active profile + chain + per-member thresholds out of `AppConfig`.
+/// Returns `None` when there's no active profile, the active isn't a chain
+/// member, or the chain is empty — every case where `next_auto_switch_target`
+/// short-circuits anyway, so callers can skip evaluation on `None`.
 pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     let active = config.state.active_profile.as_deref()?.to_string();
     let chain = &config.state.fallback_chain;
@@ -85,11 +82,10 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     })
 }
 
-/// True when the profile's 5h utilization (read from the shared `UsageStore`)
-/// has crossed `threshold`. Scheduler-side equivalent of [`is_exhausted`] —
-/// reads from the store rather than `Profile.usage`, which only the UI
-/// thread writes via `apply_usage`. A poisoned store lock fails safe to
-/// "not exhausted" so a momentarily wedged mutex can't trigger a switch.
+/// Scheduler-side [`is_exhausted`]: reads 5h utilization from the shared
+/// `UsageStore` rather than `Profile.usage` (which only the UI thread writes via
+/// `apply_usage`). A poisoned store lock fails safe to "not exhausted" so a
+/// momentarily wedged mutex can't trigger a switch.
 fn is_exhausted_from_store(name: &str, threshold: f64, store: &UsageStore) -> bool {
     let util = match store.lock() {
         Ok(s) => s
@@ -104,11 +100,10 @@ fn is_exhausted_from_store(name: &str, threshold: f64, store: &UsageStore) -> bo
     util >= threshold
 }
 
-/// Generic three-phase chain walk shared by [`next_target`] and
-/// [`next_auto_switch_target`]. Scans every other slot starting one after
-/// `idx` and wrapping. `skip_pred(i)` is true for slots to skip (the active
-/// profile, or a member with no resolvable profile); `accept_pred(i)` selects
-/// the first matching slot, whose index is returned.
+/// Chain walk shared by [`next_target`] and [`next_auto_switch_target`]. Scans
+/// every other slot starting one after `idx` and wrapping. `skip_pred(i)` skips
+/// slots (active profile, or a member with no resolvable profile);
+/// `accept_pred(i)` selects the first matching slot, whose index is returned.
 fn walk_chain(
     idx: usize,
     len: usize,
@@ -127,18 +122,15 @@ fn walk_chain(
     None
 }
 
-/// Picks the next chain member to switch to, starting one slot after the
-/// active profile and wrapping. Returns None when nothing is viable.
+/// Picks the next chain member to switch to, starting one slot after the active
+/// profile and wrapping. Returns None when nothing is viable.
 ///
-/// Two passes:
 ///   1. Any member with real headroom (5h utilization below threshold, or no
 ///      usage data fetched yet).
-///   2. As a last resort, a member with threshold == 100% — accepted even
-///      while it's at 100%. Claude Code will show its own "out of 5h limit"
-///      message on arrival.
-///   3. Wrap-off only: when no headroom and no sink exist (every threshold is
-///      below 100%) and the active profile is itself exhausted, return
-///      [`SwitchAction::Off`] to halt all usage.
+///   2. Last resort: a member with threshold == 100%, accepted even at 100%.
+///      Claude Code shows its own "out of 5h limit" message on arrival.
+///   3. Wrap-off only: no headroom, no sink (every threshold < 100%), and the
+///      active profile itself exhausted → [`SwitchAction::Off`] to halt usage.
 pub(crate) fn next_target(config: &AppConfig) -> Option<SwitchAction> {
     let active = config.state.active_profile.as_deref()?;
     let chain = &config.state.fallback_chain;
@@ -179,15 +171,14 @@ pub(crate) fn next_target(config: &AppConfig) -> Option<SwitchAction> {
     None
 }
 
-/// Scheduler-side decision: same logic as [`auto_switch_if_needed`] but
-/// operates on an in-memory [`ChainSnapshot`] taken under the config
-/// mutex, and reads utilization from the shared `UsageStore`. Returns the
-/// chain member to switch to, or `None` when no action is warranted.
+/// Scheduler-side [`auto_switch_if_needed`]: same logic over an in-memory
+/// [`ChainSnapshot`] taken under the config mutex, reading utilization from the
+/// shared `UsageStore`. Returns the member to switch to, or `None`.
 ///
 /// The store/config lock split is load-bearing: `App::apply_usage` locks
-/// `usage_store` then `config`, so the scheduler must never hold `config`
-/// while taking `usage_store`. Caller is expected to build the snapshot
-/// under `config.lock()`, drop the guard, then call this.
+/// `usage_store` then `config`, so the scheduler must never hold `config` while
+/// taking `usage_store`. Caller builds the snapshot under `config.lock()`, drops
+/// the guard, then calls this.
 pub(crate) fn next_auto_switch_target(
     snapshot: &ChainSnapshot,
     store: &UsageStore,
@@ -230,10 +221,9 @@ pub(crate) fn next_auto_switch_target(
     None
 }
 
-/// If the active profile is a chain member and its 5h utilization has crossed
-/// its threshold, switch to the next viable chain member — or, in wrap-off
-/// mode when the whole chain is spent and no sink exists, turn off all
-/// accounts. Returns the action taken, or None when nothing was warranted.
+/// If the active profile is a chain member past its threshold, switch to the
+/// next viable member — or, in wrap-off mode when the whole chain is spent and
+/// no sink exists, turn off all accounts. Returns the action taken, or None.
 pub(crate) fn auto_switch_if_needed(config: &mut AppConfig) -> Result<Option<SwitchAction>> {
     with_state_lock(|| {
         let Some(active_name) = config.state.active_profile.as_deref() else {

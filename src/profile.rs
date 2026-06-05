@@ -9,15 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::lock::with_state_lock;
 use crate::usage::{FetchStatus, UsageInfo};
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-/// A profile's name. A `#[serde(transparent)]` newtype over `String`, so the
-/// on-disk `profiles.toml` (the `profiles` Vec, `active_profile`, and the
-/// `fallback_chain`) stays byte-identical to the bare-string format. The type
-/// exists so `rename_all_occurrences` / `sync_state_profiles` and every
-/// name-list mutation are compiler-checked: a rename that misses a `Vec` or the
-/// active marker is a type error, not a silent data drift. Derefs to `str`, so
-/// it slots into the existing `&str`-keyed lookups and HashMaps unchanged.
+/// Newtype over `String` (transparent on disk). Makes every name-list mutation
+/// compiler-checked — a rename that misses a `Vec` or the active marker is a
+/// type error, not silent data drift. Derefs to `str` for existing lookups.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct ProfileName(String);
@@ -125,16 +119,11 @@ pub(crate) struct Profile {
     pub(crate) name: ProfileName,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
-    /// When true, clauth fires a 1-token Haiku ping at startup and on every
-    /// 30s refresh tick if this profile has no active 5h window. Opt-in
-    /// because every successful ping starts a fresh 5h usage window.
+    /// Fires a 1-token Haiku ping each 30s tick while no 5h window is active.
     pub(crate) auto_start: bool,
-    /// Extra env vars merged into `~/.claude/settings.json`'s `env` block
-    /// while this profile is active. Cleared on switch to another profile.
+    /// Extra env vars merged into `settings.json`'s `env` block while active; cleared on switch.
     pub(crate) env: BTreeMap<String, String>,
-    /// 5-hour utilization percentage at/above which the auto-switch system
-    /// will move off this profile. Only takes effect while the profile is a
-    /// member of `AppState::fallback_chain`. None = use default.
+    /// Utilization % to auto-switch off at (fallback chain only). None = use default.
     pub(crate) fallback_threshold: Option<f64>,
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) usage: Option<UsageInfo>,
@@ -175,22 +164,14 @@ impl Profile {
 pub(crate) struct AppState {
     pub(crate) active_profile: Option<ProfileName>,
     pub(crate) profiles: Vec<ProfileName>,
-    /// Epoch-ms of the last successful auto-start ping per profile. Used to
-    /// skip re-pinging a profile whose previous ping should still be inside
-    /// its 5-hour window. Field stays `last_kick_at` on disk for back-compat
-    /// with older clauth versions; new state can be read by them and vice
-    /// versa.
+    /// Epoch-ms of the last successful auto-start ping per profile.
+    /// Field stays `last_kick_at` on disk for back-compat with older versions.
     #[serde(default, alias = "last_kick_at", rename = "last_kick_at")]
     pub(crate) last_auto_start_at: HashMap<String, u64>,
-    /// Ordered list of profile names participating in the auto-switch chain.
     #[serde(default)]
     pub(crate) fallback_chain: Vec<ProfileName>,
-    /// Wrap-off mode. When true and every chain member's fallback threshold is
-    /// below 100% with the whole chain exhausted, auto-switch turns OFF all
-    /// accounts (clears the live credentials, unsets the active profile)
-    /// instead of staying on the spent profile — a hard stop on further token
-    /// spend once the chain is dry. Defaults to false (the legacy "stay put"
-    /// behaviour).
+    /// When true and the whole chain is exhausted, auto-switch clears live
+    /// credentials and unsets the active profile instead of staying put.
     #[serde(default)]
     pub(crate) wrap_off: bool,
 }
@@ -200,8 +181,7 @@ pub(crate) struct AppConfig {
     pub(crate) profiles: Vec<Profile>,
 }
 
-/// Shared handle to the process-wide [`AppConfig`], ranked in the global lock
-/// order (`config` is inner of `usage_store`, outer of the state flock).
+/// Ranked in lock order: inner of `usage_store`, outer of the state flock.
 pub(crate) type ConfigHandle =
     std::sync::Arc<crate::lockorder::RankedMutex<AppConfig, crate::lockorder::rank::Config>>;
 
@@ -244,16 +224,12 @@ impl AppConfig {
         }
     }
 
-    /// Rebuild `state.profiles` from the in-memory `profiles` list so the two
-    /// can't drift out of sync (e.g. after a partial save in a prior session
-    /// left a length mismatch).
+    /// Resync `state.profiles` from in-memory list to fix length drift from partial saves.
     pub(crate) fn sync_state_profiles(&mut self) {
         self.state.profiles = self.profiles.iter().map(|p| p.name.clone()).collect();
     }
 
-    /// Replace `old` with `new` in every profile-name list — the in-memory
-    /// profiles, `state.profiles`, `state.fallback_chain`, and the active
-    /// marker. Single point of truth so a rename can't silently miss a list.
+    /// Replace `old` with `new` in every name list and the active marker.
     pub(crate) fn rename_all_occurrences(&mut self, old: &str, new: &str) {
         if let Some(profile) = self.find_mut(old) {
             profile.name = new.into();
@@ -275,7 +251,6 @@ impl AppConfig {
     }
 }
 
-/// On-disk format for ~/.clauth/profiles/<name>/config.toml
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
 struct ProfileConfig {
     base_url: Option<String>,
@@ -288,20 +263,13 @@ struct ProfileConfig {
     fallback_threshold: Option<f64>,
 }
 
-// ── Path helpers ──────────────────────────────────────────────────────────────
-
-/// Test-only home-dir override. The showcase fixture points this at a sandbox
-/// tempdir so it can run the real, fully-interactive TUI — switching, editing,
-/// toggling, deleting — with every read/write redirected away from the user's
-/// real `~/.clauth` and `~/.claude`. Never compiled into the binary.
+/// Test-only home-dir override. Redirects all reads/writes away from real `~/.clauth`.
+/// Never compiled into the binary.
 #[cfg(test)]
 static HOME_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// The one lock every test that redirects `home_dir()` must hold for its whole
-/// duration — whether it sets [`HOME_OVERRIDE`] or the `$HOME` env var. Both
-/// feed the same `home_dir()` resolution, so two such tests running at once
-/// would clobber each other. Co-located with the override it guards so a single
-/// lock covers both mechanisms across every test module.
+/// Every test redirecting `home_dir()` (via `HOME_OVERRIDE` or `$HOME`) must hold
+/// this lock for its whole duration — both paths feed the same resolution.
 #[cfg(test)]
 pub(crate) static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -312,9 +280,7 @@ pub(crate) fn set_home_override(path: PathBuf) {
     }
 }
 
-/// Drop the home override so subsequent tests fall back to the real `$HOME`
-/// (or their own `$HOME` fake). A test that sets the override must clear it on
-/// the way out, or it shadows `$HOME` for every test that runs afterward.
+/// Clear the test home override. Must be called on teardown to avoid shadowing `$HOME`.
 #[cfg(test)]
 pub(crate) fn clear_home_override() {
     if let Ok(mut guard) = HOME_OVERRIDE.lock() {
@@ -355,8 +321,6 @@ pub(crate) fn profile_dir(name: &str) -> Result<PathBuf> {
     Ok(profiles_root()?.join(name))
 }
 
-/// `~/.clauth/profiles/<name>/<sub>`. Single join point for every per-profile
-/// file and subdirectory so callers don't re-derive `profile_dir(name)?.join`.
 pub(crate) fn profile_subpath(name: &str, sub: &str) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join(sub))
 }
@@ -373,8 +337,7 @@ fn profile_credentials_pending_path(name: &str) -> Result<PathBuf> {
     profile_subpath(name, "credentials.json.pending")
 }
 
-/// Write `content` to `path` via tempfile + rename so concurrent readers see
-/// either the old file or the new one, never a partial write.
+/// Tempfile + rename write; readers always see old or new, never partial.
 pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
@@ -395,18 +358,12 @@ pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::R
     }
 }
 
-// ── Persistence ───────────────────────────────────────────────────────────────
-
-/// Read and JSON-deserialize a file, contextualizing both the read and the
-/// parse failure with the path.
 pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
     serde_json::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
-/// Read and TOML-deserialize a file, contextualizing both the read and the
-/// parse failure with the path.
 pub(crate) fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -449,8 +406,7 @@ fn load_profile(name: &str) -> Result<Profile> {
     } else {
         None
     };
-    // Adopt a rotation that was staged but never committed (failed save or a
-    // crash between the OAuth response and the structured write).
+    // Adopt a staged rotation that never committed (crash/failed write between OAuth response and save).
     let credentials = recover_pending_credentials(name, credentials);
 
     let profile = Profile {
@@ -501,10 +457,8 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
     with_state_lock(|| {
         std::fs::create_dir_all(profile_dir(&profile.name)?)?;
 
-        // Persist credentials.json BEFORE config.toml: the OAuth token chain
-        // lives here, and a single-use refresh token must not be lost to an
-        // unrelated config.toml write failure. A failure here aborts before
-        // config.toml is touched.
+        // credentials.json BEFORE config.toml: single-use refresh token must
+        // not be lost to a config.toml write failure.
         let cred_path = profile_credentials_path(&profile.name)?;
         match &profile.credentials {
             Some(creds) => atomic_write(&cred_path, serde_json::to_string_pretty(creds)?)
@@ -525,12 +479,9 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
     })
 }
 
-/// Durably stage a freshly-rotated credential blob to a sidecar BEFORE the
-/// structured `save_profile`. The OAuth refresh token is single-use: once the
-/// server returns a rotated pair the previous token is dead, so losing the new
-/// pair (a failed write, a crash mid-save) permanently breaks the chain. If the
-/// commit never lands, `load_profile` adopts this sidecar on the next start.
-/// Callers clear it with [`clear_staged_credentials`] after a successful commit.
+/// Write rotated credentials to a sidecar BEFORE `save_profile`. Single-use
+/// refresh tokens can't be lost to a crash mid-save; `load_profile` adopts
+/// this sidecar on next start if the commit never landed.
 pub(crate) fn stage_rotated_credentials(name: &str, creds: &ClaudeCredentials) -> Result<()> {
     with_state_lock(|| {
         std::fs::create_dir_all(profile_dir(name)?)?;
@@ -542,20 +493,14 @@ pub(crate) fn stage_rotated_credentials(name: &str, creds: &ClaudeCredentials) -
     })
 }
 
-/// Remove the rotation sidecar after the structured save committed successfully.
 pub(crate) fn clear_staged_credentials(name: &str) {
     if let Ok(path) = profile_credentials_pending_path(name) {
         let _ = std::fs::remove_file(path);
     }
 }
 
-/// Adopt a staged rotation that never committed. The sidecar is written before
-/// the structured save during token rotation; if that save failed or the
-/// process died between the OAuth response and the commit, `credentials.json`
-/// may still hold the now-dead pre-rotation token while the sidecar holds the
-/// live rotated one. Adopt the sidecar when it is at least as new as
-/// `credentials.json` (or the latter is missing), persist it, and clear it. A
-/// stale sidecar (commit succeeded but cleanup didn't) is simply discarded.
+/// Adopt the rotation sidecar when it's at least as new as `credentials.json`
+/// (commit failed or process died mid-save). A stale sidecar is discarded.
 fn recover_pending_credentials(
     name: &str,
     loaded: Option<ClaudeCredentials>,
@@ -571,9 +516,8 @@ fn recover_pending_credentials(
         let pending: ClaudeCredentials = serde_json::from_slice(&bytes).ok()?;
         pending.claude_ai_oauth.as_ref()?; // must carry an oauth block to matter
         let cred_path = profile_credentials_path(name).ok()?;
-        // The sidecar is written before the commit, so a clean success leaves
-        // credentials.json at least as new (discard); a failed or interrupted
-        // commit leaves it older or absent (adopt).
+        // Clean success → credentials.json at least as new → discard.
+        // Failed/interrupted commit → older or absent → adopt.
         let adopt = match cred_path.metadata().and_then(|m| m.modified()) {
             Ok(cred_mtime) => pending_meta
                 .modified()
@@ -587,7 +531,6 @@ fn recover_pending_credentials(
         let _ = with_state_lock(|| atomic_write(&cred_path, &bytes).map_err(Into::into));
         Some(pending)
     })();
-    // Whether adopted or discarded, the sidecar has served its purpose.
     let _ = std::fs::remove_file(&pending_path);
     recovered.or(loaded)
 }
@@ -603,9 +546,7 @@ pub(crate) fn load_config() -> Result<AppConfig> {
     Ok(AppConfig { state, profiles })
 }
 
-/// Hand-rolled TOML writer that keeps every option visible — set values are
-/// uncommented, unset ones stay as commented examples so users can discover
-/// what's available without consulting the README.
+/// Renders config.toml with set values uncommented and unset ones as commented examples.
 fn render_config_toml(profile: &Profile) -> String {
     fn toml_str(s: &str) -> String {
         toml::Value::String(s.to_string()).to_string()

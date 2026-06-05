@@ -17,9 +17,7 @@ use crate::fallback::threshold_for;
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{ProfileActivity, now_ms};
 
-/// Width of the per-profile timer slot inserted before the 5h bar.
-/// Format: `XXXs` (3 digits + 's') + 1 trailing space = 5 chars.
-/// When fetching: `● ` padded to this width.
+/// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -105,7 +103,7 @@ impl OverviewWidths {
         } else {
             6
         };
-        // 26 = "[bar 10] XX% (1h 32m)" fits.  17 = "[bar 10] XX%" without reset.
+        // 26 = bar+pct+reset, 17 = bar+pct only.
         let mut five_hour = if total >= 81 {
             26
         } else if total >= 64 {
@@ -151,8 +149,7 @@ impl OverviewWidths {
             }
         }
 
-        // Spread leftover width across the inter-column gaps so columns
-        // breathe on wide terminals and stay tight on narrow ones.
+        // Spread leftover width into gaps so columns breathe on wide terminals.
         let base = fixed_overview_width(name, kind, five_hour, seven_day, route, gap_min);
         let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
         let gap_slots = column_count.saturating_sub(1).max(1);
@@ -178,9 +175,8 @@ fn fixed_overview_width(
     gap: usize,
 ) -> usize {
     let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
-    // 2 = cursor (`❯ ` / two blanks) before name. Timer slot is rendered in the
-    // gap before 5h and does not count as a column. The kind→timer gap is 4 chars
-    // narrower than the standard gap (min 1).
+    // 2 = cursor prefix. Timer slot is in the gap before 5h, not a column.
+    // kind→timer gap is 4 chars narrower than standard (min 1).
     let narrow = gap.saturating_sub(4).max(1);
     let standard_gaps = column_count.saturating_sub(2);
     2 + name + kind + five_hour + seven_day + route + standard_gaps * gap + narrow
@@ -192,8 +188,7 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
     spans.push(gap(widths));
     spans.push(Span::styled(fixed("type", widths.kind), theme::label()));
     spans.push(narrow_gap(widths));
-    // The timer slot sits before the 5h bar; keep the header label left-aligned
-    // over the bar by rendering blanks for the slot width.
+    // Blank TIMER_SLOT keeps the "5h" header aligned over the bar.
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
     spans.push(Span::styled(fixed("5h", widths.five_hour), theme::label()));
     if widths.seven_day > 0 {
@@ -236,9 +231,8 @@ fn render_overview_row(
     );
     let name_pad = Span::raw(name_pad);
 
-    // Per-profile timer slot: braille spinner during any in-flight activity,
-    // seconds countdown when Idle. Right-aligned in TIMER_SLOT-1 chars + 1
-    // trailing space so the bar [ always has visible breathing room.
+    // Spinner while in-flight, seconds countdown when Idle.
+    // Right-aligned in TIMER_SLOT-1 chars + 1 trailing space.
     let timer_span = {
         let inner = TIMER_SLOT - 1;
         let activity = app
@@ -305,8 +299,7 @@ fn gap(widths: &OverviewWidths) -> Span<'static> {
     Span::raw(" ".repeat(widths.gap))
 }
 
-/// Narrower gap used only between the `type` column and the timer slot.
-/// 4 chars less than the standard gap; never drops below 1.
+/// 4 chars less than standard gap; min 1. Used between `type` and timer slot.
 fn narrow_gap(widths: &OverviewWidths) -> Span<'static> {
     Span::raw(" ".repeat(widths.gap.saturating_sub(4).max(1)))
 }
@@ -343,8 +336,6 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(para, inner);
 }
 
-/// Cells in a member's 5h gauge. Enough resolution to read headroom at a
-/// glance, narrow enough to stay quiet.
 const GAUGE_W: usize = 12;
 
 fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'static>> {
@@ -378,8 +369,7 @@ fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'s
         }
         lines.push(chain_row(cfg, name, i, last, name_w));
     }
-    // Caption only if it won't push a member off-screen: explains the tick + loop.
-    // Wrap-off mode replaces the wrap caption — the chain stops instead of cycling.
+    // Caption only if it fits; wrap-off replaces wrap caption.
     if lines.len() < cap {
         let caption = if cfg.state.wrap_off {
             vec![
@@ -397,10 +387,6 @@ fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'s
     lines
 }
 
-/// One chain member on its own line: a faint ordering rail, a padded name, then
-/// a slim 5h gauge with a threshold tick and the figure. Color carries the
-/// active state (orange name) and lands on the gauge fill + the percentage;
-/// everything else stays quiet so the row reads at a glance without shouting.
 fn chain_row(
     cfg: &AppConfig,
     name: &str,
@@ -418,7 +404,7 @@ fn chain_row(
     } else {
         "│"
     };
-    // No active glyph — color carries the active state (orange name vs dim).
+    // Color carries active state — no glyph needed.
     let name_style = if active {
         Style::default().fg(theme::ACCENT_2)
     } else {
@@ -456,9 +442,7 @@ fn chain_row(
     Line::from(spans)
 }
 
-/// A `GAUGE_W`-cell bar whose fill tracks usage *relative to the member's own
-/// threshold*: a full bar means it has reached the threshold and is about to
-/// rotate off. Fill is colored by headroom; the empty track stays faint.
+/// `GAUGE_W`-cell bar relative to the member's threshold (full = rotate off).
 fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
     let fill = pct
         .map(|v| {
@@ -486,8 +470,6 @@ fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// Style for the Overview table's `route` column. Mirrors the pill health map,
-/// red for a missing profile.
 fn chain_state_style(profile: Option<&Profile>, pct: f64, threshold: f64) -> Style {
     match profile {
         None => theme::danger(),

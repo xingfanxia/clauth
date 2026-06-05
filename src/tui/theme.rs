@@ -40,14 +40,12 @@ pub(crate) fn base() -> Style {
     Style::default().fg(TEXT).bg(BG)
 }
 
-/// Plain body text — foreground only, no background. The default span tint for
-/// keys and labels that sit on the surface the parent block already paints.
+/// Plain body text — foreground only.
 pub(crate) fn body() -> Style {
     Style::default().fg(TEXT)
 }
 
-/// Stronger line color — the empty-gauge track and other structural fills that
-/// need to read a step above `LINE`.
+/// Stronger line color — empty-gauge track and structural fills above `LINE`.
 pub(crate) fn line_strong() -> Style {
     Style::default().fg(LINE_STRONG)
 }
@@ -64,8 +62,7 @@ pub(crate) fn muted() -> Style {
     Style::default().fg(TEXT_MUTED)
 }
 
-/// Uppercase tracked eyebrow label — 11px in web translates to bold + dim
-/// in the terminal per cloudy-ui's CLI mapping.
+/// Eyebrow label — bold + dim per cloudy-ui's CLI mapping.
 pub(crate) fn label() -> Style {
     Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD)
 }
@@ -86,15 +83,12 @@ pub(crate) fn danger() -> Style {
     Style::default().fg(DANGER)
 }
 
-/// Background for the selected list row — cloudy-ui's `--accent-soft` plus an
-/// accent left-bar is the canonical "active row" treatment.
+/// Background for the selected list row.
 pub(crate) fn selected_row() -> Style {
     Style::default().bg(BG_HOVER)
 }
 
-/// Maps a utilization percentage (0..=100) to the cloudy-ui semantic color
-/// the bar fill and percentage label should wear. Mirrors the web rule:
-/// dim under 60%, warning at 60–80%, danger past 80%.
+/// Utilization color: dim &lt;60%, warning 60–80%, danger &gt;80%.
 pub(crate) fn util_color(pct: f64) -> Color {
     let pct = pct.clamp(0.0, 100.0);
     if pct >= 80.0 {
@@ -106,14 +100,12 @@ pub(crate) fn util_color(pct: f64) -> Color {
     }
 }
 
-/// Sapphire info accent. Used as the spinner color for refresh operations to
-/// keep ACCENT (the primary sapphire) reserved for the active fetch spinner.
+/// Sapphire info accent; spinner color for refresh ops.
 pub(crate) fn info() -> Style {
     Style::default().fg(INFO)
 }
 
-/// Catppuccin green — success / confirmation tint. Spinner color for the
-/// auto-start kick path so a successful window arming reads green.
+/// Catppuccin green — success tint; spinner color for auto-start.
 pub(crate) fn success() -> Style {
     Style::default().fg(SUCCESS)
 }

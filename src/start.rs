@@ -53,8 +53,7 @@ pub(crate) fn run(config: &AppConfig, name: &str, claude_args: &[String]) -> Res
         signal: None,
     };
 
-    // Explicit drop so the runtime's final sync + reference-count
-    // cleanup runs before the possible `process::exit` below.
+    // Drop runtime before process::exit so final sync + refcount cleanup runs.
     drop(runtime);
 
     let code = status_code(outcome.status, outcome.signal);

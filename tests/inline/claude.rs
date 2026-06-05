@@ -117,7 +117,7 @@ fn classify_link_diverged_when_symlink_points_elsewhere() {
 fn first_login_true_when_no_stored_creds_and_plain_oauth_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let link = tmp.path().join(".credentials.json");
-    let expected = tmp.path().join("profile.json"); // absent → no stored creds
+    let expected = tmp.path().join("profile.json");
     fs::write(
         &link,
         serde_json::to_vec(&creds("a", Some("r"))).expect("ser"),
@@ -153,7 +153,7 @@ fn first_login_false_when_oauth_block_absent() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let link = tmp.path().join(".credentials.json");
     let expected = tmp.path().join("profile.json");
-    // Mid-flight partial write: valid JSON but no OAuth block yet.
+    // valid JSON but no OAuth block — mid-flight partial write
     fs::write(&link, b"{}").expect("write");
     assert!(!is_first_login_at(&link, &expected));
 }
@@ -181,8 +181,7 @@ fn classify_link_linked_to_even_when_target_missing() {
     let link = tmp.path().join(".credentials.json");
     let expected = tmp.path().join("profile.json");
     std::os::unix::fs::symlink(&expected, &link).expect("symlink");
-    // Target file deliberately doesn't exist yet — e.g. first-ever link
-    // before save_profile writes the credentials file.
+    // target absent (e.g. first-ever link, before save_profile writes it)
     assert_eq!(
         classify_link_at(&link, &expected).expect("classify"),
         LinkState::LinkedTo,

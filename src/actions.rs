@@ -22,12 +22,8 @@ use crate::profile::{
 use crate::spinner::Spinner;
 use crate::usage::OpResult;
 
-// ── Validation ────────────────────────────────────────────────────────────────
-
-/// Verifies `name` is a usable profile slug. Same rules as the legacy
-/// inquire prompt: ASCII alphanumeric plus `-`, `_`, `.`, not leading-dot,
-/// not empty, not a duplicate of any other profile (allowing `exclude` for
-/// rename-in-place).
+/// ASCII alphanumeric + `-_.", not leading-dot, not empty, not a duplicate
+/// (`exclude` exempts the current name for rename-in-place).
 pub(crate) fn validate_profile_name(
     name: &str,
     existing: &[&str],
@@ -54,8 +50,6 @@ pub(crate) fn validate_profile_name(
     Ok(())
 }
 
-// ── Profile actions ───────────────────────────────────────────────────────────
-
 pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
         if config.is_active(name) {
@@ -67,9 +61,7 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     })
 }
 
-/// Switch after the caller has accepted reconciling a diverged live file:
-/// preserve the outgoing profile's live creds unconditionally, then force
-/// the symlink to the target. Used by the CLI prompt path only.
+/// Force-snapshot the outgoing creds then force the symlink. CLI prompt path only.
 pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
         if config.is_active(name) {
@@ -81,21 +73,13 @@ pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &str) -> R
     })
 }
 
-/// `clauth <profile>` CLI switch: apply the relink (reconciling a diverged live
-/// file via the interactive `[Y/n]` prompt when needed), then prime the target's
-/// 5h usage window. No token rotation — like the TUI switch, this is a pure
-/// filesystem relink; a stale chain is rotated lazily by the scheduler's
-/// 401-recovery (or by Claude Code on launch) when it's actually used. Takes the
-/// owned config and wraps it in the shared `Arc<RankedMutex<…>>` the oauth fns
-/// require.
+/// CLI switch: relink (reconciling diverged live file via `[Y/n]` prompt), then
+/// prime the 5h window. No token rotation — stale chains rotate lazily on first use.
 pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<()> {
     let outgoing = config.state.active_profile.clone();
 
-    // Classify the outgoing active profile's live link. A diverged link means CC
-    // re-logged or rotated and wrote a regular file — a different, still-valid
-    // chain — so the switch must reconcile (capture the live creds into the
-    // outgoing profile) rather than refuse. Pure path/FS reads (no network, no
-    // config lock).
+    // Diverged link = CC re-logged and wrote a regular file; must reconcile
+    // (capture into outgoing profile) rather than refuse.
     let reconciled = match outgoing.as_deref() {
         Some(active) => {
             matches!(classify_credentials_link(active)?, LinkState::Diverged)
@@ -106,10 +90,6 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
 
     let config = Arc::new(RankedMutex::new(config));
 
-    // When the outgoing active profile has a diverged live credentials
-    // file (CC re-logged or wrote a regular file), prompt rather than
-    // refusing. On Yes: capture the live creds into the outgoing
-    // profile first, then force the switch. On No: abort cleanly.
     if reconciled {
         let active = {
             let cfg = config.lock().expect("config mutex poisoned");
@@ -141,11 +121,8 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
         switch_profile(&mut cfg, canonical)?;
     }
 
-    // Prime the 5h window if the target is opted in via `auto_start = true`
-    // (cooldown blocks repeated CLI switches from re-kicking the same window).
-    // `start_window` spends only the access token — no refresh-token rotation.
-    // The CLI has no scheduler to drain an OpResult, so feed a throwaway sender
-    // whose receiver is dropped immediately; the disconnected `send` is ignored.
+    // Prime the 5h window if opted in. Access-token only, no rotation.
+    // Throwaway sender — CLI has no scheduler to drain OpResult.
     {
         let _spinner = Spinner::start("clauth: priming usage window…");
         let (op_sender, _op_receiver) = std::sync::mpsc::channel::<OpResult>();
@@ -155,16 +132,10 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     Ok(())
 }
 
-/// Turn off all accounts: preserve the active profile's live credentials, then
-/// clear the live `~/.claude` credentials and unset the active profile so
-/// Claude Code can't spend any account. Used by the wrap-off auto-switch mode
-/// when the whole chain is exhausted and no 100%-threshold sink exists. No-op
-/// when no profile is active.
-///
-/// `snapshot_active_credentials` no-ops on a diverged live file (an unsaved
-/// `/login`), so the caller is expected to gate on divergence first — clearing
-/// a diverged file would otherwise drop a fresh login. The TUI auto-switch path
-/// raises its standard Divergence prompt before reaching here.
+/// Snapshot active creds then clear them so Claude Code can't spend any account.
+/// Used by wrap-off mode when the whole chain is exhausted. No-op when no profile
+/// is active. Caller must gate on divergence first — snapshot no-ops on a diverged
+/// file, so clearing without checking would drop a fresh `/login`.
 pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
     with_state_lock(|| {
         if config.state.active_profile.is_none() {
@@ -178,8 +149,7 @@ pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
 }
 
 fn finish_switch(config: &mut AppConfig, name: &str) -> Result<()> {
-    // Capture prev env keys before active_profile is reassigned so
-    // apply_profile_to_claude_settings can clear the outgoing profile's env.
+    // Capture outgoing env keys before active_profile is reassigned.
     let prev_env_keys: Vec<String> = config
         .state
         .active_profile
@@ -239,9 +209,8 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         let was_active = config.is_active(name);
         let dir = profile_dir(name)?;
 
-        // Remove the directory first so a filesystem failure keeps the profile
-        // visible in state and the user can retry. Persisting state ahead of a
-        // failed delete would leave an orphan directory the loader ignores.
+        // Remove directory first: a failed delete keeps the profile in state so
+        // the user can retry; persisting state first would leave an orphan dir.
         if dir.exists() {
             std::fs::remove_dir_all(&dir)
                 .with_context(|| format!("Failed to delete profile directory for '{name}'"))?;
@@ -270,14 +239,9 @@ pub(crate) fn create_blank_profile(
     })
 }
 
-/// Reads the current `~/.claude` credentials/endpoint and saves them as a new
-/// profile under `name`. Returns the matching profile name if these OAuth
-/// tokens already belong to one (caller can warn before proceeding).
-///
-/// Matches on `refresh_token` alone, like `which::resolve_profile`: the refresh
-/// token is the stable account identity, while access tokens rotate on every
-/// refresh. Keying on the access token here would miss a freshly-rotated login
-/// and let capture create a duplicate profile sharing one refresh chain.
+/// Returns a profile whose `refresh_token` matches `live`. Matches on refresh
+/// token only (stable identity); access tokens rotate and would produce false
+/// misses and duplicate profiles.
 pub(crate) fn find_matching_oauth_profile<'a>(
     config: &'a AppConfig,
     live: Option<&ClaudeCredentials>,
@@ -290,7 +254,6 @@ pub(crate) fn find_matching_oauth_profile<'a>(
         .map(|p| p.name.as_str())
 }
 
-/// Snapshot of the live `~/.claude` state, ready to be turned into a profile.
 #[derive(Debug, Clone)]
 pub(crate) struct CaptureSnapshot {
     pub(crate) credentials: Option<ClaudeCredentials>,
@@ -337,9 +300,7 @@ pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) ->
         return Ok(());
     }
     with_state_lock(|| {
-        // Defensive: resync state.profiles from the in-memory list so a
-        // partial save in a prior session can't cause a length mismatch panic
-        // here.
+        // Resync to fix length drift from a partial save in a prior session.
         config.sync_state_profiles();
         let profile = config.profiles.remove(from);
         config.profiles.insert(to, profile);

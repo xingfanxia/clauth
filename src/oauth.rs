@@ -16,8 +16,8 @@ use crate::usage::{
     UsageStore, clear_activity, iso_to_epoch_secs, mark_activity, now_epoch_secs, now_ms,
 };
 
-/// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup
-/// to mint a fresh access token from the stored refresh token.
+/// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup to
+/// mint an access token from the stored refresh token.
 const TOKEN_ENDPOINT: &str = "https://api.anthropic.com/v1/oauth/token";
 
 /// UUID of the "Claude Code" OAuth application; required for refresh.
@@ -37,9 +37,9 @@ const KICK_MODEL: &str = "claude-haiku-4-5-20251001";
 const KICK_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Refuse to re-ping a profile until this long after its last SUCCESSFUL
-/// auto-start. Sized just under the 5-hour window so we don't re-kick a
-/// profile that just opened a window. Claimed pre-kick (concurrency guard)
-/// and kept on success; overwritten to a shorter backoff on failure.
+/// auto-start. Sized just under the 5-hour window so we don't re-kick a profile
+/// that just opened one. Claimed pre-kick (concurrency guard) and kept on
+/// success; overwritten to a shorter backoff on failure.
 const AUTO_START_COOLDOWN_MS: u64 = 4 * 3600 * 1000 + 30 * 60 * 1000;
 
 /// How long to wait before retrying after a failed kick. Short enough to
@@ -83,8 +83,8 @@ pub(crate) fn refresh(refresh_token: &str) -> Result<TokenResponse> {
     serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))
 }
 
-/// Sends a 1-token Haiku message to start the 5-hour usage window. Mirrors
-/// what Claude Code does silently on launch.
+/// Sends a 1-token Haiku message to start the 5-hour usage window. Mirrors what
+/// Claude Code does silently on launch.
 fn kick(access_token: &str) -> Result<()> {
     let body = serde_json::to_string(&serde_json::json!({
         "model": KICK_MODEL,
@@ -111,9 +111,8 @@ fn kick(access_token: &str) -> Result<()> {
 
 /// Result of [`rotate_one_inner`]. Distinguishes the rotation-lock acquire
 /// failure (no `OpResult` emitted, no activity pre-stamp to clear) from every
-/// other path (which emits its own `OpResult` and clears activity before
-/// returning). `refresh_all` workers use the distinction to surface the
-/// guard-fail as a Danger toast.
+/// other path (which emits its own `OpResult` and clears activity). Lets
+/// `refresh_all` workers surface the guard-fail as a Danger toast.
 enum RotateOutcome {
     /// `RotationGuard::acquire` failed — a live session or sibling worker holds
     /// the per-profile rotation lock. No `OpResult` was emitted.
@@ -123,27 +122,26 @@ enum RotateOutcome {
     Persisted(bool),
 }
 
-/// Body of each [`refresh_all`] worker. Holds the per-profile rotation lock across the
-/// ENTIRE HTTP window so an external `clauth start <name>` cannot begin a
-/// refresh of the same single-use token while ours is in flight. The state
-/// flock cannot do this (it must be released across the network round trip).
-/// Ordering rule (matches `ProfileRuntime::acquire`): RotationGuard OUTERMOST,
-/// then the state flock inside. With the guard held, the `has_live_session`
-/// check below is authoritative, not a TOCTOU probe: a session that won the
-/// race has already stamped its PID file before releasing the guard, and one
-/// that lost it is blocked here until we finish and persist the rotated pair.
+/// Body of each [`refresh_all`] worker. Holds the per-profile rotation lock
+/// across the ENTIRE HTTP window so an external `clauth start <name>` cannot
+/// begin a refresh of the same single-use token while ours is in flight (the
+/// state flock can't — it must release across the round trip). Ordering rule
+/// (matches `ProfileRuntime::acquire`): RotationGuard OUTERMOST, then state
+/// flock inside. With the guard held, the `has_live_session` check below is
+/// authoritative, not a TOCTOU probe: a session that won the race stamped its
+/// PID file before releasing the guard; one that lost is blocked here until we
+/// finish and persist.
 ///
-/// `force` bypasses ONLY the `has_live_session` SKIP (the user explicitly
-/// requested every account be rotated, including one a live session touches);
-/// it never relaxes the mutual exclusion, which still serialises against that
-/// session's own refresh of the same chain.
+/// `force` bypasses ONLY the `has_live_session` SKIP (user explicitly wants
+/// every account rotated, including one a live session touches); it never
+/// relaxes the mutual exclusion, still serialised against that session's own
+/// refresh of the same chain.
 ///
-/// On the HTTP/persist leg, emits one `OpResult { kind: Refreshing }` and
-/// clears the activity slot. Returns [`RotateOutcome::GuardBusy`] without
-/// emitting an `OpResult` when the rotation lock can't be acquired (the slot
-/// was never pre-stamped here; `refresh_all` pre-stamps and clears it). The
-/// no-refresh-token / skipped-live-session legs return
-/// [`RotateOutcome::Persisted(false)`].
+/// HTTP/persist leg emits one `OpResult { kind: Refreshing }` and clears the
+/// activity slot. Returns [`RotateOutcome::GuardBusy`] without emitting an
+/// `OpResult` when the lock can't be acquired (slot never pre-stamped here;
+/// `refresh_all` pre-stamps and clears it). No-refresh-token / skipped-live-
+/// session legs return [`RotateOutcome::Persisted(false)`].
 fn rotate_one_inner(
     config: &crate::profile::ConfigHandle,
     name: &str,
@@ -194,14 +192,12 @@ fn rotate_one_inner(
     RotateOutcome::Persisted(applied)
 }
 
-/// Profiles that would be rotated by `refresh_all`. Extracted so tests can
-/// pin the inclusion logic without touching the network.
-///
-/// Returns `(name, refresh_token)` pairs. Diverged-active is skipped unless
-/// `force` is true; live-session profiles are included only when `force` is true.
+/// Profiles `refresh_all` would rotate, as `(name, refresh_token)` pairs.
+/// Extracted so tests can pin the inclusion logic without the network.
+/// Diverged-active and live-session profiles are included only when `force`.
 pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(String, String)> {
-    // when force=true (t-key rotate-all) we bypass diverged-active: the user
-    // explicitly wants every account rotated, including the one CC is touching.
+    // force=true (t-key rotate-all) bypasses diverged-active: user wants every
+    // account rotated, including the one CC is touching.
     let skip_active = !force && active_link_diverged(config);
     config
         .profiles
@@ -221,22 +217,18 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Strin
 /// Refreshes every profile's OAuth token pair (rotated pair saved to disk).
 /// Mirrors what Claude Code does silently on launch — minus the kick.
 ///
-/// Profiles without a stored refresh token are skipped. Network or revocation
-/// failures are swallowed per-profile; cached state stays put for those.
+/// Profiles without a stored refresh token are skipped. Network/revocation
+/// failures are swallowed per-profile; cached state stays put. `force` bypasses
+/// both the `has_live_session` and diverged-active guards.
 ///
-/// When `force` is true both the `has_live_session` guard and the diverged-active
-/// guard are bypassed — the user explicitly requested every profile be rotated.
+/// Returns the names whose rotation succeeded so the caller can target
+/// follow-up work (re-fetch, kick) at the same set, and pushes each onto
+/// `refetch` so the next tick re-fetches usage without waiting for the cadence.
 ///
-/// Returns the names of profiles whose token rotation succeeded so the caller
-/// can target follow-up work (usage re-fetch, kick) at the same set.
-/// Pushes each rotated name onto `refetch` so the next scheduler tick
-/// re-fetches usage immediately without waiting for the cadence.
-///
-/// Takes `&crate::profile::ConfigHandle` so per-profile workers can lock/unlock
-/// independently around their HTTP calls without ever holding the config
-/// mutex across the network. Each per-profile worker emits one `OpResult`
-/// on `sender` the moment its HTTP completes, so the spinner clears in
-/// arrival order rather than waiting for the slowest sibling.
+/// Takes `&ConfigHandle` so per-profile workers lock/unlock independently around
+/// their HTTP calls, never holding the config mutex across the network. Each
+/// worker emits one `OpResult` on `sender` the moment its HTTP completes, so the
+/// spinner clears in arrival order, not when the slowest sibling finishes.
 pub(crate) fn refresh_all(
     config: &crate::profile::ConfigHandle,
     force: bool,
@@ -261,9 +253,8 @@ pub(crate) fn refresh_all(
         mark_activity(activity, name, ProfileActivity::Refreshing);
     }
 
-    // Pair each handle with the profile name so the join loop can clear the
-    // activity slot on panic — the name is consumed by the closure, so we
-    // need a second copy held outside it.
+    // Pair each handle with the name so the join loop can clear the activity
+    // slot on panic — the closure consumes the name, so we keep a second copy.
     let handles: Vec<(String, _)> = snapshots
         .into_iter()
         .map(|(name, _rt)| {
@@ -272,12 +263,11 @@ pub(crate) fn refresh_all(
             let sender = sender.clone();
             let name_for_handle = name.clone();
             let h = std::thread::spawn(move || {
-                // Shared rotation body holds the per-profile RotationGuard across
-                // the HTTP window so an external `clauth start <name>` cannot
-                // double-spend this single-use token mid-rotation. `force`
-                // bypasses the `has_live_session` SKIP (we still want to rotate
-                // the token) but NOT the mutual exclusion: a forced rotate must
-                // still not race a live session's own refresh of the same chain.
+                // Holds the per-profile RotationGuard across the HTTP window so
+                // an external `clauth start <name>` cannot double-spend this
+                // single-use token mid-rotation. `force` bypasses the
+                // `has_live_session` SKIP but NOT the mutual exclusion: a forced
+                // rotate must still not race a live session's own refresh.
                 let outcome = rotate_one_inner(&config, &name, Some(&activity), &sender, force);
                 (name, outcome)
             });
@@ -289,10 +279,9 @@ pub(crate) fn refresh_all(
     for (name, h) in handles {
         match h.join() {
             Ok((n, RotateOutcome::Persisted(true))) => refreshed.push(n),
-            // The guard-fail leg never emits an OpResult, so unlike the other
-            // sites this slot — pre-stamped Refreshing before fan-out — would
-            // both freeze the spinner AND swallow the failure silently. Emit
-            // the Danger toast (matches the pre-collapse worker) and clear.
+            // Guard-fail leg never emits an OpResult, so this pre-stamped slot
+            // would freeze the spinner AND swallow the failure. Emit the Danger
+            // toast (matches the pre-collapse worker) and clear.
             Ok((n, RotateOutcome::GuardBusy)) => {
                 let _ = sender.send(OpResult {
                     name: n.clone(),
@@ -301,14 +290,13 @@ pub(crate) fn refresh_all(
                 });
                 clear_activity(activity, &n);
             }
-            // The persist/skip legs already emitted their OpResult and cleared
-            // their own slot. The pre-stamp here means a re-clear is harmless
-            // (idempotent) and guards the skipped-no-token path.
+            // Persist/skip legs already emitted their OpResult and cleared their
+            // slot; a re-clear is idempotent and guards the skipped-no-token path.
             Ok((n, RotateOutcome::Persisted(false))) => clear_activity(activity, &n),
             Err(_) => {
-                // Worker panicked before calling `clear_activity`. Clear the slot
-                // here so the spinner doesn't freeze and `any_busy` can resolve.
-                // No OpResult was sent, so no toast is emitted for this profile.
+                // Worker panicked before `clear_activity`. Clear here so the
+                // spinner doesn't freeze and `any_busy` can resolve. No OpResult
+                // was sent, so no toast for this profile.
                 clear_activity(activity, &name);
             }
         }
@@ -321,42 +309,37 @@ pub(crate) fn refresh_all(
     refreshed
 }
 
-/// Names of opted-in OAuth profiles that currently have NO live 5-hour window
-/// and are eligible for an auto-start kick: not active-with-a-diverged-link and
-/// past the auto-start cooldown. The caller enqueues these into
-/// `pending_auto_start`; the on-tick drain kicks each through [`start_window`].
+/// Names of opted-in OAuth profiles with NO live 5-hour window eligible for an
+/// auto-start kick: not active-with-a-diverged-link and past the cooldown.
+/// Caller enqueues into `pending_auto_start`; the on-tick drain kicks each via
+/// [`start_window`].
 ///
-/// This is the single steady-state arming path, and the fix for background
-/// (non-active) accounts: the active profile gets its 5-hour window for free
-/// (Claude Code starts one on use), so without a recurring scan an opted-in
-/// background profile would only ever be armed by the one-shot startup pass — a
-/// profile whose startup kick failed, or that lost its window mid-session,
-/// would never be re-armed. Running this every tick re-arms them as soon as
-/// they fall idle and windowless.
+/// The single steady-state arming path, and the fix for background (non-active)
+/// accounts: the active profile gets its window for free (CC opens one on use),
+/// so without a recurring scan a background profile whose startup kick failed,
+/// or that lost its window mid-session, would never be re-armed. Running every
+/// tick re-arms them as soon as they fall idle and windowless.
 ///
-/// A live `clauth start` session is NOT a reason to skip: a running Claude Code
-/// process holds the session lock but only opens a 5-hour window when it
-/// actually sends a message, so an idle (or just-reset) session has a live lock
-/// and no window — exactly the case that needs arming. Liveness is the wrong
-/// signal here; `resets_at` is the right one, and `has_active_window` already
-/// excludes a session that does hold an open window. Kicking is token-safe
-/// regardless: it spends only the access token, never the single-use refresh
-/// token, so it can't race a session's chain (unlike the rotate paths, which
-/// still gate on `has_live_session`).
+/// A live `clauth start` session is NOT a skip reason: CC holds the lock but
+/// only opens a window on first message, so an idle/reset session has a live
+/// lock and no window — exactly what needs arming. `has_active_window` already
+/// excludes sessions that hold a window; liveness is the wrong signal. Kicking
+/// spends only the access token (never the single-use refresh token), so it
+/// can't race the chain — unlike the rotate paths, which gate on
+/// `has_live_session`.
 ///
 /// Reads the usage store BEFORE the config lock: `apply_usage` holds
-/// `usage_store` then `config`, so taking them in the other order here would
-/// invert the global lock rank and deadlock.
+/// `usage_store` then `config`, so the reverse order here inverts the global
+/// rank and deadlocks.
 pub(crate) fn windowless_auto_start_candidates(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
 ) -> Vec<String> {
-    // A window counts as live only while its `resets_at` is still in the
-    // future. Checking mere presence would treat an expired-but-not-yet-cleared
-    // `resets_at` as a live window, so a background profile whose window lapsed
-    // would never be re-armed (the active profile gets a fresh window from
-    // Claude Code each session, masking the bug as "auto-start only works for
-    // the active one").
+    // A window is live only while `resets_at` is still in the future. Checking
+    // mere presence would treat an expired-but-not-yet-cleared `resets_at` as
+    // live, so a background profile whose window lapsed would never be re-armed
+    // (the active profile gets a fresh window from CC each session, masking the
+    // bug as "auto-start only works for the active one").
     let now_secs = now_epoch_secs();
     let has_active_window: std::collections::HashMap<String, bool> = store
         .lock()
@@ -399,35 +382,31 @@ pub(crate) fn windowless_auto_start_candidates(
 }
 
 /// The single auto-start codepath: fire the 1-token Haiku ping that opens a
-/// profile's 5-hour usage window, using its CURRENT access token. NEVER
-/// refreshes the OAuth chain — the access token is kept valid by the fetch
-/// path's 401-rotation, so auto-start can never double-spend the single-use
-/// refresh token and needs no `RotationGuard`.
+/// profile's 5-hour window using its CURRENT access token. NEVER refreshes the
+/// OAuth chain — the fetch path's 401-rotation keeps the access token valid, so
+/// auto-start can't double-spend the single-use refresh token and needs no
+/// `RotationGuard`.
 ///
-/// Gates on opt-in, OAuth, a diverged active link, and the auto-start cooldown
-/// so every caller (the on-tick windowless scan and the CLI switch) shares one
-/// rule set. Deliberately does NOT gate on `has_live_session`: a kick spends
-/// only the access token, and a live session that lacks a window (idle, or just
-/// reset) is precisely what needs arming — see
-/// [`windowless_auto_start_candidates`]. The cooldown slot is claimed
-/// (stamped `last_auto_start_at`) before the kick as a concurrency guard so a
-/// second tick can't spawn a duplicate worker in the gap between the `is_idle`
-/// check and the worker thread starting. On success the stamp is left as-is
-/// (full 4.5 h cooldown). On failure it is overwritten with a backoff stamp
-/// that allows a retry after `AUTO_START_RETRY_MS` (5 min) so a transient
-/// error or a just-rotated token recovers without waiting for the next window.
-/// The "already has a window" check lives in [`windowless_auto_start_candidates`],
-/// where the usage store is on hand.
+/// Gates on opt-in, OAuth, diverged active link, and cooldown so every caller
+/// shares one rule set. Does NOT gate on `has_live_session`: a kick spends only
+/// the access token, and an idle/reset session with no window is precisely what
+/// needs arming — see [`windowless_auto_start_candidates`]. The cooldown slot
+/// (`last_auto_start_at`) is stamped before the kick as a concurrency guard so a
+/// second tick can't spawn a duplicate worker in the gap between the idle check
+/// and the worker starting. On success the stamp stays (full 4.5 h cooldown); on
+/// failure it's overwritten with a backoff allowing a retry after
+/// `AUTO_START_RETRY_MS` (5 min) so a transient error / just-rotated token
+/// recovers without waiting for the next window. The "already has a window"
+/// check lives in [`windowless_auto_start_candidates`], where the store is on
+/// hand.
 ///
-/// Marks `AutoStarting`, sends one `OpResult`, and on a successful kick pushes
-/// `name` onto `refetch` so usage re-fetches and the freshly armed window shows
-/// up. Returns true iff the kick succeeded.
+/// Marks `AutoStarting`, sends one `OpResult`, and on success pushes `name` onto
+/// `refetch` so usage re-fetches and the armed window shows up. Returns true iff
+/// the kick succeeded.
 ///
-/// `refetch` and `activity` are the optional scheduler side-channels: the TUI
-/// passes `Some` to re-fetch usage and drive the spinner, the no-scheduler CLI
-/// switch passes `None` (nothing drains the refetch queue, no spinner) so it
-/// allocates no throwaway mutexes. Spends only the access token, so it still
-/// takes no `RotationGuard`.
+/// `refetch`/`activity` are optional scheduler side-channels: the TUI passes
+/// `Some` to re-fetch and drive the spinner; the no-scheduler CLI switch passes
+/// `None` (no queue drain, no spinner), allocating no throwaway mutexes.
 pub(crate) fn start_window(
     config: &crate::profile::ConfigHandle,
     name: &str,
@@ -470,7 +449,7 @@ pub(crate) fn start_window(
     let outcome = kick(&access_token);
     let kicked = outcome.is_ok();
     // On failure: overwrite the pre-kick stamp with a backoff so the profile
-    // retries after AUTO_START_RETRY_MS instead of the full 4.5 h cooldown.
+    // retries after AUTO_START_RETRY_MS instead of the full 4.5 h.
     if !kicked {
         let mut cfg = config.lock().expect("config mutex poisoned");
         let _ = with_state_lock(|| {
@@ -500,7 +479,7 @@ pub(crate) fn start_window(
     kicked
 }
 
-/// Write rotated token fields into an OAuth block. Called under the state lock.
+/// Write rotated token fields into an OAuth block. Caller holds the state lock.
 fn write_token_fields(oauth: &mut OAuthToken, tok: TokenResponse) {
     oauth.access_token = tok.access_token;
     oauth.refresh_token = Some(tok.refresh_token);
@@ -510,16 +489,15 @@ fn write_token_fields(oauth: &mut OAuthToken, tok: TokenResponse) {
     }
 }
 
-/// Write a rotated token pair into the named profile's OAuth block and
-/// persist. Takes `&crate::profile::ConfigHandle` so workers can call from a thread
-/// without holding the lock across HTTP. Returns `Ok(())` on success so callers
-/// can `?` straight into their OpResult outcome. Errs (rather than silently
-/// no-ops) when the profile or OAuth block is missing, the save fails, or the
-/// state flock can't be taken — callers must refuse to act on the rotated pair
-/// in every one of those cases. Every persist-side failure uses the same
-/// "failed to persist rotated tokens" message so the surfaced toast text is
-/// identical regardless of which leg failed (none is reachable in practice —
-/// a profile selected for rotation always has an OAuth block).
+/// Write a rotated token pair into the named profile's OAuth block and persist.
+/// Takes `&ConfigHandle` so workers can call from a thread without holding the
+/// lock across HTTP. Returns `Ok(())` so callers `?` straight into their
+/// OpResult. Errs (never silently no-ops) when the profile/OAuth block is
+/// missing, the save fails, or the state flock can't be taken — callers must
+/// refuse to act on the rotated pair in every case. Every persist-side failure
+/// uses the same "failed to persist rotated tokens" message so the toast text is
+/// identical regardless of leg (none reachable in practice — a profile selected
+/// for rotation always has an OAuth block).
 pub(crate) fn apply_rotated_tokens_locked(
     config: &crate::profile::ConfigHandle,
     name: &str,
@@ -554,10 +532,10 @@ pub(crate) fn apply_rotated_tokens_locked(
     // poisoned/unavailable lock never looks like a successful rotation.
 }
 
-/// True when an active profile is set and its live .credentials.json no
-/// longer resolves to that profile's stored credentials. In that state, the
-/// in-memory tokens are stale relative to whatever CC just wrote, so
-/// rotating them would leak a refresh chain nobody will use.
+/// True when an active profile is set and its live .credentials.json no longer
+/// resolves to that profile's stored credentials. Then the in-memory tokens are
+/// stale relative to what CC just wrote, so rotating them would leak a refresh
+/// chain nobody will use.
 fn active_link_diverged(config: &AppConfig) -> bool {
     config.state.active_profile.as_deref().is_some_and(|name| {
         matches!(

@@ -24,11 +24,9 @@ fn profile_config_reads_auto_start_directly() {
 
 #[test]
 fn profile_name_is_serde_transparent() {
-    // The `ProfileName` newtype must serialize as a bare string so profiles.toml
-    // stays byte-identical to the pre-newtype format. A non-transparent newtype
-    // would wrap it (e.g. a single-field table), silently migrating every
-    // user's state file. Round-trip a hand-written bare-string state and assert
-    // the re-rendered TOML matches what the loader produced.
+    // `ProfileName` must serialize as a bare string so profiles.toml stays
+    // byte-identical to the pre-newtype format (a non-transparent newtype
+    // would silently migrate every user's state file).
     let toml = r#"active_profile = "work"
 profiles = ["work", "play"]
 fallback_chain = ["work"]
@@ -38,8 +36,6 @@ fallback_chain = ["work"]
     assert_eq!(state.profiles, ["work", "play"]);
     assert_eq!(state.fallback_chain, ["work"]);
 
-    // Re-serialize and confirm the name lists are still bare strings (no
-    // newtype wrapper appears anywhere in the rendered output).
     let rendered = toml::to_string_pretty(&state).expect("render state");
     let reparsed: AppState = toml::from_str(&rendered).expect("reparse");
     assert_eq!(reparsed.active_profile.as_deref(), Some("work"));
@@ -49,8 +45,6 @@ fallback_chain = ["work"]
         rendered.contains("active_profile = \"work\""),
         "active_profile must render as a bare string, got:\n{rendered}"
     );
-    // A transparent newtype renders each name as a bare quoted string; a
-    // non-transparent wrapper would emit a nested table/struct instead.
     assert!(
         rendered.contains("\"work\"") && rendered.contains("\"play\""),
         "profile names must render as bare strings, got:\n{rendered}"
@@ -60,11 +54,8 @@ fallback_chain = ["work"]
         "no newtype wrapper may appear on disk, got:\n{rendered}"
     );
 
-    // Byte-for-byte: a `ProfileName`-typed AppState renders identically to a
-    // String-typed control with the same data. This is the load-bearing
-    // "no format migration" guarantee.
-    // Field order and serde attrs mirror `AppState` exactly so the rendered
-    // TOML is directly comparable.
+    // Byte-for-byte equality with a String-typed control — no format migration.
+    // Field order and serde attrs mirror `AppState` exactly.
     #[derive(serde::Serialize, Default)]
     struct BareState {
         active_profile: Option<String>,
@@ -100,9 +91,7 @@ work = 1700000000000
 
 #[test]
 fn app_state_writes_last_auto_start_at_as_last_kick_at_on_disk() {
-    // Forward-compat: a 0.2.0 binary must still be able to read profiles.toml
-    // written by a newer clauth. We keep the on-disk field name `last_kick_at`
-    // via #[serde(rename = "last_kick_at")].
+    // Forward-compat: 0.2.0 must read files written by newer clauth; on-disk name kept via rename.
     let mut state = AppState::default();
     state.last_auto_start_at.insert("work".into(), 42);
     let serialized = toml::to_string(&state).expect("serialize state");

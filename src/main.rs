@@ -34,8 +34,6 @@ fn main() -> Result<()> {
     dispatch(&args)
 }
 
-/// Routes parsed CLI args to the matching per-command handler. Each arm either
-/// returns the handler's `Result` or falls through to the TUI (`[]`).
 fn dispatch(args: &[String]) -> Result<()> {
     match args {
         [cmd, sub] if cmd == "completions" && sub == "install" => completions::install(None),
@@ -72,8 +70,6 @@ fn dispatch(args: &[String]) -> Result<()> {
     }
 }
 
-/// `clauth start <profile> [claude args...]` — spawn `claude` against the
-/// profile's isolated runtime.
 fn cmd_start(name: &str, rest: &[String]) -> Result<()> {
     platform::init();
     let config = load_config()?;
@@ -81,7 +77,6 @@ fn cmd_start(name: &str, rest: &[String]) -> Result<()> {
     start::run(&config, &canonical, rest)
 }
 
-/// `clauth <profile>` — switch the active account to `name` and exit.
 fn cmd_switch(name: &str) -> Result<()> {
     platform::init();
     let config = load_config()?;
@@ -89,7 +84,6 @@ fn cmd_switch(name: &str) -> Result<()> {
     actions::switch_profile_cli(config, &canonical)
 }
 
-/// `clauth` (no args) — launch the interactive TUI.
 fn cmd_tui() -> Result<()> {
     platform::init();
     completions::auto_install_once();

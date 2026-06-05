@@ -1,9 +1,5 @@
 //! Shared formatters and style helpers used across multiple screens.
-//!
-//! Anything that maps profile/usage state to a `Span`, `Style`, or display
-//! string and is referenced by more than one screen lives here. Screen-only
-//! helpers (e.g. fallback flow widget, overview column math) stay on their
-//! screen module.
+//! Screen-only helpers stay in their own modules.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
@@ -19,9 +15,8 @@ pub(super) fn fixed(value: &str, width: usize) -> String {
     content
 }
 
-/// Split into the visible content (possibly truncated with `…`) and the trailing
-/// padding. Callers that style only the content (e.g. underlined names) keep
-/// the padding plain so decorations don't bleed past the text.
+/// Truncates with `…` and returns `(content, padding)` separately so callers
+/// can style only the content without decorations bleeding past the text.
 pub(super) fn fixed_split(value: &str, width: usize) -> (String, String) {
     let mut content = String::with_capacity(width);
     let mut count = 0;
@@ -100,9 +95,8 @@ pub(super) fn window_summary_span(
     Span::styled(fixed(&text, width), style)
 }
 
-/// Same content as [`window_summary_span`] but returns the raw text and its
-/// style so the caller can append decorations (e.g. an auto-start marker) and
-/// pad to the column width itself.
+/// Like [`window_summary_span`] but returns `(text, style)` so the caller can
+/// append decorations and pad to the column width itself.
 pub(super) fn window_summary_parts(
     window: Option<&UsageWindow>,
     width: usize,
@@ -129,8 +123,7 @@ pub(super) fn window_summary_parts(
     (text, Style::default().fg(color))
 }
 
-/// 5h headroom against a member's own threshold: green with room, yellow as it
-/// nears, pink once it crosses — the point at which clauth rotates off it.
+/// Green/yellow/red headroom against a member's threshold (crossing = rotate).
 pub(super) fn health_color(pct: f64, threshold: f64) -> ratatui::style::Color {
     if pct >= threshold {
         theme::DANGER
@@ -141,38 +134,24 @@ pub(super) fn health_color(pct: f64, threshold: f64) -> ratatui::style::Color {
     }
 }
 
-/// Braille spinner frames — the set most CLI tools use. Index by `tick_count`
-/// so each render frame advances one step. Shared by the Overview row timer
-/// slot and the Usage detail status line. Single source of truth lives in
-/// [`crate::spinner`]; re-exported here for the render helpers.
 use crate::spinner::SPINNER_FRAMES;
 
-/// Spinner frame for the current tick.
 pub(super) fn spinner_frame(tick: u64) -> &'static str {
     SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
 }
 
-/// Color for an in-flight activity's spinner. Each state gets a distinct tint so
-/// a refresh inside a fetch, a switch, or an auto-start kick read differently at
-/// a glance. `Idle` falls back to faint (callers usually special-case it first).
+/// Distinct tint per activity so states read differently at a glance.
 pub(super) fn spinner_style(activity: ProfileActivity) -> Style {
     match activity {
-        // Sapphire primary — the routine "pulling fresh numbers" state.
         ProfileActivity::Fetching => theme::accent(),
-        // Info cyan — a refresh inside a fetch reads different from a plain fetch.
         ProfileActivity::Refreshing => theme::info(),
-        // Claude orange — switching is the rare, user-visible state.
         ProfileActivity::Switching => theme::orange(),
-        // Warning yellow — a launching session is a transient mid-state.
         ProfileActivity::Starting => theme::warning(),
-        // Catppuccin green — a successful auto-start arms the 5h window.
         ProfileActivity::AutoStarting => theme::success(),
         ProfileActivity::Idle => theme::faint(),
     }
 }
 
-/// Present-tense verb for an activity, for status lines that pair the spinner
-/// with a word (`⠹ refreshing…`).
 pub(super) fn activity_verb(activity: ProfileActivity) -> &'static str {
     match activity {
         ProfileActivity::Fetching => "fetching",

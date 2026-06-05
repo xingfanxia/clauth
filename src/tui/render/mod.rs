@@ -1,18 +1,12 @@
-//! Rendering — single top-level `draw` fn dispatches the whole frame.
+//! Single top-level `draw` fn dispatches the whole frame.
 //!
-//! Visual language (kept deliberately lean):
-//!   - one content frame per tab, never nested boxes; structure comes from
-//!     hairline rules (`format::rule` / `labeled_rule`) and whitespace
-//!   - all chrome is lowercase and quiet (dim, not bold-uppercase); the active
-//!     element is the only thing that wears sapphire
-//!   - hairline rounded corners, elevation via background tone, no shadows
-//!   - claude-orange reserved for the logo and the active-account marker
+//! Visual language: one content frame per tab, no nested boxes; chrome is dim
+//! lowercase; sapphire = active element; orange = logo + active-account marker.
 //!
 //! Where new things go:
-//!   - new tab → its own submodule + dispatch in `draw` + entry in `tabs.rs`
-//!   - new modal variant → `modals.rs`
-//!   - shared profile/usage formatters → `format.rs`
-//!   - shared multi-tab widgets (profile selector) → `panes.rs`
+//!   - new tab → submodule + dispatch in `draw` + entry in `tabs.rs`
+//!   - new modal → `modals.rs`
+//!   - shared formatters → `format.rs`; shared widgets → `panes.rs`
 
 mod chain;
 mod config;
@@ -33,9 +27,7 @@ use ratatui::widgets::Block;
 use super::app::{App, Tab};
 use super::theme;
 
-/// Logo height; the header (logo + brand + count + tab bar) is this tall. The
-/// content frame's top border doubles as the header/content separator, so no
-/// extra rule row is needed.
+/// Content frame's top border doubles as the header/content separator.
 pub(super) const HEADER_HEIGHT: u16 = 3;
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
@@ -117,9 +109,8 @@ mod render_smoke {
         out
     }
 
-    /// Every tab (and both Config focus states) must render without panicking
-    /// and must paint the header. Guards against layout regressions and, more
-    /// importantly, against a nested-lock hang in any render path.
+    /// Every tab (and both Config focus states) must render without panic.
+    /// Also guards against nested-lock hangs in any render path.
     #[test]
     fn all_tabs_render() {
         let profiles = vec![
@@ -151,7 +142,6 @@ mod render_smoke {
         }
     }
 
-    /// Empty-account state must also render on every tab without panicking.
     #[test]
     fn empty_state_renders() {
         let config = AppConfig {

@@ -21,7 +21,7 @@ fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).expect("read")).expect("parse")
 }
 
-/// Deterministic timestamps so "newest mtime" is unambiguous in tests.
+/// Deterministic timestamps so mtime ordering is unambiguous in tests.
 fn t(offset: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + offset)
 }
@@ -39,17 +39,16 @@ fn shared_fields_propagate_from_newest_to_others() {
         &b,
         &json!({"numStartups": 1, "oauthAccount": {"emailAddress": "b@x"}}),
     );
-    set_mtime(&a, t(10)); // newest -> source of shared fields
+    set_mtime(&a, t(10));
     set_mtime(&b, t(5));
 
     sync_paths(&[a.clone(), b.clone()]).expect("sync");
 
     let bj = read_json(&b);
-    assert_eq!(bj["numStartups"], json!(2)); // updated shared value
-    assert_eq!(bj["mcpServers"], json!({"x": 1})); // new shared key added
-    assert_eq!(bj["oauthAccount"]["emailAddress"], json!("b@x")); // identity kept
-    // Winner is never rewritten.
-    assert_eq!(read_json(&a)["oauthAccount"]["emailAddress"], json!("a@x"));
+    assert_eq!(bj["numStartups"], json!(2));
+    assert_eq!(bj["mcpServers"], json!({"x": 1}));
+    assert_eq!(bj["oauthAccount"]["emailAddress"], json!("b@x")); // per-profile identity kept
+    assert_eq!(read_json(&a)["oauthAccount"]["emailAddress"], json!("a@x")); // winner not rewritten
 }
 
 #[test]
@@ -81,7 +80,7 @@ fn per_profile_fields_never_propagate() {
     sync_paths(&[a, b.clone()]).expect("sync");
 
     let bj = read_json(&b);
-    assert_eq!(bj["shared"], json!(1)); // shared field propagated
+    assert_eq!(bj["shared"], json!(1));
     assert_eq!(bj["oauthAccount"]["emailAddress"], json!("b@x"));
     assert_eq!(bj["passesLastSeenRemaining"], json!(0));
     assert_eq!(bj["overageCreditGrantCache"], json!({"b": true}));
@@ -108,7 +107,7 @@ fn shared_key_absent_in_winner_is_removed_from_target() {
         bj.get("staleFeature").is_none(),
         "a shared key the winner dropped must be removed from the target"
     );
-    assert_eq!(bj["oauthAccount"]["e"], json!("b")); // per-profile preserved
+    assert_eq!(bj["oauthAccount"]["e"], json!("b"));
 }
 
 #[test]
@@ -121,15 +120,15 @@ fn unparseable_file_is_skipped() {
     fs::write(&b, b"{ partial truncated write").expect("write garbage");
     write_json(&c, &json!({"numStartups": 1, "oauthAccount": {"e": "c"}}));
     set_mtime(&a, t(10));
-    set_mtime(&b, t(20)); // newest by mtime, but unparseable -> ignored
+    set_mtime(&b, t(20)); // newest by mtime but unparseable → skipped
     set_mtime(&c, t(5));
 
     let before_b = fs::read(&b).expect("read b");
     sync_paths(&[a, b.clone(), c.clone()]).expect("sync");
 
-    // The mid-write file is never read-from nor written-to.
+    // mid-write file never read from nor written to
     assert_eq!(fs::read(&b).expect("read b"), before_b);
-    // `a` is the newest *parseable* member, so `c` takes its shared field.
+    // `a` is the newest parseable member → `c` takes its shared field
     let cj = read_json(&c);
     assert_eq!(cj["numStartups"], json!(2));
     assert_eq!(cj["oauthAccount"]["e"], json!("c"));
@@ -143,7 +142,7 @@ fn newest_mtime_wins_regardless_of_argument_order() {
     write_json(&a, &json!({"v": "old"}));
     write_json(&b, &json!({"v": "new"}));
     set_mtime(&a, t(5));
-    set_mtime(&b, t(10)); // b newer though `a` is listed first
+    set_mtime(&b, t(10)); // b newer even though `a` is listed first
 
     sync_paths(&[a.clone(), b.clone()]).expect("sync");
 
@@ -156,7 +155,6 @@ fn converged_target_is_not_rewritten() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = tmp.path().join("a.json");
     let b = tmp.path().join("b.json");
-    // Agree on shared fields; differ only in per-profile identity.
     write_json(&a, &json!({"numStartups": 5, "oauthAccount": {"e": "a"}}));
     write_json(&b, &json!({"numStartups": 5, "oauthAccount": {"e": "b"}}));
     set_mtime(&a, t(10));

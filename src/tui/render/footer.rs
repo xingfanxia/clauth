@@ -9,7 +9,6 @@ use ratatui::widgets::Paragraph;
 use super::super::app::{App, ConfigFocus, FallbackHint, Tab, fallback_hint};
 use super::super::theme;
 
-/// Shown on every tab; the persistent navigation cue.
 const TAB_NAV: (&str, &str) = ("⇥ ←→", "tabs");
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {

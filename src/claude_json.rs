@@ -28,9 +28,7 @@ use serde_json::{Map, Value};
 
 use crate::profile::{atomic_write, clauth_dir, home_dir};
 
-/// Top-level keys that are account-specific and must never propagate between
-/// profiles. Each `.claude.json` keeps its own values for these; the syncer
-/// only ever touches the remaining (shared) fields.
+/// Account-specific keys that must never propagate between profiles.
 const PER_PROFILE_FIELDS: &[&str] = &[
     "oauthAccount",
     "overageCreditGrantCache",
@@ -39,17 +37,14 @@ const PER_PROFILE_FIELDS: &[&str] = &[
     "cachedExtraUsageDisabledReason",
 ];
 
-/// Newest mtime propagated by the last [`sync_once`] that did work. A stat-only
-/// tick whose newest file is no older than this short-circuits before any read,
-/// parse, or write — honoring "poll by mtime, only reconcile on change".
+/// Newest mtime from the last [`sync_once`] that did work. Short-circuits ticks
+/// where no file is newer — no reads, parses, or writes.
 static LAST_SYNCED: Mutex<Option<SystemTime>> = Mutex::new(None);
 
 fn is_per_profile(key: &str) -> bool {
     PER_PROFILE_FIELDS.contains(&key)
 }
 
-/// Global `~/.claude.json` plus every profile runtime's `.claude.json`.
-/// Non-existent paths are included; [`sync_paths`] filters them out on read.
 fn known_paths() -> Result<Vec<PathBuf>> {
     let mut paths = vec![home_dir()?.join(".claude.json")];
     let profiles = clauth_dir()?.join("profiles");
@@ -63,12 +58,9 @@ fn known_paths() -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Enumerate every known `.claude.json` and reconcile them once.
-///
-/// Cheap path: a stat-only sweep finds the newest mtime; if nothing has changed
-/// since the last reconcile, it returns without reading any file. Only when a
-/// file is newer does it fall through to [`sync_paths`]. `LAST_SYNCED` advances
-/// only after a successful reconcile, so a transient error retries next tick.
+/// Reconcile all known `.claude.json` files once. Stat-only fast path: skips
+/// reads when no file is newer than `LAST_SYNCED`. Advances `LAST_SYNCED` only
+/// on success, so transient errors retry next tick.
 pub(crate) fn sync_once() -> Result<()> {
     let paths = known_paths()?;
     let newest = paths
@@ -95,14 +87,9 @@ struct Member {
     obj: Map<String, Value>,
 }
 
-/// Reconcile a fixed set of `.claude.json` paths once.
-///
-/// Reads + parses each existing file (skipping missing files and partial
-/// mid-write JSON), picks the newest as the source of the shared fields, then
-/// rewrites every other file as `winner.shared ∪ target.per_profile` —
-/// atomically and only when the result differs. Idempotent once every file
-/// agrees on the shared fields, so repeated ticks after convergence write
-/// nothing.
+/// Read and parse each file (skipping missing/partial writes), pick the newest
+/// as winner, rewrite every other as `winner.shared ∪ target.per_profile` —
+/// atomically, only on change. Idempotent after convergence.
 fn sync_paths(paths: &[PathBuf]) -> Result<()> {
     let mut members: Vec<Member> = Vec::new();
     for path in paths {
@@ -115,8 +102,7 @@ fn sync_paths(paths: &[PathBuf]) -> Result<()> {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
-        // A partial in-place write by Claude Code fails to parse — skip it this
-        // tick rather than treat a truncated file as authoritative.
+        // Partial CC in-place write fails to parse — skip until next tick.
         let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
@@ -130,7 +116,7 @@ fn sync_paths(paths: &[PathBuf]) -> Result<()> {
         return Ok(());
     }
 
-    // Newest mtime wins; ties broken by path so the choice is deterministic.
+    // Newest mtime wins; path breaks ties for determinism.
     let winner = members
         .iter()
         .enumerate()
@@ -149,9 +135,8 @@ fn sync_paths(paths: &[PathBuf]) -> Result<()> {
         if i == winner {
             continue;
         }
-        // Start from the target so its key order and per-profile fields are
-        // preserved; drop shared keys the winner no longer has, then upsert the
-        // winner's shared values (preserve_order keeps existing positions).
+        // Start from target to preserve key order and per-profile fields;
+        // drop stale shared keys, then upsert winner's shared values.
         let mut merged = member.obj.clone();
         merged.retain(|k, _| is_per_profile(k) || shared.contains_key(k));
         for (k, v) in &shared {

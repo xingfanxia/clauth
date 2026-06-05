@@ -21,7 +21,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     draw_logo(frame, cols[0], app);
 
-    // Right column: brand, account count, tab bar — one per row, aligned.
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

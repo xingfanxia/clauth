@@ -49,15 +49,15 @@ pub(crate) trait Rank: sealed::Sealed {
     const VALUE: u16;
 }
 
-/// Global lock order. Lower value = acquired earlier (outer). Gaps leave room to
-/// insert future locks without renumbering; only the relative order matters.
-/// Each rank is an uninhabited marker type implementing [`Rank`]; the raw u16
-/// weights are private to this module so the order can't be forged elsewhere.
+/// Global lock order. Lower value = outer. Gaps leave room to insert future
+/// locks without renumbering; only the relative order matters. Each rank is an
+/// uninhabited marker implementing [`Rank`]; the raw u16 weights are private to
+/// this module so the order can't be forged elsewhere.
 pub(crate) mod rank {
     use super::{Rank, sealed::Sealed};
 
-    /// Defines one uninhabited rank marker, its `Rank::VALUE`, and the sealing
-    /// `Sealed` impl in one shot so a new rank can never be added half-sealed.
+    /// Defines a rank marker, its `Rank::VALUE`, and the `Sealed` impl in one
+    /// shot so a new rank can never be added half-sealed.
     macro_rules! ranks {
         ($($(#[$m:meta])* $name:ident = $value:literal;)*) => {$(
             $(#[$m])*
@@ -97,8 +97,7 @@ thread_local! {
 
 /// Tracks one held rank on the current thread; pops it on drop. Used directly by
 /// the two file-lock guards ([`crate::lock`]'s state flock and
-/// [`crate::runtime::RotationGuard`]) which are not [`Mutex`]es but still
-/// participate in the global order.
+/// [`crate::runtime::RotationGuard`]) — not [`Mutex`]es but still in the order.
 pub(crate) struct RankGuard {
     #[cfg(debug_assertions)]
     rank: u16,

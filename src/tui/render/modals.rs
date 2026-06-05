@@ -32,11 +32,8 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// Render a modal sized to its own content: the box snaps to the widest line
-/// (or the title) and the exact line count, so nothing clusters in a corner of
-/// an oversized frame. Chrome is the rounded border (1) + `modal_block`'s
-/// `Padding::new(2, 2, 1, 1)` — 6 cols and 4 rows. The caller pre-aligns any
-/// line it wants centered (buttons, footer hints).
+/// Modal sized to content: snaps to widest line/title, exact line count.
+/// Chrome = rounded border (1) + `Padding::new(2,2,1,1)` = 6 cols, 4 rows.
 fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let w = (content_w + 6)
@@ -52,9 +49,7 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
-/// cloudy-tui modal shell: rounded orange (`ACCENT_2`) border, an UPPERCASE
-/// bold+italic dim title, base `BG` fill (no raised tone, no backdrop — the
-/// caller `Clear`s only the modal's own rect).
+/// Rounded `ACCENT_2` border, uppercase italic dim title, base `BG` fill.
 fn modal_block(title: impl Into<String>) -> Block<'static> {
     let title_line = Line::from(vec![
         Span::raw(" "),
@@ -98,8 +93,6 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     draw_modal(frame, area, title, lines);
 }
 
-/// cloudy-tui modal buttons: lowercase action verbs, the focused one in inverse
-/// video (`fg = BG, bg = TEXT, bold`), the other in `TEXT_DIM`.
 fn choice_buttons(choice: bool) -> Line<'static> {
     Line::from(vec![
         modal_button(" cancel ", !choice),
@@ -271,14 +264,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.extend(key_section(section, entries));
     }
     lines.extend(key_section("global", global));
-    // Trim the trailing blank line every section appends.
-    lines.pop();
+    lines.pop(); // trim trailing blank from last section
     draw_modal(frame, area, title, lines);
 }
 
-/// One help block: a `label`-styled title, a blank line, a `help_row` per pair,
-/// and a trailing blank line that separates it from the next block (the caller
-/// drops the last one).
 fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(title.to_string(), theme::label())),
@@ -292,9 +281,7 @@ fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<Line<'static>> {
 }
 
 fn help_row(key: &str, desc: &str) -> Line<'static> {
-    // Pad the key to an 18-col gutter, but always leave at least 1 space so a
-    // key ≥ 18 chars can't glue onto its description (a plain `{:<18}` emits no
-    // padding once the content reaches the width). Keys under 18 are unchanged.
+    // Always leave at least 1 space — `{:<18}` emits no padding at the width.
     const KEY_W: usize = 18;
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     Line::from(vec![
@@ -306,7 +293,6 @@ fn help_row(key: &str, desc: &str) -> Line<'static> {
     ])
 }
 
-/// Footer hint line: accent-bold key + dim label, separated by `   `.
 fn modal_footer_hints(hints: &[(&str, &str)]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, (key, label)) in hints.iter().enumerate() {

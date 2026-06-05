@@ -59,9 +59,7 @@ pub(crate) struct UsageInfo {
 }
 
 impl UsageInfo {
-    /// Picks the most representative weekly window. Max accounts return
-    /// per-model windows (`seven_day_sonnet`/`seven_day_opus`); Pro returns
-    /// the model-agnostic `seven_day`.
+    /// Most representative weekly window: Max returns per-model windows, Pro returns `seven_day`.
     pub(crate) fn weekly_window(&self) -> Option<&UsageWindow> {
         self.seven_day
             .as_ref()
@@ -173,10 +171,7 @@ pub(crate) fn fetch_raw(access_token: &str) -> std::result::Result<UsageInfo, Fe
     })
 }
 
-/// Read the on-disk usage cache for `name`. Returns `Some(info)` when a
-/// snapshot is available, `None` when no cache exists. The caller maps this
-/// to a `FetchStatus` (`Cached` when the bytes load, `Failed` when they
-/// don't) so this module stays free of scheduler types.
+/// Read the on-disk usage cache for `name`. Returns `None` when no cache exists.
 pub(crate) fn load_disk_cache(name: &str) -> Option<UsageInfo> {
     cache_path(name).and_then(|p| {
         let text = std::fs::read_to_string(p).ok()?;
@@ -184,8 +179,7 @@ pub(crate) fn load_disk_cache(name: &str) -> Option<UsageInfo> {
     })
 }
 
-/// Write the live response to disk so a future restart (or a tick where the
-/// API is unreachable) can still surface numbers.
+/// Write the live response to disk for use on future restart or API failure.
 pub(crate) fn write_disk_cache(name: &str, info: &UsageInfo) {
     let Some(path) = cache_path(name) else {
         return;
@@ -200,10 +194,8 @@ pub(crate) fn write_disk_cache(name: &str, info: &UsageInfo) {
 }
 
 fn cache_path(profile_name: &str) -> Option<PathBuf> {
-    // Route through `profile_dir` (override-aware `home_dir`) rather than raw
-    // `dirs::home_dir`, so the cache honors the test/showcase home override and
-    // never reads or writes the user's real `~/.clauth` under `#[cfg(test)]`.
-    // Same path in production, where the override is compiled out.
+    // Use `profile_dir` (override-aware) rather than raw `dirs::home_dir` so
+    // tests never touch the real `~/.clauth`.
     crate::profile::profile_dir(profile_name)
         .ok()
         .map(|p| p.join("usage_cache.json"))
@@ -216,10 +208,7 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// ── Time helpers ──────────────────────────────────────────────────────────────
-
-/// Parses an ISO-8601 timestamp like `2026-05-17T14:20:00.121699+00:00` into
-/// seconds since the Unix epoch. Returns None on any format deviation.
+/// Parse ISO-8601 timestamp (e.g. `2026-05-17T14:20:00.121699+00:00`) into Unix epoch seconds.
 pub(crate) fn iso_to_epoch_secs(s: &str) -> Option<i64> {
     let bytes = s.as_bytes();
     if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
@@ -249,7 +238,7 @@ pub(crate) fn iso_to_epoch_secs(s: &str) -> Option<i64> {
             b'-' => -1,
             _ => return None,
         };
-        // Accept `±HH`, `±HHMM`, and `±HH:MM`; normalize by dropping the colon.
+        // Accept `±HH`, `±HHMM`, `±HH:MM`.
         let digits: String = after_frac[1..].chars().filter(|&c| c != ':').collect();
         if after_frac[1..]
             .chars()
@@ -284,8 +273,7 @@ pub(crate) fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Formats a duration in seconds as a tight `Nd Nh`, `Nh Nm`, or `Nm` string.
-/// Returns `now` for zero or negative.
+/// Format seconds as `Nd Nh`, `Nh Nm`, or `Nm`; returns `"now"` for ≤0.
 pub(crate) fn humanize_duration(secs: i64) -> String {
     if secs <= 0 {
         return "now".to_string();

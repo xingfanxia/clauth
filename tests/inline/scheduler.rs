@@ -25,7 +25,7 @@ fn partition_due_uses_fixed_interval() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
     let snapshot = vec![token("a")];
-    let base = 1_700_000_000_000u64; // a realistic epoch-ms
+    let base = 1_700_000_000_000u64; // realistic epoch-ms
 
     // Never fetched: last = 0, next = REFRESH_INTERVAL_MS, due at any real `now`.
     let (due, next) = partition_due(&snapshot, base, &last_fetched, &activity);
@@ -73,27 +73,23 @@ fn partition_due_excludes_switching_and_refreshing() {
 
 // ── Panic-clear discipline ────────────────────────────────────────────────────
 
-/// Verify that the mark/join/clear discipline used by fetch_all_into and
-/// spawn_refresher's join loop clears the ActivityStore slot even when the
-/// worker function panics. This exercises the `Err(_)` arm of `h.join()` at
-/// the helper level without requiring real HTTP or a full scheduler.
+/// The mark/join/clear discipline in fetch_all_into and spawn_refresher must
+/// clear the ActivityStore slot even when the worker panics — exercises the
+/// `Err(_)` arm of `h.join()` without real HTTP or a full scheduler.
 #[test]
 fn activity_cleared_on_worker_panic() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
     let name = "test-profile";
 
-    // Simulate the mark-before-spawn step.
     mark_activity(&activity, name, ProfileActivity::Fetching);
     assert!(
         !activity.lock().unwrap().is_empty(),
         "slot must be set after mark_activity"
     );
 
-    // Spawn a worker that panics immediately — mirrors what happens when
-    // run_fetch panics inside fetch_all_into / spawn_refresher.
     let h = std::thread::spawn(|| -> () { panic!("simulated worker panic") });
 
-    // The join loop's Err arm: clear the slot on panic.
+    // join loop Err arm: clear slot on panic
     match h.join() {
         Ok(_) => panic!("expected panic in worker"),
         Err(_) => clear_activity(&activity, name),

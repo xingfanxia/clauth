@@ -19,12 +19,10 @@ use ratatui::crossterm::terminal::{
 
 use crate::profile::AppConfig;
 
-/// 100ms tick: snappy enough for blink animation, cheap enough that the input
-/// thread stays responsive without burning CPU on idle redraws.
+/// 100ms tick: responsive for animation without burning CPU on idle redraws.
 const TICK: Duration = Duration::from_millis(100);
 
-/// Launch the full-screen TUI against a loaded config. Returns when the user
-/// quits via q / ⎋ / Ctrl+C, or after a fatal error.
+/// Launch the full-screen TUI. Returns on quit (q/⎋/Ctrl+C) or fatal error.
 pub(crate) fn run(config: AppConfig) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let outcome = run_loop(&mut terminal, config);
@@ -50,14 +48,9 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
 
 fn run_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
     let mut application = app::App::new(config);
-    // Kick off startup reconciliation. This is non-blocking: the network-free
-    // decision runs inline, and the HTTP refresh probe (only needed when the
-    // live credentials diverge) is spawned onto a worker. Its verdict — and,
-    // crucially, the gate that token rotation must not race a soon-to-be-
-    // disowned profile — is sequenced through `StartupSignal`, drained in
-    // `on_tick`. The bootstrap (relink, refresh-all, initial fetch, kick) is
-    // likewise spawned from `on_tick` once reconcile settles, so neither runs
-    // before the first paint below.
+    // Non-blocking reconcile: fast path runs inline; verdict sequenced via
+    // `StartupSignal`. Bootstrap is spawned from `on_tick` once reconcile
+    // settles — neither blocks the first paint.
     app::reconcile_startup(&mut application);
 
     let mut last_tick = Instant::now();
@@ -85,8 +78,8 @@ fn run_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
     app::shutdown(&mut application)
 }
 
-// Fake-data TUI for README screenshots. Test-only and out of `src/`; run with
-// `cargo test showcase -- --ignored --nocapture`.
+// Fake-data TUI for README screenshots (test-only).
+// Run: `cargo test showcase -- --ignored --nocapture`
 #[cfg(test)]
 #[path = "../../tests/inline/showcase.rs"]
 mod showcase;

@@ -24,9 +24,9 @@ use super::panes::{
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 use crate::profile::AppConfig;
 
-/// Cells in the detail-pane gauges. Wide enough to read a threshold tick.
+/// Wide enough to read a threshold tick.
 const GAUGE_W: usize = 22;
-/// Padded key column width for the detail rows, matching the Config tab.
+/// Key column width, matching the Config tab.
 const KEY_W: usize = 11;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -40,8 +40,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_chain_detail(frame, cols[1], app);
 }
 
-/// Left pane: the ordered chain members plus a trailing `+ add` row. Color marks
-/// the active account; the cursor rides on `❯` only while this pane has focus.
 fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     let items = chain_items(app);
     let cfg = app.config();
@@ -85,8 +83,6 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
     });
 }
 
-/// Right pane: the member rotation card + inline rows, the add-candidate picker
-/// on the `+ add` row, or an empty-chain explainer.
 fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let detail_focused = app.fallback_focus == FallbackFocus::Detail;
     let inner_w = section_box("", detail_focused).inner(area).width as usize;
@@ -95,10 +91,8 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .get(app.chain_cursor.min(items.len().saturating_sub(1)))
         .copied();
 
-    // Each arm acquires the `config` guard only for as long as it needs it. The
-    // `Add` arm must NOT hold it — `add_detail` re-locks `config` (via
-    // `chain_candidates`), and the mutex is non-reentrant, so holding it here
-    // would deadlock the whole render loop on the `+ add` row.
+    // `Add` arm must NOT hold the `config` guard — `add_detail` re-locks it via
+    // `chain_candidates`, and the mutex is non-reentrant (deadlock on `+ add` row).
     let (title, lines): (String, Vec<Line<'static>>) = match selected {
         Some(ChainItemKind::Member(i)) => {
             let cfg = app.config();
@@ -135,10 +129,8 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
-/// The member rotation card: position + active state, a 5h gauge with a
-/// threshold tick, the headroom, the next hop, then the inline threshold
-/// stepper / editor and remove rows. Caret + edit affordances appear only when
-/// the right pane holds focus; keybind cues live in the footer.
+/// Position + active state, 5h gauge with threshold tick, headroom, next hop,
+/// inline threshold stepper/editor and remove rows. Caret only when focused.
 #[allow(clippy::too_many_arguments)]
 fn member_detail(
     cfg: &AppConfig,
@@ -169,7 +161,6 @@ fn member_detail(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Position + active state.
     lines.push(Line::from(vec![
         Span::styled(kv_key("position"), theme::faint()),
         Span::styled(format!("#{} of {chain_len}", index + 1), theme::muted()),
@@ -181,7 +172,6 @@ fn member_detail(
     ]));
     lines.push(Line::from(""));
 
-    // 5h gauge with a threshold tick.
     lines.push(Line::from(Span::styled("5h utilization", theme::label())));
     lines.push(Line::from(gauge_with_tick(pct, Some(threshold))));
     let (figure, figure_style) = match pct {
@@ -197,7 +187,6 @@ fn member_detail(
     lines.push(Line::from(Span::styled(figure, figure_style)));
     lines.push(Line::from(""));
 
-    // Where rotation flows when this member crosses its threshold.
     if chain_len > 1 {
         let next = (index + 1) % chain_len;
         let next_name = cfg
@@ -223,9 +212,6 @@ fn member_detail(
     }
     lines.push(Line::from(""));
 
-    // Inline rows: threshold stepper / editor, the chain-global wrap-off toggle,
-    // then remove. The caret + interactivity only render while the right pane
-    // holds focus.
     let wrap_off = cfg.state.wrap_off;
     for (i, row) in FALLBACK_ROWS.iter().enumerate() {
         let selected = focused && i == cursor;
@@ -247,7 +233,6 @@ fn member_detail(
         } else {
             line
         });
-        // Meaning tooltip under the focused row (keybind cues live in the footer).
         if selected && row_editing.is_none() {
             let tip = match row {
                 FallbackRow::Threshold => Some("rotate to next account when 5h usage reaches this"),
@@ -265,9 +250,6 @@ fn member_detail(
     lines
 }
 
-/// One member detail row: the threshold stepper / editor, the chain-global
-/// wrap-off toggle, or the danger remove row. `editing` is `Some` only for the
-/// threshold row while it's typed into.
 fn detail_row(
     row: FallbackRow,
     selected: bool,
@@ -284,8 +266,7 @@ fn detail_row(
     match row {
         FallbackRow::WrapOff => {
             let pad = KEY_W.saturating_sub("when spent".len()).max(1);
-            // Spell out the action, not a mode name: the chosen branch reads as
-            // a sentence so "off" is never shown as a bare, confusing value.
+            // Spell out the action so "off" is never shown as a bare value.
             let (value, style) = if wrap_off {
                 ("switch off all accounts", theme::orange())
             } else {
@@ -331,8 +312,6 @@ fn detail_row(
     }
 }
 
-/// The typed threshold value with a block caret over a sunken input strip,
-/// matching the Config tab's inline text edit.
 fn value_caret(input: &InputState) -> Vec<Span<'static>> {
     let (head, tail) = input.value.split_at(input.cursor.min(input.value.len()));
     let caret_style = Style::default()
@@ -350,8 +329,6 @@ fn value_caret(input: &InputState) -> Vec<Span<'static>> {
     ]
 }
 
-/// The `+ add` detail: an explainer plus the candidate picker. The caret only
-/// renders while the right pane holds focus.
 fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {
     let candidates = chain_candidates(app);
     let mut lines: Vec<Line<'static>> = vec![
@@ -379,8 +356,6 @@ fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {
         return lines;
     }
 
-    // Blurred: explainer only. The candidate rows (with caret) appear once the
-    // right pane takes focus; the footer carries the keybind cue.
     if !focused {
         return lines;
     }
@@ -416,8 +391,7 @@ fn empty_detail() -> Vec<Line<'static>> {
     ]
 }
 
-/// `GAUGE_W`-cell bar over 0..100 with the fill colored by headroom against the
-/// threshold and a `┊` tick drawn at the threshold position.
+/// `GAUGE_W`-cell bar with fill colored by headroom and a `┊` tick at the threshold.
 fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static>> {
     let value = pct.unwrap_or(0.0).clamp(0.0, 100.0);
     let fill = ((value / 100.0) * GAUGE_W as f64).round() as usize;
@@ -445,7 +419,6 @@ fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static
     spans
 }
 
-/// Pad a detail key to a fixed gutter so values line up.
 fn kv_key(key: &str) -> String {
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     format!("{key}{}", " ".repeat(pad))

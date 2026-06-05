@@ -7,49 +7,41 @@ use crate::lockorder::{RankedMutex, rank};
 
 use super::fetch::{FetchError, UsageInfo, fetch_raw, load_disk_cache, now_ms, write_disk_cache};
 
-/// Default scheduler tick. `spawn_refresher` wakes every second and only
-/// performs network work for profiles whose refresh interval has elapsed.
+/// Scheduler wake interval. Network work only fires for profiles whose cadence has elapsed.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Fixed per-profile refresh interval. Every profile is re-fetched this long
-/// after its last fetch — there is no adaptive backoff.
+/// Fixed per-profile refresh interval — no adaptive backoff.
 pub(crate) const REFRESH_INTERVAL_MS: u64 = 60_000;
 
-/// A wall-clock instant in epoch-milliseconds (the unit produced by `now_ms`).
-/// Newtype so an epoch timestamp can never be confused with a duration in the
-/// cadence arithmetic. The only way to get an `EpochMs` from a bare `u64` is the
-/// explicit constructor. `#[repr(transparent)]` so the on-disk `u64`
-/// representation and any `HashMap<String, u64>` round-trip is layout-identical.
+/// Wall-clock instant in epoch-milliseconds. Distinct from [`IntervalMs`] so
+/// instants and spans can't be confused. `#[repr(transparent)]` keeps layout
+/// identical to the persisted `u64` in any `HashMap<String, u64>`.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub(crate) struct EpochMs(u64);
 
-/// A span of time in milliseconds — the refresh interval or any elapsed
-/// duration. Distinct from [`EpochMs`] so "instant" and "span" can't be mixed
-/// up. `#[repr(transparent)]` keeps it layout-identical to the persisted `u64`.
+/// Span of time in milliseconds. Distinct from [`EpochMs`] so "instant" and
+/// "span" can't be mixed up. `#[repr(transparent)]` for `u64` layout identity.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub(crate) struct IntervalMs(u64);
 
 impl EpochMs {
-    /// Wrap a raw epoch-ms count (e.g. a value loaded from disk).
     pub(crate) const fn from_millis(ms: u64) -> Self {
         Self(ms)
     }
 
-    /// Raw epoch-ms count, for persistence and render-side countdown math.
     pub(crate) const fn as_millis(self) -> u64 {
         self.0
     }
 
-    /// Instant `interval` after this one, saturating (instant + span = instant).
+    /// Instant `interval` after this one, saturating.
     pub(crate) const fn saturating_add(self, interval: IntervalMs) -> EpochMs {
         EpochMs(self.0.saturating_add(interval.0))
     }
 }
 
 impl IntervalMs {
-    /// Wrap a raw millisecond span (a const interval or a value from disk).
     pub(crate) const fn from_millis(ms: u64) -> Self {
         Self(ms)
     }
@@ -59,27 +51,21 @@ pub(crate) type UsageStore = Arc<RankedMutex<HashMap<String, UsageInfo>, rank::U
 pub(crate) type StatusStore = Arc<RankedMutex<HashMap<String, FetchStatus>, rank::UsageStatus>>;
 pub(crate) type TokenList = Arc<RankedMutex<Vec<TokenEntry>, rank::Tokens>>;
 
-/// Per-profile epoch-ms of the last fetch attempt (cache-rule gating).
+/// Per-profile epoch-ms of the last fetch attempt (cadence gating).
 pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, EpochMs>, rank::LastFetched>>;
 
-/// Names pushed here after a successful token rotation are fetched on the very
-/// next scheduler tick, bypassing the per-profile cadence.
+/// Names pushed here after a successful token rotation bypass the cadence on the next tick.
 pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, rank::RefetchQueue>>;
 
-/// Profiles that need an auto-start kick after the fetch revealed no live 5h
-/// window. Main thread drains this set on every tick.
+/// Profiles needing an auto-start kick (no live 5h window). Drained by the main thread each tick.
 pub(crate) type PendingAutoStart = Arc<RankedMutex<HashSet<String>, rank::PendingAutoStart>>;
 
-/// Scheduler-computed auto-switch decisions. Posted by the background scheduler
-/// when it observes the active profile has crossed its fallback threshold; the
-/// UI thread drains in `on_tick` and dispatches a switch worker. Set rather
-/// than Vec so duplicate enqueues collapse and a slow drain can't pile up.
+/// Auto-switch targets posted by the scheduler when the active profile crosses its threshold.
+/// Set (not Vec) so duplicate enqueues collapse. Drained by `on_tick`, which dispatches a switch worker.
 pub(crate) type PendingSwitch = Arc<RankedMutex<HashSet<String>, rank::PendingSwitch>>;
 
-/// Set true by the scheduler when wrap-off mode decides the whole chain is
-/// exhausted with no sink (every threshold below 100%). The UI thread drains it
-/// in `on_tick` and turns off all accounts. A bool rather than a set because
-/// switch-off is a single global act with no target — repeated sets collapse.
+/// Set true when wrap-off mode finds the entire chain exhausted (no sink below 100%).
+/// Drained by `on_tick` to turn off all accounts. Bool because switch-off is a global act.
 pub(crate) type PendingSwitchOff = Arc<RankedMutex<bool, rank::PendingSwitchOff>>;
 
 /// Snapshot of one profile's OAuth identity used by the refresher.
@@ -90,46 +76,33 @@ pub(crate) struct TokenEntry {
     pub(crate) refresh_token: Option<String>,
 }
 
-/// Per-profile epoch-ms of the next scheduled fetch. Written by the scheduler
-/// after each `partition_due` run so the overview rows can show a countdown
-/// without re-running the partition math on the render thread.
+/// Per-profile next-fetch epoch-ms. Written after each `partition_due` run for
+/// overview countdown display without re-running the partition math on the render thread.
 pub(crate) type NextRefreshPerProfile = Arc<RankedMutex<HashMap<String, u64>, rank::NextRefresh>>;
 
-/// In-flight blocking operation per profile. The overview row shows a spinner
-/// in the timer slot instead of a countdown whenever a profile's slot is
-/// anything other than `Idle`. The map omits `Idle` entries — absent and
-/// `Idle` are equivalent.
-///
-/// Mutex is leaf-level: never hold across HTTP. Snapshot or per-name
-/// read/write only so the UI render thread isn't blocked by a worker.
+/// In-flight op per profile. Overview shows a spinner instead of a countdown when non-`Idle`.
+/// Map omits `Idle` entries — absent == `Idle`. Leaf-level: never held across HTTP.
 pub(crate) type ActivityStore = Arc<RankedMutex<HashMap<String, ProfileActivity>, rank::Activity>>;
 
-/// What's currently happening to one profile. `Idle` means no in-flight work;
-/// every other variant is a blocking op the overview row should visualize
-/// with a spinner in the per-profile timer slot.
+/// In-flight op for one profile. Non-`Idle` shows a spinner in the overview timer slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileActivity {
     Idle,
     /// `/usage` HTTP fetch in flight.
     Fetching,
-    /// OAuth refresh (rotate access + refresh tokens) in flight.
+    /// OAuth token rotation in flight.
     Refreshing,
-    /// Account switch in flight (pure FS relink; no token rotation). Latent:
-    /// the switch now runs synchronously on the UI thread, so this is never set.
+    /// Account switch (FS relink). Latent: switch runs synchronously on the UI thread, so this is never set.
     Switching,
-    /// One-shot `clauth start` launch path. Phase 1 doesn't drive this from
-    /// any path (`start::run` runs in a separate process); Phase 2 wires it
-    /// when the launch becomes a background worker.
+    /// `clauth start` launch path. Phase 1 never sets this (`start::run` runs in a separate process);
+    /// Phase 2 wires it when the launch becomes a background worker.
     #[allow(dead_code)]
     Starting,
-    /// Background auto-start kick — token refresh + 1-token Haiku ping.
+    /// Background auto-start kick — 1-token Haiku ping.
     AutoStarting,
 }
 
-/// Kind of operation reported through an [`OpResult`]. Mirrors the non-`Idle`
-/// variants of [`ProfileActivity`] one-for-one. Phase 1 keeps every refresh
-/// path synchronous on the main thread, so the channel stays mostly empty;
-/// Phase 2 hands each variant to a real worker.
+/// Op kind reported through [`OpResult`]. Mirrors non-`Idle` [`ProfileActivity`] variants.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActivityKind {
@@ -141,7 +114,6 @@ pub(crate) enum ActivityKind {
 }
 
 impl ActivityKind {
-    /// Lift a kind to the matching activity variant.
     #[allow(dead_code)]
     pub(crate) fn as_activity(self) -> ProfileActivity {
         match self {
@@ -154,9 +126,8 @@ impl ActivityKind {
     }
 }
 
-/// Result of one async (or for now: synchronous-but-tracked) operation. The
-/// main thread drains the receiver inside `on_tick`, clears the profile's
-/// `ActivityStore` slot back to `Idle`, and surfaces any error as a toast.
+/// Result of one tracked operation. Drained by `on_tick`, which clears the `ActivityStore`
+/// slot and surfaces any error as a toast.
 #[derive(Debug)]
 pub(crate) struct OpResult {
     pub(crate) name: String,
@@ -167,37 +138,25 @@ pub(crate) struct OpResult {
 pub(crate) type OpResultSender = Sender<OpResult>;
 pub(crate) type OpResultReceiver = Receiver<OpResult>;
 
-/// Control-flow signal from the two startup background workers to the UI
-/// thread. Unlike [`OpResult`] (per-profile op completion), these carry the
-/// startup phase transitions the event loop sequences on: the reconcile
-/// worker's verdict and the bootstrap worker's completion. Drained in
-/// `on_tick` so the first paint never waits on the network or an FS walk.
+/// Startup phase transitions from background workers to the UI thread.
+/// Drained in `on_tick` so the first paint never waits on network or FS.
 #[derive(Debug)]
 pub(crate) enum StartupSignal {
-    /// Reconcile worker finished without needing user input — the live
-    /// credentials were either in sync or a silent continuation. The UI may
-    /// now proceed to bootstrap.
+    /// Reconcile finished cleanly — credentials in sync or silent continuation.
     ReconcileDone,
-    /// Reconcile found the live credentials diverged from the active profile's
-    /// stored creds. We don't probe the stored chain's liveness (an OAuth
-    /// refresh would spend its single-use token), so the UI pushes the
-    /// Divergence prompt for `active` and only proceeds to bootstrap once the
-    /// user picks an action.
+    /// Reconcile found credentials diverged from the active profile's stored creds.
+    /// UI pushes the Divergence prompt; bootstrap waits for user action.
+    /// (No OAuth probe — would spend the single-use refresh token.)
     ReconcileNeedsPrompt { active: String },
-    /// Bootstrap worker finished its HTTP work (refresh + initial fetch +
-    /// auto-start kicks). The UI rebuilds the token snapshot, spawns the
-    /// scheduler, applies usage, and runs the one-shot startup auto-switch.
-    /// Per-profile toasts (rotations, auto-starts) and the post-auto-start
-    /// re-fetch ride the standard `OpResult` drain, same as the synchronous
-    /// predecessor did.
+    /// Bootstrap finished (refresh + initial fetch + auto-start kicks).
+    /// UI rebuilds token snapshot, spawns scheduler, applies usage, runs startup auto-switch.
     BootstrapDone,
 }
 
 pub(crate) type StartupSender = Sender<StartupSignal>;
 pub(crate) type StartupReceiver = Receiver<StartupSignal>;
 
-/// Mark a profile as performing `activity` in the shared store. Idempotent;
-/// caller should pair with [`clear_activity`] in every exit path.
+/// Mark a profile's activity. Idempotent; pair with [`clear_activity`] on every exit path.
 pub(crate) fn mark_activity(store: &ActivityStore, name: &str, activity: ProfileActivity) {
     if let Ok(mut g) = store.lock() {
         if matches!(activity, ProfileActivity::Idle) {
@@ -208,27 +167,22 @@ pub(crate) fn mark_activity(store: &ActivityStore, name: &str, activity: Profile
     }
 }
 
-/// Drop a profile back to `Idle` (removes the entry entirely; readers treat
-/// missing and `Idle` identically).
+/// Drop a profile to `Idle` (removes the entry; absent == `Idle`).
 pub(crate) fn clear_activity(store: &ActivityStore, name: &str) {
     if let Ok(mut g) = store.lock() {
         g.remove(name);
     }
 }
 
-/// True iff the profile currently has no in-flight op. Used by input handlers
-/// and tick-time enqueue paths to avoid double-triggering an op on a profile
-/// that already has one running.
+/// True iff the profile has no in-flight op. Poisoned mutex fails safe to "busy".
 pub(crate) fn is_idle(store: &ActivityStore, name: &str) -> bool {
     match store.lock() {
         Ok(g) => !g.contains_key(name),
-        // Poisoned — fail-safe to "busy" so we don't fire a duplicate op.
         Err(_) => false,
     }
 }
 
-/// True iff any profile currently has any in-flight op. Used to gate global
-/// actions like "rotate all" against concurrent per-profile work.
+/// True iff any profile has an in-flight op. Gates global actions like "rotate all".
 pub(crate) fn any_busy(store: &ActivityStore) -> bool {
     match store.lock() {
         Ok(g) => !g.is_empty(),
@@ -236,30 +190,24 @@ pub(crate) fn any_busy(store: &ActivityStore) -> bool {
     }
 }
 
-/// Outcome of the most recent usage fetch attempt for a profile.
+/// Outcome of the most recent fetch attempt for a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FetchStatus {
-    /// Live response from the Anthropic API this tick.
+    /// Live API response.
     Fresh,
-    /// API request failed; the numbers shown come from the on-disk cache.
+    /// API failed; numbers come from on-disk cache.
     Cached,
-    /// API request failed and no cache was available — no data to show.
+    /// API failed and no cache available.
     Failed,
-    /// The API returned 429 on the initial call (the signal was observed this
-    /// tick regardless of whether the retry after token rotation succeeded).
-    /// Surfaced to the overview row as a distinct rate-limited status.
+    /// API returned 429 on the initial call (recorded even when the post-rotation retry succeeded).
     RateLimited,
 }
 
-/// New access + refresh token returned by a successful in-fetch rotation.
-/// The scheduler propagates this back into the live `TokenList` so the next
-/// tick uses the rotated pair instead of re-401'ing with the stale access
-/// token and burning the refresh-token chain by rotating again.
+/// Rotated (access, refresh) pair from an in-fetch rotation. Propagated back into
+/// `TokenList` so the next tick doesn't re-401 with the stale token and double-burn the chain.
 pub(crate) type RotatedTokens = (String, Option<String>);
 
-/// Resolve `load_disk_cache` into the `(Option<UsageInfo>, FetchStatus)` pair
-/// that the rotation path expects: `(Some, status)` when the cache has bytes,
-/// `(None, Failed)` when it doesn't.
+/// Load disk cache as `(Some, status)` or `(None, Failed)` for the rotation bail-out path.
 fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo>, FetchStatus) {
     match load_disk_cache(name) {
         Some(info) => (Some(info), status),
@@ -267,20 +215,14 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
     }
 }
 
-/// One profile's fetch + rotate + retry path. On 401/429 we refresh the OAuth
-/// pair, persist it, and retry once. A 429 on the initial call sets
-/// `RateLimited`; a successful retry still records it because the rate-limit
-/// signal was observed this tick. Any other error falls back to the on-disk
-/// cache. Pushes `name` onto `refetch` when
-/// rotation succeeds but the follow-up fetch failed, so the next scheduler
-/// tick re-fetches with the new token. Returns the rotated pair on success
-/// so the caller can update the live `TokenList`.
+/// Fetch + rotate + retry for one profile. On 401/429: refresh the OAuth pair,
+/// persist, retry once. A 429 on the initial call always sets `RateLimited` even
+/// when the retry succeeds. Other errors fall back to disk cache. Pushes `name`
+/// onto `refetch` when rotation succeeded but the follow-up fetch failed.
+/// Returns the rotated pair so the caller can update `TokenList`.
 ///
-/// The inline 401 refresh leg flips `activity[name]` to `Refreshing` for the
-/// duration of `oauth::refresh` so the overview row shows a refresh spinner
-/// instead of a fetch spinner during the rotation, then back to `Fetching`
-/// for the retry. The caller is responsible for the initial `Fetching` mark
-/// and the final `Idle` clear.
+/// Flips `activity[name]` to `Refreshing` during `oauth::refresh`, then back to
+/// `Fetching` for the retry. Caller owns the initial `Fetching` mark and final `Idle` clear.
 fn fetch_with_rotation(
     config: &crate::profile::ConfigHandle,
     name: &str,
@@ -304,10 +246,8 @@ fn fetch_with_rotation(
     } else {
         FetchStatus::Cached
     };
-    // Single early-return path for every rotation-leg bail-out: resolve the
-    // on-disk cache against `fallback_status` and carry the (already-rotated or
-    // not) token pair back. `fallback_status` is computed once above; this keeps
-    // the eight branches that abort to cache from drifting apart.
+    // Single bail-out path for all rotation-leg failures. `fallback_status`
+    // is computed once above so all abort branches stay consistent.
     let bail_to_cache = |rotated: Option<RotatedTokens>| {
         let (info, status) = load_cached_with_status(name, fallback_status);
         (info, status, rotated)
@@ -316,28 +256,21 @@ fn fetch_with_rotation(
     let Some(rt) = refresh_token else {
         return bail_to_cache(None);
     };
-    // Per-profile rotation lock across the refresh HTTP window so an external
-    // `clauth start <name>` cannot double-spend this single-use token while our
-    // 401-recovery rotation is in flight (same template as `rotate_one`).
-    // Blocking acquire is safe in the scheduler thread: the tick body holds no
-    // lock (leaf-mutex discipline), so this cannot deadlock against anything
-    // the scheduler already holds, and the rotation holder window is short.
+    // Per-profile rotation lock across the refresh HTTP window — prevents a
+    // concurrent `clauth start <name>` from double-spending this single-use token.
+    // Blocking acquire is safe: the tick body holds no lock, so no deadlock risk.
     // On acquire failure, fall back to cache rather than refreshing unguarded.
     let Ok(_rotation_guard) = crate::runtime::RotationGuard::acquire(name) else {
         return bail_to_cache(None);
     };
-    // Re-check liveness under the guard: a live session holds the chain and
-    // will refresh it itself; rotating here would spend the same single-use
-    // token and 401 one of the two actors, burning the chain. The guard makes
-    // this read authoritative (a session that won the acquire race stamped its
-    // PID file before releasing). `partition_due` already excludes
-    // `Refreshing`/`Switching`, but nothing excludes a *live external session*.
+    // Re-check liveness under the guard: a live session owns the chain and will
+    // refresh it itself — rotating here would double-spend the single-use token.
+    // The guard makes this authoritative (winner stamped its PID file first).
+    // `partition_due` excludes Refreshing/Switching but not live external sessions.
     if crate::runtime::has_live_session(name) {
         return bail_to_cache(None);
     }
-    // Refresh leg: surface a refresh spinner during the network round trip,
-    // then drop back to Fetching for the retry. `Idle` is only reached on the
-    // scheduler-side clear after this function returns.
+    // Show refresh spinner during the network round trip, then back to Fetching for the retry.
     mark_activity(activity, name, ProfileActivity::Refreshing);
     let refresh_result = crate::oauth::refresh(rt);
     mark_activity(activity, name, ProfileActivity::Fetching);
@@ -345,10 +278,8 @@ fn fetch_with_rotation(
         Ok(t) => t,
         Err(_) => return bail_to_cache(None),
     };
-    // Persist under the AppConfig mutex AND state lock together — matches
-    // every other rotation site so a concurrent `rotate_one` writer can't
-    // interleave between read and write. Using the shared helper also keeps
-    // the in-memory AppConfig in step with the on-disk credentials.
+    // Persist under the AppConfig mutex + state lock — matches every other rotation site
+    // so a concurrent `rotate_one_inner` can't interleave, and keeps in-memory AppConfig in sync.
     let access = tok.access_token.clone();
     let refresh = tok.refresh_token.clone();
     if crate::oauth::apply_rotated_tokens_locked(config, name, tok).is_err() {
@@ -357,8 +288,7 @@ fn fetch_with_rotation(
     let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
     match fetch_raw(&access) {
         Ok(info) => {
-            // Token rotated and fresh numbers are in hand. A 429 was still
-            // observed this tick, so report RateLimited even though we recovered.
+            // 429 was observed this tick even though we recovered — keep RateLimited.
             let status = if saw_429 {
                 FetchStatus::RateLimited
             } else {
@@ -367,18 +297,15 @@ fn fetch_with_rotation(
             (Some(info), status, rotated)
         }
         Err(FetchError::Status(429)) => {
-            // Rotation succeeded, but the retry itself got rate-limited. Don't
-            // force a refetch on the next tick: pushing to RefetchQueue here would
-            // schedule an immediate re-fetch that risks cycling on a persistent
-            // 429 (rotate→retry-429→enqueue→rotate). The fixed cadence governs the
-            // next poll instead.
+            // Retry itself rate-limited. Don't push to RefetchQueue — that risks
+            // a rotate→429→enqueue→rotate cycle. Let the fixed cadence govern.
             let (info, _) = load_cached_with_status(name, FetchStatus::RateLimited);
             (info, FetchStatus::RateLimited, rotated)
         }
         Err(_) => {
-            // Rotation succeeded but a non-429 transient error stopped the retry.
-            // Force a re-fetch on the next tick so we pick up with the new token
-            // as soon as possible without waiting the full refresh interval.
+            // Rotation succeeded but a transient error stopped the retry.
+            // Push to RefetchQueue so we retry with the new token next tick
+            // rather than waiting the full refresh interval.
             if let Ok(mut q) = refetch.lock() {
                 q.insert(name.to_string());
             }
@@ -387,20 +314,15 @@ fn fetch_with_rotation(
     }
 }
 
-/// Outcome of one profile's fetch step inside the scheduler tick. Holds the
-/// data the scheduler needs to update shared state on the main loop side of
-/// the spawned thread.
+/// One profile's fetch result, carried back to update shared state.
 struct FetchOutcome {
     name: String,
     info: Option<UsageInfo>,
     status: FetchStatus,
-    /// New `(access_token, refresh_token)` pair when the fetch path rotated
-    /// the OAuth tokens. The scheduler propagates this into the live
-    /// `TokenList` so the next tick uses the fresh pair.
+    /// Rotated token pair when the fetch path rotated OAuth; propagated into `TokenList`.
     rotated: Option<RotatedTokens>,
 }
 
-/// Run a single fetch for one entry.
 fn run_fetch(
     config: &crate::profile::ConfigHandle,
     entry: TokenEntry,
@@ -424,9 +346,7 @@ fn run_fetch(
     }
 }
 
-/// Write one outcome into the shared stores. Disk cache is updated on every
-/// successful API response so a later process restart can still surface
-/// numbers without a fresh API call.
+/// Write one outcome into the shared stores. Disk cache written on every fresh response.
 fn apply_outcome(
     outcome: FetchOutcome,
     store: &UsageStore,
@@ -446,17 +366,15 @@ fn apply_outcome(
     if let Ok(mut s) = store.lock()
         && let Some(info) = &outcome.info
     {
-        // Don't clobber newer Fresh data with older Cached snapshots loaded
-        // from disk by `fetch_with_rotation`'s fallback path. Cached only
-        // fills the store when no entry exists (cold start without network).
+        // Don't clobber newer Fresh data with a Cached fallback snapshot.
+        // Cached only fills the store when no entry exists (cold start).
         if is_fresh || !s.contains_key(&outcome.name) {
             s.insert(outcome.name.clone(), info.clone());
         }
     }
 
-    // Stamp last_fetched and status, each in its own short critical section so
-    // only one leaf lock is held at a time (never two leaves at once). Acquired
-    // in ascending rank order LAST_FETCHED(200) < USAGE_STATUS(350).
+    // Each in its own critical section — one leaf lock at a time.
+    // Ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350).
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(outcome.name.clone(), now);
     }
@@ -465,11 +383,9 @@ fn apply_outcome(
     }
 }
 
-/// Force-fetch every entry right now in parallel and write the results into
-/// the shared stores. Bypasses the cache rule — used by the startup bootstrap
-/// worker and `manual_refresh`. Blocks until all fetches complete. One-shot, so any
-/// `rotated` tokens are dropped — the main thread's `reload_if_state_changed`
-/// will pick them up from the persisted `credentials.json` shortly.
+/// Force-fetch all entries in parallel, bypassing the cadence. Used by bootstrap
+/// and `manual_refresh`. Blocks until all complete. Rotated tokens are dropped —
+/// `reload_if_state_changed` will pick them up from `credentials.json` shortly.
 pub(crate) fn fetch_all_into(
     config: &crate::profile::ConfigHandle,
     tokens: &[TokenEntry],
@@ -483,10 +399,8 @@ pub(crate) fn fetch_all_into(
         return;
     }
 
-    // Mark every entry as Fetching before the thread fan-out so the UI shows
-    // a spinner for the full window, then clear on join (or on fetch-with-
-    // rotation flipping back through Refreshing). Cleared per-name as each
-    // thread joins.
+    // Mark all as Fetching before fan-out so the spinner covers the full window.
+    // Cleared per-name as each thread joins.
     for entry in tokens {
         mark_activity(activity, &entry.name, ProfileActivity::Fetching);
     }
@@ -512,27 +426,15 @@ pub(crate) fn fetch_all_into(
             }
             Err(_) => {
                 // Worker panicked. Clear the activity slot so the spinner doesn't
-                // freeze and `any_busy` can resolve. The panic message is lost here;
-                // there is no `OpResult` sender in this path so no toast is emitted.
+                // freeze. No `OpResult` sender here so no toast is emitted.
                 clear_activity(activity, &name);
             }
         }
     }
 }
 
-/// Background scheduler. Wakes every second and fans out parallel fetches for
-/// every profile whose fixed `REFRESH_INTERVAL_MS` cadence has elapsed.
-///
-/// Also evaluates the fallback chain at the end of every tick. When the active
-/// profile has crossed its threshold and a viable target exists, the name is
-/// posted to `pending_switch` for the UI thread to dispatch a switch worker.
-/// Computing the decision here keeps the 100 ms UI tick free of FS access
-/// (`with_state_lock` was previously taken on every `on_tick`).
-/// Shared handles the background scheduler thread reads on every tick. Holds
-/// **cloned `Arc`s only** — never a live lock guard — so the struct itself
-/// carries no lock rank and constructing or passing it can't violate the
-/// lock-order discipline in `lockorder.rs`. `tick` borrows it and acquires the
-/// individual mutexes in the same order the inline loop did.
+/// Background scheduler state. Holds **cloned `Arc`s only** — no live lock guards —
+/// so the struct carries no lock rank. `tick` acquires individual mutexes in rank order.
 pub(crate) struct SchedulerState {
     config: crate::profile::ConfigHandle,
     tokens: TokenList,
@@ -546,12 +448,8 @@ pub(crate) struct SchedulerState {
     refetch_queue: RefetchQueue,
 }
 
-/// Run one scheduler tick: drain forced refetches, partition the due set, fan
-/// out parallel fetches, propagate rotated tokens, and evaluate the auto-switch
-/// chain. Returns at each early-bail point (the inline loop used `continue` for
-/// the same effect). Lock acquisition order and the `RotationGuard` boundary
-/// (inside `run_fetch` → `fetch_with_rotation`) are unchanged from the inline
-/// version — this only relocates the body.
+/// One scheduler tick: drain forced refetches, partition due set, fan out fetches,
+/// propagate rotated tokens, evaluate auto-switch chain.
 fn tick(state: &SchedulerState) {
     let snapshot: Vec<TokenEntry> = match state.tokens.lock() {
         Ok(t) => t.clone(),
@@ -561,8 +459,7 @@ fn tick(state: &SchedulerState) {
         return;
     }
 
-    // Drain names pushed by rotation paths so they bypass the cadence
-    // and get fresh numbers on this tick instead of waiting the full interval.
+    // Names pushed by rotation paths — bypass cadence and fetch this tick.
     let forced: HashSet<String> = state
         .refetch_queue
         .lock()
@@ -570,17 +467,12 @@ fn tick(state: &SchedulerState) {
         .map(|mut q| std::mem::take(&mut *q))
         .unwrap_or_default();
 
-    // Decide which entries are due this tick. Every profile uses the same
-    // fixed `REFRESH_INTERVAL_MS` cadence.
     let now = now_ms();
     let (mut due, mut per_profile_next) =
         partition_due(&snapshot, now, &state.last_fetched, &state.activity);
 
-    // Merge forced entries that aren't already scheduled this tick and
-    // reflect them in the published map as "due now" (zero countdown).
-    // Forced entries still skip Switching and Refreshing profiles — the
-    // switch worker owns the TokenList write window, and a concurrent
-    // rotate_one holds the single-use refresh token.
+    // Merge forced entries not already due. Still skip Switching/Refreshing —
+    // the switch worker owns the TokenList write window; rotate_one_inner owns the refresh token.
     if !forced.is_empty() {
         let switching: HashSet<String> = match state.activity.lock() {
             Ok(a) => a
@@ -604,9 +496,8 @@ fn tick(state: &SchedulerState) {
         due.extend(extras);
     }
 
-    // Publish the per-profile next times AFTER the forced merge so the
-    // UI countdown doesn't show "in Xs" for a profile that is in fact
-    // fetching this very tick.
+    // Publish after forced merge so the UI doesn't show a countdown for a profile
+    // that is actually fetching this tick.
     if let Ok(mut nrpp) = state.next_refresh_per_profile.lock() {
         nrpp.clone_from(&per_profile_next);
     }
@@ -615,9 +506,6 @@ fn tick(state: &SchedulerState) {
         return;
     }
 
-    // Mark profiles as in-flight so the overview row shows a spinner.
-    // Per-name leaf write — the lock is never held across the HTTP
-    // round trips below.
     for entry in &due {
         mark_activity(&state.activity, &entry.name, ProfileActivity::Fetching);
     }
@@ -637,15 +525,9 @@ fn tick(state: &SchedulerState) {
     for (name, h) in handles {
         match h.join() {
             Ok(outcome) => {
-                // Clear the in-flight marker before writing results so the
-                // overview row transitions from spinner → fresh countdown atomically
-                // from the render thread's perspective (it reads both under separate
-                // locks, but a brief flicker to "no spinner + stale timer" is acceptable).
                 clear_activity(&state.activity, &outcome.name);
-                // Propagate any rotated OAuth pair back into the live snapshot
-                // before the next tick — otherwise tick N+1 reuses the stale
-                // access token, 401s, rotates again, and burns the refresh-token
-                // chain while waiting for the mtime watch to reload AppConfig.
+                // Propagate rotated tokens back into the live snapshot — otherwise
+                // tick N+1 reuses the stale access token, 401s, and double-burns the chain.
                 if let Some((new_access, new_refresh)) = &outcome.rotated
                     && let Ok(mut t) = state.tokens.lock()
                     && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
@@ -656,32 +538,22 @@ fn tick(state: &SchedulerState) {
                 apply_outcome(outcome, &state.store, &state.status, &state.last_fetched);
             }
             Err(_) => {
-                // Worker panicked. Clear the activity slot so the spinner
-                // doesn't freeze permanently and `any_busy` can resolve.
+                // Worker panicked — clear slot so the spinner doesn't freeze.
                 clear_activity(&state.activity, &name);
             }
         }
     }
 
-    // Recompute per-profile next times AFTER fetches have updated
-    // `last_fetched` so the overview countdowns reflect fresh deadlines.
-    // `activity` is passed so a profile that became Switching mid-tick
-    // gets the same exclusion treatment here as in the pre-fetch call —
-    // its countdown is recomputed from current `last_fetched` rather
-    // than carrying a stale pre-fetch value for one extra tick.
+    // Recompute after fetches so countdowns reflect fresh deadlines.
+    // Passing `activity` ensures a mid-tick Switching profile is excluded here too.
     let (_, per_profile_after) =
         partition_due(&snapshot, now_ms(), &state.last_fetched, &state.activity);
     if let Ok(mut nrpp) = state.next_refresh_per_profile.lock() {
         nrpp.clone_from(&per_profile_after);
     }
 
-    // Auto-switch decision: read the live chain + thresholds under
-    // the config mutex (NOT across HTTP, NOT across with_state_lock)
-    // and consult `store` for utilization. Posting the target to
-    // `pending_switch` defers the actual relink to the UI thread,
-    // which dispatches a switch worker. A Switching profile here
-    // means the previous decision is still in flight — skip until
-    // the worker completes.
+    // Auto-switch: read chain under config mutex only (not across HTTP/state lock).
+    // Actual relink is deferred to the UI thread via `pending_switch`.
     scan_auto_switch(
         &state.config,
         &state.store,
@@ -724,13 +596,11 @@ pub(crate) fn spawn_refresher(
     });
 }
 
-/// Evaluate the fallback chain and queue an auto-switch target when the active
-/// profile has crossed its threshold. Snapshots the chain out of `AppConfig`
-/// under its mutex (and drops the guard), then reads utilization from the
-/// shared `UsageStore`. The split is load-bearing: `App::apply_usage` takes
-/// `usage_store` then `config`, so the scheduler must never hold `config`
-/// while taking `usage_store`. Skips when the active profile is already
-/// mid-switch.
+/// Evaluate the fallback chain and queue an auto-switch target.
+///
+/// Snapshots the chain under `config` mutex (dropped before taking `usage_store`).
+/// This split is load-bearing: `App::apply_usage` takes `usage_store` then `config`,
+/// so the scheduler must never hold `config` while taking `usage_store`.
 fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
@@ -738,12 +608,8 @@ fn scan_auto_switch(
     pending_switch: &PendingSwitch,
     pending_switch_off: &PendingSwitchOff,
 ) {
-    // Skip when an auto-switch decision is still pending the UI drain or
-    // when any profile is currently Switching — either way the previous
-    // decision hasn't landed yet and a duplicate enqueue would be a no-op
-    // anyway (set semantics), but checking here avoids the config lock.
-    // Each lock is acquired and dropped before the next to avoid holding two
-    // leaf mutexes simultaneously.
+    // Skip when a previous decision is still pending. Each lock is acquired
+    // and dropped before the next — never two leaf mutexes at once.
     {
         let Ok(p) = pending_switch.lock() else { return };
         if !p.is_empty() {
@@ -751,8 +617,7 @@ fn scan_auto_switch(
         }
     }
     {
-        // A pending switch-off hasn't been applied yet — re-deciding would just
-        // re-set the same bool. Skip until the UI drains it.
+        // Pending switch-off not yet applied — skip until UI drains it.
         let Ok(off) = pending_switch_off.lock() else {
             return;
         };
@@ -767,7 +632,7 @@ fn scan_auto_switch(
         }
     }
 
-    // Snapshot under `config` only — no `usage_store` lock here.
+    // Snapshot under `config` only — drop guard before taking `usage_store`.
     let snapshot = {
         let cfg = match config.lock() {
             Ok(c) => c,
@@ -779,7 +644,6 @@ fn scan_auto_switch(
         return;
     };
 
-    // `config` guard is dropped. Safe to lock `usage_store` now.
     match crate::fallback::next_auto_switch_target(&snapshot, store) {
         Some(crate::fallback::SwitchAction::To(name)) => {
             if let Ok(mut p) = pending_switch.lock() {
@@ -795,15 +659,12 @@ fn scan_auto_switch(
     }
 }
 
-/// Split `snapshot` into the subset due this tick and a per-profile map of
-/// next fetch epoch-ms. A poisoned `last_fetched` returns empty rather than
-/// falling back to `last=0` (which would mark every profile due → fetch storm).
+/// Split `snapshot` into the due set and a per-profile next-fetch map.
 ///
-/// `activity` is consulted to exclude profiles currently `Switching`: a
-/// concurrent switch worker may be rotating their tokens (`refresh_all` or
-/// the relink leg), and the scheduler's 401-rotated path would otherwise race
-/// it on the same `TokenList` write site. A poisoned activity mutex fails
-/// safe to "treat as Switching" so a duplicate fetch never fires.
+/// Poisoned `last_fetched` returns empty rather than `last=0` (which would mark
+/// all profiles due — fetch storm). Profiles currently `Switching` or `Refreshing`
+/// are excluded to avoid racing the switch worker on `TokenList` or `rotate_one_inner`
+/// on the single-use refresh token. Poisoned activity mutex fails safe to excluded.
 fn partition_due(
     snapshot: &[TokenEntry],
     now: u64,
@@ -826,19 +687,13 @@ fn partition_due(
             .unwrap_or(EpochMs::from_millis(0));
         let next = last.saturating_add(interval);
         per_profile.insert(entry.name.clone(), next.as_millis());
-        // Profiles mid-switch or mid-refresh are excluded from this tick's due
-        // set so the scheduler can't race the switch worker on the same
-        // TokenList write, and can't race `rotate_one` / `fetch_with_rotation`'s
-        // inline refresh leg on the same single-use refresh token.
-        // The countdown still publishes — the UI shows when the profile will
-        // become eligible once Switching/Refreshing clears.
+        // Countdown still publishes for excluded profiles — UI shows when they become eligible.
         let excluded = match act.as_ref() {
             Ok(a) => matches!(
                 a.get(&entry.name),
                 Some(ProfileActivity::Switching | ProfileActivity::Refreshing)
             ),
-            // Poisoned mutex: fail safe to "excluded" so no duplicate fetch.
-            Err(_) => true,
+            Err(_) => true, // Poisoned: fail safe to excluded.
         };
         if excluded {
             continue;

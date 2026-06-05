@@ -48,7 +48,7 @@ impl StateLock {
     pub(crate) fn acquire() -> Result<Self> {
         let depth = DEPTH.get();
         if depth > 0 {
-            // This thread already holds the mutex — just increment depth.
+            // This thread already holds the mutex — increment depth.
             DEPTH.set(
                 depth
                     .checked_add(1)
@@ -61,10 +61,9 @@ impl StateLock {
         }
 
         // Outermost acquisition: block until we own the thread mutex.
-        // `THREAD_LOCK` is a `static`, so `.lock()` borrows it for `'static`
-        // and the returned guard is `MutexGuard<'static, _>` directly — it can
-        // be stored in `StateLock` with no lifetime laundering.
-        // Poison recovery: if a previous holder panicked we still proceed.
+        // `THREAD_LOCK` is `static`, so `.lock()` yields `MutexGuard<'static, _>`
+        // directly — storable in `StateLock` with no lifetime laundering.
+        // Poison recovery: proceed even if a previous holder panicked.
         let mut guard: std::sync::MutexGuard<'static, Option<File>> = match THREAD_LOCK.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -88,9 +87,8 @@ impl StateLock {
 
         DEPTH.set(1);
 
-        // Enter the STATE rank now that this is the outermost hold. `config`
-        // (rank CONFIG) may already be held — STATE sits inside it, so the
-        // assertion in `RankGuard::enter` confirms the documented order.
+        // Enter the STATE rank on the outermost hold. `config` (rank CONFIG) may
+        // already be held — STATE sits inside it; `RankGuard::enter` asserts it.
         let rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::State>();
 
         Ok(Self {
@@ -113,7 +111,7 @@ impl Drop for StateLock {
             if let Some(ref mut g) = self._thread_guard {
                 **g = None; // close the File → flock released
             }
-            // _thread_guard (mutex guard) drops implicitly, unblocking sibling threads.
+            // _thread_guard drops implicitly, unblocking sibling threads.
         }
         // Reentrant calls have _thread_guard = None; nothing extra to do.
     }

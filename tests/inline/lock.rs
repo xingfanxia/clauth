@@ -17,12 +17,11 @@ fn cross_thread_with_state_lock_serializes() {
             let barrier = Arc::clone(&barrier);
             let intervals = Arc::clone(&intervals);
             std::thread::spawn(move || {
-                // All threads reach this point before any calls with_state_lock,
-                // maximizing the chance of concurrent entry.
+                // All threads rendezvous here to maximize concurrent entry.
                 barrier.wait();
                 with_state_lock(|| {
                     let start = epoch.elapsed().as_nanos() as u64;
-                    // Small sleep to widen the interval so overlaps are detectable.
+                    // Sleep widens the interval so overlaps are detectable.
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     let end = epoch.elapsed().as_nanos() as u64;
                     intervals.lock().unwrap().push((start, end));
@@ -44,8 +43,7 @@ fn cross_thread_with_state_lock_serializes() {
         "each thread must record one interval"
     );
 
-    // Verify no two intervals overlap. Intervals [a_start, a_end) and
-    // [b_start, b_end) overlap when a_start < b_end && b_start < a_end.
+    // [a_start, a_end) and [b_start, b_end) overlap when a_start < b_end && b_start < a_end.
     for i in 0..intervals.len() {
         for j in (i + 1)..intervals.len() {
             let (a_start, a_end) = intervals[i];
@@ -79,15 +77,14 @@ fn poison_recovery_after_panicking_closure() {
     }));
     assert!(panicked.is_err(), "the inner closure must have panicked");
 
-    // DEPTH must be back to 0 on this thread — Drop ran during unwind.
+    // DEPTH resets to 0 — Drop ran during unwind.
     DEPTH.with(|d| assert_eq!(d.get(), 0, "depth must reset to 0 after unwind"));
 
-    // THREAD_LOCK is now poisoned and its slot is None. A fresh acquire must
-    // succeed (recover poison + reopen the flock file) rather than deadlock.
+    // THREAD_LOCK poisoned + slot None; fresh acquire must recover and re-flock.
     let result = with_state_lock(|| Ok(7u32));
     assert_eq!(result.unwrap(), 7, "lock must be reusable after a panic");
 
-    // And it must still serialize a second time around (slot rebuilt cleanly).
+    // Reentrancy must still work post-recovery.
     let again = with_state_lock(|| with_state_lock(|| Ok(8u32)));
     assert_eq!(again.unwrap(), 8, "reentrancy still works post-recovery");
 }

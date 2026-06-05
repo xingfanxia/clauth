@@ -42,8 +42,7 @@ fn showcase() {
     run(demo_config()).expect("showcase loop");
 }
 
-/// Same terminal setup/teardown as [`super::run`], but redirects the home dir
-/// at a sandbox tempdir first so the real loop's writes never escape it.
+/// Same as [`super::run`] but redirects home to a sandbox tempdir first.
 fn run(config: AppConfig) -> Result<()> {
     let sandbox = tempfile::tempdir().context("create showcase sandbox dir")?;
     set_home_override(sandbox.path().to_path_buf());
@@ -51,20 +50,14 @@ fn run(config: AppConfig) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let outcome = showcase_loop(&mut terminal, config);
     let restore = restore_terminal(&mut terminal);
-    // `sandbox` drops here → the tempdir and everything written to it is removed.
-    outcome.and(restore)
+    outcome.and(restore) // `sandbox` drops here, cleaning up the tempdir
 }
 
-/// The real event loop minus startup reconciliation: draw, dispatch keys
-/// through the production `handle_key`, and run `on_tick` so worker results
-/// (e.g. a switch) drain and spinners clear. No `reconcile_startup`, so no
-/// bootstrap/scheduler ever spawns.
+/// Real event loop without startup reconciliation — no bootstrap/scheduler spawns.
 fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
     let mut application = app::App::new(config);
-    // Prime the usage stores so windows show simulated utilization, not `-`,
-    // and the timer stores so rows show a spinner / refresh countdown.
-    seed_usage(&application);
-    seed_timers(&application);
+    seed_usage(&application); // prime so windows show utilization, not `-`
+    seed_timers(&application); // prime spinner and refresh countdowns
     let mut last_tick = Instant::now();
 
     while !application.quit {
@@ -90,18 +83,14 @@ fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
     Ok(())
 }
 
-// ── Time helper ───────────────────────────────────────────────────────────────
-
-/// Returns an RFC3339-ish string (matching `iso_to_epoch_secs` expectations)
-/// for `now + offset`.
+/// RFC3339-ish string for `now + offset` (matches `iso_to_epoch_secs` format).
 fn future_iso(offset: Duration) -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
         + offset.as_secs();
-    // Manual RFC3339 formatting — no chrono dep needed; matches the
-    // `YYYY-MM-DDTHH:MM:SS+00:00` shape that `iso_to_epoch_secs` parses.
+    // no chrono dep; YYYY-MM-DDTHH:MM:SS+00:00 shape iso_to_epoch_secs parses
     let (y, mo, d, h, mi, sec) = epoch_to_parts(secs);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{sec:02}+00:00")
 }
@@ -111,7 +100,7 @@ fn epoch_to_parts(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     let m = (secs / 60) % 60;
     let h = (secs / 3600) % 24;
     let days = secs / 86400;
-    // Gregorian civil calendar (Howard Hinnant's algorithm, unsigned edition).
+    // Gregorian civil calendar — Howard Hinnant's algorithm, unsigned edition.
     let z = days + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
@@ -124,8 +113,6 @@ fn epoch_to_parts(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     let y = if mo <= 2 { y + 1 } else { y };
     (y, mo, d, h, m, s)
 }
-
-// ── Profile builders ──────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 fn oauth_profile(
@@ -210,8 +197,6 @@ fn failed_profile(name: &str) -> Profile {
     }
 }
 
-// ── Demo config ───────────────────────────────────────────────────────────────
-
 fn demo_config() -> AppConfig {
     let max20 = oauth_profile(
         "personal",
@@ -222,11 +207,11 @@ fn demo_config() -> AppConfig {
         true,
         Some(80.0),
         64.3,
-        Some(Duration::from_secs(2 * 3600 + 17 * 60)), // resets in ~2h17m
+        Some(Duration::from_secs(2 * 3600 + 17 * 60)), // ~2h17m
         Some((22.1, Duration::from_secs(5 * 86400 + 6 * 3600))), // 7d sonnet ~5d
         Some((8.4, Duration::from_secs(6 * 86400 + 2 * 3600))), // 7d opus ~6d
         None,
-        None, // live / fresh, no underline
+        None,
     );
 
     let extra = ExtraUsage {
@@ -245,11 +230,11 @@ fn demo_config() -> AppConfig {
         true,
         Some(90.0),
         88.7,
-        Some(Duration::from_secs(45 * 60)), // resets in ~45m
+        Some(Duration::from_secs(45 * 60)), // ~45m
         Some((61.2, Duration::from_secs(3 * 86400 + 9 * 3600))), // 7d sonnet ~3d
         Some((33.9, Duration::from_secs(6 * 86400 + 3600))), // 7d opus ~6d
         Some(extra),
-        Some(FetchStatus::Cached), // warning underline
+        Some(FetchStatus::Cached), // cached → warning underline
     );
 
     let pro = oauth_profile(
@@ -294,17 +279,10 @@ fn demo_config() -> AppConfig {
     }
 }
 
-// ── Usage simulation ───────────────────────────────────────────────────────────
-
-/// Seed the live usage stores from the demo profiles' baked-in usage, exactly
-/// as a real fetch worker would. Without this the first `on_tick` → `apply_usage`
-/// reads an empty `usage_store` and blanks every window to `-`; with it the demo
-/// utilization, reset timers and fetch-status underlines render — and survive
-/// every subsequent tick, since `apply_usage` now finds the values it expects.
-///
-/// Reads the config and drops its guard before touching the usage locks, so no
-/// lock is held across another (rank order: `usage_store` → `usage_status` are
-/// both inner of `config`).
+/// Seed the live usage stores from demo profile data, as a real fetch worker would.
+/// Without this, the first `on_tick` → `apply_usage` blanks all windows to `-`.
+/// Reads config and drops the guard before touching usage locks (rank order:
+/// `usage_store` / `usage_status` are both inner of `config`).
 fn seed_usage(application: &app::App) {
     let snapshot: Vec<(String, Option<UsageInfo>, Option<FetchStatus>)> = {
         let cfg = application.config();
@@ -329,16 +307,8 @@ fn seed_usage(application: &app::App) {
     }
 }
 
-/// Seed the timer slot's two data sources so the overview shows a live spinner
-/// and refresh countdowns — exactly what a running scheduler would write. The
-/// slot renders a braille spinner when a profile's `activity` is anything but
-/// `Idle`, otherwise a `next_refresh_per_profile` countdown, otherwise blank.
-/// The demo never starts the scheduler (see the module header), so without this
-/// every row's slot stays empty and the feature is invisible in screenshots.
-///
-/// Both stores are leaf-rank mutexes touched in-memory only — no disk, no
-/// network. `personal` (the active profile) shows a Fetching spinner; the other
-/// OAuth profiles show staggered countdowns to their next fetch.
+/// Seed timer sources so the overview shows a spinner and countdowns (no
+/// scheduler runs in the demo). Both stores are leaf-rank, in-memory only.
 fn seed_timers(application: &app::App) {
     let now = now_ms();
     if let Ok(mut next) = application.next_refresh_per_profile.lock() {
@@ -349,8 +319,6 @@ fn seed_timers(application: &app::App) {
         activity.insert("personal".to_string(), ProfileActivity::Fetching);
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[test]
 fn demo_config_has_expected_profiles() {
@@ -389,15 +357,11 @@ fn future_iso_parses() {
 
 // ── Non-interactive driver ──────────────────────────────────────────────────
 //
-// The `showcase` test above is the human-driven version: it takes over a real
-// terminal and waits for keypresses. This one runs the *same* `App` against the
-// *same* demo data, but feeds synthetic key events through the production
-// `handle_key` / `on_tick` so CI can prove every action works — switch, edit,
-// toggle, reorder, set threshold (stepper + inline editor), delete — without a
-// TTY and without ever touching the real `~/.clauth` / `~/.claude`.
+// Feeds synthetic key events through `handle_key` / `on_tick` so CI can prove
+// every action — switch, edit, toggle, reorder, threshold, delete — without a
+// TTY or touching the real `~/.clauth` / `~/.claude`.
 
-/// Clears the home override when it drops, so a redirect can't leak past this
-/// test and shadow `$HOME` for whatever runs next — even on a panic.
+/// Clears the home override on drop so it can't leak past this test on panic.
 struct HomeOverrideReset;
 impl Drop for HomeOverrideReset {
     fn drop(&mut self) {
@@ -423,20 +387,18 @@ fn key_shift(code: KeyCode) -> KeyEvent {
     }
 }
 
-/// Press a bare key through the real dispatcher.
 fn press(app: &mut app::App, code: KeyCode) {
     app::handle_key(app, key(code));
 }
 
-/// Type a string one `Char` event at a time, exactly as a terminal would.
+/// Type a string one `Char` event at a time.
 fn type_str(app: &mut app::App, s: &str) {
     for c in s.chars() {
         app::handle_key(app, key(KeyCode::Char(c)));
     }
 }
 
-/// Drive `on_tick` until `pred` holds (worker results land asynchronously) or a
-/// generous budget is exhausted. Mirrors the real loop's draw→tick cadence.
+/// Drain `on_tick` until `pred` holds or budget exhausted (async worker results).
 fn settle(app: &mut app::App, what: &str, mut pred: impl FnMut(&app::App) -> bool) {
     for _ in 0..400 {
         app::on_tick(app);
@@ -448,8 +410,7 @@ fn settle(app: &mut app::App, what: &str, mut pred: impl FnMut(&app::App) -> boo
     panic!("'{what}' never settled after draining ticks");
 }
 
-/// Read a profile's `auto_start` / `base_url` / `fallback_threshold` without
-/// holding the config guard across a later `handle_key` (which re-locks it).
+/// Helper: read profile fields without holding the config guard across handle_key.
 fn base_url_of(app: &app::App, name: &str) -> Option<String> {
     app.config().find(name).and_then(|p| p.base_url.clone())
 }
@@ -467,8 +428,7 @@ fn threshold_of(app: &app::App, name: &str) -> Option<f64> {
 
 #[test]
 fn demo_data_drives_all_actions() {
-    // Hold the shared home lock for the whole test and reset the override on
-    // exit, so no $HOME-based test races us or sees our (dead) sandbox.
+    // Hold home lock for the whole test; reset override on exit (even on panic).
     let _guard = crate::profile::HOME_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -476,7 +436,6 @@ fn demo_data_drives_all_actions() {
     let sandbox = tempfile::tempdir().expect("create driver sandbox");
     set_home_override(sandbox.path().to_path_buf());
 
-    // Every read/write the App makes from here on resolves under the sandbox.
     assert_eq!(
         home_dir().expect("home dir"),
         sandbox.path(),
@@ -484,14 +443,13 @@ fn demo_data_drives_all_actions() {
     );
 
     let mut app = app::App::new(demo_config());
-    seed_usage(&app); // simulate a fetch so usage windows aren't blanked to `-`
-    seed_timers(&app); // light up the spinner + refresh countdowns in the timer slot
+    seed_usage(&app);
+    seed_timers(&app);
 
-    // reconcile_startup is never called → no bootstrap, no scheduler, no fetch.
+    // reconcile_startup never called → no bootstrap, no scheduler.
     assert!(!app.reconcile_done && !app.bootstrap_started);
 
-    // The timer slot has live sources: a spinner for the active profile and a
-    // countdown for an idle one. (Workers mutate these later; assert pre-drive.)
+    // Pre-drive: timer slot has a spinner for the active profile and a countdown for an idle one.
     assert_eq!(
         app.activity.lock().unwrap().get("personal").copied(),
         Some(ProfileActivity::Fetching),
@@ -505,7 +463,7 @@ fn demo_data_drives_all_actions() {
         "idle profiles must show a refresh countdown in the timer slot"
     );
 
-    // ── Tab navigation: ⇥ walks forward and wraps, ⇧⇥ walks back. ──
+    // ── Tab navigation ──
     use app::Tab;
     assert_eq!(app.tab, Tab::Overview);
     press(&mut app, KeyCode::Tab);
@@ -523,12 +481,12 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::BackTab);
     assert_eq!(app.tab, Tab::Overview);
 
-    // ── Switch: Overview → highlight "work" → ⏎ raises confirm → ⏎ commits. ──
+    // ── Switch ──
     assert_eq!(
         app.config().state.active_profile.as_deref(),
         Some("personal")
     );
-    press(&mut app, KeyCode::Down); // cursor 0 (personal) → 1 (work)
+    press(&mut app, KeyCode::Down); // 0 (personal) → 1 (work)
     press(&mut app, KeyCode::Enter); // request switch → confirm modal
     assert_eq!(app.modals.len(), 1, "switch raises a confirm modal");
     press(&mut app, KeyCode::Enter); // accept (choice defaults to yes)
@@ -537,8 +495,7 @@ fn demo_data_drives_all_actions() {
         a.config().state.active_profile.as_deref() == Some("work")
     });
 
-    // Usage is simulated: on_tick ran apply_usage during the switch, and the
-    // seeded windows survived instead of blanking to `-`.
+    // Seeded usage windows must survive on_tick → apply_usage during the switch.
     {
         let cfg = app.config();
         let util = cfg
@@ -553,16 +510,13 @@ fn demo_data_drives_all_actions() {
         );
     }
 
-    // The switch persisted into the sandbox, never the real config.
-    let state_file = sandbox.path().join(".clauth").join("profiles.toml");
+    let state_file = sandbox.path().join(".clauth").join("profiles.toml"); // switch persists to sandbox, not real config
     assert!(
         state_file.exists(),
         "switch must write profiles.toml inside the sandbox"
     );
 
-    // ── Edit: Config → "side-project" → BaseUrl row → type a URL → ⏎ saves. ──
-    // Account selection is shared across tabs: the switch above left the cursor on
-    // "work" (1), so one ↓ reaches "side-project" (2).
+    // ── Edit ── (cursor at "work"/1 after switch; one ↓ → "side-project"/2)
     press(&mut app, KeyCode::Tab); // Overview → Usage
     press(&mut app, KeyCode::Tab); // Usage → Config
     assert_eq!(app.tab, Tab::Config);
@@ -587,14 +541,14 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Esc); // back out of the detail pane
     assert_eq!(app.config_focus, app::ConfigFocus::Profiles);
 
-    // ── Toggle: "personal" auto-start ON → OFF (no worker spawns when off). ──
+    // ── Toggle ──
     assert!(auto_start_of(&app, "personal"), "demo seeds personal ON");
-    press(&mut app, KeyCode::Up); // cursor 2 (side-project) → 1 (work)
+    press(&mut app, KeyCode::Up); // 2 → 1 (work)
     press(&mut app, KeyCode::Up); // → 0 (personal)
     press(&mut app, KeyCode::Enter); // focus detail for personal
     press(&mut app, KeyCode::Down); // Name → BaseUrl
-    press(&mut app, KeyCode::Down); // → ApiKey
-    press(&mut app, KeyCode::Down); // → AutoStart
+    press(&mut app, KeyCode::Down); // BaseUrl → ApiKey
+    press(&mut app, KeyCode::Down); // ApiKey → AutoStart
     press(&mut app, KeyCode::Enter); // flip it
     assert!(
         !auto_start_of(&app, "personal"),
@@ -602,7 +556,7 @@ fn demo_data_drives_all_actions() {
     );
     press(&mut app, KeyCode::Esc);
 
-    // ── Reorder: Fallback chain [personal, work, side-project] → ⇧↓ on head. ──
+    // ── Reorder ──
     press(&mut app, KeyCode::Tab); // Config → Fallback
     assert_eq!(app.tab, Tab::Fallback);
     {
@@ -612,7 +566,7 @@ fn demo_data_drives_all_actions() {
             vec!["personal", "work", "side-project"]
         );
     }
-    app::handle_key(&mut app, key_shift(KeyCode::Down)); // move head down one
+    app::handle_key(&mut app, key_shift(KeyCode::Down)); // head → one step down
     {
         let cfg = app.config();
         assert_eq!(
@@ -623,9 +577,9 @@ fn demo_data_drives_all_actions() {
     }
     assert_eq!(app.chain_cursor, 1, "cursor follows the moved member");
 
-    // ── Set threshold (stepper): "personal" is now chain index 1, 80% → 85%. ──
+    // ── Set threshold (stepper) ── "personal" is chain index 1, 80% → 85%
     assert_eq!(threshold_of(&app, "personal"), Some(80.0));
-    press(&mut app, KeyCode::Enter); // enter the member detail pane
+    press(&mut app, KeyCode::Enter); // enter member detail pane
     assert_eq!(app.fallback_focus, app::FallbackFocus::Detail);
     press(&mut app, KeyCode::Char('+')); // +5 step
     assert_eq!(
@@ -634,10 +588,10 @@ fn demo_data_drives_all_actions() {
         "the + stepper bumps the threshold by 5"
     );
 
-    // ── Set threshold (inline editor): ⏎ opens it, retype 50, ⏎ commits. ──
-    press(&mut app, KeyCode::Enter); // open the inline editor on the Threshold row
+    // ── Set threshold (inline editor) ──
+    press(&mut app, KeyCode::Enter); // open inline editor on Threshold row
     assert!(app.fallback_threshold_draft.is_some());
-    press(&mut app, KeyCode::Backspace); // clear "85"
+    press(&mut app, KeyCode::Backspace); // clear "85" (2 chars)
     press(&mut app, KeyCode::Backspace);
     type_str(&mut app, "50");
     press(&mut app, KeyCode::Enter); // commit
@@ -650,16 +604,16 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Esc); // leave the detail pane
     assert_eq!(app.fallback_focus, app::FallbackFocus::Chain);
 
-    // ── Delete: Config → "research" → Delete row → ⏎ arms, ⏎ confirms. ──
+    // ── Delete ──
     let before = app.profile_count();
     press(&mut app, KeyCode::BackTab); // Fallback → Config
     assert_eq!(app.tab, Tab::Config);
     for _ in 0..4 {
-        press(&mut app, KeyCode::Down); // 0 → 4 (research, the last profile)
+        press(&mut app, KeyCode::Down); // 0 → 4 ("research")
     }
     press(&mut app, KeyCode::Enter); // focus detail
     for _ in 0..4 {
-        press(&mut app, KeyCode::Down); // Name → … → Delete (last row)
+        press(&mut app, KeyCode::Down); // Name → Delete (last row)
     }
     press(&mut app, KeyCode::Enter); // arm
     assert!(
@@ -676,11 +630,9 @@ fn demo_data_drives_all_actions() {
         "the deleted profile is gone from the config"
     );
 
-    // ── Quit. ──
     press(&mut app, KeyCode::Char('q'));
     assert!(app.quit, "q quits");
 
-    // Nothing escaped the sandbox: home_dir still points there and the real
-    // tree is untouched (the override is the only path the App ever resolved).
+    // Nothing escaped the sandbox — home_dir still points there.
     assert_eq!(home_dir().expect("home dir"), sandbox.path());
 }

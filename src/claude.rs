@@ -16,18 +16,14 @@ fn claude_settings_path() -> Result<PathBuf> {
     Ok(claude_dir()?.join("settings.json"))
 }
 
-/// State of `~/.claude/.credentials.json` relative to a profile's stored
-/// credentials. Lets callers refuse to corrupt the profile when the live
-/// path is no longer the symlink clauth installed.
+/// State of `~/.claude/.credentials.json` relative to a profile's stored credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkState {
-    /// Symlink in place and resolving to the profile's stored credentials.
+    /// Symlink resolves to the profile's stored credentials.
     LinkedTo,
-    /// Live path exists but is not our symlink — CC re-logged via
-    /// unlink+write, the user edited it by hand, or a stale post-shutdown
-    /// copy is sitting there.
+    /// Path exists but is not our symlink — CC re-logged, user edited, or stale copy.
     Diverged,
-    /// Live path does not exist.
+    /// Path does not exist.
     Missing,
 }
 
@@ -37,9 +33,7 @@ pub(crate) fn classify_credentials_link(active: &str) -> Result<LinkState> {
     classify_link_at(&link, &expected)
 }
 
-/// Pure path classifier used by `classify_credentials_link` and the inline
-/// tests. Symlink target comparison is canonical-when-possible, falling back
-/// to literal path equality when either side does not currently resolve.
+/// Classify a symlink at `link` against `expected`; canonical paths when resolvable.
 pub(crate) fn classify_link_at(link: &Path, expected: &Path) -> Result<LinkState> {
     let meta = match link.symlink_metadata() {
         Ok(m) => m,
@@ -64,22 +58,17 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// True when `active` owns no stored credentials yet and the live
-/// `.credentials.json` is a regular file carrying a completed OAuth login.
-/// This is a credential-less profile's first login (e.g. a blank profile the
-/// user just authenticated through Claude Code), which clauth adopts rather
-/// than refusing as divergence. Mirrors the runtime watchdog's first-login
-/// handling in `sync_credentials_unlocked`.
+/// True when the profile has no stored credentials but the live path is a regular
+/// file with a completed OAuth login — first login after blank profile creation.
+/// clauth adopts this rather than treating it as divergence.
 pub(crate) fn is_first_login(active: &str) -> Result<bool> {
     let link = claude_credentials_path()?;
     let expected = profile_dir(active)?.join("credentials.json");
     Ok(is_first_login_at(&link, &expected))
 }
 
-/// Pure path-based companion to [`is_first_login`], split out for testing.
-/// `expected` is the profile's stored credentials file; its absence is the
-/// "no stored credentials" signal. The OAuth check rejects a mid-flight
-/// partial write (e.g. an empty `{}`) so adoption waits for a completed login.
+/// Path-based core of [`is_first_login`], split for testing. The OAuth check
+/// rejects partial writes (e.g. `{}`) so adoption waits for a completed login.
 fn is_first_login_at(link: &Path, expected: &Path) -> bool {
     if expected.exists() {
         return false;
@@ -126,12 +115,9 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
         .context("Failed to copy credentials")
 }
 
-/// Symlinks `~/.claude/.credentials.json` → profile's `credentials.json`;
-/// copies on Windows without symlink privilege. Refuses to overwrite a
-/// regular file at the live path unless its content already matches the
-/// profile target — replacing a divergent regular file would silently
-/// destroy whatever CC wrote there (typically a re-login the user hasn't
-/// resolved yet).
+/// Symlink `~/.claude/.credentials.json` → profile's `credentials.json` (copy on
+/// Windows). Refuses to overwrite a non-matching regular file — that would silently
+/// drop a CC re-login the user hasn't resolved yet.
 pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
@@ -195,10 +181,8 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
     })
 }
 
-/// Patches `settings.json`'s `env` block with ANTHROPIC_BASE_URL,
-/// ANTHROPIC_AUTH_TOKEN, and the profile's `env` map. Keys in `prev_env_keys`
-/// that the new profile doesn't carry are removed first so stale entries from
-/// the previously active profile don't linger. Every other field is untouched.
+/// Patch `settings.json` `env` with profile's endpoint keys and env map;
+/// strip `prev_env_keys` the new profile doesn't carry to clear stale entries.
 pub(crate) fn apply_profile_to_claude_settings(
     profile: &Profile,
     prev_env_keys: &[String],
@@ -227,11 +211,8 @@ fn apply_profile_to_claude_settings_inner(
     atomic_write(&path, content).context("Failed to write settings.json")
 }
 
-/// Merges `base_path`'s settings.json (or `{}` when missing) with the profile's
-/// endpoint keys and env overlay. `prev_env_keys` lists env keys to strip
-/// before applying the new profile — used by the switch path to clear the
-/// previously active profile's custom env. `start` passes `&[]` so existing
-/// keys in the file stay untouched.
+/// Build the merged settings.json content. `prev_env_keys` are stripped before
+/// the new profile's env is applied; pass `&[]` on start to leave existing keys.
 pub(crate) fn build_claude_settings_json(
     base_path: &Path,
     profile: &Profile,
@@ -274,8 +255,7 @@ pub(crate) fn build_claude_settings_json(
         }
     }
 
-    // Apply profile env last so an explicit ANTHROPIC_* entry in the profile
-    // env map wins over the dedicated base_url / api_key fields.
+    // Profile env last: explicit ANTHROPIC_* entries win over base_url/api_key.
     for (k, v) in &profile.env {
         env.insert(k.clone(), v.clone().into());
     }
@@ -283,22 +263,16 @@ pub(crate) fn build_claude_settings_json(
     serde_json::to_string_pretty(&settings).context("Failed to serialize settings.json")
 }
 
-/// Reads the live .credentials.json and saves it to the active profile.
-/// No-op when the live path has diverged from our symlink — accepting a
-/// divergent live file as authoritative would silently overwrite the
-/// profile's stored identity. The reconciliation modal resolves divergence
-/// by calling `force_snapshot_active_credentials` after the user picks
-/// "Overwrite".
+/// Save live `.credentials.json` into the active profile. No-op on divergence
+/// (would silently overwrite stored identity); divergence is resolved via
+/// `force_snapshot_active_credentials` after user confirmation. First-login
+/// on a credential-less profile is adopted instead.
 pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
     with_state_lock(|| {
         let Some(active) = config.state.active_profile.clone() else {
             return Ok(());
         };
         if matches!(classify_credentials_link(&active)?, LinkState::Diverged) {
-            // A divergent live file is normally a re-login the user must
-            // resolve, so the stored identity stays untouched. The one
-            // exception is a credential-less profile's first login: adopt
-            // Claude Code's write so the profile gains an identity.
             if is_first_login(&active)? {
                 adopt_first_login(config, &active)?;
             }
@@ -308,10 +282,8 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
     })
 }
 
-/// Adopt a credential-less profile's first login: store the live
-/// `.credentials.json` into the active profile, then replace it with a symlink
-/// so later Claude Code writes stay owned. Callers gate this on
-/// [`is_first_login`]; calling it otherwise would overwrite stored identity.
+/// Store the live `.credentials.json` into the profile then replace it with a
+/// symlink. Must only be called after `is_first_login` returns true.
 pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &str) -> Result<()> {
     with_state_lock(|| {
         snapshot_active_credentials_unchecked(config, active)?;
@@ -328,9 +300,7 @@ fn snapshot_active_credentials_unchecked(config: &mut AppConfig, active: &str) -
     Ok(())
 }
 
-/// Snapshot the live .credentials.json into the active profile even when
-/// the link is diverged. Called by the divergence-resolution modal's
-/// "Overwrite active profile with live creds" action.
+/// Snapshot the live `.credentials.json` into the active profile unconditionally.
 pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
     with_state_lock(|| {
         let Some(active) = config.state.active_profile.clone() else {
@@ -340,9 +310,7 @@ pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Resul
     })
 }
 
-/// Re-link `~/.claude/.credentials.json` to `name`'s stored credentials,
-/// overwriting whatever's at the live path. Used by the divergence modal's
-/// "Discard new creds" action to restore the profile's stored identity.
+/// Re-link `.credentials.json` to `name`'s stored credentials, overwriting the live path.
 pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
@@ -360,9 +328,8 @@ pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
     })
 }
 
-/// Returns true when both sides carry an OAuth block and either the access
-/// token or refresh token differs. Missing data on either side returns false
-/// — the caller's normal snapshot/skip path is safer than guessing.
+/// True when both sides have an OAuth block and access or refresh token differs.
+/// Missing data on either side returns false (snapshot/skip is safer than guessing).
 pub(crate) fn credentials_diverged(
     stored: Option<&ClaudeCredentials>,
     live: Option<&ClaudeCredentials>,
@@ -376,11 +343,9 @@ pub(crate) fn credentials_diverged(
     stored.access_token != live.access_token || stored.refresh_token != live.refresh_token
 }
 
-/// Replaces the symlink at `~/.claude/.credentials.json` with a regular file
-/// containing the same bytes. No-op when the path is already a regular file
-/// or doesn't exist. Called when the user disowns the active profile so
-/// subsequent Claude Code writes don't bleed into that profile's storage
-/// through the symlink.
+/// Replace the symlink at `.credentials.json` with a regular file (same bytes).
+/// No-op if already a regular file or absent. Prevents CC writes from bleeding
+/// into the profile's storage after the user disowns the active profile.
 pub(crate) fn detach_credentials_link() -> Result<()> {
     with_state_lock(|| {
         let path = claude_credentials_path()?;

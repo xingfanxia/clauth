@@ -8,14 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-/// Braille spinner frames — the set most CLI tools use. Single source of truth;
-/// the TUI re-exports this through `tui::render::format`.
+/// Braille spinner frames; re-exported through `tui::render::format`.
 pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u64 = 80;
 
 pub(crate) struct Spinner {
-    /// Shared stop flag — `Some` only on the TTY path where the worker thread
-    /// reads it. The non-TTY no-op path leaves it `None` and allocates nothing.
+    /// Stop flag; `None` on the non-TTY no-op path (nothing allocated).
     stop: Option<Arc<AtomicBool>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -56,8 +54,7 @@ impl Drop for Spinner {
         }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
-            // Clear the spinner line: carriage return + clear-to-EOL so the
-            // next stderr/stdout write starts on a clean line.
+            // CR + clear-to-EOL so the next write starts on a clean line.
             let mut err = std::io::stderr().lock();
             let _ = write!(err, "\r\x1b[2K");
             let _ = err.flush();

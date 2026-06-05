@@ -100,8 +100,7 @@ fn returns_none_when_no_profile_holds_token() {
 
 #[test]
 fn ties_break_on_active_profile() {
-    // Two profiles holding the same refresh_token (degenerate; e.g. user
-    // duplicated a profile directory). The active one wins.
+    // degenerate: duplicate profile dir gives two profiles the same token; active wins
     let config = config_with(
         vec![
             oauth_profile("first", "rt-shared"),
@@ -173,9 +172,8 @@ fn no_attribution_without_refresh_token() {
 
 #[test]
 fn no_credential_less_attribution_inside_session() {
-    // When CLAUDE_CONFIG_DIR is set the loaded creds belong to the started
-    // profile's runtime, not the global active. Suppress the fallback so a
-    // credential-less active profile isn't incorrectly credited.
+    // inside a session (CLAUDE_CONFIG_DIR set), creds belong to the runtime profile —
+    // suppress attribution so a credential-less active isn't incorrectly credited
     let config = config_with(
         vec![oauth_profile("work", "rt-work"), blank_profile("active")],
         Some("active"),
@@ -186,7 +184,7 @@ fn no_credential_less_attribution_inside_session() {
 
 #[test]
 fn token_match_still_works_inside_session() {
-    // A token-exact match is always valid, even inside a session.
+    // token-exact match is always valid, even inside a session
     let config = config_with(
         vec![oauth_profile("work", "rt-work"), blank_profile("active")],
         Some("active"),
@@ -200,9 +198,7 @@ fn token_match_still_works_inside_session() {
 
 #[test]
 fn resolves_started_profile_in_runtime_session() {
-    // `clauth start <blank>`: a credential-less started profile owns its
-    // runtime session, so its name resolves even with no stored token and an
-    // unmatched live login.
+    // `clauth start <blank>`: credential-less started profile owns the runtime session
     let config = config_with(
         vec![oauth_profile("work", "rt-work"), blank_profile("new")],
         Some("work"),
@@ -216,8 +212,7 @@ fn resolves_started_profile_in_runtime_session() {
 
 #[test]
 fn started_profile_resolves_with_no_loaded_creds() {
-    // Before the session's first login is written there are no loaded creds at
-    // all — the started profile still owns the session.
+    // no creds yet (pre-first-login) — started profile still owns the session
     let config = config_with(vec![blank_profile("new")], Some("work"));
     assert_eq!(
         resolve_profile(&config, None, true, Some("new")),
@@ -227,7 +222,7 @@ fn started_profile_resolves_with_no_loaded_creds() {
 
 #[test]
 fn token_match_wins_over_started_profile() {
-    // An exact token match is more precise than the path-derived profile.
+    // token match is more precise than path-derived profile
     let config = config_with(
         vec![
             oauth_profile("personal", "rt-personal"),
@@ -244,8 +239,7 @@ fn token_match_wins_over_started_profile() {
 
 #[test]
 fn unknown_started_profile_is_not_resolved() {
-    // A runtime path naming a profile that no longer exists falls through to
-    // the in-session suppression rather than inventing a match.
+    // profile no longer exists → falls through to in-session suppression, no invented match
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(

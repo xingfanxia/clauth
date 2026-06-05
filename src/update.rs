@@ -8,13 +8,13 @@ use serde::Deserialize;
 
 const API_URL: &str = "https://api.github.com/repos/uwuclxdy/clauth/releases/latest";
 
-/// Outcome of the background update check, surfaced as a TUI toast. Errors stay
-/// silent (best-effort) — only an actionable result is reported.
+/// Outcome of the background update check. Errors are silent; only actionable
+/// results are reported.
 pub(crate) enum UpdateEvent {
-    /// A newer release was downloaded and self-installed; effective next launch.
+    /// Newer release downloaded and self-installed; effective next launch.
     Installed(String),
-    /// A newer release exists but can't be self-applied (cargo install, or no
-    /// prebuilt asset for this platform); the user updates it manually.
+    /// Newer release exists but can't be self-applied (cargo install or no
+    /// prebuilt asset); user must update manually.
     Available(String),
 }
 
@@ -32,9 +32,8 @@ struct Asset {
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Spawns a background thread that checks for an update, applies it when it can
-/// self-replace, and reports the outcome over `tx` for the TUI to toast.
-/// Returns immediately. All errors are discarded — update is best-effort.
+/// Spawn a background update check; applies if self-replaceable, toasts result.
+/// Returns immediately; errors are silently discarded.
 pub(crate) fn spawn(tx: Sender<UpdateEvent>) {
     std::thread::spawn(move || {
         let _ = try_update(&tx);
@@ -49,8 +48,7 @@ fn try_update(tx: &Sender<UpdateEvent>) -> anyhow::Result<()> {
     }
     let version = release.tag_name.trim_start_matches('v').to_string();
 
-    // A cargo-installed binary can't be self-replaced, and an unsupported
-    // platform has no prebuilt asset — notify only, the user updates manually.
+    // Cargo install or unsupported platform: notify only.
     let Some(asset) = asset_name() else {
         let _ = tx.send(UpdateEvent::Available(version));
         return Ok(());
@@ -97,7 +95,7 @@ fn download_and_replace(url: &str) -> anyhow::Result<()> {
     let tmp_path = env::temp_dir().join("clauth_update.tmp");
     let _ = fs::remove_file(&tmp_path);
 
-    // into_reader() has no size cap, unlike read_to_vec()'s 10 MB default.
+    // into_reader() has no size cap (read_to_vec() caps at 10 MB).
     let mut bytes = Vec::new();
     ureq::get(url)
         .header("User-Agent", "clauth-updater")
@@ -119,8 +117,7 @@ fn download_and_replace(url: &str) -> anyhow::Result<()> {
         fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))?;
     }
 
-    // self_replace handles in-place replacement on every platform, including
-    // Windows where you can't directly overwrite a running executable.
+    // self_replace handles in-place replacement, including Windows.
     self_replace::self_replace(&tmp_path)?;
     let _ = fs::remove_file(&tmp_path);
 

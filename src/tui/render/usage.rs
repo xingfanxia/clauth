@@ -16,11 +16,9 @@ use crate::format::plan_label;
 use crate::profile::Profile;
 use crate::usage::{FetchStatus, ProfileActivity, UsageWindow, now_ms};
 
-/// Key column width for the header rows (`plan`, `status`).
 const KEY_W: usize = 8;
 
-/// Per-account runtime state shown in the usage detail header — gathered once
-/// under the locks in `draw_usage_detail` so the line builders stay lock-free.
+/// Runtime state gathered once under locks; keeps line builders lock-free.
 struct HeaderState {
     is_active: bool,
     activity: ProfileActivity,
@@ -59,9 +57,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    // Per-account runtime state, read under the activity / refresh-timer locks.
-    // `config` (held via `cfg`) is outer of both in the global lock order, so
-    // taking them here is safe.
+    // `config` (via `cfg`) is outer of activity/refresh-timer in lock order.
     let header = HeaderState {
         is_active: cfg.is_active(&profile.name),
         activity: app
@@ -112,9 +108,7 @@ fn build_usage_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> V
         .max()
         .unwrap_or(0);
     let bar_width = bar_width_for(inner_w, max_trailing);
-    // Right-align every % to the far edge of the content so the figures stack
-    // in one column above the trailing "resets in …" text rather than hugging
-    // the bar's right end.
+    // Right-align % to far content edge so figures stack above the reset text.
     let pct_col = (bar_width + max_trailing).min(inner_w as usize);
     for (i, stat) in stats.iter().enumerate() {
         if i > 0 {
@@ -125,8 +119,6 @@ fn build_usage_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> V
     lines
 }
 
-/// One renderable usage row: a window or the extra-credit line, reduced to the
-/// few values the bar needs.
 struct Stat {
     label: String,
     pct: f64,
@@ -135,10 +127,8 @@ struct Stat {
 }
 
 impl Stat {
-    /// Two-line block: eyebrow + right-aligned %, then a `bar_width`-cell bar
-    /// with the trailing reset/credit suffix. `bar_width` is shared across all
-    /// rows so every bar lines up at the same length; `pct_col` is the column
-    /// the % right-aligns to (the content's far edge, above the reset text).
+    /// Eyebrow + right-aligned %, then bar with trailing reset/credit suffix.
+    /// `bar_width` shared across rows; `pct_col` = far content edge for % alignment.
     fn render(&self, bar_width: usize, pct_col: usize) -> Vec<Line<'static>> {
         let pct_str = format!("{:>3.0}%", self.pct);
         let header_pad = pct_col
@@ -153,8 +143,7 @@ impl Stat {
             Span::styled("█".repeat(filled), Style::default().fg(self.color)),
             Span::styled("░".repeat(empty), Style::default().fg(theme::LINE_STRONG)),
         ];
-        // Right-align the reset/credit text to the same far column as the %, so
-        // the bar line ends in a clean right column under it.
+        // Right-align trailing text to the same far column as %.
         if !self.trailing.is_empty() {
             let pad = pct_col
                 .saturating_sub(bar_width)
@@ -179,7 +168,6 @@ impl Stat {
     }
 }
 
-/// Every renderable usage row for the account, in display order.
 fn collect_stats(profile: &Profile) -> Vec<Stat> {
     let Some(usage) = profile.usage.as_ref() else {
         return Vec::new();
@@ -225,23 +213,18 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
     stats
 }
 
-/// Uniform bar width across all rows: as wide as possible while still leaving
-/// room for the longest trailing suffix, so every bar lines up.
+/// As wide as possible while leaving room for the longest trailing suffix.
 fn bar_width_for(inner_w: u16, max_trailing: usize) -> usize {
     let avail = (inner_w as usize).saturating_sub(max_trailing);
     if avail >= 10 {
-        // Comfortable case: a readable bar with room to spare for the suffix.
         avail
     } else {
-        // Suffix nearly fills the line — keep whatever room is left rather than
-        // forcing a 10-cell bar that would push the suffix off the edge.
+        // Suffix nearly fills the line — keep what's left rather than forcing a
+        // 10-cell bar that pushes the suffix off the edge.
         avail.max(1)
     }
 }
 
-/// Header above the bars: the account's plan (with an `● active` marker when
-/// this is the live profile), then a per-account status line carrying the live
-/// activity spinner, fetch health, and the countdown to the next auto-refresh.
 fn header_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
     let plan = profile
         .usage
@@ -262,15 +245,12 @@ fn header_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
     }
 
     let mut lines = vec![Line::from(plan_spans)];
-    // Usage windows (and thus refresh scheduling) only exist for oauth profiles.
     if profile.is_oauth() {
         lines.push(status_line(profile, header));
     }
     lines
 }
 
-/// The `status` row: a live spinner while an op is in flight, otherwise the
-/// fetch health plus the seconds remaining until the next scheduled refresh.
 fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
     let key = key_span("status");
 
@@ -316,9 +296,6 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
     Line::from(spans)
 }
 
-/// A padded eyebrow key cell for the header rows — same `label` treatment as
-/// the usage bars' eyebrows just below, so the whole pane's label column reads
-/// in one style.
 fn key_span(key: &str) -> Span<'static> {
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     Span::styled(format!("{key}{}", " ".repeat(pad)), theme::label())
