@@ -1,4 +1,4 @@
-//! Bottom strip: full-width key hints. Status moved to the header status row.
+//! Bottom strip: key hints, or a footer alert in place when one is active.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -6,22 +6,25 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, ConfigFocus, FallbackFocus, FallbackHint, Tab, fallback_hint};
+use super::super::app::{
+    App, ConfigFocus, FallbackFocus, FallbackHint, FooterAlert, Tab, fallback_hint,
+};
 use super::super::theme;
 
 const TAB_NAV: (&str, &str) = ("←→", "tabs");
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // `q` label: "back" in a sub-focus, "press q again" when armed, "quit" at top level.
+    // A live alert replaces the hint bar in place — one footer row, never stacked.
+    if let Some(alert) = &app.footer_alert {
+        draw_alert(frame, area, alert);
+        return;
+    }
+
+    // `q` label: "back" in a sub-focus, "quit" at top level.
+    // (While armed the alert row shows instead, so this label stays "quit".)
     let has_sub_focus = (app.tab == Tab::Config && app.config_focus == ConfigFocus::Actions)
         || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail);
-    let q_label: &str = if has_sub_focus {
-        "back"
-    } else if app.armed_quit {
-        "press q again"
-    } else {
-        "quit"
-    };
+    let q_label: &str = if has_sub_focus { "back" } else { "quit" };
 
     let tail: &[(&str, &str)] = match app.tab {
         Tab::Overview => &[
@@ -114,6 +117,22 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled(format!(" {label}"), theme::dim()));
     }
 
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .style(theme::base())
+            .alignment(Alignment::Left),
+        area,
+    );
+}
+
+/// Render a footer alert in place of the hint bar.
+/// `! <message>` — glyph in `WARNING`, message in `TEXT_DIM`.
+fn draw_alert(frame: &mut Frame<'_>, area: Rect, alert: &FooterAlert) {
+    let FooterAlert::Warn(msg) = alert;
+    let spans = vec![
+        Span::styled("! ", Style::default().fg(theme::WARNING)),
+        Span::styled(msg.as_str(), theme::dim()),
+    ];
     frame.render_widget(
         Paragraph::new(Line::from(spans))
             .style(theme::base())

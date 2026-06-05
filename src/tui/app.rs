@@ -326,6 +326,17 @@ pub(crate) enum FallbackFocus {
     Detail,
 }
 
+// ── Footer alert ─────────────────────────────────────────────────────────────
+
+/// A transient message that replaces the hint bar in place until dismissed.
+/// `x` clears it (after all toasts are gone — see dismissal precedence).
+/// Add variants as new conditions arise; keep one active at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FooterAlert {
+    /// `! <message>` in `WARNING` color — user must act or acknowledge.
+    Warn(String),
+}
+
 // ── Overview list items ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
@@ -402,6 +413,9 @@ pub(crate) struct App {
     pub(crate) quit: bool,
     /// First `q` at top level arms this; second `q` confirms quit.
     pub(crate) armed_quit: bool,
+    /// Live footer alert; replaces the hint bar in place while `Some`.
+    /// Cleared on disarm, tab switch, or explicit `x` dismiss.
+    pub(crate) footer_alert: Option<FooterAlert>,
     /// Last time the 1Hz divergence poll ran.
     pub(crate) last_divergence_check: Instant,
     /// Set once reconcile reports back; gates bootstrap spawn.
@@ -507,6 +521,7 @@ impl App {
             tick_count: 0,
             quit: false,
             armed_quit: false,
+            footer_alert: None,
             last_divergence_check: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
@@ -701,6 +716,15 @@ impl App {
         });
     }
 
+    /// Disarm the 2-step quit and clear its accompanying footer alert.
+    /// Only call this when the armed-quit sequence is interrupted (key switch,
+    /// tab change, etc.). For `x`-dismiss of an alert produced by a non-quit
+    /// condition, clear `footer_alert` directly instead.
+    pub(crate) fn disarm_quit(&mut self) {
+        self.armed_quit = false;
+        self.footer_alert = None;
+    }
+
     pub(crate) fn prune_toasts(&mut self) {
         while let Some(front) = self.toasts.front() {
             let ttl = if front.kind == ToastKind::Danger {
@@ -867,22 +891,22 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     // Global keys (no modal owns input).
     match key.code {
         KeyCode::Right => {
-            app.armed_quit = false;
+            app.disarm_quit();
             switch_tab(app, app.tab.next());
             return;
         }
         KeyCode::Left => {
-            app.armed_quit = false;
+            app.disarm_quit();
             switch_tab(app, app.tab.prev());
             return;
         }
         KeyCode::Char('?') => {
-            app.armed_quit = false;
+            app.disarm_quit();
             app.modals.push(Modal::Help);
             return;
         }
         KeyCode::Char('r') => {
-            app.armed_quit = false;
+            app.disarm_quit();
             // Usage `r` refreshes only the current account.
             if app.tab == Tab::Usage {
                 let selected = {
@@ -909,7 +933,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('t') => {
-            app.armed_quit = false;
+            app.disarm_quit();
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: ROTATE_ALL_MSG.to_string(),
                 detail: Some(ROTATE_ALL_DETAIL.to_string()),
@@ -919,13 +943,13 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('n') => {
-            app.armed_quit = false;
+            app.disarm_quit();
             start_new_account(app);
             return;
         }
         // Esc backs out of sub-focus; no-op at the top level.
         KeyCode::Esc => {
-            app.armed_quit = false;
+            app.disarm_quit();
             if app.tab == Tab::Config && app.config_focus == ConfigFocus::Actions {
                 app.config_focus = ConfigFocus::Profiles;
                 app.config_draft = None;
@@ -942,7 +966,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 && app.config_focus == ConfigFocus::Actions)
                 || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail);
             if has_sub_focus {
-                app.armed_quit = false;
+                app.disarm_quit();
                 if app.tab == Tab::Config {
                     app.config_focus = ConfigFocus::Profiles;
                     app.config_draft = None;
@@ -953,12 +977,27 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 app.quit = true;
             } else {
                 app.armed_quit = true;
+                app.footer_alert = Some(FooterAlert::Warn("press q again to quit".to_string()));
+            }
+            return;
+        }
+        KeyCode::Char('x') => {
+            // Dismissal precedence: toasts first, then footer alert.
+            // `x` dismisses the alert directly; quit disarming is a side effect
+            // only when armed_quit was the producer — not a general alert clear.
+            if !app.toasts.is_empty() {
+                app.toasts.pop_front();
+            } else if app.footer_alert.is_some() {
+                app.footer_alert = None;
+                if app.armed_quit {
+                    app.armed_quit = false;
+                }
             }
             return;
         }
         _ => {
             // Any unhandled key disarms the 2-step quit.
-            app.armed_quit = false;
+            app.disarm_quit();
         }
     }
 
