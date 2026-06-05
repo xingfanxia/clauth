@@ -13,7 +13,8 @@ use crate::profile::{
 use crate::runtime::{RotationGuard, has_live_session};
 use crate::usage::{
     ActivityKind, ActivityStore, LastRotatedWindow, OpResult, OpResultSender, ProfileActivity,
-    RefetchQueue, UsageStore, clear_activity, mark_activity, now_ms,
+    RefetchQueue, UsageStore, clear_activity, iso_to_epoch_secs, mark_activity, now_epoch_secs,
+    now_ms,
 };
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup
@@ -411,6 +412,13 @@ pub(crate) fn windowless_auto_start_candidates(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
 ) -> Vec<String> {
+    // A window counts as live only while its `resets_at` is still in the
+    // future — same boundary `scan_expired_windows` uses. Checking mere
+    // presence would treat an expired-but-not-yet-cleared `resets_at` as a
+    // live window, so a background profile whose window lapsed would never be
+    // re-armed (the active profile gets a fresh window from Claude Code each
+    // session, masking the bug as "auto-start only works for the active one").
+    let now_secs = now_epoch_secs();
     let has_active_window: std::collections::HashMap<String, bool> = store
         .lock()
         .ok()
@@ -420,8 +428,9 @@ pub(crate) fn windowless_auto_start_candidates(
                     let active = info
                         .five_hour
                         .as_ref()
-                        .and_then(|w| w.resets_at.as_ref())
-                        .is_some();
+                        .and_then(|w| w.resets_at.as_deref())
+                        .and_then(iso_to_epoch_secs)
+                        .is_some_and(|resets_at| now_secs < resets_at);
                     (name.clone(), active)
                 })
                 .collect()

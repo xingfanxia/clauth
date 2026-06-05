@@ -572,3 +572,56 @@ fn start_window_skips_when_live_session() {
 
     drop(file);
 }
+
+/// An opted-in background profile whose 5h window has lapsed but still carries a
+/// past `resets_at` in the usage store must be re-armed: a window counts as live
+/// only while `resets_at` is in the future. The previous `.is_some()` check
+/// treated the stale timestamp as a live window, so the profile was never re-
+/// kicked — surfacing as "auto-start only works for the active account" (the
+/// active one gets a fresh window from Claude Code each session).
+#[test]
+fn windowless_candidate_when_resets_at_is_in_the_past() {
+    use std::collections::HashMap;
+
+    let _home = HomeSandbox::new();
+    let name = "test-windowless-expired-window";
+
+    let mut config = single_profile_config(name, "rt-expired");
+    config.profiles[0].auto_start = true;
+    let config = Arc::new(RankedMutex::new(config));
+
+    let store: crate::usage::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // Expired window: resets_at well in the past → still windowless → candidate.
+    let expired = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 0.0,
+            resets_at: Some("2020-01-01T00:00:00Z".to_string()),
+        }),
+        ..Default::default()
+    };
+    store.lock().unwrap().insert(name.to_string(), expired);
+
+    let candidates = windowless_auto_start_candidates(&config, &store);
+    assert_eq!(
+        candidates,
+        vec![name.to_string()],
+        "a profile with an expired (past) resets_at must be re-armed"
+    );
+
+    // Future window: resets_at ahead of now → live window → excluded.
+    let live = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 0.0,
+            resets_at: Some("2999-01-01T00:00:00Z".to_string()),
+        }),
+        ..Default::default()
+    };
+    store.lock().unwrap().insert(name.to_string(), live);
+
+    let candidates = windowless_auto_start_candidates(&config, &store);
+    assert!(
+        candidates.is_empty(),
+        "a profile with a future resets_at still has a live window — no re-arm"
+    );
+}
