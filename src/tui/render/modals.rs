@@ -8,7 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use super::super::app::{
-    App, ConfirmAction, ConfirmState, DivergenceChoice, DivergenceForm, InputState, Modal, Tab,
+    ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceChoice, DivergenceForm,
+    InputState, Modal, Tab,
 };
 use super::super::theme;
 
@@ -18,6 +19,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::Divergence(form) => draw_divergence(frame, area, form),
         Modal::CaptureName(form) => draw_capture_name(frame, area, form.input.value.as_str()),
         Modal::Help => draw_help(frame, area, app),
+        Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
     }
 }
 
@@ -353,4 +355,102 @@ fn head_cols(input: &InputState) -> usize {
     input.value[..input.cursor.min(input.value.len())]
         .chars()
         .count()
+}
+
+fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) {
+    // Right-rail column width: 1 char for the hotkey letter (or 1 space if none).
+    const HOTKEY_W: u16 = 1;
+    // Gutter: "❯ " (2) or "  " (2).
+    const GUTTER: u16 = 2;
+
+    // Render rows with right-aligned hotkeys — can't use draw_modal because that
+    // wraps all lines in one Paragraph, preventing per-row background tinting.
+    // Custom draw: measure → size → clear → border → per-row widgets.
+    let max_label_w = state
+        .items
+        .iter()
+        .map(|item| item.label.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    // Total content width: gutter + label + 3 spaces gap + hotkey
+    let content_w = GUTTER + max_label_w + 3 + HOTKEY_W;
+    let title = "actions";
+    let w = (content_w + 6)
+        .max(title.chars().count() as u16 + 4)
+        .min(area.width.saturating_sub(4));
+    // items rows + 1 blank separator + 1 hint row + 4 chrome (border + padding)
+    let h = (state.items.len() as u16 + 2 + 4).min(area.height.saturating_sub(4));
+
+    let rect = centered(area, w, h);
+    frame.render_widget(Clear, rect);
+    let block = modal_block(title);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    // Render rows with right-aligned hotkeys manually.
+    let inner_w = inner.width;
+    for (i, item) in state.items.iter().enumerate() {
+        let focused = i == state.cursor;
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let row_area = Rect {
+            y,
+            height: 1,
+            ..inner
+        };
+
+        let label_style = if focused {
+            Style::default().fg(theme::TEXT).bold()
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+        let row_bg = if focused {
+            Style::default().bg(theme::BG_HOVER)
+        } else {
+            theme::base()
+        };
+        let glyph = if focused {
+            Span::styled("❯ ", Style::default().fg(theme::ACCENT).bold())
+        } else {
+            Span::styled("  ", Style::default())
+        };
+        let label_len = item.label.chars().count() as u16;
+        // Padding between label and right-aligned hotkey.
+        let pad = inner_w
+            .saturating_sub(GUTTER)
+            .saturating_sub(label_len)
+            .saturating_sub(HOTKEY_W);
+        let padding = Span::styled(" ".repeat(pad as usize), Style::default());
+        let hotkey_span = match item.hotkey {
+            Some(c) => Span::styled(c.to_string(), Style::default().fg(theme::TEXT_DIM)),
+            None => Span::styled(" ".to_string(), Style::default().fg(theme::TEXT_DIM)),
+        };
+        let line = Line::from(vec![
+            glyph,
+            Span::styled(item.label.to_string(), label_style),
+            padding,
+            hotkey_span,
+        ])
+        .style(row_bg);
+        frame.render_widget(Paragraph::new(line).style(row_bg), row_area);
+    }
+
+    // Footer hint — placed one row after the last item (blank separator + hint).
+    let hint_y = inner.y + state.items.len() as u16 + 1;
+    if hint_y < inner.y + inner.height {
+        let hint_area = Rect {
+            y: hint_y,
+            height: 1,
+            ..inner
+        };
+        let hint = modal_footer_hints(&[("↑↓", "move"), ("⏎", "pick"), ("⎋", "close")]);
+        frame.render_widget(
+            Paragraph::new(hint)
+                .style(theme::base())
+                .alignment(Alignment::Center),
+            hint_area,
+        );
+    }
 }

@@ -33,19 +33,27 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ("⏎", "switch"),
             ("n", "new"),
             ("r", "refresh"),
+            ("a", "actions"),
             ("?", "help"),
         ],
-        Tab::Usage => &[("↑↓", "account"), ("r", "refresh account"), ("?", "help")],
+        Tab::Usage => &[
+            ("↑↓", "account"),
+            ("r", "refresh account"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
         Tab::Config => match app.config_focus {
             ConfigFocus::Profiles => &[
                 ("↑↓", "account"),
                 ("⏎", "configure"),
                 ("n", "new"),
+                ("a", "actions"),
                 ("?", "help"),
             ],
             ConfigFocus::Actions => &[
                 ("↑↓", "row"),
                 ("⏎", "edit / toggle"),
+                ("a", "actions"),
                 ("⎋", "back"),
                 ("?", "help"),
             ],
@@ -56,6 +64,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("↑↓", "move"),
                 ("⇧↑↓", "reorder"),
                 ("⏎", "open"),
+                ("a", "actions"),
                 ("?", "help"),
             ],
             FallbackHint::ChainAdd => &[("↑↓", "move"), ("⏎", "add"), ("?", "help")],
@@ -63,16 +72,25 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("↑↓", "row"),
                 ("+ -", "adjust"),
                 ("⏎", "edit"),
+                ("a", "actions"),
                 ("⎋", "back"),
                 ("?", "help"),
             ],
             FallbackHint::DetailThresholdEdit => &[("0-9", "type"), ("⏎", "save"), ("⎋", "cancel")],
-            FallbackHint::DetailWrapOff => {
-                &[("↑↓", "row"), ("⏎", "toggle"), ("⎋", "back"), ("?", "help")]
-            }
-            FallbackHint::DetailRemove => {
-                &[("↑↓", "row"), ("⏎", "remove"), ("⎋", "back"), ("?", "help")]
-            }
+            FallbackHint::DetailWrapOff => &[
+                ("↑↓", "row"),
+                ("⏎", "toggle"),
+                ("a", "actions"),
+                ("⎋", "back"),
+                ("?", "help"),
+            ],
+            FallbackHint::DetailRemove => &[
+                ("↑↓", "row"),
+                ("⏎", "remove"),
+                ("a", "actions"),
+                ("⎋", "back"),
+                ("?", "help"),
+            ],
             FallbackHint::DetailRemoveArmed => {
                 &[("⏎", "confirm remove"), ("⎋", "cancel"), ("?", "help")]
             }

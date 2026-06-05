@@ -238,6 +238,101 @@ impl DivergenceForm {
     }
 }
 
+/// One entry in the action menu.
+#[derive(Debug, Clone)]
+pub(crate) struct ActionItem {
+    pub(crate) label: &'static str,
+    /// Single-letter shortcut auto-assigned by the hotkey algorithm; `None` when
+    /// all candidate characters were already taken.
+    pub(crate) hotkey: Option<char>,
+    /// The logical action to fire when this item is selected.
+    pub(crate) action: ActionMenuAction,
+}
+
+/// Logical actions the action menu can dispatch. Each variant maps 1-to-1 to
+/// an existing key handler so there is no duplicated dispatch logic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActionMenuAction {
+    // Global
+    NewAccount,
+    RefreshUsage,
+    RotateTokens,
+    // Overview
+    SwitchToSelected,
+    // Config
+    ConfigureSelected,
+    // Fallback chain
+    OpenChainMember,
+    ReorderUp,
+    ReorderDown,
+    // Fallback detail
+    EditThreshold,
+    ToggleWrapOff,
+    RemoveMember,
+    // Config detail actions (proxied through run_config_row)
+    ToggleAutoStart,
+    DeleteProfile,
+    CreateProfile,
+    EditField,
+}
+
+/// State for the action-menu modal.
+#[derive(Debug, Clone)]
+pub(crate) struct ActionMenuState {
+    pub(crate) items: Vec<ActionItem>,
+    pub(crate) cursor: usize,
+}
+
+impl ActionMenuState {
+    /// Build and assign hotkeys in source order per the SKILL.md algorithm.
+    /// Reserved keys: `a` `x` `?` `q`.
+    pub(crate) fn new(actions: Vec<ActionMenuAction>) -> Self {
+        const RESERVED: &[char] = &['a', 'x', '?', 'q'];
+        let mut claimed: Vec<char> = Vec::new();
+        let items = actions
+            .into_iter()
+            .map(|action| {
+                let label = action.label();
+                let hotkey = label
+                    .chars()
+                    .filter(|c| c.is_alphabetic())
+                    .map(|c| c.to_lowercase().next().unwrap_or(c))
+                    .take(3)
+                    .find(|c| !RESERVED.contains(c) && !claimed.contains(c))
+                    .inspect(|c| claimed.push(*c));
+                ActionItem {
+                    label,
+                    hotkey,
+                    action,
+                }
+            })
+            .collect();
+        Self { items, cursor: 0 }
+    }
+}
+
+impl ActionMenuAction {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::NewAccount => "new account",
+            Self::RefreshUsage => "refresh usage",
+            Self::RotateTokens => "rotate tokens",
+            Self::SwitchToSelected => "switch to selected",
+            Self::ConfigureSelected => "configure",
+            Self::OpenChainMember => "open",
+            Self::ReorderUp => "reorder up",
+            Self::ReorderDown => "reorder down",
+            Self::EditThreshold => "edit threshold",
+            Self::ToggleWrapOff => "toggle wrap-off",
+            Self::RemoveMember => "remove member",
+            Self::ToggleAutoStart => "toggle auto-start",
+            Self::DeleteProfile => "delete profile",
+            Self::CreateProfile => "create profile",
+            Self::EditField => "edit field",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Modal {
     Confirm(ConfirmState),
@@ -245,6 +340,8 @@ pub(crate) enum Modal {
     Divergence(DivergenceForm),
     CaptureName(CaptureNameForm),
     Help,
+    /// Context-sensitive action menu opened by `a`.
+    ActionMenu(ActionMenuState),
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -920,6 +1017,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('?') => {
             app.disarm_quit();
             app.modals.push(Modal::Help);
+            return;
+        }
+        KeyCode::Char('a') => {
+            app.disarm_quit();
+            let state = build_action_menu(app);
+            if !state.items.is_empty() {
+                app.modals.push(Modal::ActionMenu(state));
+            }
             return;
         }
         KeyCode::Char('r') => {
@@ -1675,6 +1780,220 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::Confirm(_) => handle_confirm_key(app, key),
         Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
+        Modal::ActionMenu(_) => handle_action_menu_key(app, key),
+    }
+}
+
+/// Build the action menu for the current screen/focus context.
+fn build_action_menu(app: &App) -> ActionMenuState {
+    use ActionMenuAction::*;
+    let mut actions: Vec<ActionMenuAction> = Vec::new();
+
+    match app.tab {
+        Tab::Overview => {
+            // Switch is only useful when the cursor is on a non-active profile.
+            let can_switch = app
+                .current_main_item()
+                .map(|item| match item {
+                    MainItemKind::Profile(idx) => {
+                        let cfg = app.config();
+                        cfg.profiles
+                            .get(idx)
+                            .map(|p| !cfg.is_active(&p.name))
+                            .unwrap_or(false)
+                    }
+                })
+                .unwrap_or(false);
+            if can_switch {
+                actions.push(SwitchToSelected);
+            }
+            actions.push(NewAccount);
+            actions.push(RefreshUsage);
+            actions.push(RotateTokens);
+        }
+        Tab::Usage => {
+            actions.push(RefreshUsage);
+        }
+        Tab::Config => match app.config_focus {
+            ConfigFocus::Profiles => {
+                if app.profile_cursor < app.profile_count() {
+                    actions.push(ConfigureSelected);
+                }
+                actions.push(NewAccount);
+            }
+            ConfigFocus::Actions => {
+                // In the actions detail pane, actions depend on the focused row.
+                let rows = config_rows(app);
+                if let Some(&row) = rows.get(app.config_action_cursor) {
+                    match row {
+                        ConfigRow::AutoStart => actions.push(ActionMenuAction::ToggleAutoStart),
+                        ConfigRow::Delete => actions.push(ActionMenuAction::DeleteProfile),
+                        ConfigRow::Create => actions.push(ActionMenuAction::CreateProfile),
+                        _ => actions.push(ActionMenuAction::EditField),
+                    }
+                }
+            }
+        },
+        Tab::Fallback => match app.fallback_focus {
+            FallbackFocus::Chain => {
+                let items = chain_items(app);
+                if let Some(item) = items.get(app.chain_cursor) {
+                    match item {
+                        ChainItemKind::Member(_) => {
+                            actions.push(OpenChainMember);
+                            actions.push(ReorderUp);
+                            actions.push(ReorderDown);
+                        }
+                        ChainItemKind::Add => {}
+                    }
+                }
+            }
+            FallbackFocus::Detail => {
+                if let Some(&row) = FALLBACK_ROWS.get(app.fallback_detail_cursor) {
+                    match row {
+                        FallbackRow::Threshold => actions.push(EditThreshold),
+                        FallbackRow::WrapOff => actions.push(ToggleWrapOff),
+                        FallbackRow::Remove => actions.push(RemoveMember),
+                    }
+                }
+            }
+        },
+    }
+
+    ActionMenuState::new(actions)
+}
+
+fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
+    // Try a direct hotkey press first.
+    if let KeyCode::Char(ch) = key.code {
+        let ch_lower = ch.to_lowercase().next().unwrap_or(ch);
+        let Some(Modal::ActionMenu(state)) = app.modals.last() else {
+            return;
+        };
+        let action = state
+            .items
+            .iter()
+            .find(|item| item.hotkey == Some(ch_lower))
+            .map(|item| item.action.clone());
+        if let Some(action) = action {
+            app.modals.pop();
+            dispatch_action_menu_action(app, action);
+            return;
+        }
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Up => {
+            let Some(Modal::ActionMenu(state)) = app.modals.last_mut() else {
+                return;
+            };
+            let len = state.items.len();
+            if len > 0 {
+                state.cursor = (state.cursor + len - 1) % len;
+            }
+        }
+        KeyCode::Down => {
+            let Some(Modal::ActionMenu(state)) = app.modals.last_mut() else {
+                return;
+            };
+            let len = state.items.len();
+            if len > 0 {
+                state.cursor = (state.cursor + 1) % len;
+            }
+        }
+        KeyCode::Enter => {
+            let Some(Modal::ActionMenu(state)) = app.modals.last() else {
+                return;
+            };
+            let action = state
+                .items
+                .get(state.cursor)
+                .map(|item| item.action.clone());
+            app.modals.pop();
+            if let Some(action) = action {
+                dispatch_action_menu_action(app, action);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Fire the handler that the direct hotkey would have called.
+fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
+    match action {
+        ActionMenuAction::NewAccount => start_new_account(app),
+        ActionMenuAction::RefreshUsage => {
+            if app.tab == Tab::Usage {
+                let selected = {
+                    let cfg = app.config();
+                    cfg.profiles
+                        .get(app.profile_cursor)
+                        .map(|p| (p.name.clone(), p.is_oauth()))
+                };
+                match selected {
+                    Some((name, true)) => {
+                        app.manual_refresh_one(&name);
+                        app.toast(ToastKind::Info, format!("refreshing '{name}'…"));
+                    }
+                    Some((name, false)) => {
+                        app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
+                    }
+                    None => {}
+                }
+            } else {
+                app.manual_refresh();
+                app.toast(ToastKind::Info, "refreshing usage…");
+            }
+        }
+        ActionMenuAction::RotateTokens => {
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: ROTATE_ALL_MSG.to_string(),
+                detail: Some(ROTATE_ALL_DETAIL.to_string()),
+                choice: false,
+                on_confirm: ConfirmAction::RotateAll,
+            }));
+        }
+        ActionMenuAction::SwitchToSelected => activate_main_item(app),
+        ActionMenuAction::ConfigureSelected => enter_config_detail(app),
+        ActionMenuAction::OpenChainMember => enter_fallback_detail(app),
+        ActionMenuAction::ReorderUp => reorder_chain_member(app, -1),
+        ActionMenuAction::ReorderDown => reorder_chain_member(app, 1),
+        ActionMenuAction::EditThreshold => {
+            run_fallback_row(app, FallbackRow::Threshold);
+        }
+        ActionMenuAction::ToggleWrapOff => {
+            run_fallback_row(app, FallbackRow::WrapOff);
+        }
+        ActionMenuAction::RemoveMember => {
+            run_fallback_row(app, FallbackRow::Remove);
+        }
+        ActionMenuAction::ToggleAutoStart => {
+            let rows = config_rows(app);
+            if let Some(&row) = rows.get(app.config_action_cursor) {
+                run_config_row(app, row);
+            }
+        }
+        ActionMenuAction::DeleteProfile => {
+            let rows = config_rows(app);
+            if let Some(&row) = rows.get(app.config_action_cursor) {
+                run_config_row(app, row);
+            }
+        }
+        ActionMenuAction::CreateProfile => {
+            let rows = config_rows(app);
+            if let Some(&row) = rows.get(app.config_action_cursor) {
+                run_config_row(app, row);
+            }
+        }
+        ActionMenuAction::EditField => {
+            let rows = config_rows(app);
+            if let Some(&row) = rows.get(app.config_action_cursor) {
+                run_config_row(app, row);
+            }
+        }
     }
 }
 
