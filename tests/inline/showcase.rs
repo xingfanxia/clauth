@@ -2,7 +2,7 @@
 //! under `#[cfg(test)]` (included via `#[path]` into `crate::tui`), so none of
 //! this ships in the `clauth` binary and it lives outside `src/`.
 //!
-//! Launch it in a real terminal (it takes over the screen; press q / ⎋ to quit):
+//! Launch it in a real terminal (it takes over the screen; press q twice to quit):
 //!
 //! ```text
 //! cargo test showcase -- --ignored --nocapture
@@ -466,19 +466,19 @@ fn demo_data_drives_all_actions() {
     // ── Tab navigation ──
     use app::Tab;
     assert_eq!(app.tab, Tab::Overview);
-    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Usage);
-    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Config);
-    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Fallback);
-    press(&mut app, KeyCode::Tab);
-    assert_eq!(app.tab, Tab::Overview, "Tab wraps back to Overview");
-    press(&mut app, KeyCode::BackTab);
-    assert_eq!(app.tab, Tab::Fallback, "BackTab wraps to the last tab");
-    press(&mut app, KeyCode::BackTab);
-    press(&mut app, KeyCode::BackTab);
-    press(&mut app, KeyCode::BackTab);
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.tab, Tab::Overview, "→ wraps back to Overview");
+    press(&mut app, KeyCode::Left);
+    assert_eq!(app.tab, Tab::Fallback, "← wraps to the last tab");
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left);
     assert_eq!(app.tab, Tab::Overview);
 
     // ── Switch ──
@@ -517,8 +517,8 @@ fn demo_data_drives_all_actions() {
     );
 
     // ── Edit ── (cursor at "work"/1 after switch; one ↓ → "side-project"/2)
-    press(&mut app, KeyCode::Tab); // Overview → Usage
-    press(&mut app, KeyCode::Tab); // Usage → Config
+    press(&mut app, KeyCode::Right); // Overview → Usage
+    press(&mut app, KeyCode::Right); // Usage → Config
     assert_eq!(app.tab, Tab::Config);
     assert_eq!(app.profile_cursor, 1, "cursor carried over from the switch");
     press(&mut app, KeyCode::Down); // 1 → 2 (side-project)
@@ -557,7 +557,7 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Esc);
 
     // ── Reorder ──
-    press(&mut app, KeyCode::Tab); // Config → Fallback
+    press(&mut app, KeyCode::Right); // Config → Fallback
     assert_eq!(app.tab, Tab::Fallback);
     {
         let cfg = app.config();
@@ -606,7 +606,7 @@ fn demo_data_drives_all_actions() {
 
     // ── Delete ──
     let before = app.profile_count();
-    press(&mut app, KeyCode::BackTab); // Fallback → Config
+    press(&mut app, KeyCode::Left); // Fallback → Config
     assert_eq!(app.tab, Tab::Config);
     for _ in 0..4 {
         press(&mut app, KeyCode::Down); // 0 → 4 ("research")
@@ -631,7 +631,10 @@ fn demo_data_drives_all_actions() {
     );
 
     press(&mut app, KeyCode::Char('q'));
-    assert!(app.quit, "q quits");
+    assert!(app.armed_quit, "first q arms the quit");
+    assert!(!app.quit, "first q does not quit yet");
+    press(&mut app, KeyCode::Char('q'));
+    assert!(app.quit, "second q confirms quit");
 
     // Nothing escaped the sandbox — home_dir still points there.
     assert_eq!(home_dir().expect("home dir"), sandbox.path());

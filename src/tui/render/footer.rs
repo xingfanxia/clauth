@@ -6,12 +6,23 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, ConfigFocus, FallbackHint, Tab, fallback_hint};
+use super::super::app::{App, ConfigFocus, FallbackFocus, FallbackHint, Tab, fallback_hint};
 use super::super::theme;
 
-const TAB_NAV: (&str, &str) = ("⇥ ←→", "tabs");
+const TAB_NAV: (&str, &str) = ("←→", "tabs");
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // `q` label: "back" in a sub-focus, "press q again" when armed, "quit" at top level.
+    let has_sub_focus = (app.tab == Tab::Config && app.config_focus == ConfigFocus::Actions)
+        || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail);
+    let q_label: &str = if has_sub_focus {
+        "back"
+    } else if app.armed_quit {
+        "press q again"
+    } else {
+        "quit"
+    };
+
     let tail: &[(&str, &str)] = match app.tab {
         Tab::Overview => &[
             ("↑↓", "move"),
@@ -20,21 +31,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ("n", "new"),
             ("r", "refresh"),
             ("?", "help"),
-            ("q", "quit"),
         ],
-        Tab::Usage => &[
-            ("↑↓", "account"),
-            ("r", "refresh account"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
+        Tab::Usage => &[("↑↓", "account"), ("r", "refresh account"), ("?", "help")],
         Tab::Config => match app.config_focus {
             ConfigFocus::Profiles => &[
                 ("↑↓", "account"),
                 ("⏎", "configure"),
                 ("n", "new"),
                 ("?", "help"),
-                ("q", "quit"),
             ],
             ConfigFocus::Actions => &[
                 ("↑↓", "row"),
@@ -44,15 +48,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ],
         },
         Tab::Fallback => match fallback_hint(app) {
-            FallbackHint::Empty => &[("?", "help"), ("q", "quit")],
+            FallbackHint::Empty => &[("?", "help")],
             FallbackHint::ChainMember => &[
                 ("↑↓", "move"),
                 ("⇧↑↓", "reorder"),
                 ("⏎", "open"),
                 ("?", "help"),
-                ("q", "quit"),
             ],
-            FallbackHint::ChainAdd => &[("↑↓", "move"), ("⏎", "add"), ("?", "help"), ("q", "quit")],
+            FallbackHint::ChainAdd => &[("↑↓", "move"), ("⏎", "add"), ("?", "help")],
             FallbackHint::DetailThreshold => &[
                 ("↑↓", "row"),
                 ("+ -", "adjust"),
@@ -76,14 +79,33 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         },
     };
 
-    let hints: Vec<(&str, &str)> = std::iter::once(TAB_NAV)
+    // Suppress the trailing `q` hint for screens where `q` doesn't apply
+    // (threshold edit owns the keyboard entirely).
+    let show_q = !matches!(
+        fallback_hint(app),
+        FallbackHint::DetailThresholdEdit
+            | FallbackHint::DetailRemoveArmed
+            | FallbackHint::DetailAdd
+            | FallbackHint::DetailThreshold
+            | FallbackHint::DetailWrapOff
+            | FallbackHint::DetailRemove
+    ) || app.tab != Tab::Fallback;
+
+    // Suppress `q` on Config Actions too (⎋ backs out).
+    let show_q = show_q && app.config_focus != ConfigFocus::Actions;
+
+    let mut hints: Vec<(&str, &str)> = std::iter::once(TAB_NAV)
         .chain(tail.iter().copied())
         .collect();
+
+    if show_q {
+        hints.push(("q", q_label));
+    }
 
     let mut spans: Vec<Span<'_>> = Vec::new();
     for (i, (key, label)) in hints.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("  ", theme::faint()));
+            spans.push(Span::styled("   ", theme::faint()));
         }
         spans.push(Span::styled(
             *key,

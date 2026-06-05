@@ -399,6 +399,8 @@ pub(crate) struct App {
     /// Tick counter; advances the activity spinner frame each `on_tick`.
     pub(crate) tick_count: u64,
     pub(crate) quit: bool,
+    /// First `q` at top level arms this; second `q` confirms quit.
+    pub(crate) armed_quit: bool,
     /// Last time the 1Hz divergence poll ran.
     pub(crate) last_divergence_check: Instant,
     /// Set once reconcile reports back; gates bootstrap spawn.
@@ -499,6 +501,7 @@ impl App {
             started_at: Instant::now(),
             tick_count: 0,
             quit: false,
+            armed_quit: false,
             last_divergence_check: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
@@ -832,19 +835,23 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
 
     // Global keys (no modal owns input).
     match key.code {
-        KeyCode::Tab | KeyCode::Right => {
+        KeyCode::Right => {
+            app.armed_quit = false;
             switch_tab(app, app.tab.next());
             return;
         }
-        KeyCode::BackTab | KeyCode::Left => {
+        KeyCode::Left => {
+            app.armed_quit = false;
             switch_tab(app, app.tab.prev());
             return;
         }
         KeyCode::Char('?') => {
+            app.armed_quit = false;
             app.modals.push(Modal::Help);
             return;
         }
         KeyCode::Char('r') => {
+            app.armed_quit = false;
             // Usage `r` refreshes only the current account.
             if app.tab == Tab::Usage {
                 let selected = {
@@ -871,6 +878,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('t') => {
+            app.armed_quit = false;
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: ROTATE_ALL_MSG.to_string(),
                 detail: Some(ROTATE_ALL_DETAIL.to_string()),
@@ -880,26 +888,47 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Char('n') => {
+            app.armed_quit = false;
             start_new_account(app);
             return;
         }
-        // Esc backs out of sub-focus, otherwise quits.
+        // Esc backs out of sub-focus; no-op at the top level.
         KeyCode::Esc => {
+            app.armed_quit = false;
             if app.tab == Tab::Config && app.config_focus == ConfigFocus::Actions {
                 app.config_focus = ConfigFocus::Profiles;
                 app.config_draft = None;
             } else if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
                 leave_fallback_detail(app);
-            } else {
+            }
+            // At top level, Esc is a no-op — ctrl+c or `q q` to quit.
+            return;
+        }
+        // First `q` at the top level arms the 2-step quit; second confirms.
+        // When there is a sub-focus to back out of, `q` ascends instead.
+        KeyCode::Char('q') => {
+            let has_sub_focus = (app.tab == Tab::Config
+                && app.config_focus == ConfigFocus::Actions)
+                || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail);
+            if has_sub_focus {
+                app.armed_quit = false;
+                if app.tab == Tab::Config {
+                    app.config_focus = ConfigFocus::Profiles;
+                    app.config_draft = None;
+                } else {
+                    leave_fallback_detail(app);
+                }
+            } else if app.armed_quit {
                 app.quit = true;
+            } else {
+                app.armed_quit = true;
             }
             return;
         }
-        KeyCode::Char('q') => {
-            app.quit = true;
-            return;
+        _ => {
+            // Any unhandled key disarms the 2-step quit.
+            app.armed_quit = false;
         }
-        _ => {}
     }
 
     match app.tab {
@@ -945,8 +974,8 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
-        KeyCode::Up | KeyCode::Char('k') => step_profile_cursor(app, -1, count),
-        KeyCode::Down | KeyCode::Char('j') => step_profile_cursor(app, 1, count),
+        KeyCode::Up => step_profile_cursor(app, -1, count),
+        KeyCode::Down => step_profile_cursor(app, 1, count),
         KeyCode::Enter => activate_main_item(app),
         _ => {}
     }
@@ -956,8 +985,8 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
 fn handle_usage_key(app: &mut App, key: KeyEvent) {
     let count = app.profile_count();
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => step_profile_cursor(app, -1, count),
-        KeyCode::Down | KeyCode::Char('j') => step_profile_cursor(app, 1, count),
+        KeyCode::Up => step_profile_cursor(app, -1, count),
+        KeyCode::Down => step_profile_cursor(app, 1, count),
         _ => {}
     }
 }
@@ -1246,14 +1275,14 @@ fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
             reorder_chain_member(app, 1)
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             app.chain_cursor = if app.chain_cursor == 0 {
                 last
             } else {
                 app.chain_cursor - 1
             };
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down => {
             app.chain_cursor = if app.chain_cursor >= last {
                 0
             } else {
@@ -1293,7 +1322,7 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
     app.fallback_detail_cursor = app.fallback_detail_cursor.min(last);
     let on_threshold = FALLBACK_ROWS[app.fallback_detail_cursor] == FallbackRow::Threshold;
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             app.fallback_armed_remove = false;
             app.fallback_detail_cursor = if app.fallback_detail_cursor == 0 {
                 last
@@ -1301,7 +1330,7 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
                 app.fallback_detail_cursor - 1
             };
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down => {
             app.fallback_armed_remove = false;
             app.fallback_detail_cursor = if app.fallback_detail_cursor >= last {
                 0
@@ -1328,14 +1357,14 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
     let last = candidates.len() - 1;
     app.fallback_detail_cursor = app.fallback_detail_cursor.min(last);
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             app.fallback_detail_cursor = if app.fallback_detail_cursor == 0 {
                 last
             } else {
                 app.fallback_detail_cursor - 1
             };
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down => {
             app.fallback_detail_cursor = if app.fallback_detail_cursor >= last {
                 0
             } else {
@@ -1570,8 +1599,8 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
 
     match app.config_focus {
         ConfigFocus::Profiles => match key.code {
-            KeyCode::Up | KeyCode::Char('k') => step_profile_cursor(app, -1, sel_len),
-            KeyCode::Down | KeyCode::Char('j') => step_profile_cursor(app, 1, sel_len),
+            KeyCode::Up => step_profile_cursor(app, -1, sel_len),
+            KeyCode::Down => step_profile_cursor(app, 1, sel_len),
             KeyCode::Enter => enter_config_detail(app),
             _ => {}
         },
@@ -1585,7 +1614,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
             let last = rows.len() - 1;
             app.config_action_cursor = app.config_action_cursor.min(last);
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     disarm_delete(app);
                     app.config_action_cursor = if app.config_action_cursor == 0 {
                         last
@@ -1593,7 +1622,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                         app.config_action_cursor - 1
                     };
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     disarm_delete(app);
                     app.config_action_cursor = if app.config_action_cursor >= last {
                         0
@@ -2056,7 +2085,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
         return;
     };
     match key.code {
-        KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => {
+        KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
             state.choice = !state.choice;
         }
         KeyCode::Char('y') => state.choice = true,
@@ -2129,14 +2158,14 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
     let options = DivergenceForm::options();
     let last = options.len() - 1;
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             state.cursor = if state.cursor == 0 {
                 last
             } else {
                 state.cursor - 1
             };
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down => {
             state.cursor = if state.cursor >= last {
                 0
             } else {

@@ -209,19 +209,19 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Tab::Overview => vec![(
             "accounts",
             &[
-                ("\u{2191}\u{2193} / j k", "move cursor"),
+                ("\u{2191}\u{2193}", "move cursor"),
                 ("\u{23ce}", "switch to selected account (confirm)"),
-                ("Shift+\u{2191}\u{2193}", "reorder account up / down"),
+                ("\u{21e7}\u{2191}\u{2193}", "reorder account up / down"),
             ][..],
         )],
         Tab::Usage => vec![(
             "usage",
-            &[("\u{2191}\u{2193} / j k", "pick account to inspect")][..],
+            &[("\u{2191}\u{2193}", "pick account to inspect")][..],
         )],
         Tab::Config => vec![(
             "config",
             &[
-                ("\u{2191}\u{2193} / j k", "pick account / + new, then a row"),
+                ("\u{2191}\u{2193}", "pick account / + new, then a row"),
                 ("\u{23ce}", "open settings · edit field · flip toggle"),
                 ("\u{23ce} on a field", "edit inline; \u{23ce} again saves"),
                 ("delete", "\u{23ce} once to arm, again to confirm"),
@@ -231,8 +231,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Tab::Fallback => vec![(
             "fallback chain",
             &[
-                ("\u{2191}\u{2193} / j k", "move cursor / detail row"),
-                ("Shift+\u{2191}\u{2193}", "reorder member up / down"),
+                ("\u{2191}\u{2193}", "move cursor / detail row"),
+                ("\u{21e7}\u{2191}\u{2193}", "reorder member up / down"),
                 (
                     "\u{23ce}",
                     "open \u{00b7} edit threshold \u{00b7} remove \u{00b7} add",
@@ -244,18 +244,15 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )],
     };
 
-    let nav: &[(&str, &str)] = &[
-        ("\u{21e5} / \u{21e4}", "next / previous tab"),
-        ("\u{2190} \u{2192}", "previous / next tab"),
-    ];
+    let nav: &[(&str, &str)] = &[("\u{2190} \u{2192}", "previous / next tab")];
 
     let global: &[(&str, &str)] = &[
         ("n", "new account"),
         ("r", "refresh usage now"),
         ("t", "rotate all tokens"),
         ("?", "toggle this help"),
-        ("q", "quit"),
-        ("Ctrl+C", "quit from anywhere"),
+        ("q", "back / quit"),
+        ("\u{2303}c", "quit from anywhere"),
     ];
 
     let mut lines: Vec<Line<'_>> = Vec::new();
