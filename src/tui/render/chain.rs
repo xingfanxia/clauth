@@ -164,15 +164,18 @@ fn member_detail(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    lines.push(Line::from(vec![
+    let mut position_spans = vec![
         Span::styled(kv_key("position"), theme::faint()),
-        Span::styled(format!("#{} of {chain_len}", index + 1), theme::muted()),
-        if active {
-            Span::styled("   ● active", theme::orange())
-        } else {
-            Span::raw("")
-        },
-    ]));
+        Span::styled(format!("#{} of {chain_len}", index + 1), theme::dim()),
+    ];
+    if active {
+        position_spans.extend([
+            Span::raw("   "),
+            Span::styled("●", theme::success()),
+            Span::styled(" active", theme::dim()),
+        ]);
+    }
+    lines.push(Line::from(position_spans));
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled("5h utilization", theme::label())));
@@ -335,10 +338,7 @@ fn value_caret(input: &InputState) -> Vec<Span<'static>> {
 fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {
     let candidates = chain_candidates(app);
     let mut lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled(
-            "add an account to the rotation",
-            theme::muted(),
-        )),
+        Line::from(Span::styled("add an account to the rotation", theme::dim())),
         Line::from(""),
         Line::from(Span::styled(
             "clauth auto-switches off a member when its 5h window crosses the",
@@ -385,7 +385,7 @@ fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {
 
 fn empty_detail() -> Vec<Line<'static>> {
     vec![
-        Line::from(Span::styled("chain is empty", theme::muted())),
+        Line::from(Span::styled("chain is empty", theme::dim())),
         Line::from(""),
         Line::from(Span::styled(
             "create an account first, then add it to the chain.",
@@ -408,7 +408,7 @@ fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static
         _ => theme::TEXT_FAINT,
     };
 
-    let mut spans = vec![Span::raw("[")];
+    let mut spans = vec![];
     for i in 0..GAUGE_W {
         if Some(i) == tick {
             spans.push(Span::styled("┊", theme::body()));
@@ -418,7 +418,6 @@ fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static
             spans.push(Span::styled("░", theme::line_strong()));
         }
     }
-    spans.push(Span::raw("]"));
     spans
 }
 

@@ -80,7 +80,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
 
     let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(
         state.message.clone(),
-        theme::muted(),
+        theme::body(),
     ))];
     if let Some(detail) = &state.detail {
         lines.push(Line::from(Span::styled(detail.clone(), theme::dim())));
@@ -120,7 +120,7 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
 
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(vec![
-            Span::styled("~/.claude/.credentials.json", theme::muted()),
+            Span::styled("~/.claude/.credentials.json", theme::body()),
             Span::styled(" no longer points to ", theme::dim()),
             Span::styled(
                 format!("'{}'", form.active),
@@ -146,7 +146,7 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
         let label_style = if selected {
             theme::accent()
         } else {
-            theme::muted()
+            theme::dim()
         };
         lines.push(Line::from(vec![arrow, Span::styled(label, label_style)]));
         lines.push(Line::from(vec![

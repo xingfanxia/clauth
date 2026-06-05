@@ -17,7 +17,6 @@ pub(crate) const LINE_STRONG: Color = Color::Rgb(69, 71, 90);
 
 // ── Text ──────────────────────────────────────────────────────────────────────
 pub(crate) const TEXT: Color = Color::Rgb(205, 214, 244);
-pub(crate) const TEXT_MUTED: Color = Color::Rgb(186, 194, 222);
 pub(crate) const TEXT_DIM: Color = Color::Rgb(166, 173, 200);
 pub(crate) const TEXT_FAINT: Color = Color::Rgb(127, 132, 156);
 
@@ -55,10 +54,6 @@ pub(crate) fn dim() -> Style {
 
 pub(crate) fn faint() -> Style {
     Style::default().fg(TEXT_FAINT)
-}
-
-pub(crate) fn muted() -> Style {
-    Style::default().fg(TEXT_MUTED)
 }
 
 /// Eyebrow label — bold + dim per cloudy-ui's CLI mapping.

@@ -4,7 +4,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -51,7 +51,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(profile) = profile else {
         let hint = Paragraph::new(Line::from(Span::styled(
             "no accounts yet — press n to create one",
-            theme::muted(),
+            theme::dim(),
         )))
         .style(theme::base());
         frame.render_widget(hint, inner);
@@ -123,7 +123,7 @@ fn build_usage_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> V
 struct Stat {
     label: String,
     pct: f64,
-    color: Color,
+    color: Style,
     trailing: String,
 }
 
@@ -141,8 +141,8 @@ impl Stat {
         let empty = bar_width - filled;
 
         let mut bar_line = vec![
-            Span::styled("█".repeat(filled), Style::default().fg(self.color)),
-            Span::styled("░".repeat(empty), Style::default().fg(theme::LINE_STRONG)),
+            Span::styled("█".repeat(filled), self.color),
+            Span::styled("░".repeat(empty), theme::line_strong()),
         ];
         // Right-align trailing text to the same far column as %.
         if !self.trailing.is_empty() {
@@ -159,10 +159,7 @@ impl Stat {
             Line::from(vec![
                 Span::styled(self.label.clone(), theme::label()),
                 Span::raw(" ".repeat(header_pad)),
-                Span::styled(
-                    pct_str,
-                    Style::default().fg(self.color).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(pct_str, self.color.add_modifier(Modifier::BOLD)),
             ]),
             Line::from(bar_line),
         ]
@@ -189,7 +186,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             stats.push(Stat {
                 label: (*label).to_string(),
                 pct,
-                color: theme::util_color(pct),
+                color: Style::default().fg(theme::util_color(pct)),
                 trailing,
             });
         }
@@ -207,7 +204,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
         stats.push(Stat {
             label: "extra".to_string(),
             pct,
-            color: theme::util_color(pct),
+            color: Style::default().fg(theme::util_color(pct)),
             trailing: format!("  {sym}{used:.2} / {sym}{limit:.2}"),
         });
     }
@@ -239,10 +236,11 @@ fn header_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
                 "api".into()
             }
         });
-    let mut plan_spans = vec![key_span("plan"), Span::styled(plan, theme::muted())];
+    let mut plan_spans = vec![key_span("plan"), Span::styled(plan, theme::body())];
     if header.is_active {
         plan_spans.push(Span::raw("   "));
-        plan_spans.push(Span::styled("● active", theme::orange()));
+        plan_spans.push(Span::styled("●", theme::success()));
+        plan_spans.push(Span::styled(" active", theme::dim()));
     }
 
     let mut lines = vec![Line::from(plan_spans)];
@@ -272,19 +270,31 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
     let mut spans = vec![key];
     match profile.fetch_status {
         Some(FetchStatus::Failed) => {
-            spans.push(Span::styled("✖ fetch failed", theme::danger()));
+            spans.extend([
+                Span::styled("[ ", theme::dim()),
+                Span::styled("failed", theme::danger().add_modifier(Modifier::BOLD)),
+                Span::styled(" ]", theme::dim()),
+            ]);
             if let Some(c) = countdown {
                 spans.push(Span::styled(format!("  · retry in {c}"), theme::faint()));
             }
         }
         Some(FetchStatus::Cached) => {
-            spans.push(Span::styled("⚠ cached", theme::warning()));
+            spans.extend([
+                Span::styled("[ ", theme::dim()),
+                Span::styled("cached", theme::warning().add_modifier(Modifier::BOLD)),
+                Span::styled(" ]", theme::dim()),
+            ]);
             if let Some(c) = countdown {
                 spans.push(Span::styled(format!("  · refresh in {c}"), theme::faint()));
             }
         }
         Some(FetchStatus::RateLimited) => {
-            spans.push(Span::styled("⚠ rate limited", theme::danger()));
+            spans.extend([
+                Span::styled("[ ", theme::dim()),
+                Span::styled("rate limited", theme::danger().add_modifier(Modifier::BOLD)),
+                Span::styled(" ]", theme::dim()),
+            ]);
             if let Some(c) = countdown {
                 spans.push(Span::styled(format!("  · retry in {c}"), theme::faint()));
             }

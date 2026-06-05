@@ -19,8 +19,8 @@ use ratatui::crossterm::terminal::{
 
 use crate::profile::AppConfig;
 
-/// 100ms tick: responsive for animation without burning CPU on idle redraws.
-const TICK: Duration = Duration::from_millis(100);
+/// 80ms tick: spinner advances every frame per contract; responsive without burning CPU.
+const TICK: Duration = Duration::from_millis(80);
 
 /// Launch the full-screen TUI. Returns on quit (q/⎋/Ctrl+C) or fatal error.
 pub(crate) fn run(config: AppConfig) -> Result<()> {

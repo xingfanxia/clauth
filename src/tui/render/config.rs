@@ -278,7 +278,7 @@ fn value_spans(input: &InputState, editing: bool) -> Vec<Span<'static>> {
         if input.value.is_empty() {
             return vec![Span::styled("—", theme::faint())];
         }
-        return vec![Span::styled(input.value.clone(), theme::muted())];
+        return vec![Span::styled(input.value.clone(), theme::body())];
     }
     let (head, tail) = input.value.split_at(input.cursor.min(input.value.len()));
     let caret_style = Style::default()

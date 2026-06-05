@@ -64,19 +64,15 @@ pub(super) fn account_type_label(profile: &Profile) -> String {
         .to_string()
 }
 
-pub(super) fn account_type_style(profile: &Profile) -> Style {
-    if !profile.is_oauth() {
-        theme::accent()
-    } else {
-        Style::default().fg(theme::ACCENT_2)
-    }
+pub(super) fn account_type_style(_profile: &Profile) -> Style {
+    theme::dim()
 }
 
 pub(super) fn bar_string_with_cells(pct: f64, cells: usize) -> String {
     let pct = pct.clamp(0.0, 100.0);
     let filled = ((pct / 100.0) * cells as f64).round() as usize;
     let filled = filled.min(cells);
-    format!("[{}{}]", "█".repeat(filled), "░".repeat(cells - filled))
+    format!("{}{}", "█".repeat(filled), "░".repeat(cells - filled))
 }
 
 pub(super) fn format_reset(window: &UsageWindow) -> Option<String> {

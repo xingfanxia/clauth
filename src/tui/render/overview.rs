@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 
@@ -344,7 +344,7 @@ const GAUGE_W: usize = 12;
 fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'static>> {
     if cfg.state.fallback_chain.is_empty() {
         return vec![
-            Line::from(Span::styled("no fallback chain yet", theme::muted())),
+            Line::from(Span::styled("no fallback chain yet", theme::dim())),
             Line::from(vec![
                 Span::styled("fallback", theme::accent()),
                 Span::styled(
@@ -376,7 +376,10 @@ fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'s
     if lines.len() < cap {
         let caption = if cfg.state.wrap_off {
             vec![
-                Span::styled("     ✖", theme::danger()),
+                Span::raw("  "),
+                Span::styled("[ ", theme::dim()),
+                Span::styled("stop", theme::danger().add_modifier(Modifier::BOLD)),
+                Span::styled(" ]", theme::dim()),
                 Span::styled(" switches off when all spent", theme::faint()),
             ]
         } else {
