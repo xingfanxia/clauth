@@ -116,6 +116,19 @@ impl InputState {
             .unwrap_or(self.value.len());
     }
 
+    /// Delete the word (run of non-spaces, plus any trailing spaces) left of the
+    /// caret — the `ctrl+w` editor verb.
+    pub(crate) fn delete_word(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let head = &self.value[..self.cursor];
+        let trimmed = head.trim_end_matches(' ');
+        let start = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
+        self.value.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
     pub(crate) fn home(&mut self) {
         self.cursor = 0;
     }
@@ -137,12 +150,11 @@ impl InputState {
 // ── Modals ────────────────────────────────────────────────────────────────────
 
 /// One interactive line in the Fallback tab's detail pane for a chain member.
-/// `Threshold` is a stepper (±5 on `+`/`-`); `Remove` arms then confirms.
+/// `Threshold` is a stepper (±5 on `+`/`-`); `Remove` arms then confirms. The
+/// chain-global wrap-off setting lives on the program-wide Config tab, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FallbackRow {
     Threshold,
-    /// Chain-global wrap-off toggle (per-chain, not per-member); ⏎ flips it.
-    WrapOff,
     Remove,
 }
 
@@ -1458,12 +1470,8 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
     items
 }
 
-/// Detail rows for a chain member: threshold stepper, wrap-off toggle, remove.
-pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
-    FallbackRow::Threshold,
-    FallbackRow::WrapOff,
-    FallbackRow::Remove,
-];
+/// Detail rows for a chain member: threshold stepper, remove.
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 2] = [FallbackRow::Threshold, FallbackRow::Remove];
 
 /// Rows on the program-wide Config tab, in display order.
 pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 2] =
@@ -1536,7 +1544,6 @@ pub(crate) enum FallbackHint {
     ChainAdd,
     DetailThreshold,
     DetailThresholdEdit,
-    DetailWrapOff,
     DetailRemove,
     DetailRemoveArmed,
     DetailAdd,
@@ -1562,7 +1569,6 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
             let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
             match FALLBACK_ROWS[cursor] {
                 FallbackRow::Threshold => FallbackHint::DetailThreshold,
-                FallbackRow::WrapOff => FallbackHint::DetailWrapOff,
                 FallbackRow::Remove if app.fallback_armed_remove => FallbackHint::DetailRemoveArmed,
                 FallbackRow::Remove => FallbackHint::DetailRemove,
             }
@@ -1763,7 +1769,6 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
                 app.fallback_threshold_draft = Some(InputState::new(&format!("{current:.0}")));
             }
         }
-        FallbackRow::WrapOff => toggle_wrap_off(app),
         FallbackRow::Remove => {
             if app.fallback_armed_remove {
                 remove_chain_member(app);
@@ -1787,23 +1792,26 @@ fn handle_fallback_threshold_edit_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Parse and persist the typed threshold (0..=100); toast on bad input.
+/// Parse and persist the typed threshold (0..=100). Invalid input keeps the
+/// draft open so the inline Invalid-input treatment (DANGER value + `└ max is …`
+/// tooltip, rendered by the detail card) stays on screen until corrected — no toast.
 fn commit_threshold_edit(app: &mut App) {
     let Some(raw) = app.fallback_threshold_draft.as_ref().map(|i| i.trimmed()) else {
         return;
     };
-    let value = match raw.parse::<f64>() {
-        Ok(v) if (0.0..=100.0).contains(&v) => v,
-        _ => {
-            app.toast(
-                ToastKind::Danger,
-                "threshold must be a number between 0 and 100",
-            );
-            return;
-        }
+    let Some(value) = parse_threshold(raw) else {
+        return;
     };
     write_threshold(app, value);
     app.fallback_threshold_draft = None;
+}
+
+/// A typed threshold is valid only as a number in `0..=100`. Shared by the
+/// commit path and the detail card's inline Invalid-input check.
+pub(crate) fn parse_threshold(raw: &str) -> Option<f64> {
+    raw.parse::<f64>()
+        .ok()
+        .filter(|v| (0.0..=100.0).contains(v))
 }
 
 /// Effective threshold for the selected member, or `None` on `+ add`.
@@ -1969,7 +1977,6 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 if let Some(&row) = FALLBACK_ROWS.get(app.fallback_detail_cursor) {
                     match row {
                         FallbackRow::Threshold => actions.push(EditThreshold),
-                        FallbackRow::WrapOff => actions.push(ToggleWrapOff),
                         FallbackRow::Remove => actions.push(RemoveMember),
                     }
                 }
@@ -2090,7 +2097,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             run_fallback_row(app, FallbackRow::Threshold);
         }
         ActionMenuAction::ToggleWrapOff => {
-            run_fallback_row(app, FallbackRow::WrapOff);
+            toggle_wrap_off(app);
         }
         ActionMenuAction::RemoveMember => {
             run_fallback_row(app, FallbackRow::Remove);
@@ -2820,6 +2827,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
 
 fn apply_input_edit(input: &mut InputState, key: KeyEvent) {
     match key.code {
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => input.delete_word(),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => input.insert(c),
         KeyCode::Backspace => input.backspace(),
         KeyCode::Delete => input.delete(),
@@ -3158,6 +3166,36 @@ mod tests {
 
     fn bootstrap_busy(flag: &Arc<AtomicBool>, activity: &ActivityStore) -> bool {
         flag.load(Ordering::SeqCst) || any_busy(activity)
+    }
+
+    use super::{InputState, parse_threshold};
+
+    #[test]
+    fn delete_word_removes_run_left_of_caret() {
+        let mut input = InputState::new("foo bar");
+        input.delete_word();
+        assert_eq!(input.value, "foo ");
+        input.delete_word();
+        assert_eq!(input.value, "");
+    }
+
+    #[test]
+    fn delete_word_respects_caret_position() {
+        let mut input = InputState::new("foo bar");
+        input.home(); // caret at start — nothing to the left
+        input.delete_word();
+        assert_eq!(input.value, "foo bar");
+    }
+
+    #[test]
+    fn parse_threshold_accepts_in_range_only() {
+        assert_eq!(parse_threshold("0"), Some(0.0));
+        assert_eq!(parse_threshold("100"), Some(100.0));
+        assert_eq!(parse_threshold("73.5"), Some(73.5));
+        assert!(parse_threshold("150").is_none());
+        assert!(parse_threshold("-1").is_none());
+        assert!(parse_threshold("abc").is_none());
+        assert!(parse_threshold("").is_none());
     }
 
     #[test]

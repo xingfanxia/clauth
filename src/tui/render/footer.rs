@@ -54,7 +54,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("↑↓", "row"),
                 ("⏎", "edit / toggle"),
                 ("a", "actions"),
-                ("⎋", "back"),
+                ("esc", "back"),
                 ("?", "help"),
             ],
         },
@@ -68,7 +68,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             FallbackHint::Empty => &[("?", "help")],
             FallbackHint::ChainMember => &[
                 ("↑↓", "move"),
-                ("⇧↑↓", "reorder"),
+                ("⇧↑↓", "reorder = priority"),
                 ("⏎", "open"),
                 ("a", "actions"),
                 ("?", "help"),
@@ -76,32 +76,28 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             FallbackHint::ChainAdd => &[("↑↓", "move"), ("⏎", "add"), ("?", "help")],
             FallbackHint::DetailThreshold => &[
                 ("↑↓", "row"),
-                ("+ -", "adjust"),
-                ("⏎", "edit"),
+                ("+", "raise"),
+                ("-", "lower"),
+                ("⏎", "type"),
                 ("a", "actions"),
-                ("⎋", "back"),
+                ("esc", "back"),
                 ("?", "help"),
             ],
-            FallbackHint::DetailThresholdEdit => &[("0-9", "type"), ("⏎", "save"), ("⎋", "cancel")],
-            FallbackHint::DetailWrapOff => &[
-                ("↑↓", "row"),
-                ("⏎", "toggle"),
-                ("a", "actions"),
-                ("⎋", "back"),
-                ("?", "help"),
-            ],
+            FallbackHint::DetailThresholdEdit => {
+                &[("⏎", "save"), ("←→", "caret"), ("esc", "cancel")]
+            }
             FallbackHint::DetailRemove => &[
                 ("↑↓", "row"),
                 ("⏎", "remove"),
                 ("a", "actions"),
-                ("⎋", "back"),
+                ("esc", "back"),
                 ("?", "help"),
             ],
             FallbackHint::DetailRemoveArmed => {
-                &[("⏎", "confirm remove"), ("⎋", "cancel"), ("?", "help")]
+                &[("⏎", "confirm remove"), ("esc", "cancel"), ("?", "help")]
             }
             FallbackHint::DetailAdd => {
-                &[("↑↓", "pick"), ("⏎", "add"), ("⎋", "back"), ("?", "help")]
+                &[("↑↓", "pick"), ("⏎", "add"), ("esc", "back"), ("?", "help")]
             }
         },
     };
@@ -114,7 +110,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             | FallbackHint::DetailRemoveArmed
             | FallbackHint::DetailAdd
             | FallbackHint::DetailThreshold
-            | FallbackHint::DetailWrapOff
             | FallbackHint::DetailRemove
     ) || app.tab != Tab::Fallback;
 

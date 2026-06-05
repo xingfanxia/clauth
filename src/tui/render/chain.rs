@@ -1,10 +1,12 @@
 //! Fallback tab — master-detail, mirroring the Config layout. Left: the ordered
-//! chain (plus a trailing `+ add` row), cursor = `❯`, color = active. Right: the
-//! selected member's rotation card (position, a 5h gauge with a threshold tick,
-//! headroom, next hop) plus inline rows — a threshold stepper and a remove row —
-//! or, on `+ add`, a candidate picker. Editing happens in place: ⏎ on the left
-//! drops focus into the right pane, `+` / `-` step the threshold (or ⏎ on it to
-//! type a value), ⏎ on remove arms then confirms. No popups.
+//! chain (plus a trailing `+ add` row), cursor = `❯`, active member carries an
+//! `[ active ]` pill. Right: the selected member's rotation card — labeled
+//! key:value rows (`priority`, `5h usage` gauge with a threshold tick, `rotate at`
+//! threshold stepper, `remove`) — or, on `+ add`, a candidate picker. Order =
+//! priority (reorder with ⇧↑↓). The chain-global wrap-off setting lives on the
+//! Config tab, not here. Editing happens in place: ⏎ on the left drops focus into
+//! the right pane, `+` / `-` step the threshold (or ⏎ on it to type a value),
+//! ⏎ on remove arms then confirms. No popups.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -14,12 +16,11 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ChainItemKind, FALLBACK_ROWS, FallbackFocus, FallbackRow, InputState, chain_candidates,
-    chain_items,
+    chain_items, parse_threshold,
 };
 use super::super::theme;
-use super::format::health_color;
 use super::panes::{
-    SELECTOR_WIDTH, draw_selector_list, highlight_row, name_color, section_box, select_line,
+    SELECTOR_WIDTH, active_pill, draw_selector_list, highlight_row, section_box, select_line,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 use crate::profile::AppConfig;
@@ -28,6 +29,10 @@ use crate::profile::AppConfig;
 const GAUGE_W: usize = 22;
 /// Key column width, matching the Setup tab.
 const KEY_W: usize = 11;
+/// Fixed lines `member_detail` pushes before the FALLBACK_ROWS loop: priority,
+/// blank, `5h usage` eyebrow, gauge, figure, blank. The native-cursor math and
+/// the `rotate at` row index both key off this.
+const ROWS_BEFORE: usize = 6;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
@@ -59,7 +64,6 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                             .get(*i)
                             .map(|n| n.to_string())
                             .unwrap_or_default();
-                        let style = name_color(cfg.is_active(&name));
                         // Cursor + ordinal share the leading span so the name
                         // lands at spans[1] — the item `highlight_row` bolds.
                         // Caret only in the focused pane.
@@ -68,7 +72,13 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                         } else {
                             Span::styled(format!("  {:>2}  ", i + 1), theme::faint())
                         };
-                        Line::from(vec![rail, Span::styled(name, style)])
+                        // Active = `[ active ]` pill, never orange (DNA rule).
+                        let mut spans = vec![rail, Span::styled(name.clone(), theme::body())];
+                        if cfg.is_active(&name) {
+                            spans.push(Span::raw("  "));
+                            spans.extend(active_pill());
+                        }
+                        Line::from(spans)
                     }
                     ChainItemKind::Add => {
                         let arrow = if selected && focused {
@@ -131,25 +141,24 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 
-    // Position the native terminal cursor when the threshold field is being typed.
-    // The threshold row is always FALLBACK_ROWS[0]; member_detail pushes exactly
-    // 8 fixed lines before the loop (position, blank, label, gauge, figure,
-    // blank, next-hop-or-only-member, blank).
+    // Position the native terminal cursor when the threshold field is being typed,
+    // matching the post-draw cursor path the other edit screens use. The `rotate at`
+    // row is FALLBACK_ROWS[0]; member_detail pushes exactly `ROWS_BEFORE` fixed
+    // lines before the loop (priority, blank, eyebrow, gauge, figure, blank).
     if detail_focused
         && let Some(ChainItemKind::Member(_)) = selected
         && let Some(draft) = &app.fallback_threshold_draft
     {
-        // x = "❯ " (2) + "threshold" (9) + pad (KEY_W - 9 + 1 = 3) + cols before caret
-        // = 2 + KEY_W + 1 + head_cols  =  14 + head_cols
+        // x = "❯ " (2) + "rotate at" key + pad (always KEY_W + 1 cols) + cols before caret.
         let prefix_cols = 2 + KEY_W + 1 + head_cols(draft);
         let cx = inner.x.saturating_add(prefix_cols as u16);
-        let cy = inner.y.saturating_add(8);
+        let cy = inner.y.saturating_add(ROWS_BEFORE as u16);
         frame.set_cursor_position((cx, cy));
     }
 }
 
-/// Position + active state, 5h gauge with threshold tick, headroom, next hop,
-/// inline threshold stepper/editor and remove rows. Caret only when focused.
+/// Priority + active pill, 5h gauge with threshold tick, headroom figure, and the
+/// inline `rotate at` threshold stepper/editor + `remove` rows. Caret only when focused.
 #[allow(clippy::too_many_arguments)]
 fn member_detail(
     cfg: &AppConfig,
@@ -164,7 +173,7 @@ fn member_detail(
 ) -> Vec<Line<'static>> {
     let Some(profile) = cfg.find(name) else {
         return vec![Line::from(Span::styled(
-            "account no longer exists — remove it from the chain",
+            "account no longer exists · remove it from the chain",
             theme::danger(),
         ))];
     };
@@ -180,28 +189,28 @@ fn member_detail(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    let mut position_spans = vec![
-        Span::styled(kv_key("position"), theme::faint()),
-        Span::styled(format!("#{} of {chain_len}", index + 1), theme::dim()),
+    // `priority` — position in the chain (order = priority). Active = pill, not orange.
+    let mut priority_spans = vec![
+        Span::styled(kv_key("priority"), theme::dim()),
+        Span::styled(format!("#{} of {chain_len}", index + 1), theme::body()),
     ];
     if active {
-        position_spans.extend([
-            Span::raw("   "),
-            Span::styled("●", theme::success()),
-            Span::styled(" active", theme::dim()),
-        ]);
+        priority_spans.push(Span::raw("   "));
+        priority_spans.extend(active_pill());
     }
-    lines.push(Line::from(position_spans));
+    lines.push(Line::from(priority_spans));
     lines.push(Line::from(""));
 
-    lines.push(Line::from(Span::styled("5h utilization", theme::label())));
+    // `5h usage` eyebrow — UPPERCASE-tracked, TEXT_DIM, no bold (DNA: eyebrows
+    // carry on color + tracking, never weight).
+    lines.push(Line::from(Span::styled(" 5H USAGE ", theme::dim())));
     lines.push(Line::from(gauge_with_tick(pct, Some(threshold))));
     let (figure, figure_style) = match pct {
         Some(v) => {
             let headroom = (threshold - v).max(0.0);
             (
                 format!("{v:.0}% used · {headroom:.0}% until rotate"),
-                Style::default().fg(health_color(v, threshold)),
+                Style::default().fg(theme::util_color(v)),
             )
         }
         None => ("no usage data yet".to_string(), theme::faint()),
@@ -209,32 +218,6 @@ fn member_detail(
     lines.push(Line::from(Span::styled(figure, figure_style)));
     lines.push(Line::from(""));
 
-    if chain_len > 1 {
-        let next = (index + 1) % chain_len;
-        let next_name = cfg
-            .state
-            .fallback_chain
-            .get(next)
-            .map(|n| n.to_string())
-            .unwrap_or_default();
-        let arrow = if next == 0 {
-            Span::styled("↺ wraps to ", theme::orange())
-        } else {
-            Span::styled("→ next ", theme::accent())
-        };
-        lines.push(Line::from(vec![
-            arrow,
-            Span::styled(next_name, theme::dim()),
-        ]));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "only member — rotation has nowhere to go",
-            theme::faint(),
-        )));
-    }
-    lines.push(Line::from(""));
-
-    let wrap_off = cfg.state.wrap_off;
     for (i, row) in FALLBACK_ROWS.iter().enumerate() {
         let selected = focused && i == cursor;
         let row_editing = if *row == FallbackRow::Threshold {
@@ -242,34 +225,36 @@ fn member_detail(
         } else {
             None
         };
-        let line = detail_row(
-            *row,
-            selected,
-            threshold,
-            armed_remove,
-            wrap_off,
-            row_editing,
-        );
+        let line = detail_row(*row, selected, threshold, armed_remove, row_editing);
         lines.push(if selected {
             highlight_row(line, width)
         } else {
             line
         });
-        if selected && row_editing.is_none() {
-            let tip = match row {
-                FallbackRow::Threshold => Some("rotate to next account when 5h usage reaches this"),
-                FallbackRow::WrapOff => Some("what to do once every member is over its threshold"),
-                FallbackRow::Remove => None,
-            };
-            if let Some(tip) = tip {
-                lines.push(Line::from(vec![
-                    Span::styled("  └ ", theme::faint()),
-                    Span::styled(tip, theme::faint()),
-                ]));
+        // `rotate at` always carries its tooltip as an always-visible sub-line;
+        // an out-of-range typed value swaps it for the Invalid-input reason.
+        if *row == FallbackRow::Threshold {
+            match row_editing {
+                Some(input) if parse_threshold(input.trimmed()).is_none() => {
+                    lines.push(tooltip("max is 100", theme::danger()));
+                }
+                _ => lines.push(tooltip(
+                    "switch to the next account once 5h usage reaches this",
+                    theme::faint(),
+                )),
             }
         }
     }
     lines
+}
+
+/// A `  └ text` sub-line in the given style — help (`faint`) or Invalid-input
+/// reason (`danger`); the `└ ` chrome stays `LINE`.
+fn tooltip(text: &str, text_style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  └ ", Style::default().fg(theme::line_color())),
+        Span::styled(text.to_string(), text_style),
+    ])
 }
 
 fn detail_row(
@@ -277,7 +262,6 @@ fn detail_row(
     selected: bool,
     threshold: f64,
     armed_remove: bool,
-    wrap_off: bool,
     editing: Option<&InputState>,
 ) -> Line<'static> {
     let arrow = if selected {
@@ -286,30 +270,20 @@ fn detail_row(
         Span::raw("  ")
     };
     match row {
-        FallbackRow::WrapOff => {
-            let pad = KEY_W.saturating_sub("when spent".len()).max(1);
-            // Spell out the action so "off" is never shown as a bare value.
-            let (value, style) = if wrap_off {
-                ("switch off all accounts", theme::orange())
-            } else {
-                ("stay on last account", theme::accent())
-            };
-            Line::from(vec![
-                arrow,
-                Span::styled(format!("when spent{}", " ".repeat(pad)), theme::body()),
-                Span::styled(value.to_string(), style),
-            ])
-        }
         FallbackRow::Threshold => {
-            let pad = KEY_W.saturating_sub("threshold".len()).max(1);
-            let mut spans = vec![
-                arrow,
-                Span::styled(format!("threshold{}", " ".repeat(pad)), theme::body()),
-            ];
+            let mut spans = vec![arrow, Span::styled(kv_key("rotate at"), theme::dim())];
             match editing {
                 Some(input) => {
-                    spans.extend(value_caret(input));
-                    spans.push(Span::styled("%", theme::faint()));
+                    // Invalid typed value renders in DANGER (the gutter `└ max is 100`
+                    // tooltip carries the reason); valid keeps body styling.
+                    let invalid = parse_threshold(input.trimmed()).is_none();
+                    spans.extend(value_caret(input, invalid));
+                    let pct_style = if invalid {
+                        theme::danger()
+                    } else {
+                        theme::faint()
+                    };
+                    spans.push(Span::styled("%", pct_style));
                 }
                 None => {
                     spans.push(Span::styled(format!("{threshold:.0}%"), theme::accent()));
@@ -325,21 +299,28 @@ fn detail_row(
         }
         FallbackRow::Remove => {
             let label = if armed_remove {
-                "remove from chain — ⏎ again to confirm".to_string()
+                "↵ again to remove".to_string()
             } else {
                 "remove from chain".to_string()
             };
-            Line::from(vec![arrow, Span::styled(label, theme::danger())])
+            Line::from(vec![
+                arrow,
+                Span::styled(kv_key("remove"), theme::dim()),
+                Span::styled(label, theme::danger()),
+            ])
         }
     }
 }
 
-fn value_caret(input: &InputState) -> Vec<Span<'static>> {
+fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
     // The terminal cursor (set via frame.set_cursor_position) owns the caret
-    // glyph — render the whole buffer with uniform body styling.
-    let body = Style::default()
-        .fg(theme::text_color())
-        .bg(theme::bg_sunken());
+    // glyph — render the whole buffer with uniform styling.
+    let fg = if invalid {
+        theme::danger_color()
+    } else {
+        theme::text_color()
+    };
+    let body = Style::default().fg(fg).bg(theme::bg_sunken());
     vec![Span::styled(input.value.clone(), body)]
 }
 
@@ -409,7 +390,10 @@ fn empty_detail() -> Vec<Line<'static>> {
     ]
 }
 
-/// `GAUGE_W`-cell bar with fill colored by headroom and a `┊` tick at the threshold.
+/// `GAUGE_W`-cell usage bar: fill colored by the usage thresholds (via
+/// `util_color`), with a `│` tick at the rotate threshold. Once the fill reaches
+/// or passes the tick column, the tick is drawn `│` in `DANGER` over the fill so
+/// the "over limit" marker is never occluded.
 fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static>> {
     let value = pct.unwrap_or(0.0).clamp(0.0, 100.0);
     let fill = ((value / 100.0) * GAUGE_W as f64).round() as usize;
@@ -417,16 +401,22 @@ fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static
     let tick = threshold.map(|t| {
         (((t.clamp(0.0, 100.0) / 100.0) * GAUGE_W as f64).round() as usize).min(GAUGE_W - 1)
     });
-    let fill_color = match (pct, threshold) {
-        (Some(v), Some(t)) => health_color(v, t),
-        (Some(_), None) => theme::accent_color(),
-        _ => theme::text_faint_color(),
+    let fill_color = match pct {
+        Some(v) => theme::util_color(v),
+        None => theme::text_faint_color(),
     };
 
     let mut spans = vec![];
     for i in 0..GAUGE_W {
         if Some(i) == tick {
-            spans.push(Span::styled("┊", theme::body()));
+            // Below the fill the tick is a neutral marker; once fill reaches it,
+            // promote to DANGER so it stays visible over the blocks.
+            let style = if i < fill {
+                theme::danger()
+            } else {
+                theme::dim()
+            };
+            spans.push(Span::styled("│", style));
         } else if i < fill {
             spans.push(Span::styled("█", Style::default().fg(fill_color)));
         } else {

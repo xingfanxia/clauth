@@ -266,14 +266,14 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "fallback chain",
             &[
                 ("\u{2191}\u{2193}", "move cursor / detail row"),
-                ("\u{21e7}\u{2191}\u{2193}", "reorder member up / down"),
+                ("\u{21e7}\u{2191}\u{2193}", "reorder member = priority"),
                 (
                     "\u{23ce}",
                     "open \u{00b7} edit threshold \u{00b7} remove \u{00b7} add",
                 ),
                 ("+ / -", "step threshold by 5"),
-                ("0-9 \u{23ce}", "type a threshold, \u{23ce} saves"),
-                ("\u{238b}", "back / cancel edit"),
+                ("\u{23ce}", "type a threshold, \u{23ce} saves"),
+                ("esc", "back / cancel edit"),
             ][..],
         )],
     };

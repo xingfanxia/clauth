@@ -59,6 +59,21 @@ pub(super) fn name_color(active: bool) -> Style {
     }
 }
 
+/// `[ active ]` pill: label in `ACCENT + bold`, brackets in `TEXT_DIM`. The
+/// master-detail in-use marker — never orange (DNA rule: active ≠ accent_2).
+pub(super) fn active_pill() -> Vec<Span<'static>> {
+    vec![
+        Span::styled("[ ", theme::dim()),
+        Span::styled(
+            "active",
+            Style::default()
+                .fg(theme::accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ]", theme::dim()),
+    ]
+}
+
 pub(super) fn picker_row(
     selected: bool,
     focused: bool,

@@ -387,6 +387,15 @@ fn key_shift(code: KeyCode) -> KeyEvent {
     }
 }
 
+fn key_ctrl(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::CONTROL,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    }
+}
+
 fn press(app: &mut app::App, code: KeyCode) {
     app::handle_key(app, key(code));
 }
@@ -596,6 +605,30 @@ fn demo_data_drives_all_actions() {
     assert!(app.fallback_threshold_draft.is_some());
     press(&mut app, KeyCode::Backspace); // clear "85" (2 chars)
     press(&mut app, KeyCode::Backspace);
+
+    // Out-of-range value: commit is blocked and the draft stays open so the
+    // inline Invalid-input treatment (DANGER value + `└ max is 100`) shows.
+    type_str(&mut app, "150");
+    press(&mut app, KeyCode::Enter); // commit attempt — rejected
+    assert!(
+        app.fallback_threshold_draft.is_some(),
+        "an out-of-range threshold keeps the editor open (inline invalid, no toast)"
+    );
+    assert_eq!(
+        threshold_of(&app, "personal"),
+        Some(85.0),
+        "the rejected value never persists"
+    );
+
+    // ctrl+w wipes the bad input as one word, then a valid value commits.
+    app::handle_key(&mut app, key_ctrl(KeyCode::Char('w')));
+    assert_eq!(
+        app.fallback_threshold_draft
+            .as_ref()
+            .map(|d| d.value.as_str()),
+        Some(""),
+        "ctrl+w clears the whole typed run"
+    );
     type_str(&mut app, "50");
     press(&mut app, KeyCode::Enter); // commit
     assert!(app.fallback_threshold_draft.is_none());
