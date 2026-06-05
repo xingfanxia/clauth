@@ -42,11 +42,11 @@ use crate::profile::{
 };
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityKind, ActivityStore, LastFetchedAt, LastRotatedWindow, NextRefreshPerProfile, OpResult,
-    OpResultReceiver, OpResultSender, PendingAutoStart, PendingSwitch, PendingSwitchOff,
-    PendingWindowRotation, ProfileActivity, RefetchQueue, StartupReceiver, StartupSender,
-    StartupSignal, StatusStore, TokenEntry, TokenList, UsageStore, any_busy, clear_activity,
-    fetch_all_into, is_idle, mark_activity, spawn_refresher,
+    ActivityKind, ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
+    OpResultSender, PendingAutoStart, PendingSwitch, PendingSwitchOff, ProfileActivity,
+    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, TokenEntry,
+    TokenList, UsageStore, any_busy, clear_activity, fetch_all_into, is_idle, mark_activity,
+    spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -392,8 +392,6 @@ pub(crate) struct App {
     pub(crate) startup_sender: StartupSender,
     pub(crate) last_fetched: LastFetchedAt,
     pub(crate) pending_auto_start: PendingAutoStart,
-    pub(crate) pending_window_rotation: PendingWindowRotation,
-    pub(crate) last_rotated_window: LastRotatedWindow,
     /// Scheduler-posted auto-switch decisions. Drained inside `on_tick` and
     /// dispatched to the same switch worker pipeline as user-initiated
     /// switches.
@@ -479,8 +477,6 @@ struct WorkerHandles {
     next_refresh_per_profile: NextRefreshPerProfile,
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
-    pending_window_rotation: PendingWindowRotation,
-    last_rotated_window: LastRotatedWindow,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -497,8 +493,6 @@ impl WorkerHandles {
             next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
             activity: Arc::clone(&app.activity),
             last_fetched: Arc::clone(&app.last_fetched),
-            pending_window_rotation: Arc::clone(&app.pending_window_rotation),
-            last_rotated_window: Arc::clone(&app.last_rotated_window),
             pending_switch: Arc::clone(&app.pending_switch),
             pending_switch_off: Arc::clone(&app.pending_switch_off),
             refetch_queue: Arc::clone(&app.refetch_queue),
@@ -518,9 +512,6 @@ impl App {
         let (startup_sender, startup_results) = std::sync::mpsc::channel::<StartupSignal>();
         let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
         let pending_auto_start: PendingAutoStart = Arc::new(RankedMutex::new(HashSet::new()));
-        let pending_window_rotation: PendingWindowRotation =
-            Arc::new(RankedMutex::new(HashMap::new()));
-        let last_rotated_window: LastRotatedWindow = Arc::new(RankedMutex::new(HashMap::new()));
         let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_switch_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
@@ -543,8 +534,6 @@ impl App {
             startup_sender,
             last_fetched,
             pending_auto_start,
-            pending_window_rotation,
-            last_rotated_window,
             pending_switch,
             pending_switch_off,
             refetch_queue,
@@ -580,15 +569,15 @@ impl App {
     }
 
     /// Spawn the startup bootstrap onto a background thread so it never blocks
-    /// the first paint. The worker re-links the active profile's credentials,
-    /// rotates every profile's OAuth pair (`refresh_all`), and runs the initial
-    /// usage fetch. All of this is HTTP-heavy and used to run on the UI thread
-    /// before the event loop ever painted. Arming opted-in 5h windows is left
-    /// to the recurring windowless scan in `on_tick`.
+    /// the first paint. The worker re-links the active profile's credentials and
+    /// runs the initial usage fetch. No proactive token rotation: the fetch
+    /// path's 401-recovery rotates any stale access token lazily, on the first
+    /// poll that needs it. Arming opted-in 5h windows is left to the recurring
+    /// windowless scan in `on_tick`.
     ///
-    /// Per-profile spinners light up from inside `refresh_all` / `fetch_all_into`
-    /// (they mark `Refreshing` / `Fetching`), and per-profile completion toasts
-    /// ride the existing `OpResult` drain. When the worker finishes it posts
+    /// Per-profile spinners light up from inside `fetch_all_into` (it marks
+    /// `Fetching`), and per-profile completion toasts ride the existing
+    /// `OpResult` drain. When the worker finishes it posts
     /// `StartupSignal::BootstrapDone`; the UI thread then rebuilds the token
     /// snapshot, spawns the scheduler, applies usage, and runs the one-shot
     /// startup auto-switch — all fast, lock-scoped, network-free work.
@@ -599,7 +588,6 @@ impl App {
         let last_fetched = Arc::clone(&self.last_fetched);
         let refetch_queue = Arc::clone(&self.refetch_queue);
         let activity = Arc::clone(&self.activity);
-        let op_sender = self.op_sender.clone();
         let startup_sender = self.startup_sender.clone();
         let bootstrap_active = Arc::clone(&self.bootstrap_active);
 
@@ -619,11 +607,6 @@ impl App {
                 if let Some(active) = active {
                     let _ = link_profile_credentials(&active);
                 }
-
-                // Refresh every profile's OAuth token pair — Claude Code does the
-                // same thing silently on launch. Rotates and persists the new pair
-                // so the initial usage fetch below uses fresh access tokens.
-                let _ = oauth::refresh_all(&config, false, &refetch_queue, &activity, &op_sender);
 
                 let snapshot =
                     collect_tokens(&config.lock().expect("config mutex poisoned").profiles);
@@ -696,8 +679,6 @@ impl App {
             h.next_refresh_per_profile,
             h.activity,
             h.last_fetched,
-            h.pending_window_rotation,
-            h.last_rotated_window,
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,
@@ -1183,49 +1164,15 @@ fn spawn_profile_worker<F>(
     });
 }
 
-/// Kick off a TUI switch to `name`. Marks the target `Switching` and spawns a
-/// worker that rotates the outgoing active and incoming target profiles via
-/// `rotate_one`, then emits `OpResult { kind: Switching, outcome }`. The drain in `on_tick`
-/// completes the FS half (`switch_profile` + bookkeeping) when the result
-/// lands. Refusal on a non-idle target is the caller's responsibility.
+/// Switch the active profile to `name`. Pure filesystem relink — no token
+/// rotation. The switch used to rotate the outgoing + incoming chains over HTTP
+/// on a worker thread; that is gone. Claude Code refreshes the chain itself on
+/// launch and the scheduler's 401-recovery rotates any stale access token
+/// lazily, so the switch is network-free and runs synchronously on the UI
+/// thread via [`finalize_switch`]. Refusal on a non-idle target is the caller's
+/// responsibility.
 fn perform_switch(app: &mut App, name: &str) {
-    mark_activity(&app.activity, name, ProfileActivity::Switching);
-    let config = Arc::clone(&app.config);
-    let activity = Arc::clone(&app.activity);
-    let sender = app.op_sender.clone();
-    let target = name.to_string();
-    // Read the outgoing active profile before mutating anything — worker only
-    // rotates active + target, not every profile.
-    let outgoing = app.config().state.active_profile.clone();
-    let work_activity = Arc::clone(&activity);
-    let work_sender = sender.clone();
-    spawn_profile_worker(
-        target.clone(),
-        ActivityKind::Switching,
-        "switch worker panicked",
-        activity,
-        sender,
-        move || {
-            // Rotate only the outgoing active and incoming target profiles.
-            // Every other profile's single-use refresh token is left untouched.
-            // `rotate_one` returns false (no HTTP) when there is no refresh
-            // token or a live session holds the chain — both are safe to skip.
-            if let Some(ref active) = outgoing
-                && active != &target
-            {
-                oauth::rotate_one(&config, active, Some(&work_activity), &work_sender);
-            }
-            oauth::rotate_one(&config, &target, Some(&work_activity), &work_sender);
-            // Re-stamp Switching so the spinner stays up through the FS leg
-            // the UI thread runs next (rotate_one leaves the slot as Idle).
-            mark_activity(&work_activity, &target, ProfileActivity::Switching);
-            let _ = work_sender.send(OpResult {
-                name: target.clone(),
-                kind: ActivityKind::Switching,
-                outcome: Ok(()),
-            });
-        },
-    );
+    finalize_switch(app, name);
 }
 
 /// True when `active`'s live `.credentials.json` has diverged from its stored
@@ -1249,10 +1196,10 @@ fn prompt_divergence(app: &mut App, active: String, verb: &str) {
         .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
 }
 
-/// FS half of the TUI switch: runs on the UI thread when an
-/// `OpResult { kind: Switching, .. }` drains. No HTTP — safe to keep
-/// inline. Clears the Switching marker, runs `switch_profile`, and on
-/// success refreshes the scheduler's token snapshot and bumps state mtime.
+/// The TUI switch: runs synchronously on the UI thread from
+/// [`perform_switch`]. No HTTP. Clears any Switching marker, runs
+/// `switch_profile`, and on success refreshes the scheduler's token snapshot
+/// and bumps state mtime.
 fn finalize_switch(app: &mut App, name: &str) {
     // Guard a diverged outgoing active before `switch_profile` runs blind.
     // `switch_profile` would no-op the snapshot of the diverged live creds and
@@ -2542,64 +2489,6 @@ pub(crate) fn on_tick(app: &mut App) {
         );
     }
 
-    // Drain 5h-window-expiry rotation requests posted by the scheduler. Each
-    // entry is handed to a worker that runs the rotation off the UI thread.
-    // The map value is the `resets_at` epoch pinned at detection time; using
-    // it (not a re-read from `usage_store`) prevents stamping the wrong window
-    // if the API returned a fresh `resets_at` between detection and drain.
-    //
-    // `LastRotatedWindow` and `RefetchQueue` are independent mutexes (not
-    // AppConfig), so the worker stamps them inline on success — no UI-side
-    // bookkeeping is required after the OpResult lands.
-    //
-    // Skip the entire drain while bootstrap is running for the same reason as
-    // `pending_auto_start` above — entries stay in the mutex for the next tick.
-    let pending_rotations: Vec<(String, i64)> = if app.bootstrap_active.load(Ordering::SeqCst) {
-        Vec::new()
-    } else {
-        app.pending_window_rotation
-            .lock()
-            .map(|mut g| g.drain().collect())
-            .unwrap_or_default()
-    };
-    for (name, epoch) in pending_rotations {
-        if !is_idle(&app.activity, &name) {
-            continue;
-        }
-        let config = Arc::clone(&app.config);
-        let refetch = Arc::clone(&app.refetch_queue);
-        let last_rotated = Arc::clone(&app.last_rotated_window);
-        let work_name = name.clone();
-        let work_activity = Arc::clone(&app.activity);
-        let work_sender = app.op_sender.clone();
-        spawn_profile_worker(
-            name,
-            ActivityKind::Refreshing,
-            "window-rotation worker panicked",
-            Arc::clone(&app.activity),
-            app.op_sender.clone(),
-            move || {
-                let rotated = oauth::rotate_one_for_window(
-                    &config,
-                    &work_name,
-                    &work_activity,
-                    &work_sender,
-                    &last_rotated,
-                    epoch,
-                );
-                if rotated {
-                    // The 5h window expired and the chain rotated. Re-fetch so
-                    // the fresh numbers land; the windowless scan in `on_tick`
-                    // re-arms opted-in profiles on a later tick (the single kick
-                    // path), so this worker never kicks.
-                    if let Ok(mut q) = refetch.lock() {
-                        q.insert(work_name);
-                    }
-                }
-            },
-        );
-    }
-
     // Drain scheduler-posted auto-switch decisions. Each entry was computed
     // by `scan_auto_switch` in the scheduler thread; the UI thread just
     // dispatches the standard switch worker pipeline so the refresh + relink
@@ -2645,30 +2534,21 @@ fn drain_op_results(app: &mut App) {
     // and the scheduler's forced-merge path respects Switching/Refreshing
     // exclusions, keeping the scheduler the single cadence authority.
     let mut auto_started_names: Vec<String> = Vec::new();
-    // Names whose `Switching` OpResult arrived — the FS half runs after the
-    // drain loop so the per-name `Refreshing` toasts/clears for the same
-    // tick have already been processed and the spinner stays Switching
-    // through the relink. (The worker re-stamps Switching after
-    // `refresh_all` returns; the drain's conditional clear below preserves
-    // that re-stamp against late `Refreshing` results.)
-    let mut switch_finalize: Vec<String> = Vec::new();
     while let Ok(OpResult {
         name,
         kind,
         outcome,
     }) = app.op_results.try_recv()
     {
-        // Only clear the slot when it still reflects this op's kind. The
-        // switch worker re-stamps Switching after `refresh_all` returns; an
-        // in-flight Refreshing result for the same name must not clobber
-        // that stamp, or the spinner would blink Idle between the refresh
-        // leg and the relink leg.
+        // Only clear the slot when it still reflects this op's kind, so an
+        // in-flight result for one op can't clobber a fresher mark for another.
         //
         // Invariant: `ActivityKind::Fetching` is NEVER sent through OpResult.
         // `fetch_with_rotation` and `run_fetch` manage the Fetching activity
         // slot directly (mark before spawn, clear in join loop) without going
-        // through the OpResult channel. Valid kinds in OpResult: Refreshing,
-        // AutoStarting, Switching.
+        // through the OpResult channel. The switch is now a synchronous
+        // UI-thread relink (no worker), so `Switching` never arrives here
+        // either. Valid kinds in OpResult: Refreshing, AutoStarting.
         if matches!(kind, ActivityKind::Fetching) {
             unreachable!(
                 "ActivityKind::Fetching must never be sent via OpResult; \
@@ -2694,9 +2574,6 @@ fn drain_op_results(app: &mut App) {
                     needs_token_snapshot_rebuild = true;
                     app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
                 }
-                ActivityKind::Switching => {
-                    switch_finalize.push(name.clone());
-                }
                 _ => {}
             },
             Err(e) => {
@@ -2715,13 +2592,6 @@ fn drain_op_results(app: &mut App) {
                 );
             }
         }
-    }
-    // Run the FS half for every successful Switching result. `finalize_switch`
-    // clears the Switching marker, runs `switch_profile`, and on success bumps
-    // mtime + refreshes the token snapshot. A no-op target is harmless —
-    // `switch_profile` returns early when already active.
-    for name in switch_finalize {
-        finalize_switch(app, &name);
     }
     if needs_token_snapshot_rebuild {
         app.refresh_tokens();

@@ -10,9 +10,9 @@ pub(crate) use fetch::{
 #[cfg(test)]
 pub(crate) use fetch::ExtraUsage;
 pub(crate) use scheduler::{
-    ActivityKind, ActivityStore, FetchStatus, LastFetchedAt, LastRotatedWindow,
-    NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingAutoStart,
-    PendingSwitch, PendingSwitchOff, PendingWindowRotation, ProfileActivity, RefetchQueue,
-    StartupReceiver, StartupSender, StartupSignal, StatusStore, TokenEntry, TokenList, UsageStore,
-    any_busy, clear_activity, fetch_all_into, is_idle, mark_activity, spawn_refresher,
+    ActivityKind, ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult,
+    OpResultReceiver, OpResultSender, PendingAutoStart, PendingSwitch, PendingSwitchOff,
+    ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
+    TokenEntry, TokenList, UsageStore, any_busy, clear_activity, fetch_all_into, is_idle,
+    mark_activity, spawn_refresher,
 };

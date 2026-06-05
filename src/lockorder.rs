@@ -83,8 +83,6 @@ pub(crate) mod rank {
         // Standalone leaves — never nested with another tracked lock.
         NextRefresh = 1100;
         RefetchQueue = 1200;
-        LastRotatedWindow = 1300;
-        PendingWindowRotation = 1400;
         PendingSwitch = 1500;
         PendingAutoStart = 1600;
         PendingSwitchOff = 1700;

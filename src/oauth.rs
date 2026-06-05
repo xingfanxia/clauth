@@ -12,9 +12,8 @@ use crate::profile::{
 };
 use crate::runtime::{RotationGuard, has_live_session};
 use crate::usage::{
-    ActivityKind, ActivityStore, LastRotatedWindow, OpResult, OpResultSender, ProfileActivity,
-    RefetchQueue, UsageStore, clear_activity, iso_to_epoch_secs, mark_activity, now_epoch_secs,
-    now_ms,
+    ActivityKind, ActivityStore, OpResult, OpResultSender, ProfileActivity, RefetchQueue,
+    UsageStore, clear_activity, iso_to_epoch_secs, mark_activity, now_epoch_secs, now_ms,
 };
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup
@@ -114,8 +113,7 @@ fn kick(access_token: &str) -> Result<()> {
 /// the new pair was persisted. Skips when the profile has no refresh token or
 /// a live `clauth start` session holds the chain (same gate as `refresh_all`).
 ///
-/// No cooldown gating — the caller is responsible for deduplication via
-/// `LastRotatedWindow`. Does not touch `last_auto_start_at`.
+/// Does not touch `last_auto_start_at`.
 ///
 /// Takes `crate::profile::ConfigHandle` so the lock is held only across the brief
 /// read/write windows around HTTP, not across the network round trip.
@@ -132,7 +130,7 @@ pub(crate) fn rotate_one(
     sender: &OpResultSender,
 ) -> bool {
     matches!(
-        rotate_one_inner(config, name, activity, sender, false, None),
+        rotate_one_inner(config, name, activity, sender, false),
         RotateOutcome::Persisted(true)
     )
 }
@@ -142,8 +140,8 @@ pub(crate) fn rotate_one(
 /// other path (which emits its own `OpResult` and clears activity before
 /// returning). `refresh_all` workers use the distinction to surface the
 /// guard-fail as a Danger toast, matching the pre-collapse behavior; the
-/// `rotate_one`/`rotate_one_for_window` callers map `GuardBusy` to a silent
-/// `false`, also matching their pre-collapse behavior.
+/// `rotate_one` caller maps `GuardBusy` to a silent
+/// `false`, also matching its pre-collapse behavior.
 enum RotateOutcome {
     /// `RotationGuard::acquire` failed — a live session or sibling worker holds
     /// the per-profile rotation lock. No `OpResult` was emitted.
@@ -153,7 +151,7 @@ enum RotateOutcome {
     Persisted(bool),
 }
 
-/// Shared body of [`rotate_one`], [`rotate_one_for_window`] and each
+/// Shared body of [`rotate_one`] and each
 /// [`refresh_all`] worker. Holds the per-profile rotation lock across the
 /// ENTIRE HTTP window so an external `clauth start <name>` cannot begin a
 /// refresh of the same single-use token while ours is in flight. The state
@@ -167,9 +165,7 @@ enum RotateOutcome {
 /// `force` bypasses ONLY the `has_live_session` SKIP (the user explicitly
 /// requested every account be rotated, including one a live session touches);
 /// it never relaxes the mutual exclusion, which still serialises against that
-/// session's own refresh of the same chain. When `window_stamp` is `Some`, the
-/// rotated pair is persisted and `LastRotatedWindow` stamped atomically under
-/// the same state-lock acquisition (see [`apply_rotated_tokens_locked`]).
+/// session's own refresh of the same chain.
 ///
 /// On the HTTP/persist leg, emits one `OpResult { kind: Refreshing }` and
 /// clears the activity slot. Returns [`RotateOutcome::GuardBusy`] without
@@ -183,7 +179,6 @@ fn rotate_one_inner(
     activity: Option<&ActivityStore>,
     sender: &OpResultSender,
     force: bool,
-    window_stamp: Option<(&LastRotatedWindow, i64)>,
 ) -> RotateOutcome {
     let Ok(_rotation_guard) = RotationGuard::acquire(name) else {
         return RotateOutcome::GuardBusy;
@@ -215,8 +210,7 @@ fn rotate_one_inner(
     let Some(rt) = token else {
         return RotateOutcome::Persisted(false);
     };
-    let outcome =
-        refresh(&rt).and_then(|tok| apply_rotated_tokens_locked(config, name, tok, window_stamp));
+    let outcome = refresh(&rt).and_then(|tok| apply_rotated_tokens_locked(config, name, tok));
     let applied = outcome.is_ok();
     if let Some(activity) = activity {
         clear_activity(activity, name);
@@ -227,40 +221,6 @@ fn rotate_one_inner(
         outcome,
     });
     RotateOutcome::Persisted(applied)
-}
-
-/// Window-expiry variant of [`rotate_one`] that stamps `LastRotatedWindow`
-/// atomically with the credential write. Use this from the on_tick
-/// window-expiry dispatcher instead of `rotate_one + manual LRW insert`.
-///
-/// The stamp happens inside `apply_rotated_tokens_locked` under the same
-/// state-lock acquisition as the credential write, so no panic or
-/// mutex-poison between persist and stamp can cause the scheduler to
-/// re-enqueue and burn an already-rotated refresh token chain.
-///
-/// Returns true iff the rotation was persisted (same as `rotate_one`).
-/// On `has_live_session = true` the profile is skipped and LRW is
-/// left untouched — `scan_expired_windows` will re-enqueue next tick
-/// (no HTTP, benign).
-pub(crate) fn rotate_one_for_window(
-    config: &crate::profile::ConfigHandle,
-    name: &str,
-    activity: &ActivityStore,
-    sender: &OpResultSender,
-    lrw: &LastRotatedWindow,
-    resets_at: i64,
-) -> bool {
-    matches!(
-        rotate_one_inner(
-            config,
-            name,
-            Some(activity),
-            sender,
-            false,
-            Some((lrw, resets_at))
-        ),
-        RotateOutcome::Persisted(true)
-    )
 }
 
 /// Profiles that would be rotated by `refresh_all`. Extracted so tests can
@@ -347,8 +307,7 @@ pub(crate) fn refresh_all(
                 // bypasses the `has_live_session` SKIP (we still want to rotate
                 // the token) but NOT the mutual exclusion: a forced rotate must
                 // still not race a live session's own refresh of the same chain.
-                let outcome =
-                    rotate_one_inner(&config, &name, Some(&activity), &sender, force, None);
+                let outcome = rotate_one_inner(&config, &name, Some(&activity), &sender, force);
                 (name, outcome)
             });
             (name_for_handle, h)
@@ -413,11 +372,11 @@ pub(crate) fn windowless_auto_start_candidates(
     store: &UsageStore,
 ) -> Vec<String> {
     // A window counts as live only while its `resets_at` is still in the
-    // future — same boundary `scan_expired_windows` uses. Checking mere
-    // presence would treat an expired-but-not-yet-cleared `resets_at` as a
-    // live window, so a background profile whose window lapsed would never be
-    // re-armed (the active profile gets a fresh window from Claude Code each
-    // session, masking the bug as "auto-start only works for the active one").
+    // future. Checking mere presence would treat an expired-but-not-yet-cleared
+    // `resets_at` as a live window, so a background profile whose window lapsed
+    // would never be re-armed (the active profile gets a fresh window from
+    // Claude Code each session, masking the bug as "auto-start only works for
+    // the active one").
     let now_secs = now_epoch_secs();
     let has_active_window: std::collections::HashMap<String, bool> = store
         .lock()
@@ -582,17 +541,10 @@ fn write_token_fields(oauth: &mut OAuthToken, tok: TokenResponse) {
 /// "failed to persist rotated tokens" message so the surfaced toast text is
 /// identical regardless of which leg failed (none is reachable in practice —
 /// a profile selected for rotation always has an OAuth block).
-///
-/// When `window_stamp` is `Some((lrw, resets_at))`, the `LastRotatedWindow`
-/// map is updated atomically with the credential write — under the same
-/// state-lock acquisition — so no panic or mutex-poison between the persist
-/// and the stamp can cause a silent chain burn on the next scheduler tick.
-/// Lock order: AppConfig → state flock → LRW leaf mutex.
 pub(crate) fn apply_rotated_tokens_locked(
     config: &crate::profile::ConfigHandle,
     name: &str,
     tok: TokenResponse,
-    window_stamp: Option<(&LastRotatedWindow, i64)>,
 ) -> Result<()> {
     let mut cfg = config.lock().expect("config mutex poisoned");
     with_state_lock(|| {
@@ -617,11 +569,6 @@ pub(crate) fn apply_rotated_tokens_locked(
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         }
         clear_staged_credentials(name);
-        if let Some((lrw, resets_at)) = window_stamp
-            && let Ok(mut guard) = lrw.lock()
-        {
-            guard.insert(name.to_string(), resets_at);
-        }
         Ok(())
     })
     // A failed state flock surfaces as the `Err` from `with_state_lock`, so a
