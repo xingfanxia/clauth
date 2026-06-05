@@ -157,8 +157,8 @@ fn force_true_bypasses_diverged_active_when_no_active_profile() {
     assert_eq!(force_true[0].0, "test-oauth-force-diverged");
 }
 
-/// `rotate_one` must NOT stamp `Refreshing` when the profile has no refresh
-/// token — the short-circuit `let Some(rt) = token else { return false }` runs
+/// `rotate_one_inner` must NOT stamp `Refreshing` when the profile has no
+/// refresh token — the short-circuit `let Some(rt) = token else { … }` runs
 /// before any HTTP, so the activity slot should remain clean (Idle).
 #[test]
 fn rotate_one_no_stamp_when_no_refresh_token() {
@@ -196,15 +196,21 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, _rx) = mpsc::channel();
 
-    let result = rotate_one(&config, "test-rotate-one-no-rt", Some(&activity), &tx);
+    let result = rotate_one_inner(
+        &config,
+        "test-rotate-one-no-rt",
+        Some(&activity),
+        &tx,
+        false,
+    );
 
     assert!(
-        !result,
-        "rotate_one should return false when no refresh token"
+        matches!(result, RotateOutcome::Persisted(false)),
+        "rotate_one_inner should return Persisted(false) when no refresh token"
     );
     assert!(
         is_idle(&activity, "test-rotate-one-no-rt"),
-        "activity slot must remain Idle when rotate_one short-circuits at no-token"
+        "activity slot must remain Idle when rotation short-circuits at no-token"
     );
 }
 

@@ -109,39 +109,11 @@ fn kick(access_token: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rotate the OAuth token chain for a single named profile. Returns true iff
-/// the new pair was persisted. Skips when the profile has no refresh token or
-/// a live `clauth start` session holds the chain (same gate as `refresh_all`).
-///
-/// Does not touch `last_auto_start_at`.
-///
-/// Takes `crate::profile::ConfigHandle` so the lock is held only across the brief
-/// read/write windows around HTTP, not across the network round trip.
-/// Emits one `OpResult { kind: Refreshing }` on the supplied sender unless
-/// the profile is skipped (no refresh token / live session).
-///
-/// `activity` is the optional spinner side-channel: the scheduler/TUI pass
-/// `Some` to drive the overview spinner, the no-scheduler CLI switch passes
-/// `None` so it allocates no throwaway store.
-pub(crate) fn rotate_one(
-    config: &crate::profile::ConfigHandle,
-    name: &str,
-    activity: Option<&ActivityStore>,
-    sender: &OpResultSender,
-) -> bool {
-    matches!(
-        rotate_one_inner(config, name, activity, sender, false),
-        RotateOutcome::Persisted(true)
-    )
-}
-
 /// Result of [`rotate_one_inner`]. Distinguishes the rotation-lock acquire
 /// failure (no `OpResult` emitted, no activity pre-stamp to clear) from every
 /// other path (which emits its own `OpResult` and clears activity before
 /// returning). `refresh_all` workers use the distinction to surface the
-/// guard-fail as a Danger toast, matching the pre-collapse behavior; the
-/// `rotate_one` caller maps `GuardBusy` to a silent
-/// `false`, also matching its pre-collapse behavior.
+/// guard-fail as a Danger toast.
 enum RotateOutcome {
     /// `RotationGuard::acquire` failed — a live session or sibling worker holds
     /// the per-profile rotation lock. No `OpResult` was emitted.
@@ -151,8 +123,7 @@ enum RotateOutcome {
     Persisted(bool),
 }
 
-/// Shared body of [`rotate_one`] and each
-/// [`refresh_all`] worker. Holds the per-profile rotation lock across the
+/// Body of each [`refresh_all`] worker. Holds the per-profile rotation lock across the
 /// ENTIRE HTTP window so an external `clauth start <name>` cannot begin a
 /// refresh of the same single-use token while ours is in flight. The state
 /// flock cannot do this (it must be released across the network round trip).
