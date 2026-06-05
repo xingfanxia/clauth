@@ -10,7 +10,7 @@ use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::format::{
     account_type_label, account_type_style, fixed, fixed_split, health_color, name_style,
-    spinner_frame, spinner_style, window_summary_parts, window_summary_span,
+    spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
 use super::panes::{draw_scrollbar, empty_state, section_box, select_line};
 use crate::fallback::threshold_for;
@@ -107,7 +107,7 @@ impl OverviewWidths {
         } else {
             6
         };
-        // 26 = bar+pct+reset, 17 = bar+pct only.
+        // 26 = [bar]+pct+reset, 17 = [bar]+pct only.
         let mut five_hour = if total >= 81 {
             26
         } else if total >= 64 {
@@ -276,21 +276,28 @@ fn render_overview_row(
     ));
     spans.push(narrow_gap(widths));
     spans.push(timer_span);
-    let (five_text, five_style) = window_summary_parts(
+    // Bracketed bars ([███░░░]) for overview account rows only.
+    // Usage-page gauges, chain bars, and fallback thresholds stay bracket-less.
+    let five_spans = window_summary_spans_bracketed(
         profile.usage.as_ref().and_then(|u| u.five_hour.as_ref()),
         widths.five_hour,
         true,
     );
-    let five_pad = widths.five_hour.saturating_sub(five_text.chars().count());
-    spans.push(Span::styled(five_text, five_style));
+    let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
+    let five_pad = widths.five_hour.saturating_sub(five_len);
+    spans.extend(five_spans);
     spans.push(Span::raw(" ".repeat(five_pad)));
     if widths.seven_day > 0 {
         spans.push(gap(widths));
-        spans.push(window_summary_span(
+        let seven_spans = window_summary_spans_bracketed(
             profile.usage.as_ref().and_then(|u| u.weekly_window()),
             widths.seven_day,
             widths.seven_day >= 18,
-        ));
+        );
+        let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
+        let seven_pad = widths.seven_day.saturating_sub(seven_len);
+        spans.extend(seven_spans);
+        spans.push(Span::raw(" ".repeat(seven_pad)));
     }
     if widths.route > 0 {
         spans.push(gap(widths));

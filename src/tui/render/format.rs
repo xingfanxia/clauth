@@ -75,48 +75,59 @@ pub(super) fn bar_string_with_cells(pct: f64, cells: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(cells - filled))
 }
 
+/// Overview accounts rows only: `[███░░░]` with dim brackets around the bar.
+/// Brackets render in `dim`; filled/empty cells keep their semantic util color.
+/// All other bar sites use [`bar_string_with_cells`] directly (no brackets).
+pub(super) fn window_summary_spans_bracketed(
+    window: Option<&UsageWindow>,
+    width: usize,
+    include_bar: bool,
+) -> Vec<Span<'static>> {
+    let Some(window) = window else {
+        return vec![Span::styled("—".to_string(), theme::faint())];
+    };
+    let pct = window.utilization.clamp(0.0, 100.0);
+    let color = theme::util_color(pct);
+    let style = Style::default().fg(color);
+
+    if include_bar && width >= 26 {
+        // [██████░░░░] XX% (reset)
+        let reset = format_reset(window)
+            .map(|r| format!(" ({r})"))
+            .unwrap_or_default();
+        vec![
+            Span::styled("[", theme::dim()),
+            Span::styled(bar_string_with_cells(pct, 10), style),
+            Span::styled("]", theme::dim()),
+            Span::styled(format!(" {:>2.0}%{reset}", pct), style),
+        ]
+    } else if include_bar && width >= 17 {
+        // [██████░░░░] XX%
+        vec![
+            Span::styled("[", theme::dim()),
+            Span::styled(bar_string_with_cells(pct, 10), style),
+            Span::styled("]", theme::dim()),
+            Span::styled(format!(" {:>2.0}%", pct), style),
+        ]
+    } else if include_bar && width >= 12 {
+        // [███░░░] XX%  — bar shrinks to fit
+        let bar_cells = width.saturating_sub(7).clamp(3, 7);
+        vec![
+            Span::styled("[", theme::dim()),
+            Span::styled(bar_string_with_cells(pct, bar_cells), style),
+            Span::styled("]", theme::dim()),
+            Span::styled(format!(" {:>2.0}%", pct), style),
+        ]
+    } else {
+        vec![Span::styled(format!("{pct:>2.0}%"), style)]
+    }
+}
+
 pub(super) fn format_reset(window: &UsageWindow) -> Option<String> {
     let resets_at = window.resets_at.as_deref()?;
     let target = iso_to_epoch_secs(resets_at)?;
     let secs = target - now_epoch_secs();
     Some(crate::usage::humanize_duration(secs))
-}
-
-pub(super) fn window_summary_span(
-    window: Option<&UsageWindow>,
-    width: usize,
-    include_bar: bool,
-) -> Span<'static> {
-    let (text, style) = window_summary_parts(window, width, include_bar);
-    Span::styled(fixed(&text, width), style)
-}
-
-/// Like [`window_summary_span`] but returns `(text, style)` so the caller can
-/// append decorations and pad to the column width itself.
-pub(super) fn window_summary_parts(
-    window: Option<&UsageWindow>,
-    width: usize,
-    include_bar: bool,
-) -> (String, Style) {
-    let Some(window) = window else {
-        return ("—".to_string(), theme::faint());
-    };
-    let pct = window.utilization.clamp(0.0, 100.0);
-    let color = theme::util_color(pct);
-    let text = if include_bar && width >= 26 {
-        let reset = format_reset(window)
-            .map(|r| format!(" ({r})"))
-            .unwrap_or_default();
-        format!("{} {:>2.0}%{reset}", bar_string_with_cells(pct, 10), pct)
-    } else if include_bar && width >= 17 {
-        format!("{} {:>2.0}%", bar_string_with_cells(pct, 10), pct)
-    } else if include_bar && width >= 12 {
-        let bar_cells = width.saturating_sub(5).clamp(3, 7);
-        format!("{}{:>2.0}", bar_string_with_cells(pct, bar_cells), pct)
-    } else {
-        format!("{pct:>2.0}%")
-    };
-    (text, Style::default().fg(color))
 }
 
 /// Green/yellow/red headroom against a member's threshold (crossing = rotate).
