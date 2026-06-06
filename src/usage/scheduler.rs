@@ -13,8 +13,14 @@ use super::fetch::{
 /// Scheduler wake interval. Network work only fires for profiles whose cadence has elapsed.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Fixed per-profile refresh interval — no adaptive backoff.
+/// Fixed per-profile refresh interval — no adaptive backoff. A server
+/// `retry-after` on a 429 defers a single profile's next slot (capped by
+/// [`MAX_RETRY_AFTER_MS`]); the cadence itself never changes.
 pub(crate) const REFRESH_INTERVAL_MS: u64 = 60_000;
+
+/// Hard ceiling on a server-provided `retry-after` so a bogus huge value
+/// can't starve a profile's refresh slot.
+const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
 
 /// Wall-clock instant in epoch-milliseconds. Distinct from [`IntervalMs`] so
 /// instants and spans can't be confused. `#[repr(transparent)]` keeps layout
@@ -225,9 +231,9 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
 /// storm; it falls back to disk cache as `RateLimited` and the fixed cadence
 /// retries. Other errors fall back to disk cache as `Cached`. Pushes `name`
 /// onto `refetch` when rotation succeeded but the follow-up fetch failed.
-/// Returns the rotated pair so the caller can update `TokenList`, plus a
-/// `from_fetch` flag: true only when the returned info is a live API body,
-/// false for every disk-cache fallback (see [`FetchOutcome::from_fetch`]).
+/// Returns a [`FetchOutcome`]: the rotated pair for the caller's `TokenList`
+/// sync, the `from_fetch` provenance flag, and the 429 `retry-after` hint that
+/// [`apply_outcome`] turns into a deferred next-fetch slot.
 ///
 /// Flips `activity[name]` to `Refreshing` during `oauth::refresh`, then back to
 /// `Fetching` for the retry. Caller owns the initial `Fetching` mark and final `Idle` clear.
@@ -238,26 +244,21 @@ fn fetch_with_rotation(
     refresh_token: Option<&str>,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
-) -> (Option<UsageInfo>, FetchStatus, Option<RotatedTokens>, bool) {
+) -> FetchOutcome {
     match fetch_raw(access_token) {
-        Ok(info) => return (Some(info), FetchStatus::Fresh, None, true),
+        Ok(info) => return FetchOutcome::live(name, info, None),
         // Rate-limited: bail to cache, never rotate (see the doc comment).
-        Err(FetchError::Status(429)) => {
-            let (info, status) = load_cached_with_status(name, FetchStatus::RateLimited);
-            return (info, status, None, false);
+        Err(FetchError::RateLimited { retry_after }) => {
+            return FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after);
         }
         // Expired access token: fall through into the rotation leg.
         Err(FetchError::Status(401)) => {}
-        Err(_) => {
-            let (info, status) = load_cached_with_status(name, FetchStatus::Cached);
-            return (info, status, None, false);
-        }
+        Err(_) => return FetchOutcome::cached(name, FetchStatus::Cached, None, None),
     }
 
     // Single bail-out path for all rotation-leg failures.
     let bail_to_cache = |rotated: Option<RotatedTokens>| {
-        let (info, status) = load_cached_with_status(name, FetchStatus::Cached);
-        (info, status, rotated, false)
+        FetchOutcome::cached(name, FetchStatus::Cached, rotated, None)
     };
 
     let Some(rt) = refresh_token else {
@@ -294,12 +295,11 @@ fn fetch_with_rotation(
     }
     let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
     match fetch_raw(&access) {
-        Ok(info) => (Some(info), FetchStatus::Fresh, rotated, true),
-        Err(FetchError::Status(429)) => {
+        Ok(info) => FetchOutcome::live(name, info, rotated),
+        Err(FetchError::RateLimited { retry_after }) => {
             // Retry itself rate-limited. Don't push to RefetchQueue — that risks
-            // a rotate→429→enqueue→rotate cycle. Let the fixed cadence govern.
-            let (info, _) = load_cached_with_status(name, FetchStatus::RateLimited);
-            (info, FetchStatus::RateLimited, rotated, false)
+            // a rotate→429→enqueue→rotate cycle. The retry-after deferral governs.
+            FetchOutcome::cached(name, FetchStatus::RateLimited, rotated, retry_after)
         }
         Err(_) => {
             // Rotation succeeded but a transient error stopped the retry.
@@ -323,6 +323,42 @@ struct FetchOutcome {
     /// `info` is a live API body (not a disk-cache fallback). Only live bodies
     /// may overwrite the store / disk cache in [`apply_outcome`].
     from_fetch: bool,
+    /// Server `retry-after` hint from a 429; [`apply_outcome`] turns it into a
+    /// deferred next-fetch slot for this profile.
+    retry_after: Option<Duration>,
+}
+
+impl FetchOutcome {
+    /// A live API body — overwrites the store and disk cache.
+    fn live(name: &str, info: UsageInfo, rotated: Option<RotatedTokens>) -> Self {
+        Self {
+            name: name.to_string(),
+            info: Some(info),
+            status: FetchStatus::Fresh,
+            rotated,
+            from_fetch: true,
+            retry_after: None,
+        }
+    }
+
+    /// A disk-cache fallback (`status` downgrades to `Failed` when no cache
+    /// exists) — may only cold-fill an absent store entry.
+    fn cached(
+        name: &str,
+        status: FetchStatus,
+        rotated: Option<RotatedTokens>,
+        retry_after: Option<Duration>,
+    ) -> Self {
+        let (info, status) = load_cached_with_status(name, status);
+        Self {
+            name: name.to_string(),
+            info,
+            status,
+            rotated,
+            from_fetch: false,
+            retry_after,
+        }
+    }
 }
 
 fn run_fetch(
@@ -331,22 +367,14 @@ fn run_fetch(
     refetch: &RefetchQueue,
     activity: &ActivityStore,
 ) -> FetchOutcome {
-    let (info, status, rotated, from_fetch) = fetch_with_rotation(
+    fetch_with_rotation(
         config,
         &entry.name,
         &entry.access_token,
         entry.refresh_token.as_deref(),
         refetch,
         activity,
-    );
-
-    FetchOutcome {
-        name: entry.name,
-        info,
-        status,
-        rotated,
-        from_fetch,
-    }
+    )
 }
 
 /// Write one outcome into the shared stores. Disk cache written on every live response.
@@ -379,10 +407,22 @@ fn apply_outcome(
         }
     }
 
+    // Server-directed deferral: a 429's `retry-after` stamps this profile's
+    // slot `retry_after - interval` into the future, so `partition_due`'s
+    // fixed math (due + countdown at `stamp + REFRESH_INTERVAL_MS`) lands
+    // exactly on `now + retry_after` (capped). Not an adaptive learner — the
+    // cadence stays fixed; an explicit server hint defers one profile's next
+    // slot once.
+    let defer = IntervalMs::from_millis(outcome.retry_after.map_or(0, |ra| {
+        (ra.as_millis() as u64)
+            .min(MAX_RETRY_AFTER_MS)
+            .saturating_sub(REFRESH_INTERVAL_MS)
+    }));
+
     // Each in its own critical section — one leaf lock at a time.
     // Ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350).
     if let Ok(mut lf) = last_fetched.lock() {
-        lf.insert(outcome.name.clone(), now);
+        lf.insert(outcome.name.clone(), now.saturating_add(defer));
     }
     if let Ok(mut st) = status.lock() {
         st.insert(outcome.name.clone(), outcome.status);

@@ -109,3 +109,16 @@ fn epoch_to_iso_round_trips() {
     // Negative input clamps to epoch 0 instead of underflowing the calendar.
     assert_eq!(epoch_secs_to_iso(-1), "1970-01-01T00:00:00+00:00");
 }
+
+/// `retry-after` parsing accepts only the delta-seconds form; the HTTP-date
+/// form and garbage are no-hint (`None`).
+#[test]
+fn retry_after_parses_delta_seconds_only() {
+    assert_eq!(parse_retry_after("5"), Some(Duration::from_secs(5)));
+    assert_eq!(parse_retry_after(" 30 "), Some(Duration::from_secs(30)));
+    assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
+    assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+    assert_eq!(parse_retry_after(""), None);
+    assert_eq!(parse_retry_after("-5"), None);
+    assert_eq!(parse_retry_after("1.5"), None);
+}

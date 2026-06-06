@@ -107,12 +107,24 @@ struct RawProfileOrg {
 }
 
 /// HTTP layer error. `Status` carries an HTTP code so the fetch path can
-/// distinguish a 401 (refresh + retry) and a 429 (rate-limited, cache — never
-/// rotate) from a connection blip (cache).
+/// distinguish a 401 (refresh + retry) from a connection blip (cache); a 429
+/// gets its own variant carrying the server's `retry-after` hint (rate-limited,
+/// cache — never rotate, defer the next attempt).
 pub(crate) enum FetchError {
     Status(u16),
+    /// HTTP 429. `retry_after` is the server's `retry-after` header when
+    /// present in delta-seconds form (the HTTP-date form is treated as absent).
+    RateLimited {
+        retry_after: Option<Duration>,
+    },
     Network,
     Parse,
+}
+
+/// Parse a `retry-after` header value in delta-seconds form. The HTTP-date
+/// form (and anything else non-numeric) returns `None` — no hint.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
@@ -131,6 +143,14 @@ fn get_json(url: &str, access_token: &str) -> std::result::Result<String, FetchE
         .call()
         .map_err(|_| FetchError::Network)?;
     let status = response.status().as_u16();
+    if status == 429 {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
+        return Err(FetchError::RateLimited { retry_after });
+    }
     if status >= 400 {
         return Err(FetchError::Status(status));
     }

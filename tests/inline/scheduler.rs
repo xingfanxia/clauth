@@ -131,6 +131,7 @@ fn cached_fallback_does_not_clobber_store() {
             status: FetchStatus::RateLimited,
             rotated: None,
             from_fetch: false,
+            retry_after: None,
         },
         &store,
         &status,
@@ -154,6 +155,7 @@ fn cached_fallback_does_not_clobber_store() {
             status: FetchStatus::Cached,
             rotated: None,
             from_fetch: false,
+            retry_after: None,
         },
         &store,
         &status,
@@ -224,4 +226,104 @@ fn mark_window_open_synthesizes_only_when_not_live() {
         Some(now + 5 * 3600)
     );
     assert_eq!(replaced.utilization, 0.0, "fresh window starts at zero");
+}
+
+/// A 429's `retry-after` hint defers the profile's next fetch slot: the
+/// `last_fetched` stamp lands `retry_after - interval` in the future so
+/// `partition_due` marks the profile due (and publishes its countdown) exactly
+/// at `now + retry_after`. No hint, a zero hint, or one shorter than the
+/// interval keeps the normal cadence; an absurd hint clamps to the ceiling.
+#[test]
+fn retry_after_defers_next_fetch_slot() {
+    use std::time::Duration;
+
+    use super::{
+        FetchOutcome, FetchStatus, MAX_RETRY_AFTER_MS, StatusStore, apply_outcome, now_ms,
+    };
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let outcome = |name: &str, retry_after: Option<Duration>| FetchOutcome {
+        name: name.to_string(),
+        info: None,
+        status: FetchStatus::RateLimited,
+        rotated: None,
+        from_fetch: false,
+        retry_after,
+    };
+    let stamp = |name: &str| {
+        last_fetched
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .expect("stamp present")
+            .as_millis()
+    };
+
+    // retry-after 300s → stamp ≈ now + (300s - interval).
+    let before = now_ms();
+    apply_outcome(
+        outcome("a", Some(Duration::from_secs(300))),
+        &store,
+        &status,
+        &last_fetched,
+    );
+    let after = now_ms();
+    let extra = 300_000 - REFRESH_INTERVAL_MS;
+    let a = stamp("a");
+    assert!(
+        (before + extra..=after + extra).contains(&a),
+        "deferred stamp must sit retry_after - interval ahead of now"
+    );
+    // partition_due: not due just before now + retry_after, due at it.
+    let snapshot = vec![token("a")];
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let (due, next) = partition_due(
+        &snapshot,
+        a + REFRESH_INTERVAL_MS - 1,
+        &last_fetched,
+        &activity,
+    );
+    assert!(due.is_empty(), "not due before the deferred slot");
+    assert_eq!(
+        next.get("a").copied(),
+        Some(a + REFRESH_INTERVAL_MS),
+        "countdown publishes the deferred slot"
+    );
+    let (due, _) = partition_due(&snapshot, a + REFRESH_INTERVAL_MS, &last_fetched, &activity);
+    assert_eq!(due.len(), 1, "due once the deferred slot arrives");
+
+    // No hint → plain now stamp (normal cadence).
+    let before = now_ms();
+    apply_outcome(outcome("b", None), &store, &status, &last_fetched);
+    let after = now_ms();
+    assert!((before..=after).contains(&stamp("b")));
+
+    // Hint shorter than the interval → no extra deferral.
+    let before = now_ms();
+    apply_outcome(
+        outcome("c", Some(Duration::from_secs(5))),
+        &store,
+        &status,
+        &last_fetched,
+    );
+    let after = now_ms();
+    assert!((before..=after).contains(&stamp("c")));
+
+    // Absurd hint → clamped to the ceiling.
+    let before = now_ms();
+    apply_outcome(
+        outcome("d", Some(Duration::from_secs(86_400))),
+        &store,
+        &status,
+        &last_fetched,
+    );
+    let after = now_ms();
+    let capped = MAX_RETRY_AFTER_MS - REFRESH_INTERVAL_MS;
+    assert!(
+        (before + capped..=after + capped).contains(&stamp("d")),
+        "huge retry-after clamps to MAX_RETRY_AFTER_MS"
+    );
 }
