@@ -2891,6 +2891,7 @@ pub(crate) fn on_tick(app: &mut App) {
             continue;
         }
         let config = Arc::clone(&app.config);
+        let tokens = Arc::clone(&app.usage_tokens);
         let refetch = Arc::clone(&app.refetch_queue);
         let work_name = name.clone();
         let work_activity = Arc::clone(&app.activity);
@@ -2905,6 +2906,7 @@ pub(crate) fn on_tick(app: &mut App) {
                 let _ = oauth::start_window(
                     &config,
                     &work_name,
+                    Some(&tokens),
                     Some(&refetch),
                     Some(&work_activity),
                     &work_sender,

@@ -121,12 +121,13 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
         switch_profile(&mut cfg, canonical)?;
     }
 
-    // Prime the 5h window if opted in. Access-token only, no rotation.
-    // Throwaway sender — CLI has no scheduler to drain OpResult.
+    // Prime the 5h window if opted in. Kicks with the current access token and
+    // rotates once on a 401. No TokenList to sync (CLI has no scheduler), so
+    // pass None there. Throwaway sender — nothing drains OpResult.
     {
         let _spinner = Spinner::start("clauth: priming usage window…");
         let (op_sender, _op_receiver) = std::sync::mpsc::channel::<OpResult>();
-        let _ = oauth::start_window(&config, canonical, None, None, &op_sender);
+        let _ = oauth::start_window(&config, canonical, None, None, None, &op_sender);
     }
     println!("switched to '{canonical}'");
     Ok(())
