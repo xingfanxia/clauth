@@ -1,7 +1,7 @@
 //! Program-wide Config tab — a single panel of global settings, distinct from
 //! the per-account Setup tab. Rows back real persisted state in `AppState`:
 //! the theme tier (`[theme]`) and the chain-wide wrap-off default. ↑↓ walks the
-//! rows; ⏎/space cycles the theme or flips wrap-off in place. No left selector,
+//! rows; ⏎/space cycles the theme or wrap-off value in place. No left selector,
 //! no popups — these settings are global, not per-account.
 
 use ratatui::Frame;
@@ -61,36 +61,62 @@ fn detail_row(row: GlobalConfigRow, selected: bool, wrap_off: bool) -> Line<'sta
     } else {
         Span::raw("  ")
     };
+    let tier = theme::tier();
     match row {
-        GlobalConfigRow::Theme => {
-            let (value, style) = match theme::tier() {
-                Tier::Full => ("full · 24-bit truecolor", theme::accent()),
-                Tier::Compatible => ("compatible · xterm-256", theme::orange()),
-            };
-            kv(arrow, "theme", value.to_string(), style)
-        }
-        GlobalConfigRow::WrapOff => {
-            // Spell out the action so "off" is never shown as a bare value.
-            let (value, style) = if wrap_off {
-                ("switch off all accounts", theme::orange())
-            } else {
-                ("stay on last account", theme::accent())
-            };
-            kv(arrow, "when spent", value.to_string(), style)
-        }
+        GlobalConfigRow::Theme => cycle_row(
+            arrow,
+            "theme",
+            &[
+                ("full", tier == Tier::Full),
+                ("compatible", tier == Tier::Compatible),
+            ],
+            selected,
+        ),
+        GlobalConfigRow::WrapOff => cycle_row(
+            arrow,
+            "when spent",
+            &[("stay on last", !wrap_off), ("switch off all", wrap_off)],
+            selected,
+        ),
     }
 }
 
-fn kv(
+/// A cloudy-tui cycle row: `key   [active]  other`. The active option is `ACCENT`
+/// (bracketed only while the row is the cursor), the rest `TEXT_FAINT`; ⏎/space
+/// cycles the value in place. Reads as the segmented control it is, instead of a
+/// single value that silently swaps text on cycle.
+fn cycle_row(
     arrow: Span<'static>,
     key: &str,
-    value: String,
-    value_style: ratatui::style::Style,
+    options: &[(&str, bool)],
+    row_selected: bool,
 ) -> Line<'static> {
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
-    Line::from(vec![
+    let mut spans = vec![
         arrow,
         Span::styled(format!("{key}{}", " ".repeat(pad)), theme::body()),
-        Span::styled(value, value_style),
-    ])
+    ];
+    for (i, (label, active)) in options.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(cycle_option(label, *active, row_selected));
+    }
+    Line::from(spans)
+}
+
+/// One segment of a cycle row. Active → `ACCENT`: `[label]` when the row is the
+/// cursor, ` label ` (bracket cells reserved as spaces) when blurred so focus
+/// never reflows the row. Inactive → bare `TEXT_FAINT`.
+fn cycle_option(label: &str, active: bool, row_selected: bool) -> Span<'static> {
+    if active {
+        let text = if row_selected {
+            format!("[{label}]")
+        } else {
+            format!(" {label} ")
+        };
+        Span::styled(text, theme::accent())
+    } else {
+        Span::styled(label.to_string(), theme::faint())
+    }
 }

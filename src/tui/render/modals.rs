@@ -78,6 +78,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::Switch(_) => "CONFIRM",
         ConfirmAction::DiscardDivergence(_) => "CONFIRM",
         ConfirmAction::RotateAll => "CONFIRM",
+        ConfirmAction::RotateOne(_) => "CONFIRM",
     };
 
     let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(

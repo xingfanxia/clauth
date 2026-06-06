@@ -405,6 +405,49 @@ pub(crate) fn refresh_all(
     refreshed
 }
 
+/// Force-rotate a single profile's OAuth token pair — one [`refresh_all`] worker
+/// leg, scoped to `name` (the action-menu "rotate tokens" on the focused account).
+/// Same discipline: `rotate_one_inner` holds the per-profile RotationGuard across
+/// the HTTP window with a `has_live_session` re-check, so the single-use refresh
+/// token can't double-spend. On success the profile is pushed onto `refetch` so
+/// the next tick re-fetches its usage. Returns `true` when a new pair persisted.
+pub(crate) fn rotate_one(
+    config: &crate::profile::ConfigHandle,
+    name: &str,
+    refetch: &RefetchQueue,
+    activity: &ActivityStore,
+    sender: &OpResultSender,
+    force: bool,
+) -> bool {
+    // Pre-stamp so the row shows a refresh spinner for the whole HTTP window;
+    // rotate_one_inner clears the slot when it emits its OpResult.
+    mark_activity(activity, name, ProfileActivity::Refreshing);
+    let persisted = match rotate_one_inner(config, name, Some(activity), sender, force) {
+        RotateOutcome::Persisted(true) => true,
+        // Guard-fail never emits an OpResult; surface the failure + clear, exactly
+        // as refresh_all's join loop does for a busy guard.
+        RotateOutcome::GuardBusy => {
+            let _ = sender.send(OpResult {
+                name: name.to_string(),
+                kind: ActivityKind::Refreshing,
+                outcome: Err(anyhow::anyhow!("failed to acquire rotation lock")),
+            });
+            clear_activity(activity, name);
+            false
+        }
+        // Persist/skip legs already emitted + cleared; clearing the pre-stamp again
+        // is idempotent and covers the no-refresh-token early return.
+        RotateOutcome::Persisted(false) => {
+            clear_activity(activity, name);
+            false
+        }
+    };
+    if persisted && let Ok(mut q) = refetch.lock() {
+        q.insert(name.to_string());
+    }
+    persisted
+}
+
 /// Names of opted-in OAuth profiles eligible for an auto-start kick: not
 /// active-with-a-diverged-link and past the cooldown, AND either lacking a live
 /// 5-hour window OR carrying a known-idle weekly window (present with zero

@@ -14,6 +14,10 @@ use super::super::theme;
 const TAB_NAV: (&str, &str) = ("←→", "tabs");
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // 1-col breathing room on each side; the alert row (which replaces this in
+    // place) shares the same inset so the left margin never jumps.
+    let area = inset_x(area, 1);
+
     // A live alert replaces the hint bar in place — one footer row, never stacked.
     if let Some(alert) = &app.footer_alert {
         draw_alert(frame, area, alert);
@@ -27,15 +31,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let q_label: &str = if has_sub_focus { "back" } else { "quit" };
 
     let tail: &[(&str, &str)] = match app.tab {
-        Tab::Overview => &[
-            ("↑↓", "move"),
-            ("⇧↑↓", "reorder"),
-            ("⏎", "switch"),
-            ("n", "new"),
-            ("r", "refresh"),
-            ("a", "actions"),
-            ("?", "help"),
-        ],
+        Tab::Overview => &[("⇧↑↓", "reorder"), ("a", "actions"), ("?", "help")],
         Tab::Usage => &[
             ("↑↓", "account"),
             ("r", "refresh account"),
@@ -142,6 +138,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .alignment(Alignment::Left),
         area,
     );
+}
+
+/// Shrink a rect by `pad` columns on each side (clamped), leaving the row intact.
+fn inset_x(area: Rect, pad: u16) -> Rect {
+    Rect {
+        x: area.x.saturating_add(pad),
+        width: area.width.saturating_sub(pad.saturating_mul(2)),
+        ..area
+    }
 }
 
 /// Render a footer alert in place of the hint bar.

@@ -15,9 +15,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let toasts: Vec<&Toast> = app.toasts.iter().collect();
 
-    // Max content width: min(36, terminal_width − 2); the −2 accounts for the
-    // 1-cell inset on each side.
-    let content_cap = 36_u16.min(area.width.saturating_sub(2));
+    // Max content width: min(36, terminal_width − 4); the −4 budgets the chrome —
+    // `┃ ` (2) + 1-cell right pad inside the toast + 1-cell inset from the edge.
+    let content_cap = 36_u16.min(area.width.saturating_sub(4));
 
     // Measure the widest *natural* line across all toasts, then clamp to the
     // cap.  This drives both the column width and the wrap budget.
@@ -28,8 +28,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .unwrap_or(0)
         .min(content_cap);
 
-    // +2: 1 for the bar glyph cell, 1 for the space after it.
-    let col_width = max_content_width + 2;
+    // +3: `┃ ` (bar cell + space) on the left, 1 trailing pad cell on the right.
+    // The pad cell carries no text, so the Paragraph's `bg_sunken` base fills it.
+    let col_width = max_content_width + 3;
 
     // Anchor: 1-cell inset from the right edge.
     let x = area.x + area.width.saturating_sub(col_width + 1);
@@ -225,9 +226,9 @@ mod tests {
     }
 
     #[test]
-    fn col_width_equals_content_width_plus_bar() {
+    fn col_width_equals_content_width_plus_chrome() {
         // Simulate the geometry: content_cap=36, message fits in 25 chars.
-        // col_width must be 27 (25 + 2 for "┃ ").
+        // col_width must be 28 (25 + 2 for "┃ " + 1 right pad).
         let msg = "· enlarge for full layout"; // 25 chars
         let content_cap: u16 = 36;
         let max_content_width = [msg]
@@ -236,8 +237,8 @@ mod tests {
             .max()
             .unwrap()
             .min(content_cap);
-        let col_width = max_content_width + 2;
+        let col_width = max_content_width + 3;
         assert_eq!(max_content_width, 25);
-        assert_eq!(col_width, 27);
+        assert_eq!(col_width, 28);
     }
 }

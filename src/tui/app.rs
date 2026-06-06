@@ -227,6 +227,9 @@ pub(crate) enum ConfirmAction {
     DiscardDivergence(String),
     /// Force-rotate all refresh tokens; active sessions may be logged out.
     RotateAll,
+    /// Force-rotate one account's refresh token (action-menu "rotate tokens" on
+    /// the focused account).
+    RotateOne(String),
 }
 
 #[derive(Debug, Clone)]
@@ -321,12 +324,19 @@ impl ActionMenuState {
             .into_iter()
             .map(|action| {
                 let label = action.label();
-                let hotkey = label
-                    .chars()
-                    .filter(|c| c.is_alphabetic())
-                    .map(|c| c.to_lowercase().next().unwrap_or(c))
-                    .take(3)
-                    .find(|c| !RESERVED.contains(c) && !claimed.contains(c))
+                // An explicit override wins when free; else scan the first 3 alpha
+                // chars of the label per the SKILL.md algorithm.
+                let hotkey = action
+                    .preferred_hotkey()
+                    .filter(|c| !RESERVED.contains(c) && !claimed.contains(c))
+                    .or_else(|| {
+                        label
+                            .chars()
+                            .filter(|c| c.is_alphabetic())
+                            .map(|c| c.to_lowercase().next().unwrap_or(c))
+                            .take(3)
+                            .find(|c| !RESERVED.contains(c) && !claimed.contains(c))
+                    })
                     .inspect(|c| claimed.push(*c));
                 ActionItem {
                     label,
@@ -340,6 +350,16 @@ impl ActionMenuState {
 }
 
 impl ActionMenuAction {
+    /// Explicit hotkey override, taking priority over the label scan when free.
+    /// `rotate tokens` pins `t` (mnemonic + matches the global rotate key) instead
+    /// of falling to `o` after `refresh usage` claims `r`.
+    fn preferred_hotkey(&self) -> Option<char> {
+        match self {
+            Self::RotateTokens => Some('t'),
+            _ => None,
+        }
+    }
+
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::NewAccount => "new account",
@@ -392,6 +412,7 @@ pub(crate) struct Toast {
 
 const ROTATE_ALL_MSG: &str = "rotate tokens for all accounts?";
 const ROTATE_ALL_DETAIL: &str = "accounts with a live session might be logged out.";
+const ROTATE_ONE_DETAIL: &str = "a live session on this account might be logged out.";
 const TOAST_CAPACITY: usize = 3;
 const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
 const TOAST_TTL_DANGER: Duration = Duration::from_secs(6);
@@ -2079,39 +2100,48 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Fire the handler that the direct hotkey would have called.
+/// The account under the cursor as `(name, is_oauth)`. `profile_cursor` is shared
+/// across Overview, Usage, and Setup, so this resolves the focused account on any
+/// of them. `None` when the cursor sits past the profile list (e.g. `+ new`).
+fn focused_account(app: &App) -> Option<(String, bool)> {
+    let cfg = app.config();
+    cfg.profiles
+        .get(app.profile_cursor)
+        .map(|p| (p.name.to_string(), p.is_oauth()))
+}
+
 fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
     match action {
         ActionMenuAction::NewAccount => start_new_account(app),
         ActionMenuAction::RefreshUsage => {
-            if app.tab == Tab::Usage {
-                let selected = {
-                    let cfg = app.config();
-                    cfg.profiles
-                        .get(app.profile_cursor)
-                        .map(|p| (p.name.clone(), p.is_oauth()))
-                };
-                match selected {
-                    Some((name, true)) => {
-                        app.manual_refresh_one(&name);
-                        app.toast(ToastKind::Info, format!("refreshing '{name}'…"));
-                    }
-                    Some((name, false)) => {
-                        app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
-                    }
-                    None => {}
+            // Action-menu refresh is always scoped to the focused account.
+            match focused_account(app) {
+                Some((name, true)) => {
+                    app.manual_refresh_one(&name);
+                    app.toast(ToastKind::Info, format!("refreshing '{name}'…"));
                 }
-            } else {
-                app.manual_refresh();
-                app.toast(ToastKind::Info, "refreshing usage…");
+                Some((name, false)) => {
+                    app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
+                }
+                None => {}
             }
         }
         ActionMenuAction::RotateTokens => {
-            app.modals.push(Modal::Confirm(ConfirmState {
-                message: ROTATE_ALL_MSG.to_string(),
-                detail: Some(ROTATE_ALL_DETAIL.to_string()),
-                choice: false,
-                on_confirm: ConfirmAction::RotateAll,
-            }));
+            // Rotate only the focused account, not the whole chain.
+            match focused_account(app) {
+                Some((name, true)) => {
+                    app.modals.push(Modal::Confirm(ConfirmState {
+                        message: format!("rotate tokens for '{name}'?"),
+                        detail: Some(ROTATE_ONE_DETAIL.to_string()),
+                        choice: false,
+                        on_confirm: ConfirmAction::RotateOne(name),
+                    }));
+                }
+                Some((name, false)) => {
+                    app.toast(ToastKind::Info, format!("'{name}' has no tokens to rotate"));
+                }
+                None => {}
+            }
         }
         ActionMenuAction::SwitchToSelected => activate_main_item(app),
         ActionMenuAction::ConfigureSelected => enter_config_detail(app),
@@ -2705,6 +2735,22 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 }));
             });
             app.toast(ToastKind::Info, "rotating all tokens…");
+        }
+        ConfirmAction::RotateOne(name) => {
+            // The per-profile RotationGuard inside rotate_one serialises against a
+            // live session's own refresh, so unlike RotateAll this doesn't need the
+            // global any_busy gate — a busy guard surfaces as a Danger toast.
+            let config = Arc::clone(&app.config);
+            let refetch = Arc::clone(&app.refetch_queue);
+            let activity = Arc::clone(&app.activity);
+            let sender = app.op_sender.clone();
+            let target = name.clone();
+            std::thread::spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    oauth::rotate_one(&config, &target, &refetch, &activity, &sender, true);
+                }));
+            });
+            app.toast(ToastKind::Info, format!("rotating '{name}'…"));
         }
     }
 }
