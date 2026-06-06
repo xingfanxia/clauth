@@ -484,13 +484,15 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Config);
     press(&mut app, KeyCode::Right);
+    assert_eq!(app.tab, Tab::Status);
+    press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Overview, "→ wraps back to Overview");
     press(&mut app, KeyCode::Left);
-    assert_eq!(app.tab, Tab::Config, "← wraps to the last tab");
-    press(&mut app, KeyCode::Left);
-    press(&mut app, KeyCode::Left);
-    press(&mut app, KeyCode::Left);
-    press(&mut app, KeyCode::Left);
+    assert_eq!(app.tab, Tab::Status, "← wraps to the last tab");
+    // Five ← from the last tab walk back to the first.
+    for _ in 0..5 {
+        press(&mut app, KeyCode::Left);
+    }
     assert_eq!(app.tab, Tab::Overview);
 
     // ── Switch ──

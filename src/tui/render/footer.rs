@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{
-    App, ConfigFocus, FallbackFocus, FallbackHint, FooterAlert, Tab, fallback_hint,
+    App, ConfigFocus, FallbackFocus, FallbackHint, FooterAlert, StatusFocus, Tab, fallback_hint,
 };
 use super::super::theme;
 
@@ -27,7 +27,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // `q` label: "back" in a sub-focus, "quit" at top level.
     // (While armed the alert row shows instead, so this label stays "quit".)
     let has_sub_focus = (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
-        || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail);
+        || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
+        || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail);
     let q_label: &str = if has_sub_focus { "back" } else { "quit" };
 
     let tail: &[(&str, &str)] = match app.tab {
@@ -60,6 +61,21 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ("a", "actions"),
             ("?", "help"),
         ],
+        Tab::Status => match app.status.focus {
+            StatusFocus::List => &[
+                ("↑↓", "incident"),
+                ("⏎", "open"),
+                ("r", "refresh"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
+            StatusFocus::Detail => &[
+                ("↑↓", "scroll"),
+                ("a", "actions"),
+                ("esc", "back"),
+                ("?", "help"),
+            ],
+        },
         Tab::Fallback => match fallback_hint(app) {
             FallbackHint::Empty => &[("?", "help")],
             FallbackHint::ChainMember => &[
@@ -111,6 +127,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Suppress `q` on Config Actions too (⎋ backs out).
     let show_q = show_q && app.config_focus != ConfigFocus::Actions;
+
+    // Status detail keeps `esc back`; suppress the redundant `q` (mirrors the
+    // Setup-Actions / Fallback-detail house pattern).
+    let show_q = show_q && !(app.tab == Tab::Status && app.status.focus == StatusFocus::Detail);
 
     let mut hints: Vec<(&str, &str)> = std::iter::once(TAB_NAV)
         .chain(tail.iter().copied())

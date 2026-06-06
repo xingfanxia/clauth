@@ -263,6 +263,14 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("\u{23ce}", "cycle theme · flip wrap-off"),
             ][..],
         )],
+        Tab::Status => vec![(
+            "status",
+            &[
+                ("\u{2191}\u{2193}", "pick incident / scroll detail"),
+                ("\u{23ce}", "open incident timeline"),
+                ("r", "refresh the feed"),
+            ][..],
+        )],
         Tab::Fallback => vec![(
             "fallback chain",
             &[

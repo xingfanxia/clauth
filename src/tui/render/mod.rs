@@ -18,6 +18,7 @@ mod header;
 mod modals;
 mod overview;
 mod panes;
+mod status;
 mod tabs;
 mod toasts;
 mod usage;
@@ -66,6 +67,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         Tab::Setup => config::draw(frame, body_area, app),
         Tab::Fallback => chain::draw(frame, body_area, app),
         Tab::Config => global_config::draw(frame, body_area, app),
+        Tab::Status => status::draw(frame, body_area, app),
     }
     footer::draw(frame, chunks[2], app);
 
@@ -80,7 +82,8 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
 mod render_smoke {
     use super::*;
     use crate::profile::{AppConfig, AppState, Profile, ProfileName};
-    use crate::tui::app::{App, ConfigFocus};
+    use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase};
+    use crate::tui::app::{App, ConfigFocus, StatusFocus};
     use crate::usage::{UsageInfo, UsageWindow};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -109,6 +112,71 @@ mod render_smoke {
             }),
             fetch_status: None,
         }
+    }
+
+    /// Two fixture incidents so both Status panels exercise content paths: one
+    /// active (monitoring) with impact + mixed-status components + a multi-
+    /// transition update, one resolved with no impact.
+    fn demo_incidents() -> Vec<Incident> {
+        vec![
+            Incident {
+                id: "6ptd5skgmy3v".into(),
+                title: "opus 4.8 degraded service".into(),
+                link: "https://stspg.io/abc".into(),
+                phase: UpdatePhase::Monitoring,
+                impact: Impact::Minor,
+                started_ms: 1_780_740_881_000,
+                resolved_ms: None,
+                // Mixed snapshot statuses; names already paren-stripped at parse.
+                components: vec![
+                    ("claude.ai".into(), "operational".into()),
+                    ("Claude Code".into(), "degraded_performance".into()),
+                    ("Claude API".into(), "major_outage".into()),
+                ],
+                updates: vec![
+                    IncidentUpdate {
+                        phase: UpdatePhase::Monitoring,
+                        at_ms: 1_780_741_000_000,
+                        text: "a fix has been implemented and we are monitoring".into(),
+                        // Multi-transition update with varied target statuses.
+                        transitions: vec![
+                            (
+                                "claude.ai".into(),
+                                "degraded_performance".into(),
+                                "operational".into(),
+                            ),
+                            (
+                                "Claude Code".into(),
+                                "major_outage".into(),
+                                "degraded_performance".into(),
+                            ),
+                        ],
+                    },
+                    IncidentUpdate {
+                        phase: UpdatePhase::Investigating,
+                        at_ms: 1_780_740_881_000,
+                        text: "we are currently investigating this issue.".into(),
+                        transitions: Vec::new(),
+                    },
+                ],
+            },
+            Incident {
+                id: "fprlnsvdnr2k".into(),
+                title: "elevated errors on many claude models".into(),
+                link: "https://stspg.io/def".into(),
+                phase: UpdatePhase::Resolved,
+                impact: Impact::None,
+                started_ms: 1_780_684_084_000,
+                resolved_ms: Some(1_780_686_904_000),
+                components: Vec::new(),
+                updates: vec![IncidentUpdate {
+                    phase: UpdatePhase::Resolved,
+                    at_ms: 1_780_686_904_000,
+                    text: "this incident has been resolved.".into(),
+                    transitions: Vec::new(),
+                }],
+            },
+        ]
     }
 
     fn dump(app: &App, w: u16, h: u16) -> String {
@@ -145,6 +213,8 @@ mod render_smoke {
             profiles,
         };
         let mut app = App::new(config);
+        // Seed the Status feed so both panels hit content paths.
+        app.status.incidents = demo_incidents();
         for (tab, focus) in [
             (Tab::Overview, ConfigFocus::Profiles),
             (Tab::Usage, ConfigFocus::Profiles),
@@ -152,11 +222,92 @@ mod render_smoke {
             (Tab::Setup, ConfigFocus::Actions),
             (Tab::Fallback, ConfigFocus::Profiles),
             (Tab::Config, ConfigFocus::Profiles),
+            (Tab::Status, ConfigFocus::Profiles),
         ] {
             app.tab = tab;
             app.config_focus = focus;
             assert!(dump(&app, 90, 20).contains("clauth"));
         }
+
+        // Status detail focus must also render (descended pane), with the new
+        // detail rows: timeline eyebrow, components row, transition arrow.
+        app.tab = Tab::Status;
+        app.status.focus = StatusFocus::Detail;
+        let detail = dump(&app, 90, 20);
+        assert!(detail.contains("clauth"));
+        assert!(
+            detail.contains("TIMELINE"),
+            "detail timeline eyebrow renders"
+        );
+        assert!(detail.contains("components"), "components row renders");
+        assert!(detail.contains('→'), "a transition arrow renders");
+        app.status.focus = StatusFocus::List;
+    }
+
+    /// The selected incident's `BG_HOVER` tint must cover BOTH of its rows across
+    /// the full content width (incl. trailing filler) — the ratatui filler-tint
+    /// gotcha. Settles the auditor's `Color::Reset` concern with a buffer probe.
+    #[test]
+    fn status_selected_row_tint_spans_both_lines() {
+        let config = AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        };
+        let mut app = App::new(config);
+        app.status.incidents = demo_incidents();
+        app.tab = Tab::Status;
+        app.status.focus = StatusFocus::List;
+        app.status.cursor = 0;
+
+        let (w, h) = (90u16, 20u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let hover = crate::tui::theme::bg_hover();
+        let cell = |x: u16, y: u16| &buf.content[(y as usize) * (w as usize) + (x as usize)];
+
+        // Find the row carrying the selection caret in the left panel.
+        let mut caret_y = None;
+        for y in 0..h {
+            for x in 0..w {
+                if cell(x, y).symbol() == "❯" {
+                    caret_y = Some(y);
+                    break;
+                }
+            }
+            if caret_y.is_some() {
+                break;
+            }
+        }
+        let caret_y = caret_y.expect("selected incident renders a caret");
+
+        // Probe the content span on the caret row and the row below: every cell
+        // from the caret rightward must carry BG_HOVER until the padding/border
+        // edge, including trailing filler.
+        let row_has_full_tint = |y: u16| {
+            let caret_x = (0..w).find(|&x| cell(x, caret_y).symbol() == "❯").unwrap();
+            let mut saw_filler_tint = false;
+            for x in caret_x..w {
+                let c = cell(x, y);
+                if c.style().bg != Some(hover) {
+                    return saw_filler_tint && x > caret_x + 4;
+                }
+                if c.symbol() == " " {
+                    saw_filler_tint = true;
+                }
+            }
+            saw_filler_tint
+        };
+
+        assert!(
+            row_has_full_tint(caret_y),
+            "title row tint must span the full content width"
+        );
+        assert!(
+            row_has_full_tint(caret_y + 1),
+            "pill row tint must span the full content width"
+        );
     }
 
     #[test]

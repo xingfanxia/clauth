@@ -1,0 +1,703 @@
+//! Status tab — incident list on the left, the selected incident's timeline on
+//! the right. Master-detail (counts as 2 of the 3-panel budget; no third panel).
+//!
+//! The left panel is the focusable selector: each incident takes two rows, a
+//! title row and a `[ phase ]` pill row with a right-aligned relative age. Its
+//! title-right meta slot shows feed health (`operational` / `N active` /
+//! `cached`) or a spinner while a manual refresh is in flight. The right panel
+//! is a read-only timeline the list descends into with enter; up/down scrolls it.
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::symbols::border;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
+
+use super::super::app::{App, StatusFocus};
+use super::super::theme;
+use super::format::{clock_label, relative_age, spinner_frame};
+use super::panes::{draw_scrollbar, empty_state, section_box};
+use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase, shorten_component_status};
+
+/// Detail-pane key column width (matches the usage tab's `KEY_W`).
+const KEY_W: usize = 11;
+
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // Selector width: 2/5 of the body, clamped 24–40 (spec).
+    let sel_w = (area.width.saturating_mul(2) / 5).clamp(24, 40);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(sel_w), Constraint::Min(20)])
+        .split(area);
+
+    draw_incident_list(frame, cols[0], app);
+    draw_incident_detail(frame, cols[1], app);
+}
+
+// ── Left panel: incident list ─────────────────────────────────────────────────
+
+fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let focused = app.status.focus == StatusFocus::List;
+    let block = list_block(app, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.status.incidents.is_empty() {
+        // The widget already renders the `r to retry` action line, so the hint
+        // line only states the condition.
+        let widget = if app.status.error.is_some() {
+            empty_state("fetch failed", "r", "to retry")
+        } else {
+            empty_state("no status data yet", "r", "to fetch")
+        };
+        frame.render_widget(widget, inner);
+        return;
+    }
+
+    // 2 lines per incident; window so the selected item stays visible.
+    const ITEM_H: usize = 2;
+    let viewport_lines = inner.height as usize;
+    let viewport_items = (viewport_lines / ITEM_H).max(1);
+    let first_item = first_visible_item(
+        app.status.cursor,
+        viewport_items,
+        app.status.incidents.len(),
+    );
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport_lines);
+    let content_w = inner.width as usize;
+    for (i, incident) in app
+        .status
+        .incidents
+        .iter()
+        .enumerate()
+        .skip(first_item)
+        .take(viewport_items)
+    {
+        let selected = i == app.status.cursor;
+        lines.extend(incident_rows(incident, selected, focused, content_w));
+    }
+
+    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+
+    // Scrollbar: total = items * 2 lines, offset = first visible line.
+    draw_scrollbar(
+        frame,
+        inner,
+        app.status.incidents.len() * ITEM_H,
+        first_item * ITEM_H,
+        viewport_lines,
+    );
+}
+
+/// First item index to render so `cursor` is within the viewport.
+fn first_visible_item(cursor: usize, viewport_items: usize, total: usize) -> usize {
+    if total <= viewport_items {
+        return 0;
+    }
+    if cursor < viewport_items {
+        0
+    } else {
+        (cursor + 1 - viewport_items).min(total - viewport_items)
+    }
+}
+
+/// Two rendered lines for one incident: title row + phase-pill / age row. The
+/// `BG_HOVER` tint spans both lines' full content width when selected.
+fn incident_rows(
+    incident: &Incident,
+    selected: bool,
+    pane_focused: bool,
+    content_w: usize,
+) -> Vec<Line<'static>> {
+    let tint = if selected {
+        Some(theme::bg_hover())
+    } else {
+        None
+    };
+    let with_bg = |style: Style| match tint {
+        Some(c) => style.bg(c),
+        None => style,
+    };
+
+    // Line 1: caret gutter + truncated title.
+    let caret = if selected && pane_focused {
+        Span::styled(
+            "❯ ",
+            with_bg(
+                Style::default()
+                    .fg(theme::accent_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+    } else {
+        Span::styled("  ", with_bg(Style::default()))
+    };
+    // Unselected titles read as primary content (TEXT); the selected one keeps
+    // the focused TEXT + bold promotion.
+    let title_style = if selected && pane_focused {
+        with_bg(
+            Style::default()
+                .fg(theme::text_color())
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        with_bg(theme::body())
+    };
+    let title = truncate(&incident.title, content_w.saturating_sub(2));
+    let mut line1 = vec![caret, Span::styled(title, title_style)];
+    pad_to(&mut line1, content_w, tint);
+
+    // Line 2: 2-space gutter + `[ status ]` pill + optional `[ impact ]` pill +
+    // right-aligned age. Fit priority on narrow selectors: status > impact > age.
+    let (pill_word, pill_color) = phase_pill(incident);
+    let mut line2: Vec<Span<'static>> = vec![
+        Span::styled("  ", with_bg(Style::default())),
+        Span::styled("[ ", with_bg(theme::dim())),
+        Span::styled(
+            pill_word.clone(),
+            with_bg(Style::default().fg(pill_color).add_modifier(Modifier::BOLD)),
+        ),
+        Span::styled(" ]", with_bg(theme::dim())),
+    ];
+    let mut used = 2 + 2 + pill_word.chars().count() + 2;
+
+    // Impact pill (omitted when none) — only if it fits after the status pill.
+    if !matches!(incident.impact, Impact::None) {
+        let (iword, icolor) = impact_pill(&incident.impact);
+        let iwidth = 2 + 2 + iword.chars().count() + 2; // "  [ word ]"
+        if used + iwidth <= content_w {
+            line2.extend([
+                Span::styled("  [ ", with_bg(theme::dim())),
+                Span::styled(
+                    iword.clone(),
+                    with_bg(Style::default().fg(icolor).add_modifier(Modifier::BOLD)),
+                ),
+                Span::styled(" ]", with_bg(theme::dim())),
+            ]);
+            used += iwidth;
+        }
+    }
+
+    // Age — right-aligned only if it still fits after both pills + a 2-space gap.
+    let age = relative_age(incident.started_ms);
+    let age_w = age.chars().count();
+    if used + 2 + age_w <= content_w {
+        let gap = content_w - used - age_w;
+        line2.push(Span::styled(" ".repeat(gap), with_bg(Style::default())));
+        line2.push(Span::styled(age, with_bg(theme::faint())));
+    }
+    pad_to(&mut line2, content_w, tint);
+
+    vec![Line::from(line1), Line::from(line2)]
+}
+
+/// Pad a span list with tinted filler so the `BG_HOVER` tint spans the full
+/// content width (the ratatui filler-tint gotcha).
+fn pad_to(spans: &mut Vec<Span<'static>>, content_w: usize, tint: Option<ratatui::style::Color>) {
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let pad = content_w.saturating_sub(used);
+    if pad > 0 {
+        let style = match tint {
+            Some(c) => Style::default().bg(c),
+            None => Style::default(),
+        };
+        spans.push(Span::styled(" ".repeat(pad), style));
+    }
+}
+
+/// The list panel block with its title-right meta slot. The Block draws every
+/// border dash (chrome owns the dashes); the title and meta are bare tokens with
+/// single-space insets. A manual-refresh spinner lives inside the title token's
+/// trailing inset (` INCIDENTS ⠇ `), never appended after it.
+fn list_block(app: &App, focused: bool) -> Block<'static> {
+    let border_color = if focused {
+        theme::line_strong_color()
+    } else {
+        theme::line_color()
+    };
+    let border_style = Style::default().fg(border_color);
+
+    // First panel on the screen → ACCENT_2 title, italic, bold when focused.
+    let mut title_mods = Modifier::ITALIC;
+    if focused {
+        title_mods |= Modifier::BOLD;
+    }
+    let title_style = Style::default()
+        .fg(theme::accent_2_color())
+        .add_modifier(title_mods);
+
+    // Title token: ` INCIDENTS ` with the spinner inside the trailing inset.
+    let mut title_spans = vec![Span::styled(" INCIDENTS ", title_style)];
+    if app.status.fetching {
+        title_spans.push(Span::styled(
+            format!("{} ", spinner_frame(app.tick_count)),
+            theme::accent(),
+        ));
+    }
+
+    Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(border_style)
+        .title(Line::from(title_spans))
+        .title_top(Line::from(meta_spans(app)).right_aligned())
+        .padding(ratatui::widgets::Padding::horizontal(1))
+}
+
+/// Title-right meta spans — single-space insets, no border dashes (the Block
+/// draws those). Cached (stale) → `cached` (WARNING); active incidents →
+/// `N active` (WARNING); otherwise `● operational`.
+fn meta_spans(app: &App) -> Vec<Span<'static>> {
+    if app.status.cached && app.status.fetched_at_ms.is_some() {
+        return vec![Span::styled(" cached ", theme::warning())];
+    }
+    let active = app.status.active_count();
+    if active > 0 {
+        vec![Span::styled(format!(" {active} active "), theme::warning())]
+    } else {
+        vec![
+            Span::styled(" ", Style::default()),
+            Span::styled("●", theme::success()),
+            Span::styled(" operational ", theme::dim()),
+        ]
+    }
+}
+
+/// `(word, color)` for an incident's status pill from its lifecycle phase: a
+/// terminal phase (resolved / completed) is SUCCESS, any active phase is WARNING.
+fn phase_pill(incident: &Incident) -> (String, ratatui::style::Color) {
+    let color = if incident.phase.is_terminal() {
+        theme::success_color()
+    } else {
+        theme::warning_color()
+    };
+    (incident.phase.word(), color)
+}
+
+// ── Right panel: incident timeline ─────────────────────────────────────────────
+
+fn draw_incident_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let incident = app.status.selected();
+    let title = incident.map(|i| i.title.as_str()).unwrap_or("status");
+    // Read-only detail pane (focus descends but it's the second panel): blurred
+    // when the list owns focus, strong when the detail is focused.
+    let focused = app.status.focus == StatusFocus::Detail;
+    let block = section_box(title, focused, false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(incident) = incident else {
+        let hint = Paragraph::new(Line::from(Span::styled(
+            "no incident selected",
+            theme::dim(),
+        )))
+        .style(theme::base());
+        frame.render_widget(hint, inner);
+        return;
+    };
+
+    let lines = detail_lines(incident, inner.width as usize);
+    let total = lines.len();
+    let viewport = inner.height as usize;
+
+    // Clamp the scroll so the last line stays reachable but the body never
+    // scrolls past its end. Record the bound so the key handler can clamp state
+    // too (otherwise a held ↓ inflates `detail_scroll` past the end).
+    let max_scroll = total.saturating_sub(viewport).min(u16::MAX as usize) as u16;
+    app.status.detail_max_scroll.set(max_scroll);
+    let scroll = app.status.detail_scroll.min(max_scroll);
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((scroll, 0)),
+        inner,
+    );
+    draw_scrollbar(frame, inner, total, scroll as usize, viewport);
+}
+
+/// Build the full detail view as styled lines (header, started / components
+/// rows, link, eyebrow, per-update timeline). The caller scrolls / clamps; this
+/// is pure layout.
+fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Header: status pill + impact pill + age + duration / ongoing.
+    let (pill_word, pill_color) = phase_pill(incident);
+    let mut header = vec![
+        Span::styled("[ ", theme::dim()),
+        Span::styled(
+            pill_word,
+            Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ]", theme::dim()),
+    ];
+    // Impact pill — omitted entirely when impact is none.
+    if !matches!(incident.impact, Impact::None) {
+        let (iword, icolor) = impact_pill(&incident.impact);
+        header.extend([
+            Span::styled("  [ ", theme::dim()),
+            Span::styled(
+                iword,
+                Style::default().fg(icolor).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ]", theme::dim()),
+        ]);
+    }
+    header.push(Span::styled(
+        format!("  {}", relative_age(incident.started_ms)),
+        theme::faint(),
+    ));
+    // Duration: `· lasted <dur>` when resolved, `· ongoing` otherwise.
+    match incident.resolved_ms {
+        Some(resolved) if resolved >= incident.started_ms => {
+            let dur = duration_label((resolved - incident.started_ms) / 1000);
+            header.push(Span::styled(format!(" · lasted {dur}"), theme::faint()));
+        }
+        _ => header.push(Span::styled(" · ongoing", theme::faint())),
+    }
+    lines.push(Line::from(header));
+
+    // started row (the one place the `utc` suffix appears).
+    lines.push(Line::from(vec![
+        key_span("started"),
+        Span::styled(clock_label(incident.started_ms, true), theme::body()),
+    ]));
+
+    // components row — status-dot-prefixed entries, 2-space gaps; omitted when
+    // empty. Narrow panes fit whole entries only and append `+N` for the rest.
+    if !incident.components.is_empty() {
+        lines.push(components_line(&incident.components, inner_w));
+    }
+
+    // Link line, middle-truncated to width (kept as-is per user).
+    if !incident.link.is_empty() {
+        lines.push(Line::from(Span::styled(
+            middle_truncate(&incident.link, inner_w),
+            theme::faint(),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("TIMELINE", theme::dim())));
+
+    // Per update (newest first). Columns: time | phase word | wrapped body.
+    let time_col = incident
+        .updates
+        .iter()
+        .map(|u| clock_label(u.at_ms, false).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("jun 6, 10:14".chars().count())
+        .min(18);
+    let phase_col = 13; // widest phase word ("investigating") + gap
+    let indent = time_col + 1 + phase_col + 1;
+    let body_w = inner_w.saturating_sub(indent).max(8);
+
+    for update in &incident.updates {
+        lines.extend(update_lines(update, time_col, phase_col, body_w, indent));
+    }
+    lines
+}
+
+/// Render one update: a `time | phase | wrapped body` row (body wraps with a
+/// hanging indent under the body column), then one `TEXT_FAINT` continuation
+/// line per changed component, indented to the body column.
+fn update_lines(
+    update: &IncidentUpdate,
+    time_col: usize,
+    phase_col: usize,
+    body_w: usize,
+    indent: usize,
+) -> Vec<Line<'static>> {
+    let time = pad_right(&clock_label(update.at_ms, false), time_col);
+    let phase = pad_right(&update.phase.word(), phase_col);
+    let phase_color = phase_text_color(&update.phase);
+
+    let wrapped = wrap_text(&update.text, body_w);
+    let mut out = Vec::with_capacity(wrapped.len() + update.transitions.len());
+    let first_body = wrapped.first().cloned().unwrap_or_default();
+    out.push(Line::from(vec![
+        Span::styled(format!("{time} "), theme::dim()),
+        Span::styled(format!("{phase} "), Style::default().fg(phase_color)),
+        Span::styled(first_body, theme::dim()),
+    ]));
+    for cont in wrapped.iter().skip(1) {
+        out.push(Line::from(vec![
+            Span::raw(" ".repeat(indent)),
+            Span::styled(cont.clone(), theme::dim()),
+        ]));
+    }
+    out.extend(transition_lines(&update.transitions, indent, body_w));
+    out
+}
+
+/// Aligned, colored transition block, one line per changed component, indented
+/// to the body column: `name  → new`. The name column is left-padded to the
+/// block's widest name + a 2-space gap; the arrow renders `TEXT_FAINT`; the new
+/// status carries its semantic color (the previous state is dropped — the prior
+/// timeline entry already shows it). Width-safe: an over-long line truncates the
+/// NAME column first, then trailing-truncates the whole line as a last resort.
+fn transition_lines(
+    transitions: &[(String, String, String)],
+    indent: usize,
+    body_w: usize,
+) -> Vec<Line<'static>> {
+    if transitions.is_empty() {
+        return Vec::new();
+    }
+    // Pre-shorten the new status; the name column is sized to the widest name.
+    let rows: Vec<(String, String)> = transitions
+        .iter()
+        .map(|(name, _, new)| (name.to_lowercase(), shorten_component_status(new)))
+        .collect();
+    let widest_name = rows
+        .iter()
+        .map(|(n, _)| n.chars().count())
+        .max()
+        .unwrap_or(0);
+    // Reserve room for ` → new` so the name column can shrink under pressure.
+    let max_status = rows
+        .iter()
+        .map(|(_, n)| 2 + n.chars().count())
+        .max()
+        .unwrap_or(0);
+    // Name column width: widest name, but shrunk so `name  → new` fits body_w.
+    let name_col = widest_name
+        .min(body_w.saturating_sub(2 + max_status).max(3))
+        .max(1);
+
+    rows.into_iter()
+        .map(|(name, new)| {
+            let name = pad_right(&truncate(&name, name_col), name_col);
+            let new_color = component_status_color(&new);
+            let spans = vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(format!("{name}  "), theme::faint()),
+                Span::styled("→ ", theme::faint()),
+                Span::styled(new, Style::default().fg(new_color)),
+            ];
+            // Last-resort guard: if the assembled content still overflows body_w,
+            // trailing-truncate the whole line so ratatui never clips silently.
+            let content_w: usize = spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+                - indent;
+            if content_w > body_w {
+                let mut flat = String::new();
+                for s in spans.iter().skip(1) {
+                    flat.push_str(&s.content);
+                }
+                Line::from(vec![
+                    Span::raw(" ".repeat(indent)),
+                    Span::styled(truncate(&flat, body_w), theme::faint()),
+                ])
+            } else {
+                Line::from(spans)
+            }
+        })
+        .collect()
+}
+
+/// Semantic timeline color per phase: resolved/completed SUCCESS, monitoring &
+/// in-progress/verifying INFO, identified/investigating WARNING, scheduled &
+/// update/other TEXT_DIM.
+fn phase_text_color(phase: &UpdatePhase) -> ratatui::style::Color {
+    match phase {
+        UpdatePhase::Resolved | UpdatePhase::Completed => theme::success_color(),
+        UpdatePhase::Monitoring | UpdatePhase::InProgress | UpdatePhase::Verifying => {
+            theme::info_color()
+        }
+        UpdatePhase::Identified | UpdatePhase::Investigating => theme::warning_color(),
+        UpdatePhase::Update | UpdatePhase::Scheduled | UpdatePhase::Other(_) => {
+            theme::text_dim_color()
+        }
+    }
+}
+
+/// `(word, color)` for an impact pill. Minor → WARNING; major/critical → DANGER;
+/// none/maintenance/other → neutral TEXT_DIM.
+fn impact_pill(impact: &Impact) -> (String, ratatui::style::Color) {
+    let color = match impact {
+        Impact::Minor => theme::warning_color(),
+        Impact::Major | Impact::Critical => theme::danger_color(),
+        Impact::None | Impact::Maintenance | Impact::Other(_) => theme::text_dim_color(),
+    };
+    (impact.word(), color)
+}
+
+/// Semantic color for a component status (raw or shortened word): operational →
+/// SUCCESS, degraded → WARNING, partial/major outage → DANGER, maintenance →
+/// TEXT_DIM, unknown → TEXT_FAINT.
+fn component_status_color(status: &str) -> ratatui::style::Color {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "operational" => theme::success_color(),
+        "degraded" | "degraded_performance" => theme::warning_color(),
+        "partial outage" | "partial_outage" | "major outage" | "major_outage" => {
+            theme::danger_color()
+        }
+        "maintenance" | "under_maintenance" => theme::text_dim_color(),
+        _ => theme::text_faint_color(),
+    }
+}
+
+/// Build the detail `components` row: `● name  ● name …`. The dot alone carries
+/// the component's first-reported status (user decision — no status word; the
+/// name is `theme::body()`, lowercased — value-row consistency, a house
+/// deviation from the dim-label rule). Fits whole entries only; dropped entries
+/// append `+N`. When the column has zero room, shows just `…`.
+fn components_line(components: &[(String, String)], inner_w: usize) -> Line<'static> {
+    let avail = inner_w.saturating_sub(KEY_W);
+    let mut spans: Vec<Span<'static>> = vec![key_span("components")];
+
+    // Zero-width guard: no room for even one entry → a faint ellipsis.
+    if avail == 0 {
+        spans.push(Span::styled("…", theme::faint()));
+        return Line::from(spans);
+    }
+
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    for (i, (name, status)) in components.iter().enumerate() {
+        let label = name.to_lowercase();
+        // Each entry: "● name", preceded by a 2-space gap except the first.
+        let gap = if i == 0 { 0 } else { 2 };
+        let entry_w = gap + 2 + label.chars().count();
+        // Reserve room for a possible trailing `  +N` when more remain.
+        let remaining_after = components.len() - i - 1;
+        let reserve = if remaining_after > 0 {
+            2 + 1 + count_digits(remaining_after)
+        } else {
+            0
+        };
+        if used + entry_w + reserve > avail && shown > 0 {
+            break;
+        }
+        if gap > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            "●",
+            Style::default().fg(component_status_color(status)),
+        ));
+        spans.push(Span::styled(format!(" {label}"), theme::body()));
+        used += entry_w;
+        shown += 1;
+    }
+    let dropped = components.len() - shown;
+    if dropped > 0 {
+        spans.push(Span::styled(format!("  +{dropped}"), theme::faint()));
+    }
+    Line::from(spans)
+}
+
+/// Decimal digit count of `n` (for reserving `+N` width).
+fn count_digits(n: usize) -> usize {
+    if n == 0 { 1 } else { (n.ilog10() + 1) as usize }
+}
+
+/// Single-largest-unit duration label for a span in seconds: `47m`, `2h`, `3d`.
+fn duration_label(secs: u64) -> String {
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    if days >= 1 {
+        format!("{days}d")
+    } else if hours >= 1 {
+        format!("{hours}h")
+    } else {
+        format!("{}m", mins.max(1))
+    }
+}
+
+/// Detail key column: `key` padded to [`KEY_W`] in the eyebrow label style.
+fn key_span(key: &str) -> Span<'static> {
+    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
+    Span::styled(format!("{key}{}", " ".repeat(pad)), theme::label())
+}
+
+// ── Small text helpers ──────────────────────────────────────────────────────
+
+/// Trailing-ellipsis truncation to `max` chars.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Middle-ellipsis truncation (for URLs / IDs — both ends carry meaning).
+fn middle_truncate(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max || max < 3 {
+        return truncate(s, max);
+    }
+    let keep = max - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let front: String = chars[..head].iter().collect();
+    let back: String = chars[chars.len() - tail..].iter().collect();
+    format!("{front}…{back}")
+}
+
+/// Pad `s` on the right to `width` chars (truncating with `…` if longer).
+fn pad_right(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    if count > width {
+        return truncate(s, width);
+    }
+    format!("{s}{}", " ".repeat(width - count))
+}
+
+/// Greedy word-wrap to `width` chars; long words are hard-split.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if word.chars().count() > width {
+            // Flush, then hard-split the oversized word.
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            if !chunk.is_empty() {
+                line = chunk;
+            }
+            continue;
+        }
+        let extra = if line.is_empty() { 0 } else { 1 };
+        if line.chars().count() + extra + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+            line.push_str(word);
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}

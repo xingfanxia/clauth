@@ -37,6 +37,7 @@ use crate::profile::{
     save_profile,
 };
 use crate::runtime::has_live_session;
+use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
@@ -305,6 +306,9 @@ pub(crate) enum ActionMenuAction {
     EditField,
     // Program-wide Config tab
     CycleTheme,
+    // Status tab
+    RefreshStatus,
+    OpenIncidentLink,
 }
 
 /// State for the action-menu modal.
@@ -378,6 +382,8 @@ impl ActionMenuAction {
             Self::CreateProfile => "create profile",
             Self::EditField => "edit field",
             Self::CycleTheme => "cycle theme",
+            Self::RefreshStatus => "refresh status",
+            Self::OpenIncidentLink => "open in browser",
         }
     }
 }
@@ -433,15 +439,18 @@ pub(crate) enum Tab {
     Fallback,
     /// Program-wide settings: theme tier and global defaults.
     Config,
+    /// Claude service status feed (incidents from status.claude.com).
+    Status,
 }
 
 impl Tab {
-    pub(crate) const ALL: [Tab; 5] = [
+    pub(crate) const ALL: [Tab; 6] = [
         Tab::Overview,
         Tab::Usage,
         Tab::Setup,
         Tab::Fallback,
         Tab::Config,
+        Tab::Status,
     ];
 
     pub(crate) fn title(self) -> &'static str {
@@ -451,6 +460,7 @@ impl Tab {
             Tab::Setup => "Setup",
             Tab::Fallback => "Fallback",
             Tab::Config => "Config",
+            Tab::Status => "Status",
         }
     }
 
@@ -480,6 +490,83 @@ pub(crate) enum ConfigFocus {
 pub(crate) enum FallbackFocus {
     Chain,
     Detail,
+}
+
+// ── Status tab ─────────────────────────────────────────────────────────────────
+
+/// Which Status pane has focus. `List`: the incident selector (↑↓ + ⏎ descends).
+/// `Detail`: the selected incident's timeline (↑↓ scrolls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusFocus {
+    List,
+    Detail,
+}
+
+/// UI-thread-only state for the Status tab. Fed by [`StatusEvent`]s drained in
+/// `on_tick`; never shared with the background thread (which only sends events).
+#[derive(Debug)]
+pub(crate) struct StatusState {
+    /// Incidents in feed order (newest first).
+    pub(crate) incidents: Vec<Incident>,
+    /// Wall-clock ms of the last successful fetch / cache load; `None` until any
+    /// event arrives. Drives the "cached / stale" age cue.
+    pub(crate) fetched_at_ms: Option<u64>,
+    /// True when the last event was `Cached` (startup cache or fetch-failed
+    /// fallback) — render the data as cached rather than fresh.
+    pub(crate) cached: bool,
+    /// Set only when a fetch failed with nothing cached to show.
+    pub(crate) error: Option<String>,
+    /// A manual refresh is in flight → the panel title shows a spinner.
+    pub(crate) fetching: bool,
+    /// Selected incident index in `incidents`.
+    pub(crate) cursor: usize,
+    pub(crate) focus: StatusFocus,
+    /// Scroll offset (lines) into the detail timeline.
+    pub(crate) detail_scroll: u16,
+    /// Max valid `detail_scroll` from the last detail render (`total - viewport`).
+    /// The render pass owns the real geometry, so it writes the bound here (via
+    /// `&App` interior mutability) and the key handler clamps against it — that
+    /// stops a held ↓ from inflating `detail_scroll` toward `u16::MAX`.
+    pub(crate) detail_max_scroll: std::cell::Cell<u16>,
+    /// Newest incident id already signalled, so a refresh only toasts genuinely
+    /// new incidents (not the initial load).
+    pub(crate) seen_latest: Option<String>,
+}
+
+impl Default for StatusState {
+    fn default() -> Self {
+        Self {
+            incidents: Vec::new(),
+            fetched_at_ms: None,
+            cached: false,
+            error: None,
+            fetching: false,
+            cursor: 0,
+            focus: StatusFocus::List,
+            detail_scroll: 0,
+            detail_max_scroll: std::cell::Cell::new(0),
+            seen_latest: None,
+        }
+    }
+}
+
+impl StatusState {
+    /// The incident currently under the cursor, if any.
+    pub(crate) fn selected(&self) -> Option<&Incident> {
+        self.incidents.get(self.cursor)
+    }
+
+    /// How many incidents are still active (status not `resolved`/`completed`).
+    pub(crate) fn active_count(&self) -> usize {
+        self.incidents.iter().filter(|i| i.is_active()).count()
+    }
+}
+
+/// An incident is active when its lifecycle status is not terminal
+/// (`resolved` / `completed`). Thin wrapper over [`Incident::is_active`] for the
+/// render layer.
+pub(crate) fn incident_is_active(incident: &Incident) -> bool {
+    incident.is_active()
 }
 
 // ── Footer alert ─────────────────────────────────────────────────────────────
@@ -585,6 +672,13 @@ pub(crate) struct App {
     /// Startup update check result; drained in `on_tick`. Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
 
+    /// Claude status feed state; UI-thread-only (no shared lock).
+    pub(crate) status: StatusState,
+    /// Status feed events from the background thread; drained in `on_tick`.
+    pub(crate) status_events: std::sync::mpsc::Receiver<StatusEvent>,
+    /// Manual-refresh signal to the status thread; a `()` triggers a refetch.
+    pub(crate) status_refresh: std::sync::mpsc::Sender<()>,
+
     pub(crate) last_state_mtime: Option<SystemTime>,
     pub(crate) started_at: Instant,
     /// Tick counter; advances the activity spinner frame each `on_tick`.
@@ -668,6 +762,21 @@ impl App {
         let (update_sender, update_results) = std::sync::mpsc::channel::<UpdateEvent>();
         update::spawn(update_sender);
 
+        // Status feed worker: streams incidents over `status_events`; a `()` on
+        // `status_refresh` triggers a manual refetch. The channels are always
+        // created (so the drains stay inert), but the thread is skipped under
+        // `cfg!(test)`: a detached worker could outlive a test's `HOME_OVERRIDE`
+        // scope and its cache write would then resolve the real `~/.clauth`.
+        let (status_sender, status_events) = std::sync::mpsc::channel::<StatusEvent>();
+        let (status_refresh, status_refresh_rx) = std::sync::mpsc::channel::<()>();
+        if cfg!(test) {
+            // Drop the worker's ends so they aren't flagged unused; the stored
+            // `status_refresh` sender simply has no receiver in tests.
+            drop((status_sender, status_refresh_rx));
+        } else {
+            status::spawn(status_sender, status_refresh_rx);
+        }
+
         Self {
             config: Arc::new(RankedMutex::new(config)),
             usage_store,
@@ -700,6 +809,9 @@ impl App {
             toasts: VecDeque::new(),
             compact: false,
             update_results,
+            status: StatusState::default(),
+            status_events,
+            status_refresh,
             last_state_mtime: app_state_mtime(),
             started_at: Instant::now(),
             tick_count: 0,
@@ -1113,6 +1225,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('r') => {
             app.disarm_quit();
+            // Status `r` refreshes the whole feed.
+            if app.tab == Tab::Status {
+                trigger_status_refresh(app);
+                return;
+            }
             // Usage `r` refreshes only the current account.
             if app.tab == Tab::Usage {
                 let selected = {
@@ -1161,6 +1278,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 app.config_draft = None;
             } else if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
                 leave_fallback_detail(app);
+            } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
+                app.status.focus = StatusFocus::List;
             }
             // At top level, Esc is a no-op — ctrl+c or `q q` to quit.
             return;
@@ -1169,14 +1288,17 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // When there is a sub-focus to back out of, `q` ascends instead.
         KeyCode::Char('q') => {
             let has_sub_focus = (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
-                || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail);
+                || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
+                || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail);
             if has_sub_focus {
                 app.disarm_quit();
                 if app.tab == Tab::Setup {
                     app.config_focus = ConfigFocus::Profiles;
                     app.config_draft = None;
-                } else {
+                } else if app.tab == Tab::Fallback {
                     leave_fallback_detail(app);
+                } else {
+                    app.status.focus = StatusFocus::List;
                 }
             } else if app.armed_quit {
                 app.quit = true;
@@ -1212,6 +1334,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         Tab::Setup => handle_config_key(app, key),
         Tab::Fallback => handle_fallback_key(app, key),
         Tab::Config => handle_global_config_key(app, key),
+        Tab::Status => handle_status_key(app, key),
     }
 }
 
@@ -1238,6 +1361,10 @@ fn switch_tab(app: &mut App, tab: Tab) {
         }
         Tab::Config => {
             app.global_config_cursor = 0;
+        }
+        Tab::Status => {
+            // Keep the incident cursor; reset focus to the list per the contract.
+            app.status.focus = StatusFocus::List;
         }
     }
 }
@@ -1269,6 +1396,73 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up => step_profile_cursor(app, -1, count),
         KeyCode::Down => step_profile_cursor(app, 1, count),
         _ => {}
+    }
+}
+
+/// Status tab keymap. List focus: ↑↓ moves the incident cursor (wrapping), ⏎
+/// descends into the timeline (only when an incident exists). Detail focus: ↑↓
+/// scrolls the timeline (clamped to content by the render pass).
+fn handle_status_key(app: &mut App, key: KeyEvent) {
+    match app.status.focus {
+        StatusFocus::List => {
+            let len = app.status.incidents.len();
+            match key.code {
+                KeyCode::Up if len > 0 => {
+                    app.status.cursor = (app.status.cursor + len - 1).rem_euclid(len.max(1));
+                    app.status.detail_scroll = 0;
+                }
+                KeyCode::Down if len > 0 => {
+                    app.status.cursor = (app.status.cursor + 1).rem_euclid(len.max(1));
+                    app.status.detail_scroll = 0;
+                }
+                KeyCode::Enter if len > 0 => {
+                    app.status.focus = StatusFocus::Detail;
+                    // Open at the top of the timeline.
+                    app.status.detail_scroll = 0;
+                }
+                _ => {}
+            }
+        }
+        StatusFocus::Detail => match key.code {
+            KeyCode::Up => {
+                app.status.detail_scroll = app.status.detail_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                // Clamp against the last render's content height so a held ↓ can't
+                // run the offset past the end (which would make ↑ look dead).
+                let max = app.status.detail_max_scroll.get();
+                app.status.detail_scroll = app.status.detail_scroll.saturating_add(1).min(max);
+            }
+            _ => {}
+        },
+    }
+}
+
+/// Signal the status thread to refetch and light the title spinner.
+fn trigger_status_refresh(app: &mut App) {
+    let _ = app.status_refresh.send(());
+    app.status.fetching = true;
+    app.toast(ToastKind::Info, "refreshing status…");
+}
+
+/// Open the selected incident's page in the default browser (detached).
+fn open_incident_link(app: &mut App) {
+    let Some(link) = app.status.selected().map(|i| i.link.clone()) else {
+        return;
+    };
+    if link.is_empty() {
+        app.toast(ToastKind::Info, "no link for this incident");
+        return;
+    }
+    let spawned = std::process::Command::new("xdg-open")
+        .arg(&link)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(_) => app.toast(ToastKind::Info, "opening in browser"),
+        Err(_) => app.toast(ToastKind::Danger, "failed to open browser"),
     }
 }
 
@@ -2036,6 +2230,12 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 }
             }
         }
+        Tab::Status => {
+            actions.push(RefreshStatus);
+            if app.status.selected().is_some() {
+                actions.push(OpenIncidentLink);
+            }
+        }
     }
 
     ActionMenuState::new(actions)
@@ -2182,6 +2382,8 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             }
         }
         ActionMenuAction::CycleTheme => cycle_theme(app),
+        ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
+        ActionMenuAction::OpenIncidentLink => open_incident_link(app),
     }
 }
 
@@ -2905,6 +3107,114 @@ fn apply_input_edit(input: &mut InputState, key: KeyEvent) {
 
 // ── Per-tick maintenance ──────────────────────────────────────────────────────
 
+/// Apply queued status-feed events to `app.status`. Surfaces a new-incident cue
+/// (toast on the Status tab, tab-activity color elsewhere) and a manual-refresh
+/// failure toast. Manual refresh always clears `fetching`.
+fn drain_status_events(app: &mut App) {
+    while let Ok(ev) = app.status_events.try_recv() {
+        match ev {
+            StatusEvent::Fetched {
+                incidents,
+                fetched_at_ms,
+            } => {
+                let was_manual = app.status.fetching;
+                apply_status_incidents(app, incidents, fetched_at_ms, false, was_manual);
+            }
+            StatusEvent::Cached {
+                incidents,
+                fetched_at_ms,
+            } => {
+                // A cache fallback after a manual refresh means the live fetch
+                // failed — surface that as a danger toast.
+                let was_manual = app.status.fetching;
+                apply_status_incidents(app, incidents, fetched_at_ms, true, false);
+                if was_manual {
+                    app.status.fetching = false;
+                    app.toast(ToastKind::Danger, "status refresh failed — showing cached");
+                }
+            }
+            StatusEvent::Failed(msg) => {
+                let was_manual = app.status.fetching;
+                app.status.fetching = false;
+                // Keep an error only while nothing is loaded; avoid toast spam on
+                // the steady-state retry loop. A manual failure does toast.
+                if app.status.incidents.is_empty() {
+                    app.status.error = Some(msg);
+                }
+                if was_manual {
+                    app.toast(ToastKind::Danger, "status refresh failed");
+                }
+            }
+        }
+    }
+}
+
+/// Replace the incident list, clear the spinner, clamp the cursor, and run the
+/// new-incident signal. `cached` marks the data as a cache load / fallback.
+/// `manual` is true when this `Fetched` answers a manual refresh (toasts there).
+fn apply_status_incidents(
+    app: &mut App,
+    incidents: Vec<Incident>,
+    fetched_at_ms: u64,
+    cached: bool,
+    manual: bool,
+) {
+    let prev_selected_id = app.status.selected().map(|i| i.id.clone());
+
+    app.status.fetching = false;
+    app.status.cached = cached;
+    app.status.fetched_at_ms = Some(fetched_at_ms);
+    if !cached {
+        app.status.error = None;
+    }
+
+    // New-incident signal: compare the newest id to the last one we signalled.
+    let newest_id = incidents.first().map(|i| i.id.clone());
+    if let Some(newest) = &newest_id
+        && app.status.seen_latest.as_ref() != Some(newest)
+    {
+        let is_initial = app.status.seen_latest.is_none();
+        // Only signal genuinely new incidents, never the initial load.
+        if !is_initial && let Some(incident) = incidents.first() {
+            let severity = if incident_is_active(incident) {
+                ToastKind::Warning
+            } else {
+                ToastKind::Info
+            };
+            if app.tab == Tab::Status {
+                let title = truncate_chars(&incident.title, 40);
+                app.toast(severity, format!("new incident · {title}"));
+            } else {
+                app.set_tab_activity(Tab::Status, severity);
+            }
+        }
+        app.status.seen_latest = newest_id.clone();
+    }
+    let _ = manual; // a fresh `Fetched` needs no extra toast beyond the new-incident cue.
+
+    app.status.incidents = incidents;
+
+    // Clamp the cursor and reset the detail scroll if the selection changed.
+    if app.status.incidents.is_empty() {
+        app.status.cursor = 0;
+    } else if app.status.cursor >= app.status.incidents.len() {
+        app.status.cursor = app.status.incidents.len() - 1;
+    }
+    if app.status.selected().map(|i| i.id.clone()) != prev_selected_id {
+        app.status.detail_scroll = 0;
+    }
+}
+
+/// Truncate a string to `max` chars, appending `…` when cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
 
@@ -2927,6 +3237,7 @@ pub(crate) fn on_tick(app: &mut App) {
     }
 
     drain_op_results(app);
+    drain_status_events(app);
 
     if app.reload_if_state_changed() {
         app.clamp_profile_cursor();

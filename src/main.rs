@@ -12,6 +12,7 @@ mod profile;
 mod runtime;
 mod spinner;
 mod start;
+mod status;
 mod tui;
 mod update;
 mod ureq_error;

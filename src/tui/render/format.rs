@@ -130,6 +130,64 @@ pub(super) fn format_reset(window: &UsageWindow) -> Option<String> {
     Some(crate::usage::humanize_duration(secs))
 }
 
+/// Relative age of an epoch-ms timestamp per the cloudy-tui Time-formatting
+/// contract: single largest unit under 30 days (`4m ago`, `2h ago`, `3d ago`,
+/// `2w ago`); the absolute ISO date (`2026-04-12`) at 30 days and beyond.
+/// `< 1 minute` reads `just now`.
+pub(super) fn relative_age(epoch_ms: u64) -> String {
+    let now = crate::usage::now_ms();
+    let age_secs = (now.saturating_sub(epoch_ms) / 1000) as i64;
+    let mins = age_secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    let weeks = days / 7;
+    if age_secs < 60 {
+        "just now".to_string()
+    } else if days < 1 {
+        if hours < 1 {
+            format!("{mins}m ago")
+        } else {
+            format!("{hours}h ago")
+        }
+    } else if days < 30 {
+        if weeks < 1 {
+            format!("{days}d ago")
+        } else {
+            format!("{weeks}w ago")
+        }
+    } else {
+        // ≥ 30 days → absolute ISO date (date portion only).
+        let iso = crate::usage::epoch_secs_to_iso((epoch_ms / 1000) as i64);
+        iso.split('T').next().unwrap_or(&iso).to_string()
+    }
+}
+
+/// Lowercase clock label for an epoch-ms timestamp: `jun 5, 18:27`. A comma sits
+/// directly after the day, no space before it. With `utc = true` appends ` utc`
+/// (used only on the detail `started` row). All times are UTC.
+pub(super) fn clock_label(epoch_ms: u64, utc: bool) -> String {
+    // `epoch_secs_to_iso` → `YYYY-MM-DDTHH:MM:SS+00:00`.
+    let iso = crate::usage::epoch_secs_to_iso((epoch_ms / 1000) as i64);
+    let bytes = iso.as_bytes();
+    // Defensive: a malformed ISO string degrades to the raw value.
+    if bytes.len() < 16 || bytes[10] != b'T' {
+        return iso;
+    }
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let month: usize = iso[5..7].parse().unwrap_or(1);
+    let mon = MONTHS
+        .get(month.saturating_sub(1))
+        .copied()
+        .unwrap_or("jan");
+    // Day without a leading zero.
+    let day: u32 = iso[8..10].parse().unwrap_or(0);
+    let hm = &iso[11..16]; // HH:MM
+    let suffix = if utc { " utc" } else { "" };
+    format!("{mon} {day}, {hm}{suffix}")
+}
+
 /// Green/yellow/red headroom against a member's threshold (crossing = rotate).
 pub(super) fn health_color(pct: f64, threshold: f64) -> ratatui::style::Color {
     if pct >= threshold {

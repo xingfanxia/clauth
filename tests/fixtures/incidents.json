@@ -1,0 +1,142 @@
+{
+  "page": {
+    "id": "tymt9n04zgry",
+    "name": "Claude"
+  },
+  "incidents": [
+    {
+      "id": "6ptd5skgmy3v",
+      "name": "Elevated errors on Claude Opus 4.8",
+      "status": "resolved",
+      "impact": "minor",
+      "created_at": "2026-06-06T18:37:44.139Z",
+      "started_at": "2026-06-06T18:37:44.116Z",
+      "monitoring_at": null,
+      "resolved_at": "2026-06-06T19:05:27.178Z",
+      "updated_at": "2026-06-06T19:05:27.193Z",
+      "shortlink": "https://stspg.io/32dgd2bnmh8z",
+      "incident_updates": [
+        {
+          "status": "resolved",
+          "body": "From 18:12–18:55, we saw elevated errors on requests to Claude Opus 4.8. This issue has been resolved.",
+          "display_at": "2026-06-06T19:05:27.178Z",
+          "affected_components": [
+            {
+              "code": "rwppv331jlwc",
+              "name": "claude.ai",
+              "old_status": "degraded_performance",
+              "new_status": "operational"
+            },
+            {
+              "code": "k8w3r06qmzrp",
+              "name": "Claude API (api.anthropic.com)",
+              "old_status": "degraded_performance",
+              "new_status": "operational"
+            }
+          ]
+        },
+        {
+          "status": "identified",
+          "body": "We are experiencing elevated error rates on Claude Opus 4.8. Our team has identified the issue and is working to fully resolve these errors.",
+          "display_at": "2026-06-06T18:37:44.395Z",
+          "affected_components": [
+            {
+              "code": "rwppv331jlwc",
+              "name": "claude.ai",
+              "old_status": "operational",
+              "new_status": "degraded_performance"
+            },
+            {
+              "code": "k8w3r06qmzrp",
+              "name": "Claude API (api.anthropic.com)",
+              "old_status": "operational",
+              "new_status": "degraded_performance"
+            }
+          ]
+        }
+      ],
+      "components": [
+        {
+          "name": "claude.ai",
+          "status": "operational"
+        },
+        {
+          "name": "Claude API (api.anthropic.com)",
+          "status": "operational"
+        }
+      ]
+    },
+    {
+      "id": "maint01",
+      "name": "Scheduled database maintenance",
+      "status": "in_progress",
+      "impact": "maintenance",
+      "created_at": "2026-06-04T02:00:00.000Z",
+      "started_at": "2026-06-04T02:00:00.000Z",
+      "monitoring_at": null,
+      "resolved_at": null,
+      "updated_at": "2026-06-04T02:05:00.500Z",
+      "shortlink": "https://stspg.io/maint01",
+      "incident_updates": [
+        {
+          "status": "in_progress",
+          "body": "Maintenance is underway.",
+          "display_at": "2026-06-04T02:05:00.500Z",
+          "affected_components": null
+        },
+        {
+          "status": "scheduled",
+          "body": "Maintenance scheduled.",
+          "display_at": "2026-06-04T02:00:00.000Z",
+          "affected_components": [
+            {
+              "code": "x",
+              "name": "claude.ai",
+              "old_status": "operational",
+              "new_status": "under_maintenance"
+            }
+          ]
+        }
+      ],
+      "components": [
+        {
+          "name": "claude.ai",
+          "status": "under_maintenance"
+        }
+      ]
+    },
+    {
+      "id": "weird01",
+      "name": "Weird impact incident",
+      "status": "resolved",
+      "impact": "catastrophic",
+      "created_at": "2026-06-02T00:00:00.000Z",
+      "started_at": "2026-06-02T00:00:00.000Z",
+      "monitoring_at": null,
+      "resolved_at": "2026-06-02T00:30:00.000Z",
+      "updated_at": "2026-06-02T00:30:00.000Z",
+      "shortlink": "https://stspg.io/weird01",
+      "incident_updates": [
+        {
+          "status": "surprise",
+          "body": "Odd one.",
+          "display_at": "2026-06-02T00:30:00.000Z",
+          "affected_components": [
+            {
+              "code": "y",
+              "name": "claude.ai",
+              "old_status": "operational",
+              "new_status": "operational"
+            }
+          ]
+        }
+      ],
+      "components": [
+        {
+          "name": "claude.ai",
+          "status": "operational"
+        }
+      ]
+    }
+  ]
+}
