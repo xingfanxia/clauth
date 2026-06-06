@@ -31,9 +31,9 @@ const GAUGE_W: usize = 22;
 /// Key column width, matching the Setup tab.
 const KEY_W: usize = 11;
 /// Fixed lines `member_detail` pushes before the FALLBACK_ROWS loop: priority,
-/// blank, `5h usage` eyebrow, gauge, figure, blank. The native-cursor math and
-/// the `rotate at` row index both key off this.
-const ROWS_BEFORE: usize = 6;
+/// blank, `5h usage` gauge (key row), headroom figure, blank. The native-cursor
+/// math and the `rotate at` row index both key off this.
+const ROWS_BEFORE: usize = 5;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
@@ -150,7 +150,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Position the native terminal cursor when the threshold field is being typed,
     // matching the post-draw cursor path the other edit screens use. The `rotate at`
     // row is FALLBACK_ROWS[0]; member_detail pushes exactly `ROWS_BEFORE` fixed
-    // lines before the loop (priority, blank, eyebrow, gauge, figure, blank).
+    // lines before the loop (priority, blank, gauge, figure, blank).
     if detail_focused
         && let Some(ChainItemKind::Member(_)) = selected
         && let Some(draft) = &app.fallback_threshold_draft
@@ -211,21 +211,29 @@ fn member_detail(
     lines.push(Line::from(priority_spans));
     lines.push(Line::from(""));
 
-    // `5h usage` eyebrow — UPPERCASE-tracked, TEXT_DIM, no bold (DNA: eyebrows
-    // carry on color + tracking, never weight).
-    lines.push(Line::from(Span::styled(" 5H USAGE ", theme::dim())));
-    lines.push(Line::from(gauge_with_tick(pct, Some(threshold))));
-    let (figure, figure_style) = match pct {
-        Some(v) => {
-            let headroom = (threshold - v).max(0.0);
-            (
-                format!("{v:.0}% used · {headroom:.0}% until rotate"),
-                Style::default().fg(theme::util_color(v)),
-            )
-        }
-        None => ("no usage data yet".to_string(), theme::faint()),
+    // `5h usage` — gauge lives on the kv key row (matching `priority` / `rotate
+    // at` grammar), headroom figure indented beneath it. Two lines, not three:
+    // the standalone eyebrow is folded into the key.
+    let mut gauge_spans = vec![Span::styled(kv_key("5h usage"), theme::dim())];
+    gauge_spans.extend(gauge_with_tick(pct, Some(threshold)));
+    if let Some(v) = pct {
+        gauge_spans.push(Span::styled(
+            format!("  {v:.0}% used"),
+            Style::default().fg(theme::util_color(v)),
+        ));
+    } else {
+        gauge_spans.push(Span::styled("  no data yet", theme::faint()));
+    }
+    lines.push(Line::from(gauge_spans));
+
+    let figure = match pct {
+        Some(v) => format!("{:.0}% until rotate", (threshold - v).max(0.0)),
+        None => String::new(),
     };
-    lines.push(Line::from(Span::styled(figure, figure_style)));
+    lines.push(Line::from(vec![
+        Span::raw(" ".repeat(KEY_W)),
+        Span::styled(figure, theme::faint()),
+    ]));
     lines.push(Line::from(""));
 
     for (i, row) in FALLBACK_ROWS.iter().enumerate() {
@@ -241,17 +249,18 @@ fn member_detail(
         } else {
             line
         });
-        // `rotate at` always carries its tooltip as an always-visible sub-line;
-        // an out-of-range typed value swaps it for the Invalid-input reason.
+        // `rotate at` carries its hint only while the row is selected; an
+        // out-of-range typed value always swaps in the Invalid-input reason.
         if *row == FallbackRow::Threshold {
             match row_editing {
                 Some(input) if parse_threshold(input.trimmed()).is_none() => {
                     lines.push(tooltip("max is 100", theme::danger()));
                 }
-                _ => lines.push(tooltip(
+                _ if selected => lines.push(tooltip(
                     "switch to the next account once 5h usage reaches this",
                     theme::faint(),
                 )),
+                _ => {}
             }
         }
     }
