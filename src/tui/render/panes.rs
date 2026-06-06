@@ -107,7 +107,7 @@ pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'
 
 /// Renders a scrollbar into the 1-cell right-padding column of a panel.
 ///
-/// Track: `░` in `LINE`. Thumb: `█` in `TEXT_DIM`.
+/// Track: `┊` in `LINE`. Thumb: `┃` in `TEXT_DIM`.
 /// Only renders when `total > viewport` (content overflows). The column sits
 /// flush against the content area's right edge — it reuses the padding cell
 /// `section_box` already reserves, so content width is unchanged.
@@ -140,10 +140,10 @@ pub(super) fn draw_scrollbar(
         let cell = buf.cell_mut((col_x, col_y + row as u16));
         if let Some(cell) = cell {
             if row >= thumb_top && row < thumb_end {
-                cell.set_symbol("█");
+                cell.set_symbol("┃");
                 cell.set_style(Style::default().fg(theme::text_dim_color()));
             } else {
-                cell.set_symbol("░");
+                cell.set_symbol("┊");
                 cell.set_style(Style::default().fg(theme::line_color()));
             }
         }

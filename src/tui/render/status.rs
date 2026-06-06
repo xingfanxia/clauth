@@ -2,10 +2,10 @@
 //! the right. Master-detail (counts as 2 of the 3-panel budget; no third panel).
 //!
 //! The left panel is the focusable selector: each incident takes two rows, a
-//! title row and a `[ phase ]` pill row with a right-aligned relative age. Its
-//! title-right meta slot shows feed health (`operational` / `N active` /
-//! `cached`) or a spinner while a manual refresh is in flight. The right panel
-//! is a read-only timeline the list descends into with enter; up/down scrolls it.
+//! title row and a `[ phase ]` pill row with a right-aligned relative age. A
+//! spinner sits in the title inset while a manual refresh is in flight; feed
+//! health lives in the header's `● status.claude.ai` dot. The right panel is
+//! a read-only timeline the list descends into with enter; up/down scrolls it.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -207,10 +207,11 @@ fn pad_to(spans: &mut Vec<Span<'static>>, content_w: usize, tint: Option<ratatui
     }
 }
 
-/// The list panel block with its title-right meta slot. The Block draws every
-/// border dash (chrome owns the dashes); the title and meta are bare tokens with
-/// single-space insets. A manual-refresh spinner lives inside the title token's
-/// trailing inset (` INCIDENTS ⠇ `), never appended after it.
+/// The list panel block. The Block draws every border dash (chrome owns the
+/// dashes); the title is a bare token with single-space insets. A
+/// manual-refresh spinner lives inside the title token's trailing inset
+/// (` INCIDENTS ⠇ `), never appended after it. Feed health lives in the
+/// header's `● status.claude.ai` dot, not here.
 fn list_block(app: &App, focused: bool) -> Block<'static> {
     let border_color = if focused {
         theme::line_strong_color()
@@ -242,27 +243,7 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
         .border_set(border::ROUNDED)
         .border_style(border_style)
         .title(Line::from(title_spans))
-        .title_top(Line::from(meta_spans(app)).right_aligned())
         .padding(ratatui::widgets::Padding::horizontal(1))
-}
-
-/// Title-right meta spans — single-space insets, no border dashes (the Block
-/// draws those). Cached (stale) → `cached` (WARNING); active incidents →
-/// `N active` (WARNING); otherwise `● operational`.
-fn meta_spans(app: &App) -> Vec<Span<'static>> {
-    if app.status.cached && app.status.fetched_at_ms.is_some() {
-        return vec![Span::styled(" cached ", theme::warning())];
-    }
-    let active = app.status.active_count();
-    if active > 0 {
-        vec![Span::styled(format!(" {active} active "), theme::warning())]
-    } else {
-        vec![
-            Span::styled(" ", Style::default()),
-            Span::styled("●", theme::success()),
-            Span::styled(" operational ", theme::dim()),
-        ]
-    }
 }
 
 /// `(word, color)` for an incident's status pill from its lifecycle phase: a

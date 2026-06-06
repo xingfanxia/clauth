@@ -32,30 +32,60 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let n = app.config().profiles.len();
 
-    // Row 0: brand (ACCENT_2 + bold) left; version (TEXT_DIM) right-aligned to
-    // the info column's edge, per the ASCII-art header contract.
+    // Row 0: brand (TEXT + bold, house deviation from ACCENT_2) left; version
+    // (TEXT_DIM) right-aligned to the info column's edge.
     let info_width = rows[0].width as usize;
     let brand = "clauth";
     let ver = format!("v{VERSION}");
     // Pad between brand and version so the version sits flush at the right edge.
     let gap = info_width.saturating_sub(brand.len() + ver.len());
     let title = Line::from(vec![
-        Span::styled(brand, Style::default().fg(theme::accent_2_color()).bold()),
+        Span::styled(brand, Style::default().fg(theme::text_color()).bold()),
         Span::styled(" ".repeat(gap), theme::base()),
         Span::styled(ver, theme::dim()),
     ]);
 
-    let count = Line::from(Span::styled(
-        format!("{n} account{}", plural(n)),
-        theme::faint(),
-    ));
+    // Row 1: account count left; `● status.claude.ai` right-aligned below the
+    // version. Static label, semantic dot (mirrors the status tab's meta:
+    // stale cache / active incidents → WARNING, otherwise SUCCESS). Dropped
+    // when the row can't keep a 3-cell gap.
+    let count_txt = format!("{n} account{}", plural(n));
+    let mut count_spans = vec![Span::styled(count_txt.clone(), theme::faint())];
+    let feed = "status.claude.ai"; // display label per user choice; feed itself is status.claude.com
+    let ind_width = 2 + feed.len(); // `● ` + label
+    if info_width >= count_txt.len() + ind_width + 3 {
+        let gap = info_width - count_txt.len() - ind_width;
+        count_spans.push(Span::styled(" ".repeat(gap), theme::base()));
+        count_spans.push(Span::styled(
+            "●",
+            Style::default().fg(status_dot_color(app)),
+        ));
+        count_spans.push(Span::styled(format!(" {feed}"), theme::dim()));
+    }
+
     frame.render_widget(Paragraph::new(title).style(theme::base()), rows[0]);
-    frame.render_widget(Paragraph::new(count).style(theme::base()), rows[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(count_spans)).style(theme::base()),
+        rows[1],
+    );
     tabs::draw(frame, rows[2], app);
 }
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+/// Feed-health color for the header status dot — same buckets as the status
+/// tab's title-right meta: stale cache or active incidents → WARNING,
+/// otherwise SUCCESS.
+fn status_dot_color(app: &App) -> ratatui::style::Color {
+    if app.status.cached && app.status.fetched_at_ms.is_some() {
+        theme::warning_color()
+    } else if app.status.active_count() > 0 {
+        theme::warning_color()
+    } else {
+        theme::success_color()
+    }
 }
 
 /// Claude glyph in the top-left. Eyes blank for ~200ms every ~6s as a subtle sign of life.
