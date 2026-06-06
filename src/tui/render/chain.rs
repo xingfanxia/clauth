@@ -318,7 +318,7 @@ fn detail_row(
         }
         FallbackRow::Remove => {
             let label = if armed_remove {
-                "↵ again to remove".to_string()
+                "press again to remove".to_string()
             } else {
                 "remove from chain".to_string()
             };

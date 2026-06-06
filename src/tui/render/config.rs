@@ -175,7 +175,7 @@ fn draw_settings_rows(
     let (type_value, type_style) = if is_api {
         ("API", theme::accent())
     } else {
-        ("OAuthed", Style::default().fg(theme::accent_2_color()))
+        ("OAuth", Style::default().fg(theme::accent_2_color()))
     };
 
     let mut type_spans = vec![
@@ -294,7 +294,7 @@ fn detail_row(
         }
         ConfigRow::Delete => {
             let label = if armed_delete {
-                "delete account — ⏎ again to confirm".to_string()
+                "press again to delete".to_string()
             } else {
                 "delete account".to_string()
             };

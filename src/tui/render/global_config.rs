@@ -48,7 +48,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// Inline help for rows whose value doesn't self-describe.
 fn row_hint(row: GlobalConfigRow) -> Option<&'static str> {
     match row {
-        GlobalConfigRow::Theme => Some("color depth · ⏎ cycles · applies immediately"),
+        GlobalConfigRow::Theme => None,
         GlobalConfigRow::WrapOff => {
             Some("default when every fallback member is over its threshold")
         }

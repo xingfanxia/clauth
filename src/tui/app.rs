@@ -1530,11 +1530,6 @@ fn cycle_theme(app: &mut App) {
     }
     app.last_state_mtime = app_state_mtime();
     theme::set_tier(next);
-    let label = match next {
-        theme::Tier::Full => "full · 24-bit truecolor",
-        theme::Tier::Compatible => "compatible · xterm-256",
-    };
-    app.toast(ToastKind::Success, format!("theme → {label}"));
 }
 
 /// Fallback footer hint derived from current focus + selection + edit state.
@@ -1649,19 +1644,12 @@ fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
 
 /// Toggle wrap-off: on = switch off all when chain is spent; off = stay on last.
 fn toggle_wrap_off(app: &mut App) {
-    let enabled = {
+    {
         let mut cfg = app.config();
         cfg.state.wrap_off = !cfg.state.wrap_off;
         let _ = save_app_state(&cfg.state);
-        cfg.state.wrap_off
-    };
+    }
     app.last_state_mtime = app_state_mtime();
-    let msg = if enabled {
-        "chain spent → switch off all accounts (stops usage)"
-    } else {
-        "chain spent → stay on last account (keeps using it)"
-    };
-    app.toast(ToastKind::Success, msg.to_string());
 }
 
 /// Right-pane keymap for a member: ↑↓ walks rows, `+`/`-` steps the threshold,
@@ -2495,7 +2483,6 @@ fn commit_endpoint(app: &mut App) {
                 d.api_key = InputState::new(&key);
                 d.active = None;
             }
-            app.toast(ToastKind::Success, format!("updated '{name}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("edit failed: {e}")),
     }
@@ -2602,12 +2589,6 @@ fn toggle_auto_start(app: &mut App, name: &str) {
                 cfg.state.last_auto_start_at.remove(name);
                 let _ = save_app_state(&cfg.state);
             }
-            let body = if now_on {
-                format!("auto-start usage on for '{name}'")
-            } else {
-                format!("auto-start usage off for '{name}'")
-            };
-            app.toast(ToastKind::Success, body);
         }
         Outcome::SaveFailed(e) => {
             app.toast(ToastKind::Danger, format!("save failed: {e}"));
