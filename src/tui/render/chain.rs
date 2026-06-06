@@ -1,6 +1,6 @@
 //! Fallback tab — master-detail, mirroring the Config layout. Left: the ordered
-//! chain (plus a trailing `+ add` row), cursor = `❯`, active member carries an
-//! `[ active ]` pill. Right: the selected member's rotation card — labeled
+//! chain (plus a trailing `+ add` row), cursor = `❯`, active member name in
+//! orange. Right: the selected member's rotation card — labeled
 //! key:value rows (`priority`, `5h usage` gauge with a threshold tick, `rotate at`
 //! threshold stepper, `remove`) — or, on `+ add`, a candidate picker. Order =
 //! priority (reorder with ⇧↑↓). The chain-global wrap-off setting lives on the
@@ -20,7 +20,8 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    SELECTOR_WIDTH, active_pill, draw_selector_list, highlight_row, section_box, select_line,
+    SELECTOR_WIDTH, active_dot, draw_selector_list, highlight_row, name_color, section_box,
+    select_line,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 use crate::profile::AppConfig;
@@ -72,12 +73,11 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                         } else {
                             Span::styled(format!("  {:>2}  ", i + 1), theme::faint())
                         };
-                        // Active = `[ active ]` pill, never orange (DNA rule).
-                        let mut spans = vec![rail, Span::styled(name.clone(), theme::body())];
-                        if cfg.is_active(&name) {
-                            spans.push(Span::raw("  "));
-                            spans.extend(active_pill());
-                        }
+                        // Active = orange name (matches usage/setup selector style).
+                        let spans = vec![
+                            rail,
+                            Span::styled(name.clone(), name_color(cfg.is_active(&name))),
+                        ];
                         Line::from(spans)
                     }
                     ChainItemKind::Add => {
@@ -157,7 +157,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-/// Priority + active pill, 5h gauge with threshold tick, headroom figure, and the
+/// Priority + `● active` dot, 5h gauge with threshold tick, headroom figure, and the
 /// inline `rotate at` threshold stepper/editor + `remove` rows. Caret only when focused.
 #[allow(clippy::too_many_arguments)]
 fn member_detail(
@@ -189,14 +189,14 @@ fn member_detail(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // `priority` — position in the chain (order = priority). Active = pill, not orange.
+    // `priority` — position in the chain (order = priority).
     let mut priority_spans = vec![
         Span::styled(kv_key("priority"), theme::dim()),
         Span::styled(format!("#{} of {chain_len}", index + 1), theme::body()),
     ];
     if active {
         priority_spans.push(Span::raw("   "));
-        priority_spans.extend(active_pill());
+        priority_spans.extend(active_dot());
     }
     lines.push(Line::from(priority_spans));
     lines.push(Line::from(""));

@@ -25,7 +25,8 @@ fn head_cols(input: &InputState) -> usize {
 use super::super::app::{App, ConfigFocus, ConfigRow, InputState, config_rows};
 use super::super::theme;
 use super::panes::{
-    SELECTOR_WIDTH, draw_selector_list, highlight_row, name_color, picker_row, section_box,
+    SELECTOR_WIDTH, active_dot, draw_selector_list, highlight_row, name_color, picker_row,
+    section_box,
 };
 
 const KEY_W: usize = 11;
@@ -80,6 +81,7 @@ struct Snap {
     base_url: String,
     api_key: String,
     auto_start: bool,
+    is_active: bool,
 }
 
 fn build_snap(app: &App, with_text: bool) -> Snap {
@@ -98,10 +100,12 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             base_url: String::new(),
             api_key: String::new(),
             auto_start: false,
+            is_active: false,
         };
     }
     match cfg.profiles.get(app.profile_cursor) {
         Some(p) => Snap {
+            is_active: cfg.is_active(&p.name),
             title: p.name.to_string(),
             name: if with_text {
                 p.name.to_string()
@@ -118,6 +122,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             base_url: String::new(),
             api_key: String::new(),
             auto_start: false,
+            is_active: false,
         },
     }
 }
@@ -167,16 +172,24 @@ fn draw_settings_rows(
         ("OAuthed", Style::default().fg(theme::accent_2_color()))
     };
 
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::from(vec![
-            Span::styled(
-                format!("type{}", " ".repeat(KEY_W - 4)),
-                Style::default().fg(theme::text_color()),
-            ),
-            Span::styled(type_value, type_style),
-        ]),
-        Line::from(""),
+    let mut type_spans = vec![
+        Span::styled(
+            format!("type{}", " ".repeat(KEY_W - 4)),
+            Style::default().fg(theme::text_color()),
+        ),
+        Span::styled(type_value, type_style),
     ];
+    if snap.is_active {
+        // "● active" = 8 chars; left side = KEY_W + type_value chars; pad the gap.
+        let left_w = KEY_W + type_value.chars().count();
+        let indicator_w = "● active".chars().count(); // 8
+        let pad = (inner.width as usize)
+            .saturating_sub(left_w)
+            .saturating_sub(indicator_w);
+        type_spans.push(Span::raw(" ".repeat(pad)));
+        type_spans.extend(active_dot());
+    }
+    let mut lines: Vec<Line<'static>> = vec![Line::from(type_spans), Line::from("")];
     // Track which absolute line index the editing row occupies so we can set
     // the native terminal cursor after rendering.
     let mut edit_line_y: Option<u16> = None;

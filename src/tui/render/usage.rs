@@ -11,7 +11,7 @@ use ratatui::widgets::Paragraph;
 use super::super::app::App;
 use super::super::theme;
 use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
-use super::panes::{SELECTOR_WIDTH, draw_profile_selector, section_box};
+use super::panes::{SELECTOR_WIDTH, active_dot, draw_profile_selector, section_box};
 use crate::format::plan_label;
 use crate::profile::Profile;
 use crate::usage::{FetchStatus, ProfileActivity, UsageWindow, now_ms};
@@ -245,8 +245,7 @@ fn header_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Li
             .saturating_sub(left_w)
             .saturating_sub(indicator_w);
         plan_spans.push(Span::raw(" ".repeat(pad)));
-        plan_spans.push(Span::styled("●", theme::success()));
-        plan_spans.push(Span::styled(" active", theme::dim()));
+        plan_spans.extend(active_dot());
     }
 
     let mut lines = vec![Line::from(plan_spans)];
