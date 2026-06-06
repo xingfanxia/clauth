@@ -196,12 +196,16 @@ fn member_detail(
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // `priority` — position in the chain (order = priority).
+    let value = format!("#{} of {chain_len}", index + 1);
     let mut priority_spans = vec![
         Span::styled(kv_key("priority"), theme::dim()),
-        Span::styled(format!("#{} of {chain_len}", index + 1), theme::body()),
+        Span::styled(value.clone(), theme::body()),
     ];
     if active {
-        priority_spans.push(Span::raw("   "));
+        let left_w = KEY_W + value.chars().count();
+        let indicator_w = "● active".chars().count(); // 8
+        let pad = width.saturating_sub(left_w).saturating_sub(indicator_w);
+        priority_spans.push(Span::raw(" ".repeat(pad)));
         priority_spans.extend(active_dot());
     }
     lines.push(Line::from(priority_spans));
