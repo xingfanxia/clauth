@@ -1208,7 +1208,8 @@ fn switch_tab(app: &mut App, tab: Tab) {
             app.config_action_cursor = 0;
         }
         Tab::Fallback => {
-            app.chain_cursor = 0;
+            app.chain_cursor = chain_cursor_for_profile(app);
+            sync_profile_from_chain(app);
             app.fallback_focus = FallbackFocus::Chain;
             app.fallback_detail_cursor = 0;
             app.fallback_armed_remove = false;
@@ -1584,6 +1585,40 @@ fn handle_fallback_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Returns the chain row that should be highlighted when entering the fallback tab.
+/// If the currently-selected profile (`profile_cursor`) is a member of the chain,
+/// returns its position there; otherwise 0.
+fn chain_cursor_for_profile(app: &App) -> usize {
+    let cfg = app.config();
+    let selected_name = cfg
+        .profiles
+        .get(app.profile_cursor)
+        .map(|p| p.name.as_str());
+    if let Some(name) = selected_name
+        && let Some(pos) = cfg.state.fallback_chain.iter().position(|c| c == name)
+    {
+        return pos;
+    }
+    0
+}
+
+/// If the current `chain_cursor` points at a `Member`, sync `profile_cursor` to that
+/// member's index in the profile list. Leaves `profile_cursor` unchanged on `Add` or
+/// when the name is not found (e.g. empty chain).
+fn sync_profile_from_chain(app: &mut App) {
+    let chain_pos = app.chain_cursor;
+    let profile_idx = {
+        let cfg = app.config();
+        match cfg.state.fallback_chain.get(chain_pos) {
+            Some(name) => cfg.profiles.iter().position(|p| p.name == *name),
+            None => None,
+        }
+    };
+    if let Some(idx) = profile_idx {
+        app.profile_cursor = idx;
+    }
+}
+
 fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
     let last = chain_items(app).len().saturating_sub(1);
     match key.code {
@@ -1597,6 +1632,7 @@ fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.chain_cursor - 1
             };
+            sync_profile_from_chain(app);
         }
         KeyCode::Down => {
             app.chain_cursor = if app.chain_cursor >= last {
@@ -1604,6 +1640,7 @@ fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.chain_cursor + 1
             };
+            sync_profile_from_chain(app);
         }
         KeyCode::Enter => enter_fallback_detail(app),
         _ => {}
