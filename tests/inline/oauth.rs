@@ -339,3 +339,121 @@ fn windowless_candidate_when_resets_at_is_in_the_past() {
         "a profile with a future resets_at still has a live window — no re-arm"
     );
 }
+
+/// A live 5h window does NOT exclude a profile whose weekly window is present and
+/// sitting at zero usage: the kick is what seeds the weekly clock. Any nonzero
+/// weekly usage flips it back to excluded.
+#[test]
+fn weekly_idle_candidate_even_with_live_window() {
+    use std::collections::HashMap;
+
+    let _home = HomeSandbox::new();
+    let name = "test-weekly-idle";
+
+    let mut config = single_profile_config(name, "rt-weekly-idle");
+    config.profiles[0].auto_start = true;
+    let config = Arc::new(RankedMutex::new(config));
+
+    let store: crate::usage::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // live 5h window + weekly window present at 0% → cold weekly clock → candidate
+    let cold_weekly = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 0.0,
+            resets_at: Some("2999-01-01T00:00:00Z".to_string()),
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: 0.0,
+            resets_at: Some("2999-01-08T00:00:00Z".to_string()),
+        }),
+        ..Default::default()
+    };
+    store.lock().unwrap().insert(name.to_string(), cold_weekly);
+
+    let candidates = windowless_auto_start_candidates(&config, &store);
+    assert_eq!(
+        candidates,
+        vec![name.to_string()],
+        "a live window with zero weekly usage must still be re-armed to seed the weekly clock"
+    );
+
+    // weekly usage now nonzero → both windows live → excluded
+    let warm_weekly = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 0.0,
+            resets_at: Some("2999-01-01T00:00:00Z".to_string()),
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: 1.0,
+            resets_at: Some("2999-01-08T00:00:00Z".to_string()),
+        }),
+        ..Default::default()
+    };
+    store.lock().unwrap().insert(name.to_string(), warm_weekly);
+
+    let candidates = windowless_auto_start_candidates(&config, &store);
+    assert!(
+        candidates.is_empty(),
+        "once weekly usage is nonzero, a profile with a live window is no longer a candidate"
+    );
+}
+
+/// The cooldown filter governs the weekly-idle leg too: a profile that *would*
+/// be a weekly-idle candidate (live 5h window, zero weekly usage) is excluded
+/// while it sits inside `AUTO_START_COOLDOWN_MS`. This is what keeps `on_tick`
+/// from spawning an auto-start worker every tick for a 0%-weekly profile —
+/// `start_window` stamps `last_auto_start_at` on the kick, and this filter then
+/// drops the profile until the cooldown elapses.
+#[test]
+fn weekly_idle_candidate_suppressed_inside_cooldown() {
+    use std::collections::HashMap;
+
+    let _home = HomeSandbox::new();
+    let name = "test-weekly-idle-cooldown";
+
+    let mut config = single_profile_config(name, "rt-weekly-idle-cd");
+    config.profiles[0].auto_start = true;
+    // Stamp the cooldown slot as if a kick just landed.
+    config
+        .state
+        .last_auto_start_at
+        .insert(name.to_string(), now_ms());
+    let config = Arc::new(RankedMutex::new(config));
+
+    let store: crate::usage::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // live 5h window + cold (0%) weekly window: weekly-idle leg would arm it,
+    // but the fresh cooldown stamp must suppress it.
+    let cold_weekly = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 0.0,
+            resets_at: Some("2999-01-01T00:00:00Z".to_string()),
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: 0.0,
+            resets_at: Some("2999-01-08T00:00:00Z".to_string()),
+        }),
+        ..Default::default()
+    };
+    store.lock().unwrap().insert(name.to_string(), cold_weekly);
+
+    let candidates = windowless_auto_start_candidates(&config, &store);
+    assert!(
+        candidates.is_empty(),
+        "a weekly-idle profile inside the auto-start cooldown must NOT be a candidate \
+         (else on_tick would respawn a worker every tick)"
+    );
+
+    // Move the stamp past the cooldown → the weekly-idle leg arms it again.
+    {
+        let mut cfg = config.lock().unwrap();
+        let stale = now_ms().saturating_sub(AUTO_START_COOLDOWN_MS + 1);
+        cfg.state.last_auto_start_at.insert(name.to_string(), stale);
+    }
+    let candidates = windowless_auto_start_candidates(&config, &store);
+    assert_eq!(
+        candidates,
+        vec![name.to_string()],
+        "past the cooldown, a weekly-idle profile is a candidate again"
+    );
+}

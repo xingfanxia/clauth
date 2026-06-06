@@ -3068,6 +3068,12 @@ fn drain_op_results(app: &mut App) {
     if needs_token_snapshot_rebuild {
         app.refresh_tokens();
     }
+    // Optimistically mark kicked windows open before the re-fetch: /usage can
+    // rate-limit for minutes after a kick, and until a live body lands the
+    // usage tab + auto-start scan would still see the stale windowless data.
+    for name in &auto_started_names {
+        crate::usage::mark_window_open(&app.usage_store, name, crate::usage::now_epoch_secs());
+    }
     // Route auto-start re-fetches through RefetchQueue (not all-profile refresh).
     if !auto_started_names.is_empty()
         && let Ok(mut q) = app.refetch_queue.lock()

@@ -100,3 +100,128 @@ fn activity_cleared_on_worker_panic() {
         "activity slot must be cleared after worker panic"
     );
 }
+
+/// A disk-cache fallback (`from_fetch: false`) must not clobber a newer store
+/// entry: while `/usage` rate-limits, every tick recycles the stale on-disk
+/// snapshot, and treating it as fresh froze the UI + auto-start scan on
+/// pre-kick windowless data. Regression for the RateLimited-masking bug.
+#[test]
+fn cached_fallback_does_not_clobber_store() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let live = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        ..Default::default()
+    };
+    store.lock().unwrap().insert("a".to_string(), live);
+
+    let stale_windowless = UsageInfo::default();
+    apply_outcome(
+        FetchOutcome {
+            name: "a".to_string(),
+            info: Some(stale_windowless.clone()),
+            status: FetchStatus::RateLimited,
+            rotated: None,
+            from_fetch: false,
+        },
+        &store,
+        &status,
+        &last_fetched,
+    );
+    assert!(
+        store.lock().unwrap().get("a").unwrap().five_hour.is_some(),
+        "a cache fallback must not overwrite a newer store entry"
+    );
+    assert_eq!(
+        status.lock().unwrap().get("a").copied(),
+        Some(FetchStatus::RateLimited),
+        "the RateLimited status still surfaces"
+    );
+
+    // Cold start: the same fallback DOES fill an absent entry.
+    apply_outcome(
+        FetchOutcome {
+            name: "b".to_string(),
+            info: Some(stale_windowless),
+            status: FetchStatus::Cached,
+            rotated: None,
+            from_fetch: false,
+        },
+        &store,
+        &status,
+        &last_fetched,
+    );
+    assert!(
+        store.lock().unwrap().contains_key("b"),
+        "a cache fallback still cold-fills an absent entry"
+    );
+}
+
+/// `mark_window_open` synthesizes a live 5h window after a successful kick
+/// (the kick's 200 IS the window opening; /usage may 429 for minutes), but
+/// never touches a window that is already live.
+#[test]
+fn mark_window_open_synthesizes_only_when_not_live() {
+    use super::mark_window_open;
+    use crate::usage::{UsageInfo, UsageWindow, iso_to_epoch_secs};
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let now = 1_780_000_000i64;
+
+    // Absent entry → synthetic window resets now + 5h.
+    mark_window_open(&store, "a", now);
+    let resets = store.lock().unwrap()["a"]
+        .five_hour
+        .as_ref()
+        .and_then(|w| w.resets_at.as_deref())
+        .and_then(iso_to_epoch_secs);
+    assert_eq!(
+        resets,
+        Some(now + 5 * 3600),
+        "synthetic window opens at +5h"
+    );
+
+    // Live window → untouched (kick into a live window must not extend it).
+    let live_resets = "2999-01-01T00:00:00+00:00";
+    store.lock().unwrap().insert(
+        "b".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(live_resets.to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    mark_window_open(&store, "b", now);
+    let kept = store.lock().unwrap()["b"].five_hour.clone().unwrap();
+    assert_eq!(kept.resets_at.as_deref(), Some(live_resets));
+    assert_eq!(kept.utilization, 42.0);
+
+    // Expired window → replaced by a fresh synthetic one.
+    store.lock().unwrap().insert(
+        "c".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 88.0,
+                resets_at: Some("2020-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    mark_window_open(&store, "c", now);
+    let replaced = store.lock().unwrap()["c"].five_hour.clone().unwrap();
+    assert_eq!(
+        replaced.resets_at.as_deref().and_then(iso_to_epoch_secs),
+        Some(now + 5 * 3600)
+    );
+    assert_eq!(replaced.utilization, 0.0, "fresh window starts at zero");
+}

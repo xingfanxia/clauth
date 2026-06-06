@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use crate::lockorder::{RankedMutex, rank};
 
-use super::fetch::{FetchError, UsageInfo, fetch_raw, load_disk_cache, now_ms, write_disk_cache};
+use super::fetch::{
+    FetchError, UsageInfo, UsageWindow, epoch_secs_to_iso, fetch_raw, iso_to_epoch_secs,
+    load_disk_cache, now_ms, write_disk_cache,
+};
 
 /// Scheduler wake interval. Network work only fires for profiles whose cadence has elapsed.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -199,7 +202,7 @@ pub(crate) enum FetchStatus {
     Cached,
     /// API failed and no cache available.
     Failed,
-    /// API returned 429 on the initial call (recorded even when the post-rotation retry succeeded).
+    /// API returned 429 (endpoint-level rate limit); numbers come from on-disk cache.
     RateLimited,
 }
 
@@ -215,11 +218,16 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
     }
 }
 
-/// Fetch + rotate + retry for one profile. On 401/429: refresh the OAuth pair,
-/// persist, retry once. A 429 on the initial call always sets `RateLimited` even
-/// when the retry succeeds. Other errors fall back to disk cache. Pushes `name`
+/// Fetch + rotate + retry for one profile. On 401: refresh the OAuth pair,
+/// persist, retry once. A 429 never rotates — it's an endpoint-level rate
+/// limit (`retry-after: 0`, token-independent), so a refresh can't fix it and
+/// would spend the single-use refresh token every tick under a persistent
+/// storm; it falls back to disk cache as `RateLimited` and the fixed cadence
+/// retries. Other errors fall back to disk cache as `Cached`. Pushes `name`
 /// onto `refetch` when rotation succeeded but the follow-up fetch failed.
-/// Returns the rotated pair so the caller can update `TokenList`.
+/// Returns the rotated pair so the caller can update `TokenList`, plus a
+/// `from_fetch` flag: true only when the returned info is a live API body,
+/// false for every disk-cache fallback (see [`FetchOutcome::from_fetch`]).
 ///
 /// Flips `activity[name]` to `Refreshing` during `oauth::refresh`, then back to
 /// `Fetching` for the retry. Caller owns the initial `Fetching` mark and final `Idle` clear.
@@ -230,27 +238,26 @@ fn fetch_with_rotation(
     refresh_token: Option<&str>,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
-) -> (Option<UsageInfo>, FetchStatus, Option<RotatedTokens>) {
-    let saw_429 = match fetch_raw(access_token) {
-        Ok(info) => return (Some(info), FetchStatus::Fresh, None),
-        Err(FetchError::Status(429)) => true,
-        Err(FetchError::Status(401)) => false,
+) -> (Option<UsageInfo>, FetchStatus, Option<RotatedTokens>, bool) {
+    match fetch_raw(access_token) {
+        Ok(info) => return (Some(info), FetchStatus::Fresh, None, true),
+        // Rate-limited: bail to cache, never rotate (see the doc comment).
+        Err(FetchError::Status(429)) => {
+            let (info, status) = load_cached_with_status(name, FetchStatus::RateLimited);
+            return (info, status, None, false);
+        }
+        // Expired access token: fall through into the rotation leg.
+        Err(FetchError::Status(401)) => {}
         Err(_) => {
             let (info, status) = load_cached_with_status(name, FetchStatus::Cached);
-            return (info, status, None);
+            return (info, status, None, false);
         }
-    };
+    }
 
-    let fallback_status = if saw_429 {
-        FetchStatus::RateLimited
-    } else {
-        FetchStatus::Cached
-    };
-    // Single bail-out path for all rotation-leg failures. `fallback_status`
-    // is computed once above so all abort branches stay consistent.
+    // Single bail-out path for all rotation-leg failures.
     let bail_to_cache = |rotated: Option<RotatedTokens>| {
-        let (info, status) = load_cached_with_status(name, fallback_status);
-        (info, status, rotated)
+        let (info, status) = load_cached_with_status(name, FetchStatus::Cached);
+        (info, status, rotated, false)
     };
 
     let Some(rt) = refresh_token else {
@@ -287,20 +294,12 @@ fn fetch_with_rotation(
     }
     let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
     match fetch_raw(&access) {
-        Ok(info) => {
-            // 429 was observed this tick even though we recovered — keep RateLimited.
-            let status = if saw_429 {
-                FetchStatus::RateLimited
-            } else {
-                FetchStatus::Fresh
-            };
-            (Some(info), status, rotated)
-        }
+        Ok(info) => (Some(info), FetchStatus::Fresh, rotated, true),
         Err(FetchError::Status(429)) => {
             // Retry itself rate-limited. Don't push to RefetchQueue — that risks
             // a rotate→429→enqueue→rotate cycle. Let the fixed cadence govern.
             let (info, _) = load_cached_with_status(name, FetchStatus::RateLimited);
-            (info, FetchStatus::RateLimited, rotated)
+            (info, FetchStatus::RateLimited, rotated, false)
         }
         Err(_) => {
             // Rotation succeeded but a transient error stopped the retry.
@@ -321,6 +320,9 @@ struct FetchOutcome {
     status: FetchStatus,
     /// Rotated token pair when the fetch path rotated OAuth; propagated into `TokenList`.
     rotated: Option<RotatedTokens>,
+    /// `info` is a live API body (not a disk-cache fallback). Only live bodies
+    /// may overwrite the store / disk cache in [`apply_outcome`].
+    from_fetch: bool,
 }
 
 fn run_fetch(
@@ -329,7 +331,7 @@ fn run_fetch(
     refetch: &RefetchQueue,
     activity: &ActivityStore,
 ) -> FetchOutcome {
-    let (info, status, rotated) = fetch_with_rotation(
+    let (info, status, rotated, from_fetch) = fetch_with_rotation(
         config,
         &entry.name,
         &entry.access_token,
@@ -343,10 +345,11 @@ fn run_fetch(
         info,
         status,
         rotated,
+        from_fetch,
     }
 }
 
-/// Write one outcome into the shared stores. Disk cache written on every fresh response.
+/// Write one outcome into the shared stores. Disk cache written on every live response.
 fn apply_outcome(
     outcome: FetchOutcome,
     store: &UsageStore,
@@ -355,10 +358,13 @@ fn apply_outcome(
 ) {
     let now = EpochMs::from_millis(now_ms());
 
-    let is_fresh = matches!(
-        outcome.status,
-        FetchStatus::Fresh | FetchStatus::RateLimited
-    );
+    // Only a body that came off the live API may overwrite shared state. The
+    // 429/cached fallback paths recycle the on-disk snapshot — stamping that
+    // as fresh would clobber a newer store entry and re-write the disk cache
+    // mtime, freezing the UI (and the auto-start scan) on stale numbers for as
+    // long as the rate limit lasts. `status` still surfaces RateLimited/Cached
+    // so the staleness stays visible.
+    let is_fresh = outcome.from_fetch;
     if is_fresh && let Some(info) = &outcome.info {
         write_disk_cache(&outcome.name, info);
     }
@@ -381,6 +387,33 @@ fn apply_outcome(
     if let Ok(mut st) = status.lock() {
         st.insert(outcome.name.clone(), outcome.status);
     }
+}
+
+/// Optimistically mark a just-kicked profile's 5h window open in the store. A
+/// 200 from the kick endpoint IS the window opening, but `/usage` can
+/// rate-limit for minutes afterwards — until a live body lands, the usage tab
+/// and the auto-start scan would keep seeing the stale windowless snapshot and
+/// re-arm a profile whose window is already running. Utilization starts at 0
+/// (the kick is ~1 token); the next live fetch overwrites the synthetic entry
+/// with API truth. No-op while the stored window is still live.
+pub(crate) fn mark_window_open(store: &UsageStore, name: &str, now_secs: i64) {
+    let Ok(mut s) = store.lock() else {
+        return;
+    };
+    let info = s.entry(name.to_string()).or_default();
+    let live = info
+        .five_hour
+        .as_ref()
+        .and_then(|w| w.resets_at.as_deref())
+        .and_then(iso_to_epoch_secs)
+        .is_some_and(|resets_at| now_secs < resets_at);
+    if live {
+        return;
+    }
+    info.five_hour = Some(UsageWindow {
+        utilization: 0.0,
+        resets_at: Some(epoch_secs_to_iso(now_secs + 5 * 3600)),
+    });
 }
 
 /// Force-fetch all entries in parallel, bypassing the cadence. Used by bootstrap

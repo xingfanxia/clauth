@@ -106,8 +106,9 @@ struct RawProfileOrg {
     rate_limit_tier: Option<String>,
 }
 
-/// HTTP layer error. `Status` carries an HTTP code so the rotation path can
-/// distinguish 401/429 (refresh + retry) from a connection blip (cache).
+/// HTTP layer error. `Status` carries an HTTP code so the fetch path can
+/// distinguish a 401 (refresh + retry) and a 429 (rate-limited, cache — never
+/// rotate) from a connection blip (cache).
 pub(crate) enum FetchError {
     Status(u16),
     Network,
@@ -264,6 +265,28 @@ pub(crate) fn iso_to_epoch_secs(s: &str) -> Option<i64> {
     let days = era * 146097 + doe - 719468;
 
     Some(days * 86400 + hour * 3600 + minute * 60 + second - tz_offset_secs)
+}
+
+/// Format Unix epoch seconds as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS+00:00`) —
+/// the shape [`iso_to_epoch_secs`] parses. Negative inputs clamp to epoch 0.
+pub(crate) fn epoch_secs_to_iso(secs: i64) -> String {
+    let secs = secs.max(0);
+    let s = secs % 60;
+    let mi = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    // Civil-from-days — the inverse of days-from-civil in `iso_to_epoch_secs`.
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}+00:00")
 }
 
 pub(crate) fn now_epoch_secs() -> i64 {

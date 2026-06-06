@@ -405,10 +405,14 @@ pub(crate) fn refresh_all(
     refreshed
 }
 
-/// Names of opted-in OAuth profiles with NO live 5-hour window eligible for an
-/// auto-start kick: not active-with-a-diverged-link and past the cooldown.
-/// Caller enqueues into `pending_auto_start`; the on-tick drain kicks each via
-/// [`start_window`].
+/// Names of opted-in OAuth profiles eligible for an auto-start kick: not
+/// active-with-a-diverged-link and past the cooldown, AND either lacking a live
+/// 5-hour window OR carrying a known-idle weekly window (present with zero
+/// utilization). The weekly leg keeps a profile armed until its weekly clock has
+/// actually started, so an account with an open 5h window but no weekly usage
+/// still gets kicked. A weekly window that was never fetched is not "idle" —
+/// usage is unknown there, so only the 5h rule applies. Caller enqueues into
+/// `pending_auto_start`; the on-tick drain kicks each via [`start_window`].
 ///
 /// The single steady-state arming path, and the fix for background (non-active)
 /// accounts: the active profile gets its window for free (CC opens one on use),
@@ -437,7 +441,13 @@ pub(crate) fn windowless_auto_start_candidates(
     // (the active profile gets a fresh window from CC each session, masking the
     // bug as "auto-start only works for the active one").
     let now_secs = now_epoch_secs();
-    let has_active_window: std::collections::HashMap<String, bool> = store
+    // Per profile: (live 5h window?, weekly window known-idle?). Both gate
+    // arming — a profile is a candidate when it lacks a live window OR its
+    // weekly window is present and sitting at zero usage, so an opted-in account
+    // with an open 5h window but a cold weekly clock still gets kicked to seed
+    // weekly usage. A *missing* weekly window (never fetched) is NOT idle: we
+    // don't know the usage, so the 5h rule alone governs.
+    let window_state: std::collections::HashMap<String, (bool, bool)> = store
         .lock()
         .ok()
         .map(|s| {
@@ -449,7 +459,8 @@ pub(crate) fn windowless_auto_start_candidates(
                         .and_then(|w| w.resets_at.as_deref())
                         .and_then(iso_to_epoch_secs)
                         .is_some_and(|resets_at| now_secs < resets_at);
-                    (name.clone(), active)
+                    let weekly_idle = info.weekly_window().is_some_and(|w| w.utilization <= 0.0);
+                    (name.clone(), (active, weekly_idle))
                 })
                 .collect()
         })
@@ -461,10 +472,14 @@ pub(crate) fn windowless_auto_start_candidates(
     cfg.profiles
         .iter()
         .filter(|p| {
+            let (has_window, weekly_idle) = window_state
+                .get(p.name.as_str())
+                .copied()
+                .unwrap_or((false, false));
             p.auto_start
                 && p.is_oauth()
                 && !(skip_active && cfg.is_active(&p.name))
-                && !*has_active_window.get(p.name.as_str()).unwrap_or(&false)
+                && (!has_window || weekly_idle)
                 && now.saturating_sub(
                     cfg.state
                         .last_auto_start_at

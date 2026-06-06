@@ -92,3 +92,20 @@ fn rejects_malformed() {
     assert_eq!(iso_to_epoch_secs("2026-05-17T14:20:00+12345"), None);
     assert_eq!(iso_to_epoch_secs("2026-05-17T14:20:00+05:3"), None);
 }
+
+/// `epoch_secs_to_iso` is the exact inverse of `iso_to_epoch_secs`: a round
+/// trip through the formatter lands on the same epoch, and the output uses the
+/// `+00:00` shape the parser accepts.
+#[test]
+fn epoch_to_iso_round_trips() {
+    assert_eq!(epoch_secs_to_iso(BASE_UTC), "2026-05-17T14:20:00+00:00");
+    for secs in [0, BASE_UTC, 951_867_122, 4_102_444_799] {
+        assert_eq!(
+            iso_to_epoch_secs(&epoch_secs_to_iso(secs)),
+            Some(secs),
+            "round trip failed for {secs}"
+        );
+    }
+    // Negative input clamps to epoch 0 instead of underflowing the calendar.
+    assert_eq!(epoch_secs_to_iso(-1), "1970-01-01T00:00:00+00:00");
+}
