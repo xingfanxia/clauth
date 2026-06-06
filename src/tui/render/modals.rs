@@ -108,7 +108,7 @@ fn choice_buttons(choice: bool) -> Line<'static> {
 fn modal_button(label: &str, focused: bool) -> Span<'static> {
     if focused {
         Span::styled(
-            format!("\u{2590}{label}\u{258c}"),
+            label.to_string(),
             Style::default().fg(theme::bg()).bg(theme::text_color()),
         )
     } else {
