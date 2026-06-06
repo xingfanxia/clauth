@@ -246,8 +246,8 @@ fn draw_settings_rows(
             ConfigRow::ApiKey => &key_in,
             _ => return,
         };
-        // x = "❯ " (2) + key + pad (always KEY_W + 1 cols) + cols before caret
-        let prefix_cols = 2 + KEY_W + 1 + head_cols(input);
+        // x = "❯ " (2) + key+pad block (exactly KEY_W cols) + cols before caret
+        let prefix_cols = 2 + KEY_W + head_cols(input);
         let cx = inner.x.saturating_add(prefix_cols as u16);
         let cy = inner.y.saturating_add(ly);
         frame.set_cursor_position((cx, cy));

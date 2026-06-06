@@ -155,8 +155,8 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         && let Some(ChainItemKind::Member(_)) = selected
         && let Some(draft) = &app.fallback_threshold_draft
     {
-        // x = "❯ " (2) + "rotate at" key + pad (always KEY_W + 1 cols) + cols before caret.
-        let prefix_cols = 2 + KEY_W + 1 + head_cols(draft);
+        // x = "❯ " (2) + "rotate at" key+pad block (exactly KEY_W cols) + cols before caret.
+        let prefix_cols = 2 + KEY_W + head_cols(draft);
         let cx = inner.x.saturating_add(prefix_cols as u16);
         let cy = inner.y.saturating_add(ROWS_BEFORE as u16);
         frame.set_cursor_position((cx, cy));
