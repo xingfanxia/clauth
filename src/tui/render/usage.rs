@@ -11,7 +11,9 @@ use ratatui::widgets::Paragraph;
 use super::super::app::App;
 use super::super::theme;
 use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
-use super::panes::{SELECTOR_WIDTH, active_dot, draw_profile_selector, section_box};
+use super::panes::{
+    SELECTOR_WIDTH, active_dot, draw_profile_selector, section_box, section_box_verbatim,
+};
 use crate::format::plan_label;
 use crate::profile::Profile;
 use crate::usage::{FetchStatus, ProfileActivity, UsageWindow, now_ms};
@@ -44,7 +46,12 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let title = profile.map(|p| p.name.as_str()).unwrap_or("usage");
     // Detail pane: read-only, focus never descends into it; second panel on screen.
-    let block = section_box(title, false, false);
+    // Profile names preserve original case; the "usage" fallback stays uppercased.
+    let block = if profile.is_some() {
+        section_box_verbatim(title, false, false)
+    } else {
+        section_box(title, false, false)
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

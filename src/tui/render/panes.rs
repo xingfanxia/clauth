@@ -186,6 +186,16 @@ pub(super) fn draw_selector_list(
 /// Title: always italic, always UPPERCASE; bold added only when focused.
 /// Color: `ACCENT_2` for the first bordered panel on the screen body, `TEXT_DIM` for the rest.
 pub(super) fn section_box(title: &str, focused: bool, first: bool) -> Block<'static> {
+    section_box_impl(title, focused, first, true)
+}
+
+/// Like [`section_box`] but preserves the title's original case — use only when
+/// the title is a profile/account name, not a structural label.
+pub(super) fn section_box_verbatim(title: &str, focused: bool, first: bool) -> Block<'static> {
+    section_box_impl(title, focused, first, false)
+}
+
+fn section_box_impl(title: &str, focused: bool, first: bool, uppercase: bool) -> Block<'static> {
     let border_style = if focused {
         Style::default().fg(theme::line_strong_color())
     } else {
@@ -206,14 +216,16 @@ pub(super) fn section_box(title: &str, focused: bool, first: bool) -> Block<'sta
             base
         }
     };
+    let label = if uppercase {
+        format!(" {} ", title.to_uppercase())
+    } else {
+        format!(" {} ", title)
+    };
     Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
         .border_style(border_style)
-        .title(Line::from(Span::styled(
-            format!(" {} ", title.to_uppercase()),
-            title_style,
-        )))
+        .title(Line::from(Span::styled(label, title_style)))
         .padding(Padding::horizontal(1))
 }
 

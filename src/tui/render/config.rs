@@ -26,7 +26,7 @@ use super::super::app::{App, ConfigFocus, ConfigRow, InputState, config_rows};
 use super::super::theme;
 use super::panes::{
     SELECTOR_WIDTH, active_dot, draw_selector_list, highlight_row, name_color, picker_row,
-    section_box,
+    section_box, section_box_verbatim,
 };
 
 const KEY_W: usize = 11;
@@ -133,7 +133,13 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let snap = build_snap(app, draft.is_none());
 
     // Detail pane: second panel on this screen.
-    let block = section_box(&snap.title, actions_focused, false);
+    // Profile names preserve original case; structural titles ("+ new account", "settings") stay uppercased.
+    let is_profile_name = app.profile_cursor < app.config().profiles.len();
+    let block = if is_profile_name {
+        section_box_verbatim(&snap.title, actions_focused, false)
+    } else {
+        section_box(&snap.title, actions_focused, false)
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

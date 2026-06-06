@@ -21,7 +21,7 @@ use super::super::app::{
 use super::super::theme;
 use super::panes::{
     SELECTOR_WIDTH, active_dot, draw_selector_list, highlight_row, name_color, section_box,
-    select_line,
+    section_box_verbatim, select_line,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 use crate::profile::AppConfig;
@@ -105,7 +105,8 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // `Add` arm must NOT hold the `config` guard — `add_detail` re-locks it via
     // `chain_candidates`, and the mutex is non-reentrant (deadlock on `+ add` row).
-    let (title, lines): (String, Vec<Line<'static>>) = match selected {
+    // `is_name`: member names render in original case; structural titles stay uppercased.
+    let (title, is_name, lines): (String, bool, Vec<Line<'static>>) = match selected {
         Some(ChainItemKind::Member(i)) => {
             let cfg = app.config();
             let chain_len = cfg.state.fallback_chain.len();
@@ -126,17 +127,22 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 app.fallback_threshold_draft.as_ref(),
                 inner_w,
             );
-            (name, lines)
+            (name, true, lines)
         }
         Some(ChainItemKind::Add) => (
             "add to chain".to_string(),
+            false,
             add_detail(app, detail_focused, inner_w),
         ),
-        None => ("chain".to_string(), empty_detail()),
+        None => ("chain".to_string(), false, empty_detail()),
     };
 
     // Detail is the second panel on this screen — not first.
-    let block = section_box(&title, detail_focused, false);
+    let block = if is_name {
+        section_box_verbatim(&title, detail_focused, false)
+    } else {
+        section_box(&title, detail_focused, false)
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
