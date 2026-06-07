@@ -79,9 +79,8 @@ fn plural(n: usize) -> &'static str {
 /// tab's title-right meta: stale cache or active incidents → WARNING,
 /// otherwise SUCCESS.
 fn status_dot_color(app: &App) -> ratatui::style::Color {
-    if app.status.cached && app.status.fetched_at_ms.is_some() {
-        theme::warning_color()
-    } else if app.status.active_count() > 0 {
+    let stale = app.status.cached && app.status.fetched_at_ms.is_some();
+    if stale || app.status.active_count() > 0 {
         theme::warning_color()
     } else {
         theme::success_color()
