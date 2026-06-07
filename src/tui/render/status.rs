@@ -59,7 +59,8 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
     const ITEM_H: usize = 2;
     let viewport_lines = inner.height as usize;
     // Items that fill the viewport (ceil — the last may be partially clipped).
-    let viewport_items = viewport_lines.div_ceil(ITEM_H)
+    let viewport_items = viewport_lines
+        .div_ceil(ITEM_H)
         .max(1)
         .min(app.status.incidents.len());
     let first_item = first_visible_item(
@@ -183,10 +184,7 @@ fn incident_rows(
         // 1-char right pad so pad_to leaves a trailing space when possible.
         if used + 2 + dot_w <= content_w {
             let gap = content_w - used - dot_w - 1;
-            line2.push(Span::styled(
-                " ".repeat(gap),
-                with_bg(Style::default()),
-            ));
+            line2.push(Span::styled(" ".repeat(gap), with_bg(Style::default())));
             line2.push(Span::styled(
                 dot,
                 with_bg(Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),

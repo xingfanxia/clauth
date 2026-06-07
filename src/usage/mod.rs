@@ -10,9 +10,9 @@ pub(crate) use fetch::{
 pub(crate) use fetch::ExtraUsage;
 pub(crate) use scheduler::{
     ActivityKind, ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult,
-    OpResultReceiver, OpResultSender, PendingAutoStart, PendingSwitch, PendingSwitchOff,
-    ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
-    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageStore,
-    any_busy, clear_activity, collect_third_party_entries, fetch_all_into, is_idle, mark_activity,
-    mark_window_open, spawn_refresher,
+    OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity,
+    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
+    ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageStore, any_busy,
+    clear_activity, collect_third_party_entries, fetch_all_into, is_idle, mark_activity,
+    spawn_refresher,
 };

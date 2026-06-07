@@ -5,7 +5,7 @@ use crate::lockorder::RankedMutex;
 
 use super::{
     ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, REFRESH_INTERVAL_MS, TokenEntry,
-    clear_activity, mark_activity, partition_due,
+    clear_activity, mark_activity, partition_due, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -13,6 +13,8 @@ fn token(name: &str) -> TokenEntry {
         name: name.to_string(),
         access_token: "access".to_string(),
         refresh_token: Some("refresh".to_string()),
+        auto_start: false,
+        access_expires_at: None,
     }
 }
 
@@ -226,6 +228,67 @@ fn mark_window_open_synthesizes_only_when_not_live() {
         Some(now + 5 * 3600)
     );
     assert_eq!(replaced.utilization, 0.0, "fresh window starts at zero");
+}
+
+/// `window_lapsed` gates the auto-start kick: an absent store entry (never
+/// fetched this run) is NOT lapsed — fetch first, kick next tick — while a
+/// fetched entry with no 5h window or a past `resets_at` IS lapsed, and a future
+/// `resets_at` is live.
+#[test]
+fn window_lapsed_only_fires_on_a_fetched_expired_window() {
+    use super::UsageStore;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let now = 1_780_000_000i64;
+
+    // Never fetched (absent) → not lapsed: fetch first.
+    assert!(
+        !window_lapsed(&store, "a", now),
+        "an absent entry must not kick — fetch first, kick next tick"
+    );
+
+    // Fetched, no 5h window present → lapsed.
+    store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), UsageInfo::default());
+    assert!(
+        window_lapsed(&store, "a", now),
+        "a fetched entry with no live window is lapsed"
+    );
+
+    // Past resets_at → lapsed.
+    store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some("2020-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    assert!(
+        window_lapsed(&store, "a", now),
+        "a past resets_at is lapsed"
+    );
+
+    // Future resets_at → live, not lapsed.
+    store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    assert!(
+        !window_lapsed(&store, "a", now),
+        "a future resets_at is a live window — no kick"
+    );
 }
 
 /// A 429's `retry-after` hint defers the profile's next fetch slot: the

@@ -87,7 +87,6 @@ pub(crate) mod rank {
         NextRefresh = 1100;
         RefetchQueue = 1200;
         PendingSwitch = 1500;
-        PendingAutoStart = 1600;
         PendingSwitchOff = 1700;
     }
 }

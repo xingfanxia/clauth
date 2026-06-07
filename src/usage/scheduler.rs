@@ -8,7 +8,7 @@ use crate::providers::{Provider, ThirdPartyStats};
 
 use super::fetch::{
     FetchError, UsageInfo, UsageWindow, epoch_secs_to_iso, fetch_raw, iso_to_epoch_secs,
-    load_disk_cache, now_ms, write_disk_cache,
+    load_disk_cache, now_epoch_secs, now_ms, write_disk_cache,
 };
 
 /// Scheduler wake interval. Network work only fires for profiles whose cadence has elapsed.
@@ -67,9 +67,6 @@ pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, EpochMs>, rank::
 /// Names pushed here after a successful token rotation bypass the cadence on the next tick.
 pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, rank::RefetchQueue>>;
 
-/// Profiles needing an auto-start kick (no live 5h window). Drained by the main thread each tick.
-pub(crate) type PendingAutoStart = Arc<RankedMutex<HashSet<String>, rank::PendingAutoStart>>;
-
 /// Auto-switch targets posted by the scheduler when the active profile crosses its threshold.
 /// Set (not Vec) so duplicate enqueues collapse. Drained by `on_tick`, which dispatches a switch worker.
 pub(crate) type PendingSwitch = Arc<RankedMutex<HashSet<String>, rank::PendingSwitch>>;
@@ -84,6 +81,12 @@ pub(crate) struct TokenEntry {
     pub(crate) name: String,
     pub(crate) access_token: String,
     pub(crate) refresh_token: Option<String>,
+    /// Opted into auto-start: the periodic tick opens a 5h window for this
+    /// profile (kick) before fetching usage whenever its last-known window lapsed.
+    pub(crate) auto_start: bool,
+    /// Epoch-ms the access token expires at, when known. Gates the kick's
+    /// rotate-on-429 to clock-expired tokens only.
+    pub(crate) access_expires_at: Option<i64>,
 }
 
 /// Snapshot of one third-party profile identity used by the refresher.
@@ -140,8 +143,6 @@ pub(crate) enum ProfileActivity {
     /// Phase 2 wires it when the launch becomes a background worker.
     #[allow(dead_code)]
     Starting,
-    /// Background auto-start kick — 1-token Haiku ping.
-    AutoStarting,
 }
 
 /// Op kind reported through [`OpResult`]. Mirrors non-`Idle` [`ProfileActivity`] variants.
@@ -152,7 +153,6 @@ pub(crate) enum ActivityKind {
     Refreshing,
     Switching,
     Starting,
-    AutoStarting,
 }
 
 impl ActivityKind {
@@ -163,7 +163,6 @@ impl ActivityKind {
             ActivityKind::Refreshing => ProfileActivity::Refreshing,
             ActivityKind::Switching => ProfileActivity::Switching,
             ActivityKind::Starting => ProfileActivity::Starting,
-            ActivityKind::AutoStarting => ProfileActivity::AutoStarting,
         }
     }
 }
@@ -394,20 +393,84 @@ impl FetchOutcome {
     }
 }
 
+/// True iff we hold a fetched usage entry for `name` whose 5h window is absent
+/// or already past its reset — the signal to open a fresh window. An ABSENT
+/// store entry (never fetched this run) returns false on purpose: fetch first,
+/// kick next tick, so a cold cache never kicks blind on a window that may
+/// already be live.
+fn window_lapsed(store: &UsageStore, name: &str, now_secs: i64) -> bool {
+    let Ok(s) = store.lock() else {
+        return false;
+    };
+    let Some(info) = s.get(name) else {
+        return false;
+    };
+    let live = info
+        .five_hour
+        .as_ref()
+        .and_then(|w| w.resets_at.as_deref())
+        .and_then(iso_to_epoch_secs)
+        .is_some_and(|resets_at| now_secs < resets_at);
+    !live
+}
+
+/// Fetch one profile's usage. When `store` is `Some` (the periodic tick) and the
+/// profile opted into auto-start, open its 5h window first if the last-known
+/// window lapsed — kick (rotating once on 401 OR 429), mark the window open on
+/// success, then fetch with the possibly-rotated token. `fetch_all_into`
+/// (bootstrap / manual refresh) passes `None` so only the steady-state tick
+/// auto-starts.
 fn run_fetch(
     config: &crate::profile::ConfigHandle,
-    entry: TokenEntry,
+    mut entry: TokenEntry,
+    store: Option<&UsageStore>,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
 ) -> FetchOutcome {
-    fetch_with_rotation(
+    // Auto-start leg: open a window before fetching when this profile opted in
+    // and its last-known window has lapsed. The kick may rotate the chain (401
+    // OR 429 in this branch only); fold its rotated pair into both the local
+    // entry (so the fetch below uses the fresh token, never re-spending) and the
+    // returned outcome (so the tick syncs it into the live snapshot).
+    let mut kick_rotated: Option<RotatedTokens> = None;
+    if entry.auto_start
+        && let Some(store) = store
+    {
+        let now_secs = now_epoch_secs();
+        if window_lapsed(store, &entry.name, now_secs) {
+            let kicked = crate::oauth::auto_start_kick(
+                config,
+                &entry.name,
+                &entry.access_token,
+                entry.refresh_token.as_deref(),
+                entry.access_expires_at,
+                Some(activity),
+            );
+            if let Some((access, refresh)) = kicked.rotated.clone() {
+                entry.access_token = access;
+                entry.refresh_token = refresh;
+                kick_rotated = kicked.rotated;
+            }
+            if kicked.opened {
+                mark_window_open(store, &entry.name, now_secs);
+            }
+        }
+    }
+
+    let mut outcome = fetch_with_rotation(
         config,
         &entry.name,
         &entry.access_token,
         entry.refresh_token.as_deref(),
         refetch,
         activity,
-    )
+    );
+    // The fetch's own rotation (if any) supersedes the kick's; otherwise carry
+    // the kick's rotated pair back so the tick still syncs the spent chain.
+    if outcome.rotated.is_none() {
+        outcome.rotated = kick_rotated;
+    }
+    outcome
 }
 
 /// Write one outcome into the shared stores. Disk cache written on every live response.
@@ -469,7 +532,7 @@ fn apply_outcome(
 /// re-arm a profile whose window is already running. Utilization starts at 0
 /// (the kick is ~1 token); the next live fetch overwrites the synthetic entry
 /// with API truth. No-op while the stored window is still live.
-pub(crate) fn mark_window_open(store: &UsageStore, name: &str, now_secs: i64) {
+fn mark_window_open(store: &UsageStore, name: &str, now_secs: i64) {
     let Ok(mut s) = store.lock() else {
         return;
     };
@@ -519,7 +582,8 @@ pub(crate) fn fetch_all_into(
             let config = Arc::clone(config);
             let refetch = Arc::clone(refetch);
             let activity = Arc::clone(activity);
-            let h = std::thread::spawn(move || run_fetch(&config, entry, &refetch, &activity));
+            let h =
+                std::thread::spawn(move || run_fetch(&config, entry, None, &refetch, &activity));
             (name, h)
         })
         .collect();
@@ -733,10 +797,11 @@ fn tick(state: &SchedulerState) {
             .map(|entry| {
                 let name = entry.name.clone();
                 let config = Arc::clone(&state.config);
+                let store = Arc::clone(&state.store);
                 let refetch_queue = Arc::clone(&state.refetch_queue);
                 let activity = Arc::clone(&state.activity);
                 let h = std::thread::spawn(move || {
-                    run_fetch(&config, entry, &refetch_queue, &activity)
+                    run_fetch(&config, entry, Some(&store), &refetch_queue, &activity)
                 });
                 (name, h)
             })

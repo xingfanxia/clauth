@@ -212,7 +212,6 @@ pub(super) fn spinner_style(activity: ProfileActivity) -> Style {
         ProfileActivity::Refreshing => theme::info(),
         ProfileActivity::Switching => theme::orange(),
         ProfileActivity::Starting => theme::warning(),
-        ProfileActivity::AutoStarting => theme::success(),
         ProfileActivity::Idle => theme::faint(),
     }
 }
@@ -223,7 +222,6 @@ pub(super) fn activity_verb(activity: ProfileActivity) -> &'static str {
         ProfileActivity::Refreshing => "refreshing",
         ProfileActivity::Switching => "switching",
         ProfileActivity::Starting => "starting",
-        ProfileActivity::AutoStarting => "auto-starting",
         ProfileActivity::Idle => "idle",
     }
 }

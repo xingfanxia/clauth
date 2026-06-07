@@ -7,14 +7,12 @@ use serde::Deserialize;
 use crate::claude::{LinkState, classify_credentials_link};
 use crate::lock::with_state_lock;
 use crate::profile::{
-    AppConfig, OAuthToken, clear_staged_credentials, save_app_state, save_profile,
-    stage_rotated_credentials,
+    AppConfig, OAuthToken, clear_staged_credentials, save_profile, stage_rotated_credentials,
 };
 use crate::runtime::{RotationGuard, has_live_session};
 use crate::usage::{
     ActivityKind, ActivityStore, OpResult, OpResultSender, ProfileActivity, RefetchQueue,
-    TokenList, UsageStore, clear_activity, iso_to_epoch_secs, mark_activity, now_epoch_secs,
-    now_ms,
+    clear_activity, mark_activity, now_ms,
 };
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup to
@@ -37,19 +35,8 @@ const KICK_MODEL: &str = "claude-haiku-4-5-20251001";
 /// the call as an unauthorized non-CC inference.
 const KICK_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// Refuse to re-ping a profile until this long after its last SUCCESSFUL
-/// auto-start. Sized just under the 5-hour window so we don't re-kick a profile
-/// that just opened one. Claimed pre-kick (concurrency guard) and kept on
-/// success; overwritten to a shorter backoff on failure.
-const AUTO_START_COOLDOWN_MS: u64 = 4 * 3600 * 1000 + 30 * 60 * 1000;
-
-/// How long to wait before retrying after a failed kick. Short enough to
-/// recover from a transient API error or a just-rotated token, but not so
-/// short that a persistent failure hammers the endpoint.
-const AUTO_START_RETRY_MS: u64 = 60 * 1000;
-
-/// Pause between the steps of the 401-recovery sequence (failed kick → rotate
-/// → retry kick → usage re-fetch) so the API sees the rotated pair settle
+/// Pause between the steps of the 401/429-recovery sequence (failed kick →
+/// rotate → retry kick → usage re-fetch) so the API sees the rotated pair settle
 /// instead of three back-to-back requests on the same chain.
 const ROTATION_STEP_DELAY_MS: u64 = 2000;
 
@@ -147,93 +134,115 @@ fn kick(access_token: &str) -> std::result::Result<(), KickError> {
     Ok(())
 }
 
-/// Kick the window, and on a 401 rotate the OAuth chain once and retry. The
-/// access token expired, so spend the single-use refresh token to mint a fresh
-/// pair and re-kick — the same reactive-rotation leg `fetch_with_rotation` runs,
-/// with the same double-spend guards:
+/// Outcome of an [`auto_start_kick`]. `opened` is whether the 5h window opened
+/// (a 2xx from the messages endpoint, first try or post-rotation retry).
+/// `rotated` carries a freshly minted `(access, refresh)` pair whenever a
+/// rotation happened — the caller MUST propagate it into the live token snapshot
+/// even when `opened` is false, because the single-use refresh token was already
+/// spent.
+pub(crate) struct KickResult {
+    pub(crate) opened: bool,
+    pub(crate) rotated: Option<(String, Option<String>)>,
+}
+
+impl KickResult {
+    fn not_opened() -> Self {
+        Self {
+            opened: false,
+            rotated: None,
+        }
+    }
+}
+
+/// Fire the 1-token Haiku ping that opens a profile's 5h window. On a 401
+/// (expired access token) it rotates the chain once and retries. On a 429
+/// (rate-limited) it rotates ONLY when `access_expires_at` is in the past — a
+/// clock-expired token is the one case where a refresh could actually unstick
+/// the kick. A 429 on a still-valid token is a pure endpoint rate limit a
+/// refresh can't fix; rotating it would spend the single-use refresh token every
+/// 60s tick under a sustained 429 (the steady-state fetch path refuses 429
+/// rotation entirely for exactly this reason). Unknown expiry (`None`) is
+/// treated as not-expired, so it does not rotate.
 ///
-/// - `RotationGuard` is held across the refresh HTTP window (outermost lock), so
-///   a concurrent `clauth start <name>` or scheduler 401-recovery can't refresh
-///   the same single-use token in parallel.
-/// - `has_live_session` is re-checked under the guard: a live session owns the
-///   chain and refreshes it itself, so we bail rather than double-spend. The
-///   guard makes this authoritative, not a TOCTOU probe.
-/// - The rotated pair is written back into `tokens` (the scheduler's TokenList)
-///   the instant it persists — otherwise the next fetch tick reuses the spent
-///   refresh token and burns the chain.
+/// Same double-spend guards as `fetch_with_rotation`'s rotation leg:
+/// `RotationGuard` outermost across the refresh HTTP window, a `has_live_session`
+/// re-check under the guard (a live session refreshes the chain itself), and the
+/// rotated pair returned to the caller for the live token snapshot. A first kick
+/// that succeeds spends only the access token and takes no `RotationGuard`.
 ///
-/// Any non-401 error, a missing refresh token, a busy guard, or a live session
-/// leaves the original failure in place (no rotation attempted). Returns the
-/// final kick outcome as an `anyhow::Result` for the caller's `OpResult`.
-///
-/// Each recovery step is paced by [`ROTATION_STEP_DELAY_MS`] (401 → rotate →
-/// retry kick → caller's usage re-fetch); none of the sleeps holds the
-/// rotation lock.
-fn kick_with_rotation(
+/// Each recovery step is paced by [`ROTATION_STEP_DELAY_MS`] (kick → rotate →
+/// retry kick → caller's usage re-fetch); none of the sleeps holds the rotation
+/// lock. `activity` (the scheduler's store) drives the spinner; the CLI passes
+/// `None`.
+pub(crate) fn auto_start_kick(
     config: &crate::profile::ConfigHandle,
     name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
-    tokens: Option<&TokenList>,
+    access_expires_at: Option<i64>,
     activity: Option<&ActivityStore>,
-) -> Result<()> {
+) -> KickResult {
     match kick(access_token) {
-        Ok(()) => return Ok(()),
+        Ok(()) => {
+            return KickResult {
+                opened: true,
+                rotated: None,
+            };
+        }
+        // Expired token (401): always rotate once and retry.
         Err(KickError::Status(401)) => {}
-        Err(e) => return Err(e.into()),
+        // Rate limit (429): rotate only if the access token is also clock-expired;
+        // a still-valid token can't be unstuck by a refresh, so refuse to spend it.
+        Err(KickError::Status(429))
+            if access_expires_at.is_some_and(|exp| now_ms() as i64 >= exp) => {}
+        Err(_) => return KickResult::not_opened(),
     }
 
-    // Access token expired. Rotate once, mirroring `fetch_with_rotation`.
     let Some(rt) = refresh_token else {
-        return Err(anyhow::anyhow!("HTTP 401"));
+        return KickResult::not_opened();
     };
-    // Pace the recovery: breathe between the failed kick and the rotation
-    // round trip, before any lock is taken.
+    // Pace the recovery before any lock is taken.
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
     // RotationGuard outermost across the HTTP window — acquired with no other
-    // lock held (the cooldown read in `start_window` released config first).
+    // lock held (the caller released the usage store before kicking).
     let Ok(rotation_guard) = RotationGuard::acquire(name) else {
-        return Err(anyhow::anyhow!("HTTP 401"));
+        return KickResult::not_opened();
     };
     if has_live_session(name) {
-        return Err(anyhow::anyhow!("HTTP 401"));
+        return KickResult::not_opened();
     }
 
-    // Show the refresh spinner during the round trip, then back to AutoStarting
-    // for the retry kick.
+    // Refresh spinner during the round trip, then back to Fetching for the retry
+    // kick + the caller's fetch (the kick runs inside the scheduler's fetch leg).
     if let Some(activity) = activity {
         mark_activity(activity, name, ProfileActivity::Refreshing);
     }
     let refreshed = refresh(rt);
     if let Some(activity) = activity {
-        mark_activity(activity, name, ProfileActivity::AutoStarting);
+        mark_activity(activity, name, ProfileActivity::Fetching);
     }
-    let tok = refreshed?;
+    let tok = match refreshed {
+        Ok(t) => t,
+        Err(_) => return KickResult::not_opened(),
+    };
 
     let access = tok.access_token.clone();
     let new_refresh = tok.refresh_token.clone();
-    apply_rotated_tokens_locked(config, name, tok)?;
-    // Propagate into the scheduler's live snapshot the moment the rotation
-    // persists — independent of whether the retry kick below succeeds. The
-    // refresh token was spent regardless; leaving the stale pair in `tokens`
-    // would 401 the next fetch tick and double-burn the chain.
-    if let Some(tokens) = tokens
-        && let Ok(mut list) = tokens.lock()
-        && let Some(entry) = list.iter_mut().find(|e| e.name == name)
-    {
-        entry.access_token = access.clone();
-        entry.refresh_token = Some(new_refresh);
+    if apply_rotated_tokens_locked(config, name, tok).is_err() {
+        return KickResult::not_opened();
     }
-    // The rotated pair is persisted and synced; the retry kick spends only the
-    // access token, so release the rotation lock before the paced waits — a
-    // `clauth start` or sibling worker shouldn't block on our sleeps.
+    // The pair is persisted; carry it back so the caller syncs the live snapshot
+    // even if the retry kick below fails — the refresh token was spent either way.
+    let rotated = Some((access.clone(), Some(new_refresh)));
+    // Retry kick spends only the access token, so release the rotation lock
+    // before the paced waits — a sibling worker shouldn't block on our sleeps.
     drop(rotation_guard);
 
     // Pace rotate → retry kick, then retry kick → the caller's usage re-fetch.
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
-    kick(&access).map_err(anyhow::Error::from)?;
+    let opened = kick(&access).is_ok();
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
-    Ok(())
+    KickResult { opened, rotated }
 }
 
 /// Result of [`rotate_one_inner`]. Distinguishes the rotation-lock acquire
@@ -479,135 +488,17 @@ pub(crate) fn rotate_one(
     persisted
 }
 
-/// Names of opted-in OAuth profiles eligible for an auto-start kick: not
-/// active-with-a-diverged-link and past the cooldown, AND either lacking a live
-/// 5-hour window OR carrying a known-idle weekly window (present with zero
-/// utilization). The weekly leg keeps a profile armed until its weekly clock has
-/// actually started, so an account with an open 5h window but no weekly usage
-/// still gets kicked. A weekly window that was never fetched is not "idle" —
-/// usage is unknown there, so only the 5h rule applies. Caller enqueues into
-/// `pending_auto_start`; the on-tick drain kicks each via [`start_window`].
+/// One-shot window prime for the CLI switch: if `name` is an opted-in OAuth
+/// account, fire the kick (rotating once on a 401/429 via [`auto_start_kick`]).
+/// No scheduler side channels and no cooldown — the CLI runs once and exits, so
+/// there is no tick to debounce against. Returns whether the window opened.
 ///
-/// The single steady-state arming path, and the fix for background (non-active)
-/// accounts: the active profile gets its window for free (CC opens one on use),
-/// so without a recurring scan a background profile whose startup kick failed,
-/// or that lost its window mid-session, would never be re-armed. Running every
-/// tick re-arms them as soon as they fall idle and windowless.
-///
-/// A live `clauth start` session is NOT a skip reason: CC holds the lock but
-/// only opens a window on first message, so an idle/reset session has a live
-/// lock and no window — exactly what needs arming. `has_active_window` already
-/// excludes sessions that hold a window; liveness is the wrong signal. Kicking
-/// spends only the access token (never the single-use refresh token), so it
-/// can't race the chain — unlike the rotate paths, which gate on
-/// `has_live_session`.
-///
-/// Reads the usage store BEFORE the config lock: `apply_usage` holds
-/// `usage_store` then `config`, so the reverse order here inverts the global
-/// rank and deadlocks.
-pub(crate) fn windowless_auto_start_candidates(
-    config: &crate::profile::ConfigHandle,
-    store: &UsageStore,
-) -> Vec<String> {
-    // A window is live only while `resets_at` is still in the future. Checking
-    // mere presence would treat an expired-but-not-yet-cleared `resets_at` as
-    // live, so a background profile whose window lapsed would never be re-armed
-    // (the active profile gets a fresh window from CC each session, masking the
-    // bug as "auto-start only works for the active one").
-    let now_secs = now_epoch_secs();
-    // Per profile: (live 5h window?, weekly window known-idle?). Both gate
-    // arming — a profile is a candidate when it lacks a live window OR its
-    // weekly window is present and sitting at zero usage, so an opted-in account
-    // with an open 5h window but a cold weekly clock still gets kicked to seed
-    // weekly usage. A *missing* weekly window (never fetched) is NOT idle: we
-    // don't know the usage, so the 5h rule alone governs.
-    let window_state: std::collections::HashMap<String, (bool, bool)> = store
-        .lock()
-        .ok()
-        .map(|s| {
-            s.iter()
-                .map(|(name, info)| {
-                    let active = info
-                        .five_hour
-                        .as_ref()
-                        .and_then(|w| w.resets_at.as_deref())
-                        .and_then(iso_to_epoch_secs)
-                        .is_some_and(|resets_at| now_secs < resets_at);
-                    let weekly_idle = info.weekly_window().is_some_and(|w| w.utilization <= 0.0);
-                    (name.clone(), (active, weekly_idle))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let cfg = config.lock().expect("config mutex poisoned");
-    let skip_active = active_link_diverged(&cfg);
-    let now = now_ms();
-    cfg.profiles
-        .iter()
-        .filter(|p| {
-            let (has_window, weekly_idle) = window_state
-                .get(p.name.as_str())
-                .copied()
-                .unwrap_or((false, false));
-            p.auto_start
-                && p.is_oauth()
-                && !(skip_active && cfg.is_active(&p.name))
-                && (!has_window || weekly_idle)
-                && now.saturating_sub(
-                    cfg.state
-                        .last_auto_start_at
-                        .get(p.name.as_str())
-                        .copied()
-                        .unwrap_or(0),
-                ) >= AUTO_START_COOLDOWN_MS
-        })
-        .map(|p| p.name.to_string())
-        .collect()
-}
-
-/// The single auto-start codepath: fire the 1-token Haiku ping that opens a
-/// profile's 5-hour window using its CURRENT access token. On a 401 (expired
-/// access token) it rotates the chain once and retries via [`kick_with_rotation`]
-/// — the same reactive-rotation leg the fetch path runs, gated by the same
-/// double-spend guards (RotationGuard outermost, `has_live_session` re-check,
-/// rotated pair written back into `tokens`). A successful first kick spends only
-/// the access token and takes no `RotationGuard`.
-///
-/// Gates on opt-in, OAuth, diverged active link, and cooldown so every caller
-/// shares one rule set. Does NOT gate on `has_live_session` for the initial
-/// kick: it spends only the access token, and an idle/reset session with no
-/// window is precisely what needs arming — see
-/// [`windowless_auto_start_candidates`]. The 401-rotation leg DOES re-check
-/// `has_live_session` under the guard before spending the refresh token. The
-/// cooldown slot
-/// (`last_auto_start_at`) is stamped before the kick as a concurrency guard so a
-/// second tick can't spawn a duplicate worker in the gap between the idle check
-/// and the worker starting. On success the stamp stays (full 4.5 h cooldown); on
-/// failure it's overwritten with a backoff allowing a retry after
-/// `AUTO_START_RETRY_MS` (1 min) so a transient error / just-rotated token
-/// recovers without waiting for the next window. The "already has a window"
-/// check lives in [`windowless_auto_start_candidates`], where the store is on
-/// hand.
-///
-/// Marks `AutoStarting`, sends one `OpResult`, and on success pushes `name` onto
-/// `refetch` so usage re-fetches and the armed window shows up. Returns true iff
-/// the kick succeeded.
-///
-/// `tokens`/`refetch`/`activity` are optional scheduler side-channels: the TUI
-/// passes `Some` to sync the rotated pair into the live TokenList, re-fetch, and
-/// drive the spinner; the no-scheduler CLI switch passes `None` (no TokenList to
-/// sync, no queue drain, no spinner), allocating no throwaway mutexes.
-pub(crate) fn start_window(
-    config: &crate::profile::ConfigHandle,
-    name: &str,
-    tokens: Option<&TokenList>,
-    refetch: Option<&RefetchQueue>,
-    activity: Option<&ActivityStore>,
-    sender: &OpResultSender,
-) -> bool {
-    let (access_token, refresh_token) = {
-        let mut cfg = config.lock().expect("config mutex poisoned");
+/// The just-switched profile is active and freshly reconciled, so the diverged-
+/// active guard the steady-state path needs doesn't apply here; opt-in + OAuth
+/// is the whole gate.
+pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &str) -> bool {
+    let (access_token, refresh_token, expires_at) = {
+        let cfg = config.lock().expect("config mutex poisoned");
         match with_state_lock(|| {
             let Some(profile) = cfg.find(name) else {
                 return Ok::<_, anyhow::Error>(None);
@@ -619,64 +510,22 @@ pub(crate) fn start_window(
                 return Ok(None);
             };
             let refresh = profile.refresh_token().map(str::to_string);
-            if active_link_diverged(&cfg) && cfg.is_active(name) {
-                return Ok(None);
-            }
-            let now = now_ms();
-            let last = cfg.state.last_auto_start_at.get(name).copied().unwrap_or(0);
-            if now.saturating_sub(last) < AUTO_START_COOLDOWN_MS {
-                return Ok(None);
-            }
-            cfg.state.last_auto_start_at.insert(name.to_string(), now);
-            let _ = save_app_state(&cfg.state);
-            Ok(Some((token, refresh)))
+            Ok(Some((token, refresh, profile.access_token_expires_at())))
         }) {
             Ok(Some(t)) => t,
             _ => return false,
         }
     };
 
-    if let Some(activity) = activity {
-        mark_activity(activity, name, ProfileActivity::AutoStarting);
-    }
-    let outcome = kick_with_rotation(
+    auto_start_kick(
         config,
         name,
         &access_token,
         refresh_token.as_deref(),
-        tokens,
-        activity,
-    );
-    let kicked = outcome.is_ok();
-    // On failure: overwrite the pre-kick stamp with a backoff so the profile
-    // retries after AUTO_START_RETRY_MS instead of the full 4.5 h.
-    if !kicked {
-        let mut cfg = config.lock().expect("config mutex poisoned");
-        let _ = with_state_lock(|| {
-            let backoff =
-                now_ms().saturating_sub(AUTO_START_COOLDOWN_MS.saturating_sub(AUTO_START_RETRY_MS));
-            cfg.state
-                .last_auto_start_at
-                .insert(name.to_string(), backoff);
-            let _ = save_app_state(&cfg.state);
-            Ok::<_, anyhow::Error>(())
-        });
-    }
-    if let Some(activity) = activity {
-        clear_activity(activity, name);
-    }
-    let _ = sender.send(OpResult {
-        name: name.to_string(),
-        kind: ActivityKind::AutoStarting,
-        outcome,
-    });
-    if kicked
-        && let Some(refetch) = refetch
-        && let Ok(mut q) = refetch.lock()
-    {
-        q.insert(name.to_string());
-    }
-    kicked
+        expires_at,
+        None,
+    )
+    .opened
 }
 
 /// Write rotated token fields into an OAuth block. Caller holds the state lock.

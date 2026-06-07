@@ -36,16 +36,15 @@ use crate::profile::{
     AppConfig, ConfigHandle, Profile, ThemeName, app_state_mtime, load_config, save_app_state,
     save_profile,
 };
-use crate::runtime::has_live_session;
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
     ActivityKind, ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
-    OpResultSender, PendingAutoStart, PendingSwitch, PendingSwitchOff, ProfileActivity,
-    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
+    OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RefetchQueue,
+    StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
     ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageStore, any_busy,
-    clear_activity, collect_third_party_entries, fetch_all_into, is_idle, mark_activity, now_ms,
+    clear_activity, collect_third_party_entries, fetch_all_into, is_idle, mark_activity,
     spawn_refresher,
 };
 
@@ -638,10 +637,6 @@ pub(crate) struct App {
     /// Sender side for startup workers.
     pub(crate) startup_sender: StartupSender,
     pub(crate) last_fetched: LastFetchedAt,
-    pub(crate) pending_auto_start: PendingAutoStart,
-    /// name → epoch-ms first seen windowless; debounces live-session candidates.
-    /// Pruned each tick to the current candidate set.
-    pub(crate) auto_start_windowless_since: HashMap<String, u64>,
     /// Scheduler-posted auto-switch decisions; drained in `on_tick`.
     pub(crate) pending_switch: PendingSwitch,
     /// Set by the scheduler when the whole chain is spent; `on_tick` drains it
@@ -771,7 +766,6 @@ impl App {
         let (op_sender, op_results) = std::sync::mpsc::channel::<OpResult>();
         let (startup_sender, startup_results) = std::sync::mpsc::channel::<StartupSignal>();
         let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-        let pending_auto_start: PendingAutoStart = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_switch_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
@@ -814,8 +808,6 @@ impl App {
             startup_results,
             startup_sender,
             last_fetched,
-            pending_auto_start,
-            auto_start_windowless_since: HashMap::new(),
             pending_switch,
             pending_switch_off,
             refetch_queue,
@@ -1159,6 +1151,8 @@ fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
                 name: p.name.to_string(),
                 access_token: oauth.access_token.clone(),
                 refresh_token: oauth.refresh_token.clone(),
+                auto_start: p.auto_start,
+                access_expires_at: oauth.expires_at,
             })
         })
         .collect()
@@ -1566,33 +1560,6 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
     } else if delta > 0 {
         app.profile_cursor += 1;
     }
-}
-
-/// Spawn a worker under `catch_unwind`. On panic, clears the activity slot and
-/// emits a failure `OpResult` so a panic before `sender.send` never strands the
-/// slot (which would wedge `any_busy`). `AssertUnwindSafe` is intentional —
-/// captured Arcs have their own locks; a panic can't violate other threads.
-fn spawn_profile_worker<F>(
-    name: String,
-    kind: ActivityKind,
-    panic_msg: &'static str,
-    activity: ActivityStore,
-    sender: OpResultSender,
-    work: F,
-) where
-    F: FnOnce() + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-        if result.is_err() {
-            clear_activity(&activity, &name);
-            let _ = sender.send(OpResult {
-                name,
-                kind,
-                outcome: Err(anyhow::anyhow!(panic_msg)),
-            });
-        }
-    });
 }
 
 /// Switch the active profile to `name`. Pure filesystem relink, no token
@@ -2860,62 +2827,19 @@ fn toggle_auto_start(app: &mut App, name: &str) {
             ToastKind::Warning,
             "auto-start usage only applies to OAuth profiles",
         ),
-        Outcome::Saved(now_on) => {
-            // Clear the 4.5h cooldown on explicit ON so a prior failed kick
-            // doesn't block the scan for hours. The scan arms on the next tick
-            // if there's no live window; an existing window is left alone.
-            if now_on {
-                let mut cfg = app.config();
-                cfg.state.last_auto_start_at.remove(name);
-                let _ = save_app_state(&cfg.state);
-            }
+        Outcome::Saved(_now_on) => {
+            // Rebuild the scheduler's token snapshot so the new `auto_start` flag
+            // reaches the fetch leg's window-lapsed gate. The per-profile
+            // config.toml write doesn't bump the profiles.toml mtime that
+            // `reload_if_state_changed` watches, so without this the toggle would
+            // lag until the next unrelated snapshot rebuild. The periodic tick
+            // then opens a window if this profile now lacks a live one.
+            app.refresh_tokens();
         }
         Outcome::SaveFailed(e) => {
             app.toast(ToastKind::Danger, format!("save failed: {e}"));
         }
     }
-}
-
-/// Debounce before kicking a live-session candidate. Exceeds the 60s refresh
-/// interval so a CC-opened 5h window lands in the store first.
-const AUTO_START_LIVE_SESSION_DEBOUNCE_MS: u64 = 90_000;
-
-/// Filter windowless candidates to those ready to kick. Non-live pass through
-/// immediately; live candidates are held for `AUTO_START_LIVE_SESSION_DEBOUNCE_MS`.
-/// Timestamps pruned to the live set each call so debounce restarts cleanly.
-fn ready_auto_start(app: &mut App, candidates: Vec<String>) -> Vec<String> {
-    let live: HashSet<String> = candidates
-        .iter()
-        .filter(|name| has_live_session(name))
-        .cloned()
-        .collect();
-    debounce_live_candidates(
-        &mut app.auto_start_windowless_since,
-        candidates,
-        &live,
-        now_ms(),
-    )
-}
-
-/// Testable core of [`ready_auto_start`]. `since` tracks first-seen-windowless
-/// timestamps and is pruned to `live` so stale timers can't linger.
-fn debounce_live_candidates(
-    since: &mut HashMap<String, u64>,
-    candidates: Vec<String>,
-    live: &HashSet<String>,
-    now: u64,
-) -> Vec<String> {
-    since.retain(|name, _| live.contains(name));
-    candidates
-        .into_iter()
-        .filter(|name| {
-            if !live.contains(name) {
-                return true;
-            }
-            let first = *since.entry(name.clone()).or_insert(now);
-            now.saturating_sub(first) >= AUTO_START_LIVE_SESSION_DEBOUNCE_MS
-        })
-        .collect()
 }
 
 fn handle_confirm_key(app: &mut App, key: KeyEvent) {
@@ -3292,52 +3216,6 @@ pub(crate) fn on_tick(app: &mut App) {
     }
     app.apply_usage();
 
-    // Arm opted-in profiles with no live 5h window. Skip while bootstrap is
-    // running — it's mid-`refresh_all` and rotated tokens must land first.
-    let pending: Vec<String> = if app.bootstrap_active.load(Ordering::SeqCst) {
-        Vec::new()
-    } else {
-        let candidates = oauth::windowless_auto_start_candidates(&app.config, &app.usage_store);
-        let raw: Vec<String> = app
-            .pending_auto_start
-            .lock()
-            .map(|mut g| {
-                g.extend(candidates);
-                g.drain().collect()
-            })
-            .unwrap_or_default();
-        // Debounce live-session candidates.
-        ready_auto_start(app, raw)
-    };
-    for name in pending {
-        if !is_idle(&app.activity, &name) {
-            continue;
-        }
-        let config = Arc::clone(&app.config);
-        let tokens = Arc::clone(&app.usage_tokens);
-        let refetch = Arc::clone(&app.refetch_queue);
-        let work_name = name.clone();
-        let work_activity = Arc::clone(&app.activity);
-        let work_sender = app.op_sender.clone();
-        spawn_profile_worker(
-            name,
-            ActivityKind::AutoStarting,
-            "auto-start worker panicked",
-            Arc::clone(&app.activity),
-            app.op_sender.clone(),
-            move || {
-                let _ = oauth::start_window(
-                    &config,
-                    &work_name,
-                    Some(&tokens),
-                    Some(&refetch),
-                    Some(&work_activity),
-                    &work_sender,
-                );
-            },
-        );
-    }
-
     // Drain scheduler auto-switch decisions; skip non-idle targets.
     let auto_switch_targets: Vec<String> = app
         .pending_switch
@@ -3392,10 +3270,9 @@ fn update_banner(app: &mut App) {
 }
 
 /// Drain worker op results: clear activity slots, toast errors/successes,
-/// rebuild token snapshot on Refreshing/AutoStarting success.
+/// rebuild token snapshot on Refreshing success.
 fn drain_op_results(app: &mut App) {
     let mut needs_token_snapshot_rebuild = false;
-    let mut auto_started_names: Vec<String> = Vec::new();
     while let Ok(OpResult {
         name,
         kind,
@@ -3417,23 +3294,13 @@ fn drain_op_results(app: &mut App) {
             a.remove(&name);
         }
         match outcome {
-            Ok(()) => match kind {
-                ActivityKind::AutoStarting => {
-                    needs_token_snapshot_rebuild = true;
-                    auto_started_names.push(name.clone());
-                    app.toast(
-                        ToastKind::Info,
-                        format!("auto-started usage window for '{name}'"),
-                    );
-                    app.set_tab_activity(Tab::Usage, ToastKind::Info);
-                }
-                ActivityKind::Refreshing => {
+            Ok(()) => {
+                if kind == ActivityKind::Refreshing {
                     needs_token_snapshot_rebuild = true;
                     app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
                     app.set_tab_activity(Tab::Usage, ToastKind::Info);
                 }
-                _ => {}
-            },
+            }
             Err(e) => {
                 let verb = match kind {
                     ActivityKind::Fetching => {
@@ -3442,7 +3309,6 @@ fn drain_op_results(app: &mut App) {
                     ActivityKind::Refreshing => "refresh",
                     ActivityKind::Switching => "switch",
                     ActivityKind::Starting => "start",
-                    ActivityKind::AutoStarting => "auto-start",
                 };
                 app.toast(
                     ToastKind::Danger,
@@ -3450,7 +3316,7 @@ fn drain_op_results(app: &mut App) {
                 );
                 // Route the failure to the relevant tab.
                 let failure_tab = match kind {
-                    ActivityKind::Refreshing | ActivityKind::AutoStarting => Tab::Usage,
+                    ActivityKind::Refreshing => Tab::Usage,
                     ActivityKind::Switching | ActivityKind::Starting => Tab::Overview,
                     _ => Tab::Overview,
                 };
@@ -3460,18 +3326,6 @@ fn drain_op_results(app: &mut App) {
     }
     if needs_token_snapshot_rebuild {
         app.refresh_tokens();
-    }
-    // Optimistically mark kicked windows open before the re-fetch: /usage can
-    // rate-limit for minutes after a kick, and until a live body lands the
-    // usage tab + auto-start scan would still see the stale windowless data.
-    for name in &auto_started_names {
-        crate::usage::mark_window_open(&app.usage_store, name, crate::usage::now_epoch_secs());
-    }
-    // Route auto-start re-fetches through RefetchQueue (not all-profile refresh).
-    if !auto_started_names.is_empty()
-        && let Ok(mut q) = app.refetch_queue.lock()
-    {
-        q.extend(auto_started_names.drain(..));
     }
 }
 
@@ -3662,49 +3516,6 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let activity = make_activity(&[("alice", ProfileActivity::Refreshing)]);
         assert!(bootstrap_busy(&flag, &activity));
-    }
-
-    use super::{AUTO_START_LIVE_SESSION_DEBOUNCE_MS, debounce_live_candidates};
-    use std::collections::HashSet;
-
-    #[test]
-    fn debounce_passes_non_live_candidate_through() {
-        let mut since = HashMap::new();
-        let live = HashSet::new();
-        let ready = debounce_live_candidates(&mut since, vec!["bg".to_string()], &live, 1_000_000);
-        assert_eq!(ready, vec!["bg".to_string()]);
-        assert!(since.is_empty(), "no timer for a non-live candidate");
-    }
-
-    #[test]
-    fn debounce_holds_live_candidate_on_first_sight() {
-        let mut since = HashMap::new();
-        let live = HashSet::from(["cc".to_string()]);
-        let ready = debounce_live_candidates(&mut since, vec!["cc".to_string()], &live, 1_000_000);
-        assert!(
-            ready.is_empty(),
-            "live candidate must wait out the debounce"
-        );
-        assert_eq!(since.get("cc"), Some(&1_000_000), "first-seen stamped");
-    }
-
-    #[test]
-    fn debounce_arms_live_candidate_after_window() {
-        let now = 5_000_000;
-        let mut since =
-            HashMap::from([("cc".to_string(), now - AUTO_START_LIVE_SESSION_DEBOUNCE_MS)]);
-        let live = HashSet::from(["cc".to_string()]);
-        let ready = debounce_live_candidates(&mut since, vec!["cc".to_string()], &live, now);
-        assert_eq!(ready, vec!["cc".to_string()]);
-    }
-
-    #[test]
-    fn debounce_prunes_stale_timers() {
-        let mut since = HashMap::from([("gone".to_string(), 1)]);
-        let live = HashSet::new();
-        let ready = debounce_live_candidates(&mut since, Vec::new(), &live, 9_000_000);
-        assert!(ready.is_empty());
-        assert!(since.is_empty(), "stale timer pruned");
     }
 
     // ── compact mode ─────────────────────────────────────────────────────────

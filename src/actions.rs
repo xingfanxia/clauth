@@ -20,7 +20,6 @@ use crate::profile::{
     AppConfig, ClaudeCredentials, Profile, profile_dir, save_app_state, save_profile,
 };
 use crate::spinner::Spinner;
-use crate::usage::OpResult;
 
 /// ASCII alphanumeric + `-_.", not leading-dot, not empty, not a duplicate
 /// (`exclude` exempts the current name for rename-in-place).
@@ -122,12 +121,11 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     }
 
     // Prime the 5h window if opted in. Kicks with the current access token and
-    // rotates once on a 401. No TokenList to sync (CLI has no scheduler), so
-    // pass None there. Throwaway sender — nothing drains OpResult.
+    // rotates once on a 401/429. One-shot — the CLI has no scheduler tick to
+    // re-arm against, so no side channels.
     {
         let _spinner = Spinner::start("clauth: priming usage window…");
-        let (op_sender, _op_receiver) = std::sync::mpsc::channel::<OpResult>();
-        let _ = oauth::start_window(&config, canonical, None, None, None, &op_sender);
+        let _ = oauth::prime_window(&config, canonical);
     }
     println!("switched to '{canonical}'");
     Ok(())

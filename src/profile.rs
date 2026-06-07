@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -99,6 +99,12 @@ impl ClaudeCredentials {
     pub(crate) fn access_token(&self) -> Option<&str> {
         Some(self.claude_ai_oauth.as_ref()?.access_token.as_str())
     }
+
+    /// Epoch-ms the access token expires at, when known. Gates the auto-start
+    /// kick's rotate-on-429: only a clock-expired token is worth rotating.
+    pub(crate) fn access_token_expires_at(&self) -> Option<i64> {
+        self.claude_ai_oauth.as_ref()?.expires_at
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +174,10 @@ impl Profile {
     pub(crate) fn access_token(&self) -> Option<&str> {
         self.credentials.as_ref()?.access_token()
     }
+
+    pub(crate) fn access_token_expires_at(&self) -> Option<i64> {
+        self.credentials.as_ref()?.access_token_expires_at()
+    }
 }
 
 /// Theme tier stored in `profiles.toml`. Serialized as a lowercase string so
@@ -185,10 +195,6 @@ pub(crate) enum ThemeName {
 pub(crate) struct AppState {
     pub(crate) active_profile: Option<ProfileName>,
     pub(crate) profiles: Vec<ProfileName>,
-    /// Epoch-ms of the last successful auto-start ping per profile.
-    /// Field stays `last_kick_at` on disk for back-compat with older versions.
-    #[serde(default, alias = "last_kick_at", rename = "last_kick_at")]
-    pub(crate) last_auto_start_at: HashMap<String, u64>,
     #[serde(default)]
     pub(crate) fallback_chain: Vec<ProfileName>,
     /// When true and the whole chain is exhausted, auto-switch clears live
