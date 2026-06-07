@@ -280,9 +280,9 @@ fn detail_row(
         Span::raw("  ")
     };
     match row {
-        ConfigRow::Name => kv_field(arrow, "name", name_in, editing, selected),
-        ConfigRow::BaseUrl => kv_field(arrow, "base url", base_in, editing, selected),
-        ConfigRow::ApiKey => kv_field(arrow, "api key", key_in, editing, selected),
+        ConfigRow::Name => kv_field(arrow, "name", name_in, editing, selected, false),
+        ConfigRow::BaseUrl => kv_field(arrow, "base url", base_in, editing, selected, false),
+        ConfigRow::ApiKey => kv_field(arrow, "api key", key_in, editing, selected, true),
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
                 (theme::toggle_on().to_string(), theme::accent())
@@ -322,13 +322,14 @@ fn kv_field(
     input: &InputState,
     editing: bool,
     focused: bool,
+    mask_value: bool,
 ) -> Line<'static> {
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     let mut spans = vec![
         arrow,
         Span::styled(format!("{key}{}", " ".repeat(pad)), label_style(focused)),
     ];
-    spans.extend(value_spans(input, editing));
+    spans.extend(value_spans(input, editing, mask_value));
     Line::from(spans)
 }
 
@@ -347,12 +348,17 @@ fn kv_static(
     ])
 }
 
-fn value_spans(input: &InputState, editing: bool) -> Vec<Span<'static>> {
+fn value_spans(input: &InputState, editing: bool, mask_value: bool) -> Vec<Span<'static>> {
     if !editing {
         if input.value.is_empty() {
             return vec![Span::styled("—", theme::faint())];
         }
-        return vec![Span::styled(input.value.clone(), theme::accent())];
+        let display = if mask_value {
+            "••••••••".to_string()
+        } else {
+            input.value.clone()
+        };
+        return vec![Span::styled(display, theme::accent())];
     }
     // In edit mode the terminal cursor (set via frame.set_cursor_position) owns
     // the caret glyph — no simulated block highlight needed.
