@@ -557,9 +557,16 @@ impl StatusState {
         self.incidents.get(self.cursor)
     }
 
-    /// How many incidents are still active (status not `resolved`/`completed`).
-    pub(crate) fn active_count(&self) -> usize {
-        self.incidents.iter().filter(|i| i.is_active()).count()
+    /// Worst impact among active incidents: critical > major > minor > maintenance.
+    /// Returns [`crate::status::Impact::None`] when nothing is active.
+    pub(crate) fn worst_active_impact(&self) -> crate::status::Impact {
+        self.incidents
+            .iter()
+            .filter(|i| i.is_active())
+            .map(|i| &i.impact)
+            .max_by_key(|i| i.severity())
+            .cloned()
+            .unwrap_or(crate::status::Impact::None)
     }
 }
 

@@ -75,15 +75,16 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Feed-health color for the header status dot — same buckets as the status
-/// tab's title-right meta: stale cache or active incidents → WARNING,
-/// otherwise SUCCESS.
+/// Feed-health color for the header status dot — when active incidents exist,
+/// uses the worst impact's semantic color (critical/major → DANGER, minor →
+/// WARNING, maintenance → TEXT_DIM). Stale cache or no data → SUCCESS.
 fn status_dot_color(app: &App) -> ratatui::style::Color {
-    let stale = app.status.cached && app.status.fetched_at_ms.is_some();
-    if stale || app.status.active_count() > 0 {
-        theme::warning_color()
-    } else {
-        theme::success_color()
+    use crate::status::Impact;
+    match app.status.worst_active_impact() {
+        Impact::Critical | Impact::Major => theme::danger_color(),
+        Impact::Minor => theme::warning_color(),
+        Impact::Maintenance => theme::text_dim_color(),
+        Impact::None | Impact::Other(_) => theme::success_color(),
     }
 }
 

@@ -58,14 +58,18 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // 2 lines per incident; window so the selected item stays visible.
     const ITEM_H: usize = 2;
     let viewport_lines = inner.height as usize;
-    let viewport_items = (viewport_lines / ITEM_H).max(1);
+    // Items that fill the viewport (ceil — the last may be partially clipped).
+    let viewport_items = viewport_lines.div_ceil(ITEM_H)
+        .max(1)
+        .min(app.status.incidents.len());
     let first_item = first_visible_item(
         app.status.cursor,
         viewport_items,
         app.status.incidents.len(),
     );
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport_lines);
+    let shown = (app.status.incidents.len() - first_item).min(viewport_items);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(shown * ITEM_H);
     let content_w = inner.width as usize;
     for (i, incident) in app
         .status
@@ -73,7 +77,7 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .skip(first_item)
-        .take(viewport_items)
+        .take(shown)
     {
         let selected = i == app.status.cursor;
         lines.extend(incident_rows(incident, selected, focused, content_w));
@@ -81,7 +85,7 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 
-    // Scrollbar: total = items * 2 lines, offset = first visible line.
+    // Scrollbar: total = items × 2 lines; viewport = actual pixel height.
     draw_scrollbar(
         frame,
         inner,
@@ -91,15 +95,17 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-/// First item index to render so `cursor` is within the viewport.
+/// First item index to render so `cursor` is near the center of the viewport,
+/// shifting the window on both ↑ and ↓ (not only when the cursor hits the bottom).
 fn first_visible_item(cursor: usize, viewport_items: usize, total: usize) -> usize {
     if total <= viewport_items {
         return 0;
     }
-    if cursor < viewport_items {
+    let half = viewport_items / 2;
+    if cursor < half {
         0
     } else {
-        (cursor + 1 - viewport_items).min(total - viewport_items)
+        cursor.saturating_sub(half).min(total - viewport_items)
     }
 }
 
@@ -149,44 +155,51 @@ fn incident_rows(
     let mut line1 = vec![caret, Span::styled(title, title_style)];
     pad_to(&mut line1, content_w, tint);
 
-    // Line 2: 2-space gutter + `[ status ]` pill + optional `[ impact ]` pill +
-    // right-aligned age. Fit priority on narrow selectors: status > impact > age.
-    let (pill_word, pill_color) = phase_pill(incident);
-    let mut line2: Vec<Span<'static>> = vec![
-        Span::styled("  ", with_bg(Style::default())),
-        Span::styled("[ ", with_bg(theme::dim())),
-        Span::styled(
-            pill_word.clone(),
-            with_bg(Style::default().fg(pill_color).add_modifier(Modifier::BOLD)),
-        ),
-        Span::styled(" ]", with_bg(theme::dim())),
-    ];
-    let mut used = 2 + 2 + pill_word.chars().count() + 2;
+    // Line 2: 2-space gutter + `[ impact ]` pill (severity only, no status
+    // word) + right-aligned age. Ongoing incidents swap the age for a semantic
+    // dot. Fit priority: impact > age/dot.
+    let mut line2: Vec<Span<'static>> = vec![Span::styled("  ", with_bg(Style::default()))];
+    let mut used = 2usize;
 
-    // Impact pill (omitted when none) — only if it fits after the status pill.
+    // Impact pill (omitted when none).
     if !matches!(incident.impact, Impact::None) {
         let (iword, icolor) = impact_pill(&incident.impact);
-        let iwidth = 2 + 2 + iword.chars().count() + 2; // "  [ word ]"
-        if used + iwidth <= content_w {
-            line2.extend([
-                Span::styled("  [ ", with_bg(theme::dim())),
-                Span::styled(
-                    iword.clone(),
-                    with_bg(Style::default().fg(icolor).add_modifier(Modifier::BOLD)),
-                ),
-                Span::styled(" ]", with_bg(theme::dim())),
-            ]);
-            used += iwidth;
-        }
+        line2.extend([
+            Span::styled("[ ", with_bg(theme::dim())),
+            Span::styled(
+                iword.clone(),
+                with_bg(Style::default().fg(icolor).add_modifier(Modifier::BOLD)),
+            ),
+            Span::styled(" ]", with_bg(theme::dim())),
+        ]);
+        used += 2 + iword.chars().count() + 2; // "[ word ]" — no gap before it
     }
 
-    // Age — right-aligned only if it still fits after both pills + a 2-space gap.
-    let age = relative_age(incident.started_ms);
-    let age_w = age.chars().count();
-    if used + 2 + age_w <= content_w {
-        let gap = content_w - used - age_w;
-        line2.push(Span::styled(" ".repeat(gap), with_bg(Style::default())));
-        line2.push(Span::styled(age, with_bg(theme::faint())));
+    if incident.is_active() {
+        // Ongoing → semantic dot in place of the age, 1-char right padding.
+        let dot_color = phase_text_color(&incident.phase);
+        let dot = "●";
+        let dot_w = dot.chars().count();
+        // 1-char right pad so pad_to leaves a trailing space when possible.
+        if used + 2 + dot_w <= content_w {
+            let gap = content_w - used - dot_w - 1;
+            line2.push(Span::styled(
+                " ".repeat(gap),
+                with_bg(Style::default()),
+            ));
+            line2.push(Span::styled(
+                dot,
+                with_bg(Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),
+            ));
+        }
+    } else {
+        let age = relative_age(incident.started_ms);
+        let age_w = age.chars().count();
+        if used + 2 + age_w <= content_w {
+            let gap = content_w - used - age_w - 1;
+            line2.push(Span::styled(" ".repeat(gap), with_bg(Style::default())));
+            line2.push(Span::styled(age, with_bg(theme::faint())));
+        }
     }
     pad_to(&mut line2, content_w, tint);
 
@@ -246,15 +259,10 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
         .padding(ratatui::widgets::Padding::horizontal(1))
 }
 
-/// `(word, color)` for an incident's status pill from its lifecycle phase: a
-/// terminal phase (resolved / completed) is SUCCESS, any active phase is WARNING.
+/// `(word, color)` for an incident's status pill — delegates to
+/// [`phase_text_color`] so the pill, detail header, and timeline all agree.
 fn phase_pill(incident: &Incident) -> (String, ratatui::style::Color) {
-    let color = if incident.phase.is_terminal() {
-        theme::success_color()
-    } else {
-        theme::warning_color()
-    };
-    (incident.phase.word(), color)
+    (incident.phase.word(), phase_text_color(&incident.phase))
 }
 
 // ── Right panel: incident timeline ─────────────────────────────────────────────
@@ -305,7 +313,7 @@ fn draw_incident_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Header: status pill + impact pill + age + duration / ongoing.
+    // Header: status pill + impact pill + age left; duration right-aligned.
     let (pill_word, pill_color) = phase_pill(incident);
     let mut header = vec![
         Span::styled("[ ", theme::dim()),
@@ -327,18 +335,23 @@ fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
             Span::styled(" ]", theme::dim()),
         ]);
     }
-    header.push(Span::styled(
-        format!("  {}", relative_age(incident.started_ms)),
-        theme::faint(),
-    ));
-    // Duration: `· lasted <dur>` when resolved, `· ongoing` otherwise.
-    match incident.resolved_ms {
+    let age_str = relative_age(incident.started_ms);
+    header.push(Span::styled(format!("  {age_str}"), theme::faint()));
+
+    // Duration text: `· lasted <dur>` when resolved, `· ongoing` otherwise.
+    let dur_str = match incident.resolved_ms {
         Some(resolved) if resolved >= incident.started_ms => {
             let dur = duration_label((resolved - incident.started_ms) / 1000);
-            header.push(Span::styled(format!(" · lasted {dur}"), theme::faint()));
+            format!("lasted {dur}")
         }
-        _ => header.push(Span::styled(" · ongoing", theme::faint())),
+        _ => "ongoing".to_string(),
+    };
+    let left_w: usize = header.iter().map(|s| s.content.chars().count()).sum();
+    if left_w + dur_str.chars().count() < inner_w {
+        let gap = inner_w - left_w - dur_str.chars().count();
+        header.push(Span::styled(" ".repeat(gap), Style::default()));
     }
+    header.push(Span::styled(dur_str, theme::faint()));
     lines.push(Line::from(header));
 
     // started row (the one place the `utc` suffix appears).

@@ -186,6 +186,17 @@ impl Impact {
             Self::Other(w) => w.clone(),
         }
     }
+
+    /// Numeric severity for ordering: larger = worse.
+    pub(crate) fn severity(&self) -> u8 {
+        match self {
+            Self::Critical => 4,
+            Self::Major => 3,
+            Self::Minor => 2,
+            Self::Maintenance => 1,
+            Self::None | Self::Other(_) => 0,
+        }
+    }
 }
 
 /// Outcome of one fetch attempt, streamed to the TUI.
