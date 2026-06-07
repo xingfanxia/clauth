@@ -22,6 +22,8 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         }),
         usage: None,
         fetch_status: None,
+        provider: None,
+        third_party_usage: None,
     }
 }
 
@@ -36,6 +38,8 @@ fn endpoint_profile(name: &str) -> Profile {
         credentials: None,
         usage: None,
         fetch_status: None,
+        provider: None,
+        third_party_usage: None,
     }
 }
 
@@ -50,6 +54,8 @@ fn blank_profile(name: &str) -> Profile {
         credentials: None,
         usage: None,
         fetch_status: None,
+        provider: None,
+        third_party_usage: None,
     }
 }
 

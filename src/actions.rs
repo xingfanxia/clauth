@@ -172,8 +172,21 @@ pub(crate) fn edit_profile_endpoint(
 ) -> Result<()> {
     with_state_lock(|| {
         let profile = config.find_mut(name).context("Profile not found")?;
+        let old_api_key = profile.api_key.clone();
         profile.base_url = base_url;
         profile.api_key = api_key;
+        // Re-derive the provider — the in-memory config is authoritative until
+        // the next disk reload, so a stale value here would keep (or block)
+        // third-party fetches against the wrong endpoint. Also clear when only the
+        // api key changed for the same provider (rotated key — old stats are stale).
+        let provider = profile
+            .base_url
+            .as_deref()
+            .and_then(crate::providers::Provider::from_base_url);
+        if provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key) {
+            profile.third_party_usage = None;
+        }
+        profile.provider = provider;
         save_profile(profile)?;
 
         if config.is_active(name) {

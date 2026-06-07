@@ -123,7 +123,7 @@ pub(crate) enum FetchError {
 
 /// Parse a `retry-after` header value in delta-seconds form. The HTTP-date
 /// form (and anything else non-numeric) returns `None` — no hint.
-fn parse_retry_after(value: &str) -> Option<Duration> {
+pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
@@ -131,9 +131,20 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(4)))
         .timeout_recv_response(Some(Duration::from_secs(8)))
+        // ureq 3 defaults non-2xx to `Err(Error::StatusCode)`; our callers read
+        // the status off the `Ok` response (401 → rotate, 429 → retry-after).
+        // Without this flag those branches are unreachable and every HTTP error
+        // collapses into `Network`.
+        .http_status_as_error(false)
         .build()
         .into()
 });
+
+/// Shared HTTP agent for usage-style GETs (also used by `crate::providers`).
+/// Status codes arrive on the `Ok` response — see the builder comment.
+pub(crate) fn http_agent() -> &'static ureq::Agent {
+    &AGENT
+}
 
 fn get_json(url: &str, access_token: &str) -> std::result::Result<String, FetchError> {
     let mut response = AGENT

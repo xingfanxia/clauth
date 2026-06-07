@@ -29,6 +29,8 @@ fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64
             ..UsageInfo::default()
         }),
         fetch_status: None,
+        provider: None,
+        third_party_usage: None,
     }
 }
 

@@ -9,6 +9,7 @@ mod lockorder;
 mod oauth;
 mod platform;
 mod profile;
+mod providers;
 mod runtime;
 mod spinner;
 mod start;

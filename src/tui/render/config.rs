@@ -82,6 +82,8 @@ struct Snap {
     api_key: String,
     auto_start: bool,
     is_active: bool,
+    /// Recognised third-party provider display name, if any.
+    provider: Option<&'static str>,
 }
 
 fn build_snap(app: &App, with_text: bool) -> Snap {
@@ -101,6 +103,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             api_key: String::new(),
             auto_start: false,
             is_active: false,
+            provider: None,
         };
     }
     match cfg.profiles.get(app.profile_cursor) {
@@ -115,6 +118,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             base_url: text(&p.base_url),
             api_key: text(&p.api_key),
             auto_start: p.auto_start,
+            provider: p.provider.map(|p| p.display_name()),
         },
         None => Snap {
             title: "settings".to_string(),
@@ -123,6 +127,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             api_key: String::new(),
             auto_start: false,
             is_active: false,
+            provider: None,
         },
     }
 }
@@ -192,12 +197,24 @@ fn draw_settings_rows(
         type_spans.push(Span::raw(" ".repeat(pad)));
         type_spans.extend(active_dot());
     }
-    let mut lines: Vec<Line<'static>> = vec![Line::from(type_spans), Line::from("")];
+    let mut lines: Vec<Line<'static>> = vec![Line::from(type_spans)];
+
+    // Provider row — only for recognised third-party providers. Hidden while a
+    // draft empties the base-url buffer (`is_api` tracks the draft live).
+    let provider_label = if is_api { snap.provider } else { None };
+    if let Some(label) = provider_label {
+        lines.push(Line::from(vec![
+            Span::styled(format!("provider{}", " ".repeat(KEY_W - 8)), theme::label()),
+            Span::styled(label, theme::accent()),
+        ]));
+    }
+
+    lines.push(Line::from(""));
     // Track which absolute line index the editing row occupies so we can set
     // the native terminal cursor after rendering.
     let mut edit_line_y: Option<u16> = None;
-    // `lines` starts with [type, blank] = 2 entries before the loop.
-    let mut line_idx: u16 = 2;
+    // `lines` starts with [type (, provider), blank] before the loop.
+    let mut line_idx: u16 = if provider_label.is_some() { 3 } else { 2 };
 
     for (i, row) in rows.iter().enumerate() {
         let selected = actions_focused && i == cursor;

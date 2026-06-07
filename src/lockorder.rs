@@ -74,6 +74,9 @@ pub(crate) mod rank {
         Rotation = 100;
         LastFetched = 200;
         Tokens = 250;
+        ThirdParty = 260;
+        ThirdPartyUsageStore = 270;
+        ThirdPartyStatus = 280;
         UsageStore = 300;
         UsageStatus = 350;
         Config = 400;

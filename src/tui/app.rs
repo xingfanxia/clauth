@@ -43,9 +43,10 @@ use crate::update::{self, UpdateEvent};
 use crate::usage::{
     ActivityKind, ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
     OpResultSender, PendingAutoStart, PendingSwitch, PendingSwitchOff, ProfileActivity,
-    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, TokenEntry,
-    TokenList, UsageStore, any_busy, clear_activity, fetch_all_into, is_idle, mark_activity,
-    now_ms, spawn_refresher,
+    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
+    ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageStore, any_busy,
+    clear_activity, collect_third_party_entries, fetch_all_into, is_idle, mark_activity, now_ms,
+    spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -641,6 +642,9 @@ pub(crate) struct App {
     pub(crate) pending_switch_off: PendingSwitchOff,
     pub(crate) refetch_queue: RefetchQueue,
 
+    pub(crate) third_party_tokens: ThirdPartyList,
+    pub(crate) third_party_usage_store: ThirdPartyUsageStore,
+    pub(crate) third_party_status: ThirdPartyStatusStore,
     pub(crate) tab: Tab,
     pub(crate) modals: Vec<Modal>,
 
@@ -723,6 +727,9 @@ struct WorkerHandles {
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
+    third_party_tokens: ThirdPartyList,
+    third_party_usage_store: ThirdPartyUsageStore,
+    third_party_status: ThirdPartyStatusStore,
 }
 
 impl WorkerHandles {
@@ -739,6 +746,9 @@ impl WorkerHandles {
             pending_switch: Arc::clone(&app.pending_switch),
             pending_switch_off: Arc::clone(&app.pending_switch_off),
             refetch_queue: Arc::clone(&app.refetch_queue),
+            third_party_tokens: Arc::clone(&app.third_party_tokens),
+            third_party_usage_store: Arc::clone(&app.third_party_usage_store),
+            third_party_status: Arc::clone(&app.third_party_status),
         }
     }
 }
@@ -758,6 +768,12 @@ impl App {
         let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_switch_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+        let third_party_tokens: ThirdPartyList = Arc::new(RankedMutex::new(
+            collect_third_party_entries(&config.profiles),
+        ));
+        let third_party_usage_store: ThirdPartyUsageStore =
+            Arc::new(RankedMutex::new(HashMap::new()));
+        let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
 
         // Kick the best-effort update check on its own thread; its verdict lands
         // in `update_results` and is toasted from `on_tick`.
@@ -796,6 +812,9 @@ impl App {
             pending_switch,
             pending_switch_off,
             refetch_queue,
+            third_party_tokens,
+            third_party_usage_store,
+            third_party_status,
             tab: Tab::Overview,
             modals: Vec::new(),
             profile_cursor: 0,
@@ -930,12 +949,18 @@ impl App {
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,
+            h.third_party_tokens,
+            h.third_party_usage_store,
+            h.third_party_status,
         );
     }
 
     pub(crate) fn apply_usage(&mut self) {
         // Poisoned lock: keep prior value rather than blanking all usage.
         // A blank map would blind auto-switch permanently.
+        // Third-party stores BEFORE OAuth stores: ranks 270/280 < 300/350.
+        let third_party_map = self.third_party_usage_store.lock().ok();
+        let third_party_status_map = self.third_party_status.lock().ok();
         let info_map = self.usage_store.lock().ok();
         let status_map = self.usage_status.lock().ok();
         let mut cfg = self.config();
@@ -943,8 +968,18 @@ impl App {
             if let Some(s) = info_map.as_ref() {
                 p.usage = s.get(p.name.as_str()).cloned();
             }
-            if let Some(s) = status_map.as_ref() {
+            // OAuth fetch_status takes precedence; third-party only when no OAuth status.
+            if let Some(s) = status_map.as_ref()
+                && s.contains_key(p.name.as_str())
+            {
                 p.fetch_status = s.get(p.name.as_str()).copied();
+            } else if let Some(s) = third_party_status_map.as_ref() {
+                p.fetch_status = s.get(p.name.as_str()).copied();
+            }
+            if let Some(s) = third_party_map.as_ref()
+                && s.contains_key(p.name.as_str())
+            {
+                p.third_party_usage = s.get(p.name.as_str()).cloned();
             }
         }
     }
@@ -958,10 +993,16 @@ impl App {
         if let Ok(fresh) = load_config() {
             *self.config() = fresh;
             self.last_state_mtime = current;
+            let profiles = &self.config().profiles;
             *self
                 .usage_tokens
                 .lock()
-                .expect("usage_tokens mutex poisoned") = collect_tokens(&self.config().profiles);
+                .expect("usage_tokens mutex poisoned") = collect_tokens(profiles);
+            *self
+                .third_party_tokens
+                .lock()
+                .expect("third_party_tokens mutex poisoned") =
+                collect_third_party_entries(profiles);
             true
         } else {
             false
@@ -972,10 +1013,15 @@ impl App {
         // Drop `config` lock before taking `usage_tokens` — folding them would
         // invert lock order (TOKENS is outer of CONFIG).
         let tokens = collect_tokens(&self.config().profiles);
+        let third_party = collect_third_party_entries(&self.config().profiles);
         *self
             .usage_tokens
             .lock()
             .expect("usage_tokens mutex poisoned") = tokens;
+        *self
+            .third_party_tokens
+            .lock()
+            .expect("third_party_tokens mutex poisoned") = third_party;
     }
 
     /// Queue every profile for an immediate re-fetch (Overview `r`).
@@ -1232,15 +1278,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                     let cfg = app.config();
                     cfg.profiles
                         .get(app.profile_cursor)
-                        .map(|p| (p.name.clone(), p.is_oauth()))
+                        .map(|p| (p.name.clone(), p.is_oauth(), p.is_third_party()))
                 };
                 match selected {
-                    // Only oauth profiles have a usage endpoint.
-                    Some((name, true)) => {
+                    Some((name, true, _)) | Some((name, _, true)) => {
                         app.manual_refresh_one(&name);
                         app.toast(ToastKind::Info, format!("refreshing '{name}'…"));
                     }
-                    Some((name, false)) => {
+                    Some((name, false, false)) => {
                         app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
                     }
                     None => {}
@@ -2296,14 +2341,14 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Fire the handler that the direct hotkey would have called.
-/// The account under the cursor as `(name, is_oauth)`. `profile_cursor` is shared
+/// The account under the cursor as `(name, is_oauth, is_third_party)`. `profile_cursor` is shared
 /// across Overview, Usage, and Setup, so this resolves the focused account on any
 /// of them. `None` when the cursor sits past the profile list (e.g. `+ new`).
-fn focused_account(app: &App) -> Option<(String, bool)> {
+fn focused_account(app: &App) -> Option<(String, bool, bool)> {
     let cfg = app.config();
     cfg.profiles
         .get(app.profile_cursor)
-        .map(|p| (p.name.to_string(), p.is_oauth()))
+        .map(|p| (p.name.to_string(), p.is_oauth(), p.is_third_party()))
 }
 
 fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
@@ -2312,11 +2357,11 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::RefreshUsage => {
             // Action-menu refresh is always scoped to the focused account.
             match focused_account(app) {
-                Some((name, true)) => {
+                Some((name, _, true)) | Some((name, true, _)) => {
                     app.manual_refresh_one(&name);
                     app.toast(ToastKind::Info, format!("refreshing '{name}'…"));
                 }
-                Some((name, false)) => {
+                Some((name, false, false)) => {
                     app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
                 }
                 None => {}
@@ -2325,7 +2370,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::RotateTokens => {
             // Rotate only the focused account, not the whole chain.
             match focused_account(app) {
-                Some((name, true)) => {
+                Some((name, true, _)) => {
                     app.modals.push(Modal::Confirm(ConfirmState {
                         message: format!("rotate tokens for '{name}'?"),
                         detail: Some(ROTATE_ONE_DETAIL.to_string()),
@@ -2333,7 +2378,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                         on_confirm: ConfirmAction::RotateOne(name),
                     }));
                 }
-                Some((name, false)) => {
+                Some((name, _, _)) => {
                     app.toast(ToastKind::Info, format!("'{name}' has no tokens to rotate"));
                 }
                 None => {}

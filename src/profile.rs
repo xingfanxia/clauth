@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::lock::with_state_lock;
+use crate::providers::{Provider, ThirdPartyStats};
 use crate::usage::{FetchStatus, UsageInfo};
 
 /// Newtype over `String` (transparent on disk). Makes every name-list mutation
@@ -128,10 +129,15 @@ pub(crate) struct Profile {
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) fetch_status: Option<FetchStatus>,
+    /// Recognised third-party provider (derived from base_url).
+    pub(crate) provider: Option<Provider>,
+    /// Provider-specific usage data (e.g. DeepSeek balance).
+    pub(crate) third_party_usage: Option<ThirdPartyStats>,
 }
 
 impl Profile {
     pub(crate) fn new(name: String, base_url: Option<String>, api_key: Option<String>) -> Self {
+        let provider = base_url.as_deref().and_then(Provider::from_base_url);
         Self {
             name: name.into(),
             base_url,
@@ -142,11 +148,17 @@ impl Profile {
             credentials: None,
             usage: None,
             fetch_status: None,
+            provider,
+            third_party_usage: None,
         }
     }
 
     pub(crate) fn is_oauth(&self) -> bool {
         self.base_url.is_none()
+    }
+
+    pub(crate) fn is_third_party(&self) -> bool {
+        self.provider.is_some()
     }
 
     pub(crate) fn refresh_token(&self) -> Option<&str> {
@@ -422,6 +434,11 @@ fn load_profile(name: &str) -> Result<Profile> {
     // Adopt a staged rotation that never committed (crash/failed write between OAuth response and save).
     let credentials = recover_pending_credentials(name, credentials);
 
+    let provider = config.base_url.as_deref().and_then(Provider::from_base_url);
+    let third_party_usage = provider
+        .as_ref()
+        .and_then(|_| crate::providers::load_third_party_disk_cache(name));
+
     let profile = Profile {
         name: name.into(),
         base_url: config.base_url,
@@ -432,6 +449,8 @@ fn load_profile(name: &str) -> Result<Profile> {
         credentials,
         usage: None,
         fetch_status: None,
+        provider,
+        third_party_usage,
     };
 
     maybe_rewrite_config_toml(&config_path, &raw_config, &profile);

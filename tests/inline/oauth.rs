@@ -31,6 +31,8 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         }),
         usage: None,
         fetch_status: None,
+        provider: None,
+        third_party_usage: None,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -169,6 +171,8 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         }),
         usage: None,
         fetch_status: None,
+        provider: None,
+        third_party_usage: None,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -219,6 +223,8 @@ fn profile_without_refresh_token_excluded() {
         }),
         usage: None,
         fetch_status: None,
+        provider: None,
+        third_party_usage: None,
     };
     let mut config = AppConfig {
         state: AppState::default(),

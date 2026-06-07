@@ -4,6 +4,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use crate::lockorder::{RankedMutex, rank};
+use crate::providers::{Provider, ThirdPartyStats};
 
 use super::fetch::{
     FetchError, UsageInfo, UsageWindow, epoch_secs_to_iso, fetch_raw, iso_to_epoch_secs,
@@ -84,6 +85,38 @@ pub(crate) struct TokenEntry {
     pub(crate) access_token: String,
     pub(crate) refresh_token: Option<String>,
 }
+
+/// Snapshot of one third-party profile identity used by the refresher.
+#[derive(Clone)]
+pub(crate) struct ThirdPartyEntry {
+    pub(crate) name: String,
+    pub(crate) provider: Provider,
+    pub(crate) api_key: String,
+}
+
+/// Profile-name accessor shared by the OAuth and third-party entry types so
+/// `partition_due` / `merge_forced` run identically over both.
+trait NamedEntry {
+    fn name(&self) -> &str;
+}
+
+impl NamedEntry for TokenEntry {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl NamedEntry for ThirdPartyEntry {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+pub(crate) type ThirdPartyList = Arc<RankedMutex<Vec<ThirdPartyEntry>, rank::ThirdParty>>;
+pub(crate) type ThirdPartyUsageStore =
+    Arc<RankedMutex<HashMap<String, ThirdPartyStats>, rank::ThirdPartyUsageStore>>;
+pub(crate) type ThirdPartyStatusStore =
+    Arc<RankedMutex<HashMap<String, FetchStatus>, rank::ThirdPartyStatus>>;
 
 /// Per-profile next-fetch epoch-ms. Written after each `partition_due` run for
 /// overview countdown display without re-running the partition math on the render thread.
@@ -506,6 +539,137 @@ pub(crate) fn fetch_all_into(
     }
 }
 
+/// Collect third-party profiles that have a recognised provider and API key.
+pub(crate) fn collect_third_party_entries(
+    profiles: &[crate::profile::Profile],
+) -> Vec<ThirdPartyEntry> {
+    profiles
+        .iter()
+        .filter_map(|p| {
+            let provider = p.provider?;
+            let api_key = p.api_key.clone()?;
+            Some(ThirdPartyEntry {
+                name: p.name.to_string(),
+                provider,
+                api_key,
+            })
+        })
+        .collect()
+}
+
+/// Fetch a pre-partitioned set of due third-party entries and apply outcomes to
+/// the third-party stores. Partitioning + countdown publishing happen in `tick`
+/// so both legs share one publish window; this leg only fetches.
+fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
+    for entry in &due {
+        mark_activity(&state.activity, &entry.name, ProfileActivity::Fetching);
+    }
+
+    let handles: Vec<_> = due
+        .into_iter()
+        .map(|entry| {
+            let name = entry.name.clone();
+            let h = std::thread::spawn(move || {
+                crate::providers::fetch_third_party_usage(entry.provider, &entry.api_key)
+            });
+            (name, h)
+        })
+        .collect();
+
+    for (name, h) in handles {
+        match h.join() {
+            Ok(Ok(stats)) => {
+                clear_activity(&state.activity, &name);
+                crate::providers::write_third_party_disk_cache(&name, &stats);
+                if let Ok(mut store) = state.third_party_usage_store.lock() {
+                    store.insert(name.clone(), stats);
+                }
+                if let Ok(mut st) = state.third_party_status.lock() {
+                    st.insert(name.clone(), FetchStatus::Fresh);
+                }
+                stamp_last_fetched(&state.last_fetched, name, None);
+            }
+            Ok(Err(err)) => {
+                clear_activity(&state.activity, &name);
+                // Cache cold-fills an absent entry only — never overwrites live
+                // store data with disk state (same rule as the OAuth path).
+                let cached = crate::providers::load_third_party_disk_cache(&name);
+                // A 429 carries the server's `retry-after` and defers the next
+                // slot (same server-directed deferral as the OAuth 429 path);
+                // any other error falls back to cache without deferring.
+                let (status, retry_after) = match &err {
+                    crate::providers::ThirdPartyError::RateLimited { retry_after } => {
+                        (FetchStatus::RateLimited, *retry_after)
+                    }
+                    _ if cached.is_some() => (FetchStatus::Cached, None),
+                    _ => (FetchStatus::Failed, None),
+                };
+                if let Some(c) = cached
+                    && let Ok(mut store) = state.third_party_usage_store.lock()
+                {
+                    store.entry(name.clone()).or_insert(c);
+                }
+                if let Ok(mut st) = state.third_party_status.lock() {
+                    st.insert(name.clone(), status);
+                }
+                stamp_last_fetched(&state.last_fetched, name, retry_after);
+            }
+            Err(_) => {
+                // Worker panicked — clear slot so the spinner doesn't freeze.
+                clear_activity(&state.activity, &name);
+            }
+        }
+    }
+}
+
+/// Stamp a profile's fetch slot. Normally `now` (so the next deadline reflects
+/// fetch duration, mirroring OAuth `apply_outcome`); a 429's `retry-after`
+/// stamps `retry_after - interval` ahead so `partition_due`'s fixed
+/// `stamp + REFRESH_INTERVAL_MS` math lands the next slot on `now + retry_after`
+/// (capped by [`MAX_RETRY_AFTER_MS`]).
+fn stamp_last_fetched(last_fetched: &LastFetchedAt, name: String, retry_after: Option<Duration>) {
+    let defer = IntervalMs::from_millis(retry_after.map_or(0, |ra| {
+        (ra.as_millis() as u64)
+            .min(MAX_RETRY_AFTER_MS)
+            .saturating_sub(REFRESH_INTERVAL_MS)
+    }));
+    if let Ok(mut lf) = last_fetched.lock() {
+        lf.insert(name, EpochMs::from_millis(now_ms()).saturating_add(defer));
+    }
+}
+
+/// Partition a leg's snapshot into due entries + per-profile countdowns, with
+/// forced (cadence-bypassing) names merged in. Empty snapshot → no work, no
+/// lock traffic. Shared by both legs so they publish in one window.
+fn partition_and_merge<T: NamedEntry + Clone>(
+    snapshot: &[T],
+    forced: &HashSet<String>,
+    state: &SchedulerState,
+    now: u64,
+) -> (Vec<T>, HashMap<String, u64>) {
+    if snapshot.is_empty() {
+        return (Vec::new(), HashMap::new());
+    }
+    let (mut due, mut next) = partition_due(snapshot, now, &state.last_fetched, &state.activity);
+    merge_forced(snapshot, forced, &mut due, &mut next, &state.activity, now);
+    (due, next)
+}
+
+/// Full-replace publish of both legs' countdowns in one lock window. `clear`
+/// before `extend` drops any deleted profile's stale key and avoids the
+/// mid-tick window where one leg's countdowns are momentarily missing.
+fn publish_countdowns(
+    nrpp: &NextRefreshPerProfile,
+    oauth: HashMap<String, u64>,
+    third_party: HashMap<String, u64>,
+) {
+    if let Ok(mut map) = nrpp.lock() {
+        map.clear();
+        map.extend(oauth);
+        map.extend(third_party);
+    }
+}
+
 /// Background scheduler state. Holds **cloned `Arc`s only** — no live lock guards —
 /// so the struct carries no lock rank. `tick` acquires individual mutexes in rank order.
 pub(crate) struct SchedulerState {
@@ -519,20 +683,18 @@ pub(crate) struct SchedulerState {
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
+    third_party_tokens: ThirdPartyList,
+    third_party_usage_store: ThirdPartyUsageStore,
+    third_party_status: ThirdPartyStatusStore,
 }
 
-/// One scheduler tick: drain forced refetches, partition due set, fan out fetches,
-/// propagate rotated tokens, evaluate auto-switch chain.
+/// One scheduler tick: drain forced refetches, partition both legs, publish
+/// countdowns once, fan out fetches (OAuth + third-party), propagate rotated
+/// tokens, evaluate auto-switch chain.
 fn tick(state: &SchedulerState) {
-    let snapshot: Vec<TokenEntry> = match state.tokens.lock() {
-        Ok(t) => t.clone(),
-        Err(_) => return,
-    };
-    if snapshot.is_empty() {
-        return;
-    }
-
-    // Names pushed by rotation paths — bypass cadence and fetch this tick.
+    // Names pushed by rotation or manual refresh — bypass cadence this tick.
+    // Drained once and handed to both legs; a forced name only matches the leg
+    // whose snapshot owns it, so neither starves the other.
     let forced: HashSet<String> = state
         .refetch_queue
         .lock()
@@ -540,100 +702,95 @@ fn tick(state: &SchedulerState) {
         .map(|mut q| std::mem::take(&mut *q))
         .unwrap_or_default();
 
+    // Snapshot both legs. A poisoned OAuth lock yields an empty snapshot rather
+    // than an early `return` — that would starve the third-party leg and drop
+    // its already-drained forced names.
+    let oauth_snapshot: Vec<TokenEntry> =
+        state.tokens.lock().map(|t| t.clone()).unwrap_or_default();
+    let tp_snapshot: Vec<ThirdPartyEntry> = state
+        .third_party_tokens
+        .lock()
+        .map(|t| t.clone())
+        .unwrap_or_default();
+
+    // Partition both before either fetches, then publish in one window so the
+    // countdown map never shows a leg as momentarily missing (and a deleted
+    // profile's stale key is dropped by the full replace).
     let now = now_ms();
-    let (mut due, mut per_profile_next) =
-        partition_due(&snapshot, now, &state.last_fetched, &state.activity);
+    let (oauth_due, oauth_next) = partition_and_merge(&oauth_snapshot, &forced, state, now);
+    let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now);
+    publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
-    // Merge forced entries not already due. Still skip Switching/Refreshing —
-    // the switch worker owns the TokenList write window; rotate_one_inner owns the refresh token.
-    if !forced.is_empty() {
-        let switching: HashSet<String> = match state.activity.lock() {
-            Ok(a) => a
-                .iter()
-                .filter(|(_, v)| {
-                    matches!(v, ProfileActivity::Switching | ProfileActivity::Refreshing)
-                })
-                .map(|(n, _)| n.clone())
-                .collect(),
-            Err(_) => snapshot.iter().map(|e| e.name.clone()).collect(),
-        };
-        let mut extras: Vec<TokenEntry> = Vec::with_capacity(forced.len());
-        for entry in snapshot.iter().filter(|e| {
-            forced.contains(&e.name)
-                && !switching.contains(&e.name)
-                && !due.iter().any(|d| d.name == e.name)
-        }) {
-            per_profile_next.insert(entry.name.clone(), now);
-            extras.push(entry.clone());
+    let fetched = !oauth_due.is_empty() || !tp_due.is_empty();
+
+    if !oauth_due.is_empty() {
+        for entry in &oauth_due {
+            mark_activity(&state.activity, &entry.name, ProfileActivity::Fetching);
         }
-        due.extend(extras);
-    }
 
-    // Publish after forced merge so the UI doesn't show a countdown for a profile
-    // that is actually fetching this tick.
-    if let Ok(mut nrpp) = state.next_refresh_per_profile.lock() {
-        nrpp.clone_from(&per_profile_next);
-    }
-
-    if due.is_empty() {
-        return;
-    }
-
-    for entry in &due {
-        mark_activity(&state.activity, &entry.name, ProfileActivity::Fetching);
-    }
-
-    let handles: Vec<_> = due
-        .into_iter()
-        .map(|entry| {
-            let name = entry.name.clone();
-            let config = Arc::clone(&state.config);
-            let refetch_queue = Arc::clone(&state.refetch_queue);
-            let activity = Arc::clone(&state.activity);
-            let h =
-                std::thread::spawn(move || run_fetch(&config, entry, &refetch_queue, &activity));
-            (name, h)
-        })
-        .collect();
-    for (name, h) in handles {
-        match h.join() {
-            Ok(outcome) => {
-                clear_activity(&state.activity, &outcome.name);
-                // Propagate rotated tokens back into the live snapshot — otherwise
-                // tick N+1 reuses the stale access token, 401s, and double-burns the chain.
-                if let Some((new_access, new_refresh)) = &outcome.rotated
-                    && let Ok(mut t) = state.tokens.lock()
-                    && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
-                {
-                    entry.access_token = new_access.clone();
-                    entry.refresh_token = new_refresh.clone();
+        let handles: Vec<_> = oauth_due
+            .into_iter()
+            .map(|entry| {
+                let name = entry.name.clone();
+                let config = Arc::clone(&state.config);
+                let refetch_queue = Arc::clone(&state.refetch_queue);
+                let activity = Arc::clone(&state.activity);
+                let h = std::thread::spawn(move || {
+                    run_fetch(&config, entry, &refetch_queue, &activity)
+                });
+                (name, h)
+            })
+            .collect();
+        for (name, h) in handles {
+            match h.join() {
+                Ok(outcome) => {
+                    clear_activity(&state.activity, &outcome.name);
+                    // Propagate rotated tokens back into the live snapshot — otherwise
+                    // tick N+1 reuses the stale access token, 401s, and double-burns the chain.
+                    if let Some((new_access, new_refresh)) = &outcome.rotated
+                        && let Ok(mut t) = state.tokens.lock()
+                        && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
+                    {
+                        entry.access_token = new_access.clone();
+                        entry.refresh_token = new_refresh.clone();
+                    }
+                    apply_outcome(outcome, &state.store, &state.status, &state.last_fetched);
                 }
-                apply_outcome(outcome, &state.store, &state.status, &state.last_fetched);
-            }
-            Err(_) => {
-                // Worker panicked — clear slot so the spinner doesn't freeze.
-                clear_activity(&state.activity, &name);
+                Err(_) => {
+                    // Worker panicked — clear slot so the spinner doesn't freeze.
+                    clear_activity(&state.activity, &name);
+                }
             }
         }
+
+        // Auto-switch: read chain under config mutex only (not across HTTP/state lock).
+        // Actual relink is deferred to the UI thread via `pending_switch`. Only
+        // when OAuth profiles were fetched this tick — third-party has no chain.
+        scan_auto_switch(
+            &state.config,
+            &state.store,
+            &state.activity,
+            &state.pending_switch,
+            &state.pending_switch_off,
+        );
     }
 
-    // Recompute after fetches so countdowns reflect fresh deadlines.
-    // Passing `activity` ensures a mid-tick Switching profile is excluded here too.
-    let (_, per_profile_after) =
-        partition_due(&snapshot, now_ms(), &state.last_fetched, &state.activity);
-    if let Ok(mut nrpp) = state.next_refresh_per_profile.lock() {
-        nrpp.clone_from(&per_profile_after);
+    // Third-party providers — same cadence, separate stores. Owns the forced
+    // names the OAuth leg didn't consume.
+    if !tp_due.is_empty() {
+        fetch_third_party_due(state, tp_due);
     }
 
-    // Auto-switch: read chain under config mutex only (not across HTTP/state lock).
-    // Actual relink is deferred to the UI thread via `pending_switch`.
-    scan_auto_switch(
-        &state.config,
-        &state.store,
-        &state.activity,
-        &state.pending_switch,
-        &state.pending_switch_off,
-    );
+    // Recompute deadlines after fetches so countdowns reflect fresh stamps —
+    // one publish, both legs. Skipped on a fully-idle tick (nothing changed, so
+    // the pre-fetch publish already holds).
+    if fetched {
+        let now = now_ms();
+        let (_, oauth_after) =
+            partition_due(&oauth_snapshot, now, &state.last_fetched, &state.activity);
+        let (_, tp_after) = partition_due(&tp_snapshot, now, &state.last_fetched, &state.activity);
+        publish_countdowns(&state.next_refresh_per_profile, oauth_after, tp_after);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -648,6 +805,9 @@ pub(crate) fn spawn_refresher(
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
+    third_party_tokens: ThirdPartyList,
+    third_party_usage_store: ThirdPartyUsageStore,
+    third_party_status: ThirdPartyStatusStore,
 ) {
     let state = SchedulerState {
         config,
@@ -660,6 +820,9 @@ pub(crate) fn spawn_refresher(
         pending_switch,
         pending_switch_off,
         refetch_queue,
+        third_party_tokens,
+        third_party_usage_store,
+        third_party_status,
     };
     std::thread::spawn(move || {
         loop {
@@ -738,12 +901,12 @@ fn scan_auto_switch(
 /// all profiles due — fetch storm). Profiles currently `Switching` or `Refreshing`
 /// are excluded to avoid racing the switch worker on `TokenList` or `rotate_one_inner`
 /// on the single-use refresh token. Poisoned activity mutex fails safe to excluded.
-fn partition_due(
-    snapshot: &[TokenEntry],
+fn partition_due<T: NamedEntry + Clone>(
+    snapshot: &[T],
     now: u64,
     last_fetched: &LastFetchedAt,
     activity: &ActivityStore,
-) -> (Vec<TokenEntry>, HashMap<String, u64>) {
+) -> (Vec<T>, HashMap<String, u64>) {
     let now = EpochMs::from_millis(now);
     let Ok(lf) = last_fetched.lock() else {
         return (Vec::new(), HashMap::new());
@@ -755,15 +918,15 @@ fn partition_due(
     let mut per_profile = HashMap::with_capacity(snapshot.len());
     for entry in snapshot {
         let last = lf
-            .get(&entry.name)
+            .get(entry.name())
             .copied()
             .unwrap_or(EpochMs::from_millis(0));
         let next = last.saturating_add(interval);
-        per_profile.insert(entry.name.clone(), next.as_millis());
+        per_profile.insert(entry.name().to_string(), next.as_millis());
         // Countdown still publishes for excluded profiles — UI shows when they become eligible.
         let excluded = match act.as_ref() {
             Ok(a) => matches!(
-                a.get(&entry.name),
+                a.get(entry.name()),
                 Some(ProfileActivity::Switching | ProfileActivity::Refreshing)
             ),
             Err(_) => true, // Poisoned: fail safe to excluded.
@@ -776,6 +939,40 @@ fn partition_due(
         }
     }
     (due, per_profile)
+}
+
+/// Merge forced (cadence-bypassing) entries into `due`. Skips profiles that are
+/// `Switching`/`Refreshing` — the switch worker owns the `TokenList` write
+/// window; `rotate_one_inner` owns the refresh token — and entries already due.
+fn merge_forced<T: NamedEntry + Clone>(
+    snapshot: &[T],
+    forced: &HashSet<String>,
+    due: &mut Vec<T>,
+    per_profile_next: &mut HashMap<String, u64>,
+    activity: &ActivityStore,
+    now: u64,
+) {
+    if forced.is_empty() {
+        return;
+    }
+    let switching: HashSet<String> = match activity.lock() {
+        Ok(a) => a
+            .iter()
+            .filter(|(_, v)| matches!(v, ProfileActivity::Switching | ProfileActivity::Refreshing))
+            .map(|(n, _)| n.clone())
+            .collect(),
+        Err(_) => snapshot.iter().map(|e| e.name().to_string()).collect(),
+    };
+    let mut extras: Vec<T> = Vec::with_capacity(forced.len());
+    for entry in snapshot.iter().filter(|e| {
+        forced.contains(e.name())
+            && !switching.contains(e.name())
+            && !due.iter().any(|d| d.name() == e.name())
+    }) {
+        per_profile_next.insert(entry.name().to_string(), now);
+        extras.push(entry.clone());
+    }
+    due.extend(extras);
 }
 
 #[cfg(test)]

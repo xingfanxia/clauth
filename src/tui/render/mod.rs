@@ -111,6 +111,8 @@ mod render_smoke {
                 ..UsageInfo::default()
             }),
             fetch_status: None,
+            provider: None,
+            third_party_usage: None,
         }
     }
 

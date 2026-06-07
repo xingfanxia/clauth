@@ -66,6 +66,12 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(4)))
         .timeout_recv_response(Some(Duration::from_secs(15)))
+        // ureq 3 defaults non-2xx to `Err(Error::StatusCode)`, which `kick`'s
+        // error mapping collapsed into `KickError::Other` — making the
+        // 401 → rotate-and-retry leg unreachable. With the flag off, `kick`
+        // reads the status from the `Ok` response and `refresh` checks it
+        // explicitly below.
+        .http_status_as_error(false)
         .build()
         .into()
 });
@@ -77,14 +83,19 @@ pub(crate) fn refresh(refresh_token: &str) -> Result<TokenResponse> {
         "client_id": CLIENT_ID,
     }))?;
 
-    let text = AGENT
+    let mut response = AGENT
         .post(TOKEN_ENDPOINT)
         .header("Content-Type", "application/json")
         .send(&body)
-        .map_err(crate::ureq_error::into_anyhow)?
+        .map_err(crate::ureq_error::into_anyhow)?;
+    let status = response.status().as_u16();
+    let text = response
         .body_mut()
         .read_to_string()
         .map_err(crate::ureq_error::into_anyhow)?;
+    if status >= 400 {
+        anyhow::bail!("HTTP {status}: {text}");
+    }
 
     serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))
 }

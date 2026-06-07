@@ -16,6 +16,7 @@ use super::panes::{
 };
 use crate::format::plan_label;
 use crate::profile::Profile;
+use crate::providers::StatRowKind;
 use crate::usage::{FetchStatus, ProfileActivity, UsageWindow, now_ms};
 
 const KEY_W: usize = 8;
@@ -90,6 +91,11 @@ fn build_usage_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> V
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.extend(header_lines(profile, inner_w, header));
     lines.push(Line::from(""));
+
+    if profile.is_third_party() {
+        lines.extend(build_tp_rows(profile, header));
+        return lines;
+    }
 
     if !profile.is_oauth() {
         lines.push(Line::from(Span::styled(
@@ -256,7 +262,7 @@ fn header_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Li
     }
 
     let mut lines = vec![Line::from(plan_spans)];
-    if profile.is_oauth() {
+    if profile.is_oauth() || profile.is_third_party() {
         lines.push(status_line(profile, header));
     }
     lines
@@ -317,6 +323,66 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
         },
     }
     Line::from(spans)
+}
+
+/// Render provider-agnostic third-party stats. The header (plan + status) was
+/// already pushed by the caller; only the stats body goes here.
+fn build_tp_rows(profile: &Profile, _header: &HeaderState) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let Some(stats) = profile.third_party_usage.as_ref() else {
+        lines.push(Line::from(Span::styled("  loading…", theme::faint())));
+        return lines;
+    };
+
+    if stats.rows.is_empty() {
+        // `unavailable()` always carries a row, so an empty list means an
+        // available account whose provider reported no stats.
+        let (msg, style) = if stats.is_available {
+            ("  no stats reported", theme::faint())
+        } else {
+            ("  usage unavailable", theme::danger())
+        };
+        lines.push(Line::from(Span::styled(msg, style)));
+        return lines;
+    }
+
+    for row in &stats.rows {
+        if row.label.is_empty() {
+            // Single-line message (e.g. danger / faint).
+            let style = match row.kind {
+                StatRowKind::Danger => theme::danger(),
+                _ => theme::faint(),
+            };
+            lines.push(Line::from(Span::styled(format!("  {}", row.value), style)));
+        } else if row.kind == StatRowKind::Heading {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", row.label),
+                theme::label(),
+            )));
+        } else {
+            let style = match row.kind {
+                StatRowKind::Danger => theme::danger(),
+                StatRowKind::Faint => theme::faint(),
+                _ => theme::body(),
+            };
+            lines.push(Line::from(key_value_span(&row.label, &row.value, style)));
+        }
+    }
+
+    lines
+}
+
+/// Key column width for third-party stat rows (wider than `KEY_W` to fit
+/// labels like "topped up" plus a 1-space gap).
+const TP_KEY_W: usize = 10;
+
+fn key_value_span(key: &str, value: &str, value_style: Style) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(format!("    {key}"), theme::faint())];
+    let pad = TP_KEY_W.saturating_sub(key.chars().count()).max(1);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(value.to_string(), value_style));
+    spans
 }
 
 fn key_span(key: &str) -> Span<'static> {

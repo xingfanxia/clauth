@@ -164,6 +164,8 @@ fn oauth_profile(
             extra_usage: extra,
         }),
         fetch_status,
+        provider: None,
+        third_party_usage: None,
     }
 }
 
@@ -180,6 +182,8 @@ fn api_profile(name: &str) -> Profile {
         credentials: None,
         usage: None,
         fetch_status: None,
+        provider: None,
+        third_party_usage: None,
     }
 }
 
@@ -194,6 +198,8 @@ fn failed_profile(name: &str) -> Profile {
         credentials: None,
         usage: None,
         fetch_status: Some(FetchStatus::Failed),
+        provider: None,
+        third_party_usage: None,
     }
 }
 
