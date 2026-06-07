@@ -95,11 +95,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         lines.push(Line::from(Span::styled(detail.clone(), theme::dim())));
     }
     lines.push(Line::from(""));
-    lines.push(choice_buttons(state.choice, destructive).alignment(Alignment::Center));
-    lines.push(Line::from(""));
-    lines.push(
-        modal_footer_hints(&[("← →", "choose"), ("↵", "apply")]).alignment(Alignment::Center),
-    );
+    lines.push(choice_buttons(state.choice, destructive).alignment(Alignment::Right));
 
     draw_modal(frame, area, title, lines);
 }
@@ -181,12 +177,6 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
         ]));
     }
 
-    lines.push(Line::from(""));
-    lines.push(
-        modal_footer_hints(&[("↑ ↓", "choose"), ("↵", "apply"), ("esc", "dismiss")])
-            .alignment(Alignment::Center),
-    );
-
     draw_modal(frame, area, "DIVERGENCE", lines);
 }
 
@@ -219,8 +209,6 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
         )),
         Line::from(""),
         labelled_input("name", &input, true),
-        Line::from(""),
-        modal_footer_hints(&[("↵", "capture"), ("esc", "cancel")]).alignment(Alignment::Center),
     ];
 
     // Replicate draw_modal's geometry to place the native terminal cursor on the
@@ -357,21 +345,6 @@ fn help_row(key: &str, desc: &str) -> Line<'static> {
         ),
         Span::styled(desc.to_string(), Style::default().fg(theme::text_color())),
     ])
-}
-
-fn modal_footer_hints(hints: &[(&str, &str)]) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, (key, label)) in hints.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("   ", theme::faint()));
-        }
-        spans.push(Span::styled(
-            (*key).to_string(),
-            Style::default().fg(theme::accent_color()).bold(),
-        ));
-        spans.push(Span::styled(format!(" {label}"), theme::dim()));
-    }
-    Line::from(spans)
 }
 
 fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'static> {
