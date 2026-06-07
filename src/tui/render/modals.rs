@@ -107,7 +107,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
 fn choice_buttons(choice: bool, destructive_confirm: bool) -> Line<'static> {
     Line::from(vec![
         modal_button(" cancel ", !choice),
-        Span::raw("  "),
+        Span::raw("   "),
         if destructive_confirm {
             danger_button(" confirm ", choice)
         } else {
@@ -214,7 +214,7 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
     };
     let lines = vec![
         Line::from(Span::styled(
-            "Stores the live ~/.claude/.credentials.json under this profile.",
+            "stores the live ~/.claude/.credentials.json under this profile.",
             theme::dim(),
         )),
         Line::from(""),
@@ -247,8 +247,8 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
 
     draw_modal(frame, area, title, lines);
 
-    // x = label "name" (4) + " " (1) + cols before caret
-    let cx = inner_x.saturating_add(4 + 1 + head_cols(&input) as u16);
+    // x = edit gutter "✎ " (2) + label "name" (4) + " " (1) + cols before caret
+    let cx = inner_x.saturating_add(2 + 4 + 1 + head_cols(&input) as u16);
     let cy = inner_y.saturating_add(2); // line index 2
     frame.set_cursor_position((cx, cy));
 }
@@ -377,6 +377,8 @@ fn modal_footer_hints(hints: &[(&str, &str)]) -> Line<'static> {
 fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'static> {
     // When focused the native terminal cursor owns the caret — no block highlight.
     // Unfocused fields still render with plain text styling (no BG_SUNKEN tint).
+    // A focused field carries the `✎` edit-mode gutter glyph (same as form rows);
+    // the 2-col gutter is accounted for in the caller's cursor-x math.
     let value_style = if focused {
         Style::default()
             .fg(theme::text_color())
@@ -384,7 +386,13 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
     } else {
         Style::default().fg(theme::text_color())
     };
+    let gutter = if focused {
+        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent())
+    } else {
+        Span::raw("  ")
+    };
     Line::from(vec![
+        gutter,
         Span::styled(label.to_string(), theme::label()),
         Span::raw(" "),
         Span::styled(input.value.clone(), value_style),
