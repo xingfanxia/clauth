@@ -169,6 +169,27 @@ pub(crate) fn info_color() -> Color {
 pub(crate) fn bg_danger_color() -> Color {
     pick(Color::Rgb(75, 35, 44), Color::Indexed(52))
 }
+/// WARNING wash blended into BG — muted warm-amber background for warning rows.
+#[inline]
+pub(crate) fn bg_warning_color() -> Color {
+    pick(Color::Rgb(74, 60, 33), Color::Indexed(58))
+}
+
+/// Per-channel RGB blend of `over` onto `beneath`, weighted by `alpha`
+/// (the weight of `over`, clamped to `0.0..=1.0`).
+/// Blends only on the full truecolor tier with both colors RGB-resolvable;
+/// otherwise returns `over` unchanged.
+pub(crate) fn blend_over(beneath: Color, over: Color, alpha: f64) -> Color {
+    let (Color::Rgb(br, bg, bb), Color::Rgb(or, og, ob)) = (beneath, over) else {
+        return over;
+    };
+    if tier() != Tier::Full {
+        return over;
+    }
+    let a = alpha.clamp(0.0, 1.0);
+    let mix = |o: u8, b: u8| -> u8 { (a * f64::from(o) + (1.0 - a) * f64::from(b)).round() as u8 };
+    Color::Rgb(mix(or, br), mix(og, bg), mix(ob, bb))
+}
 
 // ── Toggle glyphs (tier-sensitive) ────────────────────────────────────────────
 

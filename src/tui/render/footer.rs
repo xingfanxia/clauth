@@ -42,14 +42,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Tab::Setup => match app.config_focus {
             ConfigFocus::Profiles => &[
                 ("↑↓", "account"),
-                ("⏎", "configure"),
+                ("↵", "configure"),
                 ("n", "new"),
                 ("a", "actions"),
                 ("?", "help"),
             ],
             ConfigFocus::Actions => &[
                 ("↑↓", "row"),
-                ("⏎", "edit / toggle"),
+                ("↵", "edit / toggle"),
                 ("a", "actions"),
                 ("esc", "back"),
                 ("?", "help"),
@@ -57,14 +57,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         },
         Tab::Config => &[
             ("↑↓", "row"),
-            ("⏎", "cycle / toggle"),
+            ("↵", "cycle / toggle"),
             ("a", "actions"),
             ("?", "help"),
         ],
         Tab::Status => match app.status.focus {
             StatusFocus::List => &[
                 ("↑↓", "incident"),
-                ("⏎", "open"),
+                ("↵", "open"),
                 ("r", "refresh"),
                 ("a", "actions"),
                 ("?", "help"),
@@ -81,56 +81,47 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             FallbackHint::ChainMember => &[
                 ("↑↓", "move"),
                 ("⇧↑↓", "reorder = priority"),
-                ("⏎", "open"),
+                ("↵", "open"),
                 ("a", "actions"),
                 ("?", "help"),
             ],
-            FallbackHint::ChainAdd => &[("↑↓", "move"), ("⏎", "add"), ("?", "help")],
+            FallbackHint::ChainAdd => &[("↑↓", "move"), ("↵", "add"), ("?", "help")],
             FallbackHint::DetailThreshold => &[
                 ("↑↓", "row"),
                 ("+", "raise"),
                 ("-", "lower"),
-                ("⏎", "type"),
+                ("↵", "type"),
                 ("a", "actions"),
                 ("esc", "back"),
                 ("?", "help"),
             ],
             FallbackHint::DetailThresholdEdit => {
-                &[("⏎", "save"), ("←→", "caret"), ("esc", "cancel")]
+                &[("↵", "save"), ("←→", "caret"), ("esc", "cancel")]
             }
             FallbackHint::DetailRemove => &[
                 ("↑↓", "row"),
-                ("⏎", "remove"),
+                ("↵", "remove"),
                 ("a", "actions"),
                 ("esc", "back"),
                 ("?", "help"),
             ],
             FallbackHint::DetailRemoveArmed => {
-                &[("⏎", "confirm remove"), ("esc", "cancel"), ("?", "help")]
+                &[("↵", "confirm remove"), ("esc", "cancel"), ("?", "help")]
             }
             FallbackHint::DetailAdd => {
-                &[("↑↓", "pick"), ("⏎", "add"), ("esc", "back"), ("?", "help")]
+                &[("↑↓", "pick"), ("↵", "add"), ("esc", "back"), ("?", "help")]
             }
         },
     };
 
-    // Suppress the trailing `q` hint for screens where `q` doesn't apply
-    // (threshold edit owns the keyboard entirely).
-    let show_q = !matches!(
-        fallback_hint(app),
-        FallbackHint::DetailThresholdEdit
-            | FallbackHint::DetailRemoveArmed
-            | FallbackHint::DetailAdd
-            | FallbackHint::DetailThreshold
-            | FallbackHint::DetailRemove
-    ) || app.tab != Tab::Fallback;
-
-    // Suppress `q` on Config Actions too (⎋ backs out).
-    let show_q = show_q && app.config_focus != ConfigFocus::Actions;
-
-    // Status detail keeps `esc back`; suppress the redundant `q` (mirrors the
-    // Setup-Actions / Fallback-detail house pattern).
-    let show_q = show_q && !(app.tab == Tab::Status && app.status.focus == StatusFocus::Detail);
+    // Suppress the trailing `q` hint only where `q` is fully captured by the
+    // screen (threshold edit / armed-remove own the keyboard entirely). Every
+    // other sub-focus shows `q back` via `q_label` per the cloudy-tui contract.
+    let show_q = !(app.tab == Tab::Fallback
+        && matches!(
+            fallback_hint(app),
+            FallbackHint::DetailThresholdEdit | FallbackHint::DetailRemoveArmed
+        ));
 
     let mut hints: Vec<(&str, &str)> = std::iter::once(TAB_NAV)
         .chain(tail.iter().copied())

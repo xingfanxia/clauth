@@ -254,7 +254,7 @@ fn member_detail(
         if *row == FallbackRow::Threshold {
             match row_editing {
                 Some(input) if parse_threshold(input.trimmed()).is_none() => {
-                    lines.push(tooltip("max is 100", theme::danger()));
+                    lines.push(invalid_tooltip("max is 100"));
                 }
                 _ if selected => lines.push(tooltip(
                     "switch to the next account once 5h usage reaches this",
@@ -267,12 +267,21 @@ fn member_detail(
     lines
 }
 
-/// A `  └ text` sub-line in the given style — help (`faint`) or Invalid-input
-/// reason (`danger`); the `└ ` chrome stays `LINE`.
+/// A `  └ text` help sub-line: the `└ ` chrome stays `LINE`, the reason renders
+/// in `text_style` (e.g. `faint`).
 fn tooltip(text: &str, text_style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled("  └ ", Style::default().fg(theme::line_color())),
         Span::styled(text.to_string(), text_style),
+    ])
+}
+
+/// A `  └ text` Invalid-input sub-line: both the `└ ` leader and the reason
+/// render in `DANGER` (an Invalid-input tooltip, unlike a help tooltip).
+fn invalid_tooltip(text: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  └ ", Style::default().fg(theme::danger_color())),
+        Span::styled(text.to_string(), theme::danger()),
     ])
 }
 

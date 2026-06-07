@@ -397,9 +397,9 @@ fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'s
             vec![
                 Span::raw("  "),
                 Span::styled("[ ", theme::dim()),
-                Span::styled("wraps", theme::orange().add_modifier(Modifier::BOLD)),
+                Span::styled("stay", theme::dim().add_modifier(Modifier::BOLD)),
                 Span::styled(" ]", theme::dim()),
-                Span::styled(" to the top when all spent", theme::faint()),
+                Span::styled(" on last when all spent", theme::faint()),
             ]
         };
         lines.push(Line::from(caption));
@@ -451,7 +451,7 @@ fn chain_row(
             let (figure, figure_style) = match pct {
                 Some(v) => (
                     format!("  {v:>3.0}"),
-                    Style::default().fg(health_color(v, threshold)),
+                    Style::default().fg(theme::util_color(v)),
                 ),
                 None => ("    —".to_string(), theme::faint()),
             };
@@ -476,7 +476,7 @@ fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
         .unwrap_or(0)
         .min(GAUGE_W);
     let fill_color = pct
-        .map(|v| health_color(v, threshold))
+        .map(theme::util_color)
         .unwrap_or(theme::text_faint_color());
 
     (0..GAUGE_W)

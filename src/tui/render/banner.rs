@@ -16,6 +16,7 @@ use super::super::theme;
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, banner: &Banner) {
     let (fg, bg) = match banner.severity {
         BannerSeverity::Danger => (theme::danger_color(), theme::bg_danger_color()),
+        BannerSeverity::Warning => (theme::warning_color(), theme::bg_warning_color()),
     };
 
     let spans = vec![

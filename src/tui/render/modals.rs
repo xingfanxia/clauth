@@ -81,6 +81,12 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::RotateOne(_) => "CONFIRM",
     };
 
+    // Destructive/global ops carry a DANGER cue on their confirm button.
+    let destructive = matches!(
+        state.on_confirm,
+        ConfirmAction::Switch(_) | ConfirmAction::RotateAll | ConfirmAction::RotateOne(_)
+    );
+
     let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(
         state.message.clone(),
         theme::body(),
@@ -89,20 +95,24 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         lines.push(Line::from(Span::styled(detail.clone(), theme::dim())));
     }
     lines.push(Line::from(""));
-    lines.push(choice_buttons(state.choice).alignment(Alignment::Center));
+    lines.push(choice_buttons(state.choice, destructive).alignment(Alignment::Center));
     lines.push(Line::from(""));
     lines.push(
-        modal_footer_hints(&[("← →", "choose"), ("⏎", "apply")]).alignment(Alignment::Center),
+        modal_footer_hints(&[("← →", "choose"), ("↵", "apply")]).alignment(Alignment::Center),
     );
 
     draw_modal(frame, area, title, lines);
 }
 
-fn choice_buttons(choice: bool) -> Line<'static> {
+fn choice_buttons(choice: bool, destructive_confirm: bool) -> Line<'static> {
     Line::from(vec![
         modal_button(" cancel ", !choice),
         Span::raw("  "),
-        modal_button(" confirm ", choice),
+        if destructive_confirm {
+            danger_button(" confirm ", choice)
+        } else {
+            modal_button(" confirm ", choice)
+        },
     ])
 }
 
@@ -114,6 +124,19 @@ fn modal_button(label: &str, focused: bool) -> Span<'static> {
         )
     } else {
         Span::styled(label.to_string(), theme::dim())
+    }
+}
+
+/// Destructive variant of `modal_button`: DANGER fg unfocused, inverse DANGER block
+/// focused. Same bar-less house style as `modal_button` (no `▐`/`▌`).
+fn danger_button(label: &str, focused: bool) -> Span<'static> {
+    if focused {
+        Span::styled(
+            label.to_string(),
+            Style::default().fg(theme::bg()).bg(theme::danger_color()),
+        )
+    } else {
+        Span::styled(label.to_string(), theme::danger())
     }
 }
 
@@ -160,7 +183,7 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
 
     lines.push(Line::from(""));
     lines.push(
-        modal_footer_hints(&[("↑ ↓", "choose"), ("⏎", "apply"), ("⎋", "dismiss")])
+        modal_footer_hints(&[("↑ ↓", "choose"), ("↵", "apply"), ("esc", "dismiss")])
             .alignment(Alignment::Center),
     );
 
@@ -197,7 +220,7 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
         Line::from(""),
         labelled_input("name", &input, true),
         Line::from(""),
-        modal_footer_hints(&[("⏎", "capture"), ("⎋", "cancel")]).alignment(Alignment::Center),
+        modal_footer_hints(&[("↵", "capture"), ("esc", "cancel")]).alignment(Alignment::Center),
     ];
 
     // Replicate draw_modal's geometry to place the native terminal cursor on the

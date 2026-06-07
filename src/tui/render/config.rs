@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -175,7 +175,7 @@ fn draw_settings_rows(
     let (type_value, type_style) = if is_api {
         ("API", theme::accent())
     } else {
-        ("OAuth", Style::default().fg(theme::accent_2_color()))
+        ("OAuth", theme::accent())
     };
 
     let mut type_spans = vec![
@@ -229,7 +229,7 @@ fn draw_settings_rows(
             && let Some(text) = row_hint(*row)
         {
             lines.push(Line::from(vec![
-                Span::styled("  └ ", theme::faint()),
+                Span::styled("  └ ", Style::default().fg(theme::line_color())),
                 Span::styled(text, theme::faint()),
             ]));
             line_idx += 1;
@@ -281,16 +281,16 @@ fn detail_row(
         Span::raw("  ")
     };
     match row {
-        ConfigRow::Name => kv_field(arrow, "name", name_in, editing),
-        ConfigRow::BaseUrl => kv_field(arrow, "base url", base_in, editing),
-        ConfigRow::ApiKey => kv_field(arrow, "api key", key_in, editing),
+        ConfigRow::Name => kv_field(arrow, "name", name_in, editing, selected),
+        ConfigRow::BaseUrl => kv_field(arrow, "base url", base_in, editing, selected),
+        ConfigRow::ApiKey => kv_field(arrow, "api key", key_in, editing, selected),
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
                 (theme::toggle_on().to_string(), theme::accent())
             } else {
                 (theme::toggle_off().to_string(), theme::faint())
             };
-            kv_static(arrow, "auto-start", value, style)
+            kv_static(arrow, "auto-start", value, style, selected)
         }
         ConfigRow::Delete => {
             let label = if armed_delete {
@@ -306,27 +306,44 @@ fn detail_row(
     }
 }
 
-fn kv_field(arrow: Span<'static>, key: &str, input: &InputState, editing: bool) -> Line<'static> {
+/// Form-row label style: TEXT+bold when the row is focused, else TEXT_DIM.
+fn label_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(theme::text_color())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme::dim()
+    }
+}
+
+fn kv_field(
+    arrow: Span<'static>,
+    key: &str,
+    input: &InputState,
+    editing: bool,
+    focused: bool,
+) -> Line<'static> {
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     let mut spans = vec![
         arrow,
-        Span::styled(
-            format!("{key}{}", " ".repeat(pad)),
-            Style::default().fg(theme::text_color()),
-        ),
+        Span::styled(format!("{key}{}", " ".repeat(pad)), label_style(focused)),
     ];
     spans.extend(value_spans(input, editing));
     Line::from(spans)
 }
 
-fn kv_static(arrow: Span<'static>, key: &str, value: String, value_style: Style) -> Line<'static> {
+fn kv_static(
+    arrow: Span<'static>,
+    key: &str,
+    value: String,
+    value_style: Style,
+    focused: bool,
+) -> Line<'static> {
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     Line::from(vec![
         arrow,
-        Span::styled(
-            format!("{key}{}", " ".repeat(pad)),
-            Style::default().fg(theme::text_color()),
-        ),
+        Span::styled(format!("{key}{}", " ".repeat(pad)), label_style(focused)),
         Span::styled(value, value_style),
     ])
 }
@@ -336,7 +353,7 @@ fn value_spans(input: &InputState, editing: bool) -> Vec<Span<'static>> {
         if input.value.is_empty() {
             return vec![Span::styled("—", theme::faint())];
         }
-        return vec![Span::styled(input.value.clone(), theme::body())];
+        return vec![Span::styled(input.value.clone(), theme::accent())];
     }
     // In edit mode the terminal cursor (set via frame.set_cursor_position) owns
     // the caret glyph — no simulated block highlight needed.

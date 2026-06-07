@@ -15,9 +15,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let toasts: Vec<&Toast> = app.toasts.iter().collect();
 
-    // Max content width: min(36, terminal_width − 4); the −4 budgets the chrome —
-    // `┃ ` (2) + 1-cell right pad inside the toast + 1-cell inset from the edge.
-    let content_cap = 36_u16.min(area.width.saturating_sub(4));
+    // Max content width: min(36, terminal_width − 5); the −5 budgets the chrome —
+    // `┃ ` (2) + 1-cell right pad inside the toast + 2-cell inset from the edge.
+    let content_cap = 36_u16.min(area.width.saturating_sub(5));
 
     // Measure the widest *natural* line across all toasts, then clamp to the
     // cap.  This drives both the column width and the wrap budget.
@@ -32,11 +32,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The pad cell carries no text, so the Paragraph's `bg_sunken` base fills it.
     let col_width = max_content_width + 3;
 
-    // Anchor: 1-cell inset from the right edge.
-    let x = area.x + area.width.saturating_sub(col_width + 1);
+    // Anchor: 2-cell inset from the right edge.
+    let x = area.x + area.width.saturating_sub(col_width + 2);
 
-    // Count total rows needed to place the stack top-down from row 1.
-    let mut row = area.y + 1;
+    // Count total rows needed to place the stack top-down from a 2-cell top inset.
+    let mut row = area.y + 2;
 
     for toast in &toasts {
         let color = match toast.kind {
@@ -87,11 +87,43 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             height,
         };
         if fits_in(area, rect) {
+            // Glass pane: capture the bg currently beneath each cell, render the
+            // toast (which paints a solid `bg_sunken` base), then re-blend each
+            // cell's bg as `bg_sunken` at 75 % over what was beneath it.
+            // `blend_over` no-ops on the compatible tier → solid `bg_sunken`.
+            let buf = frame.buffer_mut();
+            let mut beneath: Vec<ratatui::style::Color> =
+                Vec::with_capacity((rect.width as usize) * (rect.height as usize));
+            for cy in rect.y..rect.y + rect.height {
+                for cx in rect.x..rect.x + rect.width {
+                    let bg = buf
+                        .cell((cx, cy))
+                        .and_then(|c| c.style().bg)
+                        .unwrap_or(theme::bg_sunken());
+                    beneath.push(bg);
+                }
+            }
+
+            // Clear wipes underlying symbols to spaces (the captured `beneath`
+            // bg above is unaffected); without it, Paragraph leaves stray glyphs
+            // in the pad/short-wrap cells it never writes.
             frame.render_widget(Clear, rect);
             frame.render_widget(
                 Paragraph::new(render_lines).style(Style::default().bg(theme::bg_sunken())),
                 rect,
             );
+
+            let buf = frame.buffer_mut();
+            let mut i = 0;
+            for cy in rect.y..rect.y + rect.height {
+                for cx in rect.x..rect.x + rect.width {
+                    let glass = theme::blend_over(beneath[i], theme::bg_sunken(), 0.75);
+                    if let Some(cell) = buf.cell_mut((cx, cy)) {
+                        cell.set_bg(glass);
+                    }
+                    i += 1;
+                }
+            }
         }
         row += height;
     }

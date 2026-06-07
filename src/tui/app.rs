@@ -582,10 +582,12 @@ pub(crate) enum FooterAlert {
 
 // ── Banner ────────────────────────────────────────────────────────────────────
 
-/// Severity for the full-width body banner.
-/// Add `Warning` back when a real warning-level sticky condition exists.
+/// Severity for the full-width body banner. Ordering matters: `Danger`
+/// outranks `Warning`, so when two conditions could both be live the
+/// higher-severity banner wins (see `update_banner`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BannerSeverity {
+    Warning,
     Danger,
 }
 
@@ -1037,17 +1039,11 @@ impl App {
         }
     }
 
-    /// Called each frame with the current terminal height. Transitions compact
-    /// state and emits the one-shot "too small" toast on the first entry.
+    /// Called each frame with the current terminal height. Tracks compact
+    /// state; the matching warning banner is recomputed from this flag in
+    /// `update_banner` each tick, so it self-clears on resize (no toast).
     pub(crate) fn update_compact(&mut self, terminal_height: u16) {
-        let now_compact = terminal_height < 14;
-        if now_compact && !self.compact {
-            self.toast(
-                ToastKind::Danger,
-                "terminal too small · enlarge for full layout",
-            );
-        }
-        self.compact = now_compact;
+        self.compact = terminal_height < 14;
     }
 
     /// Mark a background tab with an activity color. Only sets if `tab` is not
@@ -3331,6 +3327,13 @@ fn update_banner(app: &mut App) {
             severity: BannerSeverity::Danger,
             message: "all accounts spent · switch to a profile to resume".to_string(),
         })
+    } else if app.compact {
+        // Terminal too small for the full layout. Lower severity than the
+        // all-spent danger above, so danger wins the tie.
+        Some(Banner {
+            severity: BannerSeverity::Warning,
+            message: "terminal too small · enlarge for full layout".to_string(),
+        })
     } else {
         None
     };
@@ -3654,7 +3657,7 @@ mod tests {
 
     // ── compact mode ─────────────────────────────────────────────────────────
 
-    use super::{App, ToastKind};
+    use super::App;
 
     fn bare_app() -> App {
         use crate::profile::{AppConfig, AppState};
@@ -3664,50 +3667,57 @@ mod tests {
         })
     }
 
-    /// First entry into compact (< 14 rows) sets the flag and queues exactly
-    /// one DANGER toast with the contract's exact message.
+    /// Compact entry (< 14 rows) sets the flag and emits no toast; the warning
+    /// banner is driven from the flag in `update_banner` instead.
     #[test]
-    fn compact_entry_emits_danger_toast() {
+    fn compact_entry_sets_flag_no_toast() {
         let mut app = bare_app();
         app.update_compact(13);
         assert!(app.compact);
-        assert_eq!(app.toasts.len(), 1);
-        let t = &app.toasts[0];
-        assert_eq!(t.kind, ToastKind::Danger);
-        assert_eq!(t.body, "terminal too small · enlarge for full layout");
+        assert!(app.toasts.is_empty(), "compact must not fire a toast");
     }
 
-    /// Staying in compact must not repeat the toast.
+    /// Compact recomputes a WARNING banner with the contract's exact message.
     #[test]
-    fn compact_no_repeat_toast() {
+    fn compact_yields_warning_banner() {
+        use super::{BannerSeverity, update_banner};
         let mut app = bare_app();
         app.update_compact(13);
-        app.update_compact(13);
-        assert_eq!(app.toasts.len(), 1, "no second toast while still compact");
+        update_banner(&mut app);
+        let banner = app.banner.as_ref().expect("compact banner present");
+        assert_eq!(banner.severity, BannerSeverity::Warning);
+        assert_eq!(
+            banner.message,
+            "terminal too small · enlarge for full layout"
+        );
     }
 
-    /// Growing back above threshold clears the compact flag; no toast emitted.
+    /// Growing back above threshold clears the flag and self-clears the banner.
     #[test]
-    fn compact_exit_clears_flag_no_toast() {
+    fn compact_exit_clears_banner() {
+        use super::update_banner;
         let mut app = bare_app();
         app.update_compact(13);
-        app.toasts.clear();
+        update_banner(&mut app);
+        assert!(app.banner.is_some());
         app.update_compact(14);
+        update_banner(&mut app);
         assert!(!app.compact);
-        assert!(app.toasts.is_empty());
+        assert!(app.banner.is_none(), "banner self-clears on resize");
     }
 
-    /// Re-entering compact after a return to normal re-arms the toast.
+    /// Re-entering compact after a return to normal re-shows the banner; never a toast.
     #[test]
     fn compact_rearm_after_exit() {
+        use super::update_banner;
         let mut app = bare_app();
         app.update_compact(13);
-        app.toasts.clear();
         app.update_compact(14); // exit
-        app.update_compact(13); // re-enter → toast fires again
+        app.update_compact(13); // re-enter
+        update_banner(&mut app);
         assert!(app.compact);
-        assert_eq!(app.toasts.len(), 1);
-        assert_eq!(app.toasts[0].kind, ToastKind::Danger);
+        assert!(app.toasts.is_empty(), "compact must not fire a toast");
+        assert!(app.banner.is_some());
     }
 
     // ── global config tab ────────────────────────────────────────────────────

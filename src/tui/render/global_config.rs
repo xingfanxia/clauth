@@ -6,6 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -36,7 +37,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         });
         if selected && let Some(tip) = row_hint(*row) {
             lines.push(Line::from(vec![
-                Span::styled("  └ ", theme::faint()),
+                Span::styled("  └ ", Style::default().fg(theme::line_color())),
                 Span::styled(tip, theme::faint()),
             ]));
         }
@@ -92,9 +93,14 @@ fn cycle_row(
     row_selected: bool,
 ) -> Line<'static> {
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
+    let key_style = if row_selected {
+        theme::body().add_modifier(Modifier::BOLD)
+    } else {
+        theme::dim()
+    };
     let mut spans = vec![
         arrow,
-        Span::styled(format!("{key}{}", " ".repeat(pad)), theme::body()),
+        Span::styled(format!("{key}{}", " ".repeat(pad)), key_style),
     ];
     for (i, (label, active)) in options.iter().enumerate() {
         if i > 0 {
