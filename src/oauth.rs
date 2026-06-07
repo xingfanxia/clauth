@@ -46,7 +46,12 @@ const AUTO_START_COOLDOWN_MS: u64 = 4 * 3600 * 1000 + 30 * 60 * 1000;
 /// How long to wait before retrying after a failed kick. Short enough to
 /// recover from a transient API error or a just-rotated token, but not so
 /// short that a persistent failure hammers the endpoint.
-const AUTO_START_RETRY_MS: u64 = 5 * 60 * 1000;
+const AUTO_START_RETRY_MS: u64 = 60 * 1000;
+
+/// Pause between the steps of the 401-recovery sequence (failed kick → rotate
+/// → retry kick → usage re-fetch) so the API sees the rotated pair settle
+/// instead of three back-to-back requests on the same chain.
+const ROTATION_STEP_DELAY_MS: u64 = 2000;
 
 #[derive(Deserialize)]
 pub(crate) struct TokenResponse {
@@ -149,6 +154,10 @@ fn kick(access_token: &str) -> std::result::Result<(), KickError> {
 /// Any non-401 error, a missing refresh token, a busy guard, or a live session
 /// leaves the original failure in place (no rotation attempted). Returns the
 /// final kick outcome as an `anyhow::Result` for the caller's `OpResult`.
+///
+/// Each recovery step is paced by [`ROTATION_STEP_DELAY_MS`] (401 → rotate →
+/// retry kick → caller's usage re-fetch); none of the sleeps holds the
+/// rotation lock.
 fn kick_with_rotation(
     config: &crate::profile::ConfigHandle,
     name: &str,
@@ -167,9 +176,12 @@ fn kick_with_rotation(
     let Some(rt) = refresh_token else {
         return Err(anyhow::anyhow!("HTTP 401"));
     };
+    // Pace the recovery: breathe between the failed kick and the rotation
+    // round trip, before any lock is taken.
+    std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
     // RotationGuard outermost across the HTTP window — acquired with no other
     // lock held (the cooldown read in `start_window` released config first).
-    let Ok(_rotation_guard) = RotationGuard::acquire(name) else {
+    let Ok(rotation_guard) = RotationGuard::acquire(name) else {
         return Err(anyhow::anyhow!("HTTP 401"));
     };
     if has_live_session(name) {
@@ -201,8 +213,16 @@ fn kick_with_rotation(
         entry.access_token = access.clone();
         entry.refresh_token = Some(new_refresh);
     }
+    // The rotated pair is persisted and synced; the retry kick spends only the
+    // access token, so release the rotation lock before the paced waits — a
+    // `clauth start` or sibling worker shouldn't block on our sleeps.
+    drop(rotation_guard);
 
-    kick(&access).map_err(Into::into)
+    // Pace rotate → retry kick, then retry kick → the caller's usage re-fetch.
+    std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
+    kick(&access).map_err(anyhow::Error::from)?;
+    std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
+    Ok(())
 }
 
 /// Result of [`rotate_one_inner`]. Distinguishes the rotation-lock acquire
@@ -554,7 +574,7 @@ pub(crate) fn windowless_auto_start_candidates(
 /// second tick can't spawn a duplicate worker in the gap between the idle check
 /// and the worker starting. On success the stamp stays (full 4.5 h cooldown); on
 /// failure it's overwritten with a backoff allowing a retry after
-/// `AUTO_START_RETRY_MS` (5 min) so a transient error / just-rotated token
+/// `AUTO_START_RETRY_MS` (1 min) so a transient error / just-rotated token
 /// recovers without waiting for the next window. The "already has a window"
 /// check lives in [`windowless_auto_start_candidates`], where the store is on
 /// hand.
