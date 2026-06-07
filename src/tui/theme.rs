@@ -211,6 +211,12 @@ pub(crate) fn toggle_off() -> &'static str {
     }
 }
 
+/// Gutter glyph for a row in edit mode — replaces the `❯` selection caret while
+/// a text/stepper field is being typed into. Same on both tiers (per cloudy-tui).
+pub(crate) fn edit_glyph() -> &'static str {
+    "✎"
+}
+
 // ── Style helpers ─────────────────────────────────────────────────────────────
 
 pub(crate) fn base() -> Style {

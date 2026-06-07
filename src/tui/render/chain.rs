@@ -292,7 +292,9 @@ fn detail_row(
     armed_remove: bool,
     editing: Option<&InputState>,
 ) -> Line<'static> {
-    let arrow = if selected {
+    let arrow = if editing.is_some() {
+        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent())
+    } else if selected {
         Span::styled("❯ ", theme::accent())
     } else {
         Span::raw("  ")
