@@ -179,10 +179,7 @@ fn draw_settings_rows(
     };
 
     let mut type_spans = vec![
-        Span::styled(
-            format!("type{}", " ".repeat(KEY_W - 4)),
-            Style::default().fg(theme::text_color()),
-        ),
+        Span::styled(format!("type{}", " ".repeat(KEY_W - 4)), theme::label()),
         Span::styled(type_value, type_style),
     ];
     if snap.is_active {

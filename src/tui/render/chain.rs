@@ -10,7 +10,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -198,7 +198,7 @@ fn member_detail(
     // `priority` — position in the chain (order = priority).
     let value = format!("#{} of {chain_len}", index + 1);
     let mut priority_spans = vec![
-        Span::styled(kv_key("priority"), theme::dim()),
+        Span::styled(kv_key("priority"), theme::label()),
         Span::styled(value.clone(), theme::body()),
     ];
     if active {
@@ -214,7 +214,7 @@ fn member_detail(
     // `5h usage` — gauge lives on the kv key row (matching `priority` / `rotate
     // at` grammar), headroom figure indented beneath it. Two lines, not three:
     // the standalone eyebrow is folded into the key.
-    let mut gauge_spans = vec![Span::styled(kv_key("5h usage"), theme::dim())];
+    let mut gauge_spans = vec![Span::styled(kv_key("5h usage"), theme::label())];
     gauge_spans.extend(gauge_with_tick(pct, Some(threshold)));
     if let Some(v) = pct {
         gauge_spans.push(Span::styled(
@@ -299,7 +299,10 @@ fn detail_row(
     };
     match row {
         FallbackRow::Threshold => {
-            let mut spans = vec![arrow, Span::styled(kv_key("rotate at"), theme::dim())];
+            let mut spans = vec![
+                arrow,
+                Span::styled(kv_key("rotate at"), label_style(selected)),
+            ];
             match editing {
                 Some(input) => {
                     // Invalid typed value renders in DANGER (the gutter `└ max is 100`
@@ -333,7 +336,7 @@ fn detail_row(
             };
             Line::from(vec![
                 arrow,
-                Span::styled(kv_key("remove"), theme::dim()),
+                Span::styled(kv_key("remove"), label_style(selected)),
                 Span::styled(label, theme::danger()),
             ])
         }
@@ -452,6 +455,18 @@ fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static
         }
     }
     spans
+}
+
+/// Interactive form-row label: `TEXT + bold` when the row is focused,
+/// `TEXT_DIM` blurred (matches the setup-tab `label_style`).
+fn label_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(theme::text_color())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme::dim()
+    }
 }
 
 fn kv_key(key: &str) -> String {
