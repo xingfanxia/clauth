@@ -43,7 +43,7 @@ use crate::update::{self, UpdateEvent};
 use crate::usage::{
     ActivityKind, ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult,
     OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity,
-    REFRESH_INTERVAL_MS, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
+    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageInfo,
     UsageStore, any_busy, clear_activity, collect_third_party_entries, fetch_all_into, is_idle,
     mark_activity, now_ms, spawn_refresher,
@@ -193,7 +193,7 @@ pub(crate) enum GlobalConfigRow {
     /// Chain-wide "when spent" behavior (`AppState.wrap_off`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.
     WrapOff,
-    /// Per-profile refresh interval; `+`/`-` steps through presets in-place.
+    /// Global refresh interval; `+`/`-` steps through presets in-place.
     RefreshInterval,
 }
 
@@ -803,9 +803,7 @@ impl App {
         let third_party_usage_store: ThirdPartyUsageStore =
             Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
-        let refresh_interval = Arc::new(AtomicU64::new(
-            config.state.refresh_interval_ms.max(REFRESH_INTERVAL_MS),
-        ));
+        let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
 
         // Kick the best-effort update check on its own thread; its verdict lands
         // in `update_results` and is toasted from `on_tick`.

@@ -502,7 +502,7 @@ fn apply_outcome(
 
     // Server-directed deferral: a 429's `retry-after` stamps this profile's
     // slot `retry_after - interval` into the future, so `partition_due`'s
-    // fixed math (due + countdown at `stamp + REFRESH_INTERVAL_MS`) lands
+    // fixed math (due + countdown at `stamp + interval_ms`) lands
     // exactly on `now + retry_after` (capped). Not an adaptive learner — the
     // cadence stays fixed; an explicit server hint defers one profile's next
     // slot once.
@@ -689,7 +689,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
 /// Stamp a profile's fetch slot. Normally `now` (so the next deadline reflects
 /// fetch duration, mirroring OAuth `apply_outcome`); a 429's `retry-after`
 /// stamps `retry_after - interval` ahead so `partition_due`'s fixed
-/// `stamp + REFRESH_INTERVAL_MS` math lands the next slot on `now + retry_after`
+/// `stamp + interval_ms` math lands the next slot on `now + retry_after`
 /// (capped by [`MAX_RETRY_AFTER_MS`]).
 fn stamp_last_fetched(
     last_fetched: &LastFetchedAt,
