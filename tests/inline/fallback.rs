@@ -330,6 +330,81 @@ fn auto_switch_wrap_off_switches_off_when_chain_spent() {
     );
 }
 
+// ── recovery_target ──────────────────────────────────────────────────────────
+//
+// After switch-off-all (no active profile), find a chain member whose
+// utilization has dropped below its threshold.
+
+#[test]
+fn find_recovered_returns_first_member_below_threshold() {
+    let members = vec![
+        ChainMember {
+            name: "a".into(),
+            threshold: 95.0,
+        },
+        ChainMember {
+            name: "b".into(),
+            threshold: 95.0,
+        },
+    ];
+    let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
+    assert_eq!(
+        find_recovered_member(&members, &store),
+        Some("b".to_string()),
+    );
+}
+
+#[test]
+fn find_recovered_skips_exhausted_members() {
+    let members = vec![
+        ChainMember {
+            name: "a".into(),
+            threshold: 95.0,
+        },
+        ChainMember {
+            name: "b".into(),
+            threshold: 95.0,
+        },
+    ];
+    let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
+    assert_eq!(find_recovered_member(&members, &store), None);
+}
+
+#[test]
+fn find_recovered_returns_none_when_no_member_has_data() {
+    let members = vec![
+        ChainMember {
+            name: "a".into(),
+            threshold: 95.0,
+        },
+        ChainMember {
+            name: "b".into(),
+            threshold: 95.0,
+        },
+    ];
+    let store = store_with_utils(&[]); // no usage data for any member
+    assert_eq!(find_recovered_member(&members, &store), None);
+}
+
+#[test]
+fn find_recovered_uses_threshold_per_member() {
+    let members = vec![
+        ChainMember {
+            name: "a".into(),
+            threshold: 90.0,
+        }, // 95% util ≥ 90 → exhausted
+        ChainMember {
+            name: "b".into(),
+            threshold: 95.0,
+        }, // 94% util < 95 → recovered
+    ];
+    let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
+    assert_eq!(
+        find_recovered_member(&members, &store),
+        Some("b".to_string()),
+    );
+}
+
 // next_auto_switch_target: wrap_off off, spent chain → legacy None.
 #[test]
 fn auto_switch_wrap_off_disabled_stays_put() {

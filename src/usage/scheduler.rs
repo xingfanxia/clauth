@@ -887,7 +887,7 @@ fn tick(state: &SchedulerState) {
 
     // Auto-switch: evaluate every tick (not only OAuth fetch ticks) so a
     // profile that crossed its threshold is switched immediately, without
-    // waiting for the next scheduled fetch.
+    // waiting for the next scheduled fetch. Also checks recovery post-switch-off.
     scan_auto_switch(
         &state.config,
         &state.store,
@@ -895,6 +895,7 @@ fn tick(state: &SchedulerState) {
         &state.pending_switch,
         &state.pending_switch_off,
     );
+    scan_recovery(&state.config, &state.store, &state.pending_switch);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1006,6 +1007,59 @@ fn scan_auto_switch(
             }
         }
         None => {}
+    }
+}
+
+/// Evaluate recovery after switch-off-all: when no active profile is set,
+/// scan the fallback chain for any member whose utilization has dropped
+/// below its threshold and queue a switch to the first one found.
+///
+/// Lock-safe: acquires `config` (rank 400) then drops before `store` (300)
+/// and `pending_switch` (1500) — never two tracked locks at once.
+fn scan_recovery(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    pending_switch: &PendingSwitch,
+) {
+    // Skip when a previous switch is still pending.
+    if let Ok(p) = pending_switch.lock()
+        && !p.is_empty()
+    {
+        return;
+    }
+
+    // Build chain-member snapshot under config lock, then drop before
+    // touching store (avoids the config↔store inversion that
+    // `next_auto_switch_target` avoids via ChainSnapshot).
+    let members: Vec<crate::fallback::ChainMember> = {
+        let cfg = match config.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        // Only scan for recovery after switch-off-all (no active profile).
+        if cfg.state.active_profile.is_some() {
+            return;
+        }
+        if cfg.state.fallback_chain.is_empty() {
+            return;
+        }
+        cfg.state
+            .fallback_chain
+            .iter()
+            .map(|name| crate::fallback::ChainMember {
+                name: name.to_string(),
+                threshold: cfg
+                    .find(name)
+                    .map(crate::fallback::threshold_for)
+                    .unwrap_or(crate::fallback::DEFAULT_THRESHOLD),
+            })
+            .collect()
+    };
+
+    if let Some(name) = crate::fallback::find_recovered_member(&members, store)
+        && let Ok(mut p) = pending_switch.lock()
+    {
+        p.insert(name);
     }
 }
 

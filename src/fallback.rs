@@ -221,6 +221,28 @@ pub(crate) fn next_auto_switch_target(
     None
 }
 
+/// Find the first chain member whose utilization is below its threshold
+/// (has recovered headroom after switch-off-all). Returns the member name.
+/// Safe to call without holding the config lock — reads from [`UsageStore`].
+pub(crate) fn find_recovered_member(chain: &[ChainMember], store: &UsageStore) -> Option<String> {
+    for member in chain {
+        let util = match store.lock() {
+            Ok(s) => s
+                .get(&member.name)
+                .and_then(|u| u.five_hour.as_ref())
+                .map(|w| w.utilization),
+            Err(_) => continue,
+        };
+        let Some(util) = util else {
+            continue; // no usage data yet — can't determine recovery
+        };
+        if util < member.threshold {
+            return Some(member.name.clone());
+        }
+    }
+    None
+}
+
 /// If the active profile is a chain member past its threshold, switch to the
 /// next viable member — or, in wrap-off mode when the whole chain is spent and
 /// no sink exists, turn off all accounts. Returns the action taken, or None.
