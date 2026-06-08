@@ -11,6 +11,7 @@
 //!     only when the stack is empty.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -43,9 +44,9 @@ use crate::usage::{
     ActivityKind, ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
     OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, REFRESH_INTERVAL_MS,
     RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
-    ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageStore, any_busy,
-    clear_activity, collect_third_party_entries, fetch_all_into, is_idle, mark_activity,
-    spawn_refresher,
+    ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageInfo, UsageStore,
+    any_busy, clear_activity, collect_third_party_entries, fetch_all_into, is_idle, mark_activity,
+    now_ms, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -724,6 +725,10 @@ pub(crate) struct App {
     /// Per-profile flag: has the bell been fired for the current crossing.
     /// Reset when utilization drops back below threshold.
     pub(crate) bell_fired: HashMap<String, bool>,
+
+    /// Last-seen usage per profile, keyed by name.
+    /// Used to detect fresh fetches and append history JSONL lines.
+    pub(crate) last_history_usage: HashMap<String, UsageInfo>,
 }
 
 /// Cloned `Arc`s bundled for [`spawn_refresher`]; carries no lock rank and is
@@ -861,6 +866,7 @@ impl App {
             bootstrap_active: Arc::new(AtomicBool::new(false)),
             tab_activity: [None; Tab::ALL.len()],
             bell_fired: HashMap::new(),
+            last_history_usage: HashMap::new(),
         }
     }
 
@@ -980,6 +986,7 @@ impl App {
         // A blank map would blind auto-switch permanently.
         // Third-party stores BEFORE OAuth stores: ranks 270/280 < 300/350.
         let bells;
+        let usage_snapshots;
         {
             let third_party_map = self.third_party_usage_store.lock().ok();
             let third_party_status_map = self.third_party_status.lock().ok();
@@ -1017,6 +1024,13 @@ impl App {
                     (p.name.to_string(), p.bell_threshold, util)
                 })
                 .collect::<Vec<_>>();
+
+            // Collect usage snapshots for history tracking while cfg is alive.
+            usage_snapshots = cfg
+                .profiles
+                .iter()
+                .filter_map(|p| p.usage.clone().map(|u| (p.name.to_string(), u)))
+                .collect::<Vec<_>>();
         }
         for (name, threshold, util) in bells {
             if let Some(t) = threshold
@@ -1031,6 +1045,33 @@ impl App {
                 } else {
                     self.bell_fired.remove(&name);
                 }
+            }
+        }
+
+        // Append history JSONL for every profile whose usage just changed.
+        for (name, usage) in usage_snapshots {
+            let changed = match self.last_history_usage.get(name.as_str()) {
+                Some(last) => {
+                    serde_json::to_string(last).ok() != serde_json::to_string(&usage).ok()
+                }
+                None => true,
+            };
+            if changed {
+                if let Ok(path) = crate::profile::profile_history_path(&name)
+                    && let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                {
+                    let ts = now_ms();
+                    let usage_json = serde_json::to_string(&usage).unwrap_or_default();
+                    let _ = writeln!(
+                        file,
+                        r#"{{"ts":{},"name":"{}","usage":{}}}"#,
+                        ts, name, usage_json,
+                    );
+                }
+                self.last_history_usage.insert(name, usage);
             }
         }
     }

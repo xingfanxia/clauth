@@ -370,6 +370,10 @@ fn profile_credentials_path(name: &str) -> Result<PathBuf> {
     profile_subpath(name, "credentials.json")
 }
 
+pub(crate) fn profile_history_path(name: &str) -> Result<PathBuf> {
+    Ok(profile_dir(name)?.join("usage_history.jsonl"))
+}
+
 fn profile_credentials_pending_path(name: &str) -> Result<PathBuf> {
     profile_subpath(name, "credentials.json.pending")
 }
