@@ -726,6 +726,9 @@ pub(crate) struct App {
     /// Reset when utilization drops back below threshold.
     pub(crate) bell_fired: HashMap<String, bool>,
 
+    /// Burn-rate samples per profile: (timestamp, 5h utilization).
+    pub(crate) burn_samples: HashMap<String, VecDeque<(Instant, f64)>>,
+
     /// Last-seen usage per profile, keyed by name.
     /// Used to detect fresh fetches and append history JSONL lines.
     pub(crate) last_history_usage: HashMap<String, UsageInfo>,
@@ -866,6 +869,7 @@ impl App {
             bootstrap_active: Arc::new(AtomicBool::new(false)),
             tab_activity: [None; Tab::ALL.len()],
             bell_fired: HashMap::new(),
+            burn_samples: HashMap::new(),
             last_history_usage: HashMap::new(),
         }
     }
@@ -987,6 +991,7 @@ impl App {
         // Third-party stores BEFORE OAuth stores: ranks 270/280 < 300/350.
         let bells;
         let usage_snapshots;
+        let burn_data: Vec<(String, f64)>;
         {
             let third_party_map = self.third_party_usage_store.lock().ok();
             let third_party_status_map = self.third_party_status.lock().ok();
@@ -1031,6 +1036,35 @@ impl App {
                 .iter()
                 .filter_map(|p| p.usage.clone().map(|u| (p.name.to_string(), u)))
                 .collect::<Vec<_>>();
+
+            // Collect burn-rate data while cfg is alive.
+            burn_data = cfg
+                .profiles
+                .iter()
+                .map(|p| {
+                    let pct = p
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.five_hour.as_ref())
+                        .map(|w| w.utilization)
+                        .unwrap_or(0.0);
+                    (p.name.to_string(), pct)
+                })
+                .collect();
+        }
+        // Burn-rate sampling outside the cfg lock scope.
+        for (name, pct) in burn_data {
+            let samples = self.burn_samples.entry(name).or_default();
+            let now = Instant::now();
+            if pct > 0.0 {
+                let cutoff = now - Duration::from_secs(300);
+                while samples.front().is_some_and(|(t, _)| *t < cutoff) {
+                    samples.pop_front();
+                }
+                samples.push_back((now, pct));
+            } else {
+                samples.clear();
+            }
         }
         for (name, threshold, util) in bells {
             if let Some(t) = threshold

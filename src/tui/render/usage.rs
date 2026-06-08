@@ -83,11 +83,16 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         tick: app.tick_count,
     };
 
-    let lines = build_usage_lines(profile, inner.width, &header);
+    let lines = build_usage_lines(profile, inner.width, &header, app);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
-fn build_usage_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Line<'static>> {
+fn build_usage_lines(
+    profile: &Profile,
+    inner_w: u16,
+    header: &HeaderState,
+    app: &App,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.extend(header_lines(profile, inner_w, header));
     lines.push(Line::from(""));
@@ -129,6 +134,25 @@ fn build_usage_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> V
             lines.push(Line::from(""));
         }
         lines.extend(stat.render(bar_width, pct_col));
+        // Insert burn rate after the 5h window's bar (first stat, 2 lines: label + bar).
+        if i == 0
+            && let Some(samples) = app.burn_samples.get(profile.name.as_str())
+            && samples.len() >= 2
+        {
+            let first = samples.front().unwrap();
+            let last = samples.back().unwrap();
+            let dt_hours = last.0.duration_since(first.0).as_secs_f64() / 3600.0;
+            if dt_hours > 0.0 {
+                let dpct = last.1 - first.1;
+                let rate = dpct / dt_hours;
+                let color = Style::default().fg(theme::util_color(rate.clamp(0.0, 100.0)));
+                let line = Line::from(vec![
+                    Span::styled("  burn ", theme::label()),
+                    Span::styled(format!("{:>5.1} %/h", rate), color),
+                ]);
+                lines.push(line);
+            }
+        }
     }
     lines
 }
