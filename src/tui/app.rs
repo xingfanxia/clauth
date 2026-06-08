@@ -1062,6 +1062,13 @@ impl App {
         for (name, pct) in burn_data {
             let samples = self.burn_samples.entry(name).or_default();
             let now = Instant::now();
+            // A drop in utilization signals a limit reset — clear stale samples
+            // so the burn rate starts tracking the new window from scratch.
+            if let Some(&(_, last_pct)) = samples.back() {
+                if pct < last_pct {
+                    samples.clear();
+                }
+            }
             if pct > 0.0 {
                 let cutoff = now - Duration::from_secs(300);
                 while samples.front().is_some_and(|(t, _)| *t < cutoff) {
