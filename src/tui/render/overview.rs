@@ -15,7 +15,7 @@ use super::format::{
 use super::panes::{draw_scrollbar, empty_state, section_box, select_line};
 use crate::fallback::threshold_for;
 use crate::profile::{AppConfig, Profile};
-use crate::usage::{ProfileActivity, now_ms};
+use crate::usage::{ProfileActivity, humanize_duration, now_ms};
 
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
@@ -343,7 +343,7 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = fallback_flow_lines(&app.config(), inner.width, inner.height);
+    let lines = fallback_flow_lines(app, inner.width, inner.height);
     let para = Paragraph::new(lines)
         .style(theme::base())
         .wrap(Wrap { trim: false });
@@ -352,7 +352,8 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 const GAUGE_W: usize = 12;
 
-fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'static>> {
+fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>> {
+    let cfg = app.config();
     if cfg.state.fallback_chain.is_empty() {
         return vec![
             Line::from(Span::styled("no fallback chain yet", theme::dim())),
@@ -381,8 +382,37 @@ fn fallback_flow_lines(cfg: &AppConfig, _width: u16, height: u16) -> Vec<Line<'s
         if lines.len() >= cap {
             break;
         }
-        lines.push(chain_row(cfg, name, i, last, name_w));
+        lines.push(chain_row(&cfg, name, i, last, name_w));
     }
+
+    if lines.len() < cap && cfg.state.active_profile.is_none()
+        && let Some(first) = chain.first() {
+            let eta = app
+                .next_refresh_per_profile
+                .lock()
+                .ok()
+                .and_then(|m| m.get(first.as_str()).copied())
+                .map(|next_ms| {
+                    let secs = ((next_ms as i64 - now_ms() as i64) / 1000).max(0);
+                    let ok = cfg.find(first).and_then(|p| {
+                        p.usage
+                            .as_ref()
+                            .and_then(|u| u.five_hour.as_ref())
+                            .map(|w| w.utilization >= threshold_for(p))
+                    });
+                    if ok.unwrap_or(true) {
+                        format!("next check in {}", humanize_duration(secs))
+                    } else {
+                        format!("switch pending · check in {}", humanize_duration(secs))
+                    }
+                })
+                .unwrap_or_else(|| "next check soon".to_string());
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("auto-switch ETA: {eta}"), theme::faint()),
+            ]));
+        }
+
     // Caption only if it fits; wrap-off replaces wrap caption.
     if lines.len() < cap {
         let caption = if cfg.state.wrap_off {
