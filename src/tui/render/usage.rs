@@ -2,6 +2,8 @@
 //! breakdown on the right: a header (plan, active marker, per-account refresh
 //! status / countdown), then every window, reset timers, and extra credits.
 
+use std::collections::HashMap;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -17,7 +19,7 @@ use super::panes::{
 use crate::format::plan_label;
 use crate::profile::Profile;
 use crate::providers::StatRowKind;
-use crate::usage::{FetchStatus, ProfileActivity, UsageWindow, now_ms};
+use crate::usage::{FetchStatus, ProfileActivity, now_ms};
 
 const KEY_W: usize = 8;
 
@@ -129,30 +131,35 @@ fn build_usage_lines(
     let bar_width = bar_width_for(inner_w, max_trailing);
     // Right-align % to far content edge so figures stack above the reset text.
     let pct_col = (bar_width + max_trailing).min(inner_w as usize);
-    for (i, stat) in stats.iter().enumerate() {
+
+    // Compute burn rates per window from accumulated samples.
+    let window_rates: HashMap<String, Option<f64>> = app
+        .burn_samples
+        .get(profile.name.as_str())
+        .map(|wm| {
+            wm.iter()
+                .filter_map(|(label, samples)| {
+                    if samples.len() >= 2 {
+                        let first = samples.front().unwrap();
+                        let last = samples.back().unwrap();
+                        let dt = last.0.duration_since(first.0).as_secs_f64() / 3600.0;
+                        if dt > 0.0 {
+                            let rate = (last.1 - first.1) / dt;
+                            return Some((label.clone(), Some(rate)));
+                        }
+                    }
+                    Some((label.clone(), None))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (i, mut stat) in stats.into_iter().enumerate() {
+        stat.burn_rate = window_rates.get(&stat.label).and_then(|r| *r);
         if i > 0 {
             lines.push(Line::from(""));
         }
         lines.extend(stat.render(bar_width, pct_col));
-        // Insert burn rate after the 5h window's bar (first stat, 2 lines: label + bar).
-        if i == 0
-            && let Some(samples) = app.burn_samples.get(profile.name.as_str())
-            && samples.len() >= 2
-        {
-            let first = samples.front().unwrap();
-            let last = samples.back().unwrap();
-            let dt_hours = last.0.duration_since(first.0).as_secs_f64() / 3600.0;
-            if dt_hours > 0.0 {
-                let dpct = last.1 - first.1;
-                let rate = dpct / dt_hours;
-                let color = Style::default().fg(theme::util_color(rate.clamp(0.0, 100.0)));
-                let line = Line::from(vec![
-                    Span::styled("  burn ", theme::label()),
-                    Span::styled(format!("{:>5.1} %/h", rate), color),
-                ]);
-                lines.push(line);
-            }
-        }
     }
     lines
 }
@@ -162,6 +169,7 @@ struct Stat {
     pct: f64,
     color: Style,
     trailing: String,
+    burn_rate: Option<f64>,
 }
 
 impl Stat {
@@ -169,8 +177,14 @@ impl Stat {
     /// `bar_width` shared across rows; `pct_col` = far content edge for % alignment.
     fn render(&self, bar_width: usize, pct_col: usize) -> Vec<Line<'static>> {
         let pct_str = format!("{:>3.0}%", self.pct);
+
+        // Compute total label width including inline burn rate if present.
+        let rate_w = self.burn_rate.map_or(0, |r| {
+            " · ".chars().count() + format!("{:.1} %/h", r).chars().count()
+        });
         let header_pad = pct_col
             .saturating_sub(self.label.chars().count())
+            .saturating_sub(rate_w)
             .saturating_sub(pct_str.chars().count());
 
         let filled = ((self.pct / 100.0) * bar_width as f64).round() as usize;
@@ -192,12 +206,25 @@ impl Stat {
             bar_line.push(Span::styled(self.trailing.clone(), theme::faint()));
         }
 
+        let mut label_spans = vec![Span::styled(self.label.clone(), theme::label())];
+        if let Some(rate) = self.burn_rate
+            && rate > 0.0
+        {
+            let rate_color = Style::default().fg(theme::util_color(rate.clamp(0.0, 100.0)));
+            label_spans.push(Span::styled(" · ", theme::dim()));
+            label_spans.push(Span::styled(format!("{:.1} %/h", rate), rate_color));
+        }
+
         vec![
-            Line::from(vec![
-                Span::styled(self.label.clone(), theme::label()),
-                Span::raw(" ".repeat(header_pad)),
-                Span::styled(pct_str, self.color.add_modifier(Modifier::BOLD)),
-            ]),
+            Line::from({
+                let mut spans = label_spans;
+                spans.push(Span::raw(" ".repeat(header_pad)));
+                spans.push(Span::styled(
+                    pct_str,
+                    self.color.add_modifier(Modifier::BOLD),
+                ));
+                spans
+            }),
             Line::from(bar_line),
         ]
     }
@@ -207,26 +234,19 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
     let Some(usage) = profile.usage.as_ref() else {
         return Vec::new();
     };
-    let windows: &[(&str, Option<&UsageWindow>)] = &[
-        ("5h", usage.five_hour.as_ref()),
-        ("7d all", usage.seven_day.as_ref()),
-        ("7d sonnet", usage.seven_day_sonnet.as_ref()),
-        ("7d opus", usage.seven_day_opus.as_ref()),
-    ];
     let mut stats: Vec<Stat> = Vec::new();
-    for (label, w) in windows {
-        if let Some(w) = w {
-            let pct = w.utilization.clamp(0.0, 100.0);
-            let trailing = format_reset(w)
-                .map(|r| format!("  resets in {r}"))
-                .unwrap_or_default();
-            stats.push(Stat {
-                label: (*label).to_string(),
-                pct,
-                color: Style::default().fg(theme::util_color(pct)),
-                trailing,
-            });
-        }
+    for (label, w) in usage.windows() {
+        let pct = w.utilization.clamp(0.0, 100.0);
+        let trailing = format_reset(w)
+            .map(|r| format!("  resets in {r}"))
+            .unwrap_or_default();
+        stats.push(Stat {
+            label: label.to_string(),
+            pct,
+            color: Style::default().fg(theme::util_color(pct)),
+            trailing,
+            burn_rate: None,
+        });
     }
     if let Some(extra) = &usage.extra_usage
         && extra.is_enabled
@@ -243,6 +263,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             pct,
             color: Style::default().fg(theme::util_color(pct)),
             trailing: format!("  {sym}{used:.2} / {sym}{limit:.2}"),
+            burn_rate: None,
         });
     }
     stats
