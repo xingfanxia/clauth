@@ -6,8 +6,8 @@ use crate::lockorder::RankedMutex;
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
-    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, TokenEntry,
-    clear_activity, mark_activity, partition_due, window_lapsed,
+    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, TokenEntry, clear_activity,
+    mark_activity, partition_due, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
