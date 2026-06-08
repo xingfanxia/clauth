@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use crate::lockorder::RankedMutex;
 
+use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
+
 use super::{
-    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, REFRESH_INTERVAL_MS, TokenEntry,
+    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, TokenEntry,
     clear_activity, mark_activity, partition_due, window_lapsed,
 };
 

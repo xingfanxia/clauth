@@ -15,11 +15,6 @@ use super::fetch::{
 /// Scheduler wake interval. Network work only fires for profiles whose cadence has elapsed.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Fixed per-profile refresh interval — no adaptive backoff. A server
-/// `retry-after` on a 429 defers a single profile's next slot (capped by
-/// [`MAX_RETRY_AFTER_MS`]); the cadence itself never changes.
-pub(crate) const REFRESH_INTERVAL_MS: u64 = 60_000;
-
 /// Hard ceiling on a server-provided `retry-after` so a bogus huge value
 /// can't starve a profile's refresh slot.
 const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;

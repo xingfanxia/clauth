@@ -65,6 +65,7 @@ fallback_chain = ["work"]
         active_profile: Some("work".to_string()),
         profiles: vec!["work".to_string(), "play".to_string()],
         fallback_chain: vec!["work".to_string()],
+        refresh_interval_ms: 90_000,
         ..Default::default()
     };
     assert_eq!(

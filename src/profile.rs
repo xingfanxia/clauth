@@ -195,7 +195,7 @@ pub(crate) enum ThemeName {
 
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
 /// Credentials and endpoint config live in per-profile subdirectories.
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AppState {
     pub(crate) active_profile: Option<ProfileName>,
     pub(crate) profiles: Vec<ProfileName>,
@@ -209,8 +209,29 @@ pub(crate) struct AppState {
     /// detect applies when this is `None` and no flag was passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) theme: Option<ThemeName>,
-    #[serde(default)]
+    #[serde(default = "default_refresh_interval")]
     pub(crate) refresh_interval_ms: u64,
+}
+
+/// Default interval new profiles.toml uses. Kept in one place — everything else
+/// references this constant.
+pub(crate) const DEFAULT_REFRESH_INTERVAL_MS: u64 = 90_000;
+
+fn default_refresh_interval() -> u64 {
+    DEFAULT_REFRESH_INTERVAL_MS
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            active_profile: None,
+            profiles: Vec::new(),
+            fallback_chain: Vec::new(),
+            wrap_off: false,
+            theme: None,
+            refresh_interval_ms: default_refresh_interval(),
+        }
+    }
 }
 
 pub(crate) struct AppConfig {
