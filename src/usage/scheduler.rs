@@ -557,6 +557,7 @@ fn mark_window_open(store: &UsageStore, name: &str, now_secs: i64) {
 /// Force-fetch all entries in parallel, bypassing the cadence. Used by bootstrap
 /// and `manual_refresh`. Blocks until all complete. Rotated tokens are dropped —
 /// `reload_if_state_changed` will pick them up from `credentials.json` shortly.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fetch_all_into(
     config: &crate::profile::ConfigHandle,
     tokens: &[TokenEntry],
@@ -854,17 +855,6 @@ fn tick(state: &SchedulerState) {
                 }
             }
         }
-
-        // Auto-switch: read chain under config mutex only (not across HTTP/state lock).
-        // Actual relink is deferred to the UI thread via `pending_switch`. Only
-        // when OAuth profiles were fetched this tick — third-party has no chain.
-        scan_auto_switch(
-            &state.config,
-            &state.store,
-            &state.activity,
-            &state.pending_switch,
-            &state.pending_switch_off,
-        );
     }
 
     // Third-party providers — same cadence, separate stores. Owns the forced
@@ -894,6 +884,17 @@ fn tick(state: &SchedulerState) {
         );
         publish_countdowns(&state.next_refresh_per_profile, oauth_after, tp_after);
     }
+
+    // Auto-switch: evaluate every tick (not only OAuth fetch ticks) so a
+    // profile that crossed its threshold is switched immediately, without
+    // waiting for the next scheduled fetch.
+    scan_auto_switch(
+        &state.config,
+        &state.store,
+        &state.activity,
+        &state.pending_switch,
+        &state.pending_switch_off,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

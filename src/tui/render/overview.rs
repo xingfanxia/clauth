@@ -399,36 +399,6 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
         lines.push(chain_row(&cfg, name, i, last, name_w));
     }
 
-    if lines.len() < cap
-        && cfg.state.active_profile.is_none()
-        && let Some(first) = chain.first()
-    {
-        let eta = app
-            .next_refresh_per_profile
-            .lock()
-            .ok()
-            .and_then(|m| m.get(first.as_str()).copied())
-            .map(|next_ms| {
-                let secs = ((next_ms as i64 - now_ms() as i64) / 1000).max(0);
-                let ok = cfg.find(first).and_then(|p| {
-                    p.usage
-                        .as_ref()
-                        .and_then(|u| u.five_hour.as_ref())
-                        .map(|w| w.utilization >= threshold_for(p))
-                });
-                if ok.unwrap_or(true) {
-                    format!("next check in {}", humanize_duration(secs))
-                } else {
-                    format!("switch pending · check in {}", humanize_duration(secs))
-                }
-            })
-            .unwrap_or_else(|| "next check soon".to_string());
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("auto-switch ETA: {eta}"), theme::faint()),
-        ]));
-    }
-
     // Caption only if it fits; wrap-off replaces wrap caption.
     if lines.len() < cap {
         let caption = if cfg.state.wrap_off {
@@ -449,6 +419,24 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
             ]
         };
         lines.push(Line::from(caption));
+    }
+
+    if lines.len() < cap
+        && let Some(first) = chain.first()
+        && let Some(profile) = cfg.find(first)
+        && let Some(usage) = profile.usage.as_ref().and_then(|u| u.five_hour.as_ref())
+    {
+        let threshold = threshold_for(profile);
+        let eta_secs = burn_rate_eta(app, first, usage.utilization, threshold);
+        if let Some(secs) = eta_secs {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("auto: → {} in {}", first, humanize_duration(secs)),
+                    theme::faint(),
+                ),
+            ]));
+        }
     }
     lines
 }
@@ -541,4 +529,32 @@ fn chain_state_style(profile: Option<&Profile>, pct: f64, threshold: f64) -> Sty
         None => theme::danger(),
         Some(_) => Style::default().fg(health_color(pct, threshold)),
     }
+}
+
+/// Project seconds until a profile's utilization crosses the threshold, based on
+/// 5h window burn rate. Returns `None` when there aren't enough samples, the
+/// rate is flat/negative, or utilization is already at/above the threshold.
+fn burn_rate_eta(app: &App, name: &str, current: f64, threshold: f64) -> Option<i64> {
+    if current >= threshold {
+        return None;
+    }
+    let samples = app.burn_samples.get(name)?.get("5h")?;
+    if samples.len() < 2 {
+        return None;
+    }
+    let first = samples.front().unwrap();
+    let last = samples.back().unwrap();
+    let dt = last.0.duration_since(first.0).as_secs_f64() / 3600.0;
+    if dt <= 0.0 {
+        return None;
+    }
+    let rate = (last.1 - first.1) / dt;
+    if rate <= 0.0 {
+        return None;
+    }
+    let hours = (threshold - current) / rate;
+    if hours <= 0.0 {
+        return None;
+    }
+    Some((hours * 3600.0) as i64)
 }

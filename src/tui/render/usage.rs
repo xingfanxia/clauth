@@ -138,17 +138,17 @@ fn build_usage_lines(
         .get(profile.name.as_str())
         .map(|wm| {
             wm.iter()
-                .filter_map(|(label, samples)| {
+                .map(|(label, samples)| {
                     if samples.len() >= 2 {
                         let first = samples.front().unwrap();
                         let last = samples.back().unwrap();
                         let dt = last.0.duration_since(first.0).as_secs_f64() / 3600.0;
                         if dt > 0.0 {
                             let rate = (last.1 - first.1) / dt;
-                            return Some((label.clone(), Some(rate)));
+                            return (label.clone(), Some(rate));
                         }
                     }
-                    Some((label.clone(), None))
+                    (label.clone(), None)
                 })
                 .collect()
         })
