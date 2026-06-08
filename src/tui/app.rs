@@ -720,6 +720,10 @@ pub(crate) struct App {
     /// Set when a background event fires on a tab that isn't currently active;
     /// cleared in `switch_tab` when the user visits that tab.
     pub(crate) tab_activity: [Option<ToastKind>; Tab::ALL.len()],
+
+    /// Per-profile flag: has the bell been fired for the current crossing.
+    /// Reset when utilization drops back below threshold.
+    pub(crate) bell_fired: HashMap<String, bool>,
 }
 
 /// Cloned `Arc`s bundled for [`spawn_refresher`]; carries no lock rank and is
@@ -856,6 +860,7 @@ impl App {
             refresh_interval,
             bootstrap_active: Arc::new(AtomicBool::new(false)),
             tab_activity: [None; Tab::ALL.len()],
+            bell_fired: HashMap::new(),
         }
     }
 
@@ -974,27 +979,58 @@ impl App {
         // Poisoned lock: keep prior value rather than blanking all usage.
         // A blank map would blind auto-switch permanently.
         // Third-party stores BEFORE OAuth stores: ranks 270/280 < 300/350.
-        let third_party_map = self.third_party_usage_store.lock().ok();
-        let third_party_status_map = self.third_party_status.lock().ok();
-        let info_map = self.usage_store.lock().ok();
-        let status_map = self.usage_status.lock().ok();
-        let mut cfg = self.config();
-        for p in &mut cfg.profiles {
-            if let Some(s) = info_map.as_ref() {
-                p.usage = s.get(p.name.as_str()).cloned();
+        let bells;
+        {
+            let third_party_map = self.third_party_usage_store.lock().ok();
+            let third_party_status_map = self.third_party_status.lock().ok();
+            let info_map = self.usage_store.lock().ok();
+            let status_map = self.usage_status.lock().ok();
+            let mut cfg = self.config();
+            for p in &mut cfg.profiles {
+                if let Some(s) = info_map.as_ref() {
+                    p.usage = s.get(p.name.as_str()).cloned();
+                }
+                // OAuth fetch_status takes precedence; third-party only when no OAuth status.
+                if let Some(s) = status_map.as_ref()
+                    && s.contains_key(p.name.as_str())
+                {
+                    p.fetch_status = s.get(p.name.as_str()).copied();
+                } else if let Some(s) = third_party_status_map.as_ref() {
+                    p.fetch_status = s.get(p.name.as_str()).copied();
+                }
+                if let Some(s) = third_party_map.as_ref()
+                    && s.contains_key(p.name.as_str())
+                {
+                    p.third_party_usage = s.get(p.name.as_str()).cloned();
+                }
             }
-            // OAuth fetch_status takes precedence; third-party only when no OAuth status.
-            if let Some(s) = status_map.as_ref()
-                && s.contains_key(p.name.as_str())
+
+            bells = cfg
+                .profiles
+                .iter()
+                .map(|p| {
+                    let util = p
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.five_hour.as_ref())
+                        .map(|u| u.utilization);
+                    (p.name.to_string(), p.bell_threshold, util)
+                })
+                .collect::<Vec<_>>();
+        }
+        for (name, threshold, util) in bells {
+            if let Some(t) = threshold
+                && let Some(u) = util
             {
-                p.fetch_status = s.get(p.name.as_str()).copied();
-            } else if let Some(s) = third_party_status_map.as_ref() {
-                p.fetch_status = s.get(p.name.as_str()).copied();
-            }
-            if let Some(s) = third_party_map.as_ref()
-                && s.contains_key(p.name.as_str())
-            {
-                p.third_party_usage = s.get(p.name.as_str()).cloned();
+                if u >= t {
+                    if !self.bell_fired.contains_key(&name) {
+                        self.toast(ToastKind::Warning, format!("bell · {name} at {:.0}%", u));
+                        self.set_tab_activity(Tab::Overview, ToastKind::Warning);
+                        self.bell_fired.insert(name, true);
+                    }
+                } else {
+                    self.bell_fired.remove(&name);
+                }
             }
         }
     }

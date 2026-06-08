@@ -132,6 +132,9 @@ pub(crate) struct Profile {
     pub(crate) env: BTreeMap<String, String>,
     /// Utilization % to auto-switch off at (fallback chain only). None = use default.
     pub(crate) fallback_threshold: Option<f64>,
+    /// Utilization % at/above which a bell toast fires in the overview tab.
+    /// None = no bell for this profile.
+    pub(crate) bell_threshold: Option<f64>,
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) fetch_status: Option<FetchStatus>,
@@ -151,6 +154,7 @@ impl Profile {
             auto_start: false,
             env: BTreeMap::new(),
             fallback_threshold: None,
+            bell_threshold: None,
             credentials: None,
             usage: None,
             fetch_status: None,
@@ -454,6 +458,7 @@ fn load_profile(name: &str) -> Result<Profile> {
         auto_start: config.auto_start,
         env: config.env,
         fallback_threshold: config.fallback_threshold,
+        bell_threshold: None,
         credentials,
         usage: None,
         fetch_status: None,
@@ -626,6 +631,14 @@ fn render_config_toml(profile: &Profile) -> String {
     match profile.fallback_threshold {
         Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
         None => out.push_str("# fallback_threshold = 95.0\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# 5-hour utilization percentage at/above which clauth fires a bell\n");
+    out.push_str("# notification in the overview tab. Range 0..=100.\n");
+    match profile.bell_threshold {
+        Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
+        None => out.push_str("# bell_threshold = 95.0\n"),
     }
     out.push('\n');
 

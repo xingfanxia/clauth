@@ -183,11 +183,12 @@ fn fixed_overview_width(
     // kind→timer gap is 4 chars narrower than standard (min 1).
     let narrow = gap.saturating_sub(4).max(1);
     let standard_gaps = column_count.saturating_sub(2);
-    2 + name + kind + five_hour + seven_day + route + standard_gaps * gap + narrow
+    4 + name + kind + five_hour + seven_day + route + standard_gaps * gap + narrow
 }
 
 fn overview_header(widths: &OverviewWidths) -> Line<'static> {
     let mut spans = vec![Span::styled("  ", theme::label())];
+    spans.push(Span::raw("  ")); // bell slot (blank in header)
     spans.push(Span::styled(fixed("account", widths.name), theme::label()));
     spans.push(gap(widths));
     spans.push(Span::styled(fixed("type", widths.kind), theme::label()));
@@ -269,7 +270,15 @@ fn render_overview_row(
         }
     };
 
-    let mut spans = vec![cursor, name, name_pad, gap(widths)];
+    let mut spans = vec![cursor];
+    if app.bell_fired.contains_key(&name_str) {
+        spans.push(Span::styled("🔔", theme::accent()));
+    } else {
+        spans.push(Span::raw("  "));
+    }
+    spans.push(name);
+    spans.push(name_pad);
+    spans.push(gap(widths));
     spans.push(Span::styled(
         fixed(&account_type_label(profile), widths.kind),
         account_type_style(profile),

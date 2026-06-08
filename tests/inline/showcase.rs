@@ -149,6 +149,7 @@ fn oauth_profile(
         auto_start,
         env: BTreeMap::new(),
         fallback_threshold,
+        bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {
             plan: Some(PlanInfo {
@@ -179,6 +180,7 @@ fn api_profile(name: &str) -> Profile {
         auto_start: false,
         env: BTreeMap::new(),
         fallback_threshold: None,
+        bell_threshold: None,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -195,6 +197,7 @@ fn failed_profile(name: &str) -> Profile {
         auto_start: false,
         env: BTreeMap::new(),
         fallback_threshold: Some(90.0),
+        bell_threshold: None,
         credentials: None,
         usage: None,
         fetch_status: Some(FetchStatus::Failed),

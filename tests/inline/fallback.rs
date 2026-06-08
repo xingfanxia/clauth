@@ -20,6 +20,7 @@ fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64
         auto_start: false,
         env: BTreeMap::new(),
         fallback_threshold: threshold,
+        bell_threshold: None,
         credentials: None,
         usage: utilization.map(|u| UsageInfo {
             five_hour: Some(UsageWindow {

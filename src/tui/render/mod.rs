@@ -97,6 +97,7 @@ mod render_smoke {
             auto_start: auto,
             env: BTreeMap::new(),
             fallback_threshold: Some(80.0),
+            bell_threshold: None,
             credentials: None,
             usage: Some(UsageInfo {
                 plan: None,

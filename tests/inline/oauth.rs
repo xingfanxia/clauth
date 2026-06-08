@@ -20,6 +20,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         auto_start: false,
         env: BTreeMap::new(),
         fallback_threshold: None,
+        bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -160,6 +161,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         auto_start: false,
         env: BTreeMap::new(),
         fallback_threshold: None,
+        bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -212,6 +214,7 @@ fn profile_without_refresh_token_excluded() {
         auto_start: false,
         env: BTreeMap::new(),
         fallback_threshold: None,
+        bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),

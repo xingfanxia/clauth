@@ -11,6 +11,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         auto_start: false,
         env: BTreeMap::new(),
         fallback_threshold: None,
+        bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: format!("at-{name}"),
@@ -35,6 +36,7 @@ fn endpoint_profile(name: &str) -> Profile {
         auto_start: false,
         env: BTreeMap::new(),
         fallback_threshold: None,
+        bell_threshold: None,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -51,6 +53,7 @@ fn blank_profile(name: &str) -> Profile {
         auto_start: false,
         env: BTreeMap::new(),
         fallback_threshold: None,
+        bell_threshold: None,
         credentials: None,
         usage: None,
         fetch_status: None,
