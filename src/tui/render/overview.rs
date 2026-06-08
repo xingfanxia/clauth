@@ -15,7 +15,7 @@ use super::format::{
 use super::panes::{draw_scrollbar, empty_state, section_box, select_line};
 use crate::fallback::threshold_for;
 use crate::profile::{AppConfig, Profile};
-use crate::usage::{ProfileActivity, humanize_duration, now_ms};
+use crate::usage::{ProfileActivity, humanize_duration, now_ms, LABEL_5H, LABEL_7D};
 
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
@@ -193,12 +193,12 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
     spans.push(gap(widths));
     spans.push(Span::styled(fixed("type", widths.kind), theme::label()));
     spans.push(narrow_gap(widths));
-    // Blank TIMER_SLOT keeps the "5h" header aligned over the bar.
+    // Blank TIMER_SLOT keeps the label aligned over the bar.
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
-    spans.push(Span::styled(fixed("5h", widths.five_hour), theme::label()));
+    spans.push(Span::styled(fixed(LABEL_5H, widths.five_hour), theme::label()));
     if widths.seven_day > 0 {
         spans.push(gap(widths));
-        spans.push(Span::styled(fixed("7d", widths.seven_day), theme::label()));
+        spans.push(Span::styled(fixed(LABEL_7D, widths.seven_day), theme::label()));
     }
     if widths.route > 0 {
         spans.push(gap(widths));

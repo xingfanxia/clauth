@@ -2,8 +2,8 @@ mod fetch;
 mod scheduler;
 
 pub(crate) use fetch::{
-    PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso, http_agent, humanize_duration,
-    iso_to_epoch_secs, now_epoch_secs, now_ms, parse_retry_after,
+    LABEL_5H, LABEL_7D, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso, http_agent,
+    humanize_duration, iso_to_epoch_secs, now_epoch_secs, now_ms, parse_retry_after,
 };
 // Named directly only in `#[cfg(test)]` showcase; the field access path is enough in prod.
 #[cfg(test)]

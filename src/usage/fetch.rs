@@ -58,7 +58,32 @@ pub(crate) struct UsageInfo {
     pub(crate) extra_usage: Option<ExtraUsage>,
 }
 
+/// Display labels for each usage window — the single source of truth.
+pub(crate) const LABEL_5H: &str = "5h";
+pub(crate) const LABEL_7D: &str = "7d";
+pub(crate) const LABEL_7D_SONNET: &str = "7d sonnet";
+pub(crate) const LABEL_7D_OPUS: &str = "7d opus";
+
 impl UsageInfo {
+    /// All available windows as `(label, &UsageWindow)` pairs.
+    /// Labels are derived from the constants above — the single source of truth.
+    pub(crate) fn windows(&self) -> Vec<(&'static str, &UsageWindow)> {
+        let mut out = Vec::new();
+        if let Some(w) = &self.five_hour {
+            out.push((LABEL_5H, w));
+        }
+        if let Some(w) = &self.seven_day {
+            out.push((LABEL_7D, w));
+        }
+        if let Some(w) = &self.seven_day_sonnet {
+            out.push((LABEL_7D_SONNET, w));
+        }
+        if let Some(w) = &self.seven_day_opus {
+            out.push((LABEL_7D_OPUS, w));
+        }
+        out
+    }
+
     /// Most representative weekly window: Max returns per-model windows, Pro returns `seven_day`.
     pub(crate) fn weekly_window(&self) -> Option<&UsageWindow> {
         self.seven_day
