@@ -205,6 +205,8 @@ pub(crate) struct AppState {
     /// detect applies when this is `None` and no flag was passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) theme: Option<ThemeName>,
+    #[serde(default)]
+    pub(crate) refresh_interval_ms: u64,
 }
 
 pub(crate) struct AppConfig {

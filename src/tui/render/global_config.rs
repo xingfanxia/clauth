@@ -22,6 +22,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let wrap_off = app.config().state.wrap_off;
+    let refresh_interval_ms = app
+        .refresh_interval
+        .load(std::sync::atomic::Ordering::Relaxed);
     let cursor = app
         .global_config_cursor
         .min(GLOBAL_CONFIG_ROWS.len().saturating_sub(1));
@@ -29,7 +32,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, row) in GLOBAL_CONFIG_ROWS.iter().enumerate() {
         let selected = i == cursor;
-        let line = detail_row(*row, selected, wrap_off);
+        let line = detail_row(*row, selected, wrap_off, refresh_interval_ms);
         lines.push(if selected {
             highlight_row(line, inner.width as usize)
         } else {
@@ -50,13 +53,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn row_hint(row: GlobalConfigRow) -> Option<&'static str> {
     match row {
         GlobalConfigRow::Theme => None,
+        GlobalConfigRow::RefreshInterval => Some("+/- or ⏎ to step through presets"),
         GlobalConfigRow::WrapOff => {
             Some("default when every fallback member is over its threshold")
         }
     }
 }
 
-fn detail_row(row: GlobalConfigRow, selected: bool, wrap_off: bool) -> Line<'static> {
+fn detail_row(
+    row: GlobalConfigRow,
+    selected: bool,
+    wrap_off: bool,
+    refresh_interval_ms: u64,
+) -> Line<'static> {
     let arrow = if selected {
         Span::styled("❯ ", theme::accent())
     } else {
@@ -70,6 +79,31 @@ fn detail_row(row: GlobalConfigRow, selected: bool, wrap_off: bool) -> Line<'sta
             &[
                 ("full", tier == Tier::Full),
                 ("compatible", tier == Tier::Compatible),
+            ],
+            selected,
+        ),
+        GlobalConfigRow::RefreshInterval => cycle_row(
+            arrow,
+            "refresh",
+            &[
+                ("15s", refresh_interval_ms <= 22_500),
+                (
+                    "30s",
+                    refresh_interval_ms > 22_500 && refresh_interval_ms <= 45_000,
+                ),
+                (
+                    "60s",
+                    refresh_interval_ms > 45_000 && refresh_interval_ms <= 75_000,
+                ),
+                (
+                    "90s",
+                    refresh_interval_ms > 75_000 && refresh_interval_ms <= 105_000,
+                ),
+                (
+                    "120s",
+                    refresh_interval_ms > 105_000 && refresh_interval_ms <= 210_000,
+                ),
+                ("300s", refresh_interval_ms > 210_000),
             ],
             selected,
         ),

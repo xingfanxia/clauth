@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -41,8 +41,8 @@ use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
     ActivityKind, ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
-    OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RefetchQueue,
-    StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
+    OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, REFRESH_INTERVAL_MS,
+    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
     ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageStore, any_busy,
     clear_activity, collect_third_party_entries, fetch_all_into, is_idle, mark_activity,
     spawn_refresher,
@@ -192,6 +192,8 @@ pub(crate) enum GlobalConfigRow {
     /// Chain-wide "when spent" behavior (`AppState.wrap_off`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.
     WrapOff,
+    /// Per-profile refresh interval; `+`/`-` steps through presets in-place.
+    RefreshInterval,
 }
 
 /// Inline editor state for the Config detail pane. Built on entry, torn down
@@ -306,6 +308,7 @@ pub(crate) enum ActionMenuAction {
     EditField,
     // Program-wide Config tab
     CycleTheme,
+    StepRefreshInterval,
     // Status tab
     RefreshStatus,
     OpenIncidentLink,
@@ -382,6 +385,7 @@ impl ActionMenuAction {
             Self::CreateProfile => "create profile",
             Self::EditField => "edit field",
             Self::CycleTheme => "cycle theme",
+            Self::StepRefreshInterval => "step refresh interval",
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
         }
@@ -706,6 +710,8 @@ pub(crate) struct App {
     pub(crate) reconcile_done: bool,
     /// Set once `spawn_bootstrap` is dispatched; prevents double-dispatch.
     pub(crate) bootstrap_started: bool,
+    /// Tunable per-profile refresh interval; the scheduler reads this each tick.
+    pub(crate) refresh_interval: Arc<AtomicU64>,
     /// Set before bootstrap spawn, cleared on every worker exit path.
     /// `ConfirmAction::RotateAll` checks this alongside `any_busy` to block a
     /// concurrent rotate-all from racing the bootstrap's relink + initial fetch.
@@ -723,6 +729,7 @@ struct WorkerHandles {
     usage_tokens: TokenList,
     usage_store: UsageStore,
     usage_status: StatusStore,
+    refresh_interval: Arc<AtomicU64>,
     next_refresh_per_profile: NextRefreshPerProfile,
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
@@ -742,6 +749,7 @@ impl WorkerHandles {
             usage_tokens: Arc::clone(&app.usage_tokens),
             usage_store: Arc::clone(&app.usage_store),
             usage_status: Arc::clone(&app.usage_status),
+            refresh_interval: Arc::clone(&app.refresh_interval),
             next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
             activity: Arc::clone(&app.activity),
             last_fetched: Arc::clone(&app.last_fetched),
@@ -775,6 +783,9 @@ impl App {
         let third_party_usage_store: ThirdPartyUsageStore =
             Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let refresh_interval = Arc::new(AtomicU64::new(
+            config.state.refresh_interval_ms.max(REFRESH_INTERVAL_MS),
+        ));
 
         // Kick the best-effort update check on its own thread; its verdict lands
         // in `update_results` and is toasted from `on_tick`.
@@ -842,6 +853,7 @@ impl App {
             last_divergence_check: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
+            refresh_interval,
             bootstrap_active: Arc::new(AtomicBool::new(false)),
             tab_activity: [None; Tab::ALL.len()],
         }
@@ -866,6 +878,7 @@ impl App {
         let activity = Arc::clone(&self.activity);
         let startup_sender = self.startup_sender.clone();
         let bootstrap_active = Arc::clone(&self.bootstrap_active);
+        let refresh_interval = Arc::clone(&self.refresh_interval);
 
         let startup_sender_for_panic = startup_sender.clone();
         let bootstrap_active_for_panic = Arc::clone(&bootstrap_active);
@@ -883,6 +896,7 @@ impl App {
                     let _ = link_profile_credentials(&active);
                 }
 
+                let interval_ms = refresh_interval.load(Ordering::Relaxed);
                 let snapshot =
                     collect_tokens(&config.lock().expect("config mutex poisoned").profiles);
                 fetch_all_into(
@@ -893,6 +907,7 @@ impl App {
                     &last_fetched,
                     &refetch_queue,
                     &activity,
+                    interval_ms,
                 );
 
                 // 5h windows are armed by the windowless scan in `on_tick` after
@@ -942,6 +957,7 @@ impl App {
             h.usage_tokens,
             h.usage_store,
             h.usage_status,
+            h.refresh_interval,
             h.next_refresh_per_profile,
             h.activity,
             h.last_fetched,
@@ -1705,10 +1721,14 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
 pub(crate) const FALLBACK_ROWS: [FallbackRow; 2] = [FallbackRow::Threshold, FallbackRow::Remove];
 
 /// Rows on the program-wide Config tab, in display order.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 2] =
-    [GlobalConfigRow::Theme, GlobalConfigRow::WrapOff];
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 3] = [
+    GlobalConfigRow::Theme,
+    GlobalConfigRow::RefreshInterval,
+    GlobalConfigRow::WrapOff,
+];
 
-/// Config tab keymap: ↑↓ walks rows, ⏎/space cycles the theme or flips wrap-off.
+/// Config tab keymap: ↑↓ walks rows, ⏎/space cycles the theme or flips wrap-off,
+/// `+`/`-` steps the refresh interval in-place.
 fn handle_global_config_key(app: &mut App, key: KeyEvent) {
     let last = GLOBAL_CONFIG_ROWS.len() - 1;
     app.global_config_cursor = app.global_config_cursor.min(last);
@@ -1727,6 +1747,16 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
                 app.global_config_cursor + 1
             };
         }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            if GLOBAL_CONFIG_ROWS[app.global_config_cursor] == GlobalConfigRow::RefreshInterval {
+                step_refresh_interval(app, 1);
+            }
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            if GLOBAL_CONFIG_ROWS[app.global_config_cursor] == GlobalConfigRow::RefreshInterval {
+                step_refresh_interval(app, -1);
+            }
+        }
         KeyCode::Enter | KeyCode::Char(' ') => {
             run_global_config_row(app, GLOBAL_CONFIG_ROWS[app.global_config_cursor]);
         }
@@ -1734,11 +1764,13 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Apply ⏎/space on a Config-tab row: cycle the theme tier or flip wrap-off.
+/// Apply ⏎/space on a Config-tab row: cycle the theme tier, flip wrap-off, or
+/// step the refresh interval forward through presets.
 fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
     match row {
         GlobalConfigRow::Theme => cycle_theme(app),
         GlobalConfigRow::WrapOff => toggle_wrap_off(app),
+        GlobalConfigRow::RefreshInterval => step_refresh_interval(app, 1),
     }
 }
 
@@ -1877,6 +1909,29 @@ fn toggle_wrap_off(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.wrap_off = !cfg.state.wrap_off;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+}
+
+/// Step the global refresh interval through preset values (`+` = faster, `-` = slower).
+fn step_refresh_interval(app: &mut App, dir: i32) {
+    const PRESETS: [u64; 6] = [15_000, 30_000, 60_000, 90_000, 120_000, 300_000];
+    let current = app.refresh_interval.load(Ordering::Relaxed);
+    let pos = PRESETS
+        .iter()
+        .position(|&p| p >= current)
+        .unwrap_or(PRESETS.len() - 1);
+    let new_pos = if dir > 0 {
+        (pos + 1).min(PRESETS.len() - 1)
+    } else {
+        pos.saturating_sub(1)
+    };
+    let new_interval = PRESETS[new_pos];
+    app.refresh_interval.store(new_interval, Ordering::Relaxed);
+    {
+        let mut cfg = app.config();
+        cfg.state.refresh_interval_ms = new_interval;
         let _ = save_app_state(&cfg.state);
     }
     app.last_state_mtime = app_state_mtime();
@@ -2241,6 +2296,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
             if let Some(&row) = GLOBAL_CONFIG_ROWS.get(app.global_config_cursor) {
                 match row {
                     GlobalConfigRow::Theme => actions.push(CycleTheme),
+                    GlobalConfigRow::RefreshInterval => actions.push(StepRefreshInterval),
                     GlobalConfigRow::WrapOff => actions.push(ToggleWrapOff),
                 }
             }
@@ -2397,6 +2453,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             }
         }
         ActionMenuAction::CycleTheme => cycle_theme(app),
+        ActionMenuAction::StepRefreshInterval => step_refresh_interval(app, 1),
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
     }

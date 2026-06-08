@@ -385,33 +385,35 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
         lines.push(chain_row(&cfg, name, i, last, name_w));
     }
 
-    if lines.len() < cap && cfg.state.active_profile.is_none()
-        && let Some(first) = chain.first() {
-            let eta = app
-                .next_refresh_per_profile
-                .lock()
-                .ok()
-                .and_then(|m| m.get(first.as_str()).copied())
-                .map(|next_ms| {
-                    let secs = ((next_ms as i64 - now_ms() as i64) / 1000).max(0);
-                    let ok = cfg.find(first).and_then(|p| {
-                        p.usage
-                            .as_ref()
-                            .and_then(|u| u.five_hour.as_ref())
-                            .map(|w| w.utilization >= threshold_for(p))
-                    });
-                    if ok.unwrap_or(true) {
-                        format!("next check in {}", humanize_duration(secs))
-                    } else {
-                        format!("switch pending · check in {}", humanize_duration(secs))
-                    }
-                })
-                .unwrap_or_else(|| "next check soon".to_string());
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(format!("auto-switch ETA: {eta}"), theme::faint()),
-            ]));
-        }
+    if lines.len() < cap
+        && cfg.state.active_profile.is_none()
+        && let Some(first) = chain.first()
+    {
+        let eta = app
+            .next_refresh_per_profile
+            .lock()
+            .ok()
+            .and_then(|m| m.get(first.as_str()).copied())
+            .map(|next_ms| {
+                let secs = ((next_ms as i64 - now_ms() as i64) / 1000).max(0);
+                let ok = cfg.find(first).and_then(|p| {
+                    p.usage
+                        .as_ref()
+                        .and_then(|u| u.five_hour.as_ref())
+                        .map(|w| w.utilization >= threshold_for(p))
+                });
+                if ok.unwrap_or(true) {
+                    format!("next check in {}", humanize_duration(secs))
+                } else {
+                    format!("switch pending · check in {}", humanize_duration(secs))
+                }
+            })
+            .unwrap_or_else(|| "next check soon".to_string());
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("auto-switch ETA: {eta}"), theme::faint()),
+        ]));
+    }
 
     // Caption only if it fits; wrap-off replaces wrap caption.
     if lines.len() < cap {

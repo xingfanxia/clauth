@@ -59,6 +59,7 @@ fallback_chain = ["work"]
         profiles: Vec<String>,
         fallback_chain: Vec<String>,
         wrap_off: bool,
+        refresh_interval_ms: u64,
     }
     let control = BareState {
         active_profile: Some("work".to_string()),

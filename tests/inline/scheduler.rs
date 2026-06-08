@@ -30,7 +30,13 @@ fn partition_due_uses_fixed_interval() {
     let base = 1_700_000_000_000u64; // realistic epoch-ms
 
     // Never fetched: last = 0, next = REFRESH_INTERVAL_MS, due at any real `now`.
-    let (due, next) = partition_due(&snapshot, base, &last_fetched, &activity);
+    let (due, next) = partition_due(
+        &snapshot,
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+    );
     assert_eq!(due.len(), 1, "a never-fetched profile is due");
     assert_eq!(next.get("a").copied(), Some(REFRESH_INTERVAL_MS));
 
@@ -39,7 +45,13 @@ fn partition_due_uses_fixed_interval() {
         .lock()
         .unwrap()
         .insert("a".to_string(), EpochMs::from_millis(base));
-    let (due, next) = partition_due(&snapshot, base + 1, &last_fetched, &activity);
+    let (due, next) = partition_due(
+        &snapshot,
+        base + 1,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+    );
     assert!(due.is_empty(), "not due one ms after a fetch");
     assert_eq!(next.get("a").copied(), Some(base + REFRESH_INTERVAL_MS));
 
@@ -49,6 +61,7 @@ fn partition_due_uses_fixed_interval() {
         base + REFRESH_INTERVAL_MS,
         &last_fetched,
         &activity,
+        REFRESH_INTERVAL_MS,
     );
     assert_eq!(due.len(), 1, "due once the fixed interval has elapsed");
 }
@@ -65,7 +78,13 @@ fn partition_due_excludes_switching_and_refreshing() {
     mark_activity(&activity, "a", ProfileActivity::Switching);
     mark_activity(&activity, "b", ProfileActivity::Refreshing);
 
-    let (due, next) = partition_due(&snapshot, REFRESH_INTERVAL_MS + 1, &last_fetched, &activity);
+    let (due, next) = partition_due(
+        &snapshot,
+        REFRESH_INTERVAL_MS + 1,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+    );
     assert!(due.is_empty(), "switching/refreshing profiles are excluded");
     assert!(
         next.contains_key("a") && next.contains_key("b"),
@@ -138,6 +157,7 @@ fn cached_fallback_does_not_clobber_store() {
         &store,
         &status,
         &last_fetched,
+        REFRESH_INTERVAL_MS,
     );
     assert!(
         store.lock().unwrap().get("a").unwrap().five_hour.is_some(),
@@ -162,6 +182,7 @@ fn cached_fallback_does_not_clobber_store() {
         &store,
         &status,
         &last_fetched,
+        REFRESH_INTERVAL_MS,
     );
     assert!(
         store.lock().unwrap().contains_key("b"),
@@ -332,6 +353,7 @@ fn retry_after_defers_next_fetch_slot() {
         &store,
         &status,
         &last_fetched,
+        REFRESH_INTERVAL_MS,
     );
     let after = now_ms();
     let extra = 300_000 - REFRESH_INTERVAL_MS;
@@ -348,6 +370,7 @@ fn retry_after_defers_next_fetch_slot() {
         a + REFRESH_INTERVAL_MS - 1,
         &last_fetched,
         &activity,
+        REFRESH_INTERVAL_MS,
     );
     assert!(due.is_empty(), "not due before the deferred slot");
     assert_eq!(
@@ -355,12 +378,24 @@ fn retry_after_defers_next_fetch_slot() {
         Some(a + REFRESH_INTERVAL_MS),
         "countdown publishes the deferred slot"
     );
-    let (due, _) = partition_due(&snapshot, a + REFRESH_INTERVAL_MS, &last_fetched, &activity);
+    let (due, _) = partition_due(
+        &snapshot,
+        a + REFRESH_INTERVAL_MS,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+    );
     assert_eq!(due.len(), 1, "due once the deferred slot arrives");
 
     // No hint → plain now stamp (normal cadence).
     let before = now_ms();
-    apply_outcome(outcome("b", None), &store, &status, &last_fetched);
+    apply_outcome(
+        outcome("b", None),
+        &store,
+        &status,
+        &last_fetched,
+        REFRESH_INTERVAL_MS,
+    );
     let after = now_ms();
     assert!((before..=after).contains(&stamp("b")));
 
@@ -371,6 +406,7 @@ fn retry_after_defers_next_fetch_slot() {
         &store,
         &status,
         &last_fetched,
+        REFRESH_INTERVAL_MS,
     );
     let after = now_ms();
     assert!((before..=after).contains(&stamp("c")));
@@ -382,6 +418,7 @@ fn retry_after_defers_next_fetch_slot() {
         &store,
         &status,
         &last_fetched,
+        REFRESH_INTERVAL_MS,
     );
     let after = now_ms();
     let capped = MAX_RETRY_AFTER_MS - REFRESH_INTERVAL_MS;

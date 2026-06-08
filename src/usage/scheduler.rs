@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
@@ -479,6 +480,7 @@ fn apply_outcome(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
+    interval_ms: u64,
 ) {
     let now = EpochMs::from_millis(now_ms());
 
@@ -512,7 +514,7 @@ fn apply_outcome(
     let defer = IntervalMs::from_millis(outcome.retry_after.map_or(0, |ra| {
         (ra.as_millis() as u64)
             .min(MAX_RETRY_AFTER_MS)
-            .saturating_sub(REFRESH_INTERVAL_MS)
+            .saturating_sub(interval_ms)
     }));
 
     // Each in its own critical section — one leaf lock at a time.
@@ -563,6 +565,7 @@ pub(crate) fn fetch_all_into(
     last_fetched: &LastFetchedAt,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
+    interval_ms: u64,
 ) {
     if tokens.is_empty() {
         return;
@@ -592,7 +595,7 @@ pub(crate) fn fetch_all_into(
         match h.join() {
             Ok(outcome) => {
                 clear_activity(activity, &outcome.name);
-                apply_outcome(outcome, store, status, last_fetched);
+                apply_outcome(outcome, store, status, last_fetched, interval_ms);
             }
             Err(_) => {
                 // Worker panicked. Clear the activity slot so the spinner doesn't
@@ -625,6 +628,7 @@ pub(crate) fn collect_third_party_entries(
 /// the third-party stores. Partitioning + countdown publishing happen in `tick`
 /// so both legs share one publish window; this leg only fetches.
 fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
+    let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
     for entry in &due {
         mark_activity(&state.activity, &entry.name, ProfileActivity::Fetching);
     }
@@ -651,7 +655,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.clone(), FetchStatus::Fresh);
                 }
-                stamp_last_fetched(&state.last_fetched, name, None);
+                stamp_last_fetched(&state.last_fetched, name, None, interval_ms);
             }
             Ok(Err(err)) => {
                 clear_activity(&state.activity, &name);
@@ -676,7 +680,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.clone(), status);
                 }
-                stamp_last_fetched(&state.last_fetched, name, retry_after);
+                stamp_last_fetched(&state.last_fetched, name, retry_after, interval_ms);
             }
             Err(_) => {
                 // Worker panicked — clear slot so the spinner doesn't freeze.
@@ -691,11 +695,16 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
 /// stamps `retry_after - interval` ahead so `partition_due`'s fixed
 /// `stamp + REFRESH_INTERVAL_MS` math lands the next slot on `now + retry_after`
 /// (capped by [`MAX_RETRY_AFTER_MS`]).
-fn stamp_last_fetched(last_fetched: &LastFetchedAt, name: String, retry_after: Option<Duration>) {
+fn stamp_last_fetched(
+    last_fetched: &LastFetchedAt,
+    name: String,
+    retry_after: Option<Duration>,
+    interval_ms: u64,
+) {
     let defer = IntervalMs::from_millis(retry_after.map_or(0, |ra| {
         (ra.as_millis() as u64)
             .min(MAX_RETRY_AFTER_MS)
-            .saturating_sub(REFRESH_INTERVAL_MS)
+            .saturating_sub(interval_ms)
     }));
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(name, EpochMs::from_millis(now_ms()).saturating_add(defer));
@@ -710,11 +719,18 @@ fn partition_and_merge<T: NamedEntry + Clone>(
     forced: &HashSet<String>,
     state: &SchedulerState,
     now: u64,
+    interval_ms: u64,
 ) -> (Vec<T>, HashMap<String, u64>) {
     if snapshot.is_empty() {
         return (Vec::new(), HashMap::new());
     }
-    let (mut due, mut next) = partition_due(snapshot, now, &state.last_fetched, &state.activity);
+    let (mut due, mut next) = partition_due(
+        snapshot,
+        now,
+        &state.last_fetched,
+        &state.activity,
+        interval_ms,
+    );
     merge_forced(snapshot, forced, &mut due, &mut next, &state.activity, now);
     (due, next)
 }
@@ -741,6 +757,7 @@ pub(crate) struct SchedulerState {
     tokens: TokenList,
     store: UsageStore,
     status: StatusStore,
+    refresh_interval: Arc<AtomicU64>,
     next_refresh_per_profile: NextRefreshPerProfile,
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
@@ -756,6 +773,8 @@ pub(crate) struct SchedulerState {
 /// countdowns once, fan out fetches (OAuth + third-party), propagate rotated
 /// tokens, evaluate auto-switch chain.
 fn tick(state: &SchedulerState) {
+    let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
+
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
     // Drained once and handed to both legs; a forced name only matches the leg
     // whose snapshot owns it, so neither starves the other.
@@ -781,8 +800,9 @@ fn tick(state: &SchedulerState) {
     // countdown map never shows a leg as momentarily missing (and a deleted
     // profile's stale key is dropped by the full replace).
     let now = now_ms();
-    let (oauth_due, oauth_next) = partition_and_merge(&oauth_snapshot, &forced, state, now);
-    let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now);
+    let (oauth_due, oauth_next) =
+        partition_and_merge(&oauth_snapshot, &forced, state, now, interval_ms);
+    let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
     let fetched = !oauth_due.is_empty() || !tp_due.is_empty();
@@ -819,7 +839,13 @@ fn tick(state: &SchedulerState) {
                         entry.access_token = new_access.clone();
                         entry.refresh_token = new_refresh.clone();
                     }
-                    apply_outcome(outcome, &state.store, &state.status, &state.last_fetched);
+                    apply_outcome(
+                        outcome,
+                        &state.store,
+                        &state.status,
+                        &state.last_fetched,
+                        interval_ms,
+                    );
                 }
                 Err(_) => {
                     // Worker panicked — clear slot so the spinner doesn't freeze.
@@ -851,9 +877,20 @@ fn tick(state: &SchedulerState) {
     // the pre-fetch publish already holds).
     if fetched {
         let now = now_ms();
-        let (_, oauth_after) =
-            partition_due(&oauth_snapshot, now, &state.last_fetched, &state.activity);
-        let (_, tp_after) = partition_due(&tp_snapshot, now, &state.last_fetched, &state.activity);
+        let (_, oauth_after) = partition_due(
+            &oauth_snapshot,
+            now,
+            &state.last_fetched,
+            &state.activity,
+            interval_ms,
+        );
+        let (_, tp_after) = partition_due(
+            &tp_snapshot,
+            now,
+            &state.last_fetched,
+            &state.activity,
+            interval_ms,
+        );
         publish_countdowns(&state.next_refresh_per_profile, oauth_after, tp_after);
     }
 }
@@ -864,6 +901,7 @@ pub(crate) fn spawn_refresher(
     tokens: TokenList,
     store: UsageStore,
     status: StatusStore,
+    refresh_interval: Arc<AtomicU64>,
     next_refresh_per_profile: NextRefreshPerProfile,
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
@@ -879,6 +917,7 @@ pub(crate) fn spawn_refresher(
         tokens,
         store,
         status,
+        refresh_interval,
         next_refresh_per_profile,
         activity,
         last_fetched,
@@ -971,6 +1010,7 @@ fn partition_due<T: NamedEntry + Clone>(
     now: u64,
     last_fetched: &LastFetchedAt,
     activity: &ActivityStore,
+    interval_ms: u64,
 ) -> (Vec<T>, HashMap<String, u64>) {
     let now = EpochMs::from_millis(now);
     let Ok(lf) = last_fetched.lock() else {
@@ -978,7 +1018,7 @@ fn partition_due<T: NamedEntry + Clone>(
     };
     let act = activity.lock();
 
-    let interval = IntervalMs::from_millis(REFRESH_INTERVAL_MS);
+    let interval = IntervalMs::from_millis(interval_ms);
     let mut due = Vec::new();
     let mut per_profile = HashMap::with_capacity(snapshot.len());
     for entry in snapshot {
