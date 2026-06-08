@@ -376,17 +376,15 @@ fn build_tp_rows(profile: &Profile, _header: &HeaderState) -> Vec<Line<'static>>
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     let Some(stats) = profile.third_party_usage.as_ref() else {
-        lines.push(Line::from(Span::styled("  loading…", theme::faint())));
+        lines.push(Line::from(Span::styled("loading…", theme::faint())));
         return lines;
     };
 
     if stats.rows.is_empty() {
-        // `unavailable()` always carries a row, so an empty list means an
-        // available account whose provider reported no stats.
         let (msg, style) = if stats.is_available {
-            ("  no stats reported", theme::faint())
+            ("no stats reported", theme::faint())
         } else {
-            ("  usage unavailable", theme::danger())
+            ("usage unavailable", theme::danger())
         };
         lines.push(Line::from(Span::styled(msg, style)));
         return lines;
@@ -399,10 +397,10 @@ fn build_tp_rows(profile: &Profile, _header: &HeaderState) -> Vec<Line<'static>>
                 StatRowKind::Danger => theme::danger(),
                 _ => theme::faint(),
             };
-            lines.push(Line::from(Span::styled(format!("  {}", row.value), style)));
+            lines.push(Line::from(Span::styled(row.value.to_string(), style)));
         } else if row.kind == StatRowKind::Heading {
             lines.push(Line::from(Span::styled(
-                format!("  {}", row.label),
+                row.label.to_string(),
                 theme::label(),
             )));
         } else {
@@ -423,7 +421,7 @@ fn build_tp_rows(profile: &Profile, _header: &HeaderState) -> Vec<Line<'static>>
 const TP_KEY_W: usize = 10;
 
 fn key_value_span(key: &str, value: &str, value_style: Style) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(format!("    {key}"), theme::faint())];
+    let mut spans = vec![Span::styled(format!("  {key}"), theme::faint())];
     let pad = TP_KEY_W.saturating_sub(key.chars().count()).max(1);
     spans.push(Span::raw(" ".repeat(pad)));
     spans.push(Span::styled(value.to_string(), value_style));
