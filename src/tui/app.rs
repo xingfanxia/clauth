@@ -3352,7 +3352,7 @@ fn drain_status_events(app: &mut App) {
 /// `manual` is true when this `Fetched` answers a manual refresh (toasts there).
 fn apply_status_incidents(
     app: &mut App,
-    incidents: Vec<Incident>,
+    mut incidents: Vec<Incident>,
     fetched_at_ms: u64,
     cached: bool,
     manual: bool,
@@ -3388,8 +3388,14 @@ fn apply_status_incidents(
         }
         app.status.seen_latest = newest_id.clone();
     }
-    let _ = manual; // a fresh `Fetched` needs no extra toast beyond the new-incident cue.
+    let _ = manual;
 
+    // Active incidents first, then by latest start.
+    incidents.sort_by(|a, b| match (a.is_active(), b.is_active()) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => b.started_ms.cmp(&a.started_ms),
+    });
     app.status.incidents = incidents;
 
     // Clamp the cursor and reset the detail scroll if the selection changed.
