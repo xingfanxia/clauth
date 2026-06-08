@@ -12,7 +12,7 @@ use super::format::{
     account_type_label, account_type_style, fixed, fixed_split, health_color, name_style,
     spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
-use super::panes::{draw_scrollbar, empty_state, section_box, select_line};
+use super::panes::{bold_when, draw_scrollbar, empty_state, section_box, select_line};
 use crate::fallback::threshold_for;
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{LABEL_5H, LABEL_7D, ProfileActivity, humanize_duration, now_ms};
@@ -229,23 +229,10 @@ fn render_overview_row(
     let name_str = profile.name.to_string();
     // Caret only in the focused pane.
     let cursor = if selected && focused {
-        Span::styled("❯ ", theme::accent())
+        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
     } else {
         Span::raw("  ")
     };
-    let (name_text, name_pad) = fixed_split(&profile.name, widths.name);
-    let name = Span::styled(
-        name_text,
-        if active {
-            name_style(profile).fg(theme::accent_2_color())
-        } else {
-            name_style(profile)
-        },
-    );
-    let name_pad = Span::raw(name_pad);
-
-    // Spinner while in-flight, seconds countdown when Idle.
-    // Right-aligned in TIMER_SLOT-1 chars + 1 trailing space.
     let timer_span = {
         let inner = TIMER_SLOT - 1;
         let activity = app
@@ -279,11 +266,23 @@ fn render_overview_row(
     let mut spans = vec![cursor];
     if app.bell_fired.contains_key(&name_str) {
         spans.push(Span::styled("🔔", theme::accent()));
+    } else if active {
+        spans.push(Span::styled("●", theme::accent_2_color()));
+        spans.push(Span::raw(" "));
     } else {
         spans.push(Span::raw("  "));
     }
-    spans.push(name);
-    spans.push(name_pad);
+    let (nt, np) = fixed_split(&profile.name, widths.name);
+    let ns = bold_when(
+        if active {
+            name_style(profile).fg(theme::accent_2_color())
+        } else {
+            name_style(profile)
+        },
+        selected && focused,
+    );
+    spans.push(Span::styled(nt, ns));
+    spans.push(Span::raw(np));
     spans.push(gap(widths));
     spans.push(Span::styled(
         fixed(&account_type_label(profile), widths.kind),

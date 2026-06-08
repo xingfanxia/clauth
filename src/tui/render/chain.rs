@@ -20,8 +20,8 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    SELECTOR_WIDTH, active_dot, draw_selector_list, highlight_row, name_color, section_box,
-    section_box_verbatim, select_line,
+    SELECTOR_WIDTH, active_dot, bold_when, draw_selector_list, highlight_row, label_style,
+    name_color, section_box, section_box_verbatim, select_line,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 use crate::profile::AppConfig;
@@ -65,28 +65,32 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                             .get(*i)
                             .map(|n| n.to_string())
                             .unwrap_or_default();
-                        // Cursor + ordinal share the leading span so the name
-                        // lands at spans[1] — the item `highlight_row` bolds.
                         // Caret only in the focused pane.
                         let rail = if selected && focused {
-                            Span::styled(format!("❯ {:>2}  ", i + 1), theme::accent())
+                            Span::styled(
+                                format!("❯ {:>2}  ", i + 1),
+                                theme::accent().add_modifier(Modifier::BOLD),
+                            )
                         } else {
                             Span::styled(format!("  {:>2}  ", i + 1), theme::faint())
                         };
-                        // Active = orange name (matches usage/setup selector style).
-                        let spans = vec![
-                            rail,
-                            Span::styled(name.clone(), name_color(cfg.is_active(&name))),
-                        ];
+                        let ns = bold_when(name_color(cfg.is_active(&name)), selected && focused);
+                        let spans = vec![rail, Span::styled(name.clone(), ns)];
                         Line::from(spans)
                     }
                     ChainItemKind::Add => {
                         let arrow = if selected && focused {
-                            Span::styled("❯ ", theme::accent())
+                            Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
                         } else {
                             Span::raw("  ")
                         };
-                        Line::from(vec![arrow, Span::styled("    + add", theme::accent())])
+                        Line::from(vec![
+                            arrow,
+                            Span::styled(
+                                "    + add",
+                                bold_when(theme::accent(), selected && focused),
+                            ),
+                        ])
                     }
                 };
                 select_line(line, selected, focused, w)
@@ -295,7 +299,7 @@ fn detail_row(
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent())
     } else if selected {
-        Span::styled("❯ ", theme::accent())
+        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
     } else {
         Span::raw("  ")
     };
@@ -398,11 +402,12 @@ fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {
     for (i, name) in candidates.iter().enumerate() {
         let selected = i == cursor;
         let arrow = if selected {
-            Span::styled("❯ ", theme::accent())
+            Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
         } else {
             Span::raw("  ")
         };
-        let line = Line::from(vec![arrow, Span::styled(name.clone(), theme::body())]);
+        let ns = bold_when(theme::body(), selected);
+        let line = Line::from(vec![arrow, Span::styled(name.clone(), ns)]);
         lines.push(if selected {
             highlight_row(line, width)
         } else {
@@ -461,16 +466,6 @@ fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static
 
 /// Interactive form-row label: `TEXT + bold` when the row is focused,
 /// `TEXT_DIM` blurred (matches the setup-tab `label_style`).
-fn label_style(focused: bool) -> Style {
-    if focused {
-        Style::default()
-            .fg(theme::text_color())
-            .add_modifier(Modifier::BOLD)
-    } else {
-        theme::dim()
-    }
-}
-
 fn kv_key(key: &str) -> String {
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     format!("{key}{}", " ".repeat(pad))

@@ -6,13 +6,13 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{App, GLOBAL_CONFIG_ROWS, GlobalConfigRow};
 use super::super::theme::{self, Tier};
-use super::panes::{highlight_row, section_box};
+use super::panes::{highlight_row, label_style, section_box};
 
 const KEY_W: usize = 12;
 
@@ -127,11 +127,7 @@ fn cycle_row(
     row_selected: bool,
 ) -> Line<'static> {
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
-    let key_style = if row_selected {
-        theme::body().add_modifier(Modifier::BOLD)
-    } else {
-        theme::dim()
-    };
+    let key_style = label_style(row_selected);
     let mut spans = vec![
         arrow,
         Span::styled(format!("{key}{}", " ".repeat(pad)), key_style),

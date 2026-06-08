@@ -14,12 +14,18 @@ use super::super::theme;
 /// Width of the account picker column on the master-detail tabs.
 pub(super) const SELECTOR_WIDTH: u16 = 24;
 
-/// Full-width selection bar: bolds `spans[1]` (after the cursor span), stretches to `width`.
-pub(super) fn highlight_row(mut line: Line<'static>, width: usize) -> Line<'static> {
-    let pad = width.saturating_sub(line.width());
-    if let Some(label) = line.spans.get_mut(1) {
-        label.style = label.style.add_modifier(Modifier::BOLD);
+/// Bolds `style` when `cond` is true.
+pub(super) fn bold_when(style: Style, cond: bool) -> Style {
+    if cond {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
     }
+}
+
+/// Full-width selection bar: bg tint and stretch. Callers handle per-row bold.
+pub(super) fn highlight_row(line: Line<'static>, width: usize) -> Line<'static> {
+    let pad = width.saturating_sub(line.width());
     let mut line = line.style(theme::selected_row());
     if pad > 0 {
         line.push_span(Span::raw(" ".repeat(pad)));
@@ -77,11 +83,14 @@ pub(super) fn picker_row(
 ) -> Line<'static> {
     // Caret only in the focused pane; blurred rows keep BG_HOVER via select_line.
     let arrow = if selected && focused {
-        Span::styled("❯ ", theme::accent())
+        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
     } else {
         Span::raw("  ")
     };
-    let line = Line::from(vec![arrow, Span::styled(name, name_style)]);
+    let line = Line::from(vec![
+        arrow,
+        Span::styled(name, bold_when(name_style, selected && focused)),
+    ]);
     select_line(line, selected, focused, width)
 }
 
@@ -178,6 +187,17 @@ pub(super) fn draw_selector_list(
 
     let viewport = inner.height as usize;
     draw_scrollbar(frame, inner, total, state.offset(), viewport);
+}
+
+/// Form-row label style: `TEXT + bold` when focused, `TEXT_DIM` when blurred.
+pub(super) fn label_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(theme::text_color())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme::dim()
+    }
 }
 
 /// Rounded box with contract-compliant chrome.

@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -25,8 +25,8 @@ fn head_cols(input: &InputState) -> usize {
 use super::super::app::{App, ConfigFocus, ConfigRow, InputState, config_rows};
 use super::super::theme;
 use super::panes::{
-    SELECTOR_WIDTH, active_dot, draw_selector_list, highlight_row, name_color, picker_row,
-    section_box, section_box_verbatim,
+    SELECTOR_WIDTH, active_dot, draw_selector_list, highlight_row, label_style, name_color,
+    picker_row, section_box, section_box_verbatim,
 };
 
 const KEY_W: usize = 11;
@@ -319,17 +319,6 @@ fn detail_row(
         ConfigRow::Create => {
             Line::from(vec![arrow, Span::styled("create account", theme::accent())])
         }
-    }
-}
-
-/// Form-row label style: TEXT+bold when the row is focused, else TEXT_DIM.
-fn label_style(focused: bool) -> Style {
-    if focused {
-        Style::default()
-            .fg(theme::text_color())
-            .add_modifier(Modifier::BOLD)
-    } else {
-        theme::dim()
     }
 }
 

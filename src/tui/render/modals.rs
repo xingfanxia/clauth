@@ -12,6 +12,7 @@ use super::super::app::{
     InputState, Modal, Tab,
 };
 use super::super::theme;
+use super::panes::bold_when;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
     match modal {
@@ -423,11 +424,7 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
             ..inner
         };
 
-        let label_style = if focused {
-            Style::default().fg(theme::text_color()).bold()
-        } else {
-            Style::default().fg(theme::text_color())
-        };
+        let label_style = bold_when(Style::default().fg(theme::text_color()), focused);
         let row_bg = if focused {
             Style::default().bg(theme::bg_hover())
         } else {
