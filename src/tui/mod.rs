@@ -6,6 +6,7 @@ mod render;
 pub(crate) mod theme;
 
 use std::io;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -56,6 +57,9 @@ fn run_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
     let mut last_tick = Instant::now();
 
     while !application.quit {
+        if application.shutting_down.load(Ordering::SeqCst) {
+            application.quit = true;
+        }
         terminal.draw(|frame| render::draw(frame, &application))?;
         // Update compact state each frame so the transition toast fires as soon
         // as the terminal shrinks below 14 rows (or re-arms when it grows back).

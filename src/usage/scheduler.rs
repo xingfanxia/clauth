@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
@@ -767,6 +767,7 @@ pub(crate) struct SchedulerState {
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
+    shutting_down: Arc<AtomicBool>,
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
@@ -911,6 +912,7 @@ pub(crate) fn spawn_refresher(
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
+    shutting_down: Arc<AtomicBool>,
 ) {
     let state = SchedulerState {
         config,
@@ -927,10 +929,17 @@ pub(crate) fn spawn_refresher(
         third_party_tokens,
         third_party_usage_store,
         third_party_status,
+        shutting_down,
     };
     std::thread::spawn(move || {
         loop {
+            if state.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
             std::thread::sleep(TICK_INTERVAL);
+            if state.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
             tick(&state);
         }
     });

@@ -717,6 +717,8 @@ pub(crate) struct App {
     /// `ConfirmAction::RotateAll` checks this alongside `any_busy` to block a
     /// concurrent rotate-all from racing the bootstrap's relink + initial fetch.
     pub(crate) bootstrap_active: Arc<AtomicBool>,
+    /// Signal to the scheduler thread that the UI is shutting down.
+    pub(crate) shutting_down: Arc<AtomicBool>,
     /// Per-tab background-event indicator; `None` = no pending activity.
     /// Set when a background event fires on a tab that isn't currently active;
     /// cleared in `switch_tab` when the user visits that tab.
@@ -751,6 +753,7 @@ struct WorkerHandles {
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl WorkerHandles {
@@ -771,6 +774,7 @@ impl WorkerHandles {
             third_party_tokens: Arc::clone(&app.third_party_tokens),
             third_party_usage_store: Arc::clone(&app.third_party_usage_store),
             third_party_status: Arc::clone(&app.third_party_status),
+            shutting_down: Arc::clone(&app.shutting_down),
         }
     }
 }
@@ -867,6 +871,7 @@ impl App {
             bootstrap_started: false,
             refresh_interval,
             bootstrap_active: Arc::new(AtomicBool::new(false)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             tab_activity: [None; Tab::ALL.len()],
             bell_fired: HashMap::new(),
             burn_samples: HashMap::new(),
@@ -982,6 +987,7 @@ impl App {
             h.third_party_tokens,
             h.third_party_usage_store,
             h.third_party_status,
+            h.shutting_down,
         );
     }
 
@@ -1092,6 +1098,7 @@ impl App {
             };
             if changed {
                 if let Ok(path) = crate::profile::profile_history_path(&name)
+                    && path.parent().is_some_and(|p| std::fs::create_dir_all(p).is_ok())
                     && let Ok(mut file) = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
@@ -1099,10 +1106,11 @@ impl App {
                 {
                     let ts = now_ms();
                     let usage_json = serde_json::to_string(&usage).unwrap_or_default();
+                    let name_json = serde_json::to_string(&name).unwrap_or_else(|_| format!(r#""{}""#, name));
                     let _ = writeln!(
                         file,
-                        r#"{{"ts":{},"name":"{}","usage":{}}}"#,
-                        ts, name, usage_json,
+                        r#"{{"ts":{},"name":{},"usage":{}}}"#,
+                        ts, name_json, usage_json,
                     );
                 }
                 self.last_history_usage.insert(name, usage);
@@ -1338,6 +1346,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     // Ctrl-C always exits.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.quit = true;
+        app.shutting_down.store(true, Ordering::SeqCst);
         return;
     }
 
@@ -1471,6 +1480,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 }
             } else if app.armed_quit {
                 app.quit = true;
+                app.shutting_down.store(true, Ordering::SeqCst);
             } else {
                 app.armed_quit = true;
                 app.footer_alert = Some(FooterAlert::Warn("press q again to quit".to_string()));
@@ -3596,6 +3606,14 @@ fn poll_credentials_divergence(app: &mut App) {
 /// Snapshot active credentials and detach the symlink. After shutdown, external
 /// writes to `.credentials.json` land in the standalone file, not the profile.
 pub(crate) fn shutdown(app: &mut App) -> Result<()> {
+    app.shutting_down.store(true, Ordering::SeqCst);
+    let wait_start = Instant::now();
+    while wait_start.elapsed() < Duration::from_millis(2000) {
+        if !any_busy(&app.activity) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     {
         let mut cfg = app.config();
         let _ = snapshot_active_credentials(&mut cfg);
