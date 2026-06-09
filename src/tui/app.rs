@@ -811,12 +811,11 @@ impl App {
             let name = profile.name.as_str();
             let data = crate::profile::load_usage_history(name);
             if !data.is_empty() {
-                if let Ok(path) = crate::profile::profile_history_path(name) {
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        if let Ok(mtime) = meta.modified() {
-                            history_mtimes.insert(name.to_string(), mtime);
-                        }
-                    }
+                if let Ok(path) = crate::profile::profile_history_path(name)
+                    && let Ok(meta) = std::fs::metadata(&path)
+                    && let Ok(mtime) = meta.modified()
+                {
+                    history_mtimes.insert(name.to_string(), mtime);
                 }
                 history_cache.insert(name.to_string(), data);
             }

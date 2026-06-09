@@ -13,7 +13,7 @@ use super::format::{
     spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
 use super::panes::{bold_when, draw_scrollbar, empty_state, section_box, select_line};
-use crate::fallback::threshold_for;
+use crate::fallback::{SwitchAction, next_target, threshold_for};
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{LABEL_5H, LABEL_7D, ProfileActivity, UsageInfo, humanize_duration, now_ms};
 
@@ -422,21 +422,36 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
     }
 
     if lines.len() < cap
-        && let Some(first) = chain.first()
-        && let Some(profile) = cfg.find(first)
+        && chain.len() > 1
+        && let Some(active_name) = cfg.state.active_profile.as_deref()
+        && let Some(profile) = cfg.find(active_name)
         && let Some(usage_info) = profile.usage.as_ref()
         && let Some(usage) = usage_info.five_hour.as_ref()
     {
         let threshold = threshold_for(profile);
-        let eta_secs = burn_rate_eta(app, first, usage_info, usage.utilization, threshold);
+        let eta_secs = burn_rate_eta(app, active_name, usage_info, usage.utilization, threshold);
         if let Some(secs) = eta_secs {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("auto: → {} in {}", first, humanize_duration(secs)),
-                    theme::faint(),
-                ),
-            ]));
+            match next_target(&cfg) {
+                Some(SwitchAction::To(target)) => {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("switching to {} in ~{}", target, humanize_duration(secs)),
+                            theme::faint(),
+                        ),
+                    ]));
+                }
+                Some(SwitchAction::Off) => {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("stops all in ~{}", humanize_duration(secs)),
+                            theme::faint(),
+                        ),
+                    ]));
+                }
+                None => {}
+            }
         }
     }
     lines
