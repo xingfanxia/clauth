@@ -181,9 +181,7 @@ fn build_usage_lines(
 
     let max_rate_w = stats
         .iter()
-        .filter_map(|s| s.burn_rate)
-        .filter(|r| *r > 0.0)
-        .map(|r| " · ".chars().count() + format!("{:.1} %/{}", r, "x").chars().count())
+        .map(|s| s.rate_section_width())
         .max()
         .unwrap_or(0);
 
@@ -205,7 +203,33 @@ struct Stat {
     rate_unit: &'static str,
 }
 
+/// Seconds until the window hits 100% at the current burn rate.
+fn eta_left(rate: f64, pct: f64) -> Option<String> {
+    if rate <= 0.0 || pct >= 100.0 {
+        return None;
+    }
+    let hours = (100.0 - pct) / rate;
+    let secs = (hours * 3600.0) as i64;
+    if secs <= 60 {
+        return None;
+    }
+    Some(crate::usage::humanize_duration(secs))
+}
+
 impl Stat {
+    /// Width of the ` · rate` + optional ` · X left` section, for alignment.
+    fn rate_section_width(&self) -> usize {
+        let Some(rate) = self.burn_rate.filter(|r| *r > 0.0) else {
+            return 0;
+        };
+        let mut w =
+            " · ".chars().count() + format!("{:.1} %/{}", rate, self.rate_unit).chars().count();
+        if let Some(dur) = eta_left(rate, self.pct) {
+            w += " · ".chars().count() + dur.chars().count() + " left".chars().count();
+        }
+        w
+    }
+
     /// Eyebrow + right-aligned %, then bar with trailing reset/credit suffix.
     /// `bar_width` shared across rows; `pct_col` = far content edge for % alignment.
     /// `max_rate_w` keeps the % column fixed across all rows regardless of per-row rate.
@@ -244,8 +268,12 @@ impl Stat {
             label_spans.push(Span::styled(" · ", theme::dim()));
             let rate_str = format!("{:.1} %/{}", rate, self.rate_unit);
             label_spans.push(Span::styled(rate_str.clone(), rate_color));
-            // Pad to max_rate_w so rows without a displayed rate still align.
-            let my_rate_w = " · ".chars().count() + rate_str.chars().count();
+
+            if let Some(dur) = eta_left(rate, self.pct) {
+                label_spans.push(Span::styled(format!(" · {dur} left"), theme::faint()));
+            }
+
+            let my_rate_w = self.rate_section_width();
             let extra = max_rate_w.saturating_sub(my_rate_w);
             if extra > 0 {
                 label_spans.push(Span::raw(" ".repeat(extra)));
