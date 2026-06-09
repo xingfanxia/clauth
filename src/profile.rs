@@ -399,6 +399,7 @@ pub(crate) fn profile_history_path(name: &str) -> Result<PathBuf> {
 #[derive(Deserialize)]
 struct HistoryLine {
     ts: u64,
+    #[serde(rename = "name")]
     _name: String,
     usage: UsageInfo,
 }

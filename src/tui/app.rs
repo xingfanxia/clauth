@@ -805,6 +805,23 @@ impl App {
 
         // Kick the best-effort update check on its own thread; its verdict lands
         // in `update_results` and is toasted from `on_tick`.
+        let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
+        let mut history_mtimes: HashMap<String, std::time::SystemTime> = HashMap::new();
+        for profile in &config.profiles {
+            let name = profile.name.as_str();
+            let data = crate::profile::load_usage_history(name);
+            if !data.is_empty() {
+                if let Ok(path) = crate::profile::profile_history_path(name) {
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if let Ok(mtime) = meta.modified() {
+                            history_mtimes.insert(name.to_string(), mtime);
+                        }
+                    }
+                }
+                history_cache.insert(name.to_string(), data);
+            }
+        }
+
         let (update_sender, update_results) = std::sync::mpsc::channel::<UpdateEvent>();
         update::spawn(update_sender);
 
@@ -874,8 +891,8 @@ impl App {
             shutting_down: Arc::new(AtomicBool::new(false)),
             tab_activity: [None; Tab::ALL.len()],
             bell_fired: HashMap::new(),
-            history_cache: HashMap::new(),
-            history_mtimes: HashMap::new(),
+            history_cache,
+            history_mtimes,
             last_history_usage: HashMap::new(),
         }
     }
