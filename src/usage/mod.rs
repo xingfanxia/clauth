@@ -1,9 +1,12 @@
+mod burn;
 mod fetch;
 mod scheduler;
 
+pub(crate) use burn::compute_burn_rates_from_history;
 pub(crate) use fetch::{
-    LABEL_5H, LABEL_7D, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso, http_agent,
-    humanize_duration, iso_to_epoch_secs, now_epoch_secs, now_ms, parse_retry_after,
+    LABEL_5H, LABEL_7D, LABEL_7D_OPUS, LABEL_7D_SONNET, PlanInfo, UsageInfo, UsageWindow,
+    epoch_secs_to_iso, http_agent, humanize_duration, iso_to_epoch_secs, now_epoch_secs, now_ms,
+    parse_retry_after,
 };
 // Named directly only in `#[cfg(test)]` showcase; the field access path is enough in prod.
 #[cfg(test)]

@@ -117,7 +117,7 @@ fn build_usage_lines(
         return lines;
     }
 
-    let stats = collect_stats(profile);
+    let mut stats = collect_stats(profile);
     if stats.is_empty() {
         lines.push(Line::from(Span::styled("  loading…", theme::faint())));
         return lines;
@@ -132,34 +132,66 @@ fn build_usage_lines(
     // Right-align % to far content edge so figures stack above the reset text.
     let pct_col = (bar_width + max_trailing).min(inner_w as usize);
 
-    // Compute burn rates per window from accumulated samples.
-    let window_rates: HashMap<String, Option<f64>> = app
-        .burn_samples
+    // Compute burn rates per window from cached history.
+    let history = app
+        .history_cache
         .get(profile.name.as_str())
-        .map(|wm| {
-            wm.iter()
-                .map(|(label, samples)| {
-                    if samples.len() >= 2 {
-                        let first = samples.front().unwrap();
-                        let last = samples.back().unwrap();
-                        let dt = last.0.duration_since(first.0).as_secs_f64() / 3600.0;
-                        if dt > 0.0 {
-                            let rate = (last.1 - first.1) / dt;
-                            return (label.clone(), Some(rate));
-                        }
-                    }
-                    (label.clone(), None)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let mut window_rates: HashMap<String, Option<f64>> = HashMap::new();
+    if let Some(u) = profile.usage.as_ref() {
+        let five_h: Vec<_> = u
+            .windows()
+            .into_iter()
+            .filter(|(l, _)| !l.starts_with("7d"))
+            .collect();
+        let seven_d: Vec<_> = u
+            .windows()
+            .into_iter()
+            .filter(|(l, _)| l.starts_with("7d"))
+            .collect();
+        if !five_h.is_empty() {
+            window_rates.extend(crate::usage::compute_burn_rates_from_history(
+                history,
+                &five_h,
+                5,
+                30 * 60 * 1000,
+            ));
+        }
+        if !seven_d.is_empty() {
+            window_rates.extend(crate::usage::compute_burn_rates_from_history(
+                history,
+                &seven_d,
+                10,
+                6 * 60 * 60 * 1000,
+            ));
+        }
+    }
 
-    for (i, mut stat) in stats.into_iter().enumerate() {
-        stat.burn_rate = window_rates.get(&stat.label).and_then(|r| *r);
+    // Populate burn rates, converting %/h → %/d for 7d windows.
+    for stat in &mut stats {
+        stat.burn_rate = window_rates.get(&stat.label).and_then(|r| *r).map(|r| {
+            if stat.label.starts_with("7d") {
+                r * 24.0
+            } else {
+                r
+            }
+        });
+    }
+
+    let max_rate_w = stats
+        .iter()
+        .filter_map(|s| s.burn_rate)
+        .filter(|r| *r > 0.0)
+        .map(|r| " · ".chars().count() + format!("{:.1} %/{}", r, "x").chars().count())
+        .max()
+        .unwrap_or(0);
+
+    for (i, stat) in stats.into_iter().enumerate() {
         if i > 0 {
             lines.push(Line::from(""));
         }
-        lines.extend(stat.render(bar_width, pct_col));
+        lines.extend(stat.render(bar_width, pct_col, max_rate_w));
     }
     lines
 }
@@ -170,21 +202,19 @@ struct Stat {
     color: Style,
     trailing: String,
     burn_rate: Option<f64>,
+    rate_unit: &'static str,
 }
 
 impl Stat {
     /// Eyebrow + right-aligned %, then bar with trailing reset/credit suffix.
     /// `bar_width` shared across rows; `pct_col` = far content edge for % alignment.
-    fn render(&self, bar_width: usize, pct_col: usize) -> Vec<Line<'static>> {
+    /// `max_rate_w` keeps the % column fixed across all rows regardless of per-row rate.
+    fn render(&self, bar_width: usize, pct_col: usize, max_rate_w: usize) -> Vec<Line<'static>> {
         let pct_str = format!("{:>3.0}%", self.pct);
 
-        // Compute total label width including inline burn rate if present.
-        let rate_w = self.burn_rate.map_or(0, |r| {
-            " · ".chars().count() + format!("{:.1} %/h", r).chars().count()
-        });
         let header_pad = pct_col
             .saturating_sub(self.label.chars().count())
-            .saturating_sub(rate_w)
+            .saturating_sub(max_rate_w)
             .saturating_sub(pct_str.chars().count());
 
         let filled = ((self.pct / 100.0) * bar_width as f64).round() as usize;
@@ -212,7 +242,16 @@ impl Stat {
         {
             let rate_color = Style::default().fg(theme::util_color(rate.clamp(0.0, 100.0)));
             label_spans.push(Span::styled(" · ", theme::dim()));
-            label_spans.push(Span::styled(format!("{:.1} %/h", rate), rate_color));
+            let rate_str = format!("{:.1} %/{}", rate, self.rate_unit);
+            label_spans.push(Span::styled(rate_str.clone(), rate_color));
+            // Pad to max_rate_w so rows without a displayed rate still align.
+            let my_rate_w = " · ".chars().count() + rate_str.chars().count();
+            let extra = max_rate_w.saturating_sub(my_rate_w);
+            if extra > 0 {
+                label_spans.push(Span::raw(" ".repeat(extra)));
+            }
+        } else {
+            label_spans.push(Span::raw(" ".repeat(max_rate_w)));
         }
 
         vec![
@@ -240,12 +279,14 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
         let trailing = format_reset(w)
             .map(|r| format!("  resets in {r}"))
             .unwrap_or_default();
+        let rate_unit = if label.starts_with("7d") { "d" } else { "h" };
         stats.push(Stat {
             label: label.to_string(),
             pct,
             color: Style::default().fg(theme::util_color(pct)),
             trailing,
             burn_rate: None,
+            rate_unit,
         });
     }
     if let Some(extra) = &usage.extra_usage
@@ -264,6 +305,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             color: Style::default().fg(theme::util_color(pct)),
             trailing: format!("  {sym}{used:.2} / {sym}{limit:.2}"),
             burn_rate: None,
+            rate_unit: "h",
         });
     }
     stats

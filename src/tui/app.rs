@@ -41,9 +41,9 @@ use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityKind, ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult,
-    OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity,
-    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
+    ActivityKind, ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
+    OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RefetchQueue,
+    StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
     ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageInfo, UsageStore,
     any_busy, clear_activity, collect_third_party_entries, fetch_all_into, is_idle, mark_activity,
     now_ms, spawn_refresher,
@@ -728,12 +728,10 @@ pub(crate) struct App {
     /// Reset when utilization drops back below threshold.
     pub(crate) bell_fired: HashMap<String, bool>,
 
-    /// Burn-rate samples per profile × window: (timestamp, utilization%).
-    pub(crate) burn_samples: HashMap<String, HashMap<String, VecDeque<(Instant, f64)>>>,
-
-    /// Last-seen fetch status per profile for burn-rate sampling.
-    /// Only transitions to `Fresh` trigger new burn samples.
-    burn_status_seen: HashMap<String, FetchStatus>,
+    /// Cached parsed usage history per profile from usage_history.jsonl.
+    pub(crate) history_cache: HashMap<String, Vec<(u64, UsageInfo)>>,
+    /// Last-known mtime per profile history file, for cache invalidation.
+    pub(crate) history_mtimes: HashMap<String, std::time::SystemTime>,
 
     /// Last-seen usage per profile, keyed by name.
     /// Used to detect fresh fetches and append history JSONL lines.
@@ -876,8 +874,8 @@ impl App {
             shutting_down: Arc::new(AtomicBool::new(false)),
             tab_activity: [None; Tab::ALL.len()],
             bell_fired: HashMap::new(),
-            burn_samples: HashMap::new(),
-            burn_status_seen: HashMap::new(),
+            history_cache: HashMap::new(),
+            history_mtimes: HashMap::new(),
             last_history_usage: HashMap::new(),
         }
     }
@@ -1000,8 +998,6 @@ impl App {
         // Third-party stores BEFORE OAuth stores: ranks 270/280 < 300/350.
         let bells;
         let usage_snapshots;
-        let burn_data: Vec<(String, String, f64)>;
-        let status_snapshot: Vec<(String, Option<FetchStatus>)>;
         {
             let third_party_map = self.third_party_usage_store.lock().ok();
             let third_party_status_map = self.third_party_status.lock().ok();
@@ -1027,13 +1023,6 @@ impl App {
                 }
             }
 
-            // Collect current fetch status for burn-rate gating.
-            status_snapshot = cfg
-                .profiles
-                .iter()
-                .map(|p| (p.name.to_string(), p.fetch_status))
-                .collect();
-
             bells = cfg
                 .profiles
                 .iter()
@@ -1053,69 +1042,6 @@ impl App {
                 .iter()
                 .filter_map(|p| p.usage.clone().map(|u| (p.name.to_string(), u)))
                 .collect::<Vec<_>>();
-
-            // Collect burn-rate data for every window while cfg is alive.
-            burn_data = cfg
-                .profiles
-                .iter()
-                .flat_map(|p| {
-                    let name = p.name.to_string();
-                    p.usage
-                        .as_ref()
-                        .map(|u| {
-                            u.windows()
-                                .into_iter()
-                                .map(move |(label, w)| {
-                                    (name.clone(), label.to_string(), w.utilization)
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect();
-        }
-        // Determine which profiles just had a successful fetch —
-        // only those contribute to burn-rate sampling.
-        let fresh_profiles: Vec<String> = status_snapshot
-            .iter()
-            .filter_map(|(name, status)| {
-                let prev = self.burn_status_seen.get(name);
-                (*status == Some(FetchStatus::Fresh) && prev != Some(&FetchStatus::Fresh))
-                    .then(|| name.clone())
-            })
-            .collect();
-
-        for (name, status) in &status_snapshot {
-            match status {
-                Some(s) => self.burn_status_seen.insert(name.clone(), *s),
-                None => self.burn_status_seen.remove(name),
-            };
-        }
-
-        // Burn-rate sampling — only on successful fetch transitions.
-        for (name, window, pct) in burn_data {
-            if !fresh_profiles.contains(&name) {
-                continue;
-            }
-            let window_map = self.burn_samples.entry(name).or_default();
-            let samples = window_map.entry(window).or_default();
-            let now = Instant::now();
-            // A drop in utilization signals a limit reset — clear stale samples
-            // so the burn rate starts tracking the new window from scratch.
-            if let Some(&(_, last_pct)) = samples.back()
-                && pct < last_pct
-            {
-                samples.clear();
-            }
-            if pct > 0.0 {
-                let cutoff = now - Duration::from_secs(300);
-                while samples.front().is_some_and(|(t, _)| *t < cutoff) {
-                    samples.pop_front();
-                }
-                samples.push_back((now, pct));
-            } else {
-                samples.clear();
-            }
         }
         for (name, threshold, util) in bells {
             if let Some(t) = threshold
@@ -1134,15 +1060,13 @@ impl App {
         }
 
         // Append history JSONL for every profile whose usage just changed.
-        for (name, usage) in usage_snapshots {
+        for (name, usage) in &usage_snapshots {
             let changed = match self.last_history_usage.get(name.as_str()) {
-                Some(last) => {
-                    serde_json::to_string(last).ok() != serde_json::to_string(&usage).ok()
-                }
+                Some(last) => serde_json::to_string(last).ok() != serde_json::to_string(usage).ok(),
                 None => true,
             };
             if changed {
-                if let Ok(path) = crate::profile::profile_history_path(&name)
+                if let Ok(path) = crate::profile::profile_history_path(name)
                     && path
                         .parent()
                         .is_some_and(|p| std::fs::create_dir_all(p).is_ok())
@@ -1152,16 +1076,28 @@ impl App {
                         .open(&path)
                 {
                     let ts = now_ms();
-                    let usage_json = serde_json::to_string(&usage).unwrap_or_default();
+                    let usage_json = serde_json::to_string(usage).unwrap_or_default();
                     let name_json =
-                        serde_json::to_string(&name).unwrap_or_else(|_| format!(r#""{}""#, name));
+                        serde_json::to_string(name).unwrap_or_else(|_| format!(r#""{}""#, name));
                     let _ = writeln!(
                         file,
                         r#"{{"ts":{},"name":{},"usage":{}}}"#,
                         ts, name_json, usage_json,
                     );
                 }
-                self.last_history_usage.insert(name, usage);
+                self.last_history_usage.insert(name.clone(), usage.clone());
+            }
+        }
+
+        // Refresh history cache for profiles whose history file changed.
+        for (name, _) in &usage_snapshots {
+            if let Ok(path) = crate::profile::profile_history_path(name)
+                && let Ok(mtime) = path.metadata().and_then(|m| m.modified())
+                && self.history_mtimes.get(name) != Some(&mtime)
+            {
+                self.history_cache
+                    .insert(name.clone(), crate::profile::load_usage_history(name));
+                self.history_mtimes.insert(name.clone(), mtime);
             }
         }
     }

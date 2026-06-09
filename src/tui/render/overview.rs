@@ -15,7 +15,7 @@ use super::format::{
 use super::panes::{bold_when, draw_scrollbar, empty_state, section_box, select_line};
 use crate::fallback::threshold_for;
 use crate::profile::{AppConfig, Profile};
-use crate::usage::{LABEL_5H, LABEL_7D, ProfileActivity, humanize_duration, now_ms};
+use crate::usage::{LABEL_5H, LABEL_7D, ProfileActivity, UsageInfo, humanize_duration, now_ms};
 
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
@@ -424,10 +424,11 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
     if lines.len() < cap
         && let Some(first) = chain.first()
         && let Some(profile) = cfg.find(first)
-        && let Some(usage) = profile.usage.as_ref().and_then(|u| u.five_hour.as_ref())
+        && let Some(usage_info) = profile.usage.as_ref()
+        && let Some(usage) = usage_info.five_hour.as_ref()
     {
         let threshold = threshold_for(profile);
-        let eta_secs = burn_rate_eta(app, first, usage.utilization, threshold);
+        let eta_secs = burn_rate_eta(app, first, usage_info, usage.utilization, threshold);
         if let Some(secs) = eta_secs {
             lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -534,21 +535,29 @@ fn chain_state_style(profile: Option<&Profile>, pct: f64, threshold: f64) -> Sty
 /// Project seconds until a profile's utilization crosses the threshold, based on
 /// 5h window burn rate. Returns `None` when there aren't enough samples, the
 /// rate is flat/negative, or utilization is already at/above the threshold.
-fn burn_rate_eta(app: &App, name: &str, current: f64, threshold: f64) -> Option<i64> {
+fn burn_rate_eta(
+    app: &App,
+    name: &str,
+    current_usage: &UsageInfo,
+    current: f64,
+    threshold: f64,
+) -> Option<i64> {
     if current >= threshold {
         return None;
     }
-    let samples = app.burn_samples.get(name)?.get("5h")?;
-    if samples.len() < 2 {
-        return None;
-    }
-    let first = samples.front().unwrap();
-    let last = samples.back().unwrap();
-    let dt = last.0.duration_since(first.0).as_secs_f64() / 3600.0;
-    if dt <= 0.0 {
-        return None;
-    }
-    let rate = (last.1 - first.1) / dt;
+    let five_h = current_usage.five_hour.as_ref().map(|w| ("5h", w));
+    let rate = five_h.and_then(|pair| {
+        let mut rates = crate::usage::compute_burn_rates_from_history(
+            app.history_cache
+                .get(name)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            std::slice::from_ref(&pair),
+            5,
+            30 * 60 * 1000,
+        );
+        rates.remove("5h").flatten()
+    })?;
     if rate <= 0.0 {
         return None;
     }

@@ -395,6 +395,34 @@ pub(crate) fn profile_history_path(name: &str) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join("usage_history.jsonl"))
 }
 
+/// One line from usage_history.jsonl.
+#[derive(Deserialize)]
+struct HistoryLine {
+    ts: u64,
+    _name: String,
+    usage: UsageInfo,
+}
+
+/// Load all parsed entries from a profile's usage_history.jsonl.
+/// Returns chronological (timestamp_ms, UsageInfo) pairs.
+pub(crate) fn load_usage_history(name: &str) -> Vec<(u64, UsageInfo)> {
+    let Ok(path) = profile_history_path(name) else {
+        return vec![];
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    let mut entries: Vec<(u64, UsageInfo)> = content
+        .lines()
+        .filter_map(|line| {
+            let entry: HistoryLine = serde_json::from_str(line).ok()?;
+            Some((entry.ts, entry.usage))
+        })
+        .collect();
+    entries.sort_by_key(|(ts, _)| *ts);
+    entries
+}
+
 fn profile_credentials_pending_path(name: &str) -> Result<PathBuf> {
     profile_subpath(name, "credentials.json.pending")
 }

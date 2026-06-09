@@ -314,7 +314,10 @@ fn detail_row(
             } else {
                 "delete account".to_string()
             };
-            Line::from(vec![arrow, Span::styled(label, theme::danger().add_modifier(Modifier::BOLD))])
+            Line::from(vec![
+                arrow,
+                Span::styled(label, theme::danger().add_modifier(Modifier::BOLD)),
+            ])
         }
         ConfigRow::Create => {
             Line::from(vec![arrow, Span::styled("create account", theme::accent())])
