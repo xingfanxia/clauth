@@ -51,7 +51,6 @@ pub(crate) fn compute_burn_rates_from_history(
         let mut entries: Vec<(u64, f64)> = history
             .iter()
             .filter_map(|(ts, u)| window_util(u, label).map(|p| (*ts, p)))
-            .filter(|(_, pct)| *pct > 0.0)
             .collect();
 
         entries.push((now_ms, window.utilization));
@@ -66,9 +65,13 @@ pub(crate) fn compute_burn_rates_from_history(
             let n = window.len();
             let last_ts = window[n - 1].0;
 
+            // Span-first: try to cover min_span_ms of data for a stable rate.
+            // Fall back to min_entries when the history isn't long enough yet
+            // (e.g. early after a window reset).
             let start_idx = (0..n - 1)
                 .rev()
-                .find(|&i| n - i >= min_entries || last_ts - window[i].0 >= min_span_ms)
+                .find(|&i| last_ts - window[i].0 >= min_span_ms)
+                .or_else(|| (0..n - 1).rev().find(|&i| n - i >= min_entries))
                 .unwrap_or(0);
 
             let first = &window[start_idx];
