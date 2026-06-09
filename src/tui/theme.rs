@@ -252,10 +252,6 @@ pub(crate) fn accent() -> Style {
     Style::default().fg(accent_color())
 }
 
-pub(crate) fn orange() -> Style {
-    Style::default().fg(accent_2_color())
-}
-
 pub(crate) fn warning() -> Style {
     Style::default().fg(warning_color())
 }

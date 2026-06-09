@@ -68,17 +68,16 @@ fn partition_due_uses_fixed_interval() {
     assert_eq!(due.len(), 1, "due once the fixed interval has elapsed");
 }
 
-/// Profiles mid-switch / mid-refresh are excluded from the due set even when
-/// their interval has elapsed, but their countdown still publishes so the UI
-/// shows when they become eligible again.
+/// Profiles mid-refresh are excluded from the due set even when their interval
+/// has elapsed, but their countdown still publishes so the UI shows when they
+/// become eligible again.
 #[test]
-fn partition_due_excludes_switching_and_refreshing() {
+fn partition_due_excludes_refreshing() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
-    let snapshot = vec![token("a"), token("b")];
+    let snapshot = vec![token("a")];
 
-    mark_activity(&activity, "a", ProfileActivity::Switching);
-    mark_activity(&activity, "b", ProfileActivity::Refreshing);
+    mark_activity(&activity, "a", ProfileActivity::Refreshing);
 
     let (due, next) = partition_due(
         &snapshot,
@@ -87,9 +86,9 @@ fn partition_due_excludes_switching_and_refreshing() {
         &activity,
         REFRESH_INTERVAL_MS,
     );
-    assert!(due.is_empty(), "switching/refreshing profiles are excluded");
+    assert!(due.is_empty(), "refreshing profiles are excluded from due");
     assert!(
-        next.contains_key("a") && next.contains_key("b"),
+        next.contains_key("a"),
         "countdown still publishes for excluded profiles"
     );
 }

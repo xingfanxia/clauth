@@ -133,34 +133,6 @@ pub(crate) enum ProfileActivity {
     Fetching,
     /// OAuth token rotation in flight.
     Refreshing,
-    /// Account switch (FS relink). Latent: switch runs synchronously on the UI thread, so this is never set.
-    Switching,
-    /// `clauth start` launch path. Phase 1 never sets this (`start::run` runs in a separate process);
-    /// Phase 2 wires it when the launch becomes a background worker.
-    #[allow(dead_code)]
-    Starting,
-}
-
-/// Op kind reported through [`OpResult`]. Mirrors non-`Idle` [`ProfileActivity`] variants.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ActivityKind {
-    Fetching,
-    Refreshing,
-    Switching,
-    Starting,
-}
-
-impl ActivityKind {
-    #[allow(dead_code)]
-    pub(crate) fn as_activity(self) -> ProfileActivity {
-        match self {
-            ActivityKind::Fetching => ProfileActivity::Fetching,
-            ActivityKind::Refreshing => ProfileActivity::Refreshing,
-            ActivityKind::Switching => ProfileActivity::Switching,
-            ActivityKind::Starting => ProfileActivity::Starting,
-        }
-    }
 }
 
 /// Result of one tracked operation. Drained by `on_tick`, which clears the `ActivityStore`
@@ -168,7 +140,6 @@ impl ActivityKind {
 #[derive(Debug)]
 pub(crate) struct OpResult {
     pub(crate) name: String,
-    pub(crate) kind: ActivityKind,
     pub(crate) outcome: anyhow::Result<()>,
 }
 
@@ -950,7 +921,7 @@ pub(crate) fn spawn_refresher(
 fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
-    activity: &ActivityStore,
+    _activity: &ActivityStore,
     pending_switch: &PendingSwitch,
     pending_switch_off: &PendingSwitchOff,
 ) {
@@ -971,13 +942,6 @@ fn scan_auto_switch(
             return;
         }
     }
-    {
-        let Ok(a) = activity.lock() else { return };
-        if a.values().any(|v| matches!(v, ProfileActivity::Switching)) {
-            return;
-        }
-    }
-
     // Snapshot under `config` only — drop guard before taking `usage_store`.
     let snapshot = {
         let cfg = match config.lock() {
@@ -1089,10 +1053,7 @@ fn partition_due<T: NamedEntry + Clone>(
         per_profile.insert(entry.name().to_string(), next.as_millis());
         // Countdown still publishes for excluded profiles — UI shows when they become eligible.
         let excluded = match act.as_ref() {
-            Ok(a) => matches!(
-                a.get(entry.name()),
-                Some(ProfileActivity::Switching | ProfileActivity::Refreshing)
-            ),
+            Ok(a) => matches!(a.get(entry.name()), Some(ProfileActivity::Refreshing)),
             Err(_) => true, // Poisoned: fail safe to excluded.
         };
         if excluded {
@@ -1106,8 +1067,7 @@ fn partition_due<T: NamedEntry + Clone>(
 }
 
 /// Merge forced (cadence-bypassing) entries into `due`. Skips profiles that are
-/// `Switching`/`Refreshing` — the switch worker owns the `TokenList` write
-/// window; `rotate_one_inner` owns the refresh token — and entries already due.
+/// `Refreshing` — `rotate_one_inner` owns the refresh token — and entries already due.
 fn merge_forced<T: NamedEntry + Clone>(
     snapshot: &[T],
     forced: &HashSet<String>,
@@ -1122,7 +1082,7 @@ fn merge_forced<T: NamedEntry + Clone>(
     let switching: HashSet<String> = match activity.lock() {
         Ok(a) => a
             .iter()
-            .filter(|(_, v)| matches!(v, ProfileActivity::Switching | ProfileActivity::Refreshing))
+            .filter(|(_, v)| matches!(v, ProfileActivity::Refreshing))
             .map(|(n, _)| n.clone())
             .collect(),
         Err(_) => snapshot.iter().map(|e| e.name().to_string()).collect(),

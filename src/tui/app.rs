@@ -41,7 +41,7 @@ use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityKind, ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
+    ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
     OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RefetchQueue,
     StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
     ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageInfo, UsageStore,
@@ -3438,57 +3438,27 @@ fn update_banner(app: &mut App) {
 }
 
 /// Drain worker op results: clear activity slots, toast errors/successes,
-/// rebuild token snapshot on Refreshing success.
+/// rebuild token snapshot on success.
 fn drain_op_results(app: &mut App) {
     let mut needs_token_snapshot_rebuild = false;
-    while let Ok(OpResult {
-        name,
-        kind,
-        outcome,
-    }) = app.op_results.try_recv()
-    {
-        // Only clear when the slot still reflects this op's kind.
-        // Invariant: `Fetching` is NEVER sent via OpResult (managed by the
-        // join loop directly); `Switching` never arrives either (UI-thread relink).
-        if matches!(kind, ActivityKind::Fetching) {
-            unreachable!(
-                "ActivityKind::Fetching must never be sent via OpResult; \
-                 the Fetching slot is managed by the join loop directly"
-            );
-        }
+    while let Ok(OpResult { name, outcome }) = app.op_results.try_recv() {
         if let Ok(mut a) = app.activity.lock()
-            && a.get(&name).copied() == Some(kind.as_activity())
+            && a.get(&name).copied() == Some(ProfileActivity::Refreshing)
         {
             a.remove(&name);
         }
         match outcome {
             Ok(()) => {
-                if kind == ActivityKind::Refreshing {
-                    needs_token_snapshot_rebuild = true;
-                    app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
-                    app.set_tab_activity(Tab::Usage, ToastKind::Info);
-                }
+                needs_token_snapshot_rebuild = true;
+                app.toast(ToastKind::Info, format!("rotated token for '{name}'"));
+                app.set_tab_activity(Tab::Usage, ToastKind::Info);
             }
             Err(e) => {
-                let verb = match kind {
-                    ActivityKind::Fetching => {
-                        unreachable!("ActivityKind::Fetching must never be sent via OpResult")
-                    }
-                    ActivityKind::Refreshing => "refresh",
-                    ActivityKind::Switching => "switch",
-                    ActivityKind::Starting => "start",
-                };
                 app.toast(
                     ToastKind::Danger,
-                    format!("{verb} for '{name}' failed: {e}"),
+                    format!("refresh for '{name}' failed: {e}"),
                 );
-                // Route the failure to the relevant tab.
-                let failure_tab = match kind {
-                    ActivityKind::Refreshing => Tab::Usage,
-                    ActivityKind::Switching | ActivityKind::Starting => Tab::Overview,
-                    _ => Tab::Overview,
-                };
-                app.set_tab_activity(failure_tab, ToastKind::Danger);
+                app.set_tab_activity(Tab::Usage, ToastKind::Danger);
             }
         }
     }

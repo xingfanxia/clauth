@@ -11,8 +11,8 @@ use crate::profile::{
 };
 use crate::runtime::{RotationGuard, has_live_session};
 use crate::usage::{
-    ActivityKind, ActivityStore, OpResult, OpResultSender, ProfileActivity, RefetchQueue,
-    clear_activity, mark_activity, now_ms,
+    ActivityStore, OpResult, OpResultSender, ProfileActivity, RefetchQueue, clear_activity,
+    mark_activity, now_ms,
 };
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup to
@@ -322,7 +322,6 @@ fn rotate_one_inner(
     }
     let _ = sender.send(OpResult {
         name: name.to_string(),
-        kind: ActivityKind::Refreshing,
         outcome,
     });
     RotateOutcome::Persisted(applied)
@@ -421,7 +420,6 @@ pub(crate) fn refresh_all(
             Ok((n, RotateOutcome::GuardBusy)) => {
                 let _ = sender.send(OpResult {
                     name: n.clone(),
-                    kind: ActivityKind::Refreshing,
                     outcome: Err(anyhow::anyhow!("failed to acquire rotation lock")),
                 });
                 clear_activity(activity, &n);
@@ -469,7 +467,6 @@ pub(crate) fn rotate_one(
         RotateOutcome::GuardBusy => {
             let _ = sender.send(OpResult {
                 name: name.to_string(),
-                kind: ActivityKind::Refreshing,
                 outcome: Err(anyhow::anyhow!("failed to acquire rotation lock")),
             });
             clear_activity(activity, name);
