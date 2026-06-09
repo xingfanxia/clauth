@@ -204,11 +204,13 @@ struct Stat {
 }
 
 /// Seconds until the window hits 100% at the current burn rate.
-fn eta_left(rate: f64, pct: f64) -> Option<String> {
+/// `rate` may be in %/h or %/d (determined by `rate_unit`).
+fn eta_left(rate: f64, pct: f64, rate_unit: &str) -> Option<String> {
     if rate <= 0.0 || pct >= 100.0 {
         return None;
     }
-    let hours = (100.0 - pct) / rate;
+    let rate_per_h = if rate_unit == "d" { rate / 24.0 } else { rate };
+    let hours = (100.0 - pct) / rate_per_h;
     let secs = (hours * 3600.0) as i64;
     if secs <= 0 {
         return None;
@@ -224,7 +226,7 @@ impl Stat {
         };
         let mut w =
             " · ".chars().count() + format!("{:.1} %/{}", rate, self.rate_unit).chars().count();
-        if let Some(dur) = eta_left(rate, self.pct) {
+        if let Some(dur) = eta_left(rate, self.pct, self.rate_unit) {
             w += " · ".chars().count() + dur.chars().count() + " left".chars().count();
         }
         w
@@ -269,7 +271,7 @@ impl Stat {
             let rate_str = format!("{:.1} %/{}", rate, self.rate_unit);
             label_spans.push(Span::styled(rate_str.clone(), rate_color));
 
-            if let Some(dur) = eta_left(rate, self.pct) {
+            if let Some(dur) = eta_left(rate, self.pct, self.rate_unit) {
                 label_spans.push(Span::styled(format!(" · {dur} left"), theme::faint()));
             }
 
