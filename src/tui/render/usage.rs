@@ -162,8 +162,8 @@ fn build_usage_lines(
             window_rates.extend(crate::usage::compute_burn_rates_from_history(
                 history,
                 &seven_d,
-                10,
-                6 * 60 * 60 * 1000,
+                50,
+                24 * 60 * 60 * 1000,
             ));
         }
     }
@@ -210,7 +210,7 @@ fn eta_left(rate: f64, pct: f64) -> Option<String> {
     }
     let hours = (100.0 - pct) / rate;
     let secs = (hours * 3600.0) as i64;
-    if secs <= 60 {
+    if secs <= 0 {
         return None;
     }
     Some(crate::usage::humanize_duration(secs))

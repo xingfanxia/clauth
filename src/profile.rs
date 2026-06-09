@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -402,6 +402,42 @@ struct HistoryLine {
     #[serde(rename = "name")]
     _name: String,
     usage: UsageInfo,
+}
+
+/// Prune a profile's usage_history.jsonl to keep at most 2 days of entries.
+/// Called at startup only — rewrites the file in-place when there's anything
+/// to remove. No-op when the file is missing, unparseable, or already within
+/// the retention window.
+pub(crate) fn prune_usage_history(name: &str) {
+    let Ok(path) = profile_history_path(name) else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let cutoff = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        - 2 * 24 * 60 * 60 * 1000;
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut pruned: usize = 0;
+    for line in content.lines() {
+        if let Ok(entry) = serde_json::from_str::<HistoryLine>(line) {
+            if entry.ts >= cutoff {
+                kept.push(line);
+            } else {
+                pruned += 1;
+            }
+        }
+    }
+
+    if pruned > 0 {
+        let body = kept.join("\n");
+        let body = if body.is_empty() { body } else { body + "\n" };
+        let _ = std::fs::write(&path, body);
+    }
 }
 
 /// Load all parsed entries from a profile's usage_history.jsonl.

@@ -805,6 +805,11 @@ impl App {
 
         // Kick the best-effort update check on its own thread; its verdict lands
         // in `update_results` and is toasted from `on_tick`.
+        // Prune old history entries before loading (startup-only).
+        for profile in &config.profiles {
+            crate::profile::prune_usage_history(profile.name.as_str());
+        }
+
         let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
         let mut history_mtimes: HashMap<String, std::time::SystemTime> = HashMap::new();
         for profile in &config.profiles {
