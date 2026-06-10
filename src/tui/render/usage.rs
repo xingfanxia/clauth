@@ -85,7 +85,8 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         tick: app.tick_count,
     };
 
-    let lines = build_usage_lines(profile, inner.width, &header, app);
+    let show_estimates = cfg.state.show_estimates;
+    let lines = build_usage_lines(profile, inner.width, &header, app, show_estimates);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
@@ -94,6 +95,7 @@ fn build_usage_lines(
     inner_w: u16,
     header: &HeaderState,
     app: &App,
+    show_estimates: bool,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.extend(header_lines(profile, inner_w, header));
@@ -179,6 +181,12 @@ fn build_usage_lines(
                 r
             }
         });
+    }
+
+    if !show_estimates {
+        for stat in &mut stats {
+            stat.burn_rate = None;
+        }
     }
 
     let max_rate_w = stats

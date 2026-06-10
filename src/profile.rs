@@ -209,8 +209,20 @@ pub(crate) struct AppState {
     /// detect applies when this is `None` and no flag was passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) theme: Option<ThemeName>,
+    /// When false, burn-rate estimates ("34.4 %/h · 1h 56m left") are hidden
+    /// in the Usage tab even when data is available.
+    #[serde(default = "default_show_estimates", skip_serializing_if = "is_true")]
+    pub(crate) show_estimates: bool,
     #[serde(default = "default_refresh_interval")]
     pub(crate) refresh_interval_ms: u64,
+}
+
+fn default_show_estimates() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// Default interval new profiles.toml uses. Kept in one place — everything else
@@ -229,6 +241,7 @@ impl Default for AppState {
             fallback_chain: Vec::new(),
             wrap_off: false,
             theme: None,
+            show_estimates: true,
             refresh_interval_ms: default_refresh_interval(),
         }
     }

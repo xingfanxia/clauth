@@ -313,6 +313,8 @@ pub(crate) enum ActionMenuAction {
     // Status tab
     RefreshStatus,
     OpenIncidentLink,
+    // Usage
+    ToggleEstimates,
 }
 
 /// State for the action-menu modal.
@@ -364,6 +366,7 @@ impl ActionMenuAction {
     fn preferred_hotkey(&self) -> Option<char> {
         match self {
             Self::RotateTokens => Some('t'),
+            Self::ToggleEstimates => Some('e'),
             _ => None,
         }
     }
@@ -389,6 +392,7 @@ impl ActionMenuAction {
             Self::StepRefreshInterval => "step refresh interval",
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
+            Self::ToggleEstimates => "toggle estimates",
         }
     }
 }
@@ -1595,6 +1599,7 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up => step_profile_cursor(app, -1, count),
         KeyCode::Down => step_profile_cursor(app, 1, count),
+        KeyCode::Char('e') => toggle_show_estimates(app),
         _ => {}
     }
 }
@@ -2056,6 +2061,15 @@ fn toggle_wrap_off(app: &mut App) {
     app.last_state_mtime = app_state_mtime();
 }
 
+fn toggle_show_estimates(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.show_estimates = !cfg.state.show_estimates;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+}
+
 /// Step the global refresh interval through preset values (`+` = faster, `-` = slower).
 fn step_refresh_interval(app: &mut App, dir: i32) {
     const PRESETS: [u64; 6] = [15_000, 30_000, 60_000, 90_000, 120_000, 300_000];
@@ -2390,6 +2404,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
         }
         Tab::Usage => {
             actions.push(RefreshUsage);
+            actions.push(ToggleEstimates);
         }
         Tab::Setup => match app.config_focus {
             ConfigFocus::Profiles => {
@@ -2598,6 +2613,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::StepRefreshInterval => step_refresh_interval(app, 1),
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
+        ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
     }
 }
 
