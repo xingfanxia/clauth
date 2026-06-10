@@ -570,6 +570,7 @@ fn burn_rate_eta(
             std::slice::from_ref(&pair),
             5,
             30 * 60 * 1000,
+            10 * 60 * 1000, // gap_cut_ms: cut idle gaps for ETA projection
         );
         rates.remove("5h").flatten()
     })?;

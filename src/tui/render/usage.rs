@@ -156,6 +156,7 @@ fn build_usage_lines(
                 &five_h,
                 5,
                 30 * 60 * 1000,
+                10 * 60 * 1000, // gap_cut_ms: cut idle gaps for short-horizon windows
             ));
         }
         if !seven_d.is_empty() {
@@ -164,6 +165,7 @@ fn build_usage_lines(
                 &seven_d,
                 50,
                 24 * 60 * 60 * 1000,
+                0, // gap_cut_ms: disabled for daily windows
             ));
         }
     }

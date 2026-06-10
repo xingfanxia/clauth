@@ -1082,7 +1082,8 @@ impl App {
 
         // Append history JSONL for every profile whose usage just changed.
         for (name, usage) in &usage_snapshots {
-            let changed = match self.last_history_usage.get(name.as_str()) {
+            let old_usage = self.last_history_usage.get(name.as_str()).cloned();
+            let changed = match &old_usage {
                 Some(last) => serde_json::to_string(last).ok() != serde_json::to_string(usage).ok(),
                 None => true,
             };
@@ -1097,6 +1098,21 @@ impl App {
                         .open(&path)
                 {
                     let ts = now_ms();
+                    // Bridge: stamp the old value one ms before the new sample
+                    // so the idle end has temporal density for burn-rate anchors
+                    // without sharing an instant with the live entry.
+                    if let Some(last) = &old_usage {
+                        let last_json = serde_json::to_string(last).unwrap_or_default();
+                        let name_json = serde_json::to_string(name)
+                            .unwrap_or_else(|_| format!(r#""{}""#, name));
+                        let _ = writeln!(
+                            file,
+                            r#"{{"ts":{},"name":{},"usage":{}}}"#,
+                            ts.saturating_sub(1),
+                            name_json,
+                            last_json,
+                        );
+                    }
                     let usage_json = serde_json::to_string(usage).unwrap_or_default();
                     let name_json =
                         serde_json::to_string(name).unwrap_or_else(|_| format!(r#""{}""#, name));
