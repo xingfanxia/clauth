@@ -135,7 +135,7 @@ struct RawProfileOrg {
 /// distinguish a 401 (refresh + retry) from a connection blip (cache); a 429
 /// gets its own variant carrying the server's `retry-after` hint (rate-limited,
 /// cache — never rotate, defer the next attempt).
-pub(crate) enum FetchError {
+pub(super) enum FetchError {
     Status(u16),
     /// HTTP 429. `retry_after` is the server's `retry-after` header when
     /// present in delta-seconds form (the HTTP-date form is treated as absent).
@@ -196,7 +196,7 @@ fn get_json(url: &str, access_token: &str) -> std::result::Result<String, FetchE
         .map_err(|_| FetchError::Network)
 }
 
-pub(crate) fn fetch_raw(access_token: &str) -> std::result::Result<UsageInfo, FetchError> {
+pub(super) fn fetch_raw(access_token: &str) -> std::result::Result<UsageInfo, FetchError> {
     let usage_text = get_json(USAGE_ENDPOINT, access_token)?;
     let raw: RawUsage = serde_json::from_str(&usage_text).map_err(|_| FetchError::Parse)?;
 
