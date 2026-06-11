@@ -117,6 +117,11 @@ fn sync_paths(paths: &[PathBuf]) -> Result<()> {
     }
 
     // Newest mtime wins; path breaks ties for determinism.
+    // Non-empty invariant: callers guard against empty members before calling.
+    #[allow(
+        clippy::expect_used,
+        reason = "non-empty invariant guaranteed by caller"
+    )]
     let winner = members
         .iter()
         .enumerate()

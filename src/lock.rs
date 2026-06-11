@@ -49,6 +49,10 @@ impl StateLock {
         let depth = DEPTH.get();
         if depth > 0 {
             // This thread already holds the mutex — increment depth.
+            #[allow(
+                clippy::expect_used,
+                reason = "lock depth overflow is a programming error, unrecoverable"
+            )]
             DEPTH.set(
                 depth
                     .checked_add(1)

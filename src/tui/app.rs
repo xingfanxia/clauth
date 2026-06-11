@@ -905,6 +905,7 @@ impl App {
 
     /// Lock the shared AppConfig. Order: AppConfig outer, `with_state_lock` inner.
     pub(crate) fn config(&self) -> RankedGuard<'_, AppConfig> {
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         self.config.lock().expect("config mutex poisoned")
     }
 
@@ -931,6 +932,7 @@ impl App {
 
             // Re-establish the credentials symlink (shutdown replaced it with
             // a plain file); without this, CC refreshes bypass the profile.
+            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             let active = config
                 .lock()
                 .expect("config mutex poisoned")
@@ -942,6 +944,7 @@ impl App {
             }
 
             let interval_ms = refresh_interval.load(Ordering::Relaxed);
+            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             let snapshot = collect_tokens(&config.lock().expect("config mutex poisoned").profiles);
             fetch_all_into(
                 &config,
@@ -1142,15 +1145,18 @@ impl App {
             *self.config() = fresh;
             self.last_state_mtime = current;
             let profiles = &self.config().profiles;
-            *self
-                .usage_tokens
-                .lock()
-                .expect("usage_tokens mutex poisoned") = collect_tokens(profiles);
-            *self
-                .third_party_tokens
-                .lock()
-                .expect("third_party_tokens mutex poisoned") =
-                collect_third_party_entries(profiles);
+            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+            {
+                *self
+                    .usage_tokens
+                    .lock()
+                    .expect("usage_tokens mutex poisoned") = collect_tokens(profiles);
+                *self
+                    .third_party_tokens
+                    .lock()
+                    .expect("third_party_tokens mutex poisoned") =
+                    collect_third_party_entries(profiles);
+            }
             true
         } else {
             false
@@ -1162,18 +1168,22 @@ impl App {
         // invert lock order (TOKENS is outer of CONFIG).
         let tokens = collect_tokens(&self.config().profiles);
         let third_party = collect_third_party_entries(&self.config().profiles);
-        *self
-            .usage_tokens
-            .lock()
-            .expect("usage_tokens mutex poisoned") = tokens;
-        *self
-            .third_party_tokens
-            .lock()
-            .expect("third_party_tokens mutex poisoned") = third_party;
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        {
+            *self
+                .usage_tokens
+                .lock()
+                .expect("usage_tokens mutex poisoned") = tokens;
+            *self
+                .third_party_tokens
+                .lock()
+                .expect("third_party_tokens mutex poisoned") = third_party;
+        }
     }
 
     /// Queue every profile for an immediate re-fetch (Overview `r`).
     pub(crate) fn manual_refresh(&self) {
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let names: Vec<String> = self
             .usage_tokens
             .lock()

@@ -289,6 +289,7 @@ fn rotate_one_inner(
         return RotateOutcome::GuardBusy;
     };
     let token = {
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
         with_state_lock(|| {
             if !force && has_live_session(name) {
@@ -372,6 +373,7 @@ pub(crate) fn refresh_all(
     sender: &OpResultSender,
 ) -> Vec<String> {
     let snapshots = {
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
         rotation_candidates(&cfg, force)
     };
@@ -495,6 +497,7 @@ pub(crate) fn rotate_one(
 /// is the whole gate.
 pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &str) -> bool {
     let (access_token, refresh_token, expires_at) = {
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
         match with_state_lock(|| {
             let Some(profile) = cfg.find(name) else {
@@ -549,6 +552,7 @@ pub(crate) fn apply_rotated_tokens_locked(
     name: &str,
     tok: TokenResponse,
 ) -> Result<()> {
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     let mut cfg = config.lock().expect("config mutex poisoned");
     with_state_lock(|| {
         let Some(profile) = cfg.find_mut(name) else {

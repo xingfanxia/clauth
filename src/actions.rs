@@ -91,6 +91,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
 
     if reconciled {
         let active = {
+            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             let cfg = config.lock().expect("config mutex poisoned");
             cfg.state
                 .active_profile
@@ -109,6 +110,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
         std::io::stdin().read_line(&mut answer)?;
         let answer = answer.trim().to_ascii_lowercase();
         if answer.is_empty() || answer == "y" || answer == "yes" {
+            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             let mut cfg = config.lock().expect("config mutex poisoned");
             switch_profile_reconciled(&mut cfg, canonical)?;
         } else {
@@ -116,6 +118,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
             return Ok(());
         }
     } else {
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let mut cfg = config.lock().expect("config mutex poisoned");
         switch_profile(&mut cfg, canonical)?;
     }
