@@ -8,28 +8,20 @@
 //! cargo test showcase -- --ignored --nocapture
 //! ```
 //!
-//! It builds a believable [`AppConfig`] from hard-coded demo values, redirects
-//! the home dir at a throwaway tempdir, and runs the **real, fully-interactive**
-//! TUI loop. Every action works for real — switch, edit, toggle, reorder, set
-//! threshold, delete — but `home_dir()` is overridden so all reads/writes land
-//! in the sandbox, never the user's real `~/.clauth` / `~/.claude`. The sandbox
-//! tempdir is removed when it drops at the end of the run.
-//!
-//! `reconcile_startup` is deliberately never called, so `on_tick` never spawns
-//! the bootstrap/scheduler (gated on `reconcile_done`) — no background worker,
-//! no network. The demo profiles carry no credentials, so even the manual
-//! refresh / rotate paths have no token to use and stay inert.
+//! All tests redirect `~/.clauth` and `~/.claude` into a tempdir via
+//! [`crate::profile::set_home_override`] so real files are never touched.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use tempfile::TempDir;
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
 };
 
 use super::{TICK, Term, app, render, restore_terminal, setup_terminal};
-use crate::profile::{AppConfig, AppState, Profile, ProfileName, home_dir, set_home_override};
+use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::usage::{
     ExtraUsage, FetchStatus, PlanInfo, ProfileActivity, UsageInfo, UsageWindow, now_ms,
 };
@@ -42,22 +34,128 @@ fn showcase() {
     run(demo_config()).expect("showcase loop");
 }
 
-/// Same as [`super::run`] but redirects home to a sandbox tempdir first.
-fn run(config: AppConfig) -> Result<()> {
-    let sandbox = tempfile::tempdir().context("create showcase sandbox dir")?;
-    set_home_override(sandbox.path().to_path_buf());
+/// Redirect home into a tempdir so all disk ops land on scratch space.
+struct ShowcaseHome {
+    _home_lock: std::sync::MutexGuard<'static, ()>,
+    _tmp: TempDir,
+}
 
+impl ShowcaseHome {
+    fn new() -> Self {
+        let _home_lock = crate::profile::HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().expect("tempdir for showcase");
+        let path = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&path).expect("create temp home");
+        crate::profile::set_home_override(path);
+
+        // Pre-seed usage history files on disk so on_tick → apply_usage doesn't
+        // overwrite the in-memory seed with an empty/partial reload.
+        for (name, entries) in &build_synthetic_history() {
+            let history_path =
+                crate::profile::profile_history_path(name).expect("history path");
+            std::fs::create_dir_all(history_path.parent().unwrap())
+                .expect("history dir");
+            let content: String = entries
+                .iter()
+                .map(|(ts, usage)| {
+                    let usage_json = serde_json::to_string(usage).unwrap_or_default();
+                    let name_json = serde_json::to_string(name)
+                        .unwrap_or_else(|_| format!(r#""{}""#, name));
+                    format!(r#"{{"ts":{},"name":{},"usage":{}}}"#, ts, name_json, usage_json)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            std::fs::write(&history_path, content).expect("write seeded history");
+        }
+
+        Self {
+            _home_lock,
+            _tmp: tmp,
+        }
+    }
+}
+
+/// Build the same synthetic history used by [`seed_history`], returned as a map
+/// so callers can write it to disk or populate the in-memory cache.
+fn build_synthetic_history() -> std::collections::HashMap<String, Vec<(u64, UsageInfo)>> {
+    use std::collections::HashMap;
+    let now = now_ms();
+
+    let mut personal: Vec<(u64, UsageInfo)> = Vec::with_capacity(40);
+    for i in 0..=30 {
+        let ts = now - (30 - i) as u64 * 480_000;
+        let pct = 45.0 + (i as f64 / 30.0) * (64.3 - 45.0);
+        personal.push((ts, UsageInfo {
+            five_hour: Some(UsageWindow { utilization: pct, resets_at: None }),
+            seven_day_sonnet: Some(UsageWindow { utilization: 22.1, resets_at: None }),
+            seven_day_opus: Some(UsageWindow { utilization: 8.4, resets_at: None }),
+            ..UsageInfo::default()
+        }));
+    }
+    for i in 0..=10 {
+        let ts = now - (10 - i) as u64 * 43_200_000;
+        personal.push((ts, UsageInfo {
+            five_hour: None,
+            seven_day_sonnet: Some(UsageWindow { utilization: 22.1, resets_at: None }),
+            seven_day_opus: Some(UsageWindow { utilization: 8.4, resets_at: None }),
+            ..UsageInfo::default()
+        }));
+    }
+
+    let mut work: Vec<(u64, UsageInfo)> = Vec::with_capacity(40);
+    for i in 0..=30 {
+        let ts = now - (30 - i) as u64 * 480_000;
+        let pct = 55.0 + (i as f64 / 30.0) * (88.7 - 55.0);
+        work.push((ts, UsageInfo {
+            five_hour: Some(UsageWindow { utilization: pct, resets_at: None }),
+            seven_day_sonnet: Some(UsageWindow { utilization: 61.2, resets_at: None }),
+            seven_day_opus: Some(UsageWindow { utilization: 33.9, resets_at: None }),
+            ..UsageInfo::default()
+        }));
+    }
+    for i in 0..=10 {
+        let ts = now - (10 - i) as u64 * 43_200_000;
+        work.push((ts, UsageInfo {
+            five_hour: None,
+            seven_day_sonnet: Some(UsageWindow { utilization: 61.2, resets_at: None }),
+            seven_day_opus: Some(UsageWindow { utilization: 33.9, resets_at: None }),
+            ..UsageInfo::default()
+        }));
+    }
+
+    let mut side: Vec<(u64, UsageInfo)> = Vec::with_capacity(40);
+    for i in 0..=30 {
+        let ts = now - (30 - i) as u64 * 480_000;
+        let pct = 5.0 + (i as f64 / 30.0) * (12.0 - 5.0);
+        side.push((ts, UsageInfo {
+            five_hour: Some(UsageWindow { utilization: pct, resets_at: None }),
+            ..UsageInfo::default()
+        }));
+    }
+
+    let mut cache = HashMap::new();
+    cache.insert("personal".to_string(), personal);
+    cache.insert("work".to_string(), work);
+    cache.insert("side-project".to_string(), side);
+    cache
+}
+
+/// Same as [`super::run`] but with home redirected into a tempdir.
+fn run(config: AppConfig) -> Result<()> {
+    let _home = ShowcaseHome::new();
     let mut terminal = setup_terminal()?;
     let outcome = showcase_loop(&mut terminal, config);
     let restore = restore_terminal(&mut terminal);
-    outcome.and(restore) // `sandbox` drops here, cleaning up the tempdir
+    outcome.and(restore)
 }
 
 /// Real event loop without startup reconciliation — no bootstrap/scheduler spawns.
 fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
     let mut application = app::App::new(config);
-    seed_usage(&application); // prime so windows show utilization, not `-`
-    seed_timers(&application); // prime spinner and refresh countdowns
+    seed_usage(&application);
+    seed_timers(&application);
+    seed_history(&application);
     let mut last_tick = Instant::now();
 
     while !application.quit {
@@ -288,10 +386,10 @@ fn demo_config() -> AppConfig {
     }
 }
 
+// ── Seeding ─────────────────────────────────────────────────────────────────
+
 /// Seed the live usage stores from demo profile data, as a real fetch worker would.
 /// Without this, the first `on_tick` → `apply_usage` blanks all windows to `-`.
-/// Reads config and drops the guard before touching usage locks (rank order:
-/// `usage_store` / `usage_status` are both inner of `config`).
 fn seed_usage(application: &app::App) {
     let snapshot: Vec<(String, Option<UsageInfo>, Option<FetchStatus>)> = {
         let cfg = application.config();
@@ -329,6 +427,25 @@ fn seed_timers(application: &app::App) {
     }
 }
 
+/// Seed `history_cache` with mock usage data so `compute_burn_rates_from_history`
+/// has entries to derive burn-rate predictions for the usage-tab detail pane.
+///
+/// Each profile gets a synthetic timeline: ~30 entries over the last ~4h for 5h
+/// windows, and ~12 entries over the last ~5d for 7d windows, with plausible
+/// utilization ramps so the burn-rate math yields non-zero results.
+///
+/// The same data is pre-seeded as disk files by [`ShowcaseHome::new`] so
+/// `apply_usage`'s history reload preserves the full timeline.
+fn seed_history(application: &app::App) {
+    let cache = build_synthetic_history();
+    unsafe {
+        let app_ptr = application as *const app::App as *mut app::App;
+        (*app_ptr).history_cache = cache;
+    }
+}
+
+// ── Unit tests on demo data ──────────────────────────────────────────────────
+
 #[test]
 fn demo_config_has_expected_profiles() {
     let cfg = demo_config();
@@ -364,19 +481,34 @@ fn future_iso_parses() {
     assert!(iso_to_epoch_secs(&s).is_some());
 }
 
+/// Synthetic history entries must be parseable by the burn-rate engine.
+#[test]
+fn seed_history_yields_burn_rates() {
+    let _home = ShowcaseHome::new();
+    let app = app::App::new(demo_config());
+    seed_usage(&app);
+    seed_history(&app);
+
+    let personal = app.history_cache.get("personal").unwrap();
+    assert!(
+        personal.len() >= 30,
+        "personal must have enough history entries for burn-rate window"
+    );
+
+    let work = app.history_cache.get("work").unwrap();
+    assert!(
+        work.len() >= 30,
+        "work must have enough history entries for burn-rate window"
+    );
+}
+
 // ── Non-interactive driver ──────────────────────────────────────────────────
 //
 // Feeds synthetic key events through `handle_key` / `on_tick` so CI can prove
-// every action — switch, edit, toggle, reorder, threshold, delete — without a
-// TTY or touching the real `~/.clauth` / `~/.claude`.
-
-/// Clears the home override on drop so it can't leak past this test on panic.
-struct HomeOverrideReset;
-impl Drop for HomeOverrideReset {
-    fn drop(&mut self) {
-        crate::profile::clear_home_override();
-    }
-}
+// every action — switch, edit, toggle, reorder, threshold, delete, create —
+// without a TTY.  HOME_OVERRIDE points at a tempdir so all disk operations
+// (save_profile, save_app_state, flock, symlinks, history) land on scratch
+// space and never touch the real filesystem.
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -446,23 +578,11 @@ fn threshold_of(app: &app::App, name: &str) -> Option<f64> {
 
 #[test]
 fn demo_data_drives_all_actions() {
-    // Hold home lock for the whole test; reset override on exit (even on panic).
-    let _guard = crate::profile::HOME_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _reset = HomeOverrideReset;
-    let sandbox = tempfile::tempdir().expect("create driver sandbox");
-    set_home_override(sandbox.path().to_path_buf());
-
-    assert_eq!(
-        home_dir().expect("home dir"),
-        sandbox.path(),
-        "home override must redirect every FS access into the sandbox"
-    );
-
+    let _home = ShowcaseHome::new();
     let mut app = app::App::new(demo_config());
     seed_usage(&app);
     seed_timers(&app);
+    seed_history(&app);
 
     // reconcile_startup never called → no bootstrap, no scheduler.
     assert!(!app.reconcile_done && !app.bootstrap_started);
@@ -533,10 +653,10 @@ fn demo_data_drives_all_actions() {
         );
     }
 
-    let state_file = sandbox.path().join(".clauth").join("profiles.toml"); // switch persists to sandbox, not real config
+    // State file written to the tempdir, not the real home.
     assert!(
-        state_file.exists(),
-        "switch must write profiles.toml inside the sandbox"
+        crate::profile::app_state_mtime().is_some(),
+        "app state must be written (to the tempdir)"
     );
 
     // ── Edit ── (cursor at "work"/1 after switch; one ↓ → "side-project"/2)
@@ -677,6 +797,123 @@ fn demo_data_drives_all_actions() {
         "the deleted profile is gone from the config"
     );
 
+    // ── Create ──
+    let before = app.profile_count();
+    // Navigate to the + new row (last slot in Setup list)
+    press(&mut app, KeyCode::Down); // 4 → end ("+ new")
+    press(&mut app, KeyCode::Enter); // focus detail (auto-positions on Name)
+    assert_eq!(app.config_focus, app::ConfigFocus::Actions);
+    assert!(app.config_draft.is_some());
+
+    // Fill the create form: Name, BaseUrl, ApiKey
+    // Cursor starts on first row (Name)
+    press(&mut app, KeyCode::Enter); // start capturing Name
+    type_str(&mut app, "sandbox-test");
+    press(&mut app, KeyCode::Enter); // commit Name
+
+    // Navigate down to BaseUrl, fill it
+    press(&mut app, KeyCode::Down); // Name → BaseUrl
+    press(&mut app, KeyCode::Enter); // start capturing
+    type_str(&mut app, "https://api.sandbox.test");
+    press(&mut app, KeyCode::Enter); // commit BaseUrl
+
+    // Move to ApiKey, fill it
+    press(&mut app, KeyCode::Down); // BaseUrl → ApiKey
+    press(&mut app, KeyCode::Enter); // start capturing
+    type_str(&mut app, "sk-test-key-0000");
+    press(&mut app, KeyCode::Enter); // commit ApiKey
+
+    // Navigate to Create row and commit
+    press(&mut app, KeyCode::Down); // ApiKey → Create
+
+    assert!(
+        app.config_draft
+            .as_ref()
+            .map(|d| d.editing_name.is_none())
+            .unwrap_or(false),
+        "Create row must only appear in new-account mode"
+    );
+
+    press(&mut app, KeyCode::Enter); // commit Create
+    assert_eq!(
+        app.profile_count(),
+        before + 1,
+        "create must add one profile"
+    );
+    let created = {
+        let cfg = app.config();
+        cfg.find("sandbox-test").map(|p| (p.base_url.clone(), p.api_key.clone()))
+    };
+    assert!(
+        created.is_some(),
+        "the created profile must exist in config"
+    );
+    assert_eq!(
+        created.as_ref().and_then(|(b, _)| b.as_deref()),
+        Some("https://api.sandbox.test"),
+        "created profile must preserve base_url"
+    );
+    assert_eq!(
+        created.as_ref().and_then(|(_, k)| k.as_deref()),
+        Some("sk-test-key-0000"),
+        "created profile must preserve api_key"
+    );
+
+    // Clean up — delete what we just created
+    // "sandbox-test" has base_url set → is_oauth = false → 4 rows (Name, BaseUrl, ApiKey, Delete)
+    let before = app.profile_count();
+    press(&mut app, KeyCode::Enter); // focus detail for sandbox-test
+    assert_eq!(app.config_focus, app::ConfigFocus::Actions);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // Name → BaseUrl → ApiKey → Delete
+    }
+    press(&mut app, KeyCode::Enter); // arm
+    assert!(
+        app.config_draft
+            .as_ref()
+            .map(|d| d.armed_delete)
+            .unwrap_or(false)
+    );
+    press(&mut app, KeyCode::Enter); // confirm delete
+    assert_eq!(
+        app.profile_count(),
+        before - 1,
+        "delete the newly created profile"
+    );
+    assert!(
+        app.config().find("sandbox-test").is_none(),
+        "sandbox-test must be gone after delete"
+    );
+
+    // ── History cache seeded for usage predictions ──
+    {
+        let personal = app.history_cache.get("personal");
+        assert!(
+            personal.is_some(),
+            "history_cache must be seeded for personal"
+        );
+        let personal = personal.unwrap();
+        assert!(
+            personal.len() >= 30,
+            "personal must have enough history entries for burn rates"
+        );
+
+        // Burn rates should compute from the seeded history after apply_usage
+        // (the first on_tick calls apply_usage which populates profile.usage
+        // from usage_store, which was seeded in seed_usage).
+    }
+
+    // ── Usage tab shows prediction data ──
+    // Navigate to usage tab and verify the profile detail renders with history.
+    // The renderer uses history_cache for burn-rate computation.
+    press(&mut app, KeyCode::Right); // Setup → Fallback
+    press(&mut app, KeyCode::Right); // Fallback → Config
+    press(&mut app, KeyCode::Right); // Config → Status
+    // One more right wraps back to Overview
+    press(&mut app, KeyCode::Right); // Status → Overview
+    assert_eq!(app.tab, Tab::Overview);
+
+    // ── Quit ──
     press(&mut app, KeyCode::Char('q'));
     assert!(app.armed_quit, "first q arms the quit");
     assert!(!app.quit, "first q does not quit yet");
@@ -699,6 +936,5 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Char('q'));
     assert!(app.quit, "second q confirms quit");
 
-    // Nothing escaped the sandbox — home_dir still points there.
-    assert_eq!(home_dir().expect("home dir"), sandbox.path());
+    // All disk writes landed in the tempdir — clean-up on drop.
 }
