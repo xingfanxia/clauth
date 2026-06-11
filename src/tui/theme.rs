@@ -228,6 +228,11 @@ pub(crate) fn body() -> Style {
     Style::default().fg(text_color())
 }
 
+/// Hairline chrome — tooltip `└ ` leaders and borders at `line_color()`.
+pub(crate) fn line() -> Style {
+    Style::default().fg(line_color())
+}
+
 /// Stronger line color — empty-gauge track and structural fills above `line_color()`.
 pub(crate) fn line_strong() -> Style {
     Style::default().fg(line_strong_color())
@@ -275,6 +280,11 @@ pub(crate) fn util_color(pct: f64) -> Color {
     } else {
         text_dim_color()
     }
+}
+
+/// `util_color` as a ready-to-use foreground style.
+pub(crate) fn util(pct: f64) -> Style {
+    Style::default().fg(util_color(pct))
 }
 
 /// Sapphire info accent; spinner color for refresh ops.

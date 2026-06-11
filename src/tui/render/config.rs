@@ -164,13 +164,17 @@ fn draw_settings_rows(
     actions_focused: bool,
 ) {
     let draft = app.config_draft.as_ref();
+    let snap_inputs;
     let (name_in, base_in, key_in) = match draft {
-        Some(d) => (d.name.clone(), d.base_url.clone(), d.api_key.clone()),
-        None => (
-            InputState::new(&snap.name),
-            InputState::new(&snap.base_url),
-            InputState::new(&snap.api_key),
-        ),
+        Some(d) => (&d.name, &d.base_url, &d.api_key),
+        None => {
+            snap_inputs = (
+                InputState::new(&snap.name),
+                InputState::new(&snap.base_url),
+                InputState::new(&snap.api_key),
+            );
+            (&snap_inputs.0, &snap_inputs.1, &snap_inputs.2)
+        }
     };
     let editing = draft.and_then(|d| d.active);
     let armed_delete = draft.map(|d| d.armed_delete).unwrap_or(false);
@@ -225,9 +229,9 @@ fn draw_settings_rows(
             is_editing,
             armed_delete,
             snap,
-            &name_in,
-            &base_in,
-            &key_in,
+            name_in,
+            base_in,
+            key_in,
         );
         if is_editing {
             edit_line_y = Some(line_idx);
@@ -255,9 +259,9 @@ fn draw_settings_rows(
     // Position the native terminal cursor at the caret when a field is active.
     if let (Some(row), Some(ly)) = (editing, edit_line_y) {
         let input = match row {
-            ConfigRow::Name => &name_in,
-            ConfigRow::BaseUrl => &base_in,
-            ConfigRow::ApiKey => &key_in,
+            ConfigRow::Name => name_in,
+            ConfigRow::BaseUrl => base_in,
+            ConfigRow::ApiKey => key_in,
             _ => return,
         };
         // x = "❯ " (2) + key+pad block (exactly KEY_W cols) + cols before caret

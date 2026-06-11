@@ -221,10 +221,7 @@ fn member_detail(
     let mut gauge_spans = vec![Span::styled(kv_key("5h usage"), theme::label())];
     gauge_spans.extend(gauge_with_tick(pct, Some(threshold)));
     if let Some(v) = pct {
-        gauge_spans.push(Span::styled(
-            format!("  {v:.0}% used"),
-            Style::default().fg(theme::util_color(v)),
-        ));
+        gauge_spans.push(Span::styled(format!("  {v:.0}% used"), theme::util(v)));
     } else {
         gauge_spans.push(Span::styled("  no data yet", theme::faint()));
     }
@@ -275,7 +272,7 @@ fn member_detail(
 /// in `text_style` (e.g. `faint`).
 fn tooltip(text: &str, text_style: Style) -> Line<'static> {
     Line::from(vec![
-        Span::styled("  └ ", Style::default().fg(theme::line_color())),
+        Span::styled("  └ ", theme::line()),
         Span::styled(text.to_string(), text_style),
     ])
 }
@@ -352,12 +349,12 @@ fn detail_row(
 fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
     // The terminal cursor (set via frame.set_cursor_position) owns the caret
     // glyph — render the whole buffer with uniform styling.
-    let fg = if invalid {
-        theme::danger_color()
+    let body = if invalid {
+        theme::danger()
     } else {
-        theme::text_color()
-    };
-    let body = Style::default().fg(fg).bg(theme::bg_sunken());
+        theme::body()
+    }
+    .bg(theme::bg_sunken());
     vec![Span::styled(input.value.clone(), body)]
 }
 
@@ -439,9 +436,9 @@ fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static
     let tick = threshold.map(|t| {
         (((t.clamp(0.0, 100.0) / 100.0) * GAUGE_W as f64).round() as usize).min(GAUGE_W - 1)
     });
-    let fill_color = match pct {
-        Some(v) => theme::util_color(v),
-        None => theme::text_faint_color(),
+    let fill_style = match pct {
+        Some(v) => theme::util(v),
+        None => theme::faint(),
     };
 
     let mut spans = vec![];
@@ -456,7 +453,7 @@ fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static
             };
             spans.push(Span::styled("│", style));
         } else if i < fill {
-            spans.push(Span::styled("█", Style::default().fg(fill_color)));
+            spans.push(Span::styled("█", fill_style));
         } else {
             spans.push(Span::styled("░", theme::line_strong()));
         }

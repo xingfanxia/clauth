@@ -920,51 +920,42 @@ impl App {
         let last_fetched = Arc::clone(&self.last_fetched);
         let refetch_queue = Arc::clone(&self.refetch_queue);
         let activity = Arc::clone(&self.activity);
-        let startup_sender = self.startup_sender.clone();
-        let bootstrap_active = Arc::clone(&self.bootstrap_active);
         let refresh_interval = Arc::clone(&self.refresh_interval);
+        let done = BootstrapDoneGuard {
+            bootstrap_active: Arc::clone(&self.bootstrap_active),
+            startup_sender: self.startup_sender.clone(),
+        };
 
-        let startup_sender_for_panic = startup_sender.clone();
-        let bootstrap_active_for_panic = Arc::clone(&bootstrap_active);
-        std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Re-establish the credentials symlink (shutdown replaced it with
-                // a plain file); without this, CC refreshes bypass the profile.
-                let active = config
-                    .lock()
-                    .expect("config mutex poisoned")
-                    .state
-                    .active_profile
-                    .clone();
-                if let Some(active) = active {
-                    let _ = link_profile_credentials(&active);
-                }
+        spawn_worker(move || {
+            let _done = done;
 
-                let interval_ms = refresh_interval.load(Ordering::Relaxed);
-                let snapshot =
-                    collect_tokens(&config.lock().expect("config mutex poisoned").profiles);
-                fetch_all_into(
-                    &config,
-                    &snapshot,
-                    &usage_store,
-                    &usage_status,
-                    &last_fetched,
-                    &refetch_queue,
-                    &activity,
-                    interval_ms,
-                );
-
-                // 5h windows are armed by the windowless scan in `on_tick` after
-                // bootstrap clears `bootstrap_active` — no startup-only kick pass.
-
-                bootstrap_active.store(false, Ordering::SeqCst);
-                let _ = startup_sender.send(StartupSignal::BootstrapDone);
-            }));
-            if result.is_err() {
-                // Panic path: clear flag and unblock the scheduler.
-                bootstrap_active_for_panic.store(false, Ordering::SeqCst);
-                let _ = startup_sender_for_panic.send(StartupSignal::BootstrapDone);
+            // Re-establish the credentials symlink (shutdown replaced it with
+            // a plain file); without this, CC refreshes bypass the profile.
+            let active = config
+                .lock()
+                .expect("config mutex poisoned")
+                .state
+                .active_profile
+                .clone();
+            if let Some(active) = active {
+                let _ = link_profile_credentials(&active);
             }
+
+            let interval_ms = refresh_interval.load(Ordering::Relaxed);
+            let snapshot = collect_tokens(&config.lock().expect("config mutex poisoned").profiles);
+            fetch_all_into(
+                &config,
+                &snapshot,
+                &usage_store,
+                &usage_status,
+                &last_fetched,
+                &refetch_queue,
+                &activity,
+                interval_ms,
+            );
+
+            // 5h windows are armed by the windowless scan in `on_tick` after
+            // bootstrap clears `bootstrap_active` — no startup-only kick pass.
         });
     }
 
@@ -3641,6 +3632,21 @@ fn poll_credentials_divergence(app: &mut App) {
     }
     app.modals
         .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+}
+
+/// Clears `bootstrap_active` and posts `BootstrapDone` when dropped — success
+/// or panic, the scheduler and UI thread are never left blocked on a crashed
+/// bootstrap.
+struct BootstrapDoneGuard {
+    bootstrap_active: Arc<AtomicBool>,
+    startup_sender: StartupSender,
+}
+
+impl Drop for BootstrapDoneGuard {
+    fn drop(&mut self) {
+        self.bootstrap_active.store(false, Ordering::SeqCst);
+        let _ = self.startup_sender.send(StartupSignal::BootstrapDone);
+    }
 }
 
 /// Spawn a background worker, catching panics so a single thread crash never
