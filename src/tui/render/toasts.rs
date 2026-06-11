@@ -220,57 +220,5 @@ fn fits_in(outer: Rect, inner: Rect) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::word_wrap;
-
-    #[test]
-    fn short_line_unchanged() {
-        assert_eq!(word_wrap("hello world", 36), vec!["hello world"]);
-    }
-
-    #[test]
-    fn wraps_at_word_boundary() {
-        // "terminal too small · enlarge for full layout" is 44 chars; cap at 36
-        let out = word_wrap("terminal too small · enlarge for full layout", 36);
-        assert_eq!(out.len(), 2, "expected 2 wrapped lines, got {out:?}");
-        for l in &out {
-            assert!(
-                l.chars().count() <= 36,
-                "line exceeds cap: {l:?} ({} chars)",
-                l.chars().count()
-            );
-        }
-    }
-
-    #[test]
-    fn empty_input_yields_one_empty_line() {
-        assert_eq!(word_wrap("", 36), vec![""]);
-    }
-
-    #[test]
-    fn single_word_exceeding_cap_hard_breaks() {
-        let long_word = "a".repeat(80);
-        let out = word_wrap(&long_word, 36);
-        assert_eq!(out.len(), 3); // 36 + 36 + 8
-        for l in &out {
-            assert!(l.chars().count() <= 36);
-        }
-    }
-
-    #[test]
-    fn col_width_equals_content_width_plus_chrome() {
-        // Simulate the geometry: content_cap=36, message fits in 25 chars.
-        // col_width must be 28 (25 + 2 for "┃ " + 1 right pad).
-        let msg = "· enlarge for full layout"; // 25 chars
-        let content_cap: u16 = 36;
-        let max_content_width = [msg]
-            .iter()
-            .map(|l| l.chars().count() as u16)
-            .max()
-            .unwrap()
-            .min(content_cap);
-        let col_width = max_content_width + 3;
-        assert_eq!(max_content_width, 25);
-        assert_eq!(col_width, 28);
-    }
-}
+#[path = "../../../tests/inline/tui_render_toasts.rs"]
+mod tests;

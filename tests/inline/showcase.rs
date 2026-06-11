@@ -15,10 +15,10 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tempfile::TempDir;
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
 };
+use tempfile::TempDir;
 
 use super::{TICK, Term, app, render, restore_terminal, setup_terminal};
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
@@ -42,7 +42,9 @@ struct ShowcaseHome {
 
 impl ShowcaseHome {
     fn new() -> Self {
-        let _home_lock = crate::profile::HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home_lock = crate::profile::HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().expect("tempdir for showcase");
         let path = tmp.path().to_path_buf();
         std::fs::create_dir_all(&path).expect("create temp home");
@@ -51,17 +53,18 @@ impl ShowcaseHome {
         // Pre-seed usage history files on disk so on_tick → apply_usage doesn't
         // overwrite the in-memory seed with an empty/partial reload.
         for (name, entries) in &build_synthetic_history() {
-            let history_path =
-                crate::profile::profile_history_path(name).expect("history path");
-            std::fs::create_dir_all(history_path.parent().unwrap())
-                .expect("history dir");
+            let history_path = crate::profile::profile_history_path(name).expect("history path");
+            std::fs::create_dir_all(history_path.parent().unwrap()).expect("history dir");
             let content: String = entries
                 .iter()
                 .map(|(ts, usage)| {
                     let usage_json = serde_json::to_string(usage).unwrap_or_default();
-                    let name_json = serde_json::to_string(name)
-                        .unwrap_or_else(|_| format!(r#""{}""#, name));
-                    format!(r#"{{"ts":{},"name":{},"usage":{}}}"#, ts, name_json, usage_json)
+                    let name_json =
+                        serde_json::to_string(name).unwrap_or_else(|_| format!(r#""{}""#, name));
+                    format!(
+                        r#"{{"ts":{},"name":{},"usage":{}}}"#,
+                        ts, name_json, usage_json
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -86,52 +89,100 @@ fn build_synthetic_history() -> std::collections::HashMap<String, Vec<(u64, Usag
     for i in 0..=30 {
         let ts = now - (30 - i) as u64 * 480_000;
         let pct = 45.0 + (i as f64 / 30.0) * (64.3 - 45.0);
-        personal.push((ts, UsageInfo {
-            five_hour: Some(UsageWindow { utilization: pct, resets_at: None }),
-            seven_day_sonnet: Some(UsageWindow { utilization: 22.1, resets_at: None }),
-            seven_day_opus: Some(UsageWindow { utilization: 8.4, resets_at: None }),
-            ..UsageInfo::default()
-        }));
+        personal.push((
+            ts,
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: pct,
+                    resets_at: None,
+                }),
+                seven_day_sonnet: Some(UsageWindow {
+                    utilization: 22.1,
+                    resets_at: None,
+                }),
+                seven_day_opus: Some(UsageWindow {
+                    utilization: 8.4,
+                    resets_at: None,
+                }),
+                ..UsageInfo::default()
+            },
+        ));
     }
     for i in 0..=10 {
         let ts = now - (10 - i) as u64 * 43_200_000;
-        personal.push((ts, UsageInfo {
-            five_hour: None,
-            seven_day_sonnet: Some(UsageWindow { utilization: 22.1, resets_at: None }),
-            seven_day_opus: Some(UsageWindow { utilization: 8.4, resets_at: None }),
-            ..UsageInfo::default()
-        }));
+        personal.push((
+            ts,
+            UsageInfo {
+                five_hour: None,
+                seven_day_sonnet: Some(UsageWindow {
+                    utilization: 22.1,
+                    resets_at: None,
+                }),
+                seven_day_opus: Some(UsageWindow {
+                    utilization: 8.4,
+                    resets_at: None,
+                }),
+                ..UsageInfo::default()
+            },
+        ));
     }
 
     let mut work: Vec<(u64, UsageInfo)> = Vec::with_capacity(40);
     for i in 0..=30 {
         let ts = now - (30 - i) as u64 * 480_000;
         let pct = 55.0 + (i as f64 / 30.0) * (88.7 - 55.0);
-        work.push((ts, UsageInfo {
-            five_hour: Some(UsageWindow { utilization: pct, resets_at: None }),
-            seven_day_sonnet: Some(UsageWindow { utilization: 61.2, resets_at: None }),
-            seven_day_opus: Some(UsageWindow { utilization: 33.9, resets_at: None }),
-            ..UsageInfo::default()
-        }));
+        work.push((
+            ts,
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: pct,
+                    resets_at: None,
+                }),
+                seven_day_sonnet: Some(UsageWindow {
+                    utilization: 61.2,
+                    resets_at: None,
+                }),
+                seven_day_opus: Some(UsageWindow {
+                    utilization: 33.9,
+                    resets_at: None,
+                }),
+                ..UsageInfo::default()
+            },
+        ));
     }
     for i in 0..=10 {
         let ts = now - (10 - i) as u64 * 43_200_000;
-        work.push((ts, UsageInfo {
-            five_hour: None,
-            seven_day_sonnet: Some(UsageWindow { utilization: 61.2, resets_at: None }),
-            seven_day_opus: Some(UsageWindow { utilization: 33.9, resets_at: None }),
-            ..UsageInfo::default()
-        }));
+        work.push((
+            ts,
+            UsageInfo {
+                five_hour: None,
+                seven_day_sonnet: Some(UsageWindow {
+                    utilization: 61.2,
+                    resets_at: None,
+                }),
+                seven_day_opus: Some(UsageWindow {
+                    utilization: 33.9,
+                    resets_at: None,
+                }),
+                ..UsageInfo::default()
+            },
+        ));
     }
 
     let mut side: Vec<(u64, UsageInfo)> = Vec::with_capacity(40);
     for i in 0..=30 {
         let ts = now - (30 - i) as u64 * 480_000;
         let pct = 5.0 + (i as f64 / 30.0) * (12.0 - 5.0);
-        side.push((ts, UsageInfo {
-            five_hour: Some(UsageWindow { utilization: pct, resets_at: None }),
-            ..UsageInfo::default()
-        }));
+        side.push((
+            ts,
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: pct,
+                    resets_at: None,
+                }),
+                ..UsageInfo::default()
+            },
+        ));
     }
 
     let mut cache = HashMap::new();
@@ -842,7 +893,8 @@ fn demo_data_drives_all_actions() {
     );
     let created = {
         let cfg = app.config();
-        cfg.find("sandbox-test").map(|p| (p.base_url.clone(), p.api_key.clone()))
+        cfg.find("sandbox-test")
+            .map(|p| (p.base_url.clone(), p.api_key.clone()))
     };
     assert!(
         created.is_some(),
