@@ -6,6 +6,15 @@ use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+/// Choice for auto-resolving credential divergence without the modal prompt.
+/// Persisted in `AppState.default_divergence`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DivergenceChoice {
+    Overwrite,
+    NewProfile,
+    Discard,
+}
+
 use crate::lock::with_state_lock;
 use crate::providers::{Provider, ThirdPartyStats};
 use crate::usage::{FetchStatus, UsageInfo};
@@ -215,6 +224,10 @@ pub(crate) struct AppState {
     pub(crate) show_estimates: bool,
     #[serde(default = "default_refresh_interval")]
     pub(crate) refresh_interval_ms: u64,
+    /// Default action when credential divergence is detected. `None` = show the
+    /// Divergence modal (current behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default_divergence: Option<DivergenceChoice>,
 }
 
 fn default_show_estimates() -> bool {
@@ -243,6 +256,7 @@ impl Default for AppState {
             theme: None,
             show_estimates: true,
             refresh_interval_ms: default_refresh_interval(),
+            default_divergence: None,
         }
     }
 }

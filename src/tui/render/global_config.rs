@@ -10,6 +10,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::profile::DivergenceChoice;
+
 use super::super::app::{App, GLOBAL_CONFIG_ROWS, GlobalConfigRow};
 use super::super::theme::{self, Tier};
 use super::panes::{highlight_row, label_style, section_box};
@@ -25,6 +27,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let refresh_interval_ms = app
         .refresh_interval
         .load(std::sync::atomic::Ordering::Relaxed);
+    let default_divergence = app.config().state.default_divergence;
     let cursor = app
         .global_config_cursor
         .min(GLOBAL_CONFIG_ROWS.len().saturating_sub(1));
@@ -32,13 +35,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, row) in GLOBAL_CONFIG_ROWS.iter().enumerate() {
         let selected = i == cursor;
-        let line = detail_row(*row, selected, wrap_off, refresh_interval_ms);
+        let line = detail_row(
+            *row,
+            selected,
+            wrap_off,
+            refresh_interval_ms,
+            default_divergence,
+        );
         lines.push(if selected {
             highlight_row(line, inner.width as usize)
         } else {
             line
         });
-        if selected && let Some(tip) = row_hint(*row) {
+        if selected && let Some(tip) = row_hint(*row, default_divergence) {
             lines.push(Line::from(vec![
                 Span::styled("  └ ", Style::default().fg(theme::line_color())),
                 Span::styled(tip, theme::faint()),
@@ -50,12 +59,25 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// Inline help for rows whose value doesn't self-describe.
-fn row_hint(row: GlobalConfigRow) -> Option<&'static str> {
+fn row_hint(row: GlobalConfigRow, default_divergence: Option<DivergenceChoice>) -> Option<String> {
     match row {
         GlobalConfigRow::Theme => None,
-        GlobalConfigRow::RefreshInterval => Some("+/- or ⏎ to step through presets"),
+        GlobalConfigRow::DivergenceDefault => {
+            let tip = match default_divergence {
+                None => "show the divergence modal when CC overwrites the symlink",
+                Some(DivergenceChoice::Overwrite) => "adopt the new login into the current profile",
+                Some(DivergenceChoice::NewProfile) => {
+                    "save the new login as a separate profile, leave current profile alone"
+                }
+                Some(DivergenceChoice::Discard) => {
+                    "restore the previous profile, clobbering the new login"
+                }
+            };
+            Some(tip.to_string())
+        }
+        GlobalConfigRow::RefreshInterval => Some("+/- or ⏎ to step through presets".to_string()),
         GlobalConfigRow::WrapOff => {
-            Some("default when every fallback member is over its threshold")
+            Some("default when every fallback member is over its threshold".to_string())
         }
     }
 }
@@ -65,6 +87,7 @@ fn detail_row(
     selected: bool,
     wrap_off: bool,
     refresh_interval_ms: u64,
+    default_divergence: Option<DivergenceChoice>,
 ) -> Line<'static> {
     let arrow = if selected {
         Span::styled("❯ ", theme::accent())
@@ -104,6 +127,26 @@ fn detail_row(
                     refresh_interval_ms > 105_000 && refresh_interval_ms <= 210_000,
                 ),
                 ("300s", refresh_interval_ms > 210_000),
+            ],
+            selected,
+        ),
+        GlobalConfigRow::DivergenceDefault => cycle_row(
+            arrow,
+            "on mismatch",
+            &[
+                ("ask", default_divergence.is_none()),
+                (
+                    "overwrite",
+                    default_divergence == Some(DivergenceChoice::Overwrite),
+                ),
+                (
+                    "new",
+                    default_divergence == Some(DivergenceChoice::NewProfile),
+                ),
+                (
+                    "discard",
+                    default_divergence == Some(DivergenceChoice::Discard),
+                ),
             ],
             selected,
         ),

@@ -7,9 +7,10 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
+use crate::profile::DivergenceChoice;
+
 use super::super::app::{
-    ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceChoice, DivergenceForm,
-    InputState, Modal, Tab,
+    ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceForm, InputState, Modal, Tab,
 };
 use super::super::theme;
 use super::panes::bold_when;

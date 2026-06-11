@@ -34,8 +34,8 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ConfigHandle, Profile, ThemeName, app_state_mtime, load_config, save_app_state,
-    save_profile,
+    AppConfig, ConfigHandle, DivergenceChoice, Profile, ThemeName, app_state_mtime, load_config,
+    save_app_state, save_profile,
 };
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
@@ -195,6 +195,8 @@ pub(crate) enum GlobalConfigRow {
     WrapOff,
     /// Global refresh interval; `+`/`-` steps through presets in-place.
     RefreshInterval,
+    /// Default action when CC overwrites the credentials symlink. ⏎/space cycles.
+    DivergenceDefault,
 }
 
 /// Inline editor state for the Config detail pane. Built on entry, torn down
@@ -243,13 +245,6 @@ pub(crate) struct CaptureNameForm {
     /// Set when initiated by `NewProfile` divergence. Detach + deactivate of
     /// the prior profile is deferred to the success arm so cancel leaves it intact.
     pub(crate) from_divergence: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DivergenceChoice {
-    Overwrite,
-    NewProfile,
-    Discard,
 }
 
 /// Credential-divergence prompt. Shown at startup and on the 1Hz poll when
@@ -309,6 +304,7 @@ pub(crate) enum ActionMenuAction {
     EditField,
     // Program-wide Config tab
     CycleTheme,
+    CycleDivergenceDefault,
     StepRefreshInterval,
     // Status tab
     RefreshStatus,
@@ -389,6 +385,7 @@ impl ActionMenuAction {
             Self::CreateProfile => "create profile",
             Self::EditField => "edit field",
             Self::CycleTheme => "cycle theme",
+            Self::CycleDivergenceDefault => "cycle divergence default",
             Self::StepRefreshInterval => "step refresh interval",
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
@@ -1868,8 +1865,9 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
 pub(crate) const FALLBACK_ROWS: [FallbackRow; 2] = [FallbackRow::Threshold, FallbackRow::Remove];
 
 /// Rows on the program-wide Config tab, in display order.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 3] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 4] = [
     GlobalConfigRow::Theme,
+    GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::WrapOff,
 ];
@@ -1916,6 +1914,7 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
 fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
     match row {
         GlobalConfigRow::Theme => cycle_theme(app),
+        GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
         GlobalConfigRow::WrapOff => toggle_wrap_off(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app, 1),
     }
@@ -2051,7 +2050,27 @@ fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Toggle wrap-off: on = switch off all when chain is spent; off = stay on last.
+pub(crate) fn next_divergence_default(
+    current: Option<DivergenceChoice>,
+) -> Option<DivergenceChoice> {
+    match current {
+        None => Some(DivergenceChoice::Overwrite),
+        Some(DivergenceChoice::Overwrite) => Some(DivergenceChoice::NewProfile),
+        Some(DivergenceChoice::NewProfile) => Some(DivergenceChoice::Discard),
+        Some(DivergenceChoice::Discard) => None,
+    }
+}
+
+fn cycle_divergence_default(app: &mut App) {
+    let next = next_divergence_default(app.config().state.default_divergence);
+    {
+        let mut cfg = app.config();
+        cfg.state.default_divergence = next;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+}
+
 fn toggle_wrap_off(app: &mut App) {
     {
         let mut cfg = app.config();
@@ -2453,6 +2472,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
             if let Some(&row) = GLOBAL_CONFIG_ROWS.get(app.global_config_cursor) {
                 match row {
                     GlobalConfigRow::Theme => actions.push(CycleTheme),
+                    GlobalConfigRow::DivergenceDefault => actions.push(CycleDivergenceDefault),
                     GlobalConfigRow::RefreshInterval => actions.push(StepRefreshInterval),
                     GlobalConfigRow::WrapOff => actions.push(ToggleWrapOff),
                 }
@@ -2610,6 +2630,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             }
         }
         ActionMenuAction::CycleTheme => cycle_theme(app),
+        ActionMenuAction::CycleDivergenceDefault => cycle_divergence_default(app),
         ActionMenuAction::StepRefreshInterval => step_refresh_interval(app, 1),
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
@@ -3546,8 +3567,13 @@ fn drain_startup_signals(app: &mut App) {
             }
             StartupSignal::ReconcileNeedsPrompt { active } => {
                 app.reconcile_done = true;
-                app.modals
-                    .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+                let default = app.config().state.default_divergence;
+                if let Some(choice) = default {
+                    run_divergence_choice(app, &active, choice);
+                } else {
+                    app.modals
+                        .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+                }
             }
             StartupSignal::BootstrapDone => {
                 app.finish_bootstrap();
@@ -3608,6 +3634,12 @@ fn poll_credentials_divergence(app: &mut App) {
             }
             Err(e) => app.toast(ToastKind::Danger, format!("adopt failed: {e}")),
         }
+        return;
+    }
+    // Auto-resolve if a default divergence choice is configured.
+    let default = app.config().state.default_divergence;
+    if let Some(choice) = default {
+        run_divergence_choice(app, &active, choice);
         return;
     }
     app.modals
@@ -3785,7 +3817,7 @@ mod tests {
     // ── global config tab ────────────────────────────────────────────────────
 
     use super::theme::{self, Tier};
-    use super::{GLOBAL_CONFIG_ROWS, KeyCode, KeyEvent, KeyModifiers, Tab};
+    use super::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, KeyCode, KeyEvent, KeyModifiers, Tab};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -3834,5 +3866,67 @@ mod tests {
                 "row {i} must surface at least one action"
             );
         }
+    }
+
+    // ── divergence default ─────────────────────────────────────────────────────
+
+    use crate::profile::DivergenceChoice;
+
+    /// The pure cycle function wraps through all four states.
+    #[test]
+    fn next_divergence_default_cycles_round_trip() {
+        assert_eq!(
+            super::next_divergence_default(None),
+            Some(DivergenceChoice::Overwrite)
+        );
+        assert_eq!(
+            super::next_divergence_default(Some(DivergenceChoice::Overwrite)),
+            Some(DivergenceChoice::NewProfile)
+        );
+        assert_eq!(
+            super::next_divergence_default(Some(DivergenceChoice::NewProfile)),
+            Some(DivergenceChoice::Discard)
+        );
+        assert_eq!(
+            super::next_divergence_default(Some(DivergenceChoice::Discard)),
+            None
+        );
+    }
+
+    /// The divergence-default row's action menu entry has the right label.
+    #[test]
+    fn divergence_default_action_menu_has_correct_label() {
+        let mut app = bare_app();
+        app.tab = Tab::Config;
+        app.global_config_cursor = GLOBAL_CONFIG_ROWS
+            .iter()
+            .position(|r| *r == GlobalConfigRow::DivergenceDefault)
+            .unwrap();
+
+        let menu = super::build_action_menu(&app);
+        let item = menu.items.first().unwrap();
+        assert_eq!(item.action.label(), "cycle divergence default");
+    }
+
+    /// The divergence-default row is reachable by cursor wrapping.
+    #[test]
+    fn divergence_default_row_is_reachable_by_cursor() {
+        let mut app = bare_app();
+        app.tab = Tab::Config;
+        let pos = GLOBAL_CONFIG_ROWS
+            .iter()
+            .position(|r| *r == GlobalConfigRow::DivergenceDefault)
+            .unwrap();
+
+        app.global_config_cursor = pos;
+        let from_up = if pos == 0 {
+            GLOBAL_CONFIG_ROWS.len() - 1
+        } else {
+            pos - 1
+        };
+        super::handle_global_config_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.global_config_cursor, from_up);
+        super::handle_global_config_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.global_config_cursor, pos);
     }
 }
