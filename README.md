@@ -139,7 +139,7 @@ The 5-hour usage window only starts after a real inference call — the standard
 auto_start = true
 ```
 
-When enabled, clauth sends a tiny Haiku ping (`max_tokens = 1`, fractions of a cent) for that profile on launch and on each refresh tick while there's no running window. Default is off. OAuth profiles only. The older field name `kick_timer = true` is still accepted on read.
+When enabled, clauth sends a tiny Haiku ping (`max_tokens = 1`, fractions of a cent) for that profile on launch and on each refresh tick while there's no running window. A cold start fetches usage before the first kick — clauth never pings blind over a window that may already be live — so the timer can arm one tick late. Default is off. OAuth profiles only. The older field name `kick_timer = true` is still accepted on read.
 
 ## Automatic account switching
 
