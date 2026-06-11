@@ -44,6 +44,10 @@ cargo build --release
 
 Binary installs self-update in the background; cargo installs upgrade via `cargo install clauth`.
 
+### Auto-update
+
+On launch, a background thread checks GitHub for a newer release, verifies the SHA-256 against `sha256sums.txt` (fail-closed), and self-replaces on next launch. Cargo-installed builds are notified only; `CLAUTH_NO_UPDATE=1` disables all checks.
+
 ## Features
 
 - **One-key switching** — pick a profile, ⏎, confirm. Or `clauth <profile>` straight from the shell.
