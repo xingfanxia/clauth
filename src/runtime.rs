@@ -38,7 +38,9 @@ use anyhow::{Context, Result};
 
 use crate::claude::{build_claude_settings_json, create_symlink};
 use crate::lock::with_state_lock;
-use crate::profile::{ClaudeCredentials, Profile, atomic_write, claude_dir, profile_subpath};
+use crate::profile::{
+    ClaudeCredentials, Profile, atomic_write, atomic_write_600, claude_dir, profile_subpath,
+};
 
 /// Watchdog tick. 1s instead of a longer interval because fake-symlink mode
 /// needs a tight upper bound on how long a session can read stale credentials
@@ -674,7 +676,7 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
                  not overwriting with runtime re-login bytes"
             );
         } else {
-            atomic_write(canonical, &runtime_bytes)?;
+            atomic_write_600(canonical, &runtime_bytes)?;
             wrote_canonical = true;
         }
     }
@@ -735,7 +737,7 @@ fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<()> {
     if std::fs::read(dst).ok().as_deref() == Some(bytes.as_slice()) {
         return Ok(());
     }
-    atomic_write(dst, &bytes).with_context(|| format!("failed to write {}", dst.display()))
+    atomic_write_600(dst, &bytes).with_context(|| format!("failed to write {}", dst.display()))
 }
 
 /// Walk both `~/.claude/` and the runtime tree; copy the newer bytes onto the

@@ -244,10 +244,9 @@ pub(crate) fn write_disk_cache(name: &str, info: &UsageInfo) {
     let Ok(json) = serde_json::to_string(info) else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, json);
+    // `atomic_write_600` creates any missing parent dir at 0o700 itself; a plain
+    // `create_dir_all` here would win the race and leave it world-readable.
+    let _ = crate::profile::atomic_write_600(&path, json.as_bytes());
 }
 
 fn cache_path(profile_name: &str) -> Option<PathBuf> {

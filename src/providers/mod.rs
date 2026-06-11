@@ -197,7 +197,8 @@ pub(crate) fn write_third_party_disk_cache(name: &str, stats: &ThirdPartyStats) 
         return;
     };
     // Atomic tmp + rename — a torn plain write would parse-fail and read as no cache.
-    let _ = crate::profile::atomic_write(&path, json);
+    // 0o600 file + 0o700 parent dir: the cache holds account/provider state.
+    let _ = crate::profile::atomic_write_600(&path, json.as_bytes());
 }
 
 #[cfg(test)]

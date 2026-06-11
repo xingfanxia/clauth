@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 
 use crate::lock::with_state_lock;
 use crate::profile::{
-    AppConfig, ClaudeCredentials, Profile, atomic_write, claude_dir, profile_dir, read_json_file,
-    save_profile,
+    AppConfig, ClaudeCredentials, Profile, atomic_write, atomic_write_600, claude_dir, profile_dir,
+    read_json_file, save_profile,
 };
 
 fn claude_credentials_path() -> Result<PathBuf> {
@@ -358,7 +358,7 @@ pub(crate) fn detach_credentials_link() -> Result<()> {
         let content =
             std::fs::read(&path).context("Failed to read .credentials.json before detach")?;
         std::fs::remove_file(&path).context("Failed to remove .credentials.json symlink")?;
-        atomic_write(&path, content).context("Failed to write detached .credentials.json")?;
+        atomic_write_600(&path, content).context("Failed to write detached .credentials.json")?;
         Ok(())
     })
 }

@@ -512,6 +512,63 @@ pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::R
     }
 }
 
+/// Like [`atomic_write`] but creates the temp file with mode 0o600 (Unix only)
+/// so the file is never world-readable even for the instant before the rename.
+/// On non-Unix this is identical to [`atomic_write`].
+pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    if !dir.exists() {
+        // A 0o600 file under a world-readable dir still leaks via the dir entry;
+        // any dir this helper must create is 0o700 to keep the secret contained.
+        mkdir_700(dir)?;
+    }
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    // Clear any stale temp so `create_new` lands on a fresh inode — guarantees
+    // the 0o600 mode is applied at creation, never inherited from a looser file.
+    if tmp.exists() {
+        std::fs::remove_file(&tmp)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(content.as_ref())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&tmp, content)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Create `path` as a directory (recursively) with mode 0o700 on Unix,
+/// or the default mode on non-Unix.
+fn mkdir_700(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)
+}
+
 pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -617,13 +674,13 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
 
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
     with_state_lock(|| {
-        std::fs::create_dir_all(profile_dir(&profile.name)?)?;
+        mkdir_700(&profile_dir(&profile.name)?)?;
 
         // credentials.json BEFORE config.toml: single-use refresh token must
         // not be lost to a config.toml write failure.
         let cred_path = profile_credentials_path(&profile.name)?;
         match &profile.credentials {
-            Some(creds) => atomic_write(&cred_path, serde_json::to_string_pretty(creds)?)
+            Some(creds) => atomic_write_600(&cred_path, serde_json::to_string_pretty(creds)?)
                 .context("Failed to write credentials.json")?,
             None if cred_path.exists() => {
                 std::fs::remove_file(&cred_path).context("Failed to remove credentials.json")?
@@ -646,8 +703,8 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
 /// this sidecar on next start if the commit never landed.
 pub(crate) fn stage_rotated_credentials(name: &str, creds: &ClaudeCredentials) -> Result<()> {
     with_state_lock(|| {
-        std::fs::create_dir_all(profile_dir(name)?)?;
-        atomic_write(
+        mkdir_700(&profile_dir(name)?)?;
+        atomic_write_600(
             &profile_credentials_pending_path(name)?,
             serde_json::to_string_pretty(creds)?,
         )
@@ -690,7 +747,7 @@ fn recover_pending_credentials(
         if !adopt {
             return None;
         }
-        let _ = with_state_lock(|| atomic_write(&cred_path, &bytes).map_err(Into::into));
+        let _ = with_state_lock(|| atomic_write_600(&cred_path, &bytes).map_err(Into::into));
         Some(pending)
     })();
     let _ = std::fs::remove_file(&pending_path);
