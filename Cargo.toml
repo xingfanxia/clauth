@@ -22,6 +22,7 @@ self-replace = "1.5.0"
 signal-hook = "0.4.4"
 tempfile = "3.27.0"
 libc = "0.2.186"
+sha2 = "0.11.0"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
