@@ -60,7 +60,7 @@ cargo build --release
 
 - **One-key switching** — pick a profile, ⏎, confirm. Or `clauth <profile>` straight from the shell.
 - **Automatic token refresh** — the OAuth refresh token is single-use, so rotation is lazy: a stale access token is rotated on the spot the moment a usage query returns a 401, never proactively. Usage queries never run with a stale token, and `t` force-rotates every account on demand.
-- **Live usage bars** — 5h utilization from the Anthropic API, refreshed every 60 seconds and color-coded with the next reset time. Max accounts also get a 7-day bar (Pro accounts don't have it in ther API respone).
+- **Live usage bars** — 5h utilization from the Anthropic API, refreshed on a configurable interval (default 90 s) and color-coded with the next reset time. Max accounts also get a 7-day bar (Pro accounts don't have it in their API response).
 - **Per-row activity** — each account shows a countdown to its next refresh or a color-coded spinner: sapphire fetch, cyan token refresh, green auto-start. (Switching is an instant relink, no spinner.)
 - **Plan detection** — `/api/oauth/profile` identifies the tier: Pro, Max (5x / 20x), Team, Enterprise.
 - **Per-account breakdown** — the Usage tab lays out every window (5h, 7d, 7d sonnet, 7d opus, any paid extra-usage spend) plus the endpoint, fallback threshold, and merged env keys.
@@ -119,9 +119,9 @@ redirected to a throwaway tempdir, so nothing touches your real `~/.clauth` /
 cargo test showcase -- --ignored --nocapture
 ```
 
-The active profile is shown in orange. Each row's usage bars refreshes every 60 seconds and are cached locally so they stay visible even if the Anthropic API is rate-limited or offline. The 7-day bar is also shown when possible.
+The active profile is shown in orange. Each row's usage bars refresh on the configured interval (default 90 s) and are cached locally so they stay visible even if the Anthropic API is rate-limited or offline. The 7-day bar is also shown when possible.
 
-`Tab` / arrows move between the four tabs — **Overview** (switch and reorder accounts), **Usage** (per-account window breakdown), **Config** (edit endpoint, key, env, auto-start), and **Fallback** (chain editor). See hints at the bottom or `?` for more.
+`Tab` / arrows move between the six tabs — **Overview** (switch and reorder accounts), **Usage** (per-account window breakdown), **Setup** (edit endpoint, key, env, auto-start), **Fallback** (chain editor), **Config** (program-wide: theme tier, refresh interval, wrap-off, divergence default), and **Status** (Claude incident feed). See hints at the bottom or `?` for more.
 
 ## Profile types
 
@@ -150,7 +150,7 @@ How it works:
 - Each chain member has its own switch threshold (5h utilization %). Default is 95%; edit it inline on the Fallback tab (`+`/`-` to step, or type a value).
 - After each usage refresh — at startup and on every per-profile tick while clauth is open — clauth checks the active profile. If it's a chain member and its 5h utilization is at or above its threshold, clauth walks the chain (starting at the slot after the active profile, wrapping) and switches to the first member whose own threshold hasn't been crossed. The active `◆` marker shifts to the new profile in place.
 - A threshold of **100%** marks that profile as a last-resort sink. clauth still prefers any chain member with real headroom; only when every other member is past its threshold does it fall back to a 100%-threshold profile, even if that profile is itself capped. Claude Code will surface its own *"out of 5h limit"* message after the switch lands.
-- A chain-global **wrap-off** toggle (also on the Fallback tab) decides what happens when every member is exhausted and no 100% sink exists: leave it off and clauth stays on the last account; turn it on and clauth switches off all accounts instead.
+- A chain-global **wrap-off** toggle (on the **Config** tab) decides what happens when every member is exhausted and no 100% sink exists: leave it off and clauth stays on the last account; turn it on and clauth switches off all accounts instead. After a switch-off, clauth automatically re-arms the active profile once any chain member's utilization drops back below its threshold.
 - If no chain member is available as a target, clauth stays put. If the active profile isn't in the chain, auto-switch is disabled.
 - Profiles outside the chain are never auto-switched away from or auto-switched to — it's opt-in per profile.
 
@@ -160,7 +160,7 @@ Configuration lives in `~/.clauth/profiles.toml` (`fallback_chain` array, ordere
 
 ```
 ~/.clauth/
-  profiles.toml          # profile order, active marker, fallback chain, wrap-off, auto-start timestamps
+  profiles.toml          # profile order, active marker, fallback chain, wrap-off, theme, refresh interval
   profiles/
     work/
       config.toml        # base_url, api_key, auto_start, fallback_threshold, [env]
