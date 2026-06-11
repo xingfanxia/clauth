@@ -1,0 +1,61 @@
+[graph]
+# Empty = evaluate ALL targets (the thorough audit). Every platform-specific dep
+# in the tree is checked, not just the host's.
+targets = []
+
+# ---------------------------------------------------------------------------
+# Advisories
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+# Deny crates with unpatched security advisories.
+yanked = "deny"
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+# Licenses actually present in the dependency tree (derived from `cargo metadata`).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "0BSD",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "MPL-2.0",
+    "LGPL-2.1-or-later",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+# Confidence threshold for SPDX expression matching.
+confidence-threshold = 0.8
+
+# ---------------------------------------------------------------------------
+# Bans
+# ---------------------------------------------------------------------------
+[bans]
+# Deny duplicate versions of the same crate unless explicitly allowed below.
+multiple-versions = "warn"
+# Wildcards in Cargo.toml dep specs are sloppy; flag them.
+wildcards = "deny"
+# Deny known-broken / security-risky crates.
+deny = [
+    # old unmaintained time 0.1 has known RUSTSEC advisories
+    { name = "time", version = "<0.2" },
+    # openssl-sys — prefer rustls; flag if it ever sneaks in
+    { name = "openssl-sys" },
+    { name = "openssl" },
+]
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
