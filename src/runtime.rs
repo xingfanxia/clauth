@@ -696,9 +696,21 @@ fn mirror_credentials(runtime_path: &Path, canonical: &Path) -> Result<()> {
     let runtime_meta = runtime_path.metadata().ok();
     let canonical_meta = canonical.metadata().ok();
 
-    // Newer side copies from; None when nothing to do (tie/unknown mtime is a
-    // noop; exactly one present seeds the other; neither is a noop).
-    let copy: Option<(&Path, &Path)> = match (runtime_meta, canonical_meta) {
+    if let Some((src, dst)) = newer_side(runtime_path, canonical, runtime_meta, canonical_meta) {
+        copy_if_valid_creds(src, dst)?;
+    }
+    Ok(())
+}
+
+/// Resolve which credential side is newer or sole-present. Returns `(src, dst)`
+/// where bytes should flow from `src` to `dst`, or `None` when equal/unknown.
+fn newer_side<'a>(
+    runtime_path: &'a Path,
+    canonical: &'a Path,
+    runtime_meta: Option<std::fs::Metadata>,
+    canonical_meta: Option<std::fs::Metadata>,
+) -> Option<(&'a Path, &'a Path)> {
+    match (runtime_meta, canonical_meta) {
         (Some(rm), Some(cm)) => match rm.modified().ok().zip(cm.modified().ok()) {
             Some((rt, ca)) if rt > ca => Some((runtime_path, canonical)),
             Some((rt, ca)) if ca > rt => Some((canonical, runtime_path)),
@@ -707,12 +719,7 @@ fn mirror_credentials(runtime_path: &Path, canonical: &Path) -> Result<()> {
         (Some(_), None) => Some((runtime_path, canonical)),
         (None, Some(_)) => Some((canonical, runtime_path)),
         (None, None) => None,
-    };
-
-    if let Some((src, dst)) = copy {
-        copy_if_valid_creds(src, dst)?;
     }
-    Ok(())
 }
 
 fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<()> {

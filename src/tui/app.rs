@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -3139,10 +3140,8 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             let refetch = Arc::clone(&app.refetch_queue);
             let activity = Arc::clone(&app.activity);
             let sender = app.op_sender.clone();
-            std::thread::spawn(move || {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _ = oauth::refresh_all(&config, true, &refetch, &activity, &sender);
-                }));
+            spawn_worker(move || {
+                let _ = oauth::refresh_all(&config, true, &refetch, &activity, &sender);
             });
             app.toast(ToastKind::Info, "rotating all tokens…");
         }
@@ -3155,10 +3154,8 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             let activity = Arc::clone(&app.activity);
             let sender = app.op_sender.clone();
             let target = name.clone();
-            std::thread::spawn(move || {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    oauth::rotate_one(&config, &target, &refetch, &activity, &sender, true);
-                }));
+            spawn_worker(move || {
+                oauth::rotate_one(&config, &target, &refetch, &activity, &sender, true);
             });
             app.toast(ToastKind::Info, format!("rotating '{name}'…"));
         }
@@ -3644,6 +3641,17 @@ fn poll_credentials_divergence(app: &mut App) {
     }
     app.modals
         .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+}
+
+/// Spawn a background worker, catching panics so a single thread crash never
+/// takes down the process. Callers clone only the Arcs their closure needs.
+fn spawn_worker<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let _ = catch_unwind(AssertUnwindSafe(f));
+    });
 }
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────

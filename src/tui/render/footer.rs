@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -138,9 +138,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         spans.push(Span::styled(
             *key,
-            Style::default().fg(theme::accent_color()).bold(),
+            theme::accent().add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(format!(" {label}"), theme::dim()));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(*label, theme::dim()));
     }
 
     frame.render_widget(

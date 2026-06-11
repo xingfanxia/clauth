@@ -483,13 +483,12 @@ fn apply_outcome(
             .saturating_sub(interval_ms)
     }));
 
-    // Each in its own critical section — one leaf lock at a time.
-    // Ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350).
+    // Both in one critical section — ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350).
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(outcome.name.clone(), now.saturating_add(defer));
-    }
-    if let Ok(mut st) = status.lock() {
-        st.insert(outcome.name.clone(), outcome.status);
+        if let Ok(mut st) = status.lock() {
+            st.insert(outcome.name.clone(), outcome.status);
+        }
     }
 }
 
@@ -1051,7 +1050,6 @@ fn partition_due<T: NamedEntry + Clone>(
             .unwrap_or(EpochMs::from_millis(0));
         let next = last.saturating_add(interval);
         per_profile.insert(entry.name().to_string(), next.as_millis());
-        // Countdown still publishes for excluded profiles — UI shows when they become eligible.
         let excluded = match act.as_ref() {
             Ok(a) => matches!(a.get(entry.name()), Some(ProfileActivity::Refreshing)),
             Err(_) => true, // Poisoned: fail safe to excluded.

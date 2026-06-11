@@ -284,7 +284,7 @@ fn tooltip(text: &str, text_style: Style) -> Line<'static> {
 /// render in `DANGER` (an Invalid-input tooltip, unlike a help tooltip).
 fn invalid_tooltip(text: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled("  └ ", Style::default().fg(theme::danger_color())),
+        Span::styled("  └ ", theme::danger()),
         Span::styled(text.to_string(), theme::danger()),
     ])
 }
