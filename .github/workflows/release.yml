@@ -71,6 +71,13 @@ jobs:
         with:
           files: ${{ matrix.asset_name }}${{ matrix.ext }}
 
+      - name: Upload artifact for checksum job
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}${{ matrix.ext }}
+          path: ${{ matrix.asset_name }}${{ matrix.ext }}
+          if-no-files-found: error
+
   build-macos:
     name: Build ${{ matrix.asset_name }}
     needs: create-release
@@ -112,3 +119,36 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.asset_name }}
+
+      - name: Upload artifact for checksum job
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  checksums:
+    name: Generate checksums
+    needs: [build-linux-windows, build-macos]
+    # Run even when some build legs failed so that binaries already published
+    # always have a matching sha256sums.txt in the release.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate sha256sums.txt
+        # Glob whatever was actually downloaded so a partial build still
+        # produces a sums file that matches exactly what shipped.
+        run: |
+          cd artifacts
+          sha256sum clauth-* > ../sha256sums.txt
+
+      - name: Upload sha256sums.txt to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: sha256sums.txt
