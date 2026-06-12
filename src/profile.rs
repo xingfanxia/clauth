@@ -242,6 +242,10 @@ fn is_true(b: &bool) -> bool {
 /// references this constant.
 pub(crate) const DEFAULT_REFRESH_INTERVAL_MS: u64 = 90_000;
 
+/// Minimum allowed `refresh_interval_ms`. The Anthropic API is rate-limited;
+/// sub-10 s intervals serve no purpose and can trigger 429s.
+pub(crate) const MIN_REFRESH_INTERVAL_MS: u64 = 10_000;
+
 fn default_refresh_interval() -> u64 {
     DEFAULT_REFRESH_INTERVAL_MS
 }
@@ -586,7 +590,9 @@ fn load_app_state() -> Result<AppState> {
     if !path.exists() {
         return Ok(AppState::default());
     }
-    read_toml_file(&path)
+    let mut state: AppState = read_toml_file(&path)?;
+    state.refresh_interval_ms = state.refresh_interval_ms.max(MIN_REFRESH_INTERVAL_MS);
+    Ok(state)
 }
 
 pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
