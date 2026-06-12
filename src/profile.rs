@@ -639,7 +639,7 @@ fn load_profile(name: &str) -> Result<Profile> {
         api_key: config.api_key,
         auto_start: config.auto_start,
         env: config.env,
-        fallback_threshold: config.fallback_threshold,
+        fallback_threshold: config.fallback_threshold.map(|v| v.clamp(0.0, 100.0)),
         bell_threshold: None,
         credentials,
         usage: None,
