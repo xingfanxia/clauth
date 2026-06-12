@@ -58,7 +58,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Tab::Config => &[
             ("↑↓", "row"),
             ("↵", "cycle / toggle"),
-            ("a", "actions"),
             ("?", "help"),
         ],
         Tab::Status => match app.status.focus {

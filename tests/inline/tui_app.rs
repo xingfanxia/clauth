@@ -170,20 +170,6 @@ fn global_config_cursor_wraps() {
     assert_eq!(app.global_config_cursor, 0, "Down from last wraps to first");
 }
 
-#[test]
-fn global_config_rows_have_actions() {
-    for (i, _row) in GLOBAL_CONFIG_ROWS.iter().enumerate() {
-        let mut app = bare_app();
-        app.tab = Tab::Config;
-        app.global_config_cursor = i;
-        let menu = super::build_action_menu(&app);
-        assert!(
-            !menu.items.is_empty(),
-            "row {i} must surface at least one action"
-        );
-    }
-}
-
 // ── divergence default ─────────────────────────────────────────────────────
 
 use crate::profile::DivergenceChoice;
@@ -206,20 +192,6 @@ fn next_divergence_default_cycles_round_trip() {
         super::next_divergence_default(Some(DivergenceChoice::Discard)),
         None
     );
-}
-
-#[test]
-fn divergence_default_action_menu_has_correct_label() {
-    let mut app = bare_app();
-    app.tab = Tab::Config;
-    app.global_config_cursor = GLOBAL_CONFIG_ROWS
-        .iter()
-        .position(|r| *r == GlobalConfigRow::DivergenceDefault)
-        .unwrap();
-
-    let menu = super::build_action_menu(&app);
-    let item = menu.items.first().unwrap();
-    assert_eq!(item.action.label(), "cycle divergence default");
 }
 
 #[test]

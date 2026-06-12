@@ -296,17 +296,12 @@ pub(crate) enum ActionMenuAction {
     ReorderDown,
     // Fallback detail
     EditThreshold,
-    ToggleWrapOff,
     RemoveMember,
     // Config detail actions (proxied through run_config_row)
     ToggleAutoStart,
     DeleteProfile,
     CreateProfile,
     EditField,
-    // Program-wide Config tab
-    CycleTheme,
-    CycleDivergenceDefault,
-    StepRefreshInterval,
     // Status tab
     RefreshStatus,
     OpenIncidentLink,
@@ -379,15 +374,11 @@ impl ActionMenuAction {
             Self::ReorderUp => "reorder up",
             Self::ReorderDown => "reorder down",
             Self::EditThreshold => "edit threshold",
-            Self::ToggleWrapOff => "toggle wrap-off",
             Self::RemoveMember => "remove member",
             Self::ToggleAutoStart => "toggle auto-start",
             Self::DeleteProfile => "delete profile",
             Self::CreateProfile => "create profile",
             Self::EditField => "edit field",
-            Self::CycleTheme => "cycle theme",
-            Self::CycleDivergenceDefault => "cycle divergence default",
-            Self::StepRefreshInterval => "step refresh interval",
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
             Self::ToggleEstimates => "toggle estimates",
@@ -2470,16 +2461,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 }
             }
         },
-        Tab::Config => {
-            if let Some(&row) = GLOBAL_CONFIG_ROWS.get(app.global_config_cursor) {
-                match row {
-                    GlobalConfigRow::Theme => actions.push(CycleTheme),
-                    GlobalConfigRow::DivergenceDefault => actions.push(CycleDivergenceDefault),
-                    GlobalConfigRow::RefreshInterval => actions.push(StepRefreshInterval),
-                    GlobalConfigRow::WrapOff => actions.push(ToggleWrapOff),
-                }
-            }
-        }
+        Tab::Config => {}
         Tab::Status => {
             actions.push(RefreshStatus);
             if app.status.selected().is_some() {
@@ -2601,9 +2583,6 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::EditThreshold => {
             run_fallback_row(app, FallbackRow::Threshold);
         }
-        ActionMenuAction::ToggleWrapOff => {
-            toggle_wrap_off(app);
-        }
         ActionMenuAction::RemoveMember => {
             run_fallback_row(app, FallbackRow::Remove);
         }
@@ -2631,9 +2610,6 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                 run_config_row(app, row);
             }
         }
-        ActionMenuAction::CycleTheme => cycle_theme(app),
-        ActionMenuAction::CycleDivergenceDefault => cycle_divergence_default(app),
-        ActionMenuAction::StepRefreshInterval => step_refresh_interval(app, 1),
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
