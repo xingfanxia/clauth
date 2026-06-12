@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::sync::mpsc::Sender;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -41,15 +42,16 @@ pub(crate) fn updates_enabled() -> bool {
 }
 
 /// Spawn a background update check; applies if self-replaceable, toasts result.
-/// Returns immediately; errors are silently discarded.
+/// Returns a `JoinHandle` for clean shutdown, or `None` when updates are disabled.
+/// Errors are silently discarded.
 /// Skips all work when `CLAUTH_NO_UPDATE=1`.
-pub(crate) fn spawn(tx: Sender<UpdateEvent>) {
+pub(crate) fn spawn(tx: Sender<UpdateEvent>) -> Option<JoinHandle<()>> {
     if !updates_enabled() {
-        return;
+        return None;
     }
-    std::thread::spawn(move || {
+    Some(std::thread::spawn(move || {
         let _ = try_update(&tx);
-    });
+    }))
 }
 
 fn try_update(tx: &Sender<UpdateEvent>) -> anyhow::Result<()> {

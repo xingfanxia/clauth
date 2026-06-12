@@ -15,6 +15,7 @@ use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -677,6 +678,8 @@ pub(crate) struct App {
     pub(crate) compact: bool,
     /// Startup update check result; drained in `on_tick`. Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
+    /// Join handle for the update check thread; joined on TUI exit for clean shutdown.
+    pub(crate) update_handle: Option<JoinHandle<()>>,
 
     /// Claude status feed state; UI-thread-only (no shared lock).
     pub(crate) status: StatusState,
@@ -820,7 +823,7 @@ impl App {
         }
 
         let (update_sender, update_results) = std::sync::mpsc::channel::<UpdateEvent>();
-        update::spawn(update_sender);
+        let update_handle = update::spawn(update_sender);
 
         // Status feed worker: streams incidents over `status_events`; a `()` on
         // `status_refresh` triggers a manual refetch. The channels are always
@@ -870,6 +873,7 @@ impl App {
             toasts: VecDeque::new(),
             compact: false,
             update_results,
+            update_handle,
             status: StatusState::default(),
             status_events,
             status_refresh,
@@ -3658,6 +3662,15 @@ pub(crate) fn shutdown(app: &mut App) -> Result<()> {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    // Wait up to 5 s for the update check to finish; let it detach if it's
+    // still running (a slow network shouldn't delay TUI exit indefinitely).
+    if let Some(handle) = app.update_handle.take() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(handle);
     }
     {
         let mut cfg = app.config();
