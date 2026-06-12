@@ -512,7 +512,7 @@ fn wire_to_update(w: UpdateWire) -> Option<IncidentUpdate> {
 /// refresh channel disconnects (TUI shutdown).
 ///
 /// Mirrors `update::spawn`: a plain `std::thread`, a ureq agent with short
-/// timeouts, and `crate::ureq_error::into_anyhow` for error mapping. No shared
+/// timeouts, and `anyhow::Error::from` for error mapping. No shared
 /// lock crosses the thread boundary — only the `StatusEvent` channel does.
 pub(crate) fn spawn(tx: Sender<StatusEvent>, refresh_rx: Receiver<()>) {
     // Resolve the cache path on the calling thread, before detaching, so the
@@ -594,7 +594,7 @@ fn fetch_feed() -> anyhow::Result<Vec<Incident>> {
         .get(FEED_URL)
         .header("User-Agent", "clauth-status")
         .call()
-        .map_err(crate::ureq_error::into_anyhow)?
+        .map_err(anyhow::Error::from)?
         .into_body()
         .into_reader();
     // +1 so a body exactly at the cap still trips the over-limit check.
@@ -603,11 +603,11 @@ fn fetch_feed() -> anyhow::Result<Vec<Incident>> {
     let mut bytes = Vec::new();
     capped
         .read_to_end(&mut bytes)
-        .map_err(crate::ureq_error::into_anyhow)?;
+        .map_err(anyhow::Error::from)?;
     if bytes.len() as u64 > MAX_BODY_BYTES {
         anyhow::bail!("status feed exceeded {MAX_BODY_BYTES} byte cap");
     }
-    let json = String::from_utf8(bytes).map_err(crate::ureq_error::into_anyhow)?;
+    let json = String::from_utf8(bytes).map_err(anyhow::Error::from)?;
 
     parse_incidents(&json)
 }

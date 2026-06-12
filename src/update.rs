@@ -150,10 +150,10 @@ fn fetch_latest() -> anyhow::Result<Release> {
         .get(API_URL)
         .header("User-Agent", "clauth-updater")
         .call()
-        .map_err(crate::ureq_error::into_anyhow)?
+        .map_err(anyhow::Error::from)?
         .body_mut()
         .read_to_string()
-        .map_err(crate::ureq_error::into_anyhow)?;
+        .map_err(anyhow::Error::from)?;
 
     Ok(serde_json::from_str(&text)?)
 }

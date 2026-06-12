@@ -74,12 +74,12 @@ pub(crate) fn refresh(refresh_token: &str) -> Result<TokenResponse> {
         .post(TOKEN_ENDPOINT)
         .header("Content-Type", "application/json")
         .send(&body)
-        .map_err(crate::ureq_error::into_anyhow)?;
+        .map_err(anyhow::Error::from)?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
         .read_to_string()
-        .map_err(crate::ureq_error::into_anyhow)?;
+        .map_err(anyhow::Error::from)?;
     if status >= 400 {
         anyhow::bail!("HTTP {status}: {text}");
     }
@@ -125,7 +125,7 @@ fn kick(access_token: &str) -> std::result::Result<(), KickError> {
         .header("anthropic-version", "2023-06-01")
         .header("anthropic-beta", "oauth-2025-04-20")
         .send(&body)
-        .map_err(|e| KickError::Other(crate::ureq_error::into_anyhow(e)))?
+        .map_err(|e| KickError::Other(anyhow::Error::from(e)))?
         .status()
         .as_u16();
     if status >= 400 {
