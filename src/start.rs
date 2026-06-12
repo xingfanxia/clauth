@@ -192,6 +192,7 @@ fn forward_signal_or_warn(child: &std::process::Child, signal: i32) {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn forward_signal(child: &std::process::Child, signal: i32) -> std::io::Result<()> {
     // SAFETY: `child.id()` is the OS pid for this live child; `signal` comes from signal-hook.
     let result = unsafe { libc::kill(child.id() as libc::pid_t, signal) };

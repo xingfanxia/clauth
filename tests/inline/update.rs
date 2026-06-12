@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! Unit tests for `src/update.rs`.
 //!
 //! All tests are pure (no network, no FS, no extra threads).  The env-var tests

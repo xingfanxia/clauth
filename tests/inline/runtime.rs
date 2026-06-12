@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use super::*;
 use std::fs::{self, OpenOptions};
 use std::time::{Duration, SystemTime};

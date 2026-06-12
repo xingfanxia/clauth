@@ -28,7 +28,6 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::thread::{self, JoinHandle};
@@ -166,9 +165,9 @@ pub(crate) struct ProfileRuntime {
     /// Held for the lifetime of the session so a sibling process's
     /// `try_lock` reveals we're still alive.
     _pid_lock: File,
-    /// Wrapped in ManuallyDrop so Drop can explicitly drop it before joining
-    /// the watchdog, signalling the thread to exit.
-    watchdog_signal: ManuallyDrop<Sender<()>>,
+    /// Wrapped in Option so Drop can take() it before joining the watchdog,
+    /// signalling the thread to exit.
+    watchdog_signal: Option<Sender<()>>,
     watchdog_handle: Option<JoinHandle<()>>,
 }
 
@@ -257,7 +256,7 @@ impl ProfileRuntime {
             sessions,
             mode,
             _pid_lock: pid_lock,
-            watchdog_signal: ManuallyDrop::new(tx),
+            watchdog_signal: Some(tx),
             watchdog_handle: Some(watchdog_handle),
         })
     }
@@ -270,8 +269,7 @@ impl ProfileRuntime {
 impl Drop for ProfileRuntime {
     fn drop(&mut self) {
         // Drop the sender to signal the watchdog, then join.
-        // SAFETY: field is never used after this point.
-        unsafe { ManuallyDrop::drop(&mut self.watchdog_signal) };
+        drop(self.watchdog_signal.take());
         if let Some(h) = self.watchdog_handle.take() {
             let _ = h.join();
         }

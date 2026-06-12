@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! Showcase — a fake-data TUI for taking README screenshots. Compiled ONLY
 //! under `#[cfg(test)]` (included via `#[path]` into `crate::tui`), so none of
 //! this ships in the `clauth` binary and it lives outside `src/`.
