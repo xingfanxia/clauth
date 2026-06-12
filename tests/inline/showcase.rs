@@ -854,7 +854,7 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Backspace);
 
     // Out-of-range value: commit is blocked and the draft stays open so the
-    // inline Invalid-input treatment (DANGER value + `└ max is 100`) shows.
+    // inline Invalid-input treatment shows.
     type_str(&mut app, "150");
     press(&mut app, KeyCode::Enter); // commit attempt — rejected
     assert!(

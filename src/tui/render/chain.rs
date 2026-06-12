@@ -255,7 +255,7 @@ fn member_detail(
         if *row == FallbackRow::Threshold {
             match row_editing {
                 Some(input) if parse_threshold(input.trimmed()).is_none() => {
-                    lines.push(invalid_tooltip("max is 100"));
+                    lines.push(invalid_tooltip("invalid input"));
                 }
                 _ if selected => lines.push(tooltip(
                     "switch to the next account once 5h usage reaches this",
@@ -308,7 +308,7 @@ fn detail_row(
             ];
             match editing {
                 Some(input) => {
-                    // Invalid typed value renders in DANGER (the gutter `└ max is 100`
+                    // Invalid typed value renders in DANGER (the gutter `└ invalid input`
                     // tooltip carries the reason); valid keeps body styling.
                     let invalid = parse_threshold(input.trimmed()).is_none();
                     spans.extend(value_caret(input, invalid));
