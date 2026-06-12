@@ -553,6 +553,70 @@ fn seed_history_yields_burn_rates() {
     );
 }
 
+/// Headless render gate: draws every tab and a post-tick frame through
+/// `TestBackend` on the shared demo data. The `term.draw(...).unwrap()` is the
+/// no-panic invariant for each surface; the content asserts prove the populated
+/// (non-empty-state) layout actually rendered. Runs under plain `cargo test` —
+/// no TTY, no `--ignored` — so CI gates that the surfaces render.
+#[test]
+fn headless_showcase_renders() {
+    // Home redirected into a tempdir + disk history seeded; held for the whole
+    // fn so on_tick writes land on scratch. Acquired BEFORE App::new so no
+    // RankedMutex is ever held while taking the (untracked) HOME_TEST_LOCK.
+    let _home = ShowcaseHome::new();
+    let mut app = app::App::new(demo_config());
+    seed_usage(&app);
+    seed_timers(&app);
+    seed_history(&app);
+
+    // 120 wide so the overview name column keeps "personal"/"work" un-truncated.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+
+    // Flatten the backend buffer to a newline-joined String of cell symbols.
+    fn flatten(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = term.backend().buffer().clone();
+        let (w, h) = (buf.area.width as usize, buf.area.height as usize);
+        let mut out = String::with_capacity((w + 1) * h);
+        for y in 0..h {
+            for x in 0..w {
+                out.push_str(buf.content[y * w + x].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    // Every tab renders without panicking and keeps the header brand.
+    for tab in app::Tab::ALL {
+        app.tab = tab;
+        term.draw(|f| render::draw(f, &app)).unwrap();
+        let frame = flatten(&term);
+        assert!(frame.contains("clauth"), "header brand renders on {tab:?}");
+    }
+
+    // One tick exercises the drain/apply_usage/reload paths against the tempdir.
+    app.tab = app::Tab::Overview;
+    app::on_tick(&mut app);
+    term.draw(|f| render::draw(f, &app)).unwrap();
+    let overview = flatten(&term);
+
+    assert!(overview.contains("clauth"), "header brand survives a tick");
+    assert!(
+        overview.contains("personal"),
+        "active demo profile populates the overview list"
+    );
+    assert!(
+        overview.contains("work"),
+        "second profile row renders in the overview list"
+    );
+    // Tab-bar labels render (lowercase, un-truncated at 120w); `setup`/`config`
+    // are tab-only words on the overview surface, so finding them proves the bar.
+    assert!(
+        overview.contains("setup") && overview.contains("config"),
+        "tab bar renders its labels"
+    );
+}
+
 // ── Non-interactive driver ──────────────────────────────────────────────────
 //
 // Feeds synthetic key events through `handle_key` / `on_tick` so CI can prove
