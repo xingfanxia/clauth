@@ -1,33 +1,281 @@
-//! Feature → test traceability map (committed deliverable for task 7b).
+//! Self-checking feature coverage test.
 //!
-//! Every item in the README "Features" list (plus the adjacent advertised
-//! surfaces — `which`, status feed, self-update, file perms) is mapped here to
-//! the test fn(s) and file that cover it. Three holes were newly filled and are
-//! marked **NEW**; everything else was already covered.
+//! Parses the README's `## Features` list, cross-references each feature
+//! against `FEATURE_MAP`, and verifies every referenced test function
+//! still exists in the test tree. Fails when a feature has no covering
+//! test or a referenced test doesn't exist.
 //!
-//! This module is doc-only: it persists the map in-tree so the coverage
-//! contract is reviewable from the source, not just from a report. Keep it in
-//! sync when a Features-list item or its covering test changes.
-//!
-//! | README feature | Test(s) | File | Status |
-//! |---|---|---|---|
-//! | One-key / CLI switching | `auto_switch_*`, `snapshot_chain_*` (switch path); CLI resolve `resolves_started_profile_in_runtime_session` | `fallback.rs`, `which.rs` | pre-existing |
-//! | Automatic token refresh (lazy rotate on 401, `t` force-rotate) | `rotate_one_no_stamp_when_no_refresh_token`, `live_session_excluded_when_force_false`, `force_true_bypasses_diverged_active_when_no_active_profile`, `rotation_guard_is_independent_across_profiles` | `oauth.rs` | pre-existing |
-//! | Live usage bars / 5h+7d util / reset time | `parses_*` time helpers, `retry_after_*`, `cached_fallback_does_not_clobber_store`, `mark_window_open_*`, `window_lapsed_*` | `fetch.rs`, `scheduler.rs` | pre-existing |
-//! | Per-row activity / burn-rate | `gap_boundary_*`, `*_gap_*`, `steady_drain_no_gap_no_cut` | `burn.rs` | pre-existing |
-//! | Plan detection (Pro/Max 5x·20x/Team/Enterprise) | `oauth_profile`, `api_profile`, `failed_profile` (subscription/plan parse) | `showcase.rs`, `which.rs::oauth_profile` | pre-existing |
-//! | Per-account breakdown (Usage tab windows + env merge) | `all_tabs_render`, `empty_state_renders`, render-tab suite | `tui_render_mod.rs`, `tui_render_tabs.rs` | pre-existing |
-//! | Auto-switch on exhaustion / fallback chain / thresholds / wrap-off / sink | `auto_switch_*`, `wrap_off_*`, `find_recovered_*`, `sink_active_*` | `fallback.rs` | pre-existing |
-//! | Stale-data cues | `all_tabs_render` + `fetch_status` model in showcase seed | `tui_render_mod.rs`, `showcase.rs` | pre-existing |
-//! | **Account-change `[Y/n]` overwrite path** | `relogin_is_diverged_and_not_first_login`, `overwrite_confirm_captures_relogin_into_profile`, `overwrite_cancel_leaves_stored_and_live_untouched` | `claude.rs` | **NEW** |
-//! | Multi-instance safe (file lock, reload, off-UI HTTP) | `cross_thread_with_state_lock_serializes`, `same_thread_reentrancy_does_not_deadlock`, `poison_recovery_after_panicking_closure` | `lock.rs` | pre-existing |
-//! | Non-destructive (only API keys + declared env touched) | `diverged_*`, `classify_link_*`, `first_login_*`, env-merge in `build_runtime_dir_writes_settings_not_symlink` | `claude.rs`, `runtime.rs` | pre-existing |
-//! | **Isolated launch (`clauth start`, no leakage)** | `acquire_creates_runtime_and_pid_file`, `build_runtime_dir_credentials_not_from_claude_home`, `*_preserves_live_runtime_credentials`, `acquire_isolates_credentials_from_real_home` | `runtime.rs` | partial pre-existing + **NEW** black-box (`acquire_isolates_credentials_from_real_home`) |
-//! | `start` signal/exit semantics | `status_code_*` | `start.rs` | pre-existing |
-//! | `clauth which [--json]` | full `which.rs` suite (token-match, session resolution, attribution, JSON path) | `which.rs` | pre-existing |
-//! | **Shell completions (`completions install [shell]`)** | `print_script_supports_bash_zsh_fish`, `print_script_rejects_unsupported_shell`, `install_bash_writes_script_and_sources_it_in_rc`, `install_bash_is_idempotent_across_reruns`, `install_fish_writes_into_fish_completions_dir`, `install_rejects_unsupported_shell` | `completions.rs` | **NEW** |
-//! | In-app help (`?` keybinding ref) | `all_tabs_render` (help-modal render), footer hint rows | `tui_render_mod.rs` | pre-existing |
-//! | Theme / Config tab / divergence default | `theme_set_tier_round_trips`, `global_config_*`, `next_divergence_default_cycles_round_trip`, `divergence_default_*` | `tui_app.rs` | pre-existing |
-//! | Status incident feed | full `status_parse.rs` (20 fns) | `status_parse.rs` | pre-existing |
-//! | Self-update integrity | full `update.rs` (sha256 / sums / opt-out) | `update.rs` | pre-existing |
-//! | File perms 0600/0700 | `credential_and_cache_files_have_restricted_permissions`, `usage_cache_write_creates_restricted_file_and_dir` | `profile.rs` | pre-existing |
+//! Run: `cargo test features_have_test_coverage`.
+
+use std::collections::HashSet;
+
+/// (feature name in README → test fn name prefixes that cover it)
+///
+/// A feature passes if each prefix matches at least one function in the
+/// test tree (substring match on function name).  Add a new row here
+/// when you add a feature to the README's `## Features` list.
+const FEATURE_MAP: &[(&str, &[&str])] = &[
+    (
+        "One-key switching",
+        &["auto_switch", "snapshot_chain", "resolves_started_profile"],
+    ),
+    (
+        "Automatic token refresh",
+        &[
+            "rotate_one",
+            "live_session_excluded",
+            "force_true_bypasses",
+            "rotation_guard_is_independent",
+        ],
+    ),
+    (
+        "Live usage bars",
+        &[
+            "parses_",
+            "retry_after",
+            "cached_fallback_does_not_clobber",
+            "mark_window_open",
+            "window_lapsed",
+        ],
+    ),
+    (
+        "Per-row activity",
+        &["gap_boundary", "steady_drain_no_gap_no_cut"],
+    ),
+    (
+        "Plan detection",
+        &["oauth_profile", "api_profile", "failed_profile"],
+    ),
+    (
+        "Per-account breakdown",
+        &["all_tabs_render", "empty_state_renders"],
+    ),
+    (
+        "Auto-switch on exhaustion",
+        &[
+            "auto_switch_",
+            "wrap_off_",
+            "find_recovered_",
+            "sink_active_",
+        ],
+    ),
+    ("Stale-data cues", &["all_tabs_render"]),
+    (
+        "Account-change detection",
+        &[
+            "relogin_is_diverged",
+            "overwrite_confirm",
+            "overwrite_cancel",
+        ],
+    ),
+    (
+        "Multi-instance safe",
+        &[
+            "cross_thread_with_state_lock_serializes",
+            "same_thread_reentrancy_does_not_deadlock",
+            "poison_recovery_after_panicking_closure",
+        ],
+    ),
+    (
+        "Non-destructive",
+        &[
+            "diverged_",
+            "classify_link_",
+            "first_login_",
+            "build_runtime_dir_writes_settings_not_symlink",
+        ],
+    ),
+    (
+        "Isolated launch",
+        &[
+            "acquire_creates_runtime_and_pid_file",
+            "build_runtime_dir_credentials_not_from_claude_home",
+            "acquire_isolates_credentials_from_real_home",
+        ],
+    ),
+    (
+        "Status-line aware",
+        &[
+            "resolves_started_profile",
+            "session_profile_",
+            "matches_profile_by_refresh_token",
+            "token_match_",
+        ],
+    ),
+    (
+        "Shell completions",
+        &[
+            "print_script_supports",
+            "print_script_rejects",
+            "install_bash_writes",
+            "install_bash_is_idempotent",
+            "install_fish_writes",
+            "install_rejects_unsupported",
+        ],
+    ),
+    ("In-app help", &["all_tabs_render"]),
+];
+
+#[test]
+fn features_have_test_coverage() {
+    let readme = include_str!("../../README.md");
+
+    let features = extract_features(readme);
+    assert!(
+        !features.is_empty(),
+        "no `## Features` section or bullet items found in README"
+    );
+
+    let test_fns = collect_test_functions();
+
+    let mut uncovered: Vec<String> = Vec::new();
+    let mut rows: Vec<String> = Vec::new();
+
+    for feature in &features {
+        let entry = lookup(feature);
+        match entry {
+            Some(prefixes) => {
+                let matched = matched_tests(prefixes, &test_fns);
+                let unmatched = unmatched_prefixes(prefixes, &test_fns);
+
+                let tests_str = if matched.is_empty() {
+                    "—".to_string()
+                } else {
+                    matched.join(", ")
+                };
+
+                if unmatched.is_empty() {
+                    rows.push(format!("| {} | {} | ✅ |", feature, tests_str));
+                } else {
+                    let detail = format!("missing: {}", unmatched.join(", "));
+                    rows.push(format!("| {} | {} | ❌ {} |", feature, tests_str, detail));
+                    uncovered.push(format!("  {feature}: {detail}"));
+                }
+            }
+            None => {
+                rows.push(format!(
+                    "| {} | — | ❌ no mapping in FEATURE_MAP |",
+                    feature
+                ));
+                uncovered.push(format!("  {feature}: add an entry to FEATURE_MAP"));
+            }
+        }
+    }
+
+    println!("\nFeature → Test Coverage Table\n");
+    println!("| Feature | Tests | Status |");
+    println!("|---|---|---|");
+    for row in &rows {
+        println!("{row}");
+    }
+    println!();
+
+    assert!(
+        uncovered.is_empty(),
+        "Features without test coverage:\n{uncovered}",
+        uncovered = uncovered.join("\n")
+    );
+}
+
+/// Extract feature names from the README's `## Features` bullet list.
+fn extract_features(readme: &str) -> Vec<String> {
+    let mut in_features = false;
+    let mut features = Vec::new();
+
+    for line in readme.lines() {
+        if line.starts_with("## Features") {
+            in_features = true;
+            continue;
+        }
+        if in_features {
+            if line.starts_with("## ") {
+                break;
+            }
+            // `- **Feature name** — description...`
+            if let Some(content) = line.strip_prefix("- **")
+                && let Some(name) = content.split("**").next()
+            {
+                let name = name.trim();
+                if !name.is_empty() {
+                    features.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    features
+}
+
+/// Look up the test prefixes for a feature name.
+fn lookup(feature: &str) -> Option<&'static [&'static str]> {
+    FEATURE_MAP
+        .iter()
+        .find(|(key, _)| *key == feature)
+        .map(|(_, prefixes)| *prefixes)
+}
+
+/// Return all test function names that match at least one prefix.
+fn matched_tests(prefixes: &[&str], test_fns: &HashSet<String>) -> Vec<String> {
+    let mut names: Vec<String> = test_fns
+        .iter()
+        .filter(|name| prefixes.iter().any(|p| name.contains(p)))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// Return prefixes that match zero test functions.
+fn unmatched_prefixes<'a>(prefixes: &'a [&str], test_fns: &HashSet<String>) -> Vec<&'a str> {
+    prefixes
+        .iter()
+        .filter(|p| !test_fns.iter().any(|name| name.contains(*p)))
+        .copied()
+        .collect()
+}
+
+/// Scan `tests/inline/*.rs` for function definitions.
+fn collect_test_functions() -> HashSet<String> {
+    let mut names = HashSet::new();
+    let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/inline");
+
+    let dir = match std::fs::read_dir(&test_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "warning: cannot read tests/inline/: {e} — \
+                 using empty function set"
+            );
+            return names;
+        }
+    };
+
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            // Match `fn name(`, `fn name <`, or `fn name` at end
+            if let Some(rest) = line
+                .strip_prefix("fn ")
+                .or_else(|| line.strip_prefix("pub fn "))
+                .or_else(|| line.strip_prefix("pub(crate) fn "))
+            {
+                let rest = rest.trim_start();
+                let name = rest.split(['(', '<', ' ', '!']).next().unwrap_or("").trim();
+                if !name.is_empty() && !name.starts_with('_') {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+
+    names
+}
