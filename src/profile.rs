@@ -467,7 +467,9 @@ pub(crate) fn prune_usage_history(name: &str) {
     if pruned > 0 {
         let body = kept.join("\n");
         let body = if body.is_empty() { body } else { body + "\n" };
-        let _ = std::fs::write(&path, body);
+        if let Err(e) = atomic_write(&path, body) {
+            eprintln!("clauth: failed to prune usage history for {name}: {e}");
+        }
     }
 }
 
@@ -598,7 +600,7 @@ fn load_app_state() -> Result<AppState> {
 pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
     with_state_lock(|| {
         std::fs::create_dir_all(clauth_dir()?)?;
-        atomic_write(&app_state_path()?, toml::to_string_pretty(state)?)
+        atomic_write_600(&app_state_path()?, toml::to_string_pretty(state)?)
             .context("Failed to write profiles.toml")
     })
 }
@@ -694,7 +696,7 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
             None => {}
         }
 
-        atomic_write(
+        atomic_write_600(
             &profile_config_path(&profile.name)?,
             render_config_toml(profile),
         )
