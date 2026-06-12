@@ -93,13 +93,17 @@ impl SignalWatcher {
             Signals::new([SIGINT, SIGTERM]).context("failed to install signal handlers")?;
         let handle = signals.handle();
         let (tx, rx) = channel();
-        let thread = std::thread::spawn(move || {
-            for signal in signals.forever() {
-                if tx.send(signal).is_err() {
-                    break;
+        #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
+        let thread = std::thread::Builder::new()
+            .name("clauth-sig".into())
+            .spawn(move || {
+                for signal in signals.forever() {
+                    if tx.send(signal).is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            })
+            .expect("failed to spawn signal watcher thread");
         Ok(Self {
             handle,
             thread: Some(thread),

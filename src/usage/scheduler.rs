@@ -898,18 +898,22 @@ pub(crate) fn spawn_refresher(
         third_party_status,
         shutting_down,
     };
-    std::thread::spawn(move || {
-        loop {
-            if state.shutting_down.load(Ordering::SeqCst) {
-                break;
+    #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
+    std::thread::Builder::new()
+        .name("clauth-tick".into())
+        .spawn(move || {
+            loop {
+                if state.shutting_down.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(TICK_INTERVAL);
+                if state.shutting_down.load(Ordering::SeqCst) {
+                    break;
+                }
+                tick(&state);
             }
-            std::thread::sleep(TICK_INTERVAL);
-            if state.shutting_down.load(Ordering::SeqCst) {
-                break;
-            }
-            tick(&state);
-        }
-    });
+        })
+        .expect("failed to spawn scheduler tick thread");
 }
 
 /// Evaluate the fallback chain and queue an auto-switch target.

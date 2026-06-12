@@ -34,6 +34,7 @@ thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
+#[must_use]
 pub(crate) struct StateLock {
     // Non-None only for the outermost acquisition on this thread.
     // Holds THREAD_LOCK for the full closure lifetime; None for reentrant calls.

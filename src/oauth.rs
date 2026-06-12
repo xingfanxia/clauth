@@ -140,6 +140,7 @@ fn kick(access_token: &str) -> std::result::Result<(), KickError> {
 /// rotation happened — the caller MUST propagate it into the live token snapshot
 /// even when `opened` is false, because the single-use refresh token was already
 /// spent.
+#[must_use]
 pub(crate) struct KickResult {
     pub(crate) opened: bool,
     pub(crate) rotated: Option<(String, Option<String>)>,

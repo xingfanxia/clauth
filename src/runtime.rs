@@ -112,6 +112,7 @@ fn rotation_lock_path(name: &str) -> Result<PathBuf> {
 ///
 /// Distinct from `~/.clauth/.lock` (global state) and `sessions/<pid>`
 /// (per-session liveness). Blocking `flock`; the holder window is short.
+#[must_use]
 pub(crate) struct RotationGuard {
     // Drops before `_rank` (declaration order): the flock releases, then the
     // ROTATION rank pops — never the reverse.
@@ -217,31 +218,36 @@ impl ProfileRuntime {
         let watchdog_runtime = runtime.clone();
         let watchdog_canonical = canonical.clone();
         let watchdog_claude_home = claude_home.clone();
-        let watchdog_handle = thread::spawn(move || {
-            // One thread, two cadences: `.claude.json` reconciles every
-            // CJSON_INTERVAL; credentials reconcile every ~WATCHDOG_INTERVAL,
-            // counted in cjson ticks. Loop exits on Disconnected (sender dropped
-            // in Drop) or Ok(()).
-            let cred_every = (WATCHDOG_INTERVAL.as_millis() / CJSON_INTERVAL.as_millis()).max(1);
-            let mut until_cred = cred_every;
-            while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(CJSON_INTERVAL) {
-                if let Err(e) = crate::claude_json::sync_once() {
-                    eprintln!("clauth: .claude.json sync failed: {e}");
-                }
-                until_cred -= 1;
-                if until_cred == 0 {
-                    until_cred = cred_every;
-                    if let Err(e) = tick(
-                        mode,
-                        &watchdog_runtime,
-                        &watchdog_claude_home,
-                        &watchdog_canonical,
-                    ) {
-                        eprintln!("clauth: watchdog tick failed: {e}");
+        #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
+        let watchdog_handle = thread::Builder::new()
+            .name(format!("clauth-wdog-{name}"))
+            .spawn(move || {
+                // One thread, two cadences: `.claude.json` reconciles every
+                // CJSON_INTERVAL; credentials reconcile every ~WATCHDOG_INTERVAL,
+                // counted in cjson ticks. Loop exits on Disconnected (sender
+                // dropped in Drop) or Ok(()).
+                let cred_every =
+                    (WATCHDOG_INTERVAL.as_millis() / CJSON_INTERVAL.as_millis()).max(1);
+                let mut until_cred = cred_every;
+                while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(CJSON_INTERVAL) {
+                    if let Err(e) = crate::claude_json::sync_once() {
+                        eprintln!("clauth: .claude.json sync failed: {e}");
+                    }
+                    until_cred -= 1;
+                    if until_cred == 0 {
+                        until_cred = cred_every;
+                        if let Err(e) = tick(
+                            mode,
+                            &watchdog_runtime,
+                            &watchdog_claude_home,
+                            &watchdog_canonical,
+                        ) {
+                            eprintln!("clauth: watchdog tick failed: {e}");
+                        }
                     }
                 }
-            }
-        });
+            })
+            .expect("failed to spawn watchdog thread");
 
         Ok(Self {
             runtime,

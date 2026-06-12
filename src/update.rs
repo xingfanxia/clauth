@@ -49,9 +49,15 @@ pub(crate) fn spawn(tx: Sender<UpdateEvent>) -> Option<JoinHandle<()>> {
     if !updates_enabled() {
         return None;
     }
-    Some(std::thread::spawn(move || {
-        let _ = try_update(&tx);
-    }))
+    #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
+    Some(
+        std::thread::Builder::new()
+            .name("clauth-upd".into())
+            .spawn(move || {
+                let _ = try_update(&tx);
+            })
+            .expect("failed to spawn update thread"),
+    )
 }
 
 fn try_update(tx: &Sender<UpdateEvent>) -> anyhow::Result<()> {

@@ -100,6 +100,7 @@ thread_local! {
 /// Tracks one held rank on the current thread; pops it on drop. Used directly by
 /// the two file-lock guards ([`crate::lock`]'s state flock and
 /// [`crate::runtime::RotationGuard`]) — not [`Mutex`]es but still in the order.
+#[must_use]
 pub(crate) struct RankGuard {
     #[cfg(debug_assertions)]
     rank: u16,
