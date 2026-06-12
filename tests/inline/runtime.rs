@@ -1045,6 +1045,74 @@ fn acquire_creates_runtime_and_pid_file() {
     });
 }
 
+/// Black-box `clauth start` isolation: a full `acquire` must build the runtime
+/// tree from the profile's OWN canonical credentials and never leak the live
+/// `~/.claude/.credentials.json` (a different account's tokens) into it. Also
+/// pins that `acquire` leaves the real home's credential file untouched.
+#[test]
+fn acquire_isolates_credentials_from_real_home() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        // The real `~/.claude/.credentials.json` belongs to a DIFFERENT account
+        // (a "wrong" chain). Isolation means it must never reach the runtime.
+        let live_creds = claude_home.join(".credentials.json");
+        fs::write(&live_creds, CREDS_V1).expect("write live creds");
+
+        // Pre-stage the profile's own canonical credentials (what `clauth start`
+        // restores for this profile) with a DISTINCT token chain.
+        let profile = make_profile("isolated");
+        let canonical = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("isolated")
+            .join("credentials.json");
+        fs::create_dir_all(canonical.parent().expect("canonical parent"))
+            .expect("mkdir profile dir");
+        fs::write(&canonical, CREDS_V2).expect("write canonical");
+
+        let rt = ProfileRuntime::acquire(&profile).expect("acquire");
+        let runtime_creds = rt.config_dir().join(".credentials.json");
+
+        // The runtime's credentials resolve to the profile's OWN chain (V2),
+        // not the live wrong-account chain (V1). On Unix this is a symlink into
+        // canonical; either way the resolved bytes must be the profile's.
+        assert_eq!(
+            fs::read(&runtime_creds).expect("read runtime creds"),
+            CREDS_V2,
+            "runtime must carry the profile's canonical chain, not the live one"
+        );
+        assert_ne!(
+            fs::read(&runtime_creds).expect("read runtime creds"),
+            CREDS_V1,
+            "the live ~/.claude chain must never leak into the runtime"
+        );
+
+        // The real home's credential file is untouched by the launch.
+        assert_eq!(
+            fs::read(&live_creds).expect("read live creds"),
+            CREDS_V1,
+            "acquire must not overwrite the real ~/.claude/.credentials.json"
+        );
+
+        // settings.json is a per-profile rewrite, never a symlink into the
+        // shared home — the isolation boundary for env/base-url too.
+        let settings = rt.config_dir().join("settings.json");
+        assert!(
+            !settings
+                .symlink_metadata()
+                .expect("settings present")
+                .file_type()
+                .is_symlink(),
+            "runtime settings.json must be a per-profile copy, not a shared symlink"
+        );
+
+        drop(rt);
+    });
+}
+
 /// `build_runtime_dir` re-walk must pick up entries added between two acquires.
 /// Uses underlying functions directly — two `ProfileRuntime::acquire` calls in
 /// the same process deadlock on the PID flock (`flock(LOCK_EX)` on same path).

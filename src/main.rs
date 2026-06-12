@@ -154,3 +154,8 @@ fn print_help() {
         ver = env!("CARGO_PKG_VERSION"),
     );
 }
+
+/// Doc-only feature→test traceability map (task 7b deliverable).
+#[cfg(test)]
+#[path = "../tests/inline/feature_coverage.rs"]
+mod feature_coverage;

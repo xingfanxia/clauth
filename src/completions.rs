@@ -158,3 +158,7 @@ fn install_fish() -> Result<()> {
     fs::write(&path, FISH).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/completions.rs"]
+mod tests;
