@@ -8,8 +8,8 @@ use crate::lockorder::{RankedMutex, rank};
 use crate::providers::{Provider, ThirdPartyStats};
 
 use super::fetch::{
-    FetchError, UsageInfo, UsageWindow, epoch_secs_to_iso, fetch_raw, iso_to_epoch_secs,
-    load_disk_cache, now_epoch_secs, now_ms, write_disk_cache,
+    FetchError, UsageInfo, UsageWindow, cache_mtime_ms, epoch_secs_to_iso, fetch_raw,
+    iso_to_epoch_secs, load_disk_cache, now_epoch_secs, now_ms, write_disk_cache,
 };
 
 /// Scheduler wake interval. Network work only fires for profiles whose cadence has elapsed.
@@ -519,8 +519,79 @@ fn mark_window_open(store: &UsageStore, name: &str, now_secs: i64) {
     });
 }
 
-/// Force-fetch all entries in parallel, bypassing the cadence. Used by bootstrap
-/// and `manual_refresh`. Blocks until all complete. Rotated tokens are dropped —
+/// Startup usage load. A profile whose on-disk cache was written less than one
+/// refresh interval ago is seeded straight from disk (no network); the rest are
+/// fetched now via [`fetch_all_into`]. Skips the redundant API round-trip on a
+/// restart that lands inside the cadence window, while a long-idle restart still
+/// refreshes immediately.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bootstrap_fetch(
+    config: &crate::profile::ConfigHandle,
+    tokens: &[TokenEntry],
+    store: &UsageStore,
+    status: &StatusStore,
+    last_fetched: &LastFetchedAt,
+    refetch: &RefetchQueue,
+    activity: &ActivityStore,
+    interval_ms: u64,
+) {
+    let now = now_ms();
+    let stale: Vec<TokenEntry> = tokens
+        .iter()
+        .filter(|e| !try_seed_recent_cache(store, status, last_fetched, &e.name, now, interval_ms))
+        .cloned()
+        .collect();
+    fetch_all_into(
+        config,
+        &stale,
+        store,
+        status,
+        last_fetched,
+        refetch,
+        activity,
+        interval_ms,
+    );
+}
+
+/// Seed `name` from its on-disk cache when that cache is younger than
+/// `interval_ms`, returning `true` (skip the fetch). The `last_fetched` slot is
+/// stamped at the cache's mtime, so `partition_due` schedules the next fetch at
+/// `mtime + interval` — the scheduler's fixed cadence carries on as if the cache
+/// write were the last fetch. Returns `false` (fetch now) on a stale or missing
+/// cache. Status is `Fresh`: the numbers are current within the cadence, so the
+/// UI shows the normal countdown rather than a staleness warning.
+fn try_seed_recent_cache(
+    store: &UsageStore,
+    status: &StatusStore,
+    last_fetched: &LastFetchedAt,
+    name: &str,
+    now_ms: u64,
+    interval_ms: u64,
+) -> bool {
+    let Some(mtime) = cache_mtime_ms(name) else {
+        return false;
+    };
+    if now_ms.saturating_sub(mtime) >= interval_ms {
+        return false;
+    }
+    let Some(info) = load_disk_cache(name) else {
+        return false;
+    };
+    if let Ok(mut s) = store.lock() {
+        s.insert(name.to_string(), info);
+    }
+    // Ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350) — matches `apply_outcome`.
+    if let Ok(mut lf) = last_fetched.lock() {
+        lf.insert(name.to_string(), EpochMs::from_millis(mtime));
+        if let Ok(mut st) = status.lock() {
+            st.insert(name.to_string(), FetchStatus::Fresh);
+        }
+    }
+    true
+}
+
+/// Force-fetch all entries in parallel, bypassing the cadence. Drives bootstrap's
+/// stale set; blocks until all complete. Rotated tokens are dropped —
 /// `reload_if_state_changed` will pick them up from `credentials.json` shortly.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fetch_all_into(

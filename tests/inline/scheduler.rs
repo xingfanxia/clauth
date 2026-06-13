@@ -428,3 +428,83 @@ fn retry_after_defers_next_fetch_slot() {
         "huge retry-after clamps to MAX_RETRY_AFTER_MS"
     );
 }
+
+/// Startup cache gating: a profile whose disk cache is younger than one interval
+/// is seeded from disk (store + `Fresh` status + `last_fetched` at the cache
+/// mtime, so the scheduler's next slot lands one interval after the write).
+/// A stale or missing cache is left for the network fetch.
+#[test]
+fn try_seed_recent_cache_seeds_fresh_only() {
+    use std::time::{Duration, SystemTime};
+
+    use super::{FetchStatus, StatusStore, now_ms, try_seed_recent_cache};
+    use crate::profile::profile_subpath;
+    use crate::testutil::{HomeSandbox, set_mtime};
+    use crate::usage::{UsageInfo, write_disk_cache};
+
+    let _home = HomeSandbox::new();
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // Fresh cache: written within the interval.
+    write_disk_cache("fresh", &UsageInfo::default());
+    let fresh_path = profile_subpath("fresh", "usage_cache.json").expect("fresh cache path");
+    set_mtime(&fresh_path, SystemTime::now());
+
+    // Stale cache: mtime well past one interval.
+    write_disk_cache("stale", &UsageInfo::default());
+    let stale_path = profile_subpath("stale", "usage_cache.json").expect("stale cache path");
+    set_mtime(
+        &stale_path,
+        SystemTime::now() - Duration::from_millis(REFRESH_INTERVAL_MS * 10),
+    );
+
+    let before = now_ms();
+    assert!(
+        try_seed_recent_cache(
+            &store,
+            &status,
+            &last_fetched,
+            "fresh",
+            before,
+            REFRESH_INTERVAL_MS
+        ),
+        "a cache younger than one interval seeds without a fetch"
+    );
+    assert!(
+        !try_seed_recent_cache(
+            &store,
+            &status,
+            &last_fetched,
+            "stale",
+            before,
+            REFRESH_INTERVAL_MS
+        ),
+        "a stale cache is left for the network fetch"
+    );
+    assert!(
+        !try_seed_recent_cache(
+            &store,
+            &status,
+            &last_fetched,
+            "missing",
+            before,
+            REFRESH_INTERVAL_MS
+        ),
+        "a missing cache is left for the network fetch"
+    );
+
+    assert!(store.lock().unwrap().contains_key("fresh"));
+    assert!(!store.lock().unwrap().contains_key("stale"));
+    assert_eq!(
+        status.lock().unwrap().get("fresh").copied(),
+        Some(FetchStatus::Fresh),
+        "recent cache surfaces as Fresh, not a staleness warning"
+    );
+    let stamp = last_fetched.lock().unwrap().get("fresh").copied().unwrap();
+    assert!(
+        (before.saturating_sub(REFRESH_INTERVAL_MS)..=before).contains(&stamp.as_millis()),
+        "last_fetched is stamped at the cache mtime, not now"
+    );
+}
