@@ -129,7 +129,57 @@ fn install_rc(shell: &str, script: &str, rc_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Env var: set to `1` to skip the first-launch completions auto-install
+/// entirely (only `"1"` opts out, matching `CLAUTH_NO_UPDATE`).
+const NO_COMPLETIONS_ENV: &str = "CLAUTH_NO_COMPLETIONS";
+
+fn completions_opt_out() -> bool {
+    std::env::var(NO_COMPLETIONS_ENV).as_deref() == Ok("1")
+}
+
+/// Outcome of asking the user whether to install completions.
+enum Consent {
+    /// Install — explicit yes, or the default-Yes empty answer.
+    Yes,
+    /// User declined — record it so we never ask again.
+    No,
+    /// Couldn't ask (not a TTY): skip WITHOUT recording, so the next
+    /// interactive launch still gets to ask. Never edits an rc unattended.
+    CannotAsk,
+}
+
+/// Parse a `[Y/n]` answer with a default-Yes policy: empty, `y`, or `yes`
+/// (case-insensitive) install; anything else declines.
+fn answer_is_yes(input: &str) -> bool {
+    let a = input.trim();
+    a.is_empty() || a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes")
+}
+
+/// Ask, on a TTY, before appending a completions `source` line to `~/{rc_name}`.
+/// Returns `CannotAsk` (never `Yes`) when stdin/stdout isn't a terminal, so a
+/// shell rc is never edited non-interactively.
+fn ask_install_completions(rc_name: &str) -> Consent {
+    use std::io::{IsTerminal as _, Write as _};
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Consent::CannotAsk;
+    }
+    print!("clauth: install shell completions? appends a source line to ~/{rc_name} [Y/n] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return Consent::CannotAsk;
+    }
+    if answer_is_yes(&line) {
+        Consent::Yes
+    } else {
+        Consent::No
+    }
+}
+
 pub(crate) fn auto_install_once() {
+    if completions_opt_out() {
+        return;
+    }
     let Ok(home) = home_dir() else { return };
     let clauth_dir = home.join(".clauth");
     let sentinel = clauth_dir.join(".completions_installed");
@@ -137,14 +187,30 @@ pub(crate) fn auto_install_once() {
         return;
     }
 
-    let _ = fs::create_dir_all(&clauth_dir);
-    let _ = fs::write(&sentinel, "");
-
     let Ok(shell) = detect_shell() else {
         return;
     };
 
-    if let Err(e) = install(Some(&shell)) {
+    // bash/zsh append a `source` line to a shell rc → require explicit consent.
+    // fish writes only into its own completions dir (the conventional location),
+    // so it installs without a prompt.
+    let consent = match shell.as_str() {
+        "bash" => ask_install_completions(".bashrc"),
+        "zsh" => ask_install_completions(".zshrc"),
+        _ => Consent::Yes,
+    };
+
+    if matches!(consent, Consent::CannotAsk) {
+        return; // don't record the sentinel — re-prompt on the next interactive launch
+    }
+
+    // Decision made (install or declined): record it so we never ask again.
+    let _ = fs::create_dir_all(&clauth_dir);
+    let _ = fs::write(&sentinel, "");
+
+    if matches!(consent, Consent::Yes)
+        && let Err(e) = install(Some(&shell))
+    {
         eprintln!("[clauth] could not install completions: {e}");
         eprintln!("[clauth] run `clauth completions install` later to retry");
     }

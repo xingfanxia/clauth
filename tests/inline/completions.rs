@@ -104,3 +104,26 @@ fn install_rejects_unsupported_shell() {
         "error must name the unsupported shell",
     );
 }
+
+// The first-launch consent prompt defaults to Yes: an empty answer (bare Enter)
+// installs, so the convenient path stays a single keypress.
+#[test]
+fn answer_is_yes_defaults_to_yes_on_empty() {
+    for a in ["", "   ", "\n", "\r\n"] {
+        assert!(answer_is_yes(a), "{a:?} (default) must install");
+    }
+}
+
+#[test]
+fn answer_is_yes_accepts_y_and_yes_any_case() {
+    for a in ["y", "Y", "yes", "YES", " Yes "] {
+        assert!(answer_is_yes(a), "{a:?} must install");
+    }
+}
+
+#[test]
+fn answer_is_yes_declines_on_n_or_other_input() {
+    for a in ["n", "N", "no", "nope", "q", "x"] {
+        assert!(!answer_is_yes(a), "{a:?} must decline");
+    }
+}
