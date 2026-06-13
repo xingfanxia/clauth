@@ -89,7 +89,7 @@ clauth start personal -- --model haiku
 # spawns claude with personal's credentials in an isolated CLAUDE_CONFIG_DIR
 ```
 
-The active profile is shown in orange. Usage bars are cached locally, so they stay visible even if the Anthropic API is rate-limited or offline. `Tab` / arrows move between the six tabs — **Overview** (switch and reorder accounts), **Usage** (per-account window breakdown), **Setup** (endpoint, key, env, auto-start), **Fallback** (chain editor), **Config** (theme, refresh interval, wrap-off, divergence default), and **Status** (Claude incident feed). `?` shows the rest.
+The active profile is shown in orange. Usage bars are cached locally, so they stay visible even if the Anthropic API is rate-limited or offline. `←`/`→` move between the six tabs — **Overview** (switch and reorder accounts), **Usage** (per-account window breakdown), **Setup** (endpoint, key, env, auto-start), **Fallback** (chain editor), **Config** (theme, refresh interval, wrap-off, divergence default), and **Status** (Claude incident feed). `?` shows the rest.
 
 Dev-only: `cargo test showcase -- --ignored --nocapture` runs the real interactive TUI on fake data against a throwaway home dir (never built into the binary, no network) — handy for screenshots.
 
