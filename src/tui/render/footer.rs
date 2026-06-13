@@ -7,7 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{
-    App, ConfigFocus, FallbackFocus, FallbackHint, FooterAlert, StatusFocus, Tab, fallback_hint,
+    App, ConfigFocus, FallbackFocus, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS,
+    GlobalConfigRow, StatusFocus, Tab, fallback_hint,
 };
 use super::super::theme;
 
@@ -55,7 +56,23 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("?", "help"),
             ],
         },
-        Tab::Config => &[("↑↓", "row"), ("↵", "cycle / toggle"), ("?", "help")],
+        Tab::Config => {
+            if app.refresh_interval_draft.is_some() {
+                &[("↵", "save"), ("←→", "caret"), ("esc", "cancel")]
+            } else if GLOBAL_CONFIG_ROWS
+                .get(app.global_config_cursor)
+                .is_some_and(|r| *r == GlobalConfigRow::RefreshInterval)
+            {
+                &[
+                    ("↑↓", "row"),
+                    ("space", "cycle"),
+                    ("↵", "custom"),
+                    ("?", "help"),
+                ]
+            } else {
+                &[("↑↓", "row"), ("space/↵", "cycle / toggle"), ("?", "help")]
+            }
+        }
         Tab::Status => match app.status.focus {
             StatusFocus::List => &[
                 ("↑↓", "incident"),
@@ -110,13 +127,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     // Suppress the trailing `q` hint only where `q` is fully captured by the
-    // screen (threshold edit / armed-remove own the keyboard entirely). Every
-    // other sub-focus shows `q back` via `q_label` per the cloudy-tui contract.
-    let show_q = !(app.tab == Tab::Fallback
+    // screen (threshold edit / armed-remove / refresh-interval edit own the
+    // keyboard entirely). Every other sub-focus shows `q back` via `q_label`
+    // per the cloudy-tui contract.
+    let show_q = !((app.tab == Tab::Fallback
         && matches!(
             fallback_hint(app),
             FallbackHint::DetailThresholdEdit | FallbackHint::DetailRemoveArmed
-        ));
+        ))
+        || (app.tab == Tab::Config && app.refresh_interval_draft.is_some()));
 
     let mut hints: Vec<(&str, &str)> = std::iter::once(TAB_NAV)
         .chain(tail.iter().copied())

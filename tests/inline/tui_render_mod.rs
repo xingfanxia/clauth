@@ -156,6 +156,43 @@ fn all_tabs_render() {
 }
 
 #[test]
+fn config_refresh_interval_custom_editor_renders() {
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::RefreshInterval)
+        .unwrap();
+
+    app.refresh_interval_draft = Some(InputState::new("45"));
+    let valid = dump(&app, 90, 20);
+    assert!(valid.contains("refresh"), "refresh row label renders");
+    assert!(valid.contains("45"), "typed seconds render in the field");
+    assert!(valid.contains("10–3600 s"), "valid-range tooltip renders");
+
+    // An out-of-range buffer still renders (DANGER value) without panicking.
+    app.refresh_interval_draft = Some(InputState::new("99999"));
+    let invalid = dump(&app, 90, 20);
+    assert!(invalid.contains("99999"));
+    assert!(invalid.contains("10–3600 s"));
+
+    // At rest, a custom (non-preset) interval shows the real value rather than
+    // mis-bracketing the nearest preset chip.
+    app.refresh_interval_draft = None;
+    app.refresh_interval
+        .store(200_000, std::sync::atomic::Ordering::Relaxed);
+    let custom = dump(&app, 90, 20);
+    assert!(
+        custom.contains("200s"),
+        "custom interval shows its real value"
+    );
+}
+
+#[test]
 fn status_selected_row_tint_spans_both_lines() {
     let config = AppConfig {
         state: AppState::default(),

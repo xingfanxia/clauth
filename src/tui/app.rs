@@ -36,8 +36,8 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ConfigHandle, DivergenceChoice, Profile, ThemeName, app_state_mtime, load_config,
-    save_app_state, save_profile,
+    AppConfig, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTERVAL_MS,
+    Profile, ThemeName, app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
@@ -671,6 +671,9 @@ pub(crate) struct App {
     pub(crate) fallback_threshold_draft: Option<InputState>,
     /// Cursor into [`GLOBAL_CONFIG_ROWS`] on the program-wide Config tab.
     pub(crate) global_config_cursor: usize,
+    /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
+    /// owns keyboard). Space/`+`/`-` still cycle the presets when `None`.
+    pub(crate) refresh_interval_draft: Option<InputState>,
 
     pub(crate) toasts: VecDeque<Toast>,
     /// Whether the terminal is currently too short for the normal layout (< 14 rows).
@@ -868,6 +871,7 @@ impl App {
             fallback_armed_remove: false,
             fallback_threshold_draft: None,
             global_config_cursor: 0,
+            refresh_interval_draft: None,
             config_draft: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
@@ -1396,6 +1400,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Same for the Config-tab refresh-interval custom-value editor.
+    if app.tab == Tab::Config && app.refresh_interval_draft.is_some() {
+        handle_refresh_interval_edit_key(app, key);
+        return;
+    }
+
     // Global keys (no modal owns input).
     match key.code {
         KeyCode::Right => {
@@ -1559,6 +1569,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
         }
         Tab::Config => {
             app.global_config_cursor = 0;
+            app.refresh_interval_draft = None;
         }
         Tab::Status => {
             // Keep the incident cursor; reset focus to the list per the contract.
@@ -1869,8 +1880,10 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 4] = [
     GlobalConfigRow::WrapOff,
 ];
 
-/// Config tab keymap: ↑↓ walks rows, ⏎/space cycles the theme or flips wrap-off,
-/// `+`/`-` steps the refresh interval in-place.
+/// Config tab keymap: ↑↓ walks rows; space cycles every row's value (theme tier,
+/// divergence default, refresh preset, wrap-off); ⏎ opens the refresh-interval
+/// custom-value editor and otherwise mirrors space; `+`/`-` steps the refresh
+/// preset in-place.
 fn handle_global_config_key(app: &mut App, key: KeyEvent) {
     let last = GLOBAL_CONFIG_ROWS.len() - 1;
     app.global_config_cursor = app.global_config_cursor.min(last);
@@ -1899,15 +1912,23 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
                 step_refresh_interval(app, -1);
             }
         }
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        KeyCode::Char(' ') => {
             run_global_config_row(app, GLOBAL_CONFIG_ROWS[app.global_config_cursor]);
+        }
+        KeyCode::Enter => {
+            let row = GLOBAL_CONFIG_ROWS[app.global_config_cursor];
+            if row == GlobalConfigRow::RefreshInterval {
+                begin_refresh_interval_edit(app);
+            } else {
+                run_global_config_row(app, row);
+            }
         }
         _ => {}
     }
 }
 
-/// Apply ⏎/space on a Config-tab row: cycle the theme tier, flip wrap-off, or
-/// step the refresh interval forward through presets.
+/// Apply space (or ⏎ on non-refresh rows) on a Config-tab row: cycle the theme
+/// tier, flip wrap-off, or step the refresh interval forward through presets.
 fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
     match row {
         GlobalConfigRow::Theme => cycle_theme(app),
@@ -2107,6 +2128,56 @@ fn step_refresh_interval(app: &mut App, dir: i32) {
         let _ = save_app_state(&cfg.state);
     }
     app.last_state_mtime = app_state_mtime();
+}
+
+/// Open the inline custom-value editor for the global refresh interval, seeded
+/// with the current value in whole seconds. ⏎ commits, ⎋ discards.
+fn begin_refresh_interval_edit(app: &mut App) {
+    let secs = app.refresh_interval.load(Ordering::Relaxed) / 1000;
+    app.refresh_interval_draft = Some(InputState::new(&secs.to_string()));
+}
+
+/// Keystrokes while the refresh-interval field is open: ⏎ saves, ⎋ discards.
+fn handle_refresh_interval_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.refresh_interval_draft = None,
+        KeyCode::Enter => commit_refresh_interval_edit(app),
+        _ => {
+            if let Some(input) = app.refresh_interval_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// Parse and persist the typed custom interval. Invalid input keeps the draft
+/// open so the Config card's inline Invalid-input treatment (DANGER value +
+/// `└ 10–3600 s` tooltip) stays on screen until corrected — no toast.
+fn commit_refresh_interval_edit(app: &mut App) {
+    let Some(raw) = app.refresh_interval_draft.as_ref().map(|i| i.trimmed()) else {
+        return;
+    };
+    let Some(ms) = parse_refresh_secs(raw) else {
+        return;
+    };
+    app.refresh_interval.store(ms, Ordering::Relaxed);
+    {
+        let mut cfg = app.config();
+        cfg.state.refresh_interval_ms = ms;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+    app.refresh_interval_draft = None;
+}
+
+/// A typed custom interval is valid only as a whole number of **seconds** that
+/// lands in `MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS` once scaled to
+/// milliseconds. Shared by the commit path and the Config card's inline check.
+pub(crate) fn parse_refresh_secs(raw: &str) -> Option<u64> {
+    let ms = raw.parse::<u64>().ok()?.checked_mul(1000)?;
+    (MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS)
+        .contains(&ms)
+        .then_some(ms)
 }
 
 /// Right-pane keymap for a member: ↑↓ walks rows, `+`/`-` steps the threshold,

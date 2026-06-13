@@ -273,7 +273,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "config",
             &[
                 ("\u{2191}\u{2193}", "move between settings"),
-                ("\u{23ce}", "cycle theme · flip wrap-off"),
+                ("space", "cycle the focused setting"),
+                ("\u{23ce}", "type a custom refresh interval"),
             ][..],
         )],
         Tab::Status => vec![(

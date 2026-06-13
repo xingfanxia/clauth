@@ -212,3 +212,132 @@ fn divergence_default_row_is_reachable_by_cursor() {
     super::handle_global_config_key(&mut app, key(KeyCode::Down));
     assert_eq!(app.global_config_cursor, pos);
 }
+
+// ── refresh interval custom value ──────────────────────────────────────────
+
+use super::parse_refresh_secs;
+
+/// Park the Config cursor on the refresh-interval row.
+fn on_refresh_row(app: &mut App) {
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::RefreshInterval)
+        .unwrap();
+}
+
+#[test]
+fn parse_refresh_secs_accepts_in_range_only() {
+    // Whole seconds, scaled to ms, must land in 10s..=3600s.
+    assert_eq!(parse_refresh_secs("10"), Some(10_000));
+    assert_eq!(parse_refresh_secs("90"), Some(90_000));
+    assert_eq!(parse_refresh_secs("3600"), Some(3_600_000));
+    assert!(parse_refresh_secs("9").is_none(), "below the 10s floor");
+    assert!(parse_refresh_secs("3601").is_none(), "above the 1h cap");
+    assert!(parse_refresh_secs("-5").is_none());
+    assert!(parse_refresh_secs("1.5").is_none());
+    assert!(parse_refresh_secs("abc").is_none());
+    assert!(parse_refresh_secs("").is_none());
+}
+
+#[test]
+fn refresh_interval_enter_opens_editor_seeded_in_seconds() {
+    let mut app = bare_app();
+    on_refresh_row(&mut app);
+
+    assert!(app.refresh_interval_draft.is_none());
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    let draft = app
+        .refresh_interval_draft
+        .as_ref()
+        .expect("⏎ opens the custom-value editor");
+    assert_eq!(draft.value, "90", "seeded with the default 90s in seconds");
+}
+
+#[test]
+fn refresh_interval_space_cycles_without_opening_editor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_refresh_row(&mut app);
+    let before = app.refresh_interval.load(Ordering::Relaxed);
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        app.refresh_interval_draft.is_none(),
+        "space cycles presets, never opens the editor"
+    );
+    assert_ne!(
+        app.refresh_interval.load(Ordering::Relaxed),
+        before,
+        "space steps to the next preset"
+    );
+}
+
+#[test]
+fn refresh_interval_custom_value_commits_and_clears() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_refresh_row(&mut app);
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    // Clear the seeded "90", type "45".
+    super::handle_refresh_interval_edit_key(&mut app, key(KeyCode::Backspace));
+    super::handle_refresh_interval_edit_key(&mut app, key(KeyCode::Backspace));
+    for c in "45".chars() {
+        super::handle_refresh_interval_edit_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_refresh_interval_edit_key(&mut app, key(KeyCode::Enter));
+
+    assert!(
+        app.refresh_interval_draft.is_none(),
+        "a valid commit clears the draft"
+    );
+    assert_eq!(app.refresh_interval.load(Ordering::Relaxed), 45_000);
+}
+
+#[test]
+fn refresh_interval_out_of_range_keeps_editor_open() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_refresh_row(&mut app);
+    let before = app.refresh_interval.load(Ordering::Relaxed);
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    for c in "99999".chars() {
+        super::handle_refresh_interval_edit_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_refresh_interval_edit_key(&mut app, key(KeyCode::Enter));
+
+    assert!(
+        app.refresh_interval_draft.is_some(),
+        "an out-of-range value keeps the editor open for correction"
+    );
+    assert_eq!(
+        app.refresh_interval.load(Ordering::Relaxed),
+        before,
+        "interval stays put while the typed value is invalid"
+    );
+}
+
+#[test]
+fn refresh_interval_esc_discards_editor() {
+    let mut app = bare_app();
+    on_refresh_row(&mut app);
+    let before = app.refresh_interval.load(Ordering::Relaxed);
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    for c in "30".chars() {
+        super::handle_refresh_interval_edit_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_refresh_interval_edit_key(&mut app, key(KeyCode::Esc));
+
+    assert!(
+        app.refresh_interval_draft.is_none(),
+        "esc discards the editor"
+    );
+    assert_eq!(
+        app.refresh_interval.load(Ordering::Relaxed),
+        before,
+        "esc leaves the interval unchanged"
+    );
+}

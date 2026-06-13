@@ -246,6 +246,10 @@ pub(crate) const DEFAULT_REFRESH_INTERVAL_MS: u64 = 90_000;
 /// sub-10 s intervals serve no purpose and can trigger 429s.
 pub(crate) const MIN_REFRESH_INTERVAL_MS: u64 = 10_000;
 
+/// Maximum settable `refresh_interval_ms` (1 h). Past this the background usage
+/// view is effectively stale; the Config-tab custom-value editor caps here.
+pub(crate) const MAX_REFRESH_INTERVAL_MS: u64 = 3_600_000;
+
 fn default_refresh_interval() -> u64 {
     DEFAULT_REFRESH_INTERVAL_MS
 }
