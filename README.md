@@ -44,6 +44,8 @@ cargo build --release
 
 Binary installs self-update in the background; cargo installs upgrade via `cargo install clauth`.
 
+On the first TUI launch, clauth installs shell completions once for your detected shell (bash/zsh/fish): it appends a `source` line to your shell rc and drops `~/.clauth/.completions_installed` so it never repeats. Delete that file (or run `clauth completions install [shell]`) to redo it.
+
 ### Auto-update
 
 On launch, a background thread checks GitHub for a newer release, verifies the SHA-256 against `sha256sums.txt` (fail-closed), and self-replaces on next launch. Cargo-installed builds are notified only; `CLAUTH_NO_UPDATE=1` disables all checks.
