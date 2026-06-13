@@ -613,18 +613,7 @@ fn key_span(key: &str) -> Span<'static> {
 
 // ── Small text helpers ──────────────────────────────────────────────────────
 
-/// Trailing-ellipsis truncation to `max` chars.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    if max == 0 {
-        return String::new();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
+use crate::format::truncate;
 
 /// Middle-ellipsis truncation (for URLs / IDs — both ends carry meaning).
 fn middle_truncate(s: &str, max: usize) -> String {

@@ -198,35 +198,7 @@ fn classify_link_linked_to_even_when_target_missing() {
 // the home-derived seam the prompt actually drives, no TTY needed.
 
 #[cfg(unix)]
-struct HomeSandbox {
-    // Drop order: tempdir first, then the shared lock.
-    _tmp: tempfile::TempDir,
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(unix)]
-impl HomeSandbox {
-    fn new() -> Self {
-        // Untracked HOME_TEST_LOCK acquired first; no RankedMutex/flock is held.
-        let guard = crate::profile::HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().expect("create home sandbox");
-        crate::profile::set_home_override(tmp.path().to_path_buf());
-        std::fs::create_dir_all(tmp.path().join(".claude")).expect("mkdir .claude");
-        Self {
-            _tmp: tmp,
-            _guard: guard,
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for HomeSandbox {
-    fn drop(&mut self) {
-        crate::profile::clear_home_override();
-    }
-}
+use crate::testutil::HomeSandbox;
 
 /// Seed an active profile `name` with stored credentials, then simulate CC
 /// re-logging into a different account: write a plain (non-symlink) live

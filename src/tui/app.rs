@@ -3368,7 +3368,7 @@ fn apply_status_incidents(
                 ToastKind::Info
             };
             if app.tab == Tab::Status {
-                let title = truncate_chars(&incident.title, 40);
+                let title = crate::format::truncate(&incident.title, 40);
                 app.toast(severity, format!("new incident · {title}"));
             } else {
                 app.set_tab_activity(Tab::Status, severity);
@@ -3395,16 +3395,6 @@ fn apply_status_incidents(
     if app.status.selected().map(|i| i.id.clone()) != prev_selected_id {
         app.status.detail_scroll = 0;
     }
-}
-
-/// Truncate a string to `max` chars, appending `…` when cut.
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 pub(crate) fn on_tick(app: &mut App) {

@@ -4,6 +4,19 @@
 use crate::profile::Profile;
 use crate::usage::PlanInfo;
 
+/// Trailing-ellipsis truncation to `max` chars (counts `char`s, not bytes).
+pub(crate) fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 pub(crate) fn endpoint_label(profile: &Profile) -> String {
     if let Some(url) = &profile.base_url {
         return url.clone();

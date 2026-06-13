@@ -1,19 +1,13 @@
 #![allow(unsafe_code)]
 use super::*;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::time::{Duration, SystemTime};
+
+use crate::testutil::set_mtime;
 
 // V1 expires_at < V2 so tie-break tests can assert which side wins unambiguously.
 const CREDS_V1: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok1","expiresAt":1000}}"#;
 const CREDS_V2: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok2","expiresAt":2000}}"#;
-
-fn set_mtime(path: &Path, when: SystemTime) {
-    let file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("open for mtime");
-    file.set_modified(when).expect("set_modified");
-}
 
 #[test]
 fn sync_no_op_when_link_missing() {

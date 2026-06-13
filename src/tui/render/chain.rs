@@ -20,8 +20,8 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    SELECTOR_WIDTH, active_dot, bold_when, draw_selector_list, highlight_row, label_style,
-    name_color, section_box, section_box_verbatim, select_line,
+    SELECTOR_WIDTH, active_dot, bold_when, draw_selector_list, head_cols, highlight_row,
+    label_style, name_color, section_box, section_box_verbatim, select_line,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 use crate::profile::AppConfig;
@@ -356,13 +356,6 @@ fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
     }
     .bg(theme::bg_sunken());
     vec![Span::styled(input.value.clone(), body)]
-}
-
-/// Display columns occupied by the text before the caret in `input`.
-fn head_cols(input: &InputState) -> usize {
-    input.value[..input.cursor.min(input.value.len())]
-        .chars()
-        .count()
 }
 
 fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {

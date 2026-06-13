@@ -13,7 +13,7 @@ use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceForm, InputState, Modal, Tab,
 };
 use super::super::theme;
-use super::panes::bold_when;
+use super::panes::{bold_when, head_cols};
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
     match modal {
@@ -372,13 +372,6 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
         Span::raw(" "),
         Span::styled(input.value.clone(), value_style),
     ])
-}
-
-/// Display columns before the caret in `input` (char count of the pre-caret slice).
-fn head_cols(input: &InputState) -> usize {
-    input.value[..input.cursor.min(input.value.len())]
-        .chars()
-        .count()
 }
 
 fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) {

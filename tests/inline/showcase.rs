@@ -626,14 +626,7 @@ fn headless_showcase_renders() {
 // (save_profile, save_app_state, flock, symlinks, history) land on scratch
 // space and never touch the real filesystem.
 
-fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent {
-        code,
-        modifiers: KeyModifiers::NONE,
-        kind: KeyEventKind::Press,
-        state: KeyEventState::NONE,
-    }
-}
+use crate::testutil::key;
 
 fn key_shift(code: KeyCode) -> KeyEvent {
     KeyEvent {

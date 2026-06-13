@@ -138,11 +138,9 @@ fn compact_rearm_after_exit() {
 // ── global config tab ────────────────────────────────────────────────────
 
 use super::theme::{self, Tier};
-use super::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, KeyCode, KeyEvent, KeyModifiers, Tab};
+use super::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, KeyCode, Tab};
 
-fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
-}
+use crate::testutil::key;
 
 #[test]
 fn theme_set_tier_round_trips() {

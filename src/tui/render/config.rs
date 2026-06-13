@@ -10,23 +10,11 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-// ── display-column helpers ────────────────────────────────────────────────────
-// `InputState::cursor` is a byte offset; for screen-column math we need the
-// char count of the text before the caret. All fields here are ASCII-only in
-// practice, so `.chars().count()` equals display columns.
-
-/// Number of display columns occupied by the text before the caret.
-fn head_cols(input: &InputState) -> usize {
-    input.value[..input.cursor.min(input.value.len())]
-        .chars()
-        .count()
-}
-
 use super::super::app::{App, ConfigFocus, ConfigRow, InputState, config_rows};
 use super::super::theme;
 use super::panes::{
-    SELECTOR_WIDTH, active_dot, draw_selector_list, highlight_row, label_style, name_color,
-    picker_row, section_box, section_box_verbatim,
+    SELECTOR_WIDTH, active_dot, draw_selector_list, head_cols, highlight_row, label_style,
+    name_color, picker_row, section_box, section_box_verbatim,
 };
 
 const KEY_W: usize = 11;

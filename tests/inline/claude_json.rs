@@ -1,17 +1,11 @@
 use super::*;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
 use serde_json::json;
 
-fn set_mtime(path: &Path, when: SystemTime) {
-    let file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("open for mtime");
-    file.set_modified(when).expect("set_modified");
-}
+use crate::testutil::set_mtime;
 
 fn write_json(path: &Path, value: &Value) {
     fs::write(path, serde_json::to_vec_pretty(value).expect("serialize")).expect("write");

@@ -63,33 +63,7 @@ fn deepseek_matches_explicit_port() {
 
 // ── Disk cache ────────────────────────────────────────────────────────────────
 
-/// RAII home sandbox: holds `HOME_TEST_LOCK` and redirects `home_dir()` into a
-/// tempdir for the test's duration, clearing on drop (even on panic).
-struct HomeSandbox {
-    // Drop order: tempdir first, then shared lock.
-    _tmp: tempfile::TempDir,
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-impl HomeSandbox {
-    fn new() -> Self {
-        let guard = crate::profile::HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().expect("create home sandbox");
-        crate::profile::set_home_override(tmp.path().to_path_buf());
-        Self {
-            _tmp: tmp,
-            _guard: guard,
-        }
-    }
-}
-
-impl Drop for HomeSandbox {
-    fn drop(&mut self) {
-        crate::profile::clear_home_override();
-    }
-}
+use crate::testutil::HomeSandbox;
 
 #[test]
 fn disk_cache_roundtrips_stats() {

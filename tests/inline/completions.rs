@@ -22,45 +22,15 @@ fn print_script_rejects_unsupported_shell() {
 }
 
 #[cfg(unix)]
-struct HomeSandbox {
-    // Drop order: tempdir first, then the shared lock.
-    _tmp: tempfile::TempDir,
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(unix)]
-impl HomeSandbox {
-    fn new() -> (Self, std::path::PathBuf) {
-        // Untracked HOME_TEST_LOCK acquired first; no RankedMutex/flock is held.
-        let guard = crate::profile::HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().expect("create home sandbox");
-        let home = tmp.path().to_path_buf();
-        crate::profile::set_home_override(home.clone());
-        (
-            Self {
-                _tmp: tmp,
-                _guard: guard,
-            },
-            home,
-        )
-    }
-}
-
-#[cfg(unix)]
-impl Drop for HomeSandbox {
-    fn drop(&mut self) {
-        crate::profile::clear_home_override();
-    }
-}
+use crate::testutil::HomeSandbox;
 
 /// `completions install bash` writes the script under `~/.clauth/completions/`
 /// and appends an idempotent `source` line to `~/.bashrc`.
 #[cfg(unix)]
 #[test]
 fn install_bash_writes_script_and_sources_it_in_rc() {
-    let (_home, home_path) = HomeSandbox::new();
+    let home = HomeSandbox::new();
+    let home_path = home.home();
 
     install(Some("bash")).expect("install bash completions");
 
@@ -91,7 +61,8 @@ fn install_bash_writes_script_and_sources_it_in_rc() {
 #[cfg(unix)]
 #[test]
 fn install_bash_is_idempotent_across_reruns() {
-    let (_home, home_path) = HomeSandbox::new();
+    let home = HomeSandbox::new();
+    let home_path = home.home();
 
     install(Some("bash")).expect("first install");
     install(Some("bash")).expect("second install");
@@ -105,7 +76,8 @@ fn install_bash_is_idempotent_across_reruns() {
 #[cfg(unix)]
 #[test]
 fn install_fish_writes_into_fish_completions_dir() {
-    let (_home, home_path) = HomeSandbox::new();
+    let home = HomeSandbox::new();
+    let home_path = home.home();
 
     install(Some("fish")).expect("install fish completions");
 

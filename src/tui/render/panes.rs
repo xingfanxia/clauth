@@ -8,11 +8,20 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
-use super::super::app::App;
+use super::super::app::{App, InputState};
 use super::super::theme;
 
 /// Width of the account picker column on the master-detail tabs.
 pub(super) const SELECTOR_WIDTH: u16 = 24;
+
+/// Display columns occupied by the text before the caret in `input`.
+/// `InputState::cursor` is a byte offset; every edited field is ASCII-only in
+/// practice, so the char count of the pre-caret slice equals display columns.
+pub(super) fn head_cols(input: &InputState) -> usize {
+    input.value[..input.cursor.min(input.value.len())]
+        .chars()
+        .count()
+}
 
 /// Bolds `style` when `cond` is true.
 pub(super) fn bold_when(style: Style, cond: bool) -> Style {

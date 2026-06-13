@@ -84,38 +84,8 @@ fallback_chain = ["work"]
     );
 }
 
-/// RAII home sandbox: acquires `HOME_TEST_LOCK` and redirects `home_dir()` into
-/// a tempdir for the duration, clearing on drop (even on panic). Required for
-/// any test that writes into the per-profile tree, or those paths land in the
-/// real `~/.clauth`.
 #[cfg(unix)]
-struct HomeSandbox {
-    // Drop order: tempdir first, then the shared lock.
-    _tmp: tempfile::TempDir,
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(unix)]
-impl HomeSandbox {
-    fn new() -> Self {
-        let guard = crate::profile::HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().expect("create home sandbox");
-        crate::profile::set_home_override(tmp.path().to_path_buf());
-        Self {
-            _tmp: tmp,
-            _guard: guard,
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for HomeSandbox {
-    fn drop(&mut self) {
-        crate::profile::clear_home_override();
-    }
-}
+use crate::testutil::HomeSandbox;
 
 #[cfg(unix)]
 fn oauth_credentials() -> ClaudeCredentials {

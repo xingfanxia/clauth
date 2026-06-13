@@ -19,6 +19,9 @@ mod update;
 mod usage;
 mod which;
 
+#[cfg(test)]
+mod testutil;
+
 use anyhow::Result;
 
 use crate::profile::{AppConfig, ThemeName, load_config};
