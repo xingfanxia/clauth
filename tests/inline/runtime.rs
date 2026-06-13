@@ -239,6 +239,40 @@ fn sync_falls_back_to_expires_at_on_equal_mtime() {
     assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
 }
 
+// The tie-break in isolation, no filesystem: mtime is primary, expires_at only
+// breaks an equal/missing-mtime tie, and an absent canonical always yields.
+#[test]
+fn resolve_credential_winner_prefers_recency_then_expiry() {
+    let early = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let late = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+
+    // Newer runtime mtime wins even with a later canonical expiry.
+    assert!(!resolve_credential_winner(
+        Some(999),
+        Some(1),
+        Some(early),
+        Some(late)
+    ));
+    // Newer canonical mtime keeps canonical despite a later runtime expiry.
+    assert!(resolve_credential_winner(
+        Some(1),
+        Some(999),
+        Some(late),
+        Some(early)
+    ));
+    // Equal mtime → expiry tie-break; canonical wins the `>=` tie.
+    assert!(resolve_credential_winner(
+        Some(5),
+        Some(5),
+        Some(late),
+        Some(late)
+    ));
+    // Runtime carries no token → keep canonical.
+    assert!(resolve_credential_winner(Some(1), None, None, None));
+    // Canonical missing/unparseable → runtime wins.
+    assert!(!resolve_credential_winner(None, Some(1), None, None));
+}
+
 // Canonical absent → runtime always wins.
 #[test]
 fn sync_runtime_wins_when_canonical_missing_expires_at() {

@@ -418,51 +418,62 @@ fn build_runtime_dir(
         pending.push((entry.path(), dst));
     }
     materialize_entries(pending, mode)?;
+    write_merged_settings(runtime, claude_home, profile)?;
 
+    let creds_link = runtime.join(".credentials.json");
+    reconcile_credentials(&creds_link, canonical, mode)?;
+
+    seed_claude_json(runtime, claude_home)?;
+
+    Ok(())
+}
+
+/// Compute this profile's merged `settings.json` and write it into the runtime
+/// tree only when absent or byte-different. Concurrent sessions on the same
+/// profile each compute the same merge, so a byte-identical result needn't win
+/// a last-writer race and stomp a sibling's write.
+fn write_merged_settings(runtime: &Path, claude_home: &Path, profile: &Profile) -> Result<()> {
     let settings_src = claude_home.join("settings.json");
     let merged = build_claude_settings_json(&settings_src, profile, &[])?;
     let settings_dst = runtime.join("settings.json");
-    // Only write when absent or content differs — concurrent sessions on the
-    // same profile each compute the same merge, so a byte-identical result
-    // doesn't need to win a last-writer race and stomp a sibling's write.
     let needs_write = std::fs::read(&settings_dst)
         .map(|existing| existing != merged.as_bytes())
         .unwrap_or(true);
     if needs_write {
         atomic_write(&settings_dst, merged).context("failed to write runtime settings.json")?;
     }
+    Ok(())
+}
 
-    let creds_link = runtime.join(".credentials.json");
-    reconcile_credentials(&creds_link, canonical, mode)?;
-
-    // Per-profile copy of `~/.claude.json`. Claude Code's big config file
-    // embeds an account-specific `oauthAccount` block (plus billing caches)
-    // that must NOT be shared across profiles — CC trusts the cached identity
-    // and won't re-derive it from the token on a normal startup, so a shared
-    // symlink leaks one account's identity into another. The background syncer
-    // (`crate::claude_json`) keeps the non-per-profile fields converged across
-    // all copies (latest write wins). A freshly seeded copy inherits the global
-    // file's `oauthAccount`; that profile's next OAuth login overwrites it with
-    // the correct identity, which the syncer then preserves.
-    if let Some(home) = claude_home.parent() {
-        let global = home.join(".claude.json");
-        let dst = runtime.join(".claude.json");
-        // Seed from the global file when this profile has no real copy yet, or
-        // migrate the old shared symlink (pre-per-profile behavior) to a copy.
-        // `atomic_write` renames over the path, replacing a symlink in one step
-        // — no window where a sibling session sees the file missing. Existing
-        // real copies keep their own identity and synced shared fields.
-        let is_symlink = dst
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink());
-        if (is_symlink || !dst.exists())
-            && let Ok(bytes) = std::fs::read(&global)
-        {
-            atomic_write(&dst, &bytes)
-                .with_context(|| format!("failed to seed {}", dst.display()))?;
-        }
+/// Seed this profile's private copy of `~/.claude.json`. Claude Code's big
+/// config file embeds an account-specific `oauthAccount` block (plus billing
+/// caches) that must NOT be shared across profiles — CC trusts the cached
+/// identity and won't re-derive it from the token on a normal startup, so a
+/// shared symlink leaks one account's identity into another. The background
+/// syncer (`crate::claude_json`) keeps the non-per-profile fields converged
+/// across all copies (latest write wins). A freshly seeded copy inherits the
+/// global file's `oauthAccount`; that profile's next OAuth login overwrites it
+/// with the correct identity, which the syncer then preserves.
+///
+/// Seeds from the global file when this profile has no real copy yet, or
+/// migrates the old shared symlink (pre-per-profile behavior) to a copy.
+/// `atomic_write` renames over the path, replacing a symlink in one step — no
+/// window where a sibling session sees the file missing. Existing real copies
+/// keep their own identity and synced shared fields.
+fn seed_claude_json(runtime: &Path, claude_home: &Path) -> Result<()> {
+    let Some(home) = claude_home.parent() else {
+        return Ok(());
+    };
+    let global = home.join(".claude.json");
+    let dst = runtime.join(".claude.json");
+    let is_symlink = dst
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink());
+    if (is_symlink || !dst.exists())
+        && let Ok(bytes) = std::fs::read(&global)
+    {
+        atomic_write(&dst, &bytes).with_context(|| format!("failed to seed {}", dst.display()))?;
     }
-
     Ok(())
 }
 
@@ -628,21 +639,10 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     let differs = canonical_bytes.as_deref() != Some(runtime_bytes.as_slice());
     let mut wrote_canonical = false;
     if differs {
-        // Bytes differ: the TUI/scheduler may have rotated canonical while CC
-        // wrote a fresh interactive re-login into the runtime file. These can be
-        // two INDEPENDENT, both-valid refresh-token chains, so `expires_at` is
-        // the wrong tie-break — it's a property of the token, not a signal of
-        // which login the user performed last. A forced rotate-all (`t` key)
-        // can stamp a canonical token whose `expires_at` is marginally later
-        // than CC's fresh login; keeping canonical there silently discards the
-        // user's just-completed login and burns its chain.
-        //
-        // Primary signal is write recency (file mtime): CC's `unlink+write`
-        // re-login and our `atomic_write` both bump mtime, so "most recently
-        // written wins" reflects the intended-live login. `expires_at` is only
-        // the tie-break when mtimes are equal/unavailable, and a full tie keeps
-        // canonical (missing/unparseable canonical → runtime wins by default,
-        // handled above via `canonical_bytes`/`canonical_exp` = None).
+        // Bytes differ. The keep-canonical-vs-adopt-runtime decision (write
+        // recency primary, `expires_at` as the tie-break) lives in
+        // `resolve_credential_winner` — see its doc for why mtime, not expiry,
+        // is the signal.
         let canonical_exp = canonical_bytes.as_deref().and_then(|cb| {
             let c = serde_json::from_slice::<ClaudeCredentials>(cb).ok()?;
             Some(c.claude_ai_oauth?.expires_at.unwrap_or(0))
@@ -655,23 +655,7 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
             .ok()
             .and_then(|m| m.modified().ok());
         let runtime_mtime = meta.modified().ok();
-        let canonical_wins = match (canonical_exp, runtime_exp) {
-            // Canonical present and parseable: mtime is the primary signal —
-            // trust the most recently written file regardless of token expiry
-            // (fixes the silent discard of CC's fresh re-login). expires_at is
-            // the tie-break only when mtimes are equal/unavailable; canonical
-            // wins that fallback tie.
-            (Some(ce), Some(re)) => match (canonical_mtime, runtime_mtime) {
-                (Some(cm), Some(rm)) if cm != rm => cm > rm,
-                _ => ce >= re,
-            },
-            // Runtime has no token: nothing to adopt, keep canonical.
-            (Some(_), None) => true,
-            // Canonical missing or unparseable: runtime always wins, never let
-            // a newer mtime on corrupt/absent canonical override that.
-            _ => false,
-        };
-        if canonical_wins {
+        if resolve_credential_winner(canonical_exp, runtime_exp, canonical_mtime, runtime_mtime) {
             // Canonical written at/after the runtime re-login (or wins the
             // tie-break); don't overwrite it with the runtime bytes.
             eprintln!(
@@ -684,6 +668,54 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
             wrote_canonical = true;
         }
     }
+    relink_to_canonical(link_path, canonical)?;
+    Ok(wrote_canonical)
+}
+
+/// Decide whether to keep the canonical credentials instead of adopting the
+/// runtime file's bytes, given each side's token `expires_at` and file mtime.
+/// Returns `true` to keep canonical.
+///
+/// The two files can hold INDEPENDENT, both-valid refresh-token chains: the
+/// TUI/scheduler may rotate canonical while Claude Code writes a fresh
+/// interactive re-login into the runtime file. So `expires_at` is the wrong
+/// primary signal — it's a property of the token, not of which login the user
+/// performed last. A forced rotate-all (`t` key) can stamp a canonical token
+/// whose `expires_at` is marginally later than CC's fresh login; keeping
+/// canonical there would silently discard that login and burn its chain.
+///
+/// Primary signal is write recency (mtime): CC's `unlink+write` re-login and
+/// our `atomic_write` both bump mtime, so "most recently written wins" reflects
+/// the intended-live login. `expires_at` is the tie-break only when mtimes are
+/// equal/unavailable, and a full tie keeps canonical. A missing/unparseable
+/// canonical (`canonical_exp` = `None`) always lets runtime win.
+fn resolve_credential_winner(
+    canonical_exp: Option<i64>,
+    runtime_exp: Option<i64>,
+    canonical_mtime: Option<std::time::SystemTime>,
+    runtime_mtime: Option<std::time::SystemTime>,
+) -> bool {
+    match (canonical_exp, runtime_exp) {
+        // Canonical present and parseable: mtime is the primary signal — trust
+        // the most recently written file regardless of token expiry. expires_at
+        // is the tie-break only when mtimes are equal/unavailable; canonical
+        // wins that fallback tie.
+        (Some(ce), Some(re)) => match (canonical_mtime, runtime_mtime) {
+            (Some(cm), Some(rm)) if cm != rm => cm > rm,
+            _ => ce >= re,
+        },
+        // Runtime has no token: nothing to adopt, keep canonical.
+        (Some(_), None) => true,
+        // Canonical missing or unparseable: runtime always wins, never let a
+        // newer mtime on corrupt/absent canonical override that.
+        _ => false,
+    }
+}
+
+/// Repoint the runtime credential link at canonical so canonical stays the
+/// single source of truth. Swaps via a temp symlink + atomic rename so a sibling
+/// session never sees the path missing; if canonical is gone, removes the file.
+fn relink_to_canonical(link_path: &Path, canonical: &Path) -> Result<()> {
     if canonical.exists() {
         let tmp = link_path.with_file_name(format!(".credentials.json.tmp.{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
@@ -692,7 +724,7 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     } else {
         std::fs::remove_file(link_path)?;
     }
-    Ok(wrote_canonical)
+    Ok(())
 }
 
 /// Bidirectional mtime mirror between `runtime/.credentials.json` and canonical
