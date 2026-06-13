@@ -350,6 +350,8 @@ struct ProfileConfig {
     env: BTreeMap<String, String>,
     #[serde(default)]
     fallback_threshold: Option<f64>,
+    #[serde(default)]
+    bell_threshold: Option<f64>,
 }
 
 /// Test-only home-dir override. Redirects all reads/writes away from real `~/.clauth`.
@@ -640,7 +642,7 @@ fn load_profile(name: &str) -> Result<Profile> {
         auto_start: config.auto_start,
         env: config.env,
         fallback_threshold: config.fallback_threshold.map(|v| v.clamp(0.0, 100.0)),
-        bell_threshold: None,
+        bell_threshold: config.bell_threshold.map(|v| v.clamp(0.0, 100.0)),
         credentials,
         usage: None,
         fetch_status: None,
@@ -667,6 +669,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 auto_start: profile.auto_start,
                 env: profile.env.clone(),
                 fallback_threshold: profile.fallback_threshold,
+                bell_threshold: profile.bell_threshold,
             };
             canonical != on_disk
         }

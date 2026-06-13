@@ -19,6 +19,15 @@ fn profile_config_reads_auto_start_directly() {
     assert!(cfg.auto_start);
 }
 
+// Drop `bell_threshold` from `ProfileConfig` and the hand-edited value is
+// silently ignored on load (the bug this pins): the field must round-trip.
+#[test]
+fn profile_config_reads_bell_threshold() {
+    let toml = "bell_threshold = 90.0\n";
+    let cfg: ProfileConfig = toml::from_str(toml).expect("parse bell config");
+    assert_eq!(cfg.bell_threshold, Some(90.0));
+}
+
 #[test]
 fn profile_name_is_serde_transparent() {
     // `ProfileName` must serialize as a bare string so profiles.toml stays
