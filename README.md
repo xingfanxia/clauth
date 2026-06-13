@@ -111,6 +111,8 @@ auto_start = true
 
 When enabled, clauth sends a tiny Haiku ping (`max_tokens = 1`, fractions of a cent) on launch and on each refresh tick while there's no running window. A cold start fetches usage before the first kick — never pinging blind over a window that may already be live — so the timer can arm one tick late. Default off, OAuth profiles only. The older field name `kick_timer = true` is still accepted on read.
 
+The ping is a real `/v1/messages` inference call, sent under your own account's OAuth token with the Claude Code client identity — the same request Claude Code itself fires silently on startup. It bills one token to your account and nothing else acts on your behalf. It is off by default; leave it off if you'd rather only the live `claude` process ever open a window.
+
 ## Automatic account switching
 
 The **Fallback** tab holds an ordered chain of profiles that clauth hops between when one runs out of 5-hour budget:
