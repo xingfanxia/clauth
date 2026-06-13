@@ -114,6 +114,16 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         ],
     ),
     ("In-app help", &["all_tabs_render"]),
+    (
+        "Claude status feed",
+        &[
+            "parses_core_fields",
+            "collects_components_with_status",
+            "component_status_",
+            "dedup_keeps_worst_status",
+            "status_selected_row_tint",
+        ],
+    ),
 ];
 
 #[test]
