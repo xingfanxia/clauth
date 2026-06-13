@@ -761,7 +761,6 @@ struct WorkerHandles {
 }
 
 impl WorkerHandles {
-    /// Clone every scheduler `Arc` out of `app`.
     fn from_app(app: &App) -> Self {
         Self {
             config: Arc::clone(&app.config),
@@ -805,8 +804,7 @@ impl App {
         let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
 
-        // Kick the best-effort update check on its own thread; its verdict lands
-        // in `update_results` and is toasted from `on_tick`.
+        // Kick the best-effort update check; verdict lands in `update_results`, toasted from `on_tick`.
         // Prune old history entries before loading (startup-only).
         for profile in &config.profiles {
             crate::profile::prune_usage_history(profile.name.as_str());
@@ -1014,8 +1012,7 @@ impl App {
     }
 
     pub(crate) fn apply_usage(&mut self) {
-        // Poisoned lock: keep prior value rather than blanking all usage.
-        // A blank map would blind auto-switch permanently.
+        // On poisoned lock keep the prior value — a blank map would blind auto-switch permanently.
         // Third-party stores BEFORE OAuth stores: ranks 270/280 < 300/350.
         let bells;
         let usage_snapshots;
@@ -1057,7 +1054,7 @@ impl App {
                 })
                 .collect::<Vec<_>>();
 
-            // Collect usage snapshots for history tracking while cfg is alive.
+            // Collect while cfg is still alive.
             usage_snapshots = cfg
                 .profiles
                 .iter()
@@ -1080,7 +1077,6 @@ impl App {
             }
         }
 
-        // Append history JSONL for every profile whose usage just changed.
         for (name, usage) in &usage_snapshots {
             let old_usage = self.last_history_usage.get(name.as_str()).cloned();
             let changed = match &old_usage {
@@ -1126,7 +1122,7 @@ impl App {
             }
         }
 
-        // Refresh history cache for profiles whose history file changed.
+        // Invalidate history cache when the file mtime changed.
         for (name, _) in &usage_snapshots {
             if let Ok(path) = crate::profile::profile_history_path(name)
                 && let Ok(mtime) = path.metadata().and_then(|m| m.modified())
@@ -1371,7 +1367,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Ctrl-C always exits.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.quit = true;
         app.shutting_down.store(true, Ordering::SeqCst);
@@ -1411,7 +1406,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Global keys (no modal owns input).
     match key.code {
         KeyCode::Right => {
             app.disarm_quit();
@@ -1633,7 +1627,6 @@ fn handle_status_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Enter if len > 0 => {
                     app.status.focus = StatusFocus::Detail;
-                    // Open at the top of the timeline.
                     app.status.detail_scroll = 0;
                 }
                 _ => {}
@@ -1705,13 +1698,11 @@ fn activate_main_item(app: &mut App) {
         return;
     };
     match item {
-        // No-op when already active.
         MainItemKind::Profile(idx) => request_switch_to(app, idx),
     }
 }
 
 fn reorder_main_cursor(app: &mut App, delta: i32) {
-    // Only reorder real profile rows, not the action rows.
     let Some(MainItemKind::Profile(idx)) = app.current_main_item() else {
         return;
     };
@@ -1728,7 +1719,6 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         app.toast(ToastKind::Danger, format!("reorder failed: {e}"));
         return;
     }
-    // Cursor follows the moved row.
     if delta < 0 && app.profile_cursor > 0 {
         app.profile_cursor -= 1;
     } else if delta > 0 {
@@ -2484,7 +2474,6 @@ fn build_action_menu(app: &App) -> ActionMenuState {
 
     match app.tab {
         Tab::Overview => {
-            // Switch is only useful when the cursor is on a non-active profile.
             let can_switch = app
                 .current_main_item()
                 .map(|item| match item {
@@ -2517,7 +2506,6 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 actions.push(NewAccount);
             }
             ConfigFocus::Actions => {
-                // In the actions detail pane, actions depend on the focused row.
                 let rows = config_rows(app);
                 if let Some(&row) = rows.get(app.config_action_cursor) {
                     match row {
@@ -2565,7 +2553,6 @@ fn build_action_menu(app: &App) -> ActionMenuState {
 }
 
 fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
-    // Try a direct hotkey press first.
     if let KeyCode::Char(ch) = key.code {
         let ch_lower = ch.to_lowercase().next().unwrap_or(ch);
         let Some(Modal::ActionMenu(state)) = app.modals.last() else {
@@ -2622,7 +2609,6 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Fire the handler that the direct hotkey would have called.
 /// The account under the cursor as `(name, is_oauth, is_third_party)`. `profile_cursor` is shared
 /// across Overview, Usage, and Setup, so this resolves the focused account on any
 /// of them. `None` when the cursor sits past the profile list (e.g. `+ new`).
@@ -2633,39 +2619,34 @@ fn focused_account(app: &App) -> Option<(String, bool, bool)> {
         .map(|p| (p.name.to_string(), p.is_oauth(), p.is_third_party()))
 }
 
+/// Dispatch a selected action menu item to its handler.
 fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
     match action {
         ActionMenuAction::NewAccount => start_new_account(app),
-        ActionMenuAction::RefreshUsage => {
-            // Action-menu refresh is always scoped to the focused account.
-            match focused_account(app) {
-                Some((name, _, true)) | Some((name, true, _)) => {
-                    app.manual_refresh_one(&name);
-                    app.toast(ToastKind::Info, format!("refreshing '{name}'…"));
-                }
-                Some((name, false, false)) => {
-                    app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
-                }
-                None => {}
+        ActionMenuAction::RefreshUsage => match focused_account(app) {
+            Some((name, _, true)) | Some((name, true, _)) => {
+                app.manual_refresh_one(&name);
+                app.toast(ToastKind::Info, format!("refreshing '{name}'…"));
             }
-        }
-        ActionMenuAction::RotateTokens => {
-            // Rotate only the focused account, not the whole chain.
-            match focused_account(app) {
-                Some((name, true, _)) => {
-                    app.modals.push(Modal::Confirm(ConfirmState {
-                        message: format!("rotate tokens for '{name}'?"),
-                        detail: Some(ROTATE_ONE_DETAIL.to_string()),
-                        choice: false,
-                        on_confirm: ConfirmAction::RotateOne(name),
-                    }));
-                }
-                Some((name, _, _)) => {
-                    app.toast(ToastKind::Info, format!("'{name}' has no tokens to rotate"));
-                }
-                None => {}
+            Some((name, false, false)) => {
+                app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
             }
-        }
+            None => {}
+        },
+        ActionMenuAction::RotateTokens => match focused_account(app) {
+            Some((name, true, _)) => {
+                app.modals.push(Modal::Confirm(ConfirmState {
+                    message: format!("rotate tokens for '{name}'?"),
+                    detail: Some(ROTATE_ONE_DETAIL.to_string()),
+                    choice: false,
+                    on_confirm: ConfirmAction::RotateOne(name),
+                }));
+            }
+            Some((name, _, _)) => {
+                app.toast(ToastKind::Info, format!("'{name}' has no tokens to rotate"));
+            }
+            None => {}
+        },
         ActionMenuAction::SwitchToSelected => activate_main_item(app),
         ActionMenuAction::ConfigureSelected => enter_config_detail(app),
         ActionMenuAction::OpenChainMember => enter_fallback_detail(app),
@@ -2711,8 +2692,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
 /// Setup tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
 /// edits/toggles/arms/creates. Esc (global) returns to list.
 fn handle_config_key(app: &mut App, key: KeyEvent) {
-    // Selector includes the trailing `+ new` row.
-    let sel_len = app.profile_count() + 1;
+    let sel_len = app.profile_count() + 1; // includes trailing `+ new` row
     app.profile_cursor = app.profile_cursor.min(sel_len - 1);
 
     match app.config_focus {
@@ -2979,7 +2959,6 @@ fn commit_rename(app: &mut App) {
         validate_profile_name(&new, &cfg.names(), Some(old.as_str()))
     };
     if let Err(e) = validation {
-        // Keep edit mode open so the user can fix the name.
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
     }
@@ -3056,7 +3035,6 @@ fn commit_new_account(app: &mut App) {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
     }
-    // API key only applies to endpoint profiles.
     let api_key = if base_url.is_some() { api_key } else { None };
     let result = {
         let mut cfg = app.config();
@@ -3066,7 +3044,6 @@ fn commit_new_account(app: &mut App) {
         Ok(()) => {
             app.refresh_tokens();
             app.last_state_mtime = app_state_mtime();
-            // Land the cursor on the freshly created account.
             let new_idx = app
                 .config()
                 .profiles
@@ -3204,7 +3181,6 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 );
                 return;
             }
-            // Spawn the rotate-all worker (HTTP off the UI thread).
             let config = Arc::clone(&app.config);
             let refetch = Arc::clone(&app.refetch_queue);
             let activity = Arc::clone(&app.activity);
@@ -3474,7 +3450,6 @@ fn apply_status_incidents(
     });
     app.status.incidents = incidents;
 
-    // Clamp the cursor and reset the detail scroll if the selection changed.
     if app.status.incidents.is_empty() {
         app.status.cursor = 0;
     } else if app.status.cursor >= app.status.incidents.len() {
@@ -3488,7 +3463,6 @@ fn apply_status_incidents(
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
 
-    // Drain update check result (worker emits at most one event).
     while let Ok(ev) = app.update_results.try_recv() {
         match ev {
             UpdateEvent::Installed(v) => {
@@ -3514,7 +3488,6 @@ pub(crate) fn on_tick(app: &mut App) {
     }
     app.apply_usage();
 
-    // Drain scheduler auto-switch decisions; skip non-idle targets.
     let auto_switch_targets: Vec<String> = app
         .pending_switch
         .lock()

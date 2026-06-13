@@ -156,7 +156,6 @@ pub(super) fn relative_age(epoch_ms: u64) -> String {
             format!("{weeks}w ago")
         }
     } else {
-        // ≥ 30 days → absolute ISO date (date portion only).
         let iso = crate::usage::epoch_secs_to_iso((epoch_ms / 1000) as i64);
         iso.split('T').next().unwrap_or(&iso).to_string()
     }
@@ -183,7 +182,7 @@ pub(super) fn clock_label(epoch_ms: u64, utc: bool) -> String {
         .unwrap_or("jan");
     // Day without a leading zero.
     let day: u32 = iso[8..10].parse().unwrap_or(0);
-    let hm = &iso[11..16]; // HH:MM
+    let hm = &iso[11..16];
     let suffix = if utc { " utc" } else { "" };
     format!("{mon} {day}, {hm}{suffix}")
 }

@@ -400,8 +400,6 @@ fn build_runtime_dir(
     canonical: &Path,
     mode: LinkMode,
 ) -> Result<()> {
-    // Re-walk every acquire so entries added to ~/.claude/ after the first
-    // build are picked up. Existing entries stay as-is.
     let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(claude_home)
         .with_context(|| format!("failed to read {}", claude_home.display()))?
@@ -559,7 +557,6 @@ fn reconcile_credentials(runtime_path: &Path, canonical: &Path, mode: LinkMode) 
     Ok(())
 }
 
-/// Recursive copy: directories created and walked, files copied byte-for-byte.
 /// Used in fake-symlink mode when the OS denies symlink creation rights.
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     let meta = src

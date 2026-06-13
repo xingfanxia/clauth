@@ -65,7 +65,6 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                             .get(*i)
                             .map(|n| n.to_string())
                             .unwrap_or_default();
-                        // Caret only in the focused pane.
                         let rail = if selected && focused {
                             Span::styled(
                                 format!("❯ {:>2}  ", i + 1),
@@ -141,7 +140,6 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         None => ("chain".to_string(), false, empty_detail()),
     };
 
-    // Detail is the second panel on this screen — not first.
     let block = if is_name {
         section_box_verbatim(&title, detail_focused, false)
     } else {

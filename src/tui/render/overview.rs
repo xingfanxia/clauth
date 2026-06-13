@@ -153,7 +153,6 @@ impl OverviewWidths {
             }
         }
 
-        // Spread leftover width into gaps so columns breathe on wide terminals.
         let base = fixed_overview_width(name, kind, five_hour, seven_day, route, gap_min);
         let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
         let gap_slots = column_count.saturating_sub(1).max(1);
@@ -227,7 +226,6 @@ fn render_overview_row(
 
     let active = cfg.is_active(&profile.name);
     let name_str = profile.name.to_string();
-    // Caret only in the focused pane.
     let cursor = if selected && focused {
         Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
     } else {

@@ -376,10 +376,8 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
 }
 
 fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) {
-    // Right-rail column width: 1 char for the hotkey letter (or 1 space if none).
-    const HOTKEY_W: u16 = 1;
-    // Gutter: "❯ " (2) or "  " (2).
-    const GUTTER: u16 = 2;
+    const HOTKEY_W: u16 = 1; // 1 char for hotkey letter, or 1 space if none
+    const GUTTER: u16 = 2; // "❯ " or "  "
 
     // Render rows with right-aligned hotkeys — can't use draw_modal because that
     // wraps all lines in one Paragraph, preventing per-row background tinting.
@@ -405,7 +403,6 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    // Render rows with right-aligned hotkeys manually.
     let inner_w = inner.width;
     for (i, item) in state.items.iter().enumerate() {
         let focused = i == state.cursor;

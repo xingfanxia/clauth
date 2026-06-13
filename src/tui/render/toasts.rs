@@ -19,8 +19,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // `┃ ` (2) + 1-cell right pad inside the toast + 2-cell inset from the edge.
     let content_cap = 36_u16.min(area.width.saturating_sub(5));
 
-    // Measure the widest *natural* line across all toasts, then clamp to the
-    // cap.  This drives both the column width and the wrap budget.
+    // Widest natural line across all toasts, clamped to cap — drives column width and wrap budget.
     let max_content_width = toasts
         .iter()
         .flat_map(|t| t.body.lines().map(|l| l.chars().count() as u16))
@@ -32,10 +31,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The pad cell carries no text, so the Paragraph's `bg_sunken` base fills it.
     let col_width = max_content_width + 3;
 
-    // Anchor: 2-cell inset from the right edge.
     let x = area.x + area.width.saturating_sub(col_width + 2);
-
-    // Count total rows needed to place the stack top-down from a 2-cell top inset.
     let mut row = area.y + 2;
 
     for toast in &toasts {
@@ -57,8 +53,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let mut lines_iter = toast.body.lines();
         let first = lines_iter.next().unwrap_or("");
 
-        // Build all rendered lines for this toast, wrapping any segment that
-        // exceeds max_content_width so nothing is clipped by the rect boundary.
         let mut render_lines: Vec<Line<'_>> = Vec::new();
         for wrapped in word_wrap(first, max_content_width as usize) {
             render_lines.push(Line::from(vec![
@@ -74,7 +68,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ]));
             }
         }
-        // Guard: always show at least one line even for an empty body.
         if render_lines.is_empty() {
             render_lines.push(Line::from(vec![Span::styled("┃ ", bar_style)]));
         }
@@ -145,9 +138,8 @@ fn word_wrap(text: &str, max_width: usize) -> Vec<String> {
     for word in text.split_whitespace() {
         let word_len = word.chars().count();
         if current_len == 0 {
-            // First word on a fresh line — hard-break if it alone exceeds the cap.
             if word_len > max_width {
-                // Emit in max_width-char chunks.
+                // Hard-break: word alone exceeds cap — emit in max_width-char chunks.
                 let mut chars = word.chars();
                 let mut chunk = String::new();
                 let mut chunk_len = 0;
@@ -169,16 +161,13 @@ fn word_wrap(text: &str, max_width: usize) -> Vec<String> {
                 current_len = word_len;
             }
         } else if current_len + 1 + word_len <= max_width {
-            // Word fits on the current line with a space.
             current.push(' ');
             current.push_str(word);
             current_len += 1 + word_len;
         } else {
-            // Flush and start a new line.
             lines.push(current.clone());
             current.clear();
             current_len = 0;
-            // Re-process this word from scratch on the new line.
             if word_len > max_width {
                 let mut chars = word.chars();
                 let mut chunk = String::new();

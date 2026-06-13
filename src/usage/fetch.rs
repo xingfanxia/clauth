@@ -66,7 +66,6 @@ pub(crate) const LABEL_7D_OPUS: &str = "7d opus";
 
 impl UsageInfo {
     /// All available windows as `(label, &UsageWindow)` pairs.
-    /// Labels are derived from the constants above — the single source of truth.
     pub(crate) fn windows(&self) -> Vec<(&'static str, &UsageWindow)> {
         let mut out = Vec::new();
         if let Some(w) = &self.five_hour {

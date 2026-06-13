@@ -32,12 +32,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let n = app.config().profiles.len();
 
-    // Row 0: brand (TEXT + bold, house deviation from ACCENT_2) left; version
-    // (TEXT_DIM) right-aligned to the info column's edge.
+    // Row 0: brand (TEXT + bold; house deviation from ACCENT_2) left, version (TEXT_DIM) right.
     let info_width = rows[0].width as usize;
     let brand = "clauth";
     let ver = format!("v{VERSION}");
-    // Pad between brand and version so the version sits flush at the right edge.
     let gap = info_width.saturating_sub(brand.len() + ver.len());
     let title = Line::from(vec![
         Span::styled(brand, Style::default().fg(theme::text_color()).bold()),
@@ -45,10 +43,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(ver, theme::dim()),
     ]);
 
-    // Row 1: account count left; `● status.claude.ai` right-aligned below the
-    // version. Static label, semantic dot (mirrors the status tab's meta:
-    // stale cache / active incidents → WARNING, otherwise SUCCESS). Dropped
-    // when the row can't keep a 3-cell gap.
+    // Row 1: count left; `● status.claude.ai` right-aligned. Dot color mirrors the
+    // status tab (incidents → WARNING/DANGER, none → SUCCESS). Dropped if < 3-cell gap.
     let count_txt = format!("{n} account{}", plural(n));
     let mut count_spans = vec![Span::styled(count_txt.clone(), theme::faint())];
     let feed = "status.claude.ai"; // display label per user choice; feed itself is status.claude.com

@@ -60,8 +60,6 @@ pub(crate) fn updates_enabled() -> bool {
 
 /// Spawn a background update check; applies if self-replaceable, toasts result.
 /// Returns a `JoinHandle` for clean shutdown, or `None` when updates are disabled.
-/// Errors are silently discarded.
-/// Skips all work when `CLAUTH_NO_UPDATE=1`.
 pub(crate) fn spawn(tx: Sender<UpdateEvent>) -> Option<JoinHandle<()>> {
     if !updates_enabled() {
         return None;
@@ -104,8 +102,6 @@ fn try_update(tx: &Sender<UpdateEvent>) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    // Derive the sha256sums.txt URL from the binary asset URL.
-    // Both assets live in the same release, so we swap the asset name.
     let sums_url = derive_sums_url(&url, asset);
 
     download_and_replace(&url, &sums_url, asset)?;
@@ -113,10 +109,8 @@ fn try_update(tx: &Sender<UpdateEvent>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build the `sha256sums.txt` URL from a binary asset URL by replacing the
-/// asset filename with `sha256sums.txt`.
+/// Build the `sha256sums.txt` URL from `asset_url` by replacing the asset filename.
 fn derive_sums_url(asset_url: &str, asset: &str) -> String {
-    // asset_url ends in `/<asset>` — replace trailing filename.
     if let Some(idx) = asset_url.rfind(asset) {
         format!("{}sha256sums.txt", &asset_url[..idx])
     } else {
@@ -128,7 +122,6 @@ fn derive_sums_url(asset_url: &str, asset: &str) -> String {
 /// Parse a single `sha256sum`-format line: `<64-hex-chars>  <filename>`.
 /// Returns `(hex, filename)` or `None` on malformed input.
 pub(crate) fn parse_sums_line(line: &str) -> Option<(&str, &str)> {
-    // Standard format: 64 hex chars, two spaces, then filename.
     let (hex, rest) = line.split_once("  ")?;
     if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -250,7 +243,6 @@ fn download_and_replace(url: &str, sums_url: &str, asset: &str) -> anyhow::Resul
     let expected_hex = find_expected_sha(&sums_text, asset)
         .ok_or_else(|| anyhow::anyhow!("asset {asset} not listed in sha256sums.txt — aborting"))?;
 
-    // 2. Download the asset binary; capped at 10 MB via read_to_vec().
     let bytes = agent
         .get(url)
         .header("User-Agent", "clauth-updater")
@@ -260,14 +252,12 @@ fn download_and_replace(url: &str, sums_url: &str, asset: &str) -> anyhow::Resul
         .read_to_vec()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // 3. Integrity check — abort on mismatch.
     if !verify_sha256(&bytes, &expected_hex) {
         anyhow::bail!(
             "SHA-256 mismatch for {asset}: download corrupted or tampered — aborting update"
         );
     }
 
-    // 4. Write to tmp and atomically self-replace.
     let tmp_path = env::temp_dir().join("clauth_update.tmp");
     let _ = fs::remove_file(&tmp_path);
 
@@ -283,7 +273,6 @@ fn download_and_replace(url: &str, sums_url: &str, asset: &str) -> anyhow::Resul
         fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))?;
     }
 
-    // self_replace handles in-place replacement, including Windows.
     self_replace::self_replace(&tmp_path)?;
     let _ = fs::remove_file(&tmp_path);
 

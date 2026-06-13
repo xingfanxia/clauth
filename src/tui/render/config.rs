@@ -125,8 +125,7 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let draft = app.config_draft.as_ref();
     let snap = build_snap(app, draft.is_none());
 
-    // Detail pane: second panel on this screen.
-    // Profile names preserve original case; structural titles ("+ new account", "settings") stay uppercased.
+    // Profile names render verbatim; structural titles ("+ new account", "settings") stay uppercased.
     let is_profile_name = app.profile_cursor < app.config().profiles.len();
     let block = if is_profile_name {
         section_box_verbatim(&snap.title, actions_focused, false)
@@ -202,10 +201,9 @@ fn draw_settings_rows(
     }
 
     lines.push(Line::from(""));
-    // Track which absolute line index the editing row occupies so we can set
-    // the native terminal cursor after rendering.
-    let mut edit_line_y: Option<u16> = None;
+    // Tracks the absolute line index of the active edit row for cursor placement after rendering.
     // `lines` starts with [type (, provider), blank] before the loop.
+    let mut edit_line_y: Option<u16> = None;
     let mut line_idx: u16 = if provider_label.is_some() { 3 } else { 2 };
 
     for (i, row) in rows.iter().enumerate() {

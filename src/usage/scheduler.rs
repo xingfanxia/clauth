@@ -255,7 +255,6 @@ fn fetch_with_rotation(
         Err(_) => return FetchOutcome::cached(name, FetchStatus::Cached, None, None),
     }
 
-    // Single bail-out path for all rotation-leg failures.
     let bail_to_cache = |rotated: Option<RotatedTokens>| {
         FetchOutcome::cached(name, FetchStatus::Cached, rotated, None)
     };
@@ -277,7 +276,6 @@ fn fetch_with_rotation(
     if crate::runtime::has_live_session(name) {
         return bail_to_cache(None);
     }
-    // Show refresh spinner during the network round trip, then back to Fetching for the retry.
     mark_activity(activity, name, ProfileActivity::Refreshing);
     let refresh_result = crate::oauth::refresh(rt);
     mark_activity(activity, name, ProfileActivity::Fetching);

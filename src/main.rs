@@ -90,15 +90,10 @@ fn peel_theme_flag(args: &[String]) -> (Option<tui::theme::Tier>, &[String]) {
                 _ => None,
             };
             if tier.is_some() {
-                // Drop the flag; return the rest by splitting around index i.
-                // SAFETY: we only call this before dispatch, args slice is valid.
-                let (before, after) = args.split_at(i);
-                // `before` is 0..i, `after` is i.. (includes the flag at 0).
-                // Reconstruct as a single contiguous slice is not possible without
-                // allocation — but in practice `--theme=` always comes first, so
-                // we return the remaining tail. For the general case the flag
-                // must precede all other args.
-                let _ = before; // before is empty in normal use
+                // Drop the flag; split_at gives (0..i, i..) but a contiguous
+                // slice over both halves needs allocation — the flag must come
+                // before all other args.
+                let (_, after) = args.split_at(i);
                 return (tier, &after[1..]);
             }
         }
@@ -157,7 +152,7 @@ fn print_help() {
     );
 }
 
-/// Doc-only feature→test traceability map (task 7b deliverable).
+/// Feature→test traceability map.
 #[cfg(test)]
 #[path = "../tests/inline/feature_coverage.rs"]
 mod feature_coverage;

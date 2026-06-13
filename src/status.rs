@@ -324,7 +324,6 @@ fn strip_parens(name: &str) -> String {
     let mut chars = name.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '(' {
-            // Consume a balanced group, tracking nesting depth.
             let mut group = String::from('(');
             let mut depth = 1usize;
             for inner in chars.by_ref() {
@@ -341,10 +340,9 @@ fn strip_parens(name: &str) -> String {
                 }
             }
             if depth != 0 {
-                // Unbalanced — restore the consumed text verbatim.
+                // Unbalanced: restore the consumed text verbatim.
                 out.push_str(&group);
             }
-            // Balanced groups are dropped entirely.
         } else {
             out.push(ch);
         }
