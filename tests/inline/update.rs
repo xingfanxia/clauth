@@ -223,3 +223,44 @@ fn derive_sums_url_replaces_asset_name() {
         "https://github.com/uwuclxdy/clauth/releases/download/v0.5.5/sha256sums.txt"
     );
 }
+
+// ---------------------------------------------------------------------------
+// verify_minisign (detached-signature authenticity)
+// ---------------------------------------------------------------------------
+
+/// Official `minisign-verify` test vector: this key + signature authenticate the
+/// exact bytes `b"test"`.
+const TEST_PUBKEY: &str = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+const TEST_SIG: &str = "untrusted comment: signature from minisign secret key
+RUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=
+trusted comment: timestamp:1633700835\tfile:test\tprehashed
+wLMDjy9FLAuxZ3q4NlEvkgtyhrr0gtTu6KC4KBJdITbbOeAi1zBIYo0v4iTgt8jJpIidRJnp94ABQkJAgAooBQ==";
+
+#[test]
+fn verify_minisign_empty_key_is_inactive() {
+    // Empty pinned key ⇒ enforcement off: even nonsense inputs return Ok, so the
+    // updater stays on SHA-256-only integrity during rollout.
+    assert!(verify_minisign("", b"anything", "not a signature").is_ok());
+}
+
+#[test]
+fn verify_minisign_known_good_vector_passes() {
+    verify_minisign(TEST_PUBKEY, b"test", TEST_SIG).expect("official vector must verify");
+}
+
+#[test]
+fn verify_minisign_tampered_payload_fails() {
+    // Same valid key + signature, one transposed byte in the payload — the core
+    // authenticity guarantee: a swapped sums file no longer verifies.
+    assert!(verify_minisign(TEST_PUBKEY, b"tset", TEST_SIG).is_err());
+}
+
+#[test]
+fn verify_minisign_garbage_key_fails() {
+    assert!(verify_minisign("not-a-valid-key", b"test", TEST_SIG).is_err());
+}
+
+#[test]
+fn verify_minisign_malformed_signature_fails() {
+    assert!(verify_minisign(TEST_PUBKEY, b"test", "untrusted comment: x\nzzz").is_err());
+}

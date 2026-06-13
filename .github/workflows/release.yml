@@ -152,3 +152,30 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: sha256sums.txt
+
+      - name: Sign sha256sums.txt with minisign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        # Signing the sums file transitively authenticates every asset hash it
+        # lists. Gated on the secret so forks / pre-key releases still ship a
+        # valid sha256-only release; update.rs verifies this signature when (and
+        # only when) MINISIGN_PUBLIC_KEY is pinned. A passwordless key signs
+        # non-interactively in the default (prehashed) format.
+        run: |
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "MINISIGN_SECRET_KEY not set — shipping sha256-only (no signature)."
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          # Remove the key file on ANY exit (incl. a signing failure under `set -e`).
+          trap 'rm -f minisign.key' EXIT
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > minisign.key
+          minisign -S -s minisign.key -m sha256sums.txt -t "clauth ${GITHUB_REF_NAME} checksums"
+          echo "Signed → sha256sums.txt.minisig"
+
+      - name: Upload signature to release
+        if: hashFiles('sha256sums.txt.minisig') != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          files: sha256sums.txt.minisig

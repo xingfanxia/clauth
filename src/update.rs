@@ -5,12 +5,29 @@ use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use minisign_verify::{PublicKey, Signature};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 const API_URL: &str = "https://api.github.com/repos/uwuclxdy/clauth/releases/latest";
 /// Env var: set to `1` to disable all background update work.
 const NO_UPDATE_ENV: &str = "CLAUTH_NO_UPDATE";
+
+/// Pinned minisign public key (base64 — the key line of `minisign.pub`, WITHOUT
+/// the `untrusted comment:` header). When set, every self-update verifies a
+/// detached minisign signature over `sha256sums.txt` against this key BEFORE
+/// trusting any hash it lists; authenticating the sums file transitively
+/// authenticates every asset hash in it.
+///
+/// EMPTY (the default) keeps signature enforcement OFF — the updater stays on
+/// SHA-256-only integrity, exactly as before, so auto-update keeps working
+/// during rollout. Pinning a real key here ACTIVATES fail-closed authenticity
+/// (missing/invalid signature ⇒ no update) and, being a compile-time constant,
+/// can never be downgraded at runtime.
+///
+/// Setup: `minisign -G -W` (passwordless) → paste the secret-key file contents
+/// into the `MINISIGN_SECRET_KEY` GitHub Actions secret, the public key here.
+const MINISIGN_PUBLIC_KEY: &str = "";
 
 /// Outcome of the background update check. Errors are silent; only actionable
 /// results are reported.
@@ -145,6 +162,52 @@ pub(crate) fn verify_sha256(bytes: &[u8], expected_hex: &str) -> bool {
     actual == expected_hex.to_ascii_lowercase()
 }
 
+/// Verify a minisign `signature_text` (full `.minisig` body, comments included)
+/// over `signed_bytes` using the base64 `public_key`. An empty key short-circuits
+/// to `Ok(())` — signature enforcement is inactive until a key is pinned. Every
+/// other outcome (unparseable key, malformed signature, bad signature) is an
+/// `Err`, so callers fail closed.
+fn verify_minisign(
+    public_key: &str,
+    signed_bytes: &[u8],
+    signature_text: &str,
+) -> anyhow::Result<()> {
+    let key = public_key.trim();
+    if key.is_empty() {
+        return Ok(());
+    }
+    let public_key = PublicKey::from_base64(key)
+        .map_err(|e| anyhow::anyhow!("pinned minisign public key is invalid: {e}"))?;
+    let signature = Signature::decode(signature_text)
+        .map_err(|e| anyhow::anyhow!("malformed minisign signature: {e}"))?;
+    public_key
+        .verify(signed_bytes, &signature, false)
+        .map_err(|e| anyhow::anyhow!("minisign signature did not verify — refusing update: {e}"))
+}
+
+/// Fetch `sha256sums.txt.minisig` and verify it against `MINISIGN_PUBLIC_KEY`.
+/// No-op (and no network call) while the key is unset; fail-closed on any fetch
+/// or verification error once it's pinned.
+fn verify_sums_signature(
+    agent: &ureq::Agent,
+    sums_url: &str,
+    sums_text: &str,
+) -> anyhow::Result<()> {
+    if MINISIGN_PUBLIC_KEY.trim().is_empty() {
+        return Ok(());
+    }
+    let sig_url = format!("{sums_url}.minisig");
+    let sig_text = agent
+        .get(&sig_url)
+        .header("User-Agent", "clauth-updater")
+        .call()
+        .map_err(|e| anyhow::anyhow!("signature fetch failed (skipping update): {e}"))?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| anyhow::anyhow!("signature read failed (skipping update): {e}"))?;
+    verify_minisign(MINISIGN_PUBLIC_KEY, sums_text.as_bytes(), &sig_text)
+}
+
 fn make_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(5)))
@@ -178,6 +241,11 @@ fn download_and_replace(url: &str, sums_url: &str, asset: &str) -> anyhow::Resul
         .body_mut()
         .read_to_string()
         .map_err(|e| anyhow::anyhow!("sha256sums.txt read failed (skipping update): {e}"))?;
+
+    // 1b. Authenticate sha256sums.txt with the pinned minisign key BEFORE
+    //     trusting any hash it lists. No-op (no network call) until a key is
+    //     pinned; fail-closed (missing/invalid signature ⇒ no update) once one is.
+    verify_sums_signature(&agent, sums_url, &sums_text)?;
 
     let expected_hex = find_expected_sha(&sums_text, asset)
         .ok_or_else(|| anyhow::anyhow!("asset {asset} not listed in sha256sums.txt — aborting"))?;

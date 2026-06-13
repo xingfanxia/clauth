@@ -48,7 +48,7 @@ On the first TUI launch, clauth installs shell completions once for your detecte
 
 ### Auto-update
 
-On launch, a background thread checks GitHub for a newer release, verifies the SHA-256 against `sha256sums.txt` (fail-closed), and self-replaces on next launch. Cargo-installed builds are notified only; `CLAUTH_NO_UPDATE=1` disables all checks.
+On launch, a background thread checks GitHub for a newer release, verifies the SHA-256 against `sha256sums.txt` (fail-closed), and self-replaces on next launch. Releases also carry a detached `minisign` signature over the checksums; once a signing key is configured the updater verifies it against a pinned public key before applying (fail-closed on a missing or bad signature). Cargo-installed builds are notified only; `CLAUTH_NO_UPDATE=1` disables all checks.
 
 ## Features
 
