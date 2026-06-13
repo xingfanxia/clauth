@@ -250,18 +250,17 @@ fn member_detail(
         } else {
             line
         });
-        // `rotate at` carries its hint only while the row is selected; an
-        // out-of-range typed value always swaps in the Invalid-input reason.
+        // `rotate at` shows its help hint while the row is selected; while typing,
+        // it swaps to an always-on `0–100 %` range tooltip (faint, DANGER when out
+        // of range) — mirroring the Config-tab refresh editor.
         if *row == FallbackRow::Threshold {
             match row_editing {
-                Some(input) if parse_threshold(input.trimmed()).is_none() => {
-                    lines.push(invalid_tooltip("invalid input"));
-                }
-                _ if selected => lines.push(tooltip(
+                Some(input) => lines.push(threshold_range_tooltip(input)),
+                None if selected => lines.push(tooltip(
                     "switch to the next account once 5h usage reaches this",
                     theme::faint(),
                 )),
-                _ => {}
+                None => {}
             }
         }
     }
@@ -284,6 +283,18 @@ fn invalid_tooltip(text: &str) -> Line<'static> {
         Span::styled("  └ ", theme::danger()),
         Span::styled(text.to_string(), theme::danger()),
     ])
+}
+
+/// Sub-line under the `rotate at` field while typing: the valid range, in DANGER
+/// when the current buffer parses out of range (or non-numeric), else faint —
+/// the threshold twin of the Config-tab refresh editor's `refresh_range_tooltip`.
+fn threshold_range_tooltip(input: &InputState) -> Line<'static> {
+    let range = "0–100 %";
+    if parse_threshold(input.trimmed()).is_none() {
+        invalid_tooltip(range)
+    } else {
+        tooltip(range, theme::faint())
+    }
 }
 
 fn detail_row(
@@ -317,7 +328,10 @@ fn detail_row(
                     } else {
                         theme::faint()
                     };
-                    spans.push(Span::styled("%", pct_style));
+                    // Leading space so the native caret (parked at the buffer end)
+                    // sits in a blank cell and `%` renders after it — matching the
+                    // refresh editor's ` s` unit.
+                    spans.push(Span::styled(" %", pct_style));
                 }
                 None => {
                     spans.push(Span::styled(format!("{threshold:.0}%"), theme::accent()));

@@ -193,6 +193,42 @@ fn config_refresh_interval_custom_editor_renders() {
 }
 
 #[test]
+fn fallback_threshold_editor_shows_range_tooltip() {
+    use crate::tui::app::{FallbackFocus, InputState, Tab};
+    let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            fallback_chain: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles,
+    };
+    let mut app = App::new(config);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = 0; // FALLBACK_ROWS[0] == `rotate at`
+
+    // A valid in-range buffer shows the range tooltip (mirrors the refresh editor).
+    app.fallback_threshold_draft = Some(InputState::new("70"));
+    let valid = dump(&app, 90, 20);
+    assert!(valid.contains("rotate at"), "threshold row label renders");
+    assert!(
+        valid.contains("70 %"),
+        "typed value renders with the unit after the caret cell"
+    );
+    assert!(valid.contains("0–100 %"), "valid-range tooltip renders");
+
+    // An out-of-range buffer still renders (DANGER) with the same range tooltip.
+    app.fallback_threshold_draft = Some(InputState::new("150"));
+    let invalid = dump(&app, 90, 20);
+    assert!(invalid.contains("150"));
+    assert!(invalid.contains("0–100 %"));
+}
+
+#[test]
 fn status_selected_row_tint_spans_both_lines() {
     let config = AppConfig {
         state: AppState::default(),
