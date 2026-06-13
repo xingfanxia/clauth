@@ -27,7 +27,7 @@ const NO_UPDATE_ENV: &str = "CLAUTH_NO_UPDATE";
 ///
 /// Setup: `minisign -G -W` (passwordless) → paste the secret-key file contents
 /// into the `MINISIGN_SECRET_KEY` GitHub Actions secret, the public key here.
-const MINISIGN_PUBLIC_KEY: &str = "";
+const MINISIGN_PUBLIC_KEY: &str = "RWS4HZQQuH8GjgSAz119H+6csSha0uFjoMKt3gx8Ror9Kvh3nObNSmVm";
 
 /// Outcome of the background update check. Errors are silent; only actionable
 /// results are reported.

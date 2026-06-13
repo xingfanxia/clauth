@@ -264,3 +264,13 @@ fn verify_minisign_garbage_key_fails() {
 fn verify_minisign_malformed_signature_fails() {
     assert!(verify_minisign(TEST_PUBKEY, b"test", "untrusted comment: x\nzzz").is_err());
 }
+
+#[test]
+fn pinned_public_key_parses_when_set() {
+    // A pinned key must decode — a typo would fail-close EVERY auto-update.
+    // No-op while the key is the empty placeholder.
+    let key = MINISIGN_PUBLIC_KEY.trim();
+    if !key.is_empty() {
+        PublicKey::from_base64(key).expect("pinned MINISIGN_PUBLIC_KEY must be a valid key");
+    }
+}
