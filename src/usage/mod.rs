@@ -6,8 +6,8 @@ pub(crate) use burn::compute_burn_rates_from_history;
 #[allow(unused_imports)]
 pub(crate) use fetch::{
     ExtraUsage, LABEL_5H, LABEL_7D, LABEL_7D_OPUS, LABEL_7D_SONNET, PlanInfo, UsageInfo,
-    UsageWindow, epoch_secs_to_iso, http_agent, humanize_duration, iso_to_epoch_secs,
-    now_epoch_secs, now_ms, parse_retry_after, write_disk_cache,
+    UsageWindow, epoch_secs_to_iso, http_agent, humanize_duration, ideal_pace_pct,
+    iso_to_epoch_secs, now_epoch_secs, now_ms, parse_retry_after, write_disk_cache,
 };
 pub(crate) use scheduler::{
     ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,

@@ -122,3 +122,46 @@ fn retry_after_parses_delta_seconds_only() {
     assert_eq!(parse_retry_after("-5"), None);
     assert_eq!(parse_retry_after("1.5"), None);
 }
+
+/// The ideal-pace marker tracks the fraction of the window already elapsed:
+/// half-elapsed → 50%, just-opened → 0%, lapsed → clamped to 100%. Windows with
+/// no reset time or no fixed duration return `None` (no marker).
+#[test]
+fn ideal_pace_tracks_elapsed_window_fraction() {
+    let win = |reset_secs: i64| UsageWindow {
+        utilization: 0.0,
+        resets_at: Some(epoch_secs_to_iso(reset_secs)),
+    };
+
+    // 5h window with 2.5h left → half elapsed → 50%.
+    let p = ideal_pace_pct(LABEL_5H, &win(BASE_UTC + 9_000), BASE_UTC).unwrap();
+    assert!(
+        (p - 50.0).abs() < 1e-6,
+        "half-elapsed 5h window paces at 50%, got {p}"
+    );
+
+    // 7d window with its full duration left → just opened → 0%.
+    let p = ideal_pace_pct(LABEL_7D, &win(BASE_UTC + 7 * 86_400), BASE_UTC).unwrap();
+    assert!(
+        p.abs() < 1e-6,
+        "a freshly-opened window paces at 0%, got {p}"
+    );
+
+    // Reset already in the past → clamped to 100%.
+    let p = ideal_pace_pct(LABEL_5H, &win(BASE_UTC - 1), BASE_UTC).unwrap();
+    assert!(
+        (p - 100.0).abs() < 1e-6,
+        "a lapsed window paces at 100%, got {p}"
+    );
+
+    // No reset time, or a window with no fixed duration → no marker.
+    let no_reset = UsageWindow {
+        utilization: 0.0,
+        resets_at: None,
+    };
+    assert_eq!(ideal_pace_pct(LABEL_5H, &no_reset, BASE_UTC), None);
+    assert_eq!(
+        ideal_pace_pct("extra", &win(BASE_UTC + 100), BASE_UTC),
+        None
+    );
+}

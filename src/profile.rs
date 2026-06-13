@@ -222,6 +222,10 @@ pub(crate) struct AppState {
     /// in the Usage tab even when data is available.
     #[serde(default = "default_show_estimates", skip_serializing_if = "is_true")]
     pub(crate) show_estimates: bool,
+    /// When true, the Usage tab overlays an ideal-pace `│` marker on each window
+    /// bar (off by default). Toggled from the Usage action menu.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) show_pace: bool,
     #[serde(default = "default_refresh_interval")]
     pub(crate) refresh_interval_ms: u64,
     /// Default action when credential divergence is detected. `None` = show the
@@ -236,6 +240,10 @@ fn default_show_estimates() -> bool {
 
 fn is_true(b: &bool) -> bool {
     *b
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Default interval new profiles.toml uses. Kept in one place — everything else
@@ -263,6 +271,7 @@ impl Default for AppState {
             wrap_off: false,
             theme: None,
             show_estimates: true,
+            show_pace: false,
             refresh_interval_ms: default_refresh_interval(),
             default_divergence: None,
         }

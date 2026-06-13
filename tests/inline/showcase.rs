@@ -616,6 +616,23 @@ fn headless_showcase_renders() {
         overview.contains("setup") && overview.contains("config"),
         "tab bar renders its labels"
     );
+
+    // Pace marker: off by default, and flipping `show_pace` overlays extra `│`
+    // ticks on the usage bars. Panel borders already draw `│`, so assert the
+    // count rises rather than mere presence.
+    let bars = |term: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+        flatten(term).matches('│').count()
+    };
+    app.tab = app::Tab::Usage;
+    term.draw(|f| render::draw(f, &app)).unwrap();
+    let without_pace = bars(&term);
+    app.config().state.show_pace = true;
+    term.draw(|f| render::draw(f, &app)).unwrap();
+    assert!(
+        bars(&term) > without_pace,
+        "show_pace overlays ideal-pace markers on the usage bars ({without_pace} → {})",
+        bars(&term),
+    );
 }
 
 // ── Non-interactive driver ──────────────────────────────────────────────────

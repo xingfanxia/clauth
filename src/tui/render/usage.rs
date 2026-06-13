@@ -19,7 +19,7 @@ use super::panes::{
 use crate::format::plan_label;
 use crate::profile::Profile;
 use crate::providers::StatRowKind;
-use crate::usage::{FetchStatus, ProfileActivity, now_ms};
+use crate::usage::{FetchStatus, ProfileActivity, ideal_pace_pct, now_epoch_secs, now_ms};
 
 const KEY_W: usize = 8;
 
@@ -86,7 +86,15 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let show_estimates = cfg.state.show_estimates;
-    let lines = build_usage_lines(profile, inner.width, &header, app, show_estimates);
+    let show_pace = cfg.state.show_pace;
+    let lines = build_usage_lines(
+        profile,
+        inner.width,
+        &header,
+        app,
+        show_estimates,
+        show_pace,
+    );
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
@@ -96,6 +104,7 @@ fn build_usage_lines(
     header: &HeaderState,
     app: &App,
     show_estimates: bool,
+    show_pace: bool,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.extend(header_lines(profile, inner_w, header));
@@ -188,6 +197,11 @@ fn build_usage_lines(
             stat.burn_rate = None;
         }
     }
+    if !show_pace {
+        for stat in &mut stats {
+            stat.pace_pct = None;
+        }
+    }
 
     let max_rate_w = stats
         .iter()
@@ -211,6 +225,9 @@ struct Stat {
     trailing: String,
     burn_rate: Option<f64>,
     rate_unit: &'static str,
+    /// Ideal-pace marker position as a percentage (0..=100), or `None` to draw
+    /// no marker. Gated by `AppState.show_pace`; computed in [`collect_stats`].
+    pace_pct: Option<f64>,
 }
 
 /// Seconds until the window hits 100% at the current burn rate.
@@ -253,14 +270,12 @@ impl Stat {
             .saturating_sub(max_rate_w)
             .saturating_sub(pct_str.chars().count());
 
-        let filled = ((self.pct / 100.0) * bar_width as f64).round() as usize;
-        let filled = filled.min(bar_width);
-        let empty = bar_width - filled;
+        let filled = (((self.pct / 100.0) * bar_width as f64).round() as usize).min(bar_width);
+        let marker = self.pace_pct.filter(|_| bar_width > 0).map(|p| {
+            (((p.clamp(0.0, 100.0) / 100.0) * bar_width as f64).round() as usize).min(bar_width - 1)
+        });
 
-        let mut bar_line = vec![
-            Span::styled("█".repeat(filled), self.color),
-            Span::styled("░".repeat(empty), theme::line_strong()),
-        ];
+        let mut bar_line = bar_spans(filled, bar_width, self.color, marker);
         // Right-align trailing text to the same far column as %.
         if !self.trailing.is_empty() {
             let pad = pct_col
@@ -313,6 +328,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
     let Some(usage) = profile.usage.as_ref() else {
         return Vec::new();
     };
+    let now_secs = now_epoch_secs();
     let mut stats: Vec<Stat> = Vec::new();
     for (label, w) in usage.windows() {
         let pct = w.utilization.clamp(0.0, 100.0);
@@ -327,6 +343,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             trailing,
             burn_rate: None,
             rate_unit,
+            pace_pct: ideal_pace_pct(label, w, now_secs),
         });
     }
     if let Some(extra) = &usage.extra_usage
@@ -346,6 +363,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             trailing: format!("  {sym}{used:.2} / {sym}{limit:.2}"),
             burn_rate: None,
             rate_unit: "h",
+            pace_pct: None,
         });
     }
     stats
@@ -361,6 +379,45 @@ fn bar_width_for(inner_w: u16, max_trailing: usize) -> usize {
         // 10-cell bar that pushes the suffix off the edge.
         avail.max(1)
     }
+}
+
+/// The usage bar: `filled` █ cells in `fill`, the rest ░, with an optional `│`
+/// ideal-pace marker at `marker_col`. The marker reads WARNING once the fill has
+/// passed it (usage running ahead of an even spread) and faint while the fill is
+/// still behind it. Drawn over the bar so a wide fill never hides it — the
+/// horizontal twin of `chain::gauge_with_tick`.
+fn bar_spans(
+    filled: usize,
+    bar_width: usize,
+    fill: Style,
+    marker_col: Option<usize>,
+) -> Vec<Span<'static>> {
+    let empty = bar_width - filled;
+    let Some(m) = marker_col.filter(|&m| m < bar_width) else {
+        return vec![
+            Span::styled("█".repeat(filled), fill),
+            Span::styled("░".repeat(empty), theme::line_strong()),
+        ];
+    };
+
+    // Emit each run only when non-empty so the marker splits the bar cleanly.
+    let run =
+        |glyph: &str, n: usize, style: Style| (n > 0).then(|| Span::styled(glyph.repeat(n), style));
+    let mut spans = Vec::with_capacity(4);
+    if m < filled {
+        // Marker sits over the filled run — usage is ahead of pace.
+        spans.extend(run("█", m, fill));
+        spans.push(Span::styled("│".to_string(), theme::warning()));
+        spans.extend(run("█", filled - m - 1, fill));
+        spans.extend(run("░", empty, theme::line_strong()));
+    } else {
+        // Marker sits over the empty run — usage is under pace.
+        spans.extend(run("█", filled, fill));
+        spans.extend(run("░", m - filled, theme::line_strong()));
+        spans.push(Span::styled("│".to_string(), theme::dim()));
+        spans.extend(run("░", bar_width - m - 1, theme::line_strong()));
+    }
+    spans
 }
 
 fn header_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Line<'static>> {
@@ -514,3 +571,7 @@ fn key_span(key: &str) -> Span<'static> {
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     Span::styled(format!("{key}{}", " ".repeat(pad)), theme::label())
 }
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_usage.rs"]
+mod tests;

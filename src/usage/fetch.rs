@@ -93,6 +93,28 @@ impl UsageInfo {
     }
 }
 
+/// Nominal length of the rolling window named by `label`, in seconds. `None`
+/// for labels with no fixed window (e.g. the monthly extra-credits bar).
+pub(crate) fn window_duration_secs(label: &str) -> Option<i64> {
+    match label {
+        LABEL_5H => Some(5 * 3600),
+        LABEL_7D | LABEL_7D_SONNET | LABEL_7D_OPUS => Some(7 * 86_400),
+        _ => None,
+    }
+}
+
+/// Ideal-pace percentage (0..=100) for a usage window at `now_secs`: the share
+/// of the window already elapsed. Usage spread evenly across the window tracks
+/// this line, so a fill past it is ahead of pace and a fill behind it is under
+/// pace. `None` when the window has no reset time or no fixed duration.
+pub(crate) fn ideal_pace_pct(label: &str, window: &UsageWindow, now_secs: i64) -> Option<f64> {
+    let duration = window_duration_secs(label)?;
+    let reset = iso_to_epoch_secs(window.resets_at.as_deref()?)?;
+    let remaining = (reset - now_secs).clamp(0, duration);
+    let elapsed = duration - remaining;
+    Some(elapsed as f64 / duration as f64 * 100.0)
+}
+
 #[derive(Deserialize)]
 struct RawUsage {
     #[serde(default)]

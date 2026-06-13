@@ -308,6 +308,7 @@ pub(crate) enum ActionMenuAction {
     OpenIncidentLink,
     // Usage
     ToggleEstimates,
+    TogglePace,
 }
 
 /// State for the action-menu modal.
@@ -360,6 +361,7 @@ impl ActionMenuAction {
         match self {
             Self::RotateTokens => Some('t'),
             Self::ToggleEstimates => Some('e'),
+            Self::TogglePace => Some('p'),
             _ => None,
         }
     }
@@ -383,6 +385,7 @@ impl ActionMenuAction {
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
             Self::ToggleEstimates => "toggle estimates",
+            Self::TogglePace => "toggle pace marker",
         }
     }
 }
@@ -1607,6 +1610,7 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up => step_profile_cursor(app, -1, count),
         KeyCode::Down => step_profile_cursor(app, 1, count),
         KeyCode::Char('e') => toggle_show_estimates(app),
+        KeyCode::Char('p') => toggle_show_pace(app),
         _ => {}
     }
 }
@@ -2109,6 +2113,15 @@ fn toggle_show_estimates(app: &mut App) {
     app.last_state_mtime = app_state_mtime();
 }
 
+fn toggle_show_pace(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.show_pace = !cfg.state.show_pace;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+}
+
 /// Step the global refresh interval through preset values (`+` = faster, `-` = slower).
 fn step_refresh_interval(app: &mut App, dir: i32) {
     const PRESETS: [u64; 6] = [15_000, 30_000, 60_000, 90_000, 120_000, 300_000];
@@ -2494,6 +2507,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
         Tab::Usage => {
             actions.push(RefreshUsage);
             actions.push(ToggleEstimates);
+            actions.push(TogglePace);
         }
         Tab::Setup => match app.config_focus {
             ConfigFocus::Profiles => {
@@ -2690,6 +2704,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
+        ActionMenuAction::TogglePace => toggle_show_pace(app),
     }
 }
 
