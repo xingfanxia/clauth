@@ -1,11 +1,24 @@
 <p align="center">
-    <img src="media/clauth.png" alt="clauth — Claude Code account switcher and usage monitor TUI" width="480" />
+    <img src="media/clauth.png" alt="clauth: Claude Code account switcher and usage monitor TUI" width="480" />
 </p>
 
-[![Release](https://github.com/uwuclxdy/clauth/actions/workflows/release.yml/badge.svg)](https://github.com/uwuclxdy/clauth/actions/workflows/release.yml)
-[![crates.io](https://img.shields.io/crates/v/clauth.svg)](https://crates.io/crates/clauth)
+<h1 align="center">Claude Code Account Switcher and Usage Monitor</h1>
 
-# Claude Code Account Switcher and Usage Monitor
+<p align="center">
+  <a href="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml"><img src="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml/badge.svg" alt="Release" /></a>
+  <a href="https://crates.io/crates/clauth"><img src="https://img.shields.io/crates/v/clauth.svg" alt="crates.io" /></a>
+</p>
+
+<p align="center">
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#automatic-account-switching">Auto-switch</a> ·
+  <a href="#alternatives">Alternatives</a> ·
+  <a href="#faq">FAQ</a> ·
+  <a href="#security">Security</a>
+</p>
 
 **clauth** is a terminal UI to **switch between multiple Claude Code accounts** without logging out, and to monitor Claude Code usage and rate limits in real time. It handles Claude Pro / Max / Team / Enterprise OAuth accounts and custom API endpoints, auto-switches to a fallback account when you hit the 5-hour limit, and runs parallel Claude Code sessions under different accounts. Linux, macOS, Windows.
 
