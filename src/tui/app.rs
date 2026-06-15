@@ -1610,9 +1610,14 @@ fn token_model_count(app: &App) -> usize {
         .unwrap_or(0)
 }
 
-/// Tokens tab: Dashboard scrolls with ↑↓ and descends to Models on ⏎;
-/// Models moves the model cursor with ↑↓ (ascend handled by the global esc/q).
+/// Tokens tab: `c` toggles cache-counting (persisted) on either view; Dashboard
+/// descends to Models on ⏎; Models moves the model cursor with ↑↓ (ascend handled
+/// by the global esc/q).
 fn handle_tokens_key(app: &mut App, key: KeyEvent) {
+    if key.code == KeyCode::Char('c') {
+        toggle_count_cache(app);
+        return;
+    }
     match app.token_view {
         TokenView::Dashboard => {
             // Dashboard is a fixed grid (no scroll); ⏎ descends into Models.
@@ -2194,6 +2199,16 @@ fn toggle_show_estimates(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.show_estimates = !cfg.state.show_estimates;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+}
+
+/// Toggle whether the Tokens tab counts cache in its token figures (persisted).
+fn toggle_count_cache(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.count_cache = !cfg.state.count_cache;
         let _ = save_app_state(&cfg.state);
     }
     app.last_state_mtime = app_state_mtime();

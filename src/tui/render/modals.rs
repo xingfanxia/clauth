@@ -264,6 +264,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             &[
                 ("\u{23ce}", "open per-model breakdown"),
                 ("\u{2191}\u{2193}", "pick model (in breakdown)"),
+                ("c", "count cache in token figures"),
                 ("r", "reload on-disk stats"),
                 ("esc", "back to dashboard"),
             ][..],

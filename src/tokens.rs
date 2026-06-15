@@ -152,9 +152,13 @@ impl TokenStats {
     }
 }
 
-/// Display grouping: keep Anthropic models (name starts with "claude") individual,
-/// fold every other model into a single "others" `ModelTokens` row.
-/// Returns rows sorted DESC by `total()`. Pure fn, unit-testable.
+/// Models below this lifetime total fold into the "others" row.
+const OTHERS_THRESHOLD: u64 = 1_000_000;
+
+/// Display grouping: keep Anthropic models individual, keep any other model that
+/// has moved more than [`OTHERS_THRESHOLD`] tokens individual too, and fold only
+/// the long tail of tiny non-Anthropic models into one "others" row.
+/// Returns rows sorted DESC by `in_out()`. Pure fn, unit-testable.
 pub(crate) fn group_models(models: &[ModelTokens]) -> Vec<ModelTokens> {
     let mut out: Vec<ModelTokens> = Vec::new();
     let mut others = ModelTokens {
@@ -163,7 +167,7 @@ pub(crate) fn group_models(models: &[ModelTokens]) -> Vec<ModelTokens> {
     };
 
     for m in models {
-        if is_anthropic(&m.model) {
+        if is_anthropic(&m.model) || m.total() > OTHERS_THRESHOLD {
             out.push(m.clone());
         } else {
             others.input = others.input.saturating_add(m.input);

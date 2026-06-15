@@ -170,6 +170,19 @@ fn busiest_hour(hours: &[u64; 24]) -> Option<usize> {
     (count > 0).then_some(hour)
 }
 
+/// A model's token count on the active basis: in+out, or +cache when `count_cache`.
+fn model_metric(m: &ModelTokens, count_cache: bool) -> u64 {
+    if count_cache { m.total() } else { m.in_out() }
+}
+
+/// Grouped models ranked DESC by the active basis (so the bars descend by the
+/// value actually shown).
+fn ranked_models(stats: &TokenStats, count_cache: bool) -> Vec<ModelTokens> {
+    let mut g = group_models(&stats.models);
+    g.sort_unstable_by_key(|m| std::cmp::Reverse(model_metric(m, count_cache)));
+    g
+}
+
 // ── dashboard view ─────────────────────────────────────────────────────────
 
 fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -187,6 +200,8 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         );
         return;
     };
+
+    let count_cache = app.config().state.count_cache;
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -207,7 +222,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "today",
         today_meta.as_deref(),
         true,
-        today_lines(stats, inner_w(top[0])),
+        today_lines(stats, inner_w(top[0]), count_cache),
     );
     card(
         frame,
@@ -215,7 +230,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "total",
         None,
         false,
-        total_lines(stats, inner_w(top[1])),
+        total_lines(stats, inner_w(top[1]), count_cache),
     );
 
     // Freshness badge → the daily card's title-right meta slot.
@@ -239,7 +254,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "top models",
         None,
         false,
-        model_lines(stats, inner_w(mid[0]), 5),
+        model_lines(stats, inner_w(mid[0]), 5, count_cache),
     );
     card(
         frame,
@@ -301,15 +316,16 @@ fn card(
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
-fn today_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
+fn today_lines(stats: &TokenStats, w: usize, count_cache: bool) -> Vec<Line<'static>> {
     let Some(t) = stats.today.as_ref() else {
         return vec![Line::from(Span::styled(
             "idle so far today",
             theme::faint(),
         ))];
     };
+    let tokens = if count_cache { t.total() } else { t.in_out() };
     vec![
-        kv_accent("tokens", fmt_count(t.in_out())),
+        kv_accent("tokens", fmt_count(tokens)),
         Line::from(vec![
             key("msgs"),
             Span::styled(t.messages.to_string(), theme::body()),
@@ -328,18 +344,23 @@ fn today_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
     ]
 }
 
-fn total_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
+fn total_lines(stats: &TokenStats, w: usize, count_cache: bool) -> Vec<Line<'static>> {
     let last = stats
         .topped_up_through
         .as_deref()
         .or(stats.daily.last().map(|d| d.date.as_str()))
         .or(stats.last_computed_date.as_deref());
+    let total = if count_cache {
+        stats.total_tokens()
+    } else {
+        stats.total_in_out()
+    };
     let mut lines = vec![
         lr(
             vec![
                 key("tokens"),
                 Span::styled(
-                    fmt_count(stats.total_in_out()),
+                    fmt_count(total),
                     theme::accent().add_modifier(Modifier::BOLD),
                 ),
             ],
@@ -395,11 +416,12 @@ fn daily_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
     ]
 }
 
-fn model_lines(stats: &TokenStats, w: usize, n: usize) -> Vec<Line<'static>> {
-    let grouped = group_models(&stats.models);
-    // in+out basis (matches the dashboard headlines + daily trend); grouped is
-    // already ranked by in+out, so the first is the longest bar.
-    let max = grouped.first().map(ModelTokens::in_out).unwrap_or(0);
+fn model_lines(stats: &TokenStats, w: usize, n: usize, count_cache: bool) -> Vec<Line<'static>> {
+    let grouped = ranked_models(stats, count_cache);
+    let max = grouped
+        .first()
+        .map(|m| model_metric(m, count_cache))
+        .unwrap_or(0);
     let names: Vec<String> = grouped
         .iter()
         .take(n)
@@ -422,15 +444,13 @@ fn model_lines(stats: &TokenStats, w: usize, n: usize) -> Vec<Line<'static>> {
             } else {
                 theme::dim()
             };
+            let val = model_metric(m, count_cache);
             let mut spans = vec![
                 Span::styled(fixed(name, label_w), theme::body()),
                 Span::raw(" "),
             ];
-            spans.extend(hbar(m.in_out(), max, bar_w, fill));
-            spans.push(Span::styled(
-                format!(" {}", fmt_count(m.in_out())),
-                theme::dim(),
-            ));
+            spans.extend(hbar(val, max, bar_w, fill));
+            spans.push(Span::styled(format!(" {}", fmt_count(val)), theme::dim()));
             Line::from(spans)
         })
         .collect()
@@ -519,10 +539,11 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Length(SELECTOR_WIDTH), Constraint::Min(20)])
         .split(area);
 
+    let count_cache = app.config().state.count_cache;
     let grouped = app
         .token_stats
         .as_ref()
-        .map(|s| group_models(&s.models))
+        .map(|s| ranked_models(s, count_cache))
         .unwrap_or_default();
     let sel = app.token_model_cursor.min(grouped.len().saturating_sub(1));
 

@@ -226,6 +226,11 @@ pub(crate) struct AppState {
     /// bar (off by default). Toggled from the Usage action menu.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) show_pace: bool,
+    /// When true, the Tokens tab counts cache tokens in every "tokens" figure
+    /// (total throughput); when false (default), figures are in+out only — the
+    /// basis that matches the daily trend. Toggled with `c` on the Tokens tab.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) count_cache: bool,
     #[serde(default = "default_refresh_interval")]
     pub(crate) refresh_interval_ms: u64,
     /// Default action when credential divergence is detected. `None` = show the
@@ -272,6 +277,7 @@ impl Default for AppState {
             theme: None,
             show_estimates: true,
             show_pace: false,
+            count_cache: false,
             refresh_interval_ms: default_refresh_interval(),
             default_divergence: None,
         }

@@ -134,6 +134,59 @@ fn tokens_dashboard_uses_alignment_not_middot() {
 }
 
 #[test]
+fn count_cache_toggle_switches_token_basis() {
+    use crate::tokens::{DaySummary, TokenStats};
+    let mut app = empty_app(Tab::Tokens);
+    app.token_stats = Some(TokenStats {
+        models: vec![],
+        daily: vec![],
+        activity: vec![],
+        hour_counts: [0; 24],
+        total_input: 10_000_000,
+        total_output: 0,
+        total_cache_read: 90_000_000,
+        total_cache_create: 0,
+        total_sessions: 1,
+        total_messages: 1,
+        first_session_date: None,
+        last_computed_date: None,
+        topped_up_through: None,
+        today: Some(DaySummary {
+            date: "2026-06-15".into(),
+            input: 10_000_000,
+            output: 0,
+            cache_read: 90_000_000,
+            cache_create: 0,
+            messages: 1,
+        }),
+    });
+    let render = |app: &App| -> String {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::super::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..30usize)
+            .flat_map(|y| (0..100usize).map(move |x| (x, y)))
+            .map(|(x, y)| buf.content[y * 100 + x].symbol().to_owned())
+            .collect()
+    };
+
+    // Default (off): in+out basis → 10.0M, never the cache-inflated 100M.
+    {
+        app.config().state.count_cache = false;
+    }
+    let off = render(&app);
+    assert!(off.contains("10.0M"), "off must headline in+out (10.0M)");
+    assert!(!off.contains("100M"), "off must not count cache");
+
+    // On: total-incl-cache basis → 100M.
+    {
+        app.config().state.count_cache = true;
+    }
+    let on = render(&app);
+    assert!(on.contains("100M"), "on must count cache (100M)");
+}
+
+#[test]
 fn normal_form_shows_all_tabs() {
     let app = empty_app(Tab::Overview);
     let s = render_tabs(&app, 70);

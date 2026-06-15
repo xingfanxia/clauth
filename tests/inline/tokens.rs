@@ -188,6 +188,46 @@ fn group_models_empty_input() {
     assert!(group_models(&[]).is_empty());
 }
 
+#[test]
+fn group_models_breaks_out_large_non_anthropic() {
+    let models = vec![
+        // > 1M total → shown individually even though non-Anthropic.
+        ModelTokens {
+            model: "gpt-5.5".to_owned(),
+            input: 2_000_000,
+            output: 100_000,
+            cache_read: 0,
+            cache_create: 0,
+        },
+        // < 1M total → folds into "others".
+        ModelTokens {
+            model: "tiny-model".to_owned(),
+            input: 100,
+            output: 50,
+            cache_read: 0,
+            cache_create: 0,
+        },
+        ModelTokens {
+            model: "claude-opus-4-8".to_owned(),
+            input: 500,
+            output: 250,
+            cache_read: 0,
+            cache_create: 0,
+        },
+    ];
+    let grouped = group_models(&models);
+    assert!(
+        grouped.iter().any(|m| m.model == "gpt-5.5"),
+        "a >1M non-Anthropic model must show separately"
+    );
+    assert!(grouped.iter().any(|m| m.model == "claude-opus-4-8"));
+    let others = grouped
+        .iter()
+        .find(|m| m.model == "others")
+        .expect("the tiny model must fold into others");
+    assert_eq!(others.in_out(), 150); // only tiny-model (100 + 50)
+}
+
 // ── 3. is_anthropic ───────────────────────────────────────────────────────────
 
 #[test]
