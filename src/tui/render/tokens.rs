@@ -21,7 +21,7 @@ use super::format::fixed;
 use super::panes::{
     SELECTOR_WIDTH, draw_selector_list, picker_row, section_box, section_box_verbatim,
 };
-use crate::tokens::{ModelTokens, TokenStats, group_models, is_anthropic};
+use crate::tokens::{ModelTokens, TokenStats, group_models, is_anthropic, model_display_name};
 
 /// Key column width for label:value rows.
 const KEY_W: usize = 8;
@@ -398,19 +398,30 @@ fn daily_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
 fn model_lines(stats: &TokenStats, w: usize, n: usize) -> Vec<Line<'static>> {
     let grouped = group_models(&stats.models);
     let max = grouped.first().map(ModelTokens::total).unwrap_or(0);
-    let label_w = (w / 3).clamp(6, 14);
-    let bar_w = w.saturating_sub(label_w).saturating_sub(9).clamp(4, 28);
+    let names: Vec<String> = grouped
+        .iter()
+        .take(n)
+        .map(|m| model_display_name(&m.model))
+        .collect();
+    // Expand the label column to the longest name when there's room; only
+    // truncate (via `fixed`) when the card is too narrow. Reserve a value
+    // column (~7) + two 1-cell gaps + a minimum 8-cell bar.
+    let longest = names.iter().map(|s| s.chars().count()).max().unwrap_or(6);
+    let max_label = w.saturating_sub(7 + 2 + 8);
+    let label_w = longest.clamp(6, max_label.max(6));
+    let bar_w = w.saturating_sub(label_w).saturating_sub(9).clamp(4, 30);
     grouped
         .iter()
         .take(n)
-        .map(|m| {
+        .zip(names.iter())
+        .map(|(m, name)| {
             let fill = if is_anthropic(&m.model) {
                 theme::accent()
             } else {
                 theme::dim()
             };
             let mut spans = vec![
-                Span::styled(fixed(&m.model, label_w), theme::body()),
+                Span::styled(fixed(name, label_w), theme::body()),
                 Span::raw(" "),
             ];
             spans.extend(hbar(m.total(), max, bar_w, fill));
@@ -523,7 +534,7 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 } else {
                     theme::dim()
                 };
-                picker_row(i == sel, true, m.model.clone(), style, w)
+                picker_row(i == sel, true, model_display_name(&m.model), style, w)
             })
             .collect()
     });
@@ -537,8 +548,10 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_model_detail(frame: &mut Frame<'_>, area: Rect, model: Option<&ModelTokens>, grand: u64) {
-    let title = model.map(|m| m.model.as_str()).unwrap_or("model");
-    let block = section_box_verbatim(title, false, false);
+    let title = model
+        .map(|m| model_display_name(&m.model))
+        .unwrap_or_else(|| "model".to_string());
+    let block = section_box_verbatim(&title, false, false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

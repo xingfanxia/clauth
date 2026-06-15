@@ -116,6 +116,11 @@ fn tokens_dashboard_uses_alignment_not_middot() {
     assert!(text.contains("jan 18"), "span start missing");
     assert!(text.contains("jun 15"), "span end / freshness missing");
     assert!(text.contains("TODAY"), "today card missing");
+    // Model names render via the friendly mapping, expanded (not truncated).
+    assert!(
+        text.contains("opus 4.8"),
+        "top models should show the mapped display name in full"
+    );
 }
 
 #[test]

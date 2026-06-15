@@ -177,6 +177,54 @@ pub(crate) fn is_anthropic(model: &str) -> bool {
     model.starts_with("claude")
 }
 
+/// Friendly display name for a model id — the single place that maps raw ids
+/// to nice labels, used everywhere a model is shown.
+///
+/// Anthropic ids collapse to `family version` (`claude-opus-4-8` → `opus 4.8`,
+/// `claude-sonnet-4-5-20250929` → `sonnet 4.5`, `claude-opus-4-6-thinking`
+/// → `opus 4.6 thinking`). A trailing 8-digit date stamp is dropped. The
+/// `others` bucket and any unrecognized id pass through (date-stripped).
+pub(crate) fn model_display_name(model: &str) -> String {
+    if model == "others" {
+        return "others".to_string();
+    }
+    // Drop a trailing 8-digit date stamp (e.g. `…-20250929`); version segments
+    // are 1–2 digits, so this never eats a real version component.
+    let base = match model.rsplit_once('-') {
+        Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => model,
+    };
+    let Some(rest) = base.strip_prefix("claude-") else {
+        return base.to_string();
+    };
+    let mut parts = rest.split('-');
+    let Some(family) = parts.next() else {
+        return base.to_string();
+    };
+    // Leading numeric/dotted segments form the version (joined by `.`); any
+    // trailing words (e.g. `thinking`) are appended verbatim.
+    let mut version: Vec<&str> = Vec::new();
+    let mut extras: Vec<&str> = Vec::new();
+    for p in parts {
+        if extras.is_empty() && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        {
+            version.push(p);
+        } else {
+            extras.push(p);
+        }
+    }
+    let mut out = family.to_string();
+    if !version.is_empty() {
+        out.push(' ');
+        out.push_str(&version.join("."));
+    }
+    for e in extras {
+        out.push(' ');
+        out.push_str(e);
+    }
+    out
+}
+
 // ── stats-cache.json wire types ──────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]

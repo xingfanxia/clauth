@@ -201,6 +201,26 @@ fn is_anthropic_recognition() {
     assert!(!is_anthropic(""));
 }
 
+#[test]
+fn model_display_name_mapping() {
+    assert_eq!(model_display_name("claude-opus-4-8"), "opus 4.8");
+    assert_eq!(model_display_name("claude-sonnet-4-6"), "sonnet 4.6");
+    assert_eq!(model_display_name("claude-haiku-4-5-20251001"), "haiku 4.5");
+    assert_eq!(
+        model_display_name("claude-sonnet-4-5-20250929"),
+        "sonnet 4.5"
+    );
+    assert_eq!(
+        model_display_name("claude-opus-4-6-thinking"),
+        "opus 4.6 thinking"
+    );
+    assert_eq!(model_display_name("claude-sonnet-4.6"), "sonnet 4.6");
+    assert_eq!(model_display_name("claude-fable-5"), "fable 5");
+    // Non-Anthropic and the synthetic bucket pass through.
+    assert_eq!(model_display_name("gpt-5.5"), "gpt-5.5");
+    assert_eq!(model_display_name("others"), "others");
+}
+
 // ── 4. cache_hit_ratio ────────────────────────────────────────────────────────
 
 #[test]
