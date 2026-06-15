@@ -26,8 +26,15 @@ use crate::tokens::{ModelTokens, TokenStats, group_models, is_anthropic, model_d
 
 /// Key column width for label:value rows.
 const KEY_W: usize = 8;
+/// Wider key column for the spelled-out `cache read`/`cache write` rows
+/// (composition card + per-model detail): `cache write` (11) + 1 trailing space,
+/// so every label keeps a gap before its bar/value and the columns stay aligned.
+const WIDE_KEY_W: usize = 12;
 /// Block-glyph ramp for sparklines, low → high.
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Hour-of-day card outer width: 24 hour buckets + 4 (border + 1-col padding
+/// each side), so the fixed-width sparkline fills the box exactly.
+const HOUR_BOX_W: u16 = 28;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     match app.token_view {
@@ -61,34 +68,42 @@ fn fmt_count(n: u64) -> String {
     }
 }
 
-/// Compact USD: `$1.2K`, `$340`, `$12.50`, `$0.34`, `<$0.01`, `$0`.
+/// Group the integer part of non-negative `n` with `,` thousands separators,
+/// keeping `decimals` fractional digits: `(12345.6, 2)` → `12,345.60`.
+fn group_thousands(n: f64, decimals: usize) -> String {
+    let s = format!("{n:.decimals$}");
+    let (int, frac) = s.split_once('.').map_or((s.as_str(), ""), |(i, f)| (i, f));
+    let digits = int.len();
+    let mut out = String::with_capacity(digits + digits / 3 + 1 + frac.len());
+    for (i, ch) in int.chars().enumerate() {
+        if i > 0 && (digits - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    out
+}
+
+/// Full USD with 2–3 decimal precision and `,`-grouped thousands: `$12,345.67`,
+/// `$340.00`, `$12.50`, `$0.340`, `<$0.001`, `$0`. No K/M/B suffix — the whole
+/// figure is shown, two decimals from a dollar up and three below.
 fn fmt_money(usd: f64) -> String {
     if usd <= 0.0 {
         return "$0".to_string();
     }
-    if usd >= 1e3 {
-        let (v, suffix) = if usd >= 1e9 {
-            (usd / 1e9, "B")
-        } else if usd >= 1e6 {
-            (usd / 1e6, "M")
-        } else {
-            (usd / 1e3, "K")
-        };
-        if v >= 100.0 {
-            format!("${v:.0}{suffix}")
-        } else if v >= 10.0 {
-            format!("${v:.1}{suffix}")
-        } else {
-            format!("${v:.2}{suffix}")
-        }
-    } else if usd >= 100.0 {
-        format!("${usd:.0}")
+    if usd >= 1.0 {
+        format!("${}", group_thousands(usd, 2))
     } else {
-        // Format first, then check — any positive value that rounds to $0.00
-        // (incl. exactly 0.005 under round-half-to-even) shows `<$0.01`.
-        let s = format!("${usd:.2}");
-        if s == "$0.00" {
-            "<$0.01".to_string()
+        // Sub-dollar: 3 decimals. Format first, then floor — any positive value
+        // that rounds to $0.000 (incl. 0.0005 under round-half-to-even) shows
+        // `<$0.001` rather than a misleading zero.
+        let s = format!("${usd:.3}");
+        if s == "$0.000" {
+            "<$0.001".to_string()
         } else {
             s
         }
@@ -204,26 +219,6 @@ fn center(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
     Line::from(out)
 }
 
-/// A row with `left` flush left, `right` flush right, and `mid` centered between
-/// them (an axis with a centered marker).
-fn lcr(
-    left: Vec<Span<'static>>,
-    mid: Vec<Span<'static>>,
-    right: Vec<Span<'static>>,
-    width: usize,
-) -> Line<'static> {
-    let (lw, mw, rw) = (span_w(&left), span_w(&mid), span_w(&right));
-    let mid_start = width.saturating_sub(mw) / 2;
-    let gap1 = mid_start.saturating_sub(lw).max(1);
-    let gap2 = width.saturating_sub(lw + gap1 + mw + rw).max(1);
-    let mut spans = left;
-    spans.push(Span::raw(" ".repeat(gap1)));
-    spans.extend(mid);
-    spans.push(Span::raw(" ".repeat(gap2)));
-    spans.extend(right);
-    Line::from(spans)
-}
-
 fn busiest_hour(hours: &[u64; 24]) -> Option<usize> {
     let (hour, &count) = hours.iter().enumerate().max_by_key(|&(_, c)| *c)?;
     (count > 0).then_some(hour)
@@ -325,7 +320,13 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         comp_lines(stats, inner_w(mid[1])),
     );
 
-    let bot = halves(rows[3], 50);
+    // Hour graph is a fixed 24-bucket sparkline (one cell/hour). Pin its box to
+    // 24 + 4 (border + 1-col padding each side) so the graph fills it with no
+    // gap; activity takes the rest and shows more history on wide terminals.
+    let bot = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(HOUR_BOX_W), Constraint::Min(0)])
+        .split(rows[3]);
     card(
         frame,
         bot[0],
@@ -477,7 +478,7 @@ fn daily_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
         .map(|d| (d.tokens, d.date.clone()))
         .unwrap_or((0, String::new()));
     vec![
-        Line::from(Span::styled(sparkline(&vals), theme::accent())),
+        center(vec![Span::styled(sparkline(&vals), theme::accent())], w),
         center(
             vec![Span::styled(
                 format!("peak {} {}", fmt_count(peak_v), short_date(&peak_d)),
@@ -572,12 +573,12 @@ fn model_lines(
 
 fn comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
     let grand = stats.total_tokens();
-    let bar_w = w.saturating_sub(KEY_W).saturating_sub(6).clamp(4, 28);
+    let bar_w = w.saturating_sub(WIDE_KEY_W).saturating_sub(6).clamp(4, 28);
     [
         ("input", stats.total_input, theme::accent()),
         ("output", stats.total_output, theme::success()),
-        ("c.write", stats.total_cache_create, theme::warning()),
-        ("c.read", stats.total_cache_read, theme::info()),
+        ("cache write", stats.total_cache_create, theme::warning()),
+        ("cache read", stats.total_cache_read, theme::info()),
     ]
     .into_iter()
     .map(|(label, value, fill)| {
@@ -586,7 +587,10 @@ fn comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
         } else {
             value as f64 / grand as f64 * 100.0
         };
-        let mut spans = vec![key(label)];
+        let mut spans = vec![Span::styled(
+            format!("{label:<WIDE_KEY_W$}"),
+            theme::label(),
+        )];
         spans.extend(hbar(value, grand, bar_w, fill));
         spans.push(Span::styled(format!(" {pct:>3.0}%"), theme::dim()));
         Line::from(spans)
@@ -595,18 +599,16 @@ fn comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
 }
 
 fn hour_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
-    // Caption is the time axis (0h..23h) with the busiest hour centered between.
+    // Centered 24-bucket sparkline with the busiest hour centered below it.
     let peak = busiest_hour(&stats.hour_counts)
         .map(|h| format!("peak {h:02}:00"))
         .unwrap_or_default();
     vec![
-        Line::from(Span::styled(sparkline(&stats.hour_counts), theme::accent())),
-        lcr(
-            vec![Span::styled("0h", theme::faint())],
-            vec![Span::styled(peak, theme::faint())],
-            vec![Span::styled("23h", theme::faint())],
+        center(
+            vec![Span::styled(sparkline(&stats.hour_counts), theme::accent())],
             w,
         ),
+        center(vec![Span::styled(peak, theme::faint())], w),
     ]
 }
 
@@ -622,14 +624,14 @@ fn activity_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
     let peak_sess = stats.activity.iter().map(|a| a.sessions).max().unwrap_or(0);
     let tools: u64 = stats.activity.iter().map(|a| a.tool_calls).sum();
     vec![
-        Line::from(Span::styled(sparkline(&msgs), theme::accent())),
-        lr(
+        center(vec![Span::styled(sparkline(&msgs), theme::accent())], w),
+        center(
             vec![Span::styled(
-                format!("peak {} msgs", fmt_count(peak_msgs)),
-                theme::faint(),
-            )],
-            vec![Span::styled(
-                format!("{peak_sess} sess  {} tools", fmt_count(tools)),
+                format!(
+                    "peak {} msgs   {peak_sess} sess   {} tools",
+                    fmt_count(peak_msgs),
+                    fmt_count(tools),
+                ),
                 theme::faint(),
             )],
             w,
@@ -713,16 +715,27 @@ fn draw_model_detail(
         return;
     };
 
+    // This block carries the spelled-out `cache read`/`cache write` rows, so it
+    // pads to WIDE_KEY_W (not the shared KEY_W) to keep the value column aligned.
     let kv = |label: &str, value: String| {
-        Line::from(vec![key(label), Span::styled(value, theme::body())])
+        Line::from(vec![
+            Span::styled(format!("{label:<WIDE_KEY_W$}"), theme::label()),
+            Span::styled(value, theme::body()),
+        ])
     };
     let mut lines = vec![
         kv("input", fmt_count(m.input)),
         kv("output", fmt_count(m.output)),
-        kv("c.read", fmt_count(m.cache_read)),
-        kv("c.write", fmt_count(m.cache_create)),
+        kv("cache read", fmt_count(m.cache_read)),
+        kv("cache write", fmt_count(m.cache_create)),
         Line::from(""),
-        kv_accent("total", fmt_count(m.total())),
+        Line::from(vec![
+            Span::styled(format!("{:<WIDE_KEY_W$}", "total"), theme::label()),
+            Span::styled(
+                fmt_count(m.total()),
+                theme::accent().add_modifier(Modifier::BOLD),
+            ),
+        ]),
         kv("io", fmt_count(m.in_out())),
     ];
 
