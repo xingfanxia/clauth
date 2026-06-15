@@ -718,6 +718,14 @@ pub(crate) struct App {
     /// Manual-refresh signal to the token loader; a `()` triggers a reload.
     pub(crate) tokens_refresh: std::sync::mpsc::Sender<()>,
 
+    /// Model price table for the Tokens tab's API-equivalent cost lens; `None`
+    /// until the pricing loader posts a result (and `—` is shown meanwhile).
+    pub(crate) price_table: Option<crate::pricing::PriceTable>,
+    /// Pricing load results from the background loader; drained in `on_tick`.
+    pub(crate) pricing_events: std::sync::mpsc::Receiver<crate::pricing::PricingEvent>,
+    /// Manual-refresh signal to the pricing loader; a `()` triggers a refetch.
+    pub(crate) pricing_refresh: std::sync::mpsc::Sender<()>,
+
     pub(crate) last_state_mtime: Option<SystemTime>,
     pub(crate) started_at: Instant,
     /// Tick counter; advances the activity spinner frame each `on_tick`.
@@ -884,6 +892,19 @@ impl App {
             drop((tokens_sender, tokens_refresh_rx));
         }
 
+        // Pricing loader: fetches per-token model rates (LiteLLM JSON) for the
+        // Tokens tab's cost lens, disk-cached under `~/.clauth`. Same test-skip
+        // rationale as the status/token workers — a detached thread could outlive
+        // a test's `HOME_OVERRIDE` and write the real `~/.clauth`.
+        let (pricing_sender, pricing_events) =
+            std::sync::mpsc::channel::<crate::pricing::PricingEvent>();
+        let (pricing_refresh, pricing_refresh_rx) = std::sync::mpsc::channel::<()>();
+        if cfg!(test) {
+            drop((pricing_sender, pricing_refresh_rx));
+        } else {
+            crate::pricing::spawn(pricing_sender, pricing_refresh_rx);
+        }
+
         Self {
             config: Arc::new(RankedMutex::new(config)),
             usage_store,
@@ -927,6 +948,9 @@ impl App {
             token_model_cursor: 0,
             tokens_events,
             tokens_refresh,
+            price_table: None,
+            pricing_events,
+            pricing_refresh,
             last_state_mtime: app_state_mtime(),
             started_at: Instant::now(),
             tick_count: 0,
@@ -1482,9 +1506,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 trigger_status_refresh(app);
                 return;
             }
-            // Tokens `r` reloads the on-disk stats + recent transcripts.
+            // Tokens `r` reloads the on-disk stats + recent transcripts, and
+            // refetches model prices for the cost lens.
             if app.tab == Tab::Tokens {
                 let _ = app.tokens_refresh.send(());
+                let _ = app.pricing_refresh.send(());
                 app.toast(ToastKind::Info, "reloading token usage…");
                 return;
             }
@@ -3591,6 +3617,17 @@ fn drain_tokens_events(app: &mut App) {
     }
 }
 
+fn drain_pricing_events(app: &mut App) {
+    while let Ok(ev) = app.pricing_events.try_recv() {
+        match ev {
+            crate::pricing::PricingEvent::Loaded(table) => {
+                app.price_table = Some(*table);
+            }
+            crate::pricing::PricingEvent::Failed => {}
+        }
+    }
+}
+
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
 
@@ -3614,6 +3651,7 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_op_results(app);
     drain_status_events(app);
     drain_tokens_events(app);
+    drain_pricing_events(app);
 
     if app.reload_if_state_changed() {
         app.clamp_profile_cursor();

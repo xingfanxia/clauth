@@ -21,6 +21,7 @@ use super::format::fixed;
 use super::panes::{
     SELECTOR_WIDTH, draw_selector_list, picker_row, section_box, section_box_verbatim,
 };
+use crate::pricing::PriceTable;
 use crate::tokens::{ModelTokens, TokenStats, group_models, is_anthropic, model_display_name};
 
 /// Key column width for label:value rows.
@@ -58,6 +59,64 @@ fn fmt_count(n: u64) -> String {
     } else {
         format!("{v:.2}{suffix}")
     }
+}
+
+/// Compact USD: `$1.2K`, `$340`, `$12.50`, `$0.34`, `<$0.01`, `$0`.
+fn fmt_money(usd: f64) -> String {
+    if usd <= 0.0 {
+        return "$0".to_string();
+    }
+    if usd >= 1e3 {
+        let (v, suffix) = if usd >= 1e9 {
+            (usd / 1e9, "B")
+        } else if usd >= 1e6 {
+            (usd / 1e6, "M")
+        } else {
+            (usd / 1e3, "K")
+        };
+        if v >= 100.0 {
+            format!("${v:.0}{suffix}")
+        } else if v >= 10.0 {
+            format!("${v:.1}{suffix}")
+        } else {
+            format!("${v:.2}{suffix}")
+        }
+    } else if usd >= 100.0 {
+        format!("${usd:.0}")
+    } else {
+        // Format first, then check — any positive value that rounds to $0.00
+        // (incl. exactly 0.005 under round-half-to-even) shows `<$0.01`.
+        let s = format!("${usd:.2}");
+        if s == "$0.00" {
+            "<$0.01".to_string()
+        } else {
+            s
+        }
+    }
+}
+
+/// Cost value style — gives the API-equivalent figures one identity across the
+/// tab, distinct from the accent-bold token headline.
+fn money_style() -> Style {
+    Style::default().fg(theme::accent_2_color())
+}
+
+/// A `label  $cost` row summing API-equivalent cost over `models`. Shows `—` when
+/// no price table has loaded yet, and a trailing `+` when some models carry
+/// tokens but no matching rate (so the figure is a floor, not a total).
+fn cost_line(label: &str, prices: Option<&PriceTable>, models: &[ModelTokens]) -> Line<'static> {
+    let value = match prices {
+        Some(p) => {
+            let (total, unpriced) = p.total_cost(models);
+            let mut s = fmt_money(total);
+            if unpriced > 0 {
+                s.push('+');
+            }
+            s
+        }
+        None => "—".to_string(),
+    };
+    Line::from(vec![key(label), Span::styled(value, money_style())])
 }
 
 /// `2026-01-18[...]` → `jan 18`. Degrades to the raw string when too short.
@@ -202,11 +261,12 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let count_cache = app.config().state.count_cache;
+    let prices = app.price_table.as_ref();
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5), // today · total
+            Constraint::Length(6), // today · total (incl. cost row)
             Constraint::Length(4), // daily
             Constraint::Length(7), // top models · composition
             Constraint::Min(4),    // hour · activity
@@ -222,7 +282,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "today",
         today_meta.as_deref(),
         true,
-        today_lines(stats, inner_w(top[0]), count_cache),
+        today_lines(stats, inner_w(top[0]), count_cache, prices),
     );
     card(
         frame,
@@ -230,7 +290,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "total",
         None,
         false,
-        total_lines(stats, inner_w(top[1]), count_cache),
+        total_lines(stats, inner_w(top[1]), count_cache, prices),
     );
 
     // Freshness badge → the daily card's title-right meta slot.
@@ -254,7 +314,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "top models",
         None,
         false,
-        model_lines(stats, inner_w(mid[0]), 5, count_cache),
+        model_lines(stats, inner_w(mid[0]), 5, count_cache, prices),
     );
     card(
         frame,
@@ -316,7 +376,12 @@ fn card(
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
-fn today_lines(stats: &TokenStats, w: usize, count_cache: bool) -> Vec<Line<'static>> {
+fn today_lines(
+    stats: &TokenStats,
+    w: usize,
+    count_cache: bool,
+    prices: Option<&PriceTable>,
+) -> Vec<Line<'static>> {
     let Some(t) = stats.today.as_ref() else {
         return vec![Line::from(Span::styled(
             "idle so far today",
@@ -326,6 +391,7 @@ fn today_lines(stats: &TokenStats, w: usize, count_cache: bool) -> Vec<Line<'sta
     let tokens = if count_cache { t.total() } else { t.in_out() };
     vec![
         kv_accent("tokens", fmt_count(tokens)),
+        cost_line("cost", prices, &t.models),
         Line::from(vec![
             key("msgs"),
             Span::styled(t.messages.to_string(), theme::body()),
@@ -344,7 +410,12 @@ fn today_lines(stats: &TokenStats, w: usize, count_cache: bool) -> Vec<Line<'sta
     ]
 }
 
-fn total_lines(stats: &TokenStats, w: usize, count_cache: bool) -> Vec<Line<'static>> {
+fn total_lines(
+    stats: &TokenStats,
+    w: usize,
+    count_cache: bool,
+    prices: Option<&PriceTable>,
+) -> Vec<Line<'static>> {
     let last = stats
         .topped_up_through
         .as_deref()
@@ -370,6 +441,7 @@ fn total_lines(stats: &TokenStats, w: usize, count_cache: bool) -> Vec<Line<'sta
             )],
             w,
         ),
+        cost_line("cost", prices, &stats.models),
         lr(
             vec![Span::styled(
                 format!("{} sess", stats.total_sessions),
@@ -416,7 +488,13 @@ fn daily_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
     ]
 }
 
-fn model_lines(stats: &TokenStats, w: usize, n: usize, count_cache: bool) -> Vec<Line<'static>> {
+fn model_lines(
+    stats: &TokenStats,
+    w: usize,
+    n: usize,
+    count_cache: bool,
+    prices: Option<&PriceTable>,
+) -> Vec<Line<'static>> {
     let grouped = ranked_models(stats, count_cache);
     let max = grouped
         .first()
@@ -427,18 +505,51 @@ fn model_lines(stats: &TokenStats, w: usize, n: usize, count_cache: bool) -> Vec
         .take(n)
         .map(|m| model_display_name(&m.model))
         .collect();
+    // Token-count strings, right-aligned to a shared column so the counts (and
+    // the cost suffix after them) form clean vertical columns across rows.
+    let counts: Vec<String> = grouped
+        .iter()
+        .take(n)
+        .map(|m| fmt_count(model_metric(m, count_cache)))
+        .collect();
+    let count_w = counts.iter().map(|s| s.chars().count()).max().unwrap_or(3);
+    // Per-model API-equivalent cost suffix (empty when unpriced / not loaded),
+    // right-aligned to its own shared column.
+    let costs: Vec<String> = grouped
+        .iter()
+        .take(n)
+        .map(|m| {
+            prices
+                .and_then(|p| p.cost(m))
+                .map(fmt_money)
+                .unwrap_or_default()
+        })
+        .collect();
+    let cost_w = costs.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    // Only carry the cost column when the card is wide enough for label + a
+    // minimum bar + the count + cost; otherwise drop it (token bars stay legible
+    // on narrow terminals rather than clipping). `cost_col` includes its gap.
+    let cost_col = if cost_w > 0 { cost_w + 1 } else { 0 };
+    let show_cost = cost_col > 0 && w >= 6 + 2 + 8 + count_w + cost_col;
+    let cost_col = if show_cost { cost_col } else { 0 };
+
     // Expand the label column to the longest name when there's room; only
-    // truncate (via `fixed`) when the card is too narrow. Reserve a value
-    // column (~7) + two 1-cell gaps + a minimum 8-cell bar.
+    // truncate (via `fixed`) when the card is too narrow. Reserve the count
+    // column + two 1-cell gaps + a minimum 8-cell bar + the cost column.
     let longest = names.iter().map(|s| s.chars().count()).max().unwrap_or(6);
-    let max_label = w.saturating_sub(7 + 2 + 8);
+    let max_label = w.saturating_sub(count_w + 2 + 8 + cost_col);
     let label_w = longest.clamp(6, max_label.max(6));
-    let bar_w = w.saturating_sub(label_w).saturating_sub(9).clamp(4, 30);
+    let bar_w = w
+        .saturating_sub(label_w)
+        .saturating_sub(count_w + 2 + cost_col)
+        .clamp(4, 30);
     grouped
         .iter()
         .take(n)
         .zip(names.iter())
-        .map(|(m, name)| {
+        .zip(counts.iter())
+        .zip(costs.iter())
+        .map(|(((m, name), count), cost)| {
             let fill = if is_anthropic(&m.model) {
                 theme::accent()
             } else {
@@ -450,7 +561,10 @@ fn model_lines(stats: &TokenStats, w: usize, n: usize, count_cache: bool) -> Vec
                 Span::raw(" "),
             ];
             spans.extend(hbar(val, max, bar_w, fill));
-            spans.push(Span::styled(format!(" {}", fmt_count(val)), theme::dim()));
+            spans.push(Span::styled(format!(" {count:>count_w$}"), theme::dim()));
+            if show_cost {
+                spans.push(Span::styled(format!(" {cost:>cost_w$}"), money_style()));
+            }
             Line::from(spans)
         })
         .collect()
@@ -567,10 +681,22 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .as_ref()
         .map(TokenStats::total_tokens)
         .unwrap_or(0);
-    draw_model_detail(frame, cols[1], grouped.get(sel), grand);
+    draw_model_detail(
+        frame,
+        cols[1],
+        grouped.get(sel),
+        grand,
+        app.price_table.as_ref(),
+    );
 }
 
-fn draw_model_detail(frame: &mut Frame<'_>, area: Rect, model: Option<&ModelTokens>, grand: u64) {
+fn draw_model_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: Option<&ModelTokens>,
+    grand: u64,
+    prices: Option<&PriceTable>,
+) {
     let title = model
         .map(|m| model_display_name(&m.model))
         .unwrap_or_else(|| "model".to_string());
@@ -599,6 +725,43 @@ fn draw_model_detail(frame: &mut Frame<'_>, area: Rect, model: Option<&ModelToke
         kv_accent("total", fmt_count(m.total())),
         kv("io", fmt_count(m.in_out())),
     ];
+
+    // API-equivalent cost, split by token bucket (rates differ per bucket).
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "COST · API-EQUIVALENT",
+        theme::label(),
+    )));
+    match prices {
+        None => lines.push(Line::from(Span::styled("rates loading…", theme::faint()))),
+        Some(p) => match p.rate(&m.model) {
+            None => lines.push(Line::from(Span::styled(
+                "no rate for this model",
+                theme::faint(),
+            ))),
+            Some(r) => {
+                let c_in = m.input as f64 * r.input;
+                let c_out = m.output as f64 * r.output;
+                let c_cache =
+                    m.cache_read as f64 * r.cache_read + m.cache_create as f64 * r.cache_write;
+                // Cost values share the `money_style` identity (vs the body-styled
+                // token counts above).
+                let cost_kv = |label: &str, value: String| {
+                    Line::from(vec![key(label), Span::styled(value, money_style())])
+                };
+                lines.push(cost_kv("input", fmt_money(c_in)));
+                lines.push(cost_kv("output", fmt_money(c_out)));
+                lines.push(cost_kv("cache", fmt_money(c_cache)));
+                lines.push(Line::from(vec![
+                    key("total"),
+                    Span::styled(
+                        fmt_money(c_in + c_out + c_cache),
+                        money_style().add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+        },
+    }
 
     let bar_w = (inner.width as usize).saturating_sub(14).clamp(6, 36);
 

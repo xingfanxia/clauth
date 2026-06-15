@@ -85,6 +85,10 @@ pub(crate) struct DaySummary {
     pub(crate) cache_create: u64,
     /// Usage-bearing (assistant) messages seen for the day.
     pub(crate) messages: u64,
+    /// Per-model breakdown of the day's tokens. Carried so cost can be priced
+    /// per model (rates differ by family) — the day's lifetime totals can't be
+    /// isolated from `TokenStats::models`. Empty until the top-up populates it.
+    pub(crate) models: Vec<ModelTokens>,
 }
 
 impl DaySummary {
@@ -468,6 +472,9 @@ fn top_up(
         date: today_date.to_owned(),
         ..Default::default()
     };
+    // Per-model split of today's usage, accumulated alongside `today_acc` so the
+    // cost lens can price today per model (rates differ by family).
+    let mut today_models: HashMap<String, ModelTokens> = HashMap::new();
 
     for proj in proj_entries {
         let proj = match proj {
@@ -505,6 +512,7 @@ fn top_up(
                 &mut daily_map,
                 &mut model_map,
                 &mut today_acc,
+                &mut today_models,
                 &mut max_date,
             );
         }
@@ -513,6 +521,10 @@ fn top_up(
     // Publish today's rollup before any early return (it does not depend on the
     // historical cutoff, so even a no-new-history pass can still have today data).
     if today_acc.messages > 0 || today_acc.total() > 0 {
+        today_acc.models = today_models.into_values().collect();
+        today_acc
+            .models
+            .sort_unstable_by_key(|m| std::cmp::Reverse(m.total()));
         stats.today = Some(today_acc);
     }
 
@@ -561,6 +573,7 @@ fn process_jsonl(
     daily_map: &mut HashMap<String, u64>,
     model_map: &mut HashMap<String, ModelTokens>,
     today: &mut DaySummary,
+    today_models: &mut HashMap<String, ModelTokens>,
     max_date: &mut Option<String>,
 ) {
     let file = match std::fs::File::open(path) {
@@ -593,6 +606,7 @@ fn process_jsonl(
             Some(u) => u,
             None => continue,
         };
+        let model_name = msg.model.as_deref().unwrap_or("unknown").to_owned();
 
         // Today's rollup — independent of the historical cutoff, so it is also
         // populated on the rare day the cache was last computed today.
@@ -606,6 +620,19 @@ fn process_jsonl(
                 .cache_create
                 .saturating_add(usage.cache_creation_input_tokens);
             today.messages = today.messages.saturating_add(1);
+
+            let tm = today_models
+                .entry(model_name.clone())
+                .or_insert_with(|| ModelTokens {
+                    model: model_name.clone(),
+                    ..Default::default()
+                });
+            tm.input = tm.input.saturating_add(usage.input_tokens);
+            tm.output = tm.output.saturating_add(usage.output_tokens);
+            tm.cache_read = tm.cache_read.saturating_add(usage.cache_read_input_tokens);
+            tm.cache_create = tm
+                .cache_create
+                .saturating_add(usage.cache_creation_input_tokens);
         }
 
         // Historical top-up — only days strictly AFTER last_computed_date, so days
@@ -613,7 +640,6 @@ fn process_jsonl(
         if date <= cutoff_date {
             continue;
         }
-        let model_name = msg.model.as_deref().unwrap_or("unknown").to_owned();
 
         let in_out = usage.input_tokens.saturating_add(usage.output_tokens);
         *daily_map.entry(date.to_owned()).or_insert(0) += in_out;

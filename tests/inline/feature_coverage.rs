@@ -124,6 +124,15 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "status_selected_row_tint",
         ],
     ),
+    (
+        "API-equivalent cost",
+        &[
+            "distill_keeps",
+            "rate_strips",
+            "cost_sums",
+            "total_cost_counts_unpriced",
+        ],
+    ),
 ];
 
 #[test]

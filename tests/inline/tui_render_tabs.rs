@@ -99,6 +99,7 @@ fn tokens_dashboard_uses_alignment_not_middot() {
             cache_read: 88_000_000,
             cache_create: 5_200_000,
             messages: 342,
+            models: vec![],
         }),
     });
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -158,6 +159,7 @@ fn count_cache_toggle_switches_token_basis() {
             cache_read: 90_000_000,
             cache_create: 0,
             messages: 1,
+            models: vec![],
         }),
     });
     let render = |app: &App| -> String {
