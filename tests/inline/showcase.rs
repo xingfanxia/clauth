@@ -733,6 +733,8 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Usage);
     press(&mut app, KeyCode::Right);
+    assert_eq!(app.tab, Tab::Tokens);
+    press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Setup);
     press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Fallback);
@@ -744,8 +746,8 @@ fn demo_data_drives_all_actions() {
     assert_eq!(app.tab, Tab::Overview, "→ wraps back to Overview");
     press(&mut app, KeyCode::Left);
     assert_eq!(app.tab, Tab::Status, "← wraps to the last tab");
-    // Five ← from the last tab walk back to the first.
-    for _ in 0..5 {
+    // Six ← from the last tab walk back to the first.
+    for _ in 0..6 {
         press(&mut app, KeyCode::Left);
     }
     assert_eq!(app.tab, Tab::Overview);
@@ -787,7 +789,8 @@ fn demo_data_drives_all_actions() {
 
     // ── Edit ── (cursor at "work"/1 after switch; one ↓ → "side-project"/2)
     press(&mut app, KeyCode::Right); // Overview → Usage
-    press(&mut app, KeyCode::Right); // Usage → Setup
+    press(&mut app, KeyCode::Right); // Usage → Tokens
+    press(&mut app, KeyCode::Right); // Tokens → Setup
     assert_eq!(app.tab, Tab::Setup);
     assert_eq!(app.profile_cursor, 1, "cursor carried over from the switch");
     press(&mut app, KeyCode::Down); // 1 → 2 (side-project)

@@ -8,7 +8,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigFocus, FallbackFocus, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS,
-    GlobalConfigRow, StatusFocus, Tab, fallback_hint,
+    GlobalConfigRow, StatusFocus, Tab, TokenView, fallback_hint,
 };
 use super::super::theme;
 
@@ -29,7 +29,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // (While armed the alert row shows instead, so this label stays "quit".)
     let has_sub_focus = (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
         || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
-        || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail);
+        || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
+        || (app.tab == Tab::Tokens && app.token_view == TokenView::Models);
     let q_label: &str = if has_sub_focus { "back" } else { "quit" };
 
     let tail: &[(&str, &str)] = match app.tab {
@@ -40,6 +41,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ("a", "actions"),
             ("?", "help"),
         ],
+        Tab::Tokens => match app.token_view {
+            TokenView::Dashboard => &[
+                ("↑↓", "scroll"),
+                ("↵", "models"),
+                ("r", "reload"),
+                ("?", "help"),
+            ],
+            TokenView::Models => &[("↑↓", "model"), ("esc", "back"), ("?", "help")],
+        },
         Tab::Setup => match app.config_focus {
             ConfigFocus::Profiles => &[
                 ("↑↓", "account"),

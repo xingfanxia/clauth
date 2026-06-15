@@ -14,6 +14,7 @@ mod runtime;
 mod spinner;
 mod start;
 mod status;
+mod tokens;
 mod tui;
 mod update;
 mod usage;

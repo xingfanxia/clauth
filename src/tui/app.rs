@@ -435,6 +435,8 @@ pub(crate) enum Tab {
     Overview,
     /// Per-account usage breakdown.
     Usage,
+    /// Global token usage across past Claude Code sessions (from `~/.claude`).
+    Tokens,
     /// Per-account settings (endpoint, rename, auto-start, delete).
     Setup,
     /// Fallback chain editor — ordering and per-member thresholds.
@@ -446,9 +448,10 @@ pub(crate) enum Tab {
 }
 
 impl Tab {
-    pub(crate) const ALL: [Tab; 6] = [
+    pub(crate) const ALL: [Tab; 7] = [
         Tab::Overview,
         Tab::Usage,
+        Tab::Tokens,
         Tab::Setup,
         Tab::Fallback,
         Tab::Config,
@@ -459,6 +462,7 @@ impl Tab {
         match self {
             Tab::Overview => "Overview",
             Tab::Usage => "Usage",
+            Tab::Tokens => "Tokens",
             Tab::Setup => "Setup",
             Tab::Fallback => "Fallback",
             Tab::Config => "Config",
@@ -477,6 +481,14 @@ impl Tab {
     pub(crate) fn prev(self) -> Tab {
         Tab::ALL[(self.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
     }
+}
+
+/// Which view the Tokens tab shows. `Dashboard` is the landing page (totals +
+/// charts); `Models` is the descend-into per-model master-detail breakdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenView {
+    Dashboard,
+    Models,
 }
 
 /// Which Config pane owns the cursor.
@@ -694,6 +706,23 @@ pub(crate) struct App {
     /// Manual-refresh signal to the status thread; a `()` triggers a refetch.
     pub(crate) status_refresh: std::sync::mpsc::Sender<()>,
 
+    /// Global token-usage stats read from `~/.claude` (stats-cache + recent
+    /// transcript top-up); `None` until the loader posts its first result.
+    pub(crate) token_stats: Option<crate::tokens::TokenStats>,
+    /// Which view the Tokens tab is showing (Dashboard landing vs Models detail).
+    pub(crate) token_view: TokenView,
+    /// Cursor into the grouped model list on the Tokens `Models` view.
+    pub(crate) token_model_cursor: usize,
+    /// Vertical scroll offset for the Tokens dashboard (rows can overflow).
+    pub(crate) token_scroll: u16,
+    /// Max valid `token_scroll`, written at render from content vs viewport so
+    /// the key handler can clamp (mirrors `StatusState::detail_max_scroll`).
+    pub(crate) token_scroll_max: std::cell::Cell<u16>,
+    /// Token-stats load results from the background loader; drained in `on_tick`.
+    pub(crate) tokens_events: std::sync::mpsc::Receiver<crate::tokens::TokensEvent>,
+    /// Manual-refresh signal to the token loader; a `()` triggers a reload.
+    pub(crate) tokens_refresh: std::sync::mpsc::Sender<()>,
+
     pub(crate) last_state_mtime: Option<SystemTime>,
     pub(crate) started_at: Instant,
     /// Tick counter; advances the activity spinner frame each `on_tick`.
@@ -844,6 +873,22 @@ impl App {
             status::spawn(status_sender, status_refresh_rx);
         }
 
+        // Token-usage loader: reads `~/.claude/stats-cache.json` + recent
+        // transcripts off the UI thread. Same test-skip rationale as the status
+        // worker — a detached thread could outlive a test's `HOME_OVERRIDE`. The
+        // `~/.claude` path is resolved once here so the worker never re-resolves
+        // `home_dir()` (which would race the override).
+        let (tokens_sender, tokens_events) =
+            std::sync::mpsc::channel::<crate::tokens::TokensEvent>();
+        let (tokens_refresh, tokens_refresh_rx) = std::sync::mpsc::channel::<()>();
+        if cfg!(test) {
+            drop((tokens_sender, tokens_refresh_rx));
+        } else if let Ok(claude_dir) = crate::profile::claude_dir() {
+            crate::tokens::spawn(tokens_sender, tokens_refresh_rx, claude_dir);
+        } else {
+            drop((tokens_sender, tokens_refresh_rx));
+        }
+
         Self {
             config: Arc::new(RankedMutex::new(config)),
             usage_store,
@@ -882,6 +927,13 @@ impl App {
             status: StatusState::default(),
             status_events,
             status_refresh,
+            token_stats: None,
+            token_view: TokenView::Dashboard,
+            token_model_cursor: 0,
+            token_scroll: 0,
+            token_scroll_max: std::cell::Cell::new(0),
+            tokens_events,
+            tokens_refresh,
             last_state_mtime: app_state_mtime(),
             started_at: Instant::now(),
             tick_count: 0,
@@ -1437,6 +1489,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 trigger_status_refresh(app);
                 return;
             }
+            // Tokens `r` reloads the on-disk stats + recent transcripts.
+            if app.tab == Tab::Tokens {
+                let _ = app.tokens_refresh.send(());
+                app.toast(ToastKind::Info, "reloading token usage…");
+                return;
+            }
             // Usage `r` refreshes only the current account.
             if app.tab == Tab::Usage {
                 let selected = {
@@ -1486,6 +1544,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 leave_fallback_detail(app);
             } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
                 app.status.focus = StatusFocus::List;
+            } else if app.tab == Tab::Tokens && app.token_view == TokenView::Models {
+                app.token_view = TokenView::Dashboard;
             }
             // At top level, Esc is a no-op — ctrl+c or `q q` to quit.
             return;
@@ -1495,7 +1555,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('q') => {
             let has_sub_focus = (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
                 || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
-                || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail);
+                || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
+                || (app.tab == Tab::Tokens && app.token_view == TokenView::Models);
             if has_sub_focus {
                 app.disarm_quit();
                 if app.tab == Tab::Setup {
@@ -1503,6 +1564,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                     app.config_draft = None;
                 } else if app.tab == Tab::Fallback {
                     leave_fallback_detail(app);
+                } else if app.tab == Tab::Tokens {
+                    app.token_view = TokenView::Dashboard;
                 } else {
                     app.status.focus = StatusFocus::List;
                 }
@@ -1538,10 +1601,56 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     match app.tab {
         Tab::Overview => handle_overview_key(app, key),
         Tab::Usage => handle_usage_key(app, key),
+        Tab::Tokens => handle_tokens_key(app, key),
         Tab::Setup => handle_config_key(app, key),
         Tab::Fallback => handle_fallback_key(app, key),
         Tab::Config => handle_global_config_key(app, key),
         Tab::Status => handle_status_key(app, key),
+    }
+}
+
+/// Number of rows in the Tokens `Models` master list (grouped models).
+fn token_model_count(app: &App) -> usize {
+    app.token_stats
+        .as_ref()
+        .map(|s| crate::tokens::group_models(&s.models).len())
+        .unwrap_or(0)
+}
+
+/// Tokens tab: Dashboard scrolls with ↑↓ and descends to Models on ⏎;
+/// Models moves the model cursor with ↑↓ (ascend handled by the global esc/q).
+fn handle_tokens_key(app: &mut App, key: KeyEvent) {
+    match app.token_view {
+        TokenView::Dashboard => match key.code {
+            KeyCode::Enter => {
+                if token_model_count(app) > 0 {
+                    app.token_view = TokenView::Models;
+                    app.token_model_cursor = 0;
+                }
+            }
+            KeyCode::Up => app.token_scroll = app.token_scroll.saturating_sub(1),
+            KeyCode::Down => {
+                // Clamp to the last-rendered max so over-scrolling never strands
+                // the offset past the content (mirrors the status detail scroll).
+                app.token_scroll = app
+                    .token_scroll
+                    .saturating_add(1)
+                    .min(app.token_scroll_max.get());
+            }
+            _ => {}
+        },
+        TokenView::Models => {
+            let len = token_model_count(app);
+            match key.code {
+                KeyCode::Up if len > 0 => {
+                    app.token_model_cursor = (app.token_model_cursor + len - 1).rem_euclid(len);
+                }
+                KeyCode::Down if len > 0 => {
+                    app.token_model_cursor = (app.token_model_cursor + 1).rem_euclid(len);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1554,6 +1663,12 @@ fn switch_tab(app: &mut App, tab: Tab) {
     app.clamp_profile_cursor();
     match tab {
         Tab::Overview | Tab::Usage => {}
+        Tab::Tokens => {
+            // Land on the dashboard; keep the model cursor reset for descend.
+            app.token_view = TokenView::Dashboard;
+            app.token_model_cursor = 0;
+            app.token_scroll = 0;
+        }
         Tab::Setup => {
             app.config_focus = ConfigFocus::Profiles;
             app.config_action_cursor = 0;
@@ -2498,6 +2613,8 @@ fn build_action_menu(app: &App) -> ActionMenuState {
             actions.push(ToggleEstimates);
             actions.push(TogglePace);
         }
+        // Tokens: no menu actions — `r` reloads, ⏎/esc navigate.
+        Tab::Tokens => {}
         Tab::Setup => match app.config_focus {
             ConfigFocus::Profiles => {
                 if app.profile_cursor < app.profile_count() {
@@ -3460,6 +3577,24 @@ fn apply_status_incidents(
     }
 }
 
+/// Apply queued token-stats loads. A `Failed` keeps the last good snapshot so a
+/// transient parse miss never blanks the tab.
+fn drain_tokens_events(app: &mut App) {
+    while let Ok(ev) = app.tokens_events.try_recv() {
+        match ev {
+            crate::tokens::TokensEvent::Loaded(stats) => {
+                app.token_stats = Some(*stats);
+                // Re-clamp the model cursor in case the grouped list shrank.
+                let len = token_model_count(app);
+                if len > 0 && app.token_model_cursor >= len {
+                    app.token_model_cursor = len - 1;
+                }
+            }
+            crate::tokens::TokensEvent::Failed => {}
+        }
+    }
+}
+
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
 
@@ -3482,6 +3617,7 @@ pub(crate) fn on_tick(app: &mut App) {
 
     drain_op_results(app);
     drain_status_events(app);
+    drain_tokens_events(app);
 
     if app.reload_if_state_changed() {
         app.clamp_profile_cursor();

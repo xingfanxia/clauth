@@ -21,6 +21,7 @@ mod panes;
 mod status;
 mod tabs;
 mod toasts;
+mod tokens;
 mod usage;
 
 use ratatui::Frame;
@@ -64,6 +65,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     match app.tab {
         Tab::Overview => overview::draw(frame, body_area, app),
         Tab::Usage => usage::draw(frame, body_area, app),
+        Tab::Tokens => tokens::draw(frame, body_area, app),
         Tab::Setup => config::draw(frame, body_area, app),
         Tab::Fallback => chain::draw(frame, body_area, app),
         Tab::Config => global_config::draw(frame, body_area, app),

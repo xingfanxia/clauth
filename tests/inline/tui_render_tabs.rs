@@ -54,6 +54,7 @@ fn normal_form_shows_all_tabs() {
     let s = render_tabs(&app, 70);
     assert!(s.contains("overview"), "active tab missing");
     assert!(s.contains("usage"), "inactive tab missing");
+    assert!(s.contains("tokens"), "inactive tab missing");
     assert!(s.contains("setup"), "inactive tab missing");
     assert!(s.contains("fallback"), "inactive tab missing");
     assert!(s.contains("config"), "inactive tab missing");
@@ -63,7 +64,8 @@ fn normal_form_shows_all_tabs() {
 #[test]
 fn normal_form_labels_untruncated_at_tight_boundary() {
     let app = empty_app(Tab::Overview);
-    let s = render_tabs(&app, 53);
+    // 7 labels (44 cols) + 6×3 separators = 62: the tight all-tabs-fit boundary.
+    let s = render_tabs(&app, 62);
     assert!(
         s.contains("overview"),
         "overview must not be truncated at tight boundary"
