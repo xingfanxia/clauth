@@ -49,6 +49,7 @@ Every request clauth makes, and what rides along with it:
 | `api.anthropic.com/api/oauth/profile` | plan-tier detection | access token |
 | `api.anthropic.com/v1/messages` | auto-start kick (opt-in, off by default) | access token; a 1-token Haiku request |
 | `status.claude.com/api/v2/incidents.json` | Status tab and background poll | no credentials |
+| `raw.githubusercontent.com/BerriAI/litellm/...` | model price table for the Tokens tab cost lens, fetched and disk-cached | no credentials |
 | `api.deepseek.com/user/balance` | only for profiles whose base URL is DeepSeek | that provider's API key |
 | a custom base URL you set | requests against an API-endpoint profile | whatever you configured |
 

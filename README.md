@@ -77,6 +77,7 @@ On first TUI launch, clauth offers to install shell completions. It asks before 
 - **Shell completions**: `clauth completions install [shell]` wires bash, zsh, or fish.
 - **In-app help**: `?` opens a keybinding reference scoped to the current tab.
 - **Claude status feed**: the Status tab pulls live incidents from status.claude.com, with per-component health (claude.ai, API, Claude Code, Cowork), severity, and timeline, cached to disk.
+- **API-equivalent cost**: the Tokens tab prices recorded usage at live pay-as-you-go API rates — what your subscription usage *would* cost on the API. Rates are fetched from LiteLLM's price feed and disk-cached, computed per model (families differ up to 10×) and cache-aware (cache reads/writes priced at their own rates). Shown on the today and total cards, the per-model detail, and the top-models bars; `—` until rates load.
 
 ## Quickstart
 
@@ -101,7 +102,7 @@ clauth start personal -- --model haiku
 # spawns claude with personal's credentials in an isolated CLAUDE_CONFIG_DIR
 ```
 
-The active profile is shown in orange. Usage bars are cached locally, so they stay visible even if the Anthropic API is rate-limited or offline. `←`/`→` move between the seven tabs: **Overview** (switch and reorder accounts), **Usage** (per-account window breakdown), **Tokens** (global Claude Code token stats across all models), **Setup** (endpoint, key, env, auto-start), **Fallback** (chain editor), **Config** (theme, refresh interval, wrap-off, divergence default), and **Status** (Claude incident feed). `?` shows the rest.
+The active profile is shown in orange. Usage bars are cached locally, so they stay visible even if the Anthropic API is rate-limited or offline. `←`/`→` move between the seven tabs: **Overview** (switch and reorder accounts), **Usage** (per-account window breakdown), **Tokens** (global Claude Code token stats + API-equivalent cost across all models), **Setup** (endpoint, key, env, auto-start), **Fallback** (chain editor), **Config** (theme, refresh interval, wrap-off, divergence default), and **Status** (Claude incident feed). `?` shows the rest.
 
 Dev-only: `cargo test showcase -- --ignored --nocapture` runs the real interactive TUI on fake data against a throwaway home dir (never built into the binary, no network). Handy for screenshots.
 
@@ -140,6 +141,8 @@ Configuration lives in `~/.clauth/profiles.toml` (`fallback_chain`, ordered) and
 ```
 ~/.clauth/
   profiles.toml          # profile order, active marker, fallback chain, wrap-off, theme, refresh interval
+  price_cache.json       # cached model price table (LiteLLM rates) for the Tokens cost lens
+  status_cache.json      # cached Claude status incident feed
   profiles/
     work/
       config.toml        # base_url, api_key, auto_start, fallback_threshold, [env]
