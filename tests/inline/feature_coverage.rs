@@ -125,6 +125,16 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "Token usage dashboard",
+        &[
+            "base_stats_parsed",
+            "today_bucket_aggregates",
+            "top_up_adds_new_day",
+            "group_models_keeps",
+            "model_display_name",
+        ],
+    ),
+    (
         "API-equivalent cost",
         &[
             "distill_keeps",
