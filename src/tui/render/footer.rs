@@ -43,7 +43,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ],
         Tab::Tokens => match app.token_view {
             TokenView::Dashboard => &[("↵", "models"), ("r", "reload"), ("?", "help")],
-            TokenView::Models => &[("↑↓", "model"), ("esc", "back"), ("?", "help")],
+            TokenView::Models => &[("↑↓", "model"), ("?", "help")],
         },
         Tab::Setup => match app.config_focus {
             ConfigFocus::Profiles => &[
@@ -57,7 +57,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("↑↓", "row"),
                 ("↵", "edit / toggle"),
                 ("a", "actions"),
-                ("esc", "back"),
                 ("?", "help"),
             ],
         },
@@ -86,12 +85,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("a", "actions"),
                 ("?", "help"),
             ],
-            StatusFocus::Detail => &[
-                ("↑↓", "scroll"),
-                ("a", "actions"),
-                ("esc", "back"),
-                ("?", "help"),
-            ],
+            StatusFocus::Detail => &[("↑↓", "scroll"), ("a", "actions"), ("?", "help")],
         },
         Tab::Fallback => match fallback_hint(app) {
             FallbackHint::Empty => &[("?", "help")],
@@ -109,7 +103,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("-", "lower"),
                 ("↵", "type"),
                 ("a", "actions"),
-                ("esc", "back"),
                 ("?", "help"),
             ],
             FallbackHint::DetailThresholdEdit => {
@@ -119,15 +112,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("↑↓", "row"),
                 ("↵", "remove"),
                 ("a", "actions"),
-                ("esc", "back"),
                 ("?", "help"),
             ],
             FallbackHint::DetailRemoveArmed => {
                 &[("↵", "confirm remove"), ("esc", "cancel"), ("?", "help")]
             }
-            FallbackHint::DetailAdd => {
-                &[("↑↓", "pick"), ("↵", "add"), ("esc", "back"), ("?", "help")]
-            }
+            FallbackHint::DetailAdd => &[("↑↓", "pick"), ("↵", "add"), ("?", "help")],
         },
     };
 
