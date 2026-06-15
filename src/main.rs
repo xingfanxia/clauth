@@ -8,6 +8,7 @@ mod lock;
 mod lockorder;
 mod oauth;
 mod platform;
+mod pricing;
 mod profile;
 mod providers;
 mod runtime;
