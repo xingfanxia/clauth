@@ -121,6 +121,16 @@ fn tokens_dashboard_uses_alignment_not_middot() {
         text.contains("opus 4.8"),
         "top models should show the mapped display name in full"
     );
+    // TODAY tokens use the in+out basis (13.7M), not the cache-inflated total
+    // (~107M) — so it stays comparable to the daily trend.
+    assert!(
+        text.contains("13.7M"),
+        "today should headline in+out tokens"
+    );
+    assert!(
+        !text.contains("107M"),
+        "today must not headline the cache-inflated total"
+    );
 }
 
 #[test]

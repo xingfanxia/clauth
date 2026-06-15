@@ -309,7 +309,7 @@ fn today_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
         ))];
     };
     vec![
-        kv_accent("tokens", fmt_count(t.total())),
+        kv_accent("tokens", fmt_count(t.in_out())),
         Line::from(vec![
             key("msgs"),
             Span::styled(t.messages.to_string(), theme::body()),
@@ -339,7 +339,7 @@ fn total_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
             vec![
                 key("tokens"),
                 Span::styled(
-                    fmt_count(stats.total_tokens()),
+                    fmt_count(stats.total_in_out()),
                     theme::accent().add_modifier(Modifier::BOLD),
                 ),
             ],
@@ -397,7 +397,9 @@ fn daily_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
 
 fn model_lines(stats: &TokenStats, w: usize, n: usize) -> Vec<Line<'static>> {
     let grouped = group_models(&stats.models);
-    let max = grouped.first().map(ModelTokens::total).unwrap_or(0);
+    // in+out basis (matches the dashboard headlines + daily trend); grouped is
+    // already ranked by in+out, so the first is the longest bar.
+    let max = grouped.first().map(ModelTokens::in_out).unwrap_or(0);
     let names: Vec<String> = grouped
         .iter()
         .take(n)
@@ -424,9 +426,9 @@ fn model_lines(stats: &TokenStats, w: usize, n: usize) -> Vec<Line<'static>> {
                 Span::styled(fixed(name, label_w), theme::body()),
                 Span::raw(" "),
             ];
-            spans.extend(hbar(m.total(), max, bar_w, fill));
+            spans.extend(hbar(m.in_out(), max, bar_w, fill));
             spans.push(Span::styled(
-                format!(" {}", fmt_count(m.total())),
+                format!(" {}", fmt_count(m.in_out())),
                 theme::dim(),
             ));
             Line::from(spans)

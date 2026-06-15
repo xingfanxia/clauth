@@ -163,9 +163,9 @@ fn group_models_keeps_claude_individual_folds_others() {
     assert_eq!(others.input, 500); // 200 + 300
     assert_eq!(others.output, 250); // 100 + 150
 
-    // sorted DESC by total
-    let totals: Vec<u64> = grouped.iter().map(|m| m.total()).collect();
-    for pair in totals.windows(2) {
+    // sorted DESC by in+out (the dashboard basis)
+    let in_outs: Vec<u64> = grouped.iter().map(|m| m.in_out()).collect();
+    for pair in in_outs.windows(2) {
         assert!(pair[0] >= pair[1], "not sorted desc: {pair:?}");
     }
 }

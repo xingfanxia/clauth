@@ -121,7 +121,16 @@ pub(crate) struct TokenStats {
 }
 
 impl TokenStats {
-    /// input + output + cache_read + cache_create across all models.
+    /// input + output across all models — the "work" metric that matches the
+    /// daily trend (`dailyModelTokens` is in+out only). The dashboard headlines
+    /// use this so today/total/daily/models all share one basis; cache is shown
+    /// separately (cache-hit badge + composition card).
+    pub(crate) fn total_in_out(&self) -> u64 {
+        self.total_input.saturating_add(self.total_output)
+    }
+
+    /// input + output + cache_read + cache_create across all models — the full
+    /// throughput, used only by the cache lens (composition card, cache-hit).
     pub(crate) fn total_tokens(&self) -> u64 {
         self.total_input
             .saturating_add(self.total_output)
@@ -168,7 +177,9 @@ pub(crate) fn group_models(models: &[ModelTokens]) -> Vec<ModelTokens> {
         out.push(others);
     }
 
-    out.sort_unstable_by_key(|m| std::cmp::Reverse(m.total()));
+    // Rank by in+out ("work"), matching the dashboard's token basis, so the
+    // bars descend by the value actually shown.
+    out.sort_unstable_by_key(|m| std::cmp::Reverse(m.in_out()));
     out
 }
 
