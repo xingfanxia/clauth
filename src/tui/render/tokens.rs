@@ -10,7 +10,7 @@
 //! per-account.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -121,9 +121,20 @@ fn trail<T>(items: &[T], width: usize) -> &[T] {
     &items[items.len().saturating_sub(n)..]
 }
 
-fn busiest_hour(hours: &[u64; 24]) -> Option<usize> {
-    let (hour, &count) = hours.iter().enumerate().max_by_key(|&(_, c)| *c)?;
-    (count > 0).then_some(hour)
+/// A row with `left` flush to the start and `right` flush to `width`, the gap
+/// filled with spaces. cloudy-tui leans on alignment + color to separate facts,
+/// not a `·` middot (that's reserved for banner/toast prose).
+fn lr(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let used: usize = left
+        .iter()
+        .chain(right.iter())
+        .map(|s| s.content.chars().count())
+        .sum();
+    let gap = width.saturating_sub(used).max(1);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(right);
+    Line::from(spans)
 }
 
 // ── dashboard view ─────────────────────────────────────────────────────────
@@ -155,13 +166,35 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area);
 
     let top = halves(rows[0], 42);
-    card(frame, top[0], &today_title(stats), true, today_lines(stats));
-    card(frame, top[1], "total", false, total_lines(stats));
+    // Today's date → the today card's title-right meta badge.
+    let today_meta = stats.today.as_ref().map(|t| short_date(&t.date));
+    card(
+        frame,
+        top[0],
+        "today",
+        today_meta.as_deref(),
+        true,
+        today_lines(stats, inner_w(top[0])),
+    );
+    card(
+        frame,
+        top[1],
+        "total",
+        None,
+        false,
+        total_lines(stats, inner_w(top[1])),
+    );
 
+    // Freshness badge → the daily card's title-right meta slot.
+    let fresh = stats
+        .topped_up_through
+        .as_deref()
+        .map(|d| format!("live thru {}", short_date(d)));
     card(
         frame,
         rows[1],
         "daily",
+        fresh.as_deref(),
         false,
         daily_lines(stats, inner_w(rows[1])),
     );
@@ -171,6 +204,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame,
         mid[0],
         "top models",
+        None,
         false,
         model_lines(stats, inner_w(mid[0]), 5),
     );
@@ -178,6 +212,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame,
         mid[1],
         "composition",
+        None,
         false,
         comp_lines(stats, inner_w(mid[1])),
     );
@@ -187,6 +222,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame,
         bot[0],
         "hour of day",
+        None,
         false,
         hour_lines(stats, inner_w(bot[0])),
     );
@@ -194,6 +230,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame,
         bot[1],
         "activity",
+        None,
         false,
         activity_lines(stats, inner_w(bot[1])),
     );
@@ -210,22 +247,28 @@ fn halves(area: Rect, left_pct: u16) -> std::rc::Rc<[Rect]> {
         .split(area)
 }
 
-/// Draw one bordered card with its lines.
-fn card(frame: &mut Frame<'_>, area: Rect, title: &str, first: bool, lines: Vec<Line<'static>>) {
-    let block = section_box(title, false, first);
+/// Draw one bordered card with its lines. `meta` (if any) renders as a
+/// right-aligned title badge (the cloudy-tui title-right meta slot).
+fn card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    meta: Option<&str>,
+    first: bool,
+    lines: Vec<Line<'static>>,
+) {
+    let mut block = section_box(title, false, first);
+    if let Some(m) = meta {
+        block = block.title(
+            Line::from(Span::styled(format!(" {m} "), theme::dim())).alignment(Alignment::Right),
+        );
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
-fn today_title(stats: &TokenStats) -> String {
-    match &stats.today {
-        Some(t) => format!("today · {}", short_date(&t.date)),
-        None => "today".to_string(),
-    }
-}
-
-fn today_lines(stats: &TokenStats) -> Vec<Line<'static>> {
+fn today_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
     let Some(t) = stats.today.as_ref() else {
         return vec![Line::from(Span::styled(
             "idle so far today",
@@ -238,48 +281,62 @@ fn today_lines(stats: &TokenStats) -> Vec<Line<'static>> {
             key("msgs"),
             Span::styled(t.messages.to_string(), theme::body()),
         ]),
-        Line::from(vec![
-            key("io"),
-            Span::styled(
-                format!("{} in · {} out", fmt_count(t.input), fmt_count(t.output)),
+        lr(
+            vec![Span::styled(
+                format!("{} in", fmt_count(t.input)),
                 theme::dim(),
-            ),
-        ]),
+            )],
+            vec![Span::styled(
+                format!("{} out", fmt_count(t.output)),
+                theme::dim(),
+            )],
+            w,
+        ),
     ]
 }
 
-fn total_lines(stats: &TokenStats) -> Vec<Line<'static>> {
+fn total_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
     let last = stats
         .topped_up_through
         .as_deref()
         .or(stats.daily.last().map(|d| d.date.as_str()))
         .or(stats.last_computed_date.as_deref());
-    let span = match (stats.first_session_date.as_deref(), last) {
-        (Some(f), Some(l)) => format!(" · {} – {}", short_date(f), short_date(l)),
-        _ => String::new(),
-    };
-    vec![
-        kv_accent("tokens", fmt_count(stats.total_tokens())),
-        Line::from(vec![
-            key("usage"),
-            Span::styled(
-                format!(
-                    "{} sess · {} msgs",
-                    stats.total_sessions,
-                    fmt_count(stats.total_messages)
+    let mut lines = vec![
+        lr(
+            vec![
+                key("tokens"),
+                Span::styled(
+                    fmt_count(stats.total_tokens()),
+                    theme::accent().add_modifier(Modifier::BOLD),
                 ),
-                theme::body(),
-            ),
-        ]),
-        Line::from(vec![
-            key("cache"),
-            Span::styled(
-                format!("{:.0}% hit", stats.cache_hit_ratio() * 100.0),
+            ],
+            vec![Span::styled(
+                format!("{:.0}% cached", stats.cache_hit_ratio() * 100.0),
                 Style::default().fg(theme::accent_2_color()),
-            ),
-            Span::styled(span, theme::faint()),
-        ]),
-    ]
+            )],
+            w,
+        ),
+        lr(
+            vec![Span::styled(
+                format!("{} sess", stats.total_sessions),
+                theme::body(),
+            )],
+            vec![Span::styled(
+                format!("{} msgs", fmt_count(stats.total_messages)),
+                theme::body(),
+            )],
+            w,
+        ),
+    ];
+    // Active span — earliest date flush left, latest flush right.
+    if let (Some(first), Some(latest)) = (stats.first_session_date.as_deref(), last) {
+        lines.push(lr(
+            vec![Span::styled(short_date(first), theme::dim())],
+            vec![Span::styled(short_date(latest), theme::dim())],
+            w,
+        ));
+    }
+    lines
 }
 
 fn daily_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
@@ -287,30 +344,22 @@ fn daily_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
     if vals.is_empty() {
         return vec![Line::from(Span::styled("no daily data", theme::faint()))];
     }
-    let last = stats.daily.last().map(|d| d.tokens).unwrap_or(0);
     let (peak_v, peak_d) = stats
         .daily
         .iter()
         .max_by_key(|d| d.tokens)
         .map(|d| (d.tokens, d.date.clone()))
         .unwrap_or((0, String::new()));
-    let fresh = stats
-        .topped_up_through
-        .as_deref()
-        .map(|d| format!(" · live thru {}", short_date(d)))
-        .unwrap_or_default();
     vec![
         Line::from(Span::styled(sparkline(&vals), theme::accent())),
-        Line::from(Span::styled(
-            format!(
-                "{}d · last {} · peak {} ({}){fresh}",
-                vals.len(),
-                fmt_count(last),
-                fmt_count(peak_v),
-                short_date(&peak_d)
-            ),
-            theme::faint(),
-        )),
+        lr(
+            vec![Span::styled(
+                format!("peak {} {}", fmt_count(peak_v), short_date(&peak_d)),
+                theme::faint(),
+            )],
+            vec![Span::styled(format!("{}d", vals.len()), theme::faint())],
+            w,
+        ),
     ]
 }
 
@@ -366,17 +415,17 @@ fn comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
     .collect()
 }
 
-fn hour_lines(stats: &TokenStats, _w: usize) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(Span::styled(
-        sparkline(&stats.hour_counts),
-        theme::accent(),
-    ))];
-    let caption = match busiest_hour(&stats.hour_counts) {
-        Some(h) => format!("0h ─── 23h · busiest {h:02}:00"),
-        None => "no activity recorded".to_string(),
-    };
-    lines.push(Line::from(Span::styled(caption, theme::faint())));
-    lines
+fn hour_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
+    // The sparkline's tallest bar already shows the busy hour, so the caption is
+    // just the time axis: midnight flush left, 23h flush right.
+    vec![
+        Line::from(Span::styled(sparkline(&stats.hour_counts), theme::accent())),
+        lr(
+            vec![Span::styled("0h", theme::faint())],
+            vec![Span::styled("23h", theme::faint())],
+            w,
+        ),
+    ]
 }
 
 fn activity_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
@@ -392,15 +441,17 @@ fn activity_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
     let tools: u64 = stats.activity.iter().map(|a| a.tool_calls).sum();
     vec![
         Line::from(Span::styled(sparkline(&msgs), theme::accent())),
-        Line::from(Span::styled(
-            format!(
-                "msgs/day · peak {} · {} sess · {} tools",
-                fmt_count(peak_msgs),
-                peak_sess,
-                fmt_count(tools)
-            ),
-            theme::faint(),
-        )),
+        lr(
+            vec![Span::styled(
+                format!("peak {} msgs", fmt_count(peak_msgs)),
+                theme::faint(),
+            )],
+            vec![Span::styled(
+                format!("{peak_sess} sess  {} tools", fmt_count(tools)),
+                theme::faint(),
+            )],
+            w,
+        ),
     ]
 }
 
