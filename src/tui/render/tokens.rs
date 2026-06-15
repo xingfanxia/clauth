@@ -121,20 +121,53 @@ fn trail<T>(items: &[T], width: usize) -> &[T] {
     &items[items.len().saturating_sub(n)..]
 }
 
+/// Total display columns of a span run.
+fn span_w(spans: &[Span<'static>]) -> usize {
+    spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
 /// A row with `left` flush to the start and `right` flush to `width`, the gap
 /// filled with spaces. cloudy-tui leans on alignment + color to separate facts,
 /// not a `·` middot (that's reserved for banner/toast prose).
 fn lr(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
-    let used: usize = left
-        .iter()
-        .chain(right.iter())
-        .map(|s| s.content.chars().count())
-        .sum();
-    let gap = width.saturating_sub(used).max(1);
+    let gap = width.saturating_sub(span_w(&left) + span_w(&right)).max(1);
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(gap)));
     spans.extend(right);
     Line::from(spans)
+}
+
+/// A row with `spans` centered within `width`.
+fn center(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let pad = width.saturating_sub(span_w(&spans)) / 2;
+    let mut out = vec![Span::raw(" ".repeat(pad))];
+    out.extend(spans);
+    Line::from(out)
+}
+
+/// A row with `left` flush left, `right` flush right, and `mid` centered between
+/// them (an axis with a centered marker).
+fn lcr(
+    left: Vec<Span<'static>>,
+    mid: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    width: usize,
+) -> Line<'static> {
+    let (lw, mw, rw) = (span_w(&left), span_w(&mid), span_w(&right));
+    let mid_start = width.saturating_sub(mw) / 2;
+    let gap1 = mid_start.saturating_sub(lw).max(1);
+    let gap2 = width.saturating_sub(lw + gap1 + mw + rw).max(1);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(gap1)));
+    spans.extend(mid);
+    spans.push(Span::raw(" ".repeat(gap2)));
+    spans.extend(right);
+    Line::from(spans)
+}
+
+fn busiest_hour(hours: &[u64; 24]) -> Option<usize> {
+    let (hour, &count) = hours.iter().enumerate().max_by_key(|&(_, c)| *c)?;
+    (count > 0).then_some(hour)
 }
 
 // ── dashboard view ─────────────────────────────────────────────────────────
@@ -352,12 +385,11 @@ fn daily_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
         .unwrap_or((0, String::new()));
     vec![
         Line::from(Span::styled(sparkline(&vals), theme::accent())),
-        lr(
+        center(
             vec![Span::styled(
                 format!("peak {} {}", fmt_count(peak_v), short_date(&peak_d)),
                 theme::faint(),
             )],
-            vec![Span::styled(format!("{}d", vals.len()), theme::faint())],
             w,
         ),
     ]
@@ -416,12 +448,15 @@ fn comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
 }
 
 fn hour_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
-    // The sparkline's tallest bar already shows the busy hour, so the caption is
-    // just the time axis: midnight flush left, 23h flush right.
+    // Caption is the time axis (0h..23h) with the busiest hour centered between.
+    let peak = busiest_hour(&stats.hour_counts)
+        .map(|h| format!("peak {h:02}:00"))
+        .unwrap_or_default();
     vec![
         Line::from(Span::styled(sparkline(&stats.hour_counts), theme::accent())),
-        lr(
+        lcr(
             vec![Span::styled("0h", theme::faint())],
+            vec![Span::styled(peak, theme::faint())],
             vec![Span::styled("23h", theme::faint())],
             w,
         ),
