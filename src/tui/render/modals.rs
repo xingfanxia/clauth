@@ -262,8 +262,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Tab::Tokens => vec![(
             "tokens",
             &[
-                ("\u{2191}\u{2193}", "scroll dashboard / pick model"),
                 ("\u{23ce}", "open per-model breakdown"),
+                ("\u{2191}\u{2193}", "pick model (in breakdown)"),
                 ("r", "reload on-disk stats"),
                 ("esc", "back to dashboard"),
             ][..],

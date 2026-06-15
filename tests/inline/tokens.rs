@@ -219,6 +219,7 @@ fn cache_hit_ratio_math() {
         first_session_date: None,
         last_computed_date: None,
         topped_up_through: None,
+        today: None,
     };
     // cache_read / (cache_read + cache_create + input) = 500 / 2000 = 0.25
     let ratio = stats.cache_hit_ratio();
@@ -241,6 +242,7 @@ fn cache_hit_ratio_zero_denominator() {
         first_session_date: None,
         last_computed_date: None,
         topped_up_through: None,
+        today: None,
     };
     assert_eq!(stats.cache_hit_ratio(), 0.0);
 }
@@ -348,6 +350,46 @@ fn top_up_adds_new_day_updates_model_and_sets_topped_up_through() {
 
     // topped_up_through set.
     assert_eq!(stats.topped_up_through.as_deref(), Some("2026-06-11"));
+}
+
+#[test]
+fn today_bucket_aggregates_todays_transcript_lines() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+
+    write_stats_cache(
+        &claude_dir,
+        r#"{
+            "lastComputedDate": "2026-06-10",
+            "totalSessions": 0, "totalMessages": 0,
+            "dailyActivity": [], "dailyModelTokens": [],
+            "modelUsage": {}, "hourCounts": {}
+        }"#,
+    );
+
+    // Today's date computed exactly as the module does (same clock).
+    let today = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs());
+    let today_date = today[..10].to_owned();
+    let ts = format!("{today_date}T12:00:00+00:00");
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let jsonl_path = proj_dir.join("sess.jsonl");
+    let l1 = jsonl_line(&ts, "claude-opus-4", 100, 50, 20, 5);
+    let l2 = jsonl_line(&ts, "claude-opus-4", 10, 5, 0, 0);
+    std::fs::write(&jsonl_path, format!("{l1}\n{l2}\n")).expect("write");
+    set_mtime(&jsonl_path, SystemTime::now());
+
+    let stats = load(&claude_dir).expect("load");
+    let today_s = stats.today.expect("today must be populated");
+    assert_eq!(today_s.date, today_date);
+    assert_eq!(today_s.messages, 2);
+    assert_eq!(today_s.input, 110);
+    assert_eq!(today_s.output, 55);
+    assert_eq!(today_s.cache_read, 20);
+    assert_eq!(today_s.cache_create, 5);
+    assert_eq!(today_s.in_out(), 165);
+    assert_eq!(today_s.total(), 190);
 }
 
 #[test]

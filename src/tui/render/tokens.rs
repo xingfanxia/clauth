@@ -1,11 +1,13 @@
 //! Tokens tab — global Claude Code token usage read from `~/.claude`
 //! (`stats-cache.json` + recent transcript top-up; see `crate::tokens`).
 //!
-//! Two views: a full-width **dashboard** (the landing page — totals, daily
-//! trend, top models, hour-of-day, composition, cache efficiency, activity) and
-//! a per-model **master-detail** breakdown reached with `⏎`. All figures are
-//! global across every model/provider Claude Code has run — the on-disk
-//! transcript/stats pool is shared across clauth profiles, not per-account.
+//! Two views. The **dashboard** (landing page) is a fixed grid of bordered
+//! cards — today, lifetime totals, daily trend, top models, token composition,
+//! hour-of-day, and activity — so each metric reads on its own rather than as
+//! one long scroll. The **Models** master-detail (reached with `⏎`) drills into
+//! a single model. All figures are global across every model/provider Claude
+//! Code has run — the on-disk pool is shared across clauth profiles, not
+//! per-account.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -17,17 +19,14 @@ use super::super::app::{App, TokenView};
 use super::super::theme;
 use super::format::fixed;
 use super::panes::{
-    SELECTOR_WIDTH, draw_scrollbar, draw_selector_list, picker_row, section_box,
-    section_box_verbatim,
+    SELECTOR_WIDTH, draw_selector_list, picker_row, section_box, section_box_verbatim,
 };
 use crate::tokens::{ModelTokens, TokenStats, group_models, is_anthropic};
 
-/// Key column width for the dashboard's label:value rows.
+/// Key column width for label:value rows.
 const KEY_W: usize = 8;
 /// Block-glyph ramp for sparklines, low → high.
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-/// How many top models the dashboard lists before stopping.
-const TOP_MODELS: usize = 8;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     match app.token_view {
@@ -105,246 +104,20 @@ fn hbar(value: u64, max: u64, width: usize, fill: Style) -> Vec<Span<'static>> {
     ]
 }
 
-/// Padded key span in the dim+bold label style (matches the usage tab).
+/// Fixed-width key span in the dim+bold label style — left-justified to `KEY_W`
+/// so values/bars in adjacent rows line up regardless of label length.
 fn key(label: &str) -> Span<'static> {
-    let pad = KEY_W.saturating_sub(label.chars().count()).max(1);
-    Span::styled(format!("{label}{}", " ".repeat(pad)), theme::label())
+    Span::styled(format!("{label:<KEY_W$}"), theme::label())
 }
 
-/// Eyebrow section header (`TEXT_DIM + bold`).
-fn eyebrow(text: &str) -> Line<'static> {
-    Line::from(Span::styled(text.to_string(), theme::label()))
+/// Inner content width of a card (`section_box` border + 1-col horizontal padding).
+fn inner_w(area: Rect) -> usize {
+    (area.width as usize).saturating_sub(4)
 }
 
-// ── dashboard view ─────────────────────────────────────────────────────────
-
-fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = section_box("tokens", false, true);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let Some(stats) = app.token_stats.as_ref() else {
-        let hint = Paragraph::new(Line::from(Span::styled(
-            "reading ~/.claude…",
-            theme::faint(),
-        )))
-        .style(theme::base());
-        frame.render_widget(hint, inner);
-        return;
-    };
-
-    let lines = dashboard_lines(stats, inner.width);
-    let total = lines.len();
-    let viewport = inner.height as usize;
-    let max_scroll = total.saturating_sub(viewport) as u16;
-    // Publish the max so the key handler can clamp over-scroll on the next event.
-    app.token_scroll_max.set(max_scroll);
-    let scroll = app.token_scroll.min(max_scroll);
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(theme::base())
-            .scroll((scroll, 0)),
-        inner,
-    );
-    draw_scrollbar(frame, inner, total, scroll as usize, viewport);
-}
-
-fn dashboard_lines(stats: &TokenStats, inner_w: u16) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let width = inner_w as usize;
-    let cache_total = stats.total_cache_read + stats.total_cache_create;
-
-    // ── headline ──
-    lines.push(Line::from(Span::styled(
-        "global across all models · from ~/.claude",
-        theme::faint(),
-    )));
-    lines.push(Line::from(vec![
-        key("total"),
-        Span::styled(
-            fmt_count(stats.total_tokens()),
-            theme::accent().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(
-                "  ·  {} sessions · {} msgs",
-                stats.total_sessions,
-                fmt_count(stats.total_messages)
-            ),
-            theme::dim(),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        key("tokens"),
-        Span::styled(
-            format!(
-                "{} in · {} out · {} cache",
-                fmt_count(stats.total_input),
-                fmt_count(stats.total_output),
-                fmt_count(cache_total)
-            ),
-            theme::body(),
-        ),
-    ]));
-    lines.push(Line::from({
-        let mut spans = vec![
-            key("cache"),
-            Span::styled(
-                format!("{:.0}% hit", stats.cache_hit_ratio() * 100.0),
-                Style::default().fg(theme::accent_2_color()),
-            ),
-        ];
-        let freshness = match (&stats.topped_up_through, &stats.last_computed_date) {
-            (Some(d), _) => format!("  ·  live through {}", short_date(d)),
-            (None, Some(d)) => format!("  ·  cache {}", short_date(d)),
-            (None, None) => String::new(),
-        };
-        if !freshness.is_empty() {
-            spans.push(Span::styled(freshness, theme::faint()));
-        }
-        spans
-    }));
-    if let (Some(first), Some(last)) = (
-        stats.first_session_date.as_deref(),
-        stats.daily.last().map(|d| d.date.as_str()),
-    ) {
-        lines.push(Line::from(vec![
-            key("span"),
-            Span::styled(
-                format!("{} – {}", short_date(first), short_date(last)),
-                theme::dim(),
-            ),
-        ]));
-    }
-
-    // ── daily trend ──
-    push_blank(&mut lines);
-    let daily: Vec<u64> = trail(&stats.daily, width)
-        .iter()
-        .map(|d| d.tokens)
-        .collect();
-    if !daily.is_empty() {
-        lines.push(eyebrow(&format!("DAILY · {} days", daily.len())));
-        lines.push(Line::from(Span::styled(sparkline(&daily), theme::accent())));
-        if let Some((peak_v, peak_d)) = stats
-            .daily
-            .iter()
-            .max_by_key(|d| d.tokens)
-            .map(|d| (d.tokens, d.date.clone()))
-        {
-            let last = stats.daily.last().map(|d| d.tokens).unwrap_or(0);
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "last {} · peak {} ({})",
-                    fmt_count(last),
-                    fmt_count(peak_v),
-                    short_date(&peak_d)
-                ),
-                theme::faint(),
-            )));
-        }
-    }
-
-    // ── top models ──
-    push_blank(&mut lines);
-    lines.push(eyebrow("TOP MODELS"));
-    let grouped = group_models(&stats.models);
-    let max = grouped.first().map(ModelTokens::total).unwrap_or(0);
-    let label_w = 16.min(width.saturating_sub(12)).max(6);
-    let val_w = 8;
-    let bar_w = width
-        .saturating_sub(label_w)
-        .saturating_sub(val_w)
-        .saturating_sub(2)
-        .clamp(6, 40);
-    for m in grouped.iter().take(TOP_MODELS) {
-        let fill = if is_anthropic(&m.model) {
-            theme::accent()
-        } else {
-            theme::dim()
-        };
-        let mut spans = vec![Span::styled(fixed(&m.model, label_w), theme::body())];
-        spans.push(Span::raw(" "));
-        spans.extend(hbar(m.total(), max, bar_w, fill));
-        spans.push(Span::styled(
-            format!(" {}", fmt_count(m.total())),
-            theme::dim(),
-        ));
-        lines.push(Line::from(spans));
-    }
-
-    // ── hour of day ──
-    push_blank(&mut lines);
-    lines.push(eyebrow("HOUR OF DAY"));
-    lines.push(Line::from(Span::styled(
-        sparkline(&stats.hour_counts),
-        theme::accent(),
-    )));
-    if let Some(busiest) = busiest_hour(&stats.hour_counts) {
-        lines.push(Line::from(Span::styled(
-            format!("0h ───────── 23h · busiest {busiest:02}:00"),
-            theme::faint(),
-        )));
-    }
-
-    // ── composition ──
-    push_blank(&mut lines);
-    lines.push(eyebrow("COMPOSITION"));
-    let grand = stats.total_tokens();
-    let comp_bar = width
-        .saturating_sub(KEY_W)
-        .saturating_sub(val_w + 6)
-        .clamp(6, 40);
-    for (label, value, fill) in [
-        ("input", stats.total_input, theme::accent()),
-        ("output", stats.total_output, theme::success()),
-        ("c.write", stats.total_cache_create, theme::warning()),
-        ("c.read", stats.total_cache_read, theme::info()),
-    ] {
-        let pct = if grand == 0 {
-            0.0
-        } else {
-            value as f64 / grand as f64 * 100.0
-        };
-        let mut spans = vec![key(label)];
-        spans.extend(hbar(value, grand, comp_bar, fill));
-        spans.push(Span::styled(
-            format!(" {} {:>3.0}%", fmt_count(value), pct),
-            theme::dim(),
-        ));
-        lines.push(Line::from(spans));
-    }
-
-    // ── activity ──
-    push_blank(&mut lines);
-    let msgs: Vec<u64> = trail(&stats.activity, width)
-        .iter()
-        .map(|a| a.messages)
-        .collect();
-    if !msgs.is_empty() {
-        lines.push(eyebrow(&format!("ACTIVITY · {} days", msgs.len())));
-        lines.push(Line::from(Span::styled(sparkline(&msgs), theme::accent())));
-        let peak_msgs = stats.activity.iter().map(|a| a.messages).max().unwrap_or(0);
-        let peak_sess = stats.activity.iter().map(|a| a.sessions).max().unwrap_or(0);
-        let tool_calls: u64 = stats.activity.iter().map(|a| a.tool_calls).sum();
-        lines.push(Line::from(Span::styled(
-            format!(
-                "messages/day · peak {} msgs, {} sessions · {} tool calls total",
-                fmt_count(peak_msgs),
-                peak_sess,
-                fmt_count(tool_calls)
-            ),
-            theme::faint(),
-        )));
-    }
-
-    lines
-}
-
-/// Last `width`-bounded window of a chronological slice (keeps the recent tail).
+/// Last `width`-bounded tail of a chronological slice (the recent days).
 fn trail<T>(items: &[T], width: usize) -> &[T] {
-    let n = items.len().min(width.saturating_sub(2).max(1));
+    let n = items.len().min(width.max(1));
     &items[items.len().saturating_sub(n)..]
 }
 
@@ -353,8 +126,290 @@ fn busiest_hour(hours: &[u64; 24]) -> Option<usize> {
     (count > 0).then_some(hour)
 }
 
-fn push_blank(lines: &mut Vec<Line<'static>>) {
-    lines.push(Line::from(""));
+// ── dashboard view ─────────────────────────────────────────────────────────
+
+fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(stats) = app.token_stats.as_ref() else {
+        let block = section_box("tokens", false, true);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "reading ~/.claude…",
+                theme::faint(),
+            )))
+            .style(theme::base()),
+            inner,
+        );
+        return;
+    };
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5), // today · total
+            Constraint::Length(4), // daily
+            Constraint::Length(7), // top models · composition
+            Constraint::Min(4),    // hour · activity
+        ])
+        .split(area);
+
+    let top = halves(rows[0], 42);
+    card(frame, top[0], &today_title(stats), true, today_lines(stats));
+    card(frame, top[1], "total", false, total_lines(stats));
+
+    card(
+        frame,
+        rows[1],
+        "daily",
+        false,
+        daily_lines(stats, inner_w(rows[1])),
+    );
+
+    let mid = halves(rows[2], 55);
+    card(
+        frame,
+        mid[0],
+        "top models",
+        false,
+        model_lines(stats, inner_w(mid[0]), 5),
+    );
+    card(
+        frame,
+        mid[1],
+        "composition",
+        false,
+        comp_lines(stats, inner_w(mid[1])),
+    );
+
+    let bot = halves(rows[3], 50);
+    card(
+        frame,
+        bot[0],
+        "hour of day",
+        false,
+        hour_lines(stats, inner_w(bot[0])),
+    );
+    card(
+        frame,
+        bot[1],
+        "activity",
+        false,
+        activity_lines(stats, inner_w(bot[1])),
+    );
+}
+
+/// Split a row into two columns, the left taking `left_pct` percent.
+fn halves(area: Rect, left_pct: u16) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(left_pct),
+            Constraint::Percentage(100 - left_pct),
+        ])
+        .split(area)
+}
+
+/// Draw one bordered card with its lines.
+fn card(frame: &mut Frame<'_>, area: Rect, title: &str, first: bool, lines: Vec<Line<'static>>) {
+    let block = section_box(title, false, first);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+}
+
+fn today_title(stats: &TokenStats) -> String {
+    match &stats.today {
+        Some(t) => format!("today · {}", short_date(&t.date)),
+        None => "today".to_string(),
+    }
+}
+
+fn today_lines(stats: &TokenStats) -> Vec<Line<'static>> {
+    let Some(t) = stats.today.as_ref() else {
+        return vec![Line::from(Span::styled(
+            "idle so far today",
+            theme::faint(),
+        ))];
+    };
+    vec![
+        kv_accent("tokens", fmt_count(t.total())),
+        Line::from(vec![
+            key("msgs"),
+            Span::styled(t.messages.to_string(), theme::body()),
+        ]),
+        Line::from(vec![
+            key("io"),
+            Span::styled(
+                format!("{} in · {} out", fmt_count(t.input), fmt_count(t.output)),
+                theme::dim(),
+            ),
+        ]),
+    ]
+}
+
+fn total_lines(stats: &TokenStats) -> Vec<Line<'static>> {
+    let last = stats
+        .topped_up_through
+        .as_deref()
+        .or(stats.daily.last().map(|d| d.date.as_str()))
+        .or(stats.last_computed_date.as_deref());
+    let span = match (stats.first_session_date.as_deref(), last) {
+        (Some(f), Some(l)) => format!(" · {} – {}", short_date(f), short_date(l)),
+        _ => String::new(),
+    };
+    vec![
+        kv_accent("tokens", fmt_count(stats.total_tokens())),
+        Line::from(vec![
+            key("usage"),
+            Span::styled(
+                format!(
+                    "{} sess · {} msgs",
+                    stats.total_sessions,
+                    fmt_count(stats.total_messages)
+                ),
+                theme::body(),
+            ),
+        ]),
+        Line::from(vec![
+            key("cache"),
+            Span::styled(
+                format!("{:.0}% hit", stats.cache_hit_ratio() * 100.0),
+                Style::default().fg(theme::accent_2_color()),
+            ),
+            Span::styled(span, theme::faint()),
+        ]),
+    ]
+}
+
+fn daily_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
+    let vals: Vec<u64> = trail(&stats.daily, w).iter().map(|d| d.tokens).collect();
+    if vals.is_empty() {
+        return vec![Line::from(Span::styled("no daily data", theme::faint()))];
+    }
+    let last = stats.daily.last().map(|d| d.tokens).unwrap_or(0);
+    let (peak_v, peak_d) = stats
+        .daily
+        .iter()
+        .max_by_key(|d| d.tokens)
+        .map(|d| (d.tokens, d.date.clone()))
+        .unwrap_or((0, String::new()));
+    let fresh = stats
+        .topped_up_through
+        .as_deref()
+        .map(|d| format!(" · live thru {}", short_date(d)))
+        .unwrap_or_default();
+    vec![
+        Line::from(Span::styled(sparkline(&vals), theme::accent())),
+        Line::from(Span::styled(
+            format!(
+                "{}d · last {} · peak {} ({}){fresh}",
+                vals.len(),
+                fmt_count(last),
+                fmt_count(peak_v),
+                short_date(&peak_d)
+            ),
+            theme::faint(),
+        )),
+    ]
+}
+
+fn model_lines(stats: &TokenStats, w: usize, n: usize) -> Vec<Line<'static>> {
+    let grouped = group_models(&stats.models);
+    let max = grouped.first().map(ModelTokens::total).unwrap_or(0);
+    let label_w = (w / 3).clamp(6, 14);
+    let bar_w = w.saturating_sub(label_w).saturating_sub(9).clamp(4, 28);
+    grouped
+        .iter()
+        .take(n)
+        .map(|m| {
+            let fill = if is_anthropic(&m.model) {
+                theme::accent()
+            } else {
+                theme::dim()
+            };
+            let mut spans = vec![
+                Span::styled(fixed(&m.model, label_w), theme::body()),
+                Span::raw(" "),
+            ];
+            spans.extend(hbar(m.total(), max, bar_w, fill));
+            spans.push(Span::styled(
+                format!(" {}", fmt_count(m.total())),
+                theme::dim(),
+            ));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
+    let grand = stats.total_tokens();
+    let bar_w = w.saturating_sub(KEY_W).saturating_sub(6).clamp(4, 28);
+    [
+        ("input", stats.total_input, theme::accent()),
+        ("output", stats.total_output, theme::success()),
+        ("c.write", stats.total_cache_create, theme::warning()),
+        ("c.read", stats.total_cache_read, theme::info()),
+    ]
+    .into_iter()
+    .map(|(label, value, fill)| {
+        let pct = if grand == 0 {
+            0.0
+        } else {
+            value as f64 / grand as f64 * 100.0
+        };
+        let mut spans = vec![key(label)];
+        spans.extend(hbar(value, grand, bar_w, fill));
+        spans.push(Span::styled(format!(" {pct:>3.0}%"), theme::dim()));
+        Line::from(spans)
+    })
+    .collect()
+}
+
+fn hour_lines(stats: &TokenStats, _w: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        sparkline(&stats.hour_counts),
+        theme::accent(),
+    ))];
+    let caption = match busiest_hour(&stats.hour_counts) {
+        Some(h) => format!("0h ─── 23h · busiest {h:02}:00"),
+        None => "no activity recorded".to_string(),
+    };
+    lines.push(Line::from(Span::styled(caption, theme::faint())));
+    lines
+}
+
+fn activity_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
+    let msgs: Vec<u64> = trail(&stats.activity, w)
+        .iter()
+        .map(|a| a.messages)
+        .collect();
+    if msgs.is_empty() {
+        return vec![Line::from(Span::styled("no activity data", theme::faint()))];
+    }
+    let peak_msgs = stats.activity.iter().map(|a| a.messages).max().unwrap_or(0);
+    let peak_sess = stats.activity.iter().map(|a| a.sessions).max().unwrap_or(0);
+    let tools: u64 = stats.activity.iter().map(|a| a.tool_calls).sum();
+    vec![
+        Line::from(Span::styled(sparkline(&msgs), theme::accent())),
+        Line::from(Span::styled(
+            format!(
+                "msgs/day · peak {} · {} sess · {} tools",
+                fmt_count(peak_msgs),
+                peak_sess,
+                fmt_count(tools)
+            ),
+            theme::faint(),
+        )),
+    ]
+}
+
+/// `key:value` line whose value is the accent-bold headline number.
+fn kv_accent(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        key(label),
+        Span::styled(value, theme::accent().add_modifier(Modifier::BOLD)),
+    ])
 }
 
 // ── models master-detail view ──────────────────────────────────────────────
@@ -402,34 +457,34 @@ fn draw_model_detail(frame: &mut Frame<'_>, area: Rect, model: Option<&ModelToke
     frame.render_widget(block, area);
 
     let Some(m) = model else {
-        let hint = Paragraph::new(Line::from(Span::styled("no model data", theme::faint())))
-            .style(theme::base());
-        frame.render_widget(hint, inner);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("no model data", theme::faint())))
+                .style(theme::base()),
+            inner,
+        );
         return;
     };
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
     let kv = |label: &str, value: String| {
         Line::from(vec![key(label), Span::styled(value, theme::body())])
     };
-    lines.push(kv("input", fmt_count(m.input)));
-    lines.push(kv("output", fmt_count(m.output)));
-    lines.push(kv("c.read", fmt_count(m.cache_read)));
-    lines.push(kv("c.write", fmt_count(m.cache_create)));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        key("total"),
-        Span::styled(
-            fmt_count(m.total()),
-            theme::body().add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(kv("io", fmt_count(m.in_out())));
+    let mut lines = vec![
+        kv("input", fmt_count(m.input)),
+        kv("output", fmt_count(m.output)),
+        kv("c.read", fmt_count(m.cache_read)),
+        kv("c.write", fmt_count(m.cache_create)),
+        Line::from(""),
+        kv_accent("total", fmt_count(m.total())),
+        kv("io", fmt_count(m.in_out())),
+    ];
 
     let bar_w = (inner.width as usize).saturating_sub(14).clamp(6, 36);
 
     lines.push(Line::from(""));
-    lines.push(eyebrow("SHARE OF ALL TOKENS"));
+    lines.push(Line::from(Span::styled(
+        "SHARE OF ALL TOKENS",
+        theme::label(),
+    )));
     let share = if grand == 0 {
         0.0
     } else {
@@ -440,7 +495,7 @@ fn draw_model_detail(frame: &mut Frame<'_>, area: Rect, model: Option<&ModelToke
     lines.push(Line::from(share_line));
 
     lines.push(Line::from(""));
-    lines.push(eyebrow("CACHE HIT"));
+    lines.push(Line::from(Span::styled("CACHE HIT", theme::label())));
     let denom = m.cache_read + m.cache_create + m.input;
     let hit = if denom == 0 {
         0.0

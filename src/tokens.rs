@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
-use crate::usage::iso_to_epoch_secs;
+use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs, now_epoch_secs};
 
 // ── Refresh cadence ─────────────────────────────────────────────────────────
 
@@ -74,6 +74,31 @@ pub(crate) struct DayActivity {
     pub(crate) tool_calls: u64,
 }
 
+/// Single-day token + message rollup, built live from today's transcripts during
+/// the top-up pass (so it carries the full in/out/cache split, unlike `DayTokens`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DaySummary {
+    pub(crate) date: String,
+    pub(crate) input: u64,
+    pub(crate) output: u64,
+    pub(crate) cache_read: u64,
+    pub(crate) cache_create: u64,
+    /// Usage-bearing (assistant) messages seen for the day.
+    pub(crate) messages: u64,
+}
+
+impl DaySummary {
+    pub(crate) fn in_out(&self) -> u64 {
+        self.input.saturating_add(self.output)
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.in_out()
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_create)
+    }
+}
+
 /// Aggregated token statistics view-model.
 #[derive(Debug, Clone)]
 pub(crate) struct TokenStats {
@@ -91,6 +116,8 @@ pub(crate) struct TokenStats {
     pub(crate) first_session_date: Option<String>, // raw ISO from stats-cache
     pub(crate) last_computed_date: Option<String>, // "YYYY-MM-DD" from stats-cache
     pub(crate) topped_up_through: Option<String>,  // latest "YYYY-MM-DD" added by top-up
+    /// Today's usage, built live from transcripts; `None` when idle today.
+    pub(crate) today: Option<DaySummary>,
 }
 
 impl TokenStats {
@@ -301,11 +328,24 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
         first_session_date: wire.first_session_date,
         last_computed_date: wire.last_computed_date.clone(),
         topped_up_through: None,
+        today: None,
     };
 
-    top_up(claude_dir, wire.last_computed_date.as_deref(), &mut stats);
+    let today = today_date();
+    top_up(
+        claude_dir,
+        wire.last_computed_date.as_deref(),
+        &today,
+        &mut stats,
+    );
 
     Some(stats)
+}
+
+/// Current UTC calendar date as "YYYY-MM-DD".
+fn today_date() -> String {
+    let iso = epoch_secs_to_iso(now_epoch_secs());
+    iso.get(..10).map(str::to_owned).unwrap_or(iso)
 }
 
 // ── Recent transcript top-up ─────────────────────────────────────────────────
@@ -321,7 +361,14 @@ fn date_to_cutoff(date: &str) -> Option<SystemTime> {
 }
 
 /// Best-effort live top-up from `projects/*/*.jsonl` files modified after the cutoff.
-fn top_up(claude_dir: &Path, last_computed_date: Option<&str>, stats: &mut TokenStats) {
+/// Also accumulates `today_date`'s usage into `stats.today` (independent of the
+/// historical cutoff, so it works even when the cache was computed today).
+fn top_up(
+    claude_dir: &Path,
+    last_computed_date: Option<&str>,
+    today_date: &str,
+    stats: &mut TokenStats,
+) {
     // Without a cutoff date we have no safe boundary — skip entirely.
     let cutoff_date = match last_computed_date {
         Some(d) => d,
@@ -354,6 +401,10 @@ fn top_up(claude_dir: &Path, last_computed_date: Option<&str>, stats: &mut Token
         .collect();
 
     let mut max_date: Option<String> = None;
+    let mut today_acc = DaySummary {
+        date: today_date.to_owned(),
+        ..Default::default()
+    };
 
     for proj in proj_entries {
         let proj = match proj {
@@ -387,11 +438,19 @@ fn top_up(claude_dir: &Path, last_computed_date: Option<&str>, stats: &mut Token
             process_jsonl(
                 &path,
                 cutoff_date,
+                today_date,
                 &mut daily_map,
                 &mut model_map,
+                &mut today_acc,
                 &mut max_date,
             );
         }
+    }
+
+    // Publish today's rollup before any early return (it does not depend on the
+    // historical cutoff, so even a no-new-history pass can still have today data).
+    if today_acc.messages > 0 || today_acc.total() > 0 {
+        stats.today = Some(today_acc);
     }
 
     if max_date.is_none() {
@@ -431,11 +490,14 @@ fn top_up(claude_dir: &Path, last_computed_date: Option<&str>, stats: &mut Token
 
 /// Process one JSONL file, updating `daily_map` and `model_map` for lines strictly
 /// after `cutoff_date`. Silently skips any parse errors.
+#[allow(clippy::too_many_arguments)]
 fn process_jsonl(
     path: &Path,
     cutoff_date: &str,
+    today_date: &str,
     daily_map: &mut HashMap<String, u64>,
     model_map: &mut HashMap<String, ModelTokens>,
+    today: &mut DaySummary,
     max_date: &mut Option<String>,
 ) {
     let file = match std::fs::File::open(path) {
@@ -460,10 +522,6 @@ fn process_jsonl(
             continue;
         }
         let date = &timestamp[..10];
-        // Only count messages strictly AFTER last_computed_date.
-        if date <= cutoff_date {
-            continue;
-        }
         let msg = match &parsed.message {
             Some(m) => m,
             None => continue,
@@ -472,6 +530,26 @@ fn process_jsonl(
             Some(u) => u,
             None => continue,
         };
+
+        // Today's rollup — independent of the historical cutoff, so it is also
+        // populated on the rare day the cache was last computed today.
+        if date == today_date {
+            today.input = today.input.saturating_add(usage.input_tokens);
+            today.output = today.output.saturating_add(usage.output_tokens);
+            today.cache_read = today
+                .cache_read
+                .saturating_add(usage.cache_read_input_tokens);
+            today.cache_create = today
+                .cache_create
+                .saturating_add(usage.cache_creation_input_tokens);
+            today.messages = today.messages.saturating_add(1);
+        }
+
+        // Historical top-up — only days strictly AFTER last_computed_date, so days
+        // already aggregated in the stats-cache are never double-counted.
+        if date <= cutoff_date {
+            continue;
+        }
         let model_name = msg.model.as_deref().unwrap_or("unknown").to_owned();
 
         let in_out = usage.input_tokens.saturating_add(usage.output_tokens);

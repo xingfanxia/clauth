@@ -42,12 +42,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ("?", "help"),
         ],
         Tab::Tokens => match app.token_view {
-            TokenView::Dashboard => &[
-                ("↑↓", "scroll"),
-                ("↵", "models"),
-                ("r", "reload"),
-                ("?", "help"),
-            ],
+            TokenView::Dashboard => &[("↵", "models"), ("r", "reload"), ("?", "help")],
             TokenView::Models => &[("↑↓", "model"), ("esc", "back"), ("?", "help")],
         },
         Tab::Setup => match app.config_focus {

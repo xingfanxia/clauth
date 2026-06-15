@@ -713,11 +713,6 @@ pub(crate) struct App {
     pub(crate) token_view: TokenView,
     /// Cursor into the grouped model list on the Tokens `Models` view.
     pub(crate) token_model_cursor: usize,
-    /// Vertical scroll offset for the Tokens dashboard (rows can overflow).
-    pub(crate) token_scroll: u16,
-    /// Max valid `token_scroll`, written at render from content vs viewport so
-    /// the key handler can clamp (mirrors `StatusState::detail_max_scroll`).
-    pub(crate) token_scroll_max: std::cell::Cell<u16>,
     /// Token-stats load results from the background loader; drained in `on_tick`.
     pub(crate) tokens_events: std::sync::mpsc::Receiver<crate::tokens::TokensEvent>,
     /// Manual-refresh signal to the token loader; a `()` triggers a reload.
@@ -930,8 +925,6 @@ impl App {
             token_stats: None,
             token_view: TokenView::Dashboard,
             token_model_cursor: 0,
-            token_scroll: 0,
-            token_scroll_max: std::cell::Cell::new(0),
             tokens_events,
             tokens_refresh,
             last_state_mtime: app_state_mtime(),
@@ -1621,24 +1614,13 @@ fn token_model_count(app: &App) -> usize {
 /// Models moves the model cursor with ↑↓ (ascend handled by the global esc/q).
 fn handle_tokens_key(app: &mut App, key: KeyEvent) {
     match app.token_view {
-        TokenView::Dashboard => match key.code {
-            KeyCode::Enter => {
-                if token_model_count(app) > 0 {
-                    app.token_view = TokenView::Models;
-                    app.token_model_cursor = 0;
-                }
+        TokenView::Dashboard => {
+            // Dashboard is a fixed grid (no scroll); ⏎ descends into Models.
+            if key.code == KeyCode::Enter && token_model_count(app) > 0 {
+                app.token_view = TokenView::Models;
+                app.token_model_cursor = 0;
             }
-            KeyCode::Up => app.token_scroll = app.token_scroll.saturating_sub(1),
-            KeyCode::Down => {
-                // Clamp to the last-rendered max so over-scrolling never strands
-                // the offset past the content (mirrors the status detail scroll).
-                app.token_scroll = app
-                    .token_scroll
-                    .saturating_add(1)
-                    .min(app.token_scroll_max.get());
-            }
-            _ => {}
-        },
+        }
         TokenView::Models => {
             let len = token_model_count(app);
             match key.code {
@@ -1667,7 +1649,6 @@ fn switch_tab(app: &mut App, tab: Tab) {
             // Land on the dashboard; keep the model cursor reset for descend.
             app.token_view = TokenView::Dashboard;
             app.token_model_cursor = 0;
-            app.token_scroll = 0;
         }
         Tab::Setup => {
             app.config_focus = ConfigFocus::Profiles;
