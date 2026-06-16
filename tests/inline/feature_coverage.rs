@@ -40,7 +40,7 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
     ),
     (
         "Per-row activity",
-        &["gap_boundary", "steady_drain_no_gap_no_cut"],
+        &["gap_boundary", "steady_linear_drain_exact_rate"],
     ),
     (
         "Plan detection",

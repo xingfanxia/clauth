@@ -40,33 +40,43 @@ fn gap_boundary(entries: &[(u64, f64)], max_gap_ms: u64) -> usize {
     0
 }
 
-/// Compute burn rates (%/h) per usage window from cached history plus the
-/// latest current usage.
+/// Compute recency-weighted burn rates (%/h) per usage window from cached
+/// history plus the latest current usage.
 ///
 /// `windows` is a slice of `(label, &UsageWindow)` pairs — typically a subset
-/// of [`UsageInfo::windows`]. Each window gets its own `(min_entries,
-/// min_span_ms)` so that 5-hour windows can use a narrow rolling window
-/// (e.g. 5 entries / 30 min) while 7-day windows use a wider one
-/// (e.g. 50 entries / 24 h) to avoid burst extrapolation.
+/// of [`UsageInfo::windows`].
 ///
-/// `gap_cut_ms` controls idle-gap detection: when two consecutive entries
-/// share the same utilization and their timestamps differ by more than
-/// `gap_cut_ms`, the history is sliced from the later entry onward. Pass 0
-/// to disable gap-cut entirely (appropriate for 7-day windows where
-/// overnight idle is part of the average).
+/// For each window the samples are filtered to that window's utilization, the
+/// current value is appended, idle plateaus are gap-cut, and flat runs are
+/// deduplicated to distinct utilization points. The rate is the slope of a
+/// recency-weighted least-squares fit over the samples falling within the last
+/// `lookback_ms` (and after the most recent window reset). Sample weights decay
+/// exponentially with age — half-life `lookback_ms / 4` — so the newest samples
+/// dominate. `None` is returned until at least `min_samples` distinct samples
+/// sit inside that window, so a rate is never shown from too little data.
 ///
-/// Returns rates in %/h — multiply by 24 for %/d display.  
+/// `lookback_ms` is a hard cap: samples older than `now - lookback_ms` are
+/// dropped (1 h for the 5-hour window → %/h; 24 h for the 7-day windows → %/d).
+///
+/// `gap_cut_ms` controls idle-gap detection: when two consecutive entries share
+/// the same utilization and their timestamps differ by more than `gap_cut_ms`,
+/// the history is sliced from the later entry onward. Pass 0 to disable gap-cut
+/// entirely (appropriate for 7-day windows where overnight idle is part of the
+/// average).
+///
+/// Returns rates in %/h — multiply by 24 for %/d display.
 pub(crate) fn compute_burn_rates_from_history(
     history: &[(u64, UsageInfo)],
     windows: &[(&str, &UsageWindow)],
-    min_entries: usize,
-    min_span_ms: u64,
+    lookback_ms: u64,
+    min_samples: usize,
     gap_cut_ms: u64,
 ) -> HashMap<String, Option<f64>> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    let half_life_ms = (lookback_ms as f64 / 4.0).max(1.0);
 
     let mut rates = HashMap::new();
     for (label, window) in windows {
@@ -86,39 +96,61 @@ pub(crate) fn compute_burn_rates_from_history(
             }
         }
 
+        // Collapse flat runs to distinct utilization points, keeping the newest
+        // timestamp of each run.
         if entries.len() >= 2 {
             entries.reverse();
             entries.dedup_by(|a, b| a.1 == b.1);
             entries.reverse();
         }
 
-        let window = &entries[reset_boundary(&entries)..];
+        // Start no earlier than the most recent window reset, and no earlier
+        // than `lookback_ms` before now (the hard sample-window cap).
+        let cutoff = now_ms.saturating_sub(lookback_ms);
+        let cap = entries
+            .iter()
+            .position(|&(ts, _)| ts >= cutoff)
+            .unwrap_or(0);
+        let start = reset_boundary(&entries).max(cap);
+        let recent = &entries[start..];
 
-        if window.len() >= 2 {
-            let n = window.len();
-            let last_ts = window[n - 1].0;
-
-            // Span-first: try to cover min_span_ms of data for a stable rate.
-            // Fall back to min_entries when the history isn't long enough yet
-            // (e.g. early after a window reset).
-            let start_idx = (0..n - 1)
-                .rev()
-                .find(|&i| last_ts - window[i].0 >= min_span_ms)
-                .or_else(|| (0..n - 1).rev().find(|&i| n - i >= min_entries))
-                .unwrap_or(0);
-
-            let first = &window[start_idx];
-            let last = &window[n - 1];
-            let dt = (last.0 - first.0) as f64 / 3_600_000.0;
-            if dt > 0.0 {
-                let rate = (last.1 - first.1) / dt;
-                rates.insert(label.to_string(), Some(rate));
-                continue;
-            }
-        }
-        rates.insert(label.to_string(), None);
+        // Require enough distinct samples in the window before trusting a rate.
+        let rate = if recent.len() >= min_samples {
+            weighted_rate_per_hour(recent, half_life_ms)
+        } else {
+            None
+        };
+        rates.insert(label.to_string(), rate);
     }
     rates
+}
+
+/// Slope of a recency-weighted least-squares fit of utilization over time, in
+/// %/h. Weights decay exponentially with age relative to the newest sample:
+/// `w = 0.5^(age / half_life_ms)`, so recent samples drive the rate. Returns
+/// `None` when the weighted time variance is zero (samples all simultaneous).
+fn weighted_rate_per_hour(entries: &[(u64, f64)], half_life_ms: f64) -> Option<f64> {
+    let last_ts = entries[entries.len() - 1].0;
+    let base = entries[0].0 as f64; // rebase time for numeric stability
+
+    let (mut sw, mut swx, mut swy, mut swxx, mut swxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(ts, util) in entries {
+        let age = last_ts.saturating_sub(ts) as f64;
+        let w = 0.5_f64.powf(age / half_life_ms);
+        let x = ts as f64 - base;
+        sw += w;
+        swx += w * x;
+        swy += w * util;
+        swxx += w * x * x;
+        swxy += w * x * util;
+    }
+
+    let denom = sw * swxx - swx * swx;
+    if denom.abs() < f64::EPSILON {
+        return None;
+    }
+    let slope_per_ms = (sw * swxy - swx * swy) / denom;
+    Some(slope_per_ms * 3_600_000.0)
 }
 
 #[cfg(test)]

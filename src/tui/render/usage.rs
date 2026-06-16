@@ -165,8 +165,8 @@ fn build_usage_lines(
             window_rates.extend(crate::usage::compute_burn_rates_from_history(
                 history,
                 &five_h,
-                5,
-                30 * 60 * 1000,
+                60 * 60 * 1000, // lookback_ms: last 1h of samples for %/h
+                3,              // min_samples before a rate is shown
                 10 * 60 * 1000, // gap_cut_ms: cut idle gaps for short-horizon windows
             ));
         }
@@ -174,9 +174,9 @@ fn build_usage_lines(
             window_rates.extend(crate::usage::compute_burn_rates_from_history(
                 history,
                 &seven_d,
-                50,
-                24 * 60 * 60 * 1000,
-                0, // gap_cut_ms: disabled for daily windows
+                24 * 60 * 60 * 1000, // lookback_ms: last 1d of samples for %/d
+                3,                   // min_samples before a rate is shown
+                0,                   // gap_cut_ms: disabled for daily windows
             ));
         }
     }

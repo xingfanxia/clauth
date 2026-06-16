@@ -566,8 +566,8 @@ fn burn_rate_eta(
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]),
             std::slice::from_ref(&pair),
-            5,
-            30 * 60 * 1000,
+            60 * 60 * 1000, // lookback_ms: last 1h of samples, aligned with %/h
+            3,              // min_samples before a rate is shown
             10 * 60 * 1000, // gap_cut_ms: cut idle gaps for ETA projection
         );
         rates.remove("5h").flatten()
