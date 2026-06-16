@@ -56,15 +56,17 @@ fn gap_boundary(entries: &[(u64, f64)], max_gap_ms: u64) -> usize {
 /// sit inside that window, so a rate is never shown from too little data.
 ///
 /// `lookback_ms` is a hard cap: samples older than `now - lookback_ms` are
-/// dropped (1 h for the 5-hour window → %/h; 24 h for the 7-day windows → %/d).
+/// dropped (1 h for the 5-hour window → `%/h`).
 ///
 /// `gap_cut_ms` controls idle-gap detection: when two consecutive entries share
 /// the same utilization and their timestamps differ by more than `gap_cut_ms`,
 /// the history is sliced from the later entry onward. Pass 0 to disable gap-cut
-/// entirely (appropriate for 7-day windows where overnight idle is part of the
-/// average).
+/// entirely (for windows where idle stretches should count toward the rate).
 ///
-/// Returns rates in %/h — multiply by 24 for %/d display.
+/// Returns rates in %/h. Drives the 5-hour window's `%/h` rate and the overview
+/// burn-ETA. The 7-day windows show a window-anchored average pace instead
+/// (`window_avg_pace_per_day`), which a history slope can't give: a per-profile
+/// history jumps to another account's utilization on every rotation.
 pub(crate) fn compute_burn_rates_from_history(
     history: &[(u64, UsageInfo)],
     windows: &[(&str, &UsageWindow)],
