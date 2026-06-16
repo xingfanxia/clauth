@@ -8,7 +8,7 @@ use crate::lockorder::{RankedMutex, rank};
 use crate::providers::{Provider, ThirdPartyStats};
 
 use super::fetch::{
-    FetchError, UsageInfo, UsageWindow, cache_mtime_ms, epoch_secs_to_iso, fetch_raw,
+    FetchError, PlanInfo, UsageInfo, UsageWindow, cache_mtime_ms, epoch_secs_to_iso, fetch_raw,
     iso_to_epoch_secs, load_disk_cache, now_epoch_secs, now_ms, write_disk_cache,
 };
 
@@ -18,6 +18,12 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// Hard ceiling on a server-provided `retry-after` so a bogus huge value
 /// can't starve a profile's refresh slot.
 const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
+
+/// Flat extra backoff applied after a 429 that carries no usable `retry-after`:
+/// the next slot lands one interval + this far out, so a rate-limited profile
+/// waits a little longer than the cadence. Not an escalating ladder — a single
+/// fixed step; a server-provided `retry-after` overrides it.
+const RATE_LIMIT_MIN_BACKOFF_MS: u64 = 10_000;
 
 /// Wall-clock instant in epoch-milliseconds. Distinct from [`IntervalMs`] so
 /// instants and spans can't be confused. `#[repr(transparent)]` keeps layout
@@ -241,10 +247,11 @@ fn fetch_with_rotation(
     name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
+    prev_plan: Option<PlanInfo>,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
 ) -> FetchOutcome {
-    match fetch_raw(access_token) {
+    match fetch_raw(name, access_token, prev_plan.clone(), false) {
         Ok(info) => return FetchOutcome::live(name, info, None),
         // Rate-limited: bail to cache, never rotate (see the doc comment).
         Err(FetchError::RateLimited { retry_after }) => {
@@ -291,7 +298,9 @@ fn fetch_with_rotation(
         return bail_to_cache(None);
     }
     let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
-    match fetch_raw(&access) {
+    // Post-rotation retry forces a `/profile` pull: the token just changed, so
+    // refresh the plan alongside it (the 401 profile-fetch trigger).
+    match fetch_raw(name, &access, prev_plan, true) {
         Ok(info) => FetchOutcome::live(name, info, rotated),
         Err(FetchError::RateLimited { retry_after }) => {
             // Retry itself rate-limited. Don't push to RefetchQueue — that risks
@@ -422,11 +431,23 @@ fn run_fetch(
         }
     }
 
+    // Prior plan for the TTL'd `/profile` policy: the live store on a periodic
+    // tick, the disk cache on bootstrap / manual-all (`store` is `None`). Read
+    // and released before the fetch so no lock is held across HTTP.
+    let prev_plan = match store {
+        Some(s) => s
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&entry.name).and_then(|i| i.plan.clone())),
+        None => load_disk_cache(&entry.name).and_then(|i| i.plan),
+    };
+
     let mut outcome = fetch_with_rotation(
         config,
         &entry.name,
         &entry.access_token,
         entry.refresh_token.as_deref(),
+        prev_plan,
         refetch,
         activity,
     );
@@ -436,6 +457,48 @@ fn run_fetch(
         outcome.rotated = kick_rotated;
     }
     outcome
+}
+
+/// Deferral added to a profile's `last_fetched` stamp so `partition_due`'s fixed
+/// `stamp + interval` math lands the next slot correctly. A server `retry-after`
+/// defers to `now + retry_after` (capped). A 429 with no usable hint adds a flat
+/// [`RATE_LIMIT_MIN_BACKOFF_MS`] on top of the cadence. Everything else: no defer.
+fn next_slot_deferral(
+    rate_limited: bool,
+    retry_after: Option<Duration>,
+    interval_ms: u64,
+) -> IntervalMs {
+    let target_ms = match retry_after
+        .map(|ra| ra.as_millis() as u64)
+        .filter(|&ms| ms > 0)
+    {
+        Some(ms) => ms,
+        None if rate_limited => interval_ms.saturating_add(RATE_LIMIT_MIN_BACKOFF_MS),
+        None => 0,
+    };
+    IntervalMs::from_millis(
+        target_ms
+            .min(MAX_RETRY_AFTER_MS)
+            .saturating_sub(interval_ms),
+    )
+}
+
+/// Deterministic per-profile spread (phase offset + per-cycle jitter) added to a
+/// live fetch's `last_fetched` stamp so distinct profiles don't fall due on the
+/// same tick — avoiding a same-instant request burst against the shared host.
+/// Range `[0, interval/4)`. Keyed by `(name, now)`: the name separates profiles,
+/// `now` re-rolls the jitter each cycle; stable for a given stamp so the deadline
+/// never moves earlier mid-wait. Only widens the gap, never shortens it.
+fn deadline_spread(name: &str, now: EpochMs, interval_ms: u64) -> IntervalMs {
+    use std::hash::{Hash, Hasher};
+    let span = interval_ms / 4;
+    if span == 0 {
+        return IntervalMs::from_millis(0);
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    now.as_millis().hash(&mut h);
+    IntervalMs::from_millis(h.finish() % span)
 }
 
 /// Write one outcome into the shared stores. Disk cache written on every live response.
@@ -469,21 +532,24 @@ fn apply_outcome(
         }
     }
 
-    // Server-directed deferral: a 429's `retry-after` stamps this profile's
-    // slot `retry_after - interval` into the future, so `partition_due`'s
-    // fixed math (due + countdown at `stamp + interval_ms`) lands
-    // exactly on `now + retry_after` (capped). Not an adaptive learner — the
-    // cadence stays fixed; an explicit server hint defers one profile's next
-    // slot once.
-    let defer = IntervalMs::from_millis(outcome.retry_after.map_or(0, |ra| {
-        (ra.as_millis() as u64)
-            .min(MAX_RETRY_AFTER_MS)
-            .saturating_sub(interval_ms)
-    }));
+    // Server-directed deferral: a 429's `retry-after` lands the next slot on
+    // `now + retry_after` (capped); a 429 with no hint adds a flat 10s beyond
+    // the cadence; everything else keeps the cadence. Live fetches also get a
+    // per-profile spread so two profiles don't fall due on the same tick.
+    let rate_limited = matches!(outcome.status, FetchStatus::RateLimited);
+    let defer = next_slot_deferral(rate_limited, outcome.retry_after, interval_ms);
+    let spread = if outcome.from_fetch {
+        deadline_spread(&outcome.name, now, interval_ms)
+    } else {
+        IntervalMs::from_millis(0)
+    };
 
     // Both in one critical section — ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350).
     if let Ok(mut lf) = last_fetched.lock() {
-        lf.insert(outcome.name.clone(), now.saturating_add(defer));
+        lf.insert(
+            outcome.name.clone(),
+            now.saturating_add(defer).saturating_add(spread),
+        );
         if let Ok(mut st) = status.lock() {
             st.insert(outcome.name.clone(), outcome.status);
         }
@@ -690,7 +756,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.clone(), FetchStatus::Fresh);
                 }
-                stamp_last_fetched(&state.last_fetched, name, None, interval_ms);
+                stamp_last_fetched(&state.last_fetched, name, None, false, interval_ms);
             }
             Ok(Err(err)) => {
                 clear_activity(&state.activity, &name);
@@ -715,7 +781,13 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.clone(), status);
                 }
-                stamp_last_fetched(&state.last_fetched, name, retry_after, interval_ms);
+                stamp_last_fetched(
+                    &state.last_fetched,
+                    name,
+                    retry_after,
+                    matches!(status, FetchStatus::RateLimited),
+                    interval_ms,
+                );
             }
             Err(_) => {
                 // Worker panicked — clear slot so the spinner doesn't freeze.
@@ -734,13 +806,10 @@ fn stamp_last_fetched(
     last_fetched: &LastFetchedAt,
     name: String,
     retry_after: Option<Duration>,
+    rate_limited: bool,
     interval_ms: u64,
 ) {
-    let defer = IntervalMs::from_millis(retry_after.map_or(0, |ra| {
-        (ra.as_millis() as u64)
-            .min(MAX_RETRY_AFTER_MS)
-            .saturating_sub(interval_ms)
-    }));
+    let defer = next_slot_deferral(rate_limited, retry_after, interval_ms);
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(name, EpochMs::from_millis(now_ms()).saturating_add(defer));
     }

@@ -1,11 +1,27 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::lockorder::{RankedMutex, rank};
+
 const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
+
+/// Re-fetch `/profile` (plan / rate-limit tier) at most once per hour per
+/// profile. The tier rarely changes, so the steady usage poll reuses the cached
+/// plan and only hits `/profile` on first load, after a 401 rotation, once the
+/// hour lapses, or on a manual single-profile refresh (which expires this
+/// clock). Halves the steady request volume against the rate-limited host.
+const PROFILE_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// Per-profile epoch-ms of the last `/profile` fetch attempt — the TTL clock for
+/// the policy above. Process-global and leaf-ranked: locked and released
+/// entirely within the fetch decision, never nested under another tracked lock.
+static PROFILE_FETCHED: LazyLock<RankedMutex<HashMap<String, u64>, rank::ProfileTtl>> =
+    LazyLock::new(|| RankedMutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct UsageWindow {
@@ -217,27 +233,69 @@ fn get_json(url: &str, access_token: &str) -> std::result::Result<String, FetchE
         .map_err(|_| FetchError::Network)
 }
 
-pub(super) fn fetch_raw(access_token: &str) -> std::result::Result<UsageInfo, FetchError> {
+/// Mark `name`'s plan stale so the next fetch re-pulls `/profile` — the manual
+/// single-profile refresh (Usage `r` / action menu). A global "refresh all"
+/// deliberately does not call this, so it keeps reusing the cached plan.
+pub(crate) fn expire_profile_ttl(name: &str) {
+    if let Ok(mut m) = PROFILE_FETCHED.lock() {
+        m.remove(name);
+    }
+}
+
+/// Decide whether to fetch `/profile` this round and stamp the attempt. Fetches
+/// on a forced refresh (401 retry / manual single), on first load (no stamp yet,
+/// incl. each process start), or once the hourly TTL lapses. Stamping on attempt
+/// — success or failure alike — caps `/profile` at one hit per hour per profile,
+/// so a persistently failing endpoint can't turn into a per-tick storm (the plan
+/// is best-effort; a cold profile just shows no tier until the next hourly try).
+fn take_profile_fetch(name: &str, force: bool, now: u64) -> bool {
+    let fresh = PROFILE_FETCHED
+        .lock()
+        .ok()
+        .and_then(|m| m.get(name).copied())
+        .is_some_and(|t| now.saturating_sub(t) < PROFILE_TTL_MS);
+    let want = force || !fresh;
+    if want && let Ok(mut m) = PROFILE_FETCHED.lock() {
+        m.insert(name.to_string(), now);
+    }
+    want
+}
+
+/// Fetch `/usage`; fetch `/profile` only when [`take_profile_fetch`] says so,
+/// otherwise carry `prev_plan` forward. `force_profile` bypasses the TTL (used
+/// for the post-401-rotation retry). A `/profile` failure never drops usage —
+/// it falls back to `prev_plan`.
+pub(super) fn fetch_raw(
+    name: &str,
+    access_token: &str,
+    prev_plan: Option<PlanInfo>,
+    force_profile: bool,
+) -> std::result::Result<UsageInfo, FetchError> {
     let usage_text = get_json(USAGE_ENDPOINT, access_token)?;
     let raw: RawUsage = serde_json::from_str(&usage_text).map_err(|_| FetchError::Parse)?;
 
-    // Profile is best-effort: a stale token may 401 on /profile while /usage
-    // still serves cached numbers. A profile failure shouldn't drop usage.
-    let plan = get_json(PROFILE_ENDPOINT, access_token)
-        .ok()
-        .and_then(|text| serde_json::from_str::<RawProfile>(&text).ok())
-        .map(|p| PlanInfo {
-            organization_type: p
-                .organization
-                .as_ref()
-                .and_then(|o| o.organization_type.clone()),
-            rate_limit_tier: p
-                .organization
-                .as_ref()
-                .and_then(|o| o.rate_limit_tier.clone()),
-            has_max: p.account.as_ref().is_some_and(|a| a.has_claude_max),
-            has_pro: p.account.as_ref().is_some_and(|a| a.has_claude_pro),
-        });
+    let plan = if take_profile_fetch(name, force_profile, now_ms()) {
+        get_json(PROFILE_ENDPOINT, access_token)
+            .ok()
+            .and_then(|text| serde_json::from_str::<RawProfile>(&text).ok())
+            .map(|p| PlanInfo {
+                organization_type: p
+                    .organization
+                    .as_ref()
+                    .and_then(|o| o.organization_type.clone()),
+                rate_limit_tier: p
+                    .organization
+                    .as_ref()
+                    .and_then(|o| o.rate_limit_tier.clone()),
+                has_max: p.account.as_ref().is_some_and(|a| a.has_claude_max),
+                has_pro: p.account.as_ref().is_some_and(|a| a.has_claude_pro),
+            })
+            // Profile leg failed (transient / 401 on a stale token) — keep the
+            // prior plan rather than dropping it from the snapshot.
+            .or(prev_plan)
+    } else {
+        prev_plan
+    };
 
     Ok(UsageInfo {
         plan,

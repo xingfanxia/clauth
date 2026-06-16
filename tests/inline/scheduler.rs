@@ -316,14 +316,16 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
 /// A 429's `retry-after` hint defers the profile's next fetch slot: the
 /// `last_fetched` stamp lands `retry_after - interval` in the future so
 /// `partition_due` marks the profile due (and publishes its countdown) exactly
-/// at `now + retry_after`. No hint, a zero hint, or one shorter than the
-/// interval keeps the normal cadence; an absurd hint clamps to the ceiling.
+/// at `now + retry_after`. A 429 with no hint adds a flat 10s beyond the
+/// cadence; a zero or sub-interval hint keeps the cadence; an absurd hint clamps
+/// to the ceiling.
 #[test]
 fn retry_after_defers_next_fetch_slot() {
     use std::time::Duration;
 
     use super::{
-        FetchOutcome, FetchStatus, MAX_RETRY_AFTER_MS, StatusStore, apply_outcome, now_ms,
+        FetchOutcome, FetchStatus, MAX_RETRY_AFTER_MS, RATE_LIMIT_MIN_BACKOFF_MS, StatusStore,
+        apply_outcome, now_ms,
     };
 
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -388,7 +390,7 @@ fn retry_after_defers_next_fetch_slot() {
     );
     assert_eq!(due.len(), 1, "due once the deferred slot arrives");
 
-    // No hint → plain now stamp (normal cadence).
+    // No hint → flat 10s backoff beyond the cadence.
     let before = now_ms();
     apply_outcome(
         outcome("b", None),
@@ -398,7 +400,11 @@ fn retry_after_defers_next_fetch_slot() {
         REFRESH_INTERVAL_MS,
     );
     let after = now_ms();
-    assert!((before..=after).contains(&stamp("b")));
+    let floor = RATE_LIMIT_MIN_BACKOFF_MS;
+    assert!(
+        (before + floor..=after + floor).contains(&stamp("b")),
+        "a 429 with no retry-after defers a flat 10s past now"
+    );
 
     // Hint shorter than the interval → no extra deferral.
     let before = now_ms();
@@ -507,4 +513,46 @@ fn try_seed_recent_cache_seeds_fresh_only() {
         (before.saturating_sub(REFRESH_INTERVAL_MS)..=before).contains(&stamp.as_millis()),
         "last_fetched is stamped at the cache mtime, not now"
     );
+}
+
+/// `deadline_spread` separates profiles' fetch deadlines so they don't fall due
+/// on the same tick: bounded to `[0, interval/4)`, deterministic for a fixed
+/// `(name, now)`, varied across profiles and across cycles, and zero on a
+/// degenerate interval (no modulo-by-zero).
+#[test]
+fn deadline_spread_is_bounded_per_profile_and_per_cycle() {
+    use super::deadline_spread;
+
+    let interval = REFRESH_INTERVAL_MS;
+    let span = interval / 4;
+    let now = EpochMs::from_millis(1_700_000_000_000);
+    let sp = |name: &str, t: EpochMs| deadline_spread(name, t, interval).0;
+
+    // Bounded and deterministic.
+    assert!(sp("alpha", now) < span, "spread stays under interval/4");
+    assert_eq!(
+        sp("alpha", now),
+        sp("alpha", now),
+        "deterministic per (name, now)"
+    );
+
+    // Varies across profiles (8 distinct names can't all collide).
+    let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    let by_name: Vec<u64> = names.iter().map(|n| sp(n, now)).collect();
+    assert!(
+        by_name.iter().any(|&s| s != by_name[0]),
+        "distinct profiles get distinct phase offsets"
+    );
+
+    // Re-rolls per cycle (different `now` for the same name).
+    let by_cycle: Vec<u64> = (0..8)
+        .map(|i| sp("alpha", EpochMs::from_millis(1_700_000_000_000 + i * 7_000)))
+        .collect();
+    assert!(
+        by_cycle.iter().any(|&s| s != by_cycle[0]),
+        "the jitter re-rolls as the cycle advances"
+    );
+
+    // Degenerate interval → no spread.
+    assert_eq!(deadline_spread("alpha", now, 0).0, 0);
 }

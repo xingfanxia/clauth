@@ -1250,7 +1250,9 @@ impl App {
         }
     }
 
-    /// Queue every profile for an immediate re-fetch (Overview `r`).
+    /// Queue every profile for an immediate re-fetch (Overview `r`). Reuses each
+    /// profile's cached plan/tier — only the single-profile refresh re-pulls
+    /// `/profile`, keeping the global refresh light on the rate-limited host.
     pub(crate) fn manual_refresh(&self) {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let names: Vec<String> = self
@@ -1261,16 +1263,27 @@ impl App {
             .map(|e| e.name.clone())
             .collect();
         for name in names {
-            self.manual_refresh_one(&name);
+            self.enqueue_refetch(&name, false);
         }
     }
 
-    /// Queue a single profile for an immediate re-fetch (Usage `r`).
+    /// Queue a single profile for an immediate re-fetch (Usage `r` / action
+    /// menu), also re-pulling its `/profile` (plan / tier).
     pub(crate) fn manual_refresh_one(&self, name: &str) {
+        self.enqueue_refetch(name, true);
+    }
+
+    /// Mark a profile for an immediate re-fetch. `refresh_plan` expires the
+    /// `/profile` TTL so the next fetch re-pulls plan/tier — set for an explicit
+    /// single-profile refresh, cleared for the bulk refresh-all.
+    fn enqueue_refetch(&self, name: &str, refresh_plan: bool) {
         // Light the spinner immediately so the UI reflects the keypress.
         // Only when idle — don't clobber an in-flight switch/refresh marker.
         if is_idle(&self.activity, name) {
             mark_activity(&self.activity, name, ProfileActivity::Fetching);
+        }
+        if refresh_plan {
+            crate::usage::expire_profile_ttl(name);
         }
         if let Ok(mut q) = self.refetch_queue.lock() {
             q.insert(name.to_string());

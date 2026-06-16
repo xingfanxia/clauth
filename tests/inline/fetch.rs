@@ -165,3 +165,46 @@ fn ideal_pace_tracks_elapsed_window_fraction() {
         None
     );
 }
+
+/// `/profile` re-fetch policy: fetches on first load (no stamp yet) and on a
+/// `force` (401 retry), reuses the plan within the hourly TTL, re-pulls once it
+/// lapses, and `expire_profile_ttl` (manual single refresh) re-arms it. A
+/// persistently failing endpoint is still capped at one attempt per hour.
+#[test]
+fn take_profile_fetch_honors_ttl_force_and_expiry() {
+    let t0 = 1_000_000_000_000u64;
+
+    // First load (no stamp) → fetch; then the same name within the hour → reuse,
+    // even though the prior attempt may have failed to yield a plan.
+    assert!(
+        take_profile_fetch("ttl-first", false, t0),
+        "first load pulls /profile"
+    );
+    assert!(
+        !take_profile_fetch("ttl-first", false, t0 + 60_000),
+        "within the TTL the cached plan is reused — no per-tick re-pull"
+    );
+
+    // `force` overrides a fresh TTL (separate name to avoid cross-talk).
+    assert!(take_profile_fetch("ttl-force", false, t0));
+    assert!(
+        take_profile_fetch("ttl-force", true, t0 + 60_000),
+        "force (401 retry) re-pulls /profile despite a fresh TTL"
+    );
+
+    // Past the TTL → re-pull.
+    assert!(take_profile_fetch("ttl-stale", false, t0));
+    assert!(
+        take_profile_fetch("ttl-stale", false, t0 + PROFILE_TTL_MS + 1),
+        "a plan past the TTL is re-pulled"
+    );
+
+    // Manual single refresh expires the clock → re-pull even within the hour.
+    assert!(take_profile_fetch("ttl-expire", false, t0));
+    assert!(!take_profile_fetch("ttl-expire", false, t0 + 60_000));
+    expire_profile_ttl("ttl-expire");
+    assert!(
+        take_profile_fetch("ttl-expire", false, t0 + 120_000),
+        "expiring the TTL forces a re-pull"
+    );
+}

@@ -73,6 +73,9 @@ pub(crate) mod rank {
         /// `RotationGuard` (per-profile rotation flock). Held across HTTP, outermost.
         Rotation = 100;
         LastFetched = 200;
+        /// `/profile` re-fetch TTL clock in `usage::fetch`. Leaf — acquired and
+        /// released inside the profile-fetch decision, never under another lock.
+        ProfileTtl = 210;
         Tokens = 250;
         ThirdParty = 260;
         ThirdPartyUsageStore = 270;
