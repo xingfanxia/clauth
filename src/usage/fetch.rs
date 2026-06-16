@@ -130,6 +130,29 @@ pub(crate) fn ideal_pace_pct(label: &str, window: &UsageWindow, now_secs: i64) -
     Some(elapsed as f64 / duration as f64 * 100.0)
 }
 
+/// Average burn pace in %/day for `window`: utilization spread evenly over the
+/// time elapsed since the window opened (`resets_at − duration`). Unlike the
+/// recency-weighted recent-burn rate, this is anchored to the fixed window, so
+/// it is unaffected by account rotation (which makes a per-profile history jump
+/// to another account's utilization). `None` until `min_elapsed_secs` have
+/// elapsed — a freshly opened window would otherwise divide by ~0 — or when the
+/// window has no reset time or no fixed duration.
+pub(crate) fn window_avg_pace_per_day(
+    label: &str,
+    window: &UsageWindow,
+    now_secs: i64,
+    min_elapsed_secs: i64,
+) -> Option<f64> {
+    let duration = window_duration_secs(label)?;
+    let reset = iso_to_epoch_secs(window.resets_at.as_deref()?)?;
+    let remaining = (reset - now_secs).clamp(0, duration);
+    let elapsed = duration - remaining;
+    if elapsed < min_elapsed_secs {
+        return None;
+    }
+    Some(window.utilization / (elapsed as f64 / 86_400.0))
+}
+
 #[derive(Deserialize)]
 struct RawUsage {
     #[serde(default)]

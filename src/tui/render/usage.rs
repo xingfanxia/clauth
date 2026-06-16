@@ -149,17 +149,16 @@ fn build_usage_lines(
         .get(profile.name.as_str())
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
+    // 5-hour windows get the recency-weighted recent-burn rate (%/h) from
+    // history. 7-day windows instead use a window-anchored average pace (%/d)
+    // derived from `resets_at` in `collect_stats` — rotation-proof, where a
+    // history slope would jump on every account rotation.
     let mut window_rates: HashMap<String, Option<f64>> = HashMap::new();
     if let Some(u) = profile.usage.as_ref() {
         let five_h: Vec<_> = u
             .windows()
             .into_iter()
             .filter(|(l, _)| !l.starts_with("7d"))
-            .collect();
-        let seven_d: Vec<_> = u
-            .windows()
-            .into_iter()
-            .filter(|(l, _)| l.starts_with("7d"))
             .collect();
         if !five_h.is_empty() {
             window_rates.extend(crate::usage::compute_burn_rates_from_history(
@@ -170,26 +169,14 @@ fn build_usage_lines(
                 10 * 60 * 1000, // gap_cut_ms: cut idle gaps for short-horizon windows
             ));
         }
-        if !seven_d.is_empty() {
-            window_rates.extend(crate::usage::compute_burn_rates_from_history(
-                history,
-                &seven_d,
-                24 * 60 * 60 * 1000, // lookback_ms: last 1d of samples for %/d
-                3,                   // min_samples before a rate is shown
-                0,                   // gap_cut_ms: disabled for daily windows
-            ));
-        }
     }
 
-    // Populate burn rates, converting %/h → %/d for 7d windows.
+    // Fill the 5h recent-burn rate; the 7d average pace is already set by
+    // collect_stats.
     for stat in &mut stats {
-        stat.burn_rate = window_rates.get(&stat.label).and_then(|r| *r).map(|r| {
-            if stat.label.starts_with("7d") {
-                r * 24.0
-            } else {
-                r
-            }
-        });
+        if !stat.label.starts_with("7d") {
+            stat.burn_rate = window_rates.get(&stat.label).and_then(|r| *r);
+        }
     }
 
     if !show_estimates {
@@ -336,12 +323,20 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             .map(|r| format!("  resets in {r}"))
             .unwrap_or_default();
         let rate_unit = if label.starts_with("7d") { "d" } else { "h" };
+        // 7d windows show a window-anchored average pace (%/d) — util spread
+        // over the time elapsed since the weekly reset, immune to rotation.
+        // The 5h recent-burn rate is filled later from history.
+        let burn_rate = if label.starts_with("7d") {
+            crate::usage::window_avg_pace_per_day(label, w, now_secs, 60 * 60)
+        } else {
+            None
+        };
         stats.push(Stat {
             label: label.to_string(),
             pct,
             color: Style::default().fg(theme::util_color(pct)),
             trailing,
-            burn_rate: None,
+            burn_rate,
             rate_unit,
             pace_pct: ideal_pace_pct(label, w, now_secs),
         });

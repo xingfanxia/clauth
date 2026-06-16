@@ -166,6 +166,45 @@ fn ideal_pace_tracks_elapsed_window_fraction() {
     );
 }
 
+/// Window-anchored average pace = utilization spread over the time elapsed since
+/// the window opened, in %/day — rotation-proof because it reads only `resets_at`
+/// and the current utilization (no history). Gated below `min_elapsed_secs`, and
+/// `None` without a reset time or fixed duration.
+#[test]
+fn window_avg_pace_is_util_over_elapsed_days() {
+    let win = |util: f64, reset_secs: i64| UsageWindow {
+        utilization: util,
+        resets_at: Some(epoch_secs_to_iso(reset_secs)),
+    };
+    let duration = 7 * 86_400;
+
+    // 7d window 12h into the week at 21% → 21 / 0.5d = 42 %/d.
+    let reset = BASE_UTC + duration - 12 * 3600;
+    let pace = window_avg_pace_per_day(LABEL_7D, &win(21.0, reset), BASE_UTC, 3600).unwrap();
+    assert!((pace - 42.0).abs() < 1e-6, "12h/21% → 42 %/d, got {pace}");
+
+    // Freshly opened (30 min elapsed) is below the 1h floor → None, no divide-by-~0.
+    let reset = BASE_UTC + duration - 1800;
+    assert_eq!(
+        window_avg_pace_per_day(LABEL_7D, &win(5.0, reset), BASE_UTC, 3600),
+        None
+    );
+
+    // No reset time, or a label with no fixed window → None.
+    let no_reset = UsageWindow {
+        utilization: 21.0,
+        resets_at: None,
+    };
+    assert_eq!(
+        window_avg_pace_per_day(LABEL_7D, &no_reset, BASE_UTC, 3600),
+        None
+    );
+    assert_eq!(
+        window_avg_pace_per_day("extra", &win(21.0, BASE_UTC + 100), BASE_UTC, 3600),
+        None
+    );
+}
+
 /// `/profile` re-fetch policy: fetches on first load (no stamp yet) and on a
 /// `force` (401 retry), reuses the plan within the hourly TTL, re-pulls once it
 /// lapses, and `expire_profile_ttl` (manual single refresh) re-arms it. A
