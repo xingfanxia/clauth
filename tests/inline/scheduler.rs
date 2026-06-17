@@ -95,9 +95,9 @@ fn partition_due_excludes_refreshing() {
 
 // ── Panic-clear discipline ────────────────────────────────────────────────────
 
-/// The mark/join/clear discipline in fetch_all_into and spawn_refresher must
-/// clear the ActivityStore slot even when the worker panics — exercises the
-/// `Err(_)` arm of `h.join()` without real HTTP or a full scheduler.
+/// The scheduler tick's mark/join/clear discipline must clear the ActivityStore
+/// slot even when a fetch worker panics — exercises the `Err(_)` arm of
+/// `h.join()` without real HTTP or a full scheduler.
 #[test]
 fn activity_cleared_on_worker_panic() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -583,83 +583,77 @@ fn transient_errors_preserve_rate_limit_streak() {
     );
 }
 
-/// Startup cache gating: a profile whose disk cache is younger than one interval
-/// is seeded from disk (store + `Fresh` status + `last_fetched` at the cache
-/// mtime, so the scheduler's next slot lands one interval after the write).
-/// A stale or missing cache is left for the network fetch.
+/// Startup seed gating: a profile whose cached 5h window is still open is seeded
+/// from disk regardless of cache age (store + `Fresh` + `last_fetched` stamped at
+/// the cache mtime, so an old cache falls due for a prompt background refresh). A
+/// cache whose 5h window has reset, or a missing cache, is left for the scheduler.
 #[test]
-fn try_seed_recent_cache_seeds_fresh_only() {
+fn try_seed_recent_cache_seeds_open_window_only() {
     use std::time::{Duration, SystemTime};
 
-    use super::{FetchStatus, StatusStore, now_ms, try_seed_recent_cache};
+    use super::{FetchStatus, StatusStore, now_epoch_secs, now_ms, try_seed_recent_cache};
     use crate::profile::profile_subpath;
     use crate::testutil::{HomeSandbox, set_mtime};
-    use crate::usage::{UsageInfo, write_disk_cache};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, write_disk_cache};
 
     let _home = HomeSandbox::new();
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
 
-    // Fresh cache: written within the interval.
-    write_disk_cache("fresh", &UsageInfo::default());
-    let fresh_path = profile_subpath("fresh", "usage_cache.json").expect("fresh cache path");
-    set_mtime(&fresh_path, SystemTime::now());
+    let now_secs = now_epoch_secs();
+    let with_window = |reset_secs: i64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 12.0,
+            resets_at: Some(epoch_secs_to_iso(reset_secs)),
+        }),
+        ..Default::default()
+    };
 
-    // Stale cache: mtime well past one interval.
-    write_disk_cache("stale", &UsageInfo::default());
-    let stale_path = profile_subpath("stale", "usage_cache.json").expect("stale cache path");
+    // 5h window still open, but the cache itself is old (written 2h ago).
+    write_disk_cache("open", &with_window(now_secs + 3600));
+    let open_path = profile_subpath("open", "usage_cache.json").expect("open cache path");
     set_mtime(
-        &stale_path,
-        SystemTime::now() - Duration::from_millis(REFRESH_INTERVAL_MS * 10),
+        &open_path,
+        SystemTime::now() - Duration::from_secs(2 * 3600),
     );
 
-    let before = now_ms();
+    // 5h window already reset (in the past).
+    write_disk_cache("reset", &with_window(now_secs - 60));
+
     assert!(
-        try_seed_recent_cache(
-            &store,
-            &status,
-            &last_fetched,
-            "fresh",
-            before,
-            REFRESH_INTERVAL_MS
-        ),
-        "a cache younger than one interval seeds without a fetch"
+        try_seed_recent_cache(&store, &status, &last_fetched, "open", now_secs),
+        "an open 5h window seeds from cache even when the cache itself is old"
     );
     assert!(
-        !try_seed_recent_cache(
-            &store,
-            &status,
-            &last_fetched,
-            "stale",
-            before,
-            REFRESH_INTERVAL_MS
-        ),
-        "a stale cache is left for the network fetch"
+        !try_seed_recent_cache(&store, &status, &last_fetched, "reset", now_secs),
+        "a reset 5h window is left for the background fetch"
     );
     assert!(
-        !try_seed_recent_cache(
-            &store,
-            &status,
-            &last_fetched,
-            "missing",
-            before,
-            REFRESH_INTERVAL_MS
-        ),
-        "a missing cache is left for the network fetch"
+        !try_seed_recent_cache(&store, &status, &last_fetched, "missing", now_secs),
+        "a missing cache is left for the background fetch"
     );
 
-    assert!(store.lock().unwrap().contains_key("fresh"));
-    assert!(!store.lock().unwrap().contains_key("stale"));
+    assert!(store.lock().unwrap().contains_key("open"));
+    assert!(!store.lock().unwrap().contains_key("reset"));
+    assert!(!store.lock().unwrap().contains_key("missing"));
     assert_eq!(
-        status.lock().unwrap().get("fresh").copied(),
+        status.lock().unwrap().get("open").copied(),
         Some(FetchStatus::Fresh),
-        "recent cache surfaces as Fresh, not a staleness warning"
+        "a seeded open-window cache surfaces as Fresh, not a staleness warning"
     );
-    let stamp = last_fetched.lock().unwrap().get("fresh").copied().unwrap();
+    // Stamped at the cache mtime (2h ago), not now — so it falls due for a prompt
+    // background refresh on the scheduler's first tick.
+    let stamp = last_fetched
+        .lock()
+        .unwrap()
+        .get("open")
+        .copied()
+        .unwrap()
+        .as_millis();
     assert!(
-        (before.saturating_sub(REFRESH_INTERVAL_MS)..=before).contains(&stamp.as_millis()),
-        "last_fetched is stamped at the cache mtime, not now"
+        stamp < now_ms().saturating_sub(REFRESH_INTERVAL_MS),
+        "an old-but-open cache stamps last_fetched at its mtime, due for a background refresh"
     );
 }
 

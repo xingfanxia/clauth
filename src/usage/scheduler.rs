@@ -377,6 +377,16 @@ impl FetchOutcome {
     }
 }
 
+/// True iff `info`'s 5h usage window is still open — its reset time is in the
+/// future at `now_secs`. A windowless or unparseable snapshot is not live.
+fn five_hour_live(info: &UsageInfo, now_secs: i64) -> bool {
+    info.five_hour
+        .as_ref()
+        .and_then(|w| w.resets_at.as_deref())
+        .and_then(iso_to_epoch_secs)
+        .is_some_and(|resets_at| now_secs < resets_at)
+}
+
 /// True iff we hold a fetched usage entry for `name` whose 5h window is absent
 /// or already past its reset — the signal to open a fresh window. An ABSENT
 /// store entry (never fetched this run) returns false on purpose: fetch first,
@@ -389,25 +399,17 @@ fn window_lapsed(store: &UsageStore, name: &str, now_secs: i64) -> bool {
     let Some(info) = s.get(name) else {
         return false;
     };
-    let live = info
-        .five_hour
-        .as_ref()
-        .and_then(|w| w.resets_at.as_deref())
-        .and_then(iso_to_epoch_secs)
-        .is_some_and(|resets_at| now_secs < resets_at);
-    !live
+    !five_hour_live(info, now_secs)
 }
 
-/// Fetch one profile's usage. When `store` is `Some` (the periodic tick) and the
-/// profile opted into auto-start, open its 5h window first if the last-known
-/// window lapsed — kick (rotating once on 401 OR 429), mark the window open on
-/// success, then fetch with the possibly-rotated token. `fetch_all_into`
-/// (bootstrap / manual refresh) passes `None` so only the steady-state tick
-/// auto-starts.
+/// Fetch one profile's usage on the periodic tick. When the profile opted into
+/// auto-start, open its 5h window first if the last-known window lapsed — kick
+/// (rotating once on 401 OR 429), mark the window open on success, then fetch
+/// with the possibly-rotated token.
 fn run_fetch(
     config: &crate::profile::ConfigHandle,
     mut entry: TokenEntry,
-    store: Option<&UsageStore>,
+    store: &UsageStore,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
 ) -> FetchOutcome {
@@ -417,9 +419,7 @@ fn run_fetch(
     // entry (so the fetch below uses the fresh token, never re-spending) and the
     // returned outcome (so the tick syncs it into the live snapshot).
     let mut kick_rotated: Option<RotatedTokens> = None;
-    if entry.auto_start
-        && let Some(store) = store
-    {
+    if entry.auto_start {
         let now_secs = now_epoch_secs();
         if window_lapsed(store, &entry.name, now_secs) {
             let kicked = crate::oauth::auto_start_kick(
@@ -441,16 +441,12 @@ fn run_fetch(
         }
     }
 
-    // Prior plan for the TTL'd `/profile` policy: the live store on a periodic
-    // tick, the disk cache on bootstrap / manual-all (`store` is `None`). Read
-    // and released before the fetch so no lock is held across HTTP.
-    let prev_plan = match store {
-        Some(s) => s
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&entry.name).and_then(|i| i.plan.clone())),
-        None => load_disk_cache(&entry.name).and_then(|i| i.plan),
-    };
+    // Prior plan for the TTL'd `/profile` policy, read from the live store and
+    // released before the fetch so no lock is held across HTTP.
+    let prev_plan = store
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&entry.name).and_then(|i| i.plan.clone()));
 
     let mut outcome = fetch_with_rotation(
         config,
@@ -628,66 +624,53 @@ fn mark_window_open(store: &UsageStore, name: &str, now_secs: i64) {
     });
 }
 
-/// Startup usage load. A profile whose on-disk cache was written less than one
-/// refresh interval ago is seeded straight from disk (no network); the rest are
-/// fetched now via [`fetch_all_into`]. Skips the redundant API round-trip on a
-/// restart that lands inside the cadence window, while a long-idle restart still
-/// refreshes immediately.
-#[allow(clippy::too_many_arguments)]
+/// Startup usage seed — never blocks on HTTP. Each profile whose on-disk cache
+/// is still in its current 5h window is seeded straight from disk so the UI
+/// shows real numbers instantly; the background scheduler then refreshes it on
+/// the normal cadence (a cache older than one interval falls due on the first
+/// tick — see [`try_seed_recent_cache`]). A profile with a stale (post-reset) or
+/// missing cache is left unseeded and unstamped, so the scheduler fetches it
+/// fresh in the background on its first tick.
 pub(crate) fn bootstrap_fetch(
-    config: &crate::profile::ConfigHandle,
-    tokens: &[TokenEntry],
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
-    streaks: &RateLimitStreaks,
-    refetch: &RefetchQueue,
-    activity: &ActivityStore,
-    interval_ms: u64,
+    tokens: &[TokenEntry],
 ) {
-    let now = now_ms();
-    let stale: Vec<TokenEntry> = tokens
-        .iter()
-        .filter(|e| !try_seed_recent_cache(store, status, last_fetched, &e.name, now, interval_ms))
-        .cloned()
-        .collect();
-    fetch_all_into(
-        config,
-        &stale,
-        store,
-        status,
-        last_fetched,
-        streaks,
-        refetch,
-        activity,
-        interval_ms,
-    );
+    let now_secs = now_epoch_secs();
+    for entry in tokens {
+        try_seed_recent_cache(store, status, last_fetched, &entry.name, now_secs);
+    }
 }
 
-/// Seed `name` from its on-disk cache when that cache is younger than
-/// `interval_ms`, returning `true` (skip the fetch). The `last_fetched` slot is
-/// stamped at the cache's mtime, so `partition_due` schedules the next fetch at
-/// `mtime + interval` — the scheduler's fixed cadence carries on as if the cache
-/// write were the last fetch. Returns `false` (fetch now) on a stale or missing
-/// cache. Status is `Fresh`: the numbers are current within the cadence, so the
-/// UI shows the normal countdown rather than a staleness warning.
+/// Seed `name` from its on-disk cache while that cache's 5h window is still open
+/// (same window timeframe), returning `true`. The `last_fetched` slot is stamped
+/// at the cache's mtime, so `partition_due` resumes the fixed cadence from the
+/// last real write: a cache older than one interval falls due on the scheduler's
+/// first tick (a prompt background refresh), a fresh one waits out the remaining
+/// cadence. Returns `false` (leave it for the background fetch) when the cache is
+/// missing or its 5h window has reset — those numbers belong to a past window and
+/// must not be shown. Status is `Fresh`: the seeded numbers are current for this
+/// window, so the UI shows the normal countdown rather than a staleness warning.
 fn try_seed_recent_cache(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
     name: &str,
-    now_ms: u64,
-    interval_ms: u64,
+    now_secs: i64,
 ) -> bool {
     let Some(mtime) = cache_mtime_ms(name) else {
         return false;
     };
-    if now_ms.saturating_sub(mtime) >= interval_ms {
-        return false;
-    }
     let Some(info) = load_disk_cache(name) else {
         return false;
     };
+    // Same-timeframe rule: trust the cache only while its 5h window is still
+    // open. After it resets the utilization belongs to a past period, so leave
+    // the profile for the scheduler to fetch fresh.
+    if !five_hour_live(&info, now_secs) {
+        return false;
+    }
     if let Ok(mut s) = store.lock() {
         s.insert(name.to_string(), info);
     }
@@ -699,60 +682,6 @@ fn try_seed_recent_cache(
         }
     }
     true
-}
-
-/// Force-fetch all entries in parallel, bypassing the cadence. Drives bootstrap's
-/// stale set; blocks until all complete. Rotated tokens are dropped —
-/// `reload_if_state_changed` will pick them up from `credentials.json` shortly.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fetch_all_into(
-    config: &crate::profile::ConfigHandle,
-    tokens: &[TokenEntry],
-    store: &UsageStore,
-    status: &StatusStore,
-    last_fetched: &LastFetchedAt,
-    streaks: &RateLimitStreaks,
-    refetch: &RefetchQueue,
-    activity: &ActivityStore,
-    interval_ms: u64,
-) {
-    if tokens.is_empty() {
-        return;
-    }
-
-    // Mark all as Fetching before fan-out so the spinner covers the full window.
-    // Cleared per-name as each thread joins.
-    for entry in tokens {
-        mark_activity(activity, &entry.name, ProfileActivity::Fetching);
-    }
-
-    let handles: Vec<_> = tokens
-        .iter()
-        .cloned()
-        .map(|entry| {
-            let name = entry.name.clone();
-            let config = Arc::clone(config);
-            let refetch = Arc::clone(refetch);
-            let activity = Arc::clone(activity);
-            let h =
-                std::thread::spawn(move || run_fetch(&config, entry, None, &refetch, &activity));
-            (name, h)
-        })
-        .collect();
-
-    for (name, h) in handles {
-        match h.join() {
-            Ok(outcome) => {
-                clear_activity(activity, &outcome.name);
-                apply_outcome(outcome, store, status, last_fetched, streaks, interval_ms);
-            }
-            Err(_) => {
-                // Worker panicked. Clear the activity slot so the spinner doesn't
-                // freeze. No `OpResult` sender here so no toast is emitted.
-                clear_activity(activity, &name);
-            }
-        }
-    }
 }
 
 /// Collect third-party profiles that have a recognised provider and API key.
@@ -977,7 +906,7 @@ fn tick(state: &SchedulerState) {
                 let refetch_queue = Arc::clone(&state.refetch_queue);
                 let activity = Arc::clone(&state.activity);
                 let h = std::thread::spawn(move || {
-                    run_fetch(&config, entry, Some(&store), &refetch_queue, &activity)
+                    run_fetch(&config, entry, &store, &refetch_queue, &activity)
                 });
                 (name, h)
             })

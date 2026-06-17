@@ -985,21 +985,18 @@ impl App {
     }
 
     /// Spawn the bootstrap on a background thread (never blocks first paint).
-    /// Re-links credentials, then loads usage via `bootstrap_fetch` — recent
-    /// on-disk caches seed without a round-trip, only stale ones fetch; no
-    /// proactive token rotation (401-recovery is lazy). Posts
-    /// `StartupSignal::BootstrapDone` when done;
-    /// the UI thread then rebuilds the token snapshot, starts the scheduler,
-    /// applies usage, and runs the startup auto-switch.
+    /// Re-links credentials, then seeds usage via `bootstrap_fetch` — on-disk
+    /// caches still inside their 5h window seed instantly (no round-trip), while
+    /// stale/missing ones are left for the scheduler to fetch in the background.
+    /// No proactive token rotation (401-recovery is lazy). Posts
+    /// `StartupSignal::BootstrapDone` when done; the UI thread then rebuilds the
+    /// token snapshot, starts the scheduler, applies usage, and runs the startup
+    /// auto-switch.
     pub(crate) fn spawn_bootstrap(&self) {
         let config = Arc::clone(&self.config);
         let usage_store = Arc::clone(&self.usage_store);
         let usage_status = Arc::clone(&self.usage_status);
         let last_fetched = Arc::clone(&self.last_fetched);
-        let rate_limit_streaks = Arc::clone(&self.rate_limit_streaks);
-        let refetch_queue = Arc::clone(&self.refetch_queue);
-        let activity = Arc::clone(&self.activity);
-        let refresh_interval = Arc::clone(&self.refresh_interval);
         let done = BootstrapDoneGuard {
             bootstrap_active: Arc::clone(&self.bootstrap_active),
             startup_sender: self.startup_sender.clone(),
@@ -1021,23 +1018,14 @@ impl App {
                 let _ = link_profile_credentials(&active);
             }
 
-            let interval_ms = refresh_interval.load(Ordering::Relaxed);
             #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             let snapshot = collect_tokens(&config.lock().expect("config mutex poisoned").profiles);
-            bootstrap_fetch(
-                &config,
-                &snapshot,
-                &usage_store,
-                &usage_status,
-                &last_fetched,
-                &rate_limit_streaks,
-                &refetch_queue,
-                &activity,
-                interval_ms,
-            );
+            bootstrap_fetch(&usage_store, &usage_status, &last_fetched, &snapshot);
 
-            // 5h windows are armed by the windowless scan in `on_tick` after
-            // bootstrap clears `bootstrap_active` — no startup-only kick pass.
+            // Seeded-but-due and stale/missing profiles are fetched by the
+            // scheduler's first tick (started in `finish_bootstrap`); 5h windows
+            // are armed by the windowless scan in `on_tick` after bootstrap
+            // clears `bootstrap_active` — no startup-only fetch or kick pass.
         });
     }
 
