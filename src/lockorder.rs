@@ -72,10 +72,19 @@ pub(crate) mod rank {
     ranks! {
         /// `RotationGuard` (per-profile rotation flock). Held across HTTP, outermost.
         Rotation = 100;
+        /// Process-wide `/usage`+`/profile` request-spacing clock in `usage::fetch`.
+        /// Held only to reserve the next request slot, never across the sleep or
+        /// the HTTP round trip; ranked just inside `Rotation` because the
+        /// post-rotation retry reserves a slot while the rotation flock is held.
+        UsageThrottle = 150;
         LastFetched = 200;
         /// `/profile` re-fetch TTL clock in `usage::fetch`. Leaf — acquired and
         /// released inside the profile-fetch decision, never under another lock.
         ProfileTtl = 210;
+        /// Per-profile consecutive-429 streak driving exponential rate-limit
+        /// backoff in `usage::scheduler`. Leaf — bumped and released before the
+        /// `last_fetched`/`status` write in `apply_outcome`.
+        RateLimitStreak = 220;
         Tokens = 250;
         ThirdParty = 260;
         ThirdPartyUsageStore = 270;

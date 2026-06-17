@@ -110,17 +110,61 @@ fn epoch_to_iso_round_trips() {
     assert_eq!(epoch_secs_to_iso(-1), "1970-01-01T00:00:00+00:00");
 }
 
-/// `retry-after` parsing accepts only the delta-seconds form; the HTTP-date
-/// form and garbage are no-hint (`None`).
+/// `retry-after` parsing accepts the delta-seconds form and the IMF-fixdate
+/// HTTP-date form; a future date becomes the delay until it, a past date is
+/// `Duration::ZERO`, and garbage is no-hint (`None`).
 #[test]
-fn retry_after_parses_delta_seconds_only() {
+fn retry_after_parses_delta_seconds_and_http_date() {
     assert_eq!(parse_retry_after("5"), Some(Duration::from_secs(5)));
     assert_eq!(parse_retry_after(" 30 "), Some(Duration::from_secs(30)));
     assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
-    assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
     assert_eq!(parse_retry_after(""), None);
     assert_eq!(parse_retry_after("-5"), None);
     assert_eq!(parse_retry_after("1.5"), None);
+
+    // HTTP-date form, evaluated against a fixed instant for determinism.
+    // "Wed, 21 Oct 2015 07:28:00 GMT" == 1_445_412_480 epoch seconds.
+    let date = "Wed, 21 Oct 2015 07:28:00 GMT";
+    assert_eq!(
+        parse_retry_after_at(date, 1_445_412_480),
+        Some(Duration::ZERO)
+    );
+    assert_eq!(
+        parse_retry_after_at(date, 1_445_412_480 - 90),
+        Some(Duration::from_secs(90)),
+        "a future HTTP-date yields the delay until it"
+    );
+    assert_eq!(
+        parse_retry_after_at(date, 1_445_412_480 + 120),
+        Some(Duration::ZERO),
+        "a past HTTP-date saturates to zero"
+    );
+    // Malformed HTTP-dates are no-hint.
+    assert_eq!(
+        parse_retry_after_at("Wed, 21 Foo 2015 07:28:00 GMT", 0),
+        None
+    );
+    assert_eq!(parse_retry_after_at("21 Oct 2015 07:28:00 GMT", 0), None);
+    assert_eq!(
+        parse_retry_after_at("Wed, 21 Oct 2015 07:28:00 PST", 0),
+        None
+    );
+}
+
+/// `reserve_slot` spaces OAuth requests by `OAUTH_REQUEST_SPACING_MS`: a cold
+/// slot (now already past it) fires immediately, and a slot still ahead of now
+/// waits until it — each reservation advancing the slot by exactly one spacing.
+#[test]
+fn reserve_slot_spaces_requests() {
+    let now = 1_000_000u64;
+    // Cold slot in the past → fire now, reserve one spacing out.
+    let (next, wait) = reserve_slot(0, now);
+    assert_eq!(wait, 0);
+    assert_eq!(next, now + OAUTH_REQUEST_SPACING_MS);
+    // Slot already ahead of now → wait until it, advance by one more spacing.
+    let (next2, wait2) = reserve_slot(next, now);
+    assert_eq!(wait2, OAUTH_REQUEST_SPACING_MS);
+    assert_eq!(next2, next + OAUTH_REQUEST_SPACING_MS);
 }
 
 /// The ideal-pace marker tracks the fraction of the window already elapsed:

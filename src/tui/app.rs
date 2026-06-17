@@ -44,8 +44,8 @@ use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
     ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
-    OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RefetchQueue,
-    StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
+    OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RateLimitStreaks,
+    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
     ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageInfo, UsageStore,
     any_busy, bootstrap_fetch, clear_activity, collect_third_party_entries, is_idle, mark_activity,
     now_ms, spawn_refresher,
@@ -651,6 +651,8 @@ pub(crate) struct App {
     /// Sender side for startup workers.
     pub(crate) startup_sender: StartupSender,
     pub(crate) last_fetched: LastFetchedAt,
+    /// Per-profile consecutive-429 counters driving exponential usage-fetch backoff.
+    pub(crate) rate_limit_streaks: RateLimitStreaks,
     /// Scheduler-posted auto-switch decisions; drained in `on_tick`.
     pub(crate) pending_switch: PendingSwitch,
     /// Set by the scheduler when the whole chain is spent; `on_tick` drains it
@@ -783,6 +785,7 @@ struct WorkerHandles {
     next_refresh_per_profile: NextRefreshPerProfile,
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
+    rate_limit_streaks: RateLimitStreaks,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -803,6 +806,7 @@ impl WorkerHandles {
             next_refresh_per_profile: Arc::clone(&app.next_refresh_per_profile),
             activity: Arc::clone(&app.activity),
             last_fetched: Arc::clone(&app.last_fetched),
+            rate_limit_streaks: Arc::clone(&app.rate_limit_streaks),
             pending_switch: Arc::clone(&app.pending_switch),
             pending_switch_off: Arc::clone(&app.pending_switch_off),
             refetch_queue: Arc::clone(&app.refetch_queue),
@@ -825,6 +829,7 @@ impl App {
         let (op_sender, op_results) = std::sync::mpsc::channel::<OpResult>();
         let (startup_sender, startup_results) = std::sync::mpsc::channel::<StartupSignal>();
         let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+        let rate_limit_streaks: RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
         let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_switch_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
@@ -917,6 +922,7 @@ impl App {
             startup_results,
             startup_sender,
             last_fetched,
+            rate_limit_streaks,
             pending_switch,
             pending_switch_off,
             refetch_queue,
@@ -990,6 +996,7 @@ impl App {
         let usage_store = Arc::clone(&self.usage_store);
         let usage_status = Arc::clone(&self.usage_status);
         let last_fetched = Arc::clone(&self.last_fetched);
+        let rate_limit_streaks = Arc::clone(&self.rate_limit_streaks);
         let refetch_queue = Arc::clone(&self.refetch_queue);
         let activity = Arc::clone(&self.activity);
         let refresh_interval = Arc::clone(&self.refresh_interval);
@@ -1023,6 +1030,7 @@ impl App {
                 &usage_store,
                 &usage_status,
                 &last_fetched,
+                &rate_limit_streaks,
                 &refetch_queue,
                 &activity,
                 interval_ms,
@@ -1070,6 +1078,7 @@ impl App {
             h.next_refresh_per_profile,
             h.activity,
             h.last_fetched,
+            h.rate_limit_streaks,
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,

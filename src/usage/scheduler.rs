@@ -19,11 +19,17 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// can't starve a profile's refresh slot.
 const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
 
-/// Flat extra backoff applied after a 429 that carries no usable `retry-after`:
-/// the next slot lands one interval + this far out, so a rate-limited profile
-/// waits a little longer than the cadence. Not an escalating ladder — a single
-/// fixed step; a server-provided `retry-after` overrides it.
+/// Base extra backoff applied after a 429 that carries no usable `retry-after`:
+/// the first such 429 lands the next slot one interval + this far out. Successive
+/// 429s multiply it by [`RATE_LIMIT_BACKOFF_FACTOR`]; a server-provided
+/// `retry-after` overrides the whole ladder.
 const RATE_LIMIT_MIN_BACKOFF_MS: u64 = 10_000;
+
+/// Per-consecutive-429 multiplier on [`RATE_LIMIT_MIN_BACKOFF_MS`] when the
+/// server gives no usable `retry-after`: streak 1 → 10s, 2 → 30s, 3 → 90s, …,
+/// each capped by [`MAX_RETRY_AFTER_MS`]. Stops a sustained rate limit from being
+/// re-hit every cadence; the streak resets on the next live fetch.
+const RATE_LIMIT_BACKOFF_FACTOR: u64 = 3;
 
 /// Wall-clock instant in epoch-milliseconds. Distinct from [`IntervalMs`] so
 /// instants and spans can't be confused. `#[repr(transparent)]` keeps layout
@@ -65,6 +71,10 @@ pub(crate) type TokenList = Arc<RankedMutex<Vec<TokenEntry>, rank::Tokens>>;
 
 /// Per-profile epoch-ms of the last fetch attempt (cadence gating).
 pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, EpochMs>, rank::LastFetched>>;
+
+/// Per-profile count of consecutive 429s, driving exponential rate-limit backoff
+/// in [`apply_outcome`]. Reset on the next live fetch.
+pub(crate) type RateLimitStreaks = Arc<RankedMutex<HashMap<String, u32>, rank::RateLimitStreak>>;
 
 /// Names pushed here after a successful token rotation bypass the cadence on the next tick.
 pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, rank::RefetchQueue>>;
@@ -459,13 +469,23 @@ fn run_fetch(
     outcome
 }
 
+/// Extra backoff (ms) for the `streak`-th consecutive 429 with no usable hint:
+/// `base * factor^(streak - 1)`, saturating. The ceiling is applied by
+/// [`next_slot_deferral`].
+fn rate_limit_backoff_ms(streak: u32) -> u64 {
+    let exp = streak.saturating_sub(1);
+    RATE_LIMIT_MIN_BACKOFF_MS.saturating_mul(RATE_LIMIT_BACKOFF_FACTOR.saturating_pow(exp))
+}
+
 /// Deferral added to a profile's `last_fetched` stamp so `partition_due`'s fixed
 /// `stamp + interval` math lands the next slot correctly. A server `retry-after`
-/// defers to `now + retry_after` (capped). A 429 with no usable hint adds a flat
-/// [`RATE_LIMIT_MIN_BACKOFF_MS`] on top of the cadence. Everything else: no defer.
+/// defers to `now + retry_after` (capped). A 429 with no usable hint defers one
+/// interval + [`rate_limit_backoff_ms`] (which grows with the consecutive-429
+/// `streak`), capped at [`MAX_RETRY_AFTER_MS`]. Everything else: no defer.
 fn next_slot_deferral(
     rate_limited: bool,
     retry_after: Option<Duration>,
+    streak: u32,
     interval_ms: u64,
 ) -> IntervalMs {
     let target_ms = match retry_after
@@ -473,7 +493,7 @@ fn next_slot_deferral(
         .filter(|&ms| ms > 0)
     {
         Some(ms) => ms,
-        None if rate_limited => interval_ms.saturating_add(RATE_LIMIT_MIN_BACKOFF_MS),
+        None if rate_limited => interval_ms.saturating_add(rate_limit_backoff_ms(streak)),
         None => 0,
     };
     IntervalMs::from_millis(
@@ -501,12 +521,36 @@ fn deadline_spread(name: &str, now: EpochMs, interval_ms: u64) -> IntervalMs {
     IntervalMs::from_millis(h.finish() % span)
 }
 
+/// Update `name`'s consecutive-429 streak from a fetch `status`, returning the
+/// post-update count. `Fresh` clears it (a live body breaks the storm),
+/// `RateLimited` increments it, and a transient `Cached`/`Failed` leaves it as
+/// is — a network blip mid-storm must not reset the ramp. Leaf lock, taken and
+/// released before the caller writes `last_fetched`/`status`.
+fn update_rate_limit_streak(streaks: &RateLimitStreaks, name: &str, status: FetchStatus) -> u32 {
+    let Ok(mut m) = streaks.lock() else {
+        return 0;
+    };
+    match status {
+        FetchStatus::Fresh => {
+            m.remove(name);
+            0
+        }
+        FetchStatus::RateLimited => {
+            let n = m.entry(name.to_string()).or_insert(0);
+            *n = n.saturating_add(1);
+            *n
+        }
+        FetchStatus::Cached | FetchStatus::Failed => m.get(name).copied().unwrap_or(0),
+    }
+}
+
 /// Write one outcome into the shared stores. Disk cache written on every live response.
 fn apply_outcome(
     outcome: FetchOutcome,
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
+    streaks: &RateLimitStreaks,
     interval_ms: u64,
 ) {
     let now = EpochMs::from_millis(now_ms());
@@ -533,11 +577,12 @@ fn apply_outcome(
     }
 
     // Server-directed deferral: a 429's `retry-after` lands the next slot on
-    // `now + retry_after` (capped); a 429 with no hint adds a flat 10s beyond
-    // the cadence; everything else keeps the cadence. Live fetches also get a
-    // per-profile spread so two profiles don't fall due on the same tick.
+    // `now + retry_after` (capped); a 429 with no hint backs off exponentially by
+    // the consecutive-429 count; everything else keeps the cadence. Live fetches
+    // also get a per-profile spread so two profiles don't fall due on the same tick.
     let rate_limited = matches!(outcome.status, FetchStatus::RateLimited);
-    let defer = next_slot_deferral(rate_limited, outcome.retry_after, interval_ms);
+    let streak = update_rate_limit_streak(streaks, &outcome.name, outcome.status);
+    let defer = next_slot_deferral(rate_limited, outcome.retry_after, streak, interval_ms);
     let spread = if outcome.from_fetch {
         deadline_spread(&outcome.name, now, interval_ms)
     } else {
@@ -595,6 +640,7 @@ pub(crate) fn bootstrap_fetch(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
+    streaks: &RateLimitStreaks,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
     interval_ms: u64,
@@ -611,6 +657,7 @@ pub(crate) fn bootstrap_fetch(
         store,
         status,
         last_fetched,
+        streaks,
         refetch,
         activity,
         interval_ms,
@@ -664,6 +711,7 @@ pub(crate) fn fetch_all_into(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
+    streaks: &RateLimitStreaks,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
     interval_ms: u64,
@@ -696,7 +744,7 @@ pub(crate) fn fetch_all_into(
         match h.join() {
             Ok(outcome) => {
                 clear_activity(activity, &outcome.name);
-                apply_outcome(outcome, store, status, last_fetched, interval_ms);
+                apply_outcome(outcome, store, status, last_fetched, streaks, interval_ms);
             }
             Err(_) => {
                 // Worker panicked. Clear the activity slot so the spinner doesn't
@@ -809,7 +857,9 @@ fn stamp_last_fetched(
     rate_limited: bool,
     interval_ms: u64,
 ) {
-    let defer = next_slot_deferral(rate_limited, retry_after, interval_ms);
+    // Third-party providers are independent hosts with their own limits; keep the
+    // flat base backoff (streak 1) rather than the per-account exponential ramp.
+    let defer = next_slot_deferral(rate_limited, retry_after, 1, interval_ms);
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(name, EpochMs::from_millis(now_ms()).saturating_add(defer));
     }
@@ -865,6 +915,7 @@ pub(crate) struct SchedulerState {
     next_refresh_per_profile: NextRefreshPerProfile,
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
+    rate_limit_streaks: RateLimitStreaks,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -949,6 +1000,7 @@ fn tick(state: &SchedulerState) {
                         &state.store,
                         &state.status,
                         &state.last_fetched,
+                        &state.rate_limit_streaks,
                         interval_ms,
                     );
                 }
@@ -1011,6 +1063,7 @@ pub(crate) fn spawn_refresher(
     next_refresh_per_profile: NextRefreshPerProfile,
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
+    rate_limit_streaks: RateLimitStreaks,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -1028,6 +1081,7 @@ pub(crate) fn spawn_refresher(
         next_refresh_per_profile,
         activity,
         last_fetched,
+        rate_limit_streaks,
         pending_switch,
         pending_switch_off,
         refetch_queue,

@@ -23,6 +23,50 @@ const PROFILE_TTL_MS: u64 = 60 * 60 * 1000;
 static PROFILE_FETCHED: LazyLock<RankedMutex<HashMap<String, u64>, rank::ProfileTtl>> =
     LazyLock::new(|| RankedMutex::new(HashMap::new()));
 
+/// Minimum spacing between consecutive requests to the Anthropic OAuth endpoints
+/// (`/usage` + `/profile`), enforced process-wide. Every profile authenticates
+/// with the same OAuth client from one host, so the endpoint's rate limit is
+/// effectively a shared bucket; serializing requests this far apart stops a
+/// same-instant multi-profile burst (startup, refetch-queue drains) from tripping
+/// a 429. Steady polling sits well below this rate, so it only bites on bursts.
+const OAUTH_REQUEST_SPACING_MS: u64 = 5_000;
+
+/// Earliest epoch-ms the next OAuth request may fire. Each caller reserves the
+/// next free slot (advancing this by [`OAUTH_REQUEST_SPACING_MS`]) and sleeps
+/// until it. Leaf-ranked and held only to reserve the slot — never across the
+/// sleep or the HTTP round trip.
+static NEXT_REQUEST_SLOT: LazyLock<RankedMutex<u64, rank::UsageThrottle>> =
+    LazyLock::new(|| RankedMutex::new(0));
+
+/// Pure slot reservation: from the current earliest-allowed slot and `now`,
+/// return `(advanced_slot, wait_ms)` — the slot reserved for the next caller
+/// (one [`OAUTH_REQUEST_SPACING_MS`] past this caller's fire time) and how long
+/// this caller must wait for its own slot.
+fn reserve_slot(current_slot: u64, now: u64) -> (u64, u64) {
+    let fire_at = current_slot.max(now);
+    (
+        fire_at.saturating_add(OAUTH_REQUEST_SPACING_MS),
+        fire_at.saturating_sub(now),
+    )
+}
+
+/// Block until this caller's spacing slot, reserving the following slot for the
+/// next caller. A poisoned lock skips throttling rather than stalling the fetch.
+fn await_request_slot() {
+    let now = now_ms();
+    let wait_ms = {
+        let Ok(mut slot) = NEXT_REQUEST_SLOT.lock() else {
+            return;
+        };
+        let (next, wait) = reserve_slot(*slot, now);
+        *slot = next;
+        wait
+    };
+    if wait_ms > 0 {
+        std::thread::sleep(Duration::from_millis(wait_ms));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct UsageWindow {
     pub(crate) utilization: f64,
@@ -206,10 +250,61 @@ pub(super) enum FetchError {
     Parse,
 }
 
-/// Parse a `retry-after` header value in delta-seconds form. The HTTP-date
-/// form (and anything else non-numeric) returns `None` — no hint.
+/// Parse a `retry-after` header value into a delay from now. Accepts the
+/// delta-seconds form (`120`) and the IMF-fixdate HTTP-date form
+/// (`Wed, 21 Oct 2015 07:28:00 GMT`); a past date yields `Duration::ZERO` and
+/// anything else returns `None` — no usable hint.
 pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
-    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+    parse_retry_after_at(value, now_epoch_secs())
+}
+
+/// Pure core of [`parse_retry_after`] taking the reference instant, so the
+/// HTTP-date branch is deterministic under test.
+pub(crate) fn parse_retry_after_at(value: &str, now_secs: i64) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let target = httpdate_to_epoch_secs(value)?;
+    Some(Duration::from_secs(
+        target.saturating_sub(now_secs).max(0) as u64
+    ))
+}
+
+/// Parse an HTTP-date in IMF-fixdate form (`Wed, 21 Oct 2015 07:28:00 GMT`) to
+/// Unix epoch seconds. The obsolete RFC-850 / asctime forms and anything
+/// malformed return `None`.
+fn httpdate_to_epoch_secs(value: &str) -> Option<i64> {
+    let mut parts = value.split_ascii_whitespace();
+    parts.next()?; // day-of-week (e.g. "Wed,") — unused
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts.next()?.parse().ok()?;
+    let mut hms = parts.next()?.split(':');
+    if parts.next()? != "GMT" || parts.next().is_some() {
+        return None;
+    }
+    let hour: i64 = hms.next()?.parse().ok()?;
+    let minute: i64 = hms.next()?.parse().ok()?;
+    let second: i64 = hms.next()?.parse().ok()?;
+    if hms.next().is_some() || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
@@ -232,6 +327,7 @@ pub(crate) fn http_agent() -> &'static ureq::Agent {
 }
 
 fn get_json(url: &str, access_token: &str) -> std::result::Result<String, FetchError> {
+    await_request_slot();
     let mut response = AGENT
         .get(url)
         .header("Authorization", &format!("Bearer {access_token}"))
@@ -423,16 +519,19 @@ pub(crate) fn iso_to_epoch_secs(s: &str) -> Option<i64> {
         sign * (tz_h * 3600 + tz_m * 60)
     };
 
-    // Howard Hinnant's days-from-civil — yields days since 1970-01-01.
+    let days = days_from_civil(year, month, day);
+    Some(days * 86400 + hour * 3600 + minute * 60 + second - tz_offset_secs)
+}
+
+/// Howard Hinnant's days-from-civil: days since 1970-01-01 for a proleptic
+/// Gregorian `(year, month, day)`. Shared by the ISO-8601 and HTTP-date parsers.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
-    let m = month;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-
-    Some(days * 86400 + hour * 3600 + minute * 60 + second - tz_offset_secs)
+    era * 146097 + doe - 719468
 }
 
 /// Format Unix epoch seconds as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS+00:00`) —

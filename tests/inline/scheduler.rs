@@ -135,6 +135,7 @@ fn cached_fallback_does_not_clobber_store() {
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
 
     let live = UsageInfo {
         five_hour: Some(UsageWindow {
@@ -158,6 +159,7 @@ fn cached_fallback_does_not_clobber_store() {
         &store,
         &status,
         &last_fetched,
+        &streaks,
         REFRESH_INTERVAL_MS,
     );
     assert!(
@@ -183,6 +185,7 @@ fn cached_fallback_does_not_clobber_store() {
         &store,
         &status,
         &last_fetched,
+        &streaks,
         REFRESH_INTERVAL_MS,
     );
     assert!(
@@ -331,6 +334,7 @@ fn retry_after_defers_next_fetch_slot() {
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
     let outcome = |name: &str, retry_after: Option<Duration>| FetchOutcome {
         name: name.to_string(),
         info: None,
@@ -356,6 +360,7 @@ fn retry_after_defers_next_fetch_slot() {
         &store,
         &status,
         &last_fetched,
+        &streaks,
         REFRESH_INTERVAL_MS,
     );
     let after = now_ms();
@@ -397,6 +402,7 @@ fn retry_after_defers_next_fetch_slot() {
         &store,
         &status,
         &last_fetched,
+        &streaks,
         REFRESH_INTERVAL_MS,
     );
     let after = now_ms();
@@ -413,6 +419,7 @@ fn retry_after_defers_next_fetch_slot() {
         &store,
         &status,
         &last_fetched,
+        &streaks,
         REFRESH_INTERVAL_MS,
     );
     let after = now_ms();
@@ -425,6 +432,7 @@ fn retry_after_defers_next_fetch_slot() {
         &store,
         &status,
         &last_fetched,
+        &streaks,
         REFRESH_INTERVAL_MS,
     );
     let after = now_ms();
@@ -432,6 +440,146 @@ fn retry_after_defers_next_fetch_slot() {
     assert!(
         (before + capped..=after + capped).contains(&stamp("d")),
         "huge retry-after clamps to MAX_RETRY_AFTER_MS"
+    );
+}
+
+/// Consecutive 429s with no `retry-after` back off exponentially (10s → 30s →
+/// 90s past now), and a live fetch resets the streak so the next 429 starts at
+/// the base again.
+#[test]
+fn consecutive_rate_limits_back_off_exponentially() {
+    use super::{
+        FetchOutcome, FetchStatus, RATE_LIMIT_BACKOFF_FACTOR, RATE_LIMIT_MIN_BACKOFF_MS,
+        StatusStore, apply_outcome, now_ms,
+    };
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let rate_limited = |from_fetch: bool, status: FetchStatus| FetchOutcome {
+        name: "a".to_string(),
+        info: None,
+        status,
+        rotated: None,
+        from_fetch,
+        retry_after: None,
+    };
+    let stamp = || {
+        last_fetched
+            .lock()
+            .unwrap()
+            .get("a")
+            .copied()
+            .expect("stamp present")
+            .as_millis()
+    };
+
+    // No retry-after: each consecutive 429 lands the slot one interval + a
+    // growing backoff out, i.e. the stamp sits `base * factor^(n-1)` past now.
+    // Derived from the constants so retuning the factor can't leave it stale.
+    let base = RATE_LIMIT_MIN_BACKOFF_MS;
+    let f = RATE_LIMIT_BACKOFF_FACTOR;
+    for expect in [base, base * f, base * f * f] {
+        let before = now_ms();
+        apply_outcome(
+            rate_limited(false, FetchStatus::RateLimited),
+            &store,
+            &status,
+            &last_fetched,
+            &streaks,
+            REFRESH_INTERVAL_MS,
+        );
+        let after = now_ms();
+        assert!(
+            (before + expect..=after + expect).contains(&stamp()),
+            "consecutive 429 backs off to {expect}ms past now"
+        );
+    }
+
+    // A live fetch resets the streak (info `None` so no disk write); the next
+    // 429 starts at the base backoff again.
+    apply_outcome(
+        rate_limited(true, FetchStatus::Fresh),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+    );
+    let before = now_ms();
+    apply_outcome(
+        rate_limited(false, FetchStatus::RateLimited),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+    );
+    let after = now_ms();
+    assert!(
+        (before + RATE_LIMIT_MIN_BACKOFF_MS..=after + RATE_LIMIT_MIN_BACKOFF_MS).contains(&stamp()),
+        "a live fetch resets the backoff streak"
+    );
+}
+
+/// A transient `Cached`/`Failed` outcome between two 429s must NOT reset the
+/// consecutive-429 streak — a network blip mid-storm should leave the ramp
+/// climbing (base → base*factor), not drop it back to the base.
+#[test]
+fn transient_errors_preserve_rate_limit_streak() {
+    use super::{
+        FetchOutcome, FetchStatus, RATE_LIMIT_BACKOFF_FACTOR, RATE_LIMIT_MIN_BACKOFF_MS,
+        StatusStore, apply_outcome, now_ms,
+    };
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = |kind: FetchStatus| FetchOutcome {
+        name: "a".to_string(),
+        info: None,
+        status: kind,
+        rotated: None,
+        from_fetch: false,
+        retry_after: None,
+    };
+    let apply = |kind: FetchStatus| {
+        apply_outcome(
+            outcome(kind),
+            &store,
+            &status,
+            &last_fetched,
+            &streaks,
+            REFRESH_INTERVAL_MS,
+        );
+    };
+    let stamp = || {
+        last_fetched
+            .lock()
+            .unwrap()
+            .get("a")
+            .copied()
+            .expect("stamp present")
+            .as_millis()
+    };
+
+    // 429 (streak 1), then transient errors that must leave the streak at 1.
+    apply(FetchStatus::RateLimited);
+    apply(FetchStatus::Cached);
+    apply(FetchStatus::Failed);
+
+    // Next 429 → streak 2 (not reset to 1) → base * factor.
+    let before = now_ms();
+    apply(FetchStatus::RateLimited);
+    let after = now_ms();
+    let expect = RATE_LIMIT_MIN_BACKOFF_MS * RATE_LIMIT_BACKOFF_FACTOR;
+    assert!(
+        (before + expect..=after + expect).contains(&stamp()),
+        "a Cached/Failed blip must not reset the 429 streak"
     );
 }
 
