@@ -83,7 +83,7 @@ fn live_session_excluded_when_force_false() {
 }
 
 #[test]
-fn live_session_included_when_force_true() {
+fn live_session_excluded_even_with_force_true() {
     let _home = HomeSandbox::new();
     let name = "test-oauth-live-session-force";
     let sessions = profile_dir(name).expect("profile_dir").join("sessions");
@@ -94,12 +94,10 @@ fn live_session_included_when_force_true() {
 
     let config = single_profile_config(name, "rt-jkl");
     let candidates = rotation_candidates(&config, true);
-    assert_eq!(
-        candidates.len(),
-        1,
-        "force=true should include a profile with a live session"
+    assert!(
+        candidates.is_empty(),
+        "a live session owns its single-use chain — never rotated, even under force"
     );
-    assert_eq!(candidates[0].0, name);
 
     drop(file);
 }
@@ -157,13 +155,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, _rx) = mpsc::channel();
 
-    let result = rotate_one_inner(
-        &config,
-        "test-rotate-one-no-rt",
-        Some(&activity),
-        &tx,
-        false,
-    );
+    let result = rotate_one_inner(&config, "test-rotate-one-no-rt", Some(&activity), &tx);
 
     assert!(
         matches!(result, RotateOutcome::Persisted(false)),
@@ -173,6 +165,73 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         is_idle(&activity, "test-rotate-one-no-rt"),
         "activity slot must remain Idle when rotation short-circuits at no-token"
     );
+}
+
+/// `rotate_one_inner` must never rotate a profile with a live `clauth start`
+/// session: its single-use chain is owned by that session, so our stored token
+/// is stale and a refresh would 400. It skips silently — `Persisted(false)`,
+/// activity Idle, no `OpResult` (the single-rotate caller messages up front).
+#[test]
+fn rotate_one_inner_skips_live_session() {
+    use std::collections::BTreeMap;
+    use std::sync::mpsc;
+
+    let _home = HomeSandbox::new();
+    let name = "test-rotate-one-live-session";
+    let sessions = profile_dir(name).expect("profile_dir").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create sessions dir");
+    let pid_file = sessions.join("test-pid");
+    let file = open_pid_file(&pid_file).expect("open pid file");
+    file.lock().expect("lock pid file");
+
+    let profile = Profile {
+        name: name.into(),
+        base_url: None,
+        api_key: None,
+        auto_start: false,
+        env: BTreeMap::new(),
+        fallback_threshold: None,
+        bell_threshold: None,
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at".to_string(),
+                refresh_token: Some("rt-live".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }),
+        usage: None,
+        fetch_status: None,
+        provider: None,
+        third_party_usage: None,
+    };
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.profiles.push(name.into());
+
+    let config = Arc::new(RankedMutex::new(config));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let (tx, rx) = mpsc::channel();
+
+    let result = rotate_one_inner(&config, name, Some(&activity), &tx);
+
+    assert!(
+        matches!(result, RotateOutcome::Persisted(false)),
+        "a live session must skip rotation (no stale-token refresh)"
+    );
+    assert!(
+        is_idle(&activity, name),
+        "a skipped rotation must leave the activity slot Idle"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the silent live-session skip must not emit an OpResult"
+    );
+
+    drop(file);
 }
 
 #[test]

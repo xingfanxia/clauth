@@ -3352,6 +3352,21 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             app.toast(ToastKind::Info, "rotating all tokens…");
         }
         ConfirmAction::RotateOne(name) => {
+            // A live `clauth start` session owns this profile's single-use OAuth
+            // chain and refreshes it itself, so our stored token is stale —
+            // rotating it would 400 ("refresh token not found or invalid").
+            // Refuse up front with a clear message; the in-guard `has_live_session`
+            // skip in `rotate_one_inner` is the authoritative backstop for a
+            // session that starts between this check and the rotation.
+            if crate::runtime::has_live_session(&name) {
+                app.toast(
+                    ToastKind::Warning,
+                    format!(
+                        "'{name}' is in use by a running session — its tokens are managed there"
+                    ),
+                );
+                return;
+            }
             // The per-profile RotationGuard inside rotate_one serialises against a
             // live session's own refresh, so unlike RotateAll this doesn't need the
             // global any_busy gate — a busy guard surfaces as a Danger toast.
@@ -3361,7 +3376,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             let sender = app.op_sender.clone();
             let target = name.clone();
             spawn_worker(move || {
-                oauth::rotate_one(&config, &target, &refetch, &activity, &sender, true);
+                oauth::rotate_one(&config, &target, &refetch, &activity, &sender);
             });
             app.toast(ToastKind::Info, format!("rotating '{name}'…"));
         }

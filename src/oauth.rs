@@ -269,22 +269,23 @@ enum RotateOutcome {
 /// PID file before releasing the guard; one that lost is blocked here until we
 /// finish and persist.
 ///
-/// `force` bypasses ONLY the `has_live_session` SKIP (user explicitly wants
-/// every account rotated, including one a live session touches); it never
-/// relaxes the mutual exclusion, still serialised against that session's own
-/// refresh of the same chain.
+/// A live session is ALWAYS skipped — never rotated, not even on a user-forced
+/// rotate. It owns the single-use refresh chain and advances it itself, so our
+/// stored token is stale; refreshing it would 400 ("refresh token not found or
+/// invalid"). `force` (a rotate-all concern, see `rotation_candidates`) governs
+/// only the diverged-active profile, never this safety skip.
 ///
 /// HTTP/persist leg emits one `OpResult { kind: Refreshing }` and clears the
 /// activity slot. Returns [`RotateOutcome::GuardBusy`] without emitting an
 /// `OpResult` when the lock can't be acquired (slot never pre-stamped here;
 /// `refresh_all` pre-stamps and clears it). No-refresh-token / skipped-live-
-/// session legs return [`RotateOutcome::Persisted(false)`].
+/// session legs return [`RotateOutcome::Persisted(false)`] silently (the live-
+/// session case is messaged up front by the single-rotate caller).
 fn rotate_one_inner(
     config: &crate::profile::ConfigHandle,
     name: &str,
     activity: Option<&ActivityStore>,
     sender: &OpResultSender,
-    force: bool,
 ) -> RotateOutcome {
     let Ok(_rotation_guard) = RotationGuard::acquire(name) else {
         return RotateOutcome::GuardBusy;
@@ -293,7 +294,13 @@ fn rotate_one_inner(
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
         with_state_lock(|| {
-            if !force && has_live_session(name) {
+            // A live `clauth start` session owns this profile's single-use OAuth
+            // chain and refreshes it itself, so our stored refresh token is
+            // already spent — rotating it 400s ("refresh token not found or
+            // invalid"). Never rotate a live session; this in-guard check is
+            // authoritative (a session that won the race stamped its PID before
+            // releasing the RotationGuard). Skipping returns Persisted(false).
+            if has_live_session(name) {
                 return Ok::<_, anyhow::Error>(None);
             }
             let rt = cfg
@@ -331,7 +338,9 @@ fn rotate_one_inner(
 
 /// Profiles `refresh_all` would rotate, as `(name, refresh_token)` pairs.
 /// Extracted so tests can pin the inclusion logic without the network.
-/// Diverged-active and live-session profiles are included only when `force`.
+/// Diverged-active profiles are included only when `force`; live-session
+/// profiles are ALWAYS excluded (a running session owns the single-use chain,
+/// so our stored token is stale — rotating it 400s, `force` or not).
 pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(String, String)> {
     // force=true (t-key rotate-all) bypasses diverged-active: user wants every
     // account rotated, including the one CC is touching.
@@ -343,7 +352,9 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Strin
             if skip_active && config.is_active(&p.name) {
                 return None;
             }
-            if !force && has_live_session(&p.name) {
+            // Never rotate a profile with a live `clauth start` session — its
+            // chain is owned and advanced by that session; force does not apply.
+            if has_live_session(&p.name) {
                 return None;
             }
             Some((p.name.to_string(), p.refresh_token()?.to_string()))
@@ -354,9 +365,10 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Strin
 /// Refreshes every profile's OAuth token pair (rotated pair saved to disk).
 /// Mirrors what Claude Code does silently on launch — minus the kick.
 ///
-/// Profiles without a stored refresh token are skipped. Network/revocation
-/// failures are swallowed per-profile; cached state stays put. `force` bypasses
-/// both the `has_live_session` and diverged-active guards.
+/// Profiles without a stored refresh token are skipped, as are profiles with a
+/// live `clauth start` session (always — they own their own chain). Network/
+/// revocation failures are swallowed per-profile; cached state stays put.
+/// `force` bypasses only the diverged-active guard.
 ///
 /// Returns the names whose rotation succeeded so the caller can target
 /// follow-up work (re-fetch, kick) at the same set, and pushes each onto
@@ -403,10 +415,10 @@ pub(crate) fn refresh_all(
             let h = std::thread::spawn(move || {
                 // Holds the per-profile RotationGuard across the HTTP window so
                 // an external `clauth start <name>` cannot double-spend this
-                // single-use token mid-rotation. `force` bypasses the
-                // `has_live_session` SKIP but NOT the mutual exclusion: a forced
-                // rotate must still not race a live session's own refresh.
-                let outcome = rotate_one_inner(&config, &name, Some(&activity), &sender, force);
+                // single-use token mid-rotation. A session that started after
+                // `rotation_candidates` snapshotted is caught by the in-guard
+                // `has_live_session` skip inside (returns Persisted(false)).
+                let outcome = rotate_one_inner(&config, &name, Some(&activity), &sender);
                 (name, outcome)
             });
             (name_for_handle, h)
@@ -446,24 +458,25 @@ pub(crate) fn refresh_all(
     refreshed
 }
 
-/// Force-rotate a single profile's OAuth token pair — one [`refresh_all`] worker
-/// leg, scoped to `name` (the action-menu "rotate tokens" on the focused account).
+/// Rotate a single profile's OAuth token pair — one [`refresh_all`] worker leg,
+/// scoped to `name` (the action-menu "rotate tokens" on the focused account).
 /// Same discipline: `rotate_one_inner` holds the per-profile RotationGuard across
-/// the HTTP window with a `has_live_session` re-check, so the single-use refresh
-/// token can't double-spend. On success the profile is pushed onto `refetch` so
-/// the next tick re-fetches its usage. Returns `true` when a new pair persisted.
+/// the HTTP window with a `has_live_session` skip, so a profile with a live
+/// `clauth start` session is never rotated (its stored token is stale — the
+/// caller refuses up front; this is the backstop). On success the profile is
+/// pushed onto `refetch` so the next tick re-fetches its usage. Returns `true`
+/// when a new pair persisted.
 pub(crate) fn rotate_one(
     config: &crate::profile::ConfigHandle,
     name: &str,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
     sender: &OpResultSender,
-    force: bool,
 ) -> bool {
     // Pre-stamp so the row shows a refresh spinner for the whole HTTP window;
     // rotate_one_inner clears the slot when it emits its OpResult.
     mark_activity(activity, name, ProfileActivity::Refreshing);
-    let persisted = match rotate_one_inner(config, name, Some(activity), sender, force) {
+    let persisted = match rotate_one_inner(config, name, Some(activity), sender) {
         RotateOutcome::Persisted(true) => true,
         // Guard-fail never emits an OpResult; surface the failure + clear, exactly
         // as refresh_all's join loop does for a busy guard.
