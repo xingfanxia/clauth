@@ -510,3 +510,120 @@ fn top_up_none_when_no_last_computed_date() {
     assert!(stats.topped_up_through.is_none());
     assert!(stats.daily.is_empty());
 }
+
+fn jsonl_line_with_ids(
+    timestamp: &str,
+    request_id: &str,
+    msg_id: &str,
+    model: &str,
+    input: u64,
+    output: u64,
+) -> String {
+    format!(
+        r#"{{"timestamp":"{timestamp}","requestId":"{request_id}","message":{{"id":"{msg_id}","model":"{model}","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+    )
+}
+
+#[test]
+fn top_up_counts_nested_subagent_transcripts() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+
+    write_stats_cache(
+        &claude_dir,
+        r#"{
+            "lastComputedDate": "2026-06-10",
+            "totalSessions": 0, "totalMessages": 0,
+            "dailyActivity": [], "dailyModelTokens": [],
+            "modelUsage": {}, "hourCounts": {}
+        }"#,
+    );
+
+    // Main-session transcript: projects/p1/sess.jsonl
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let main_path = proj_dir.join("sess.jsonl");
+    let main_line = jsonl_line("2026-06-11T10:00:00+00:00", "claude-opus-4", 100, 50, 0, 0);
+    std::fs::write(&main_path, format!("{main_line}\n")).expect("write main");
+    set_mtime(&main_path, SystemTime::now());
+
+    // Subagent/workflow transcript nested under <session>/subagents/.
+    let sub_dir = proj_dir.join("sess").join("subagents");
+    std::fs::create_dir_all(&sub_dir).expect("create subagents dir");
+    let sub_path = sub_dir.join("agent-x.jsonl");
+    let sub_line = jsonl_line("2026-06-11T10:05:00+00:00", "claude-opus-4", 300, 200, 0, 0);
+    std::fs::write(&sub_path, format!("{sub_line}\n")).expect("write subagent");
+    set_mtime(&sub_path, SystemTime::now());
+
+    let stats = load(&claude_dir).expect("load");
+
+    // Day total includes the nested subagent line: (100+50) + (300+200) = 650.
+    let day = stats
+        .daily
+        .iter()
+        .find(|d| d.date == "2026-06-11")
+        .expect("2026-06-11 must be in daily");
+    assert_eq!(day.tokens, 650);
+
+    let opus = stats
+        .models
+        .iter()
+        .find(|m| m.model == "claude-opus-4")
+        .expect("opus");
+    assert_eq!(opus.input, 400); // 100 + 300
+    assert_eq!(opus.output, 250); // 50 + 200
+}
+
+#[test]
+fn top_up_dedupes_same_message_across_files() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+
+    write_stats_cache(
+        &claude_dir,
+        r#"{
+            "lastComputedDate": "2026-06-10",
+            "totalSessions": 0, "totalMessages": 0,
+            "dailyActivity": [], "dailyModelTokens": [],
+            "modelUsage": {}, "hourCounts": {}
+        }"#,
+    );
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+
+    // Same (requestId, message.id) mirrored into two transcripts — e.g. a forked
+    // or resumed session copying a line forward. Must be counted exactly once.
+    let line = jsonl_line_with_ids(
+        "2026-06-11T10:00:00+00:00",
+        "req_1",
+        "msg_1",
+        "claude-opus-4",
+        100,
+        50,
+    );
+    let f1 = proj_dir.join("a.jsonl");
+    let f2 = proj_dir.join("b.jsonl");
+    std::fs::write(&f1, format!("{line}\n")).expect("write a");
+    std::fs::write(&f2, format!("{line}\n")).expect("write b");
+    set_mtime(&f1, SystemTime::now());
+    set_mtime(&f2, SystemTime::now());
+
+    let stats = load(&claude_dir).expect("load");
+
+    // Counted once: 100 + 50 = 150, not 300.
+    let day = stats
+        .daily
+        .iter()
+        .find(|d| d.date == "2026-06-11")
+        .expect("2026-06-11 must be in daily");
+    assert_eq!(day.tokens, 150);
+
+    let opus = stats
+        .models
+        .iter()
+        .find(|m| m.model == "claude-opus-4")
+        .expect("opus");
+    assert_eq!(opus.input, 100);
+    assert_eq!(opus.output, 50);
+}

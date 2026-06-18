@@ -6,18 +6,23 @@
 //! 1. **Base stats** — parsed from `~/.claude/stats-cache.json`, which Claude Code
 //!    maintains as a pre-aggregated lifetime snapshot. This is fast and always
 //!    available when the user has run Claude Code at least once.
-//! 2. **Live top-up** — appends recent days from `~/.claude/projects/*/*.jsonl`
-//!    transcripts whose mtime is strictly newer than the cache's `lastComputedDate`,
-//!    avoiding double-counting days already in the snapshot.
+//! 2. **Live top-up** — appends recent days from `~/.claude/projects/` transcripts
+//!    whose mtime is strictly newer than the cache's `lastComputedDate`, avoiding
+//!    double-counting days already in the snapshot. The sweep is recursive, so it
+//!    also reaches subagent and workflow transcripts nested under
+//!    `<session>/subagents/`, and deduplicates each assistant message by
+//!    `(requestId, message.id)` so a response mirrored into more than one file
+//!    (resumed/forked sessions, sidechain turns) is counted once.
 //!
 //! # Caveat
 //!
 //! `stats-cache.json` reflects **all** Claude Code usage across all profiles and
-//! accounts on this machine (global pool). The top-up reads only the JSONL files
+//! accounts on this machine (global pool). The top-up reads every JSONL file
 //! reachable via the home directory at load time, which may span all profiles if
 //! they share a home. This is intentional — the tokens tab shows aggregate usage.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -290,12 +295,15 @@ struct WireModelUsage {
 #[serde(default)]
 struct TranscriptLine {
     timestamp: Option<String>,
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
     message: Option<TranscriptMsg>,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct TranscriptMsg {
+    id: Option<String>,
     model: Option<String>,
     usage: Option<TranscriptUsage>,
 }
@@ -427,8 +435,37 @@ fn date_to_cutoff(date: &str) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
 }
 
-/// Best-effort live top-up from `projects/*/*.jsonl` files modified after the cutoff.
-/// Also accumulates `today_date`'s usage into `stats.today` (independent of the
+/// Recursively collect `*.jsonl` paths under `dir`, descending at most
+/// `max_depth` directory levels. Subagent and workflow transcripts are nested
+/// under `projects/<slug>/<session>/subagents/`, deeper than the main-session
+/// files, so a single-level read would miss them. `DirEntry::file_type` does not
+/// follow symlinks, so a symlinked directory is treated as a file and never
+/// recursed — this bounds the walk and avoids cycles.
+fn collect_jsonl(dir: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
+    if max_depth == 0 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_jsonl(&path, max_depth - 1, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            out.push(path);
+        }
+    }
+}
+
+/// Best-effort live top-up from every `*.jsonl` under `projects/` (recursive, so
+/// subagent and workflow transcripts count too) modified after the cutoff,
+/// deduplicated per assistant message by `(requestId, message.id)`. Also
+/// accumulates `today_date`'s usage into `stats.today` (independent of the
 /// historical cutoff, so it works even when the cache was computed today).
 fn top_up(
     claude_dir: &Path,
@@ -447,10 +484,6 @@ fn top_up(
     };
 
     let projects_dir = claude_dir.join("projects");
-    let proj_entries = match std::fs::read_dir(&projects_dir) {
-        Ok(it) => it,
-        Err(_) => return,
-    };
 
     // daily lookup by date for fast merge.
     let mut daily_map: HashMap<String, u64> = stats
@@ -476,46 +509,38 @@ fn top_up(
     // cost lens can price today per model (rates differ by family).
     let mut today_models: HashMap<String, ModelTokens> = HashMap::new();
 
-    for proj in proj_entries {
-        let proj = match proj {
-            Ok(e) => e,
-            Err(_) => continue,
+    // Usage lines already counted this pass, keyed by `(requestId, message.id)`.
+    // The same assistant response can appear in several transcripts (resumed or
+    // forked sessions copy lines forward; a sidechain turn is mirrored into its
+    // own subagent file), so this guards against counting one response twice.
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // Recursive sweep: main-session transcripts sit at `projects/<slug>/<id>.jsonl`,
+    // but subagent and workflow transcripts live deeper under
+    // `projects/<slug>/<session>/subagents/`, so a flat read would miss them.
+    let mut jsonl_paths: Vec<PathBuf> = Vec::new();
+    collect_jsonl(&projects_dir, 8, &mut jsonl_paths);
+
+    for path in &jsonl_paths {
+        // mtime guard: skip files not modified after the cutoff.
+        let mtime = match std::fs::metadata(path).ok().and_then(|m| m.modified().ok()) {
+            Some(t) => t,
+            None => continue,
         };
-        let jsonl_entries = match std::fs::read_dir(proj.path()) {
-            Ok(it) => it,
-            Err(_) => continue,
-        };
-        for jsonl in jsonl_entries {
-            let jsonl = match jsonl {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let path = jsonl.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            // mtime guard: skip files not modified after the cutoff.
-            let mtime = match std::fs::metadata(&path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-            {
-                Some(t) => t,
-                None => continue,
-            };
-            if mtime <= cutoff_st {
-                continue;
-            }
-            process_jsonl(
-                &path,
-                cutoff_date,
-                today_date,
-                &mut daily_map,
-                &mut model_map,
-                &mut today_acc,
-                &mut today_models,
-                &mut max_date,
-            );
+        if mtime <= cutoff_st {
+            continue;
         }
+        process_jsonl(
+            path,
+            cutoff_date,
+            today_date,
+            &mut daily_map,
+            &mut model_map,
+            &mut today_acc,
+            &mut today_models,
+            &mut max_date,
+            &mut seen,
+        );
     }
 
     // Publish today's rollup before any early return (it does not depend on the
@@ -563,8 +588,10 @@ fn top_up(
     stats.topped_up_through = max_date;
 }
 
-/// Process one JSONL file, updating `daily_map` and `model_map` for lines strictly
-/// after `cutoff_date`. Silently skips any parse errors.
+/// Process one JSONL file: historical days strictly after `cutoff_date` flow into
+/// `daily_map`/`model_map`, today's lines into `today`/`today_models`. `seen`
+/// deduplicates usage lines by `(requestId, message.id)` across the whole pass.
+/// Silently skips any parse errors.
 #[allow(clippy::too_many_arguments)]
 fn process_jsonl(
     path: &Path,
@@ -575,6 +602,7 @@ fn process_jsonl(
     today: &mut DaySummary,
     today_models: &mut HashMap<String, ModelTokens>,
     max_date: &mut Option<String>,
+    seen: &mut HashSet<String>,
 ) {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -606,6 +634,20 @@ fn process_jsonl(
             Some(u) => u,
             None => continue,
         };
+
+        // Dedupe by `(requestId, message.id)`: the same assistant response can be
+        // written to multiple transcripts, so count it once. Lines missing either
+        // id can't be keyed and are left to count as-is.
+        if let (Some(req), Some(id)) = (parsed.request_id.as_deref(), msg.id.as_deref()) {
+            let mut dedup_key = String::with_capacity(req.len() + id.len() + 1);
+            dedup_key.push_str(req);
+            dedup_key.push('\0');
+            dedup_key.push_str(id);
+            if !seen.insert(dedup_key) {
+                continue;
+            }
+        }
+
         let model_name = msg.model.as_deref().unwrap_or("unknown").to_owned();
 
         // Today's rollup — independent of the historical cutoff, so it is also
