@@ -12,7 +12,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::App;
 use super::super::theme;
-use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
+use super::format::{activity_verb, format_reset, reset_in_secs, spinner_frame, spinner_style};
 use super::panes::{
     SELECTOR_WIDTH, active_dot, draw_profile_selector, section_box, section_box_verbatim,
 };
@@ -215,21 +215,25 @@ struct Stat {
     /// Ideal-pace marker position as a percentage (0..=100), or `None` to draw
     /// no marker. Gated by `AppState.show_pace`; computed in [`collect_stats`].
     pace_pct: Option<f64>,
+    /// Seconds until this window resets, for the burn-ETA color cue. `None` when
+    /// the window carries no reset stamp (e.g. extra credits).
+    reset_secs: Option<i64>,
 }
 
 /// Seconds until the window hits 100% at the current burn rate.
 /// `rate` may be in %/h or %/d (determined by `rate_unit`).
-fn eta_left(rate: f64, pct: f64, rate_unit: &str) -> Option<String> {
+fn eta_left_secs(rate: f64, pct: f64, rate_unit: &str) -> Option<i64> {
     if rate <= 0.0 || pct >= 100.0 {
         return None;
     }
     let rate_per_h = if rate_unit == "d" { rate / 24.0 } else { rate };
     let hours = (100.0 - pct) / rate_per_h;
     let secs = (hours * 3600.0) as i64;
-    if secs <= 0 {
-        return None;
-    }
-    Some(crate::usage::humanize_duration(secs))
+    (secs > 0).then_some(secs)
+}
+
+fn eta_left(rate: f64, pct: f64, rate_unit: &str) -> Option<String> {
+    eta_left_secs(rate, pct, rate_unit).map(crate::usage::humanize_duration)
 }
 
 impl Stat {
@@ -283,8 +287,18 @@ impl Stat {
             let rate_str = format!("{:.1} %/{}", rate, self.rate_unit);
             label_spans.push(Span::styled(rate_str.clone(), rate_color));
 
-            if let Some(dur) = eta_left(rate, self.pct, self.rate_unit) {
-                label_spans.push(Span::styled(format!(" · {dur} left"), theme::faint()));
+            if let Some(eta_secs) = eta_left_secs(rate, self.pct, self.rate_unit) {
+                let dur = crate::usage::humanize_duration(eta_secs);
+                // Warn when the window hits 100% before it resets: you run dry
+                // before the limit refreshes. Faint when the reset lands first.
+                let runs_dry_first = self.reset_secs.is_some_and(|r| eta_secs < r);
+                let style = if runs_dry_first {
+                    theme::warning()
+                } else {
+                    theme::faint()
+                };
+                label_spans.push(Span::styled(" · ", theme::faint()));
+                label_spans.push(Span::styled(format!("{dur} left"), style));
             }
 
             let my_rate_w = self.rate_section_width();
@@ -339,6 +353,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             burn_rate,
             rate_unit,
             pace_pct: ideal_pace_pct(label, w, now_secs),
+            reset_secs: reset_in_secs(w),
         });
     }
     if let Some(extra) = &usage.extra_usage
@@ -359,6 +374,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             burn_rate: None,
             rate_unit: "h",
             pace_pct: None,
+            reset_secs: None,
         });
     }
     stats

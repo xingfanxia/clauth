@@ -123,11 +123,15 @@ pub(super) fn window_summary_spans_bracketed(
     }
 }
 
-pub(super) fn format_reset(window: &UsageWindow) -> Option<String> {
+/// Seconds until the window resets (may be negative if the stamp is overdue).
+pub(super) fn reset_in_secs(window: &UsageWindow) -> Option<i64> {
     let resets_at = window.resets_at.as_deref()?;
     let target = iso_to_epoch_secs(resets_at)?;
-    let secs = target - now_epoch_secs();
-    Some(crate::usage::humanize_duration(secs))
+    Some(target - now_epoch_secs())
+}
+
+pub(super) fn format_reset(window: &UsageWindow) -> Option<String> {
+    reset_in_secs(window).map(crate::usage::humanize_duration)
 }
 
 /// Relative age of an epoch-ms timestamp per the cloudy-tui Time-formatting

@@ -428,13 +428,18 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
     {
         let threshold = threshold_for(profile);
         let eta_secs = burn_rate_eta(app, active_name, usage_info, usage.utilization, threshold);
-        if let Some(secs) = eta_secs {
+        let reset_secs = super::format::reset_in_secs(usage);
+        // Only project a switch when the account crosses its threshold BEFORE the
+        // 5h window resets — past the reset the window refills and no switch fires.
+        if let Some(secs) = eta_secs
+            && reset_secs.is_none_or(|reset| secs < reset)
+        {
             match next_target(&cfg) {
                 Some(SwitchAction::To(target)) => {
                     lines.push(Line::from(vec![
                         Span::raw("  "),
                         Span::styled(
-                            format!("switching to {} in ~{}", target, humanize_duration(secs)),
+                            format!("switching to {target} in ~{}", humanize_duration(secs)),
                             theme::faint(),
                         ),
                     ]));
