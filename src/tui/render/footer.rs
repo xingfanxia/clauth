@@ -81,6 +81,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         ("a", "actions"),
                         ("?", "help"),
                     ],
+                    // The reveal chip has no `a` actions, so it isn't advertised.
+                    Some(ConfigRow::ModelOverrideAdd) => {
+                        &[("↑↓", "row"), ("↵", "add override"), ("?", "help")]
+                    }
                     _ => &[
                         ("↑↓", "row"),
                         ("↵", "edit / toggle"),

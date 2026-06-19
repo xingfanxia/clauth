@@ -291,7 +291,11 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::HaikuModel => &snap.haiku,
         ConfigRow::SubagentModel => &snap.subagent,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
-        ConfigRow::EnvAdd | ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => "",
+        ConfigRow::EnvAdd
+        | ConfigRow::ModelOverrideAdd
+        | ConfigRow::AutoStart
+        | ConfigRow::Delete
+        | ConfigRow::Create => "",
     }
 }
 
@@ -310,6 +314,9 @@ fn row_hint(row: ConfigRow) -> Option<&'static str> {
         ConfigRow::EnvEntry(_) => Some("custom env var merged into settings.json while active"),
         ConfigRow::EnvAdd => Some("add a custom settings.json env var to this account"),
         ConfigRow::AutoStart => Some("launch a session on idle to arm the 5h window"),
+        ConfigRow::ModelOverrideAdd => {
+            Some("pin what an alias resolves to, or force the subagent model")
+        }
         ConfigRow::Name | ConfigRow::Delete | ConfigRow::Create => None,
     }
 }
@@ -350,6 +357,10 @@ fn detail_row(
         // While editing, the typed text is the new key; at rest, the add chip.
         ConfigRow::EnvAdd if editing => kv_field(arrow, "key", input, editing, selected, false),
         ConfigRow::EnvAdd => Line::from(vec![arrow, Span::styled("+ add field", theme::accent())]),
+        ConfigRow::ModelOverrideAdd => Line::from(vec![
+            arrow,
+            Span::styled("+ model override", theme::accent()),
+        ]),
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
                 (theme::toggle_on().to_string(), theme::accent())

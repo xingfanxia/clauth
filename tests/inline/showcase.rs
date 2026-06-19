@@ -822,7 +822,7 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Up); // → 0 (personal)
     press(&mut app, KeyCode::Enter); // focus detail for personal
     // auto-start is the second-to-last row (before delete); wrap up to reach it
-    // without counting the model rows between api key and it.
+    // regardless of how many model/env rows sit above it.
     press(&mut app, KeyCode::Up); // Name → Delete (wraps to last)
     press(&mut app, KeyCode::Up); // Delete → AutoStart
     press(&mut app, KeyCode::Enter); // flip it

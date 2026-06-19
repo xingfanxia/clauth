@@ -386,6 +386,116 @@ mod env_editor {
         );
     }
 
+    fn app_with_profile(profile: Profile) -> App {
+        App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![profile],
+        })
+    }
+
+    #[test]
+    fn oauth_account_hides_api_key_keeps_auto_start() {
+        let app = app_with_env(BTreeMap::new()); // no base url → OAuth
+        let rows = config_rows(&app);
+        assert!(
+            !rows.contains(&ConfigRow::ApiKey),
+            "api key is meaningless without a base url"
+        );
+        assert!(
+            rows.contains(&ConfigRow::AutoStart),
+            "auto-start is the OAuth-only row"
+        );
+    }
+
+    #[test]
+    fn api_account_shows_api_key_drops_auto_start() {
+        let app = app_with_profile(Profile::new(
+            "acct".to_string(),
+            Some("https://api.test".to_string()),
+            Some("sk-test".to_string()),
+        ));
+        let rows = config_rows(&app);
+        assert!(
+            rows.contains(&ConfigRow::ApiKey),
+            "api key shows in API mode"
+        );
+        assert!(
+            !rows.contains(&ConfigRow::AutoStart),
+            "auto-start does not apply to API accounts"
+        );
+    }
+
+    #[test]
+    fn unset_overrides_collapse_behind_reveal_chip() {
+        let app = app_with_env(BTreeMap::new());
+        let rows = config_rows(&app);
+        assert!(
+            rows.contains(&ConfigRow::ModelOverrideAdd),
+            "the reveal chip stands in for the unset overrides"
+        );
+        for row in [
+            ConfigRow::OpusModel,
+            ConfigRow::SonnetModel,
+            ConfigRow::HaikuModel,
+            ConfigRow::SubagentModel,
+        ] {
+            assert!(
+                !rows.contains(&row),
+                "unset override is hidden while collapsed"
+            );
+        }
+    }
+
+    #[test]
+    fn set_override_renders_others_stay_collapsed() {
+        let mut profile = Profile::new("acct".to_string(), None, None);
+        profile.models.opus = Some("claude-opus-4-8".to_string());
+        let rows = config_rows(&app_with_profile(profile));
+        assert!(
+            rows.contains(&ConfigRow::OpusModel),
+            "a set override always renders"
+        );
+        assert!(
+            !rows.contains(&ConfigRow::SonnetModel),
+            "an unset sibling stays hidden"
+        );
+        assert!(
+            rows.contains(&ConfigRow::ModelOverrideAdd),
+            "the chip remains while any override is still unset"
+        );
+    }
+
+    #[test]
+    fn reveal_chip_expands_all_overrides() {
+        let mut app = app_with_env(BTreeMap::new());
+        enter_detail(&mut app);
+        let chip = config_rows(&app)
+            .iter()
+            .position(|r| *r == ConfigRow::ModelOverrideAdd)
+            .expect("reveal chip present while collapsed");
+        app.config_action_cursor = chip;
+        super::super::run_config_row(&mut app, ConfigRow::ModelOverrideAdd);
+        assert!(
+            app.config_draft
+                .as_ref()
+                .is_some_and(|d| d.overrides_expanded),
+            "⏎ on the chip expands the override block"
+        );
+        let rows = config_rows(&app);
+        for row in [
+            ConfigRow::OpusModel,
+            ConfigRow::SonnetModel,
+            ConfigRow::HaikuModel,
+            ConfigRow::SubagentModel,
+        ] {
+            assert!(rows.contains(&row), "every override shows once expanded");
+        }
+        assert!(
+            !rows.contains(&ConfigRow::ModelOverrideAdd),
+            "the chip is gone once expanded"
+        );
+    }
+
     #[test]
     fn add_field_with_managed_key_prompts_collision() {
         let _home = HomeSandbox::new();

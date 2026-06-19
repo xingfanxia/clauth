@@ -184,6 +184,9 @@ pub(crate) enum ConfigRow {
     HaikuModel,
     /// `CLAUDE_CODE_SUBAGENT_MODEL` — full id, free text.
     SubagentModel,
+    /// The `+ model override` reveal row. Shown only while the unset alias
+    /// overrides are collapsed; ⏎ expands opus/sonnet/haiku/subagent inline.
+    ModelOverrideAdd,
     /// A custom `key = value` env entry, indexed into the profile's sorted env
     /// snapshot. ⏎ edits the value inline; `a` → `remove field` deletes it.
     EnvEntry(usize),
@@ -257,6 +260,9 @@ pub(crate) struct ConfigDraft {
     pub(crate) active: Option<ConfigRow>,
     /// First ⏎ on delete arms it; second confirms. Any cursor move disarms.
     pub(crate) armed_delete: bool,
+    /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
+    /// collapsed (set overrides still render; unset ones hide behind the chip).
+    pub(crate) overrides_expanded: bool,
 }
 
 impl ConfigDraft {
@@ -277,6 +283,7 @@ impl ConfigDraft {
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
             ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
+            | ConfigRow::ModelOverrideAdd
             | ConfigRow::AutoStart
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
@@ -297,6 +304,7 @@ impl ConfigDraft {
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
             ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
+            | ConfigRow::ModelOverrideAdd
             | ConfigRow::AutoStart
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
@@ -2790,6 +2798,8 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                             actions.push(ActionMenuAction::EditField);
                             actions.push(ActionMenuAction::RemoveEnvField);
                         }
+                        // The reveal chip has no field to edit — `a` offers nothing.
+                        ConfigRow::ModelOverrideAdd => {}
                         _ => actions.push(ActionMenuAction::EditField),
                     }
                 }
@@ -3028,39 +3038,70 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
 /// settings (auto-start only for OAuth).
 pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     let cfg = app.config();
+    let draft = app.config_draft.as_ref();
     if app.profile_cursor >= cfg.profiles.len() {
-        return vec![
-            ConfigRow::Name,
-            ConfigRow::BaseUrl,
-            ConfigRow::ApiKey,
-            ConfigRow::Create,
-        ];
+        // `+ new` create form. The api key only means something once a base url
+        // makes this an API account, so it stays hidden until one is typed.
+        let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl];
+        if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
+            rows.push(ConfigRow::ApiKey);
+        }
+        rows.push(ConfigRow::Create);
+        return rows;
     }
-    let is_oauth = cfg
-        .profiles
-        .get(app.profile_cursor)
-        .map(|p| p.is_oauth())
-        .unwrap_or(true);
-    let mut rows = vec![
-        ConfigRow::Name,
-        ConfigRow::BaseUrl,
-        ConfigRow::ApiKey,
-        ConfigRow::Model,
+    let profile = cfg.profiles.get(app.profile_cursor);
+    // `is_api` tracks the base-url buffer live (draft wins): api key shows only
+    // in API mode, auto-start (OAuth-only) only when it's empty, so both flip the
+    // instant a base url is typed.
+    let is_api = match draft {
+        Some(d) => !d.base_url.value.trim().is_empty(),
+        None => profile.map(|p| !p.is_oauth()).unwrap_or(false),
+    };
+    let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl];
+    if is_api {
+        rows.push(ConfigRow::ApiKey);
+    }
+    rows.push(ConfigRow::Model);
+
+    // Alias overrides collapse: render the ones already set, tuck the rest behind
+    // a single `+ model override` reveal until ⏎ expands them (draft-scoped).
+    let expanded = draft.is_some_and(|d| d.overrides_expanded);
+    let override_set = |row: ConfigRow| match draft {
+        Some(d) => d.field(row).is_some_and(|i| !i.value.trim().is_empty()),
+        None => {
+            let v = match row {
+                ConfigRow::OpusModel => profile.and_then(|p| p.models.opus.as_deref()),
+                ConfigRow::SonnetModel => profile.and_then(|p| p.models.sonnet.as_deref()),
+                ConfigRow::HaikuModel => profile.and_then(|p| p.models.haiku.as_deref()),
+                ConfigRow::SubagentModel => profile.and_then(|p| p.models.subagent.as_deref()),
+                _ => None,
+            };
+            v.is_some_and(|s| !s.trim().is_empty())
+        }
+    };
+    let mut any_collapsed = false;
+    for row in [
         ConfigRow::OpusModel,
         ConfigRow::SonnetModel,
         ConfigRow::HaikuModel,
         ConfigRow::SubagentModel,
-    ];
+    ] {
+        if expanded || override_set(row) {
+            rows.push(row);
+        } else {
+            any_collapsed = true;
+        }
+    }
+    if any_collapsed {
+        rows.push(ConfigRow::ModelOverrideAdd);
+    }
+
     // One row per custom env entry (sorted), then the `+ add field` row. Indices
     // must match the sorted env snapshot used by the renderer and the commit path.
-    let env_count = cfg
-        .profiles
-        .get(app.profile_cursor)
-        .map(|p| p.env.len())
-        .unwrap_or(0);
+    let env_count = profile.map(|p| p.env.len()).unwrap_or(0);
     rows.extend((0..env_count).map(ConfigRow::EnvEntry));
     rows.push(ConfigRow::EnvAdd);
-    if is_oauth {
+    if !is_api {
         rows.push(ConfigRow::AutoStart);
     }
     rows.push(ConfigRow::Delete);
@@ -3104,6 +3145,7 @@ fn build_draft_new() -> ConfigDraft {
         env_new_key: InputState::new(""),
         active: None,
         armed_delete: false,
+        overrides_expanded: false,
     }
 }
 
@@ -3125,6 +3167,7 @@ fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
         env_new_key: InputState::new(""),
         active: None,
         armed_delete: false,
+        overrides_expanded: false,
     }
 }
 
@@ -3145,6 +3188,13 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         ConfigRow::EnvAdd => {
             enter_env_add_edit(app);
+            return;
+        }
+        ConfigRow::ModelOverrideAdd => {
+            // Reveal the unset alias-override rows inline; no buffer to seed.
+            if let Some(d) = app.config_draft.as_mut() {
+                d.overrides_expanded = true;
+            }
             return;
         }
         _ => {}
@@ -3259,9 +3309,11 @@ fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) ->
         ConfigRow::EnvEntry(i) => profile
             .and_then(|p| p.env.values().nth(i).cloned())
             .unwrap_or_default(),
-        ConfigRow::EnvAdd | ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => {
-            String::new()
-        }
+        ConfigRow::EnvAdd
+        | ConfigRow::ModelOverrideAdd
+        | ConfigRow::AutoStart
+        | ConfigRow::Delete
+        | ConfigRow::Create => String::new(),
     }
 }
 
