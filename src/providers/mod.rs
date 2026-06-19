@@ -14,6 +14,7 @@
 //! [`StatRow`]s that [`crate::tui::render::usage`] renders uniformly.
 
 mod deepseek;
+mod generic;
 
 use std::path::PathBuf;
 
@@ -44,6 +45,18 @@ impl Provider {
     }
 }
 
+/// What a third-party scheduler entry fetches against: a recognised provider
+/// (typed fetch) or an unrecognised api-key endpoint (generic discovery + scan).
+#[derive(Debug, Clone)]
+pub(crate) enum ThirdPartyTarget {
+    Known(Provider),
+    /// Generic api-key endpoint: usage is discovered + scanned at this base_url's
+    /// API origin (same host the key already authorises for completions).
+    Generic {
+        base_url: String,
+    },
+}
+
 /// `true` when `url` is exactly `base` or `base` followed by a real URL
 /// delimiter — path `/`, port `:`, query `?`, or fragment `#`
 /// (`https://api.deepseek.com`, `.../v1`, `...:443`), never a host extension
@@ -63,13 +76,34 @@ fn url_matches_host(url: &str, base: &str) -> bool {
     }
 }
 
-/// Fetch usage for a recognised provider. Dispatches to the right endpoint.
+/// Derive the API origin (`scheme://host[:port]`) from a base URL, dropping any
+/// path/query/fragment. The generic usage engine probes candidate endpoints
+/// against this origin only — the api_key never travels to a different host than
+/// the one it already authorises. `None` when the `://` scheme delimiter is absent.
+pub(crate) fn api_origin(base_url: &str) -> Option<String> {
+    let scheme_end = base_url.find("://")?;
+    let after = &base_url[scheme_end + 3..];
+    let auth_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    Some(format!(
+        "{}://{}",
+        &base_url[..scheme_end],
+        &after[..auth_end]
+    ))
+}
+
+/// Fetch usage for a third-party target. `hint` is the endpoint path that last
+/// yielded data (read from the in-memory store by the caller); only the generic
+/// arm uses it, to keep steady state at one request.
 pub(crate) fn fetch_third_party_usage(
-    provider: Provider,
+    target: &ThirdPartyTarget,
     api_key: &str,
+    hint: Option<&str>,
 ) -> Result<ThirdPartyStats, ThirdPartyError> {
-    match provider {
-        Provider::DeepSeek => deepseek::fetch(api_key),
+    match target {
+        ThirdPartyTarget::Known(provider) => match provider {
+            Provider::DeepSeek => deepseek::fetch(api_key),
+        },
+        ThirdPartyTarget::Generic { base_url } => generic::fetch(base_url, api_key, hint),
     }
 }
 
@@ -83,8 +117,30 @@ pub(crate) fn fetch_third_party_usage(
 pub(crate) struct ThirdPartyStats {
     /// `false` means the account can't make API calls (e.g. balance exhausted).
     pub(crate) is_available: bool,
-    /// Display rows in source order.
+    /// Text display rows in source order.
     pub(crate) rows: Vec<StatRow>,
+    /// Percentage-based usage windows rendered as bars (e.g. z.ai limits).
+    /// Empty for scalar/balance providers that use `rows` instead.
+    #[serde(default)]
+    pub(crate) bars: Vec<UsageBar>,
+    /// Plan/tier label for the header (e.g. "pro"), when the response carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plan: Option<String>,
+    /// Endpoint path that last yielded this data — the generic fetcher reuses it
+    /// next tick to skip re-probing. Recognised providers leave this `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) endpoint: Option<String>,
+}
+
+/// One percentage-based usage window for bar rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct UsageBar {
+    pub(crate) label: String,
+    /// 0..=100.
+    pub(crate) pct: f64,
+    /// ISO-8601 reset timestamp when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resets_at: Option<String>,
 }
 
 impl ThirdPartyStats {
@@ -92,6 +148,9 @@ impl ThirdPartyStats {
         Self {
             is_available: true,
             rows,
+            bars: Vec::new(),
+            plan: None,
+            endpoint: None,
         }
     }
 
@@ -103,6 +162,9 @@ impl ThirdPartyStats {
                 value: reason.to_string(),
                 kind: StatRowKind::Danger,
             }],
+            bars: Vec::new(),
+            plan: None,
+            endpoint: None,
         }
     }
 }

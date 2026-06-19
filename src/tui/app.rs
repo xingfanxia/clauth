@@ -1519,38 +1519,14 @@ fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
     profiles
         .iter()
         .filter_map(|p| {
-            // OAuth account: real access/refresh token pair against the Anthropic host.
-            if let Some(oauth) = p
-                .credentials
-                .as_ref()
-                .and_then(|c| c.claude_ai_oauth.as_ref())
-            {
-                return Some(TokenEntry {
-                    name: p.name.to_string(),
-                    base_url: None,
-                    access_token: oauth.access_token.clone(),
-                    refresh_token: oauth.refresh_token.clone(),
-                    auto_start: p.auto_start,
-                    access_expires_at: oauth.expires_at,
-                });
-            }
-            // API-key endpoint account (base_url set, not a recognised third-party
-            // provider): try the OAuth-shape usage endpoint against base_url using
-            // the key as the bearer. No refresh token, so a rejection silently bails
-            // to the no-usage view — this leg never rotates or spends a chain.
-            if !p.is_third_party()
-                && let Some(key) = p.api_key.clone()
-            {
-                return Some(TokenEntry {
-                    name: p.name.to_string(),
-                    base_url: p.base_url.clone(),
-                    access_token: key,
-                    refresh_token: None,
-                    auto_start: false,
-                    access_expires_at: None,
-                });
-            }
-            None
+            let oauth = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
+            Some(TokenEntry {
+                name: p.name.to_string(),
+                access_token: oauth.access_token.clone(),
+                refresh_token: oauth.refresh_token.clone(),
+                auto_start: p.auto_start,
+                access_expires_at: oauth.expires_at,
+            })
         })
         .collect()
 }

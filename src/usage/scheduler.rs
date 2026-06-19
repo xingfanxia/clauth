@@ -5,7 +5,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use crate::lockorder::{RankedMutex, rank};
-use crate::providers::{Provider, ThirdPartyStats};
+use crate::providers::ThirdPartyStats;
 
 use super::fetch::{
     FetchError, PlanInfo, UsageInfo, UsageWindow, cache_mtime_ms, epoch_secs_to_iso, fetch_raw,
@@ -91,9 +91,6 @@ pub(crate) type PendingSwitchOff = Arc<RankedMutex<bool, rank::PendingSwitchOff>
 #[derive(Clone)]
 pub(crate) struct TokenEntry {
     pub(crate) name: String,
-    /// `None` for OAuth profiles (always the Anthropic host). An API-key profile
-    /// carries its `base_url` so the usage fetch targets that endpoint instead.
-    pub(crate) base_url: Option<String>,
     pub(crate) access_token: String,
     pub(crate) refresh_token: Option<String>,
     /// Opted into auto-start: the periodic tick opens a 5h window for this
@@ -108,7 +105,7 @@ pub(crate) struct TokenEntry {
 #[derive(Clone)]
 pub(crate) struct ThirdPartyEntry {
     pub(crate) name: String,
-    pub(crate) provider: Provider,
+    pub(crate) target: crate::providers::ThirdPartyTarget,
     pub(crate) api_key: String,
 }
 
@@ -255,18 +252,16 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
 ///
 /// Flips `activity[name]` to `Refreshing` during `oauth::refresh`, then back to
 /// `Fetching` for the retry. Caller owns the initial `Fetching` mark and final `Idle` clear.
-#[allow(clippy::too_many_arguments)]
 fn fetch_with_rotation(
     config: &crate::profile::ConfigHandle,
     name: &str,
-    base_url: Option<&str>,
     access_token: &str,
     refresh_token: Option<&str>,
     prev_plan: Option<PlanInfo>,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
 ) -> FetchOutcome {
-    match fetch_raw(name, base_url, access_token, prev_plan.clone(), false) {
+    match fetch_raw(name, access_token, prev_plan.clone(), false) {
         Ok(info) => return FetchOutcome::live(name, info, None),
         // Rate-limited: bail to cache, never rotate (see the doc comment).
         Err(FetchError::RateLimited { retry_after }) => {
@@ -315,7 +310,7 @@ fn fetch_with_rotation(
     let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
     // Post-rotation retry forces a `/profile` pull: the token just changed, so
     // refresh the plan alongside it (the 401 profile-fetch trigger).
-    match fetch_raw(name, base_url, &access, prev_plan, true) {
+    match fetch_raw(name, &access, prev_plan, true) {
         Ok(info) => FetchOutcome::live(name, info, rotated),
         Err(FetchError::RateLimited { retry_after }) => {
             // Retry itself rate-limited. Don't push to RefetchQueue — that risks
@@ -456,7 +451,6 @@ fn run_fetch(
     let mut outcome = fetch_with_rotation(
         config,
         &entry.name,
-        entry.base_url.as_deref(),
         &entry.access_token,
         entry.refresh_token.as_deref(),
         prev_plan,
@@ -690,18 +684,24 @@ fn try_seed_recent_cache(
     true
 }
 
-/// Collect third-party profiles that have a recognised provider and API key.
+/// Collect api-key profiles for the third-party fetch leg: recognised providers
+/// (typed fetch) plus unrecognised api-key endpoints (generic discovery + scan).
 pub(crate) fn collect_third_party_entries(
     profiles: &[crate::profile::Profile],
 ) -> Vec<ThirdPartyEntry> {
     profiles
         .iter()
         .filter_map(|p| {
-            let provider = p.provider?;
             let api_key = p.api_key.clone()?;
+            let target = if let Some(provider) = p.provider {
+                crate::providers::ThirdPartyTarget::Known(provider)
+            } else {
+                let base_url = p.base_url.clone()?;
+                crate::providers::ThirdPartyTarget::Generic { base_url }
+            };
             Some(ThirdPartyEntry {
                 name: p.name.to_string(),
-                provider,
+                target,
                 api_key,
             })
         })
@@ -721,8 +721,18 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
         .into_iter()
         .map(|entry| {
             let name = entry.name.clone();
+            // Reuse the endpoint that last worked so steady state is one request.
+            let hint = state
+                .third_party_usage_store
+                .lock()
+                .ok()
+                .and_then(|s| s.get(&entry.name).and_then(|st| st.endpoint.clone()));
             let h = std::thread::spawn(move || {
-                crate::providers::fetch_third_party_usage(entry.provider, &entry.api_key)
+                crate::providers::fetch_third_party_usage(
+                    &entry.target,
+                    &entry.api_key,
+                    hint.as_deref(),
+                )
             });
             (name, h)
         })

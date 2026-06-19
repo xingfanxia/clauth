@@ -684,9 +684,14 @@ fn load_profile(name: &str) -> Result<Profile> {
     let credentials = recover_pending_credentials(name, credentials);
 
     let provider = config.base_url.as_deref().and_then(Provider::from_base_url);
-    let third_party_usage = provider
-        .as_ref()
-        .and_then(|_| crate::providers::load_third_party_disk_cache(name));
+    // Seed third-party usage from disk for recognised providers AND generic
+    // api-key endpoints (whose discovered usage is cached the same way).
+    let third_party_usage =
+        if provider.is_some() || (config.base_url.is_some() && config.api_key.is_some()) {
+            crate::providers::load_third_party_disk_cache(name)
+        } else {
+            None
+        };
 
     let profile = Profile {
         name: name.into(),

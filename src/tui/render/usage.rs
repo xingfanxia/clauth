@@ -12,7 +12,9 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::App;
 use super::super::theme;
-use super::format::{activity_verb, format_reset, reset_in_secs, spinner_frame, spinner_style};
+use super::format::{
+    activity_verb, bar_string_with_cells, format_reset, reset_in_secs, spinner_frame, spinner_style,
+};
 use super::panes::{
     SELECTOR_WIDTH, active_dot, draw_profile_selector, section_box, section_box_verbatim,
 };
@@ -110,20 +112,11 @@ fn build_usage_lines(
     lines.extend(header_lines(profile, inner_w, header));
     lines.push(Line::from(""));
 
-    if profile.is_third_party() {
-        lines.extend(build_tp_rows(profile, header));
-        return lines;
-    }
-
-    // API-key endpoint accounts (not OAuth, not a recognised third-party
-    // provider) also attempt the OAuth-shape usage fetch against their base_url.
-    // Show the windows when that returned a body; otherwise the static no-usage
-    // line — the silent-fail state.
-    if !profile.is_oauth() && profile.usage.is_none() {
-        lines.push(Line::from(Span::styled(
-            "API endpoint profile — no usage windows.",
-            theme::faint(),
-        )));
+    // Api-key/provider accounts (recognised or generic) render via the third-party
+    // rows/bars path; OAuth accounts — including OAuth run against a custom
+    // base_url — fall through to their live window bars.
+    if profile.api_key.is_some() || profile.is_third_party() {
+        lines.extend(build_tp_rows(profile, header, inner_w));
         return lines;
     }
 
@@ -434,15 +427,21 @@ fn bar_spans(
 
 fn header_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Line<'static>> {
     let plan = profile
-        .usage
+        .third_party_usage
         .as_ref()
-        .and_then(|u| u.plan.as_ref())
-        .map(plan_label)
+        .and_then(|s| s.plan.clone())
+        .or_else(|| {
+            profile
+                .usage
+                .as_ref()
+                .and_then(|u| u.plan.as_ref())
+                .map(plan_label)
+        })
         .unwrap_or_else(|| {
             if profile.is_oauth() {
-                "oauth".into()
+                "oauth".to_string()
             } else {
-                "api".into()
+                "api".to_string()
             }
         });
     let mut plan_spans = vec![key_span("plan"), Span::styled(plan.clone(), theme::body())];
@@ -458,9 +457,7 @@ fn header_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Li
     }
 
     let mut lines = vec![Line::from(plan_spans)];
-    if profile.is_oauth() || profile.is_third_party() {
-        lines.push(status_line(profile, header));
-    }
+    lines.push(status_line(profile, header));
     lines
 }
 
@@ -523,13 +520,31 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
 
 /// Render provider-agnostic third-party stats. The header (plan + status) was
 /// already pushed by the caller; only the stats body goes here.
-fn build_tp_rows(profile: &Profile, _header: &HeaderState) -> Vec<Line<'static>> {
+fn build_tp_rows(profile: &Profile, _header: &HeaderState, inner_w: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     let Some(stats) = profile.third_party_usage.as_ref() else {
-        lines.push(Line::from(Span::styled("loading", theme::faint())));
+        // No data yet. "loading" only while a fetch is pending or in flight; a
+        // terminal Failed status means we tried and the provider has nothing to
+        // show — never spin on "loading" forever (the original z.ai bug).
+        let msg = match profile.fetch_status {
+            Some(FetchStatus::Failed) => "no usage available",
+            _ => "loading",
+        };
+        lines.push(Line::from(Span::styled(msg, theme::faint())));
         return lines;
     };
+
+    // Percentage windows → bars (e.g. z.ai limits).
+    if !stats.bars.is_empty() {
+        for (i, bar) in stats.bars.iter().enumerate() {
+            if i > 0 {
+                lines.push(Line::from(""));
+            }
+            lines.extend(bar_row(bar, inner_w));
+        }
+        return lines;
+    }
 
     if stats.rows.is_empty() {
         let (msg, style) = if stats.is_available {
@@ -564,6 +579,46 @@ fn build_tp_rows(profile: &Profile, _header: &HeaderState) -> Vec<Line<'static>>
     }
 
     lines
+}
+
+/// One percentage window as a two-line block: label + right-aligned pct, then a
+/// bare bar with a reset suffix. Mirrors the OAuth `Stat::render` shape without
+/// burn-rate/pace (generic providers carry no history).
+fn bar_row(bar: &crate::providers::UsageBar, inner_w: u16) -> Vec<Line<'static>> {
+    let pct = bar.pct.clamp(0.0, 100.0);
+    let color = Style::default().fg(theme::util_color(pct));
+    let cells = ((inner_w as usize) / 3).clamp(8, 24);
+
+    let pct_str = format!("{pct:>2.0}%");
+    let pad =
+        (inner_w as usize).saturating_sub(bar.label.chars().count() + pct_str.chars().count());
+    let line1 = Line::from(vec![
+        Span::styled(bar.label.clone(), theme::body()),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(pct_str, color.add_modifier(Modifier::BOLD)),
+    ]);
+
+    let mut line2 = vec![Span::styled(bar_string_with_cells(pct, cells), color)];
+    let reset = bar_reset_text(&bar.resets_at);
+    if !reset.is_empty() {
+        line2.push(Span::styled(reset, theme::faint()));
+    }
+    vec![line1, Line::from(line2)]
+}
+
+/// `"  resets in …"` for an ISO reset timestamp, or empty when unknown/passed.
+fn bar_reset_text(resets_at: &Option<String>) -> String {
+    let Some(iso) = resets_at.as_ref() else {
+        return String::new();
+    };
+    let Some(reset) = crate::usage::iso_to_epoch_secs(iso) else {
+        return String::new();
+    };
+    let remaining = reset - now_epoch_secs();
+    if remaining <= 0 {
+        return String::new();
+    }
+    format!("  resets in {}", crate::usage::humanize_duration(remaining))
 }
 
 /// Key column width for third-party stat rows (wider than `KEY_W` to fit

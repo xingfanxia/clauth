@@ -75,6 +75,9 @@ fn disk_cache_roundtrips_stats() {
             value: "110.00 USD".to_string(),
             kind: StatRowKind::Body,
         }],
+        bars: Vec::new(),
+        plan: None,
+        endpoint: None,
     };
     write_third_party_disk_cache("tp-cache-test", &stats);
     let loaded = load_third_party_disk_cache("tp-cache-test").expect("cache present");
@@ -87,4 +90,31 @@ fn disk_cache_roundtrips_stats() {
 fn disk_cache_missing_reads_as_none() {
     let _home = HomeSandbox::new();
     assert!(load_third_party_disk_cache("tp-cache-absent").is_none());
+}
+
+// ── api_origin ───────────────────────────────────────────────────────────────
+
+#[test]
+fn api_origin_strips_path_to_scheme_host() {
+    assert_eq!(
+        api_origin("https://api.z.ai/api/anthropic").as_deref(),
+        Some("https://api.z.ai")
+    );
+    assert_eq!(
+        api_origin("https://api.deepseek.com/v1").as_deref(),
+        Some("https://api.deepseek.com")
+    );
+}
+
+#[test]
+fn api_origin_keeps_port_drops_query_and_fragment() {
+    assert_eq!(
+        api_origin("https://host.example:8443/path?x=1#frag").as_deref(),
+        Some("https://host.example:8443")
+    );
+}
+
+#[test]
+fn api_origin_none_without_scheme_delimiter() {
+    assert!(api_origin("api.z.ai/usage").is_none());
 }

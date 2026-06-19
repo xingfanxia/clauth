@@ -7,20 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::lockorder::{RankedMutex, rank};
 
-const API_HOST: &str = "https://api.anthropic.com";
-const USAGE_PATH: &str = "/api/oauth/usage";
-const PROFILE_PATH: &str = "/api/oauth/profile";
-
-/// Resolve an OAuth-style endpoint URL. An OAuth profile (`base_url` = `None`)
-/// always targets the Anthropic host; an API-key profile passes its `base_url`
-/// so the same `/usage` + `/profile` shape is tried against that endpoint. A
-/// trailing slash on `base_url` is trimmed so `https://proxy/` joins cleanly.
-fn endpoint_url(base_url: Option<&str>, path: &str) -> String {
-    match base_url {
-        Some(b) => format!("{}{path}", b.trim_end_matches('/')),
-        None => format!("{API_HOST}{path}"),
-    }
-}
+const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
+const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
 
 /// Re-fetch `/profile` (plan / rate-limit tier) at most once per hour per
 /// profile. The tier rarely changes, so the steady usage poll reuses the cached
@@ -398,16 +386,15 @@ fn take_profile_fetch(name: &str, force: bool, now: u64) -> bool {
 /// it falls back to `prev_plan`.
 pub(super) fn fetch_raw(
     name: &str,
-    base_url: Option<&str>,
     access_token: &str,
     prev_plan: Option<PlanInfo>,
     force_profile: bool,
 ) -> std::result::Result<UsageInfo, FetchError> {
-    let usage_text = get_json(&endpoint_url(base_url, USAGE_PATH), access_token)?;
+    let usage_text = get_json(USAGE_ENDPOINT, access_token)?;
     let raw: RawUsage = serde_json::from_str(&usage_text).map_err(|_| FetchError::Parse)?;
 
     let plan = if take_profile_fetch(name, force_profile, now_ms()) {
-        get_json(&endpoint_url(base_url, PROFILE_PATH), access_token)
+        get_json(PROFILE_ENDPOINT, access_token)
             .ok()
             .and_then(|text| serde_json::from_str::<RawProfile>(&text).ok())
             .map(|p| PlanInfo {

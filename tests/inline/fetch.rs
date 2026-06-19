@@ -4,29 +4,6 @@ use super::*;
 const BASE_UTC: i64 = 1_779_027_600;
 
 #[test]
-fn endpoint_url_targets_anthropic_host_for_oauth() {
-    // OAuth profile (base_url = None) always hits the Anthropic host.
-    assert_eq!(
-        endpoint_url(None, USAGE_PATH),
-        "https://api.anthropic.com/api/oauth/usage"
-    );
-}
-
-#[test]
-fn endpoint_url_joins_base_url_for_api_account() {
-    // API-key profile: same path shape against its own endpoint.
-    assert_eq!(
-        endpoint_url(Some("https://proxy.example"), USAGE_PATH),
-        "https://proxy.example/api/oauth/usage"
-    );
-    // A trailing slash on base_url must not double the path separator.
-    assert_eq!(
-        endpoint_url(Some("https://proxy.example/"), PROFILE_PATH),
-        "https://proxy.example/api/oauth/profile"
-    );
-}
-
-#[test]
 fn parses_z_suffix() {
     assert_eq!(iso_to_epoch_secs("2026-05-17T14:20:00Z"), Some(BASE_UTC));
     assert_eq!(
