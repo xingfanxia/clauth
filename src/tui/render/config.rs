@@ -75,6 +75,8 @@ struct Snap {
     sonnet: String,
     haiku: String,
     subagent: String,
+    /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
+    env: Vec<(String, String)>,
     auto_start: bool,
     is_active: bool,
     /// Recognised third-party provider display name, if any.
@@ -94,6 +96,7 @@ impl Snap {
             sonnet: String::new(),
             haiku: String::new(),
             subagent: String::new(),
+            env: Vec::new(),
             auto_start: false,
             is_active: false,
             provider: None,
@@ -129,6 +132,9 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             sonnet: text(&p.models.sonnet),
             haiku: text(&p.models.haiku),
             subagent: text(&p.models.subagent),
+            // Env rows render from the snapshot (no per-entry draft buffer), so
+            // they're always populated — even while a draft owns the text fields.
+            env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             auto_start: p.auto_start,
             provider: p.provider.map(|p| p.display_name()),
         },
@@ -208,9 +214,9 @@ fn draw_settings_rows(
     }
 
     lines.push(Line::from(""));
-    // Tracks the absolute line index + buffer of the active edit row for cursor
-    // placement after rendering. `lines` starts with [type (, provider), blank].
-    let mut edit_caret: Option<(u16, InputState)> = None;
+    // Tracks the absolute line index + buffer + row of the active edit row for
+    // cursor placement after rendering. `lines` starts with [type (, provider), blank].
+    let mut edit_caret: Option<(u16, InputState, ConfigRow)> = None;
     let mut line_idx: u16 = if provider_label.is_some() { 3 } else { 2 };
 
     for (i, row) in rows.iter().enumerate() {
@@ -219,7 +225,7 @@ fn draw_settings_rows(
         let input = row_input(draft, snap, *row);
         let line = detail_row(*row, selected, is_editing, armed_delete, snap, &input);
         if is_editing {
-            edit_caret = Some((line_idx, input));
+            edit_caret = Some((line_idx, input, *row));
         }
         lines.push(if selected {
             highlight_row(line, inner.width as usize)
@@ -242,12 +248,25 @@ fn draw_settings_rows(
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 
     // Position the native terminal cursor at the caret when a text/model field is active.
-    if let Some((ly, input)) = edit_caret {
-        // x = "❯ " (2) + key+pad block (exactly KEY_W cols) + cols before caret
-        let prefix_cols = 2 + KEY_W + head_cols(&input);
+    if let Some((ly, input, row)) = edit_caret {
+        // x = "❯ " (2) + label block (KEY_W, or key+1 for a long env key) + caret cols
+        let prefix_cols = 2 + row_label_cols(row, snap) + head_cols(&input);
         let cx = inner.x.saturating_add(prefix_cols as u16);
         let cy = inner.y.saturating_add(ly);
         frame.set_cursor_position((cx, cy));
+    }
+}
+
+/// Width of a row's label block (caret excluded) for native-cursor placement.
+/// Fixed labels pad to `KEY_W`; an env key longer than that pads to `key + 1`,
+/// mirroring [`kv_field`]'s padding.
+fn row_label_cols(row: ConfigRow, snap: &Snap) -> usize {
+    match row {
+        ConfigRow::EnvEntry(i) => {
+            let key_len = snap.env.get(i).map(|(k, _)| k.chars().count()).unwrap_or(0);
+            key_len + KEY_W.saturating_sub(key_len).max(1)
+        }
+        _ => KEY_W,
     }
 }
 
@@ -271,7 +290,8 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::SonnetModel => &snap.sonnet,
         ConfigRow::HaikuModel => &snap.haiku,
         ConfigRow::SubagentModel => &snap.subagent,
-        ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => "",
+        ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
+        ConfigRow::EnvAdd | ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => "",
     }
 }
 
@@ -287,6 +307,8 @@ fn row_hint(row: ConfigRow) -> Option<&'static str> {
         ConfigRow::SonnetModel => Some("what the `sonnet` alias resolves to (full model id)"),
         ConfigRow::HaikuModel => Some("what the `haiku` alias resolves to (full model id)"),
         ConfigRow::SubagentModel => Some("model forced for every subagent in this account"),
+        ConfigRow::EnvEntry(_) => Some("custom env var merged into settings.json while active"),
+        ConfigRow::EnvAdd => Some("add a custom settings.json env var to this account"),
         ConfigRow::AutoStart => Some("launch a session on idle to arm the 5h window"),
         ConfigRow::Name | ConfigRow::Delete | ConfigRow::Create => None,
     }
@@ -318,6 +340,16 @@ fn detail_row(
         ConfigRow::SonnetModel => kv_field(arrow, "sonnet", input, editing, selected, false),
         ConfigRow::HaikuModel => kv_field(arrow, "haiku", input, editing, selected, false),
         ConfigRow::SubagentModel => kv_field(arrow, "subagent", input, editing, selected, false),
+        // A custom env entry: its key is the label; mask the value when the key
+        // looks like a credential (mirrors the api-key row).
+        ConfigRow::EnvEntry(i) => {
+            let key = snap.env.get(i).map(|(k, _)| k.clone()).unwrap_or_default();
+            let mask = env_key_is_secret(&key);
+            kv_field(arrow, &key, input, editing, selected, mask)
+        }
+        // While editing, the typed text is the new key; at rest, the add chip.
+        ConfigRow::EnvAdd if editing => kv_field(arrow, "key", input, editing, selected, false),
+        ConfigRow::EnvAdd => Line::from(vec![arrow, Span::styled("+ add field", theme::accent())]),
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
                 (theme::toggle_on().to_string(), theme::accent())
@@ -373,6 +405,14 @@ fn kv_static(
         Span::styled(format!("{key}{}", " ".repeat(pad)), label_style(focused)),
         Span::styled(value, value_style),
     ])
+}
+
+/// Mask a custom env value when its key names a credential (mirrors the api-key row).
+fn env_key_is_secret(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "AUTH"]
+        .iter()
+        .any(|needle| upper.contains(needle))
 }
 
 fn value_spans(input: &InputState, editing: bool, mask_value: bool) -> Vec<Span<'static>> {

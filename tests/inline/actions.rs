@@ -1,0 +1,119 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! Per-account custom env editor: collision classification + `edit_profile_env`
+//! persistence and the strip-removed-keys-on-active behaviour.
+
+use super::*;
+use crate::profile::AppState;
+use crate::testutil::HomeSandbox;
+
+fn acct_config() -> AppConfig {
+    AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new("acct".to_string(), None, None)],
+    }
+}
+
+#[test]
+fn classify_env_key_flags_managed_keys() {
+    let p = Profile::new("acct".to_string(), None, None);
+    assert!(matches!(
+        classify_env_key(&p, &[], "ANTHROPIC_BASE_URL"),
+        Some(EnvKeyCollision::Managed(_))
+    ));
+    assert!(matches!(
+        classify_env_key(&p, &[], "CLAUDE_CODE_SUBAGENT_MODEL"),
+        Some(EnvKeyCollision::Managed(_))
+    ));
+    assert_eq!(classify_env_key(&p, &[], "ANTHROPIC_CUSTOM_FLAG"), None);
+}
+
+#[test]
+fn classify_env_key_flags_own_field_by_sorted_index() {
+    let mut p = Profile::new("acct".to_string(), None, None);
+    p.env.insert("ZED".to_string(), "1".to_string());
+    p.env.insert("ALPHA".to_string(), "2".to_string());
+    // BTreeMap order: ALPHA(0), ZED(1).
+    assert_eq!(
+        classify_env_key(&p, &[], "ALPHA"),
+        Some(EnvKeyCollision::ProfileField(0))
+    );
+    assert_eq!(
+        classify_env_key(&p, &[], "ZED"),
+        Some(EnvKeyCollision::ProfileField(1))
+    );
+}
+
+#[test]
+fn classify_env_key_base_settings_only_for_external_keys() {
+    let mut p = Profile::new("acct".to_string(), None, None);
+    p.env.insert("OWN".to_string(), "1".to_string());
+    let base = vec![
+        "OWN".to_string(),
+        "EXTERNAL".to_string(),
+        "ANTHROPIC_BASE_URL".to_string(),
+    ];
+    // Managed + own-field checks win before the base check, so only a key that is
+    // neither (genuinely external) classifies as BaseSettings.
+    assert_eq!(
+        classify_env_key(&p, &base, "EXTERNAL"),
+        Some(EnvKeyCollision::BaseSettings)
+    );
+    assert_eq!(
+        classify_env_key(&p, &base, "OWN"),
+        Some(EnvKeyCollision::ProfileField(0))
+    );
+    assert!(matches!(
+        classify_env_key(&p, &base, "ANTHROPIC_BASE_URL"),
+        Some(EnvKeyCollision::Managed(_))
+    ));
+    assert_eq!(classify_env_key(&p, &base, "FRESH"), None);
+}
+
+#[test]
+fn edit_profile_env_persists_to_config_toml() {
+    let _home = HomeSandbox::new();
+    let mut config = acct_config();
+    let mut env = BTreeMap::new();
+    env.insert("FOO".to_string(), "bar".to_string());
+    edit_profile_env(&mut config, "acct", env).expect("set env");
+
+    assert_eq!(
+        config.find("acct").unwrap().env.get("FOO"),
+        Some(&"bar".to_string())
+    );
+    let toml = std::fs::read_to_string(profile_dir("acct").unwrap().join("config.toml"))
+        .expect("config.toml written");
+    assert!(
+        toml.contains("FOO"),
+        "custom env key persisted to config.toml"
+    );
+
+    // Clearing the map persists too.
+    edit_profile_env(&mut config, "acct", BTreeMap::new()).expect("clear env");
+    assert!(config.find("acct").unwrap().env.is_empty());
+}
+
+#[test]
+fn edit_profile_env_strips_removed_keys_from_live_settings_when_active() {
+    let _home = HomeSandbox::new();
+    let mut config = acct_config();
+    config.state.active_profile = Some("acct".into());
+
+    let mut env = BTreeMap::new();
+    env.insert("KEEP".to_string(), "1".to_string());
+    env.insert("DROP".to_string(), "2".to_string());
+    edit_profile_env(&mut config, "acct", env).expect("write both");
+    let live = crate::claude::claude_settings_env_keys().expect("read settings");
+    assert!(live.contains(&"KEEP".to_string()) && live.contains(&"DROP".to_string()));
+
+    // Removing DROP must strip it from the live settings.json, not leak it.
+    let mut env2 = BTreeMap::new();
+    env2.insert("KEEP".to_string(), "1".to_string());
+    edit_profile_env(&mut config, "acct", env2).expect("drop one");
+    let live = crate::claude::claude_settings_env_keys().expect("read settings");
+    assert!(live.contains(&"KEEP".to_string()));
+    assert!(
+        !live.contains(&"DROP".to_string()),
+        "a removed key is stripped from the live settings on re-apply"
+    );
+}

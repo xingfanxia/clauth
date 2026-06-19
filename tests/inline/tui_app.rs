@@ -341,3 +341,92 @@ fn refresh_interval_esc_discards_editor() {
         "esc leaves the interval unchanged"
     );
 }
+
+// ── Setup tab: per-account custom env editor ───────────────────────────────
+
+mod env_editor {
+    use super::super::{App, ConfigFocus, ConfigRow, InputState, Modal, Tab, config_rows};
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::testutil::HomeSandbox;
+    use std::collections::BTreeMap;
+
+    fn app_with_env(env: BTreeMap<String, String>) -> App {
+        let mut profile = Profile::new("acct".to_string(), None, None);
+        profile.env = env;
+        App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![profile],
+        })
+    }
+
+    fn enter_detail(app: &mut App) {
+        app.tab = Tab::Setup;
+        app.profile_cursor = 0;
+        super::super::enter_config_detail(app);
+        assert_eq!(app.config_focus, ConfigFocus::Actions);
+    }
+
+    #[test]
+    fn config_rows_insert_env_entries_then_add_row() {
+        let mut env = BTreeMap::new();
+        env.insert("ALPHA".to_string(), "1".to_string());
+        env.insert("ZED".to_string(), "2".to_string());
+        let app = app_with_env(env);
+
+        let rows = config_rows(&app);
+        let pos = |row: ConfigRow| rows.iter().position(|r| *r == row);
+        let e0 = pos(ConfigRow::EnvEntry(0)).expect("first env row");
+        let e1 = pos(ConfigRow::EnvEntry(1)).expect("second env row");
+        let add = pos(ConfigRow::EnvAdd).expect("add-field row");
+        assert!(e0 < e1 && e1 < add, "sorted entries precede the add row");
+        assert_eq!(
+            *rows.last().unwrap(),
+            ConfigRow::Delete,
+            "delete stays last"
+        );
+    }
+
+    #[test]
+    fn add_field_with_managed_key_prompts_collision() {
+        let _home = HomeSandbox::new();
+        let mut app = app_with_env(BTreeMap::new());
+        enter_detail(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_new_key = InputState::new("ANTHROPIC_BASE_URL");
+            d.active = Some(ConfigRow::EnvAdd);
+        }
+        super::super::commit_env_new_key(&mut app);
+        assert!(
+            matches!(app.modals.last(), Some(Modal::EnvCollision(_))),
+            "a clauth-managed key clash raises the collision prompt"
+        );
+    }
+
+    #[test]
+    fn add_field_with_fresh_key_inserts_and_edits_value() {
+        let _home = HomeSandbox::new();
+        let mut app = app_with_env(BTreeMap::new());
+        enter_detail(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_new_key = InputState::new("CLAUDE_CODE_MAX_OUTPUT_TOKENS");
+            d.active = Some(ConfigRow::EnvAdd);
+        }
+        super::super::commit_env_new_key(&mut app);
+
+        assert!(app.modals.is_empty(), "a fresh key adds without prompting");
+        assert_eq!(
+            app.config()
+                .find("acct")
+                .and_then(|p| p.env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS").cloned()),
+            Some(String::new()),
+            "the key is added with an empty value"
+        );
+        assert!(
+            matches!(
+                app.config_draft.as_ref().and_then(|d| d.active),
+                Some(ConfigRow::EnvEntry(_))
+            ),
+            "focus drops into the new entry's value editor"
+        );
+    }
+}

@@ -3,6 +3,7 @@
 //! Each function takes already-validated inputs from the TUI layer and applies
 //! the change under the cross-process state lock.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -10,8 +11,8 @@ use anyhow::{Context, Result, bail};
 use crate::claude::{
     ClaudeEndpoint, LinkState, apply_profile_to_claude_settings, classify_credentials_link,
     clear_claude_credentials, force_link_profile_credentials, force_snapshot_active_credentials,
-    is_first_login, link_profile_credentials, read_claude_credentials, read_claude_endpoint_config,
-    snapshot_active_credentials,
+    is_first_login, link_profile_credentials, managed_env_key_label, read_claude_credentials,
+    read_claude_endpoint_config, snapshot_active_credentials,
 };
 use crate::lock::with_state_lock;
 use crate::lockorder::RankedMutex;
@@ -226,6 +227,65 @@ pub(crate) fn edit_profile_model(
     })
 }
 
+/// Persist a profile's custom env map (the Setup-tab field editor). Captures the
+/// OLD env keys first so a re-apply to the live `~/.claude/settings.json` strips
+/// any key the new map dropped — passing the new keys instead would leak a removed
+/// entry into the live file. Mirrors [`edit_profile_model`].
+pub(crate) fn edit_profile_env(
+    config: &mut AppConfig,
+    name: &str,
+    env: BTreeMap<String, String>,
+) -> Result<()> {
+    with_state_lock(|| {
+        let profile = config.find_mut(name).context("Profile not found")?;
+        // Snapshot before overwrite — a removed key is only stripped from live
+        // settings when it appears in `prev` but not in the new `profile.env`.
+        let old_env_keys: Vec<String> = profile.env.keys().cloned().collect();
+        profile.env = env;
+        save_profile(profile)?;
+
+        if config.is_active(name) {
+            let profile = config.find(name).context("Profile not found")?;
+            apply_profile_to_claude_settings(profile, &old_env_keys)?;
+        }
+        Ok(())
+    })
+}
+
+/// Which source a candidate custom env key collides with, in priority order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EnvKeyCollision {
+    /// A clauth-managed key derived from a profile field; carries the field's
+    /// human label (`the base url field`, …).
+    Managed(&'static str),
+    /// Already a custom env entry on this account; carries the sorted index.
+    ProfileField(usize),
+    /// Already present in the inherited `~/.claude/settings.json` `env` block.
+    BaseSettings,
+}
+
+/// Classify a candidate custom env key against the three sources, highest
+/// priority first: a clauth-managed field key, then this account's existing
+/// custom entries, then the inherited base `settings.json`. The managed and
+/// own-field checks return before the base check, so a base hit means a key set
+/// outside clauth. `base_env_keys` is read from the live settings by the caller.
+pub(crate) fn classify_env_key(
+    profile: &Profile,
+    base_env_keys: &[String],
+    candidate: &str,
+) -> Option<EnvKeyCollision> {
+    if let Some(label) = managed_env_key_label(candidate) {
+        return Some(EnvKeyCollision::Managed(label));
+    }
+    if let Some(idx) = profile.env.keys().position(|k| k == candidate) {
+        return Some(EnvKeyCollision::ProfileField(idx));
+    }
+    base_env_keys
+        .iter()
+        .any(|k| k == candidate)
+        .then_some(EnvKeyCollision::BaseSettings)
+}
+
 pub(crate) fn rename_profile(config: &mut AppConfig, old: &str, new: &str) -> Result<()> {
     with_state_lock(|| {
         let old_dir = profile_dir(old)?;
@@ -351,3 +411,7 @@ pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) ->
         save_app_state(&config.state)
     })
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/actions.rs"]
+mod tests;

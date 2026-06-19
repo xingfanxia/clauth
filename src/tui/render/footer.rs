@@ -59,25 +59,34 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("?", "help"),
             ],
             ConfigFocus::Actions => {
-                // The `model` row cycles on space and types a custom id on ⏎.
-                let on_model = config_rows(app)
-                    .get(app.config_action_cursor)
-                    .is_some_and(|r| *r == ConfigRow::Model);
-                if on_model {
-                    &[
+                // Row-aware: the `model` row cycles on space; env rows edit a value
+                // or open the add-field key editor.
+                match config_rows(app).get(app.config_action_cursor) {
+                    Some(ConfigRow::Model) => &[
                         ("↑↓", "row"),
                         ("space", "cycle"),
                         ("↵", "custom"),
                         ("a", "actions"),
                         ("?", "help"),
-                    ]
-                } else {
-                    &[
+                    ],
+                    Some(ConfigRow::EnvEntry(_)) => &[
+                        ("↑↓", "row"),
+                        ("↵", "edit value"),
+                        ("a", "actions"),
+                        ("?", "help"),
+                    ],
+                    Some(ConfigRow::EnvAdd) => &[
+                        ("↑↓", "row"),
+                        ("↵", "add field"),
+                        ("a", "actions"),
+                        ("?", "help"),
+                    ],
+                    _ => &[
                         ("↑↓", "row"),
                         ("↵", "edit / toggle"),
                         ("a", "actions"),
                         ("?", "help"),
-                    ]
+                    ],
                 }
             }
         },

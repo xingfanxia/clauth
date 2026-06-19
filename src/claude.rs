@@ -181,6 +181,38 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
     })
 }
 
+/// The Setup-tab field that owns a clauth-managed env key, phrased for the
+/// collision prompt (`'X' is already set by …`). These are the keys clauth
+/// derives from a profile's endpoint + model-tier fields; a custom env entry
+/// equal to one of them would override the field's value in `settings.json`.
+/// `None` when the key is not clauth-managed.
+pub(crate) fn managed_env_key_label(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "ANTHROPIC_BASE_URL" => "the base url field",
+        "ANTHROPIC_AUTH_TOKEN" => "the api key field",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL" => "the opus model field",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL" => "the sonnet model field",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL" => "the haiku model field",
+        "CLAUDE_CODE_SUBAGENT_MODEL" => "the subagent model field",
+        _ => return None,
+    })
+}
+
+/// Keys present in the live `~/.claude/settings.json` `env` object. Empty when
+/// the file is absent or carries no `env` block. Used to detect a custom env key
+/// that already exists in the inherited base settings.
+pub(crate) fn claude_settings_env_keys() -> Result<Vec<String>> {
+    let path = claude_settings_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let settings: serde_json::Value = read_json_file(&path)?;
+    Ok(settings["env"]
+        .as_object()
+        .map(|env| env.keys().cloned().collect())
+        .unwrap_or_default())
+}
+
 /// Patch `settings.json` `env` with profile's endpoint keys and env map;
 /// strip `prev_env_keys` the new profile doesn't carry to clear stale entries.
 pub(crate) fn apply_profile_to_claude_settings(

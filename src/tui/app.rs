@@ -22,14 +22,16 @@ use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{
-    CaptureSnapshot, capture_into_profile, capture_snapshot, create_blank_profile, delete_profile,
-    edit_profile_endpoint, edit_profile_model, find_matching_oauth_profile, rename_profile,
-    reorder_profile, switch_off, switch_profile, validate_profile_name,
+    CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
+    create_blank_profile, delete_profile, edit_profile_endpoint, edit_profile_env,
+    edit_profile_model, find_matching_oauth_profile, rename_profile, reorder_profile, switch_off,
+    switch_profile, validate_profile_name,
 };
 use crate::claude::{
-    LinkState, adopt_first_login, classify_credentials_link, credentials_diverged,
-    detach_credentials_link, force_link_profile_credentials, force_snapshot_active_credentials,
-    is_first_login, link_profile_credentials, read_claude_credentials, snapshot_active_credentials,
+    LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
+    credentials_diverged, detach_credentials_link, force_link_profile_credentials,
+    force_snapshot_active_credentials, is_first_login, link_profile_credentials,
+    read_claude_credentials, snapshot_active_credentials,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, SwitchAction, auto_switch_if_needed, threshold_for};
 use crate::lock::with_state_lock;
@@ -165,6 +167,8 @@ pub(crate) enum FallbackRow {
 /// One editable line in the Setup tab's detail pane. Built per selection by
 /// [`config_rows`]: auto-start only for OAuth; trailing row is `delete` or
 /// `create`. `Name`/`BaseUrl`/`ApiKey` are text rows; the rest are toggles/actions.
+/// `EnvEntry(i)` indexes the profile's sorted custom-env snapshot; `EnvAdd` is the
+/// trailing `+ add field` row. Both appear only for existing accounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigRow {
     Name,
@@ -180,6 +184,11 @@ pub(crate) enum ConfigRow {
     HaikuModel,
     /// `CLAUDE_CODE_SUBAGENT_MODEL` — full id, free text.
     SubagentModel,
+    /// A custom `key = value` env entry, indexed into the profile's sorted env
+    /// snapshot. ⏎ edits the value inline; `a` → `remove field` deletes it.
+    EnvEntry(usize),
+    /// The `+ add field` row — ⏎ opens a key editor that runs the collision check.
+    EnvAdd,
     AutoStart,
     Delete,
     Create,
@@ -187,8 +196,9 @@ pub(crate) enum ConfigRow {
 
 impl ConfigRow {
     /// Text rows capture keystrokes and commit on ⏎; the rest act on ⏎. The
-    /// `Model` row is hybrid (space cycles, ⏎ opens a custom field) and is
-    /// driven out of band, so it is deliberately not a text row here.
+    /// `Model` row is hybrid (space cycles, ⏎ opens a custom field), and the env
+    /// rows seed their buffer before editing, so all three are driven out of band
+    /// and are deliberately not text rows here.
     pub(crate) fn is_text(self) -> bool {
         matches!(
             self,
@@ -238,6 +248,11 @@ pub(crate) struct ConfigDraft {
     pub(crate) sonnet_model: InputState,
     pub(crate) haiku_model: InputState,
     pub(crate) subagent_model: InputState,
+    /// Value buffer for the env entry currently being edited (seeded on entry).
+    /// Shared across `EnvEntry` rows since only one is active at a time.
+    pub(crate) env_value: InputState,
+    /// Key buffer for the `+ add field` row's key editor.
+    pub(crate) env_new_key: InputState,
     /// `Some(row)` while a text row (or the `model` custom field) owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
     /// First ⏎ on delete arms it; second confirms. Any cursor move disarms.
@@ -245,7 +260,9 @@ pub(crate) struct ConfigDraft {
 }
 
 impl ConfigDraft {
-    /// The edit buffer behind a text or `Model` row; `None` for toggle/action rows.
+    /// The edit buffer behind a text, `Model`, or actively-edited env row; `None`
+    /// for toggle/action rows. The env buffers resolve only while their row is the
+    /// active one — an idle `EnvEntry` renders from the read-only snapshot instead.
     pub(crate) fn field(&self, row: ConfigRow) -> Option<&InputState> {
         Some(match row {
             ConfigRow::Name => &self.name,
@@ -256,7 +273,13 @@ impl ConfigDraft {
             ConfigRow::SonnetModel => &self.sonnet_model,
             ConfigRow::HaikuModel => &self.haiku_model,
             ConfigRow::SubagentModel => &self.subagent_model,
-            ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => return None,
+            ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
+            ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
+            ConfigRow::EnvEntry(_)
+            | ConfigRow::EnvAdd
+            | ConfigRow::AutoStart
+            | ConfigRow::Delete
+            | ConfigRow::Create => return None,
         })
     }
 
@@ -270,7 +293,13 @@ impl ConfigDraft {
             ConfigRow::SonnetModel => &mut self.sonnet_model,
             ConfigRow::HaikuModel => &mut self.haiku_model,
             ConfigRow::SubagentModel => &mut self.subagent_model,
-            ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => return None,
+            ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
+            ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
+            ConfigRow::EnvEntry(_)
+            | ConfigRow::EnvAdd
+            | ConfigRow::AutoStart
+            | ConfigRow::Delete
+            | ConfigRow::Create => return None,
         })
     }
 }
@@ -326,6 +355,42 @@ impl DivergenceForm {
     }
 }
 
+/// A choice on the env-key collision prompt (3 vertical options).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvCollisionChoice {
+    /// Add the custom field anyway — its value overrides the colliding source.
+    Overwrite,
+    /// Leave the existing value untouched; don't add. Jumps to the existing
+    /// custom field when the collision is with one.
+    KeepExisting,
+    /// Back out, no change.
+    Cancel,
+}
+
+/// Prompt shown when a freshly typed custom env key already exists in one of the
+/// three sources ([`EnvKeyCollision`]). Modeled on [`DivergenceForm`] — a message
+/// plus arrow-selected options. `cancel` is the default-focused (safe) choice.
+#[derive(Debug, Clone)]
+pub(crate) struct EnvCollisionForm {
+    pub(crate) profile: String,
+    pub(crate) key: String,
+    /// Human reason for the collision (`set by the base url field`, …).
+    pub(crate) reason: String,
+    /// Sorted `EnvEntry` index of the colliding own-field, for `keep existing`.
+    pub(crate) existing_idx: Option<usize>,
+    pub(crate) cursor: usize,
+}
+
+impl EnvCollisionForm {
+    pub(crate) fn options() -> [EnvCollisionChoice; 3] {
+        [
+            EnvCollisionChoice::Overwrite,
+            EnvCollisionChoice::KeepExisting,
+            EnvCollisionChoice::Cancel,
+        ]
+    }
+}
+
 /// One entry in the action menu.
 #[derive(Debug, Clone)]
 pub(crate) struct ActionItem {
@@ -361,6 +426,8 @@ pub(crate) enum ActionMenuAction {
     DeleteProfile,
     CreateProfile,
     EditField,
+    /// Remove the focused custom env entry from the account.
+    RemoveEnvField,
     // Status tab
     RefreshStatus,
     OpenIncidentLink,
@@ -440,6 +507,7 @@ impl ActionMenuAction {
             Self::DeleteProfile => "delete profile",
             Self::CreateProfile => "create profile",
             Self::EditField => "edit field",
+            Self::RemoveEnvField => "remove field",
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
             Self::ToggleEstimates => "toggle estimates",
@@ -457,6 +525,8 @@ pub(crate) enum Modal {
     Help,
     /// Context-sensitive action menu opened by `a`.
     ActionMenu(ActionMenuState),
+    /// Custom env key collides with an existing source; overwrite/keep/cancel.
+    EnvCollision(EnvCollisionForm),
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -2665,6 +2735,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
+        Modal::EnvCollision(_) => handle_env_collision_key(app, key),
     }
 }
 
@@ -2715,6 +2786,10 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                         ConfigRow::AutoStart => actions.push(ActionMenuAction::ToggleAutoStart),
                         ConfigRow::Delete => actions.push(ActionMenuAction::DeleteProfile),
                         ConfigRow::Create => actions.push(ActionMenuAction::CreateProfile),
+                        ConfigRow::EnvEntry(_) => {
+                            actions.push(ActionMenuAction::EditField);
+                            actions.push(ActionMenuAction::RemoveEnvField);
+                        }
                         _ => actions.push(ActionMenuAction::EditField),
                     }
                 }
@@ -2885,6 +2960,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                 run_config_row(app, row);
             }
         }
+        ActionMenuAction::RemoveEnvField => remove_env_field(app),
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
@@ -2975,6 +3051,15 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         ConfigRow::HaikuModel,
         ConfigRow::SubagentModel,
     ];
+    // One row per custom env entry (sorted), then the `+ add field` row. Indices
+    // must match the sorted env snapshot used by the renderer and the commit path.
+    let env_count = cfg
+        .profiles
+        .get(app.profile_cursor)
+        .map(|p| p.env.len())
+        .unwrap_or(0);
+    rows.extend((0..env_count).map(ConfigRow::EnvEntry));
+    rows.push(ConfigRow::EnvAdd);
     if is_oauth {
         rows.push(ConfigRow::AutoStart);
     }
@@ -3015,6 +3100,8 @@ fn build_draft_new() -> ConfigDraft {
         sonnet_model: InputState::new(""),
         haiku_model: InputState::new(""),
         subagent_model: InputState::new(""),
+        env_value: InputState::new(""),
+        env_new_key: InputState::new(""),
         active: None,
         armed_delete: false,
     }
@@ -3034,6 +3121,8 @@ fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
         sonnet_model: InputState::new(m.sonnet.as_deref().unwrap_or("")),
         haiku_model: InputState::new(m.haiku.as_deref().unwrap_or("")),
         subagent_model: InputState::new(m.subagent.as_deref().unwrap_or("")),
+        env_value: InputState::new(""),
+        env_new_key: InputState::new(""),
         active: None,
         armed_delete: false,
     }
@@ -3048,6 +3137,18 @@ fn disarm_delete(app: &mut App) {
 
 /// ⏎/space on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
 fn run_config_row(app: &mut App, row: ConfigRow) {
+    // Env rows seed their buffer before editing, so they're driven out of band.
+    match row {
+        ConfigRow::EnvEntry(i) => {
+            enter_env_value_edit(app, i);
+            return;
+        }
+        ConfigRow::EnvAdd => {
+            enter_env_add_edit(app);
+            return;
+        }
+        _ => {}
+    }
     // Text rows plus the `model` row's custom field open an inline editor.
     if row.is_text() || row == ConfigRow::Model {
         if let Some(d) = app.config_draft.as_mut() {
@@ -3154,7 +3255,13 @@ fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) ->
         ConfigRow::SubagentModel => profile
             .and_then(|p| p.models.subagent.clone())
             .unwrap_or_default(),
-        ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => String::new(),
+        // The saved value of the i-th sorted env entry; reverts a value edit on ⎋.
+        ConfigRow::EnvEntry(i) => profile
+            .and_then(|p| p.env.values().nth(i).cloned())
+            .unwrap_or_default(),
+        ConfigRow::EnvAdd | ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => {
+            String::new()
+        }
     }
 }
 
@@ -3179,6 +3286,8 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
         | ConfigRow::SonnetModel
         | ConfigRow::HaikuModel
         | ConfigRow::SubagentModel => commit_model_field(app, field),
+        ConfigRow::EnvEntry(i) => commit_env_value(app, i),
+        ConfigRow::EnvAdd => commit_env_new_key(app),
         _ => {
             if let Some(d) = app.config_draft.as_mut() {
                 d.active = None;
@@ -3291,6 +3400,311 @@ fn next_model_preset(current: Option<&str>) -> Option<String> {
             Some(i) if i + 1 < MODEL_PRESETS.len() => Some(MODEL_PRESETS[i + 1].to_string()),
             _ => None,
         },
+    }
+}
+
+/// ⏎ on an `EnvEntry`: seed the shared value buffer from the entry's saved value
+/// and open the inline value editor.
+fn enter_env_value_edit(app: &mut App, i: usize) {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+    else {
+        return;
+    };
+    let value = {
+        let cfg = app.config();
+        cfg.find(&name)
+            .and_then(|p| p.env.values().nth(i).cloned())
+            .unwrap_or_default()
+    };
+    if let Some(d) = app.config_draft.as_mut() {
+        d.env_value = InputState::new(&value);
+        d.active = Some(ConfigRow::EnvEntry(i));
+    }
+}
+
+/// ⏎ on `+ add field`: open an empty key editor (commit runs the collision check).
+fn enter_env_add_edit(app: &mut App) {
+    if let Some(d) = app.config_draft.as_mut() {
+        d.env_new_key = InputState::new("");
+        d.active = Some(ConfigRow::EnvAdd);
+    }
+}
+
+/// ⏎ in an env value editor: fold the trimmed buffer into the entry (key
+/// unchanged), persist via [`edit_profile_env`], then reseed from the saved value.
+fn commit_env_value(app: &mut App, i: usize) {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+    else {
+        return;
+    };
+    let value = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.env_value.trimmed().to_string())
+        .unwrap_or_default();
+    let new_env = {
+        let cfg = app.config();
+        cfg.find(&name).map(|p| {
+            let mut env = p.env.clone();
+            if let Some(key) = p.env.keys().nth(i).cloned() {
+                env.insert(key, value.clone());
+            }
+            env
+        })
+    };
+    let Some(new_env) = new_env else {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.active = None;
+        }
+        return;
+    };
+    let result = {
+        let mut cfg = app.config();
+        edit_profile_env(&mut cfg, &name, new_env)
+    };
+    match result {
+        Ok(()) => {
+            let saved = {
+                let cfg = app.config();
+                cfg.find(&name)
+                    .and_then(|p| p.env.values().nth(i).cloned())
+                    .unwrap_or_default()
+            };
+            if let Some(d) = app.config_draft.as_mut() {
+                d.env_value = InputState::new(&saved);
+                d.active = None;
+            }
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("env update failed: {e}")),
+    }
+}
+
+/// ⏎ in the add-field key editor: validate, run the 3-source collision check, and
+/// either prompt (overwrite/keep/cancel) or add the key and drop into value-edit.
+fn commit_env_new_key(app: &mut App) {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+    else {
+        return;
+    };
+    let key = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.env_new_key.trimmed().to_string())
+        .unwrap_or_default();
+    if key.is_empty() {
+        if let Some(d) = app.config_draft.as_mut() {
+            d.active = None;
+        }
+        return;
+    }
+    // A settings.json env key is a shell-style name; spaces or `=` are never valid.
+    if key.contains(char::is_whitespace) || key.contains('=') {
+        app.toast(
+            ToastKind::Danger,
+            "env key can't contain spaces or '='".to_string(),
+        );
+        return; // keep the editor open so the user can fix it
+    }
+    let base_env_keys = claude_settings_env_keys().unwrap_or_default();
+    let collision = {
+        let cfg = app.config();
+        cfg.find(&name)
+            .and_then(|p| classify_env_key(p, &base_env_keys, &key))
+    };
+    if let Some(d) = app.config_draft.as_mut() {
+        d.active = None;
+    }
+    match collision {
+        Some(c) => app
+            .modals
+            .push(Modal::EnvCollision(env_collision_form(name, key, c))),
+        None => env_add_commit(app, &name, &key),
+    }
+}
+
+/// Add (when new) the custom key with an empty value, then focus its row and open
+/// the value editor. An existing key (overwrite chosen on the prompt) is edited in
+/// place — never re-blanked.
+fn env_add_commit(app: &mut App, name: &str, key: &str) {
+    let exists = {
+        let cfg = app.config();
+        cfg.find(name)
+            .map(|p| p.env.contains_key(key))
+            .unwrap_or(false)
+    };
+    if !exists {
+        let new_env = {
+            let cfg = app.config();
+            cfg.find(name).map(|p| {
+                let mut env = p.env.clone();
+                env.insert(key.to_string(), String::new());
+                env
+            })
+        };
+        let Some(new_env) = new_env else {
+            return;
+        };
+        if let Err(e) = {
+            let mut cfg = app.config();
+            edit_profile_env(&mut cfg, name, new_env)
+        } {
+            app.toast(ToastKind::Danger, format!("env update failed: {e}"));
+            return;
+        }
+    }
+    let idx = {
+        let cfg = app.config();
+        cfg.find(name)
+            .and_then(|p| p.env.keys().position(|k| k == key))
+    };
+    let Some(idx) = idx else {
+        return;
+    };
+    if let Some(row_pos) = env_entry_row_index(app, idx) {
+        app.config_action_cursor = row_pos;
+    }
+    enter_env_value_edit(app, idx);
+}
+
+/// Remove the focused custom env entry and persist; clamps the cursor afterwards.
+fn remove_env_field(app: &mut App) {
+    let rows = config_rows(app);
+    let Some(ConfigRow::EnvEntry(i)) = rows.get(app.config_action_cursor).copied() else {
+        return;
+    };
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+    else {
+        return;
+    };
+    let (removed, new_env) = {
+        let cfg = app.config();
+        match cfg.find(&name) {
+            Some(p) => {
+                let Some(removed) = p.env.keys().nth(i).cloned() else {
+                    return;
+                };
+                let mut env = p.env.clone();
+                env.remove(&removed);
+                (removed, env)
+            }
+            None => return,
+        }
+    };
+    let result = {
+        let mut cfg = app.config();
+        edit_profile_env(&mut cfg, &name, new_env)
+    };
+    match result {
+        Ok(()) => {
+            if let Some(d) = app.config_draft.as_mut() {
+                d.active = None;
+            }
+            let last = config_rows(app).len().saturating_sub(1);
+            app.config_action_cursor = app.config_action_cursor.min(last);
+            app.toast(ToastKind::Success, format!("removed env '{removed}'"));
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("env remove failed: {e}")),
+    }
+}
+
+/// Position of `EnvEntry(sorted_idx)` in the current detail-row list, if present.
+fn env_entry_row_index(app: &App, sorted_idx: usize) -> Option<usize> {
+    config_rows(app)
+        .iter()
+        .position(|r| *r == ConfigRow::EnvEntry(sorted_idx))
+}
+
+/// Build the collision prompt for a candidate key against its colliding source.
+/// `reason` is a noun phrase ("the base url field", …) so both the prompt message
+/// (`used by {reason}`) and the overwrite detail (`overrides {reason}`) read right.
+fn env_collision_form(
+    profile: String,
+    key: String,
+    collision: EnvKeyCollision,
+) -> EnvCollisionForm {
+    let (reason, existing_idx) = match collision {
+        EnvKeyCollision::Managed(label) => (label.to_string(), None),
+        EnvKeyCollision::ProfileField(idx) => (
+            "another custom field on this account".to_string(),
+            Some(idx),
+        ),
+        EnvKeyCollision::BaseSettings => ("your ~/.claude/settings.json".to_string(), None),
+    };
+    EnvCollisionForm {
+        profile,
+        key,
+        reason,
+        existing_idx,
+        // Default to the safe choice (cancel), per the modal cancel-default rule.
+        cursor: EnvCollisionForm::options().len() - 1,
+    }
+}
+
+fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::EnvCollision(state)) = app.modals.last_mut() else {
+        return;
+    };
+    let last = EnvCollisionForm::options().len() - 1;
+    match key.code {
+        KeyCode::Up => {
+            state.cursor = if state.cursor == 0 {
+                last
+            } else {
+                state.cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            state.cursor = if state.cursor >= last {
+                0
+            } else {
+                state.cursor + 1
+            };
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let choice = EnvCollisionForm::options()[state.cursor.min(last)];
+            let name = state.profile.clone();
+            let pending = state.key.clone();
+            let existing_idx = state.existing_idx;
+            app.modals.pop();
+            run_env_collision_choice(app, &name, &pending, existing_idx, choice);
+        }
+        _ => {}
+    }
+}
+
+fn run_env_collision_choice(
+    app: &mut App,
+    name: &str,
+    key: &str,
+    existing_idx: Option<usize>,
+    choice: EnvCollisionChoice,
+) {
+    match choice {
+        EnvCollisionChoice::Overwrite => env_add_commit(app, name, key),
+        EnvCollisionChoice::KeepExisting => {
+            // For an own-field clash, jump to the existing entry; else just dismiss.
+            if let Some(idx) = existing_idx
+                && let Some(row_pos) = env_entry_row_index(app, idx)
+            {
+                app.config_action_cursor = row_pos;
+            }
+        }
+        EnvCollisionChoice::Cancel => {}
     }
 }
 

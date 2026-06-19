@@ -10,7 +10,8 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use crate::profile::DivergenceChoice;
 
 use super::super::app::{
-    ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceForm, InputState, Modal, Tab,
+    ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceForm, EnvCollisionChoice,
+    EnvCollisionForm, InputState, Modal, Tab,
 };
 use super::super::theme;
 use super::panes::{bold_when, head_cols};
@@ -22,6 +23,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::CaptureName(form) => draw_capture_name(frame, area, form.input.value.as_str()),
         Modal::Help => draw_help(frame, area, app),
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
+        Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
     }
 }
 
@@ -199,6 +201,67 @@ fn divergence_option_text(option: DivergenceChoice, active: &str) -> (String, St
     }
 }
 
+fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm) {
+    let options = EnvCollisionForm::options();
+    let cursor = form.cursor.min(options.len() - 1);
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("'{}'", form.key),
+                Style::default().fg(theme::accent_color()),
+            ),
+            Span::styled(" is already used by ", theme::dim()),
+            Span::styled(form.reason.clone(), theme::body()),
+            Span::styled(".", theme::dim()),
+        ]),
+        Line::from(""),
+    ];
+
+    for (i, option) in options.iter().enumerate() {
+        let selected = i == cursor;
+        let arrow = if selected {
+            Span::styled("\u{276f} ", theme::accent())
+        } else {
+            Span::raw("  ")
+        };
+        let (label, detail) = env_collision_option_text(*option, form);
+        let label_style = if selected {
+            theme::accent()
+        } else {
+            theme::dim()
+        };
+        lines.push(Line::from(vec![arrow, Span::styled(label, label_style)]));
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(detail, theme::dim()),
+        ]));
+    }
+
+    draw_modal(frame, area, "KEY IN USE", lines);
+}
+
+fn env_collision_option_text(
+    choice: EnvCollisionChoice,
+    form: &EnvCollisionForm,
+) -> (String, String) {
+    match choice {
+        EnvCollisionChoice::Overwrite => (
+            "add the custom field anyway".to_string(),
+            format!("this account's value overrides {}", form.reason),
+        ),
+        EnvCollisionChoice::KeepExisting => (
+            "keep the existing value".to_string(),
+            if form.existing_idx.is_some() {
+                "jump to the existing custom field".to_string()
+            } else {
+                "leave it untouched; don't add the field".to_string()
+            },
+        ),
+        EnvCollisionChoice::Cancel => ("cancel".to_string(), "back out, no change".to_string()),
+    }
+}
+
 fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
     let input = InputState {
         value: value.to_string(),
@@ -275,6 +338,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("\u{2191}\u{2193}", "pick account / + new, then a row"),
                 ("\u{23ce}", "open settings · edit field · flip toggle"),
                 ("\u{23ce} on a field", "edit inline; \u{23ce} again saves"),
+                ("env", "+ add field · \u{23ce} edits a value · a removes"),
                 ("delete", "\u{23ce} once to arm, again to confirm"),
                 ("\u{238b}", "stop editing / back to account list"),
             ][..],
