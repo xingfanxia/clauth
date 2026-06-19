@@ -800,7 +800,8 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Enter); // focus the detail pane
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
     assert!(app.config_draft.is_some());
-    press(&mut app, KeyCode::Down); // Name → BaseUrl
+    press(&mut app, KeyCode::Down); // Name → AutoStart (OAuth row, now right below name)
+    press(&mut app, KeyCode::Down); // AutoStart → BaseUrl
     press(&mut app, KeyCode::Enter); // start capturing the field
     assert_eq!(
         app.config_draft.as_ref().and_then(|d| d.active),
@@ -821,10 +822,8 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Up); // 2 → 1 (work)
     press(&mut app, KeyCode::Up); // → 0 (personal)
     press(&mut app, KeyCode::Enter); // focus detail for personal
-    // auto-start is the second-to-last row (before delete); wrap up to reach it
-    // regardless of how many model/env rows sit above it.
-    press(&mut app, KeyCode::Up); // Name → Delete (wraps to last)
-    press(&mut app, KeyCode::Up); // Delete → AutoStart
+    // auto-start sits right below name (OAuth-only); one step down reaches it.
+    press(&mut app, KeyCode::Down); // Name → AutoStart
     press(&mut app, KeyCode::Enter); // flip it
     assert!(
         !auto_start_of(&app, "personal"),

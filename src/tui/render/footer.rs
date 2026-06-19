@@ -60,7 +60,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ],
             ConfigFocus::Actions => {
                 // Row-aware: the `model` row cycles on space; env rows edit a value
-                // or open the add-field key editor.
+                // or open the add-env key editor.
                 match config_rows(app).get(app.config_action_cursor) {
                     Some(ConfigRow::Model) => &[
                         ("↑↓", "row"),
@@ -77,7 +77,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     ],
                     Some(ConfigRow::EnvAdd) => &[
                         ("↑↓", "row"),
-                        ("↵", "add field"),
+                        ("↵", "add env"),
                         ("a", "actions"),
                         ("?", "help"),
                     ],

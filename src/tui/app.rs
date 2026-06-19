@@ -168,7 +168,7 @@ pub(crate) enum FallbackRow {
 /// [`config_rows`]: auto-start only for OAuth; trailing row is `delete` or
 /// `create`. `Name`/`BaseUrl`/`ApiKey` are text rows; the rest are toggles/actions.
 /// `EnvEntry(i)` indexes the profile's sorted custom-env snapshot; `EnvAdd` is the
-/// trailing `+ add field` row. Both appear only for existing accounts.
+/// trailing `+ add env` row. Both appear only for existing accounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigRow {
     Name,
@@ -190,7 +190,7 @@ pub(crate) enum ConfigRow {
     /// A custom `key = value` env entry, indexed into the profile's sorted env
     /// snapshot. ⏎ edits the value inline; `a` → `remove field` deletes it.
     EnvEntry(usize),
-    /// The `+ add field` row — ⏎ opens a key editor that runs the collision check.
+    /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
     AutoStart,
     Delete,
@@ -254,7 +254,7 @@ pub(crate) struct ConfigDraft {
     /// Value buffer for the env entry currently being edited (seeded on entry).
     /// Shared across `EnvEntry` rows since only one is active at a time.
     pub(crate) env_value: InputState,
-    /// Key buffer for the `+ add field` row's key editor.
+    /// Key buffer for the `+ add env` row's key editor.
     pub(crate) env_new_key: InputState,
     /// `Some(row)` while a text row (or the `model` custom field) owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
@@ -3057,7 +3057,12 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         Some(d) => !d.base_url.value.trim().is_empty(),
         None => profile.map(|p| !p.is_oauth()).unwrap_or(false),
     };
-    let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl];
+    let mut rows = vec![ConfigRow::Name];
+    // auto-start sits right below name (OAuth-only; mutually exclusive with api key).
+    if !is_api {
+        rows.push(ConfigRow::AutoStart);
+    }
+    rows.push(ConfigRow::BaseUrl);
     if is_api {
         rows.push(ConfigRow::ApiKey);
     }
@@ -3096,14 +3101,11 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         rows.push(ConfigRow::ModelOverrideAdd);
     }
 
-    // One row per custom env entry (sorted), then the `+ add field` row. Indices
+    // One row per custom env entry (sorted), then the `+ add env` row. Indices
     // must match the sorted env snapshot used by the renderer and the commit path.
     let env_count = profile.map(|p| p.env.len()).unwrap_or(0);
     rows.extend((0..env_count).map(ConfigRow::EnvEntry));
     rows.push(ConfigRow::EnvAdd);
-    if !is_api {
-        rows.push(ConfigRow::AutoStart);
-    }
     rows.push(ConfigRow::Delete);
     rows
 }
@@ -3477,7 +3479,7 @@ fn enter_env_value_edit(app: &mut App, i: usize) {
     }
 }
 
-/// ⏎ on `+ add field`: open an empty key editor (commit runs the collision check).
+/// ⏎ on `+ add env`: open an empty key editor (commit runs the collision check).
 fn enter_env_add_edit(app: &mut App) {
     if let Some(d) = app.config_draft.as_mut() {
         d.env_new_key = InputState::new("");
@@ -3537,7 +3539,7 @@ fn commit_env_value(app: &mut App, i: usize) {
     }
 }
 
-/// ⏎ in the add-field key editor: validate, run the 3-source collision check, and
+/// ⏎ in the add-env key editor: validate, run the 3-source collision check, and
 /// either prompt (overwrite/keep/cancel) or add the key and drop into value-edit.
 fn commit_env_new_key(app: &mut App) {
     let Some(name) = app

@@ -377,7 +377,7 @@ mod env_editor {
         let pos = |row: ConfigRow| rows.iter().position(|r| *r == row);
         let e0 = pos(ConfigRow::EnvEntry(0)).expect("first env row");
         let e1 = pos(ConfigRow::EnvEntry(1)).expect("second env row");
-        let add = pos(ConfigRow::EnvAdd).expect("add-field row");
+        let add = pos(ConfigRow::EnvAdd).expect("add-env row");
         assert!(e0 < e1 && e1 < add, "sorted entries precede the add row");
         assert_eq!(
             *rows.last().unwrap(),

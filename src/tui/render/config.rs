@@ -356,7 +356,7 @@ fn detail_row(
         }
         // While editing, the typed text is the new key; at rest, the add chip.
         ConfigRow::EnvAdd if editing => kv_field(arrow, "key", input, editing, selected, false),
-        ConfigRow::EnvAdd => Line::from(vec![arrow, Span::styled("+ add field", theme::accent())]),
+        ConfigRow::EnvAdd => Line::from(vec![arrow, Span::styled("+ add env", theme::accent())]),
         ConfigRow::ModelOverrideAdd => Line::from(vec![
             arrow,
             Span::styled("+ model override", theme::accent()),

@@ -338,7 +338,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("\u{2191}\u{2193}", "pick account / + new, then a row"),
                 ("\u{23ce}", "open settings · edit field · flip toggle"),
                 ("\u{23ce} on a field", "edit inline; \u{23ce} again saves"),
-                ("env", "+ add field · \u{23ce} edits a value · a removes"),
+                ("env", "+ add env · \u{23ce} edits a value · a removes"),
                 ("delete", "\u{23ce} once to arm, again to confirm"),
                 ("\u{238b}", "stop editing / back to account list"),
             ][..],
