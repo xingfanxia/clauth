@@ -314,7 +314,7 @@ struct ComponentWire {
     status: String,
 }
 
-/// Strip a trailing/embedded balanced ` (…)` group from a component name and
+/// Strip a trailing/embedded balanced parenthesized group from a component name and
 /// tidy the leftover whitespace: `Claude Console (platform.claude.com)` →
 /// `Claude Console`. Nested parens are handled by depth-tracking so the whole
 /// balanced span is dropped (`Foo (bar (baz) qux)` → `Foo`). An unbalanced `(`
@@ -347,7 +347,7 @@ fn strip_parens(name: &str) -> String {
             out.push(ch);
         }
     }
-    // Collapse the double space left where ` (…)` was and trim the ends.
+    // Collapse the double space left where the parenthesized group was and trim the ends.
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -431,7 +431,7 @@ fn first_reported_status(name: &str, updates: &[IncidentUpdate]) -> Option<Strin
 }
 
 /// Severity rank for a component status — higher is worse. Two raw names can
-/// strip to the same display name (e.g. a `(…)`-suffixed dupe) with different
+/// strip to the same display name (e.g. a parenthesized-suffix dupe) with different
 /// statuses; the merged entry must show the WORST so a half-degraded component
 /// never gets a green dot.
 fn status_rank(status: &str) -> u8 {

@@ -26,7 +26,7 @@ const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
 const RATE_LIMIT_MIN_BACKOFF_MS: u64 = 10_000;
 
 /// Per-consecutive-429 multiplier on [`RATE_LIMIT_MIN_BACKOFF_MS`] when the
-/// server gives no usable `retry-after`: streak 1 → 10s, 2 → 30s, 3 → 90s, …,
+/// server gives no usable `retry-after`: streak 1 → 10s, 2 → 30s, 3 → 90s,
 /// each capped by [`MAX_RETRY_AFTER_MS`]. Stops a sustained rate limit from being
 /// re-hit every cadence; the streak resets on the next live fetch.
 const RATE_LIMIT_BACKOFF_FACTOR: u64 = 3;

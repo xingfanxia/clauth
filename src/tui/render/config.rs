@@ -181,7 +181,7 @@ fn draw_settings_rows(
     if snap.is_active {
         // "● active" = 8 chars; left side = KEY_W + type_value chars; pad the gap.
         let left_w = KEY_W + type_value.chars().count();
-        let indicator_w = "● active".chars().count(); // 8
+        let indicator_w = "● active".chars().count();
         let pad = (inner.width as usize)
             .saturating_sub(left_w)
             .saturating_sub(indicator_w);

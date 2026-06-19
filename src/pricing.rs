@@ -234,7 +234,7 @@ fn fetch_table() -> anyhow::Result<PriceTable> {
 
 /// Parse the LiteLLM JSON into a flat `id → ModelRate` map. Tolerant: a value
 /// that is not an object, or lacks `input_cost_per_token`, is skipped rather
-/// than failing the whole parse. Path-style keys (`bedrock/…`, `azure_ai/…`) are
+/// than failing the whole parse. Path-style keys (`bedrock/`, `azure_ai/`) are
 /// dropped — Claude Code logs bare model ids, so keeping them only bloats the
 /// cache. Missing cache rates default to `0.0`.
 fn distill(json: &str) -> anyhow::Result<HashMap<String, ModelRate>> {

@@ -86,7 +86,6 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 
-    // Scrollbar: total = items × 2 lines; viewport = actual pixel height.
     draw_scrollbar(
         frame,
         inner,
@@ -128,7 +127,6 @@ fn incident_rows(
         None => style,
     };
 
-    // Line 1: caret gutter + truncated title.
     let caret = if selected && pane_focused {
         Span::styled(
             "❯ ",
@@ -162,7 +160,6 @@ fn incident_rows(
     let mut line2: Vec<Span<'static>> = vec![Span::styled("  ", with_bg(Style::default()))];
     let mut used = 2usize;
 
-    // Impact pill (omitted when none).
     if !matches!(incident.impact, Impact::None) {
         let (iword, icolor) = impact_pill(&incident.impact);
         line2.extend([
@@ -321,7 +318,6 @@ fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
         ),
         Span::styled(" ]", theme::dim()),
     ];
-    // Impact pill — omitted entirely when impact is none.
     if !matches!(incident.impact, Impact::None) {
         let (iword, icolor) = impact_pill(&incident.impact);
         header.extend([
@@ -336,7 +332,6 @@ fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
     let age_str = relative_age(incident.started_ms);
     header.push(Span::styled(format!("  {age_str}"), theme::faint()));
 
-    // Duration text: `· lasted <dur>` when resolved, `· ongoing` otherwise.
     let dur_str = match incident.resolved_ms {
         Some(resolved) if resolved >= incident.started_ms => {
             let dur = duration_label((resolved - incident.started_ms) / 1000);
@@ -358,8 +353,6 @@ fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
         Span::styled(clock_label(incident.started_ms, true), theme::body()),
     ]));
 
-    // components row — status-dot-prefixed entries, 2-space gaps; omitted when
-    // empty. Narrow panes fit whole entries only and append `+N` for the rest.
     if !incident.components.is_empty() {
         lines.push(components_line(&incident.components, inner_w));
     }
@@ -440,7 +433,6 @@ fn transition_lines(
     if transitions.is_empty() {
         return Vec::new();
     }
-    // Pre-shorten the new status; the name column is sized to the widest name.
     let rows: Vec<(String, String)> = transitions
         .iter()
         .map(|(name, _, new)| (name.to_lowercase(), shorten_component_status(new)))
@@ -536,7 +528,7 @@ fn component_status_color(status: &str) -> ratatui::style::Color {
     }
 }
 
-/// Build the detail `components` row: `● name  ● name …`. The dot alone carries
+/// Build the detail `components` row: `● name  ● name`. The dot alone carries
 /// the component's first-reported status (user decision — no status word; the
 /// name is `theme::body()`, lowercased — value-row consistency, a house
 /// deviation from the dim-label rule). Fits whole entries only; dropped entries
@@ -555,7 +547,6 @@ fn components_line(components: &[(String, String)], inner_w: usize) -> Line<'sta
     let mut shown = 0usize;
     for (i, (name, status)) in components.iter().enumerate() {
         let label = name.to_lowercase();
-        // Each entry: "● name", preceded by a 2-space gap except the first.
         let gap = if i == 0 { 0 } else { 2 };
         let entry_w = gap + 2 + label.chars().count();
         // Reserve room for a possible trailing `  +N` when more remain.
@@ -647,7 +638,6 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut line = String::new();
     for word in text.split_whitespace() {
         if word.chars().count() > width {
-            // Flush, then hard-split the oversized word.
             if !line.is_empty() {
                 lines.push(std::mem::take(&mut line));
             }

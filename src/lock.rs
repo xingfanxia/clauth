@@ -74,7 +74,6 @@ impl StateLock {
             Err(p) => p.into_inner(),
         };
 
-        // Open/create the flock file if not already held.
         if guard.is_none() {
             let dir = clauth_dir()?;
             std::fs::create_dir_all(&dir).context("Failed to create ~/.clauth")?;
@@ -85,7 +84,6 @@ impl StateLock {
                 .truncate(false)
                 .open(dir.join(LOCK_FILENAME))
                 .context("Failed to open clauth state lock file")?;
-            // Blocking; releases when the holder drops its lock or exits.
             file.lock().context("Failed to acquire clauth state lock")?;
             *guard = Some(file);
         }
@@ -116,7 +114,6 @@ impl Drop for StateLock {
             if let Some(ref mut g) = self._thread_guard {
                 **g = None; // close the File → flock released
             }
-            // _thread_guard drops implicitly, unblocking sibling threads.
         }
         // Reentrant calls have _thread_guard = None; nothing extra to do.
     }

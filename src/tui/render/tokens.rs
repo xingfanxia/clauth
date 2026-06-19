@@ -246,7 +246,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(block, area);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "reading ~/.claude…",
+                "reading ~/.claude",
                 theme::faint(),
             )))
             .style(theme::base()),
@@ -455,7 +455,6 @@ fn total_lines(
             w,
         ),
     ];
-    // Active span — earliest date flush left, latest flush right.
     if let (Some(first), Some(latest)) = (stats.first_session_date.as_deref(), last) {
         lines.push(lr(
             vec![Span::styled(short_date(first), theme::dim())],
@@ -746,7 +745,7 @@ fn draw_model_detail(
         theme::label(),
     )));
     match prices {
-        None => lines.push(Line::from(Span::styled("rates loading…", theme::faint()))),
+        None => lines.push(Line::from(Span::styled("rates loading", theme::faint()))),
         Some(p) => match p.rate(&m.model) {
             None => lines.push(Line::from(Span::styled(
                 "no rate for this model",

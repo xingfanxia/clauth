@@ -50,7 +50,6 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
     let items = chain_items(app);
     let cfg = app.config();
     let sel = app.chain_cursor.min(items.len().saturating_sub(1));
-    // Selector is the first (and only) bordered panel in the left column.
     draw_selector_list(frame, area, "chain", focused, sel, |w| {
         items
             .iter()

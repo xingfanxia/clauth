@@ -212,7 +212,7 @@ pub(crate) fn model_display_name(model: &str) -> String {
     if model == "others" {
         return "others".to_string();
     }
-    // Drop a trailing 8-digit date stamp (e.g. `…-20250929`); version segments
+    // Drop a trailing 8-digit date stamp (e.g. `-20250929`); version segments
     // are 1–2 digits, so this never eats a real version component.
     let base = match model.rsplit_once('-') {
         Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) => head,
@@ -327,7 +327,6 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
     let raw = std::fs::read_to_string(&cache_path).ok()?;
     let wire: StatsCacheFile = serde_json::from_str(&raw).ok()?;
 
-    // Build models from modelUsage.
     let mut models: Vec<ModelTokens> = wire
         .model_usage
         .iter()
@@ -341,7 +340,6 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
         .collect();
     models.sort_unstable_by_key(|m| std::cmp::Reverse(m.total()));
 
-    // Build daily from dailyModelTokens.
     let mut daily: Vec<DayTokens> = wire
         .daily_model_tokens
         .iter()
@@ -352,7 +350,6 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
         .collect();
     daily.sort_unstable_by_key(|d| d.date.clone());
 
-    // Build activity from dailyActivity.
     let mut activity: Vec<DayActivity> = wire
         .daily_activity
         .iter()
@@ -365,7 +362,6 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
         .collect();
     activity.sort_unstable_by_key(|d| d.date.clone());
 
-    // Build hour_counts; missing keys → 0.
     let mut hour_counts = [0u64; 24];
     for (k, v) in &wire.hour_counts {
         if let Ok(h) = k.parse::<usize>()
@@ -375,7 +371,6 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
         }
     }
 
-    // Compute totals from modelUsage.
     let total_input: u64 = wire.model_usage.values().map(|u| u.input_tokens).sum();
     let total_output: u64 = wire.model_usage.values().map(|u| u.output_tokens).sum();
     let total_cache_read: u64 = wire
@@ -701,7 +696,6 @@ fn process_jsonl(
             .cache_create
             .saturating_add(usage.cache_creation_input_tokens);
 
-        // Track max date added.
         if max_date.as_deref().is_none_or(|prev| date > prev) {
             *max_date = Some(date.to_owned());
         }

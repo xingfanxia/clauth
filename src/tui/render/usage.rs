@@ -124,13 +124,13 @@ fn build_usage_lines(
     }
 
     if profile.usage.is_none() {
-        lines.push(Line::from(Span::styled("  loading…", theme::faint())));
+        lines.push(Line::from(Span::styled("  loading", theme::faint())));
         return lines;
     }
 
     let mut stats = collect_stats(profile);
     if stats.is_empty() {
-        lines.push(Line::from(Span::styled("  loading…", theme::faint())));
+        lines.push(Line::from(Span::styled("  loading", theme::faint())));
         return lines;
     }
 
@@ -143,7 +143,6 @@ fn build_usage_lines(
     // Right-align % to far content edge so figures stack above the reset text.
     let pct_col = (bar_width + max_trailing).min(inner_w as usize);
 
-    // Compute burn rates per window from cached history.
     let history = app
         .history_cache
         .get(profile.name.as_str())
@@ -416,13 +415,11 @@ fn bar_spans(
         |glyph: &str, n: usize, style: Style| (n > 0).then(|| Span::styled(glyph.repeat(n), style));
     let mut spans = Vec::with_capacity(4);
     if m < filled {
-        // Marker sits over the filled run — usage is ahead of pace.
         spans.extend(run("█", m, fill));
         spans.push(Span::styled("│".to_string(), theme::warning()));
         spans.extend(run("█", filled - m - 1, fill));
         spans.extend(run("░", empty, theme::line_strong()));
     } else {
-        // Marker sits over the empty run — usage is under pace.
         spans.extend(run("█", filled, fill));
         spans.extend(run("░", m - filled, theme::line_strong()));
         spans.push(Span::styled("│".to_string(), theme::dim()));
@@ -471,7 +468,7 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
         let verb = activity_verb(header.activity);
         return Line::from(vec![
             key,
-            Span::styled(format!("{frame} {verb}…"), spinner_style(header.activity)),
+            Span::styled(format!("{frame} {verb}"), spinner_style(header.activity)),
         ]);
     }
 
@@ -526,7 +523,7 @@ fn build_tp_rows(profile: &Profile, _header: &HeaderState) -> Vec<Line<'static>>
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     let Some(stats) = profile.third_party_usage.as_ref() else {
-        lines.push(Line::from(Span::styled("loading…", theme::faint())));
+        lines.push(Line::from(Span::styled("loading", theme::faint())));
         return lines;
     };
 
@@ -542,7 +539,6 @@ fn build_tp_rows(profile: &Profile, _header: &HeaderState) -> Vec<Line<'static>>
 
     for row in &stats.rows {
         if row.label.is_empty() {
-            // Single-line message (e.g. danger / faint).
             let style = match row.kind {
                 StatRowKind::Danger => theme::danger(),
                 _ => theme::faint(),

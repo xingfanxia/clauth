@@ -23,7 +23,7 @@
 //! - `apply_usage`: `usage_store` → `usage_status` → `config`.
 //! - rotation/save sites: `config` → state flock → `activity`.
 //!
-//! Standalone leaves (`refetch_queue`, the `pending_*` sets, …) are never nested
+//! Standalone leaves (`refetch_queue`, the `pending_*` sets) are never nested
 //! with another tracked lock; they are ranked above the rest so that a future
 //! accidental nesting under any held lock still *increases* the rank rather than
 //! inverting it.

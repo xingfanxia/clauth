@@ -89,7 +89,6 @@ pub(crate) fn compute_burn_rates_from_history(
 
         entries.push((now_ms, window.utilization));
 
-        // Gap-cut: slice off any idle stretch before the current activity.
         // Must run before dedup — the equal-util pair marks the gap.
         if gap_cut_ms > 0 && entries.len() >= 2 {
             let gap = gap_boundary(&entries, gap_cut_ms);

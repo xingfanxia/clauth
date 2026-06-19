@@ -103,7 +103,6 @@ fn build_overflow(app: &App) -> Vec<Span<'static>> {
 
     let mut spans: Vec<Span<'static>> = Vec::new();
 
-    // Left chevron — omit when already at the first tab.
     if active_idx > 0 {
         spans.push(Span::styled(PREV_MARK, theme::faint()));
     }
@@ -116,7 +115,6 @@ fn build_overflow(app: &App) -> Vec<Span<'static>> {
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
     ));
 
-    // Right chevron — omit when already at the last tab.
     if active_idx < last_idx {
         spans.push(Span::styled(NEXT_MARK, theme::faint()));
     }

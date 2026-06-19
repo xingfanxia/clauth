@@ -190,7 +190,6 @@ pub(crate) fn auto_start_kick(
                 rotated: None,
             };
         }
-        // Expired token (401): always rotate once and retry.
         Err(KickError::Status(401)) => {}
         // Rate limit (429): rotate only if the access token is also clock-expired;
         // a still-valid token can't be unstuck by a refresh, so refuse to spend it.

@@ -31,7 +31,7 @@ pub(crate) fn run(config: &AppConfig, name: &str, claude_args: &[String]) -> Res
     let profile = config.find(name).context("profile not found")?;
 
     let runtime = {
-        let _spinner = Spinner::start("clauth: preparing runtime…");
+        let _spinner = Spinner::start("clauth: preparing runtime");
         ProfileRuntime::acquire(profile)?
     };
 

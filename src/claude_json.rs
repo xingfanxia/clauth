@@ -1,7 +1,7 @@
 //! Cross-profile `.claude.json` synchronizer.
 //!
 //! Claude Code keeps one large config file — `~/.claude.json` for normal use —
-//! holding user-global state (`projects`, `mcpServers`, `tips`, `userID`, …)
+//! holding user-global state (`projects`, `mcpServers`, `tips`, `userID`)
 //! alongside an account-specific `oauthAccount` block and a few billing/usage
 //! caches. `clauth start <profile>` runs Claude Code against a per-profile
 //! runtime tree with its OWN `.claude.json`, because a single shared file leaks

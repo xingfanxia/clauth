@@ -48,7 +48,7 @@ fn config_with_chain(profiles: Vec<Profile>, active: &str) -> AppConfig {
     }
 }
 
-// All sinks exhausted: A→B→A→… loop must not form; next_target returns None.
+// All sinks exhausted: A→B→A loop must not form; next_target returns None.
 #[test]
 fn all_maxed_sinks_no_switch() {
     let config = config_with_chain(

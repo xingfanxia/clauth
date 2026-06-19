@@ -85,7 +85,7 @@ pub(crate) fn tier() -> Tier {
 // ── Palette tables ────────────────────────────────────────────────────────────
 //
 // Each row: (full: Color::Rgb, compatible: Color::Indexed(xterm-256))
-// The xterm-256 index is the nearest match per the cloudy-tui SKILL.md table.
+// The xterm-256 index is the nearest match to the RGB value, for 256-color terminals.
 
 #[inline]
 fn pick(full: Color, compatible: Color) -> Color {

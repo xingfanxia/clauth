@@ -144,9 +144,7 @@ pub(super) fn draw_scrollbar(
     let col_y = inner.y;
     let col_h = inner.height as usize;
 
-    // Thumb length: proportional to viewport / total, at least 1.
     let thumb_len = ((col_h * viewport) / total).max(1).min(col_h);
-    // Thumb start: proportional to scroll offset.
     let max_offset = total.saturating_sub(viewport);
     let thumb_top = ((col_h - thumb_len) * offset)
         .checked_div(max_offset)

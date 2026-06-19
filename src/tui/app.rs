@@ -1188,7 +1188,6 @@ impl App {
             }
         }
 
-        // Invalidate history cache when the file mtime changed.
         for (name, _) in &usage_snapshots {
             if let Ok(path) = crate::profile::profile_history_path(name)
                 && let Ok(mtime) = path.metadata().and_then(|m| m.modified())
@@ -1511,7 +1510,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('r') => {
             app.disarm_quit();
-            // Status `r` refreshes the whole feed.
             if app.tab == Tab::Status {
                 trigger_status_refresh(app);
                 return;
@@ -1521,10 +1519,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             if app.tab == Tab::Tokens {
                 let _ = app.tokens_refresh.send(());
                 let _ = app.pricing_refresh.send(());
-                app.toast(ToastKind::Info, "reloading token usage…");
+                app.toast(ToastKind::Info, "reloading token usage");
                 return;
             }
-            // Usage `r` refreshes only the current account.
             if app.tab == Tab::Usage {
                 let selected = {
                     let cfg = app.config();
@@ -1535,7 +1532,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 match selected {
                     Some((name, true, _)) | Some((name, _, true)) => {
                         app.manual_refresh_one(&name);
-                        app.toast(ToastKind::Info, format!("refreshing '{name}'…"));
+                        app.toast(ToastKind::Info, format!("refreshing '{name}'"));
                     }
                     Some((name, false, false)) => {
                         app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
@@ -1544,7 +1541,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 }
             } else {
                 app.manual_refresh();
-                app.toast(ToastKind::Info, "refreshing usage…");
+                app.toast(ToastKind::Info, "refreshing usage");
             }
             return;
         }
@@ -1622,7 +1619,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
         _ => {
-            // Any unhandled key disarms the 2-step quit.
             app.disarm_quit();
         }
     }
@@ -1788,7 +1784,7 @@ fn handle_status_key(app: &mut App, key: KeyEvent) {
 fn trigger_status_refresh(app: &mut App) {
     let _ = app.status_refresh.send(());
     app.status.fetching = true;
-    app.toast(ToastKind::Info, "refreshing status…");
+    app.toast(ToastKind::Info, "refreshing status");
 }
 
 /// Open the selected incident's page in the default browser (detached).
@@ -2498,7 +2494,7 @@ fn handle_fallback_threshold_edit_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Parse and persist the typed threshold (0..=100). Invalid input keeps the
-/// draft open so the inline Invalid-input treatment (DANGER value + `└ max is …`
+/// draft open so the inline Invalid-input treatment (DANGER value + `└ max is N`
 /// tooltip, rendered by the detail card) stays on screen until corrected — no toast.
 fn commit_threshold_edit(app: &mut App) {
     let Some(raw) = app.fallback_threshold_draft.as_ref().map(|i| i.trimmed()) else {
@@ -2775,7 +2771,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::RefreshUsage => match focused_account(app) {
             Some((name, _, true)) | Some((name, true, _)) => {
                 app.manual_refresh_one(&name);
-                app.toast(ToastKind::Info, format!("refreshing '{name}'…"));
+                app.toast(ToastKind::Info, format!("refreshing '{name}'"));
             }
             Some((name, false, false)) => {
                 app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
@@ -3337,7 +3333,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             spawn_worker(move || {
                 let _ = oauth::refresh_all(&config, true, &refetch, &activity, &sender);
             });
-            app.toast(ToastKind::Info, "rotating all tokens…");
+            app.toast(ToastKind::Info, "rotating all tokens");
         }
         ConfirmAction::RotateOne(name) => {
             // A live `clauth start` session owns this profile's single-use OAuth
@@ -3366,7 +3362,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             spawn_worker(move || {
                 oauth::rotate_one(&config, &target, &refetch, &activity, &sender);
             });
-            app.toast(ToastKind::Info, format!("rotating '{name}'…"));
+            app.toast(ToastKind::Info, format!("rotating '{name}'"));
         }
     }
 }
@@ -3582,7 +3578,6 @@ fn apply_status_incidents(
         app.status.error = None;
     }
 
-    // New-incident signal: compare the newest id to the last one we signalled.
     let newest_id = incidents.first().map(|i| i.id.clone());
     if let Some(newest) = &newest_id
         && app.status.seen_latest.as_ref() != Some(newest)
@@ -3606,7 +3601,6 @@ fn apply_status_incidents(
     }
     let _ = manual;
 
-    // Active incidents first, then by latest start.
     incidents.sort_by(|a, b| match (a.is_active(), b.is_active()) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
@@ -3860,7 +3854,6 @@ fn poll_credentials_divergence(app: &mut App) {
         }
         return;
     }
-    // Auto-resolve if a default divergence choice is configured.
     let default = app.config().state.default_divergence;
     if let Some(choice) = default {
         run_divergence_choice(app, &active, choice);

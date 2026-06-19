@@ -127,7 +127,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     // rotates once on a 401/429. One-shot — the CLI has no scheduler tick to
     // re-arm against, so no side channels.
     {
-        let _spinner = Spinner::start("clauth: priming usage window…");
+        let _spinner = Spinner::start("clauth: priming usage window");
         let _ = oauth::prime_window(&config, canonical);
     }
     println!("switched to '{canonical}'");

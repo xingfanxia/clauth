@@ -5,7 +5,7 @@
 //! profile's `refreshToken` — the clauth symlink layout keeps the live file
 //! and the matching profile's file byte-identical across rotations. (2) Inside
 //! a `clauth start` runtime, fall back to the profile named by
-//! `CLAUDE_CONFIG_DIR` (`…/profiles/<name>/runtime`): the runtime tree is
+//! `CLAUDE_CONFIG_DIR` (`profiles/<name>/runtime`): the runtime tree is
 //! per-profile, so that profile owns the session even before its first login
 //! is stored. (3) Otherwise, attribute a fresh login to the credential-less
 //! active profile.

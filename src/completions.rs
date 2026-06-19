@@ -204,7 +204,6 @@ pub(crate) fn auto_install_once() {
         return; // don't record the sentinel — re-prompt on the next interactive launch
     }
 
-    // Record so we never ask again.
     let _ = fs::create_dir_all(&clauth_dir);
     let _ = fs::write(&sentinel, "");
 

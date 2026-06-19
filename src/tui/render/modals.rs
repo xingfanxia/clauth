@@ -398,7 +398,6 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         .map(|item| item.label.chars().count())
         .max()
         .unwrap_or(0) as u16;
-    // Total content width: gutter + label + 3 spaces gap + hotkey
     let content_w = GUTTER + max_label_w + 3 + HOTKEY_W;
     let title = "actions";
     let w = (content_w + 6)
@@ -438,7 +437,6 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
             Span::styled("  ", Style::default())
         };
         let label_len = item.label.chars().count() as u16;
-        // Padding between label and right-aligned hotkey.
         let pad = inner_w
             .saturating_sub(GUTTER)
             .saturating_sub(label_len)
