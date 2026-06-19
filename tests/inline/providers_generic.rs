@@ -25,8 +25,14 @@ fn scan_zai_quota_shape_yields_bars_and_plan() {
     assert_eq!(bars[0].label, "time limit");
     assert_eq!(bars[0].pct, 0.0);
     assert!(bars[0].resets_at.is_some());
+    // Absolute amounts: `currentValue` → used, `used + remaining` → total (no
+    // explicit ceiling field). Rendered as the bar's trailing `x / y`.
+    assert_eq!(bars[0].used, Some(0.0));
+    assert_eq!(bars[0].total, Some(1000.0));
     assert_eq!(bars[1].label, "tokens limit");
     assert_eq!(bars[1].pct, 1.0);
+    // Percentage-only limit carries no absolute amounts.
+    assert!(bars[1].used.is_none() && bars[1].total.is_none());
     assert!(rows.is_empty(), "bars present → no scalar rows harvested");
 }
 

@@ -52,3 +52,63 @@ fn bar_spans_places_marker_without_changing_width() {
     assert_eq!(marker_col(&oob), None);
     assert_eq!(total(&oob), 10);
 }
+
+/// `stats_from_bars` infers each bar's window from its reset stamp, labels it in
+/// the 5h/7d/30d vocabulary, orders smallest window first, and surfaces absolute
+/// `used / total` only when both amounts are present.
+#[test]
+fn stats_from_bars_infers_labels_orders_and_trails() {
+    let now = crate::usage::now_epoch_secs();
+    let bars = vec![
+        // ~30d (monthly) window with absolute amounts, given first.
+        tp_bar(
+            "time limit",
+            0.0,
+            now + 30 * 86_400,
+            Some(0.0),
+            Some(1000.0),
+        ),
+        // ~4h window, percentage-only.
+        tp_bar("tokens limit", 1.0, now + 4 * 3600, None, None),
+    ];
+    let stats = stats_from_bars(&bars);
+    // Smallest inferred window first regardless of source order.
+    assert_eq!(stats[0].label, "5h");
+    assert_eq!(stats[1].label, "30d");
+    // Percentage-only bar: countdown only, no absolute.
+    assert!(stats[0].trailing.contains("resets in"));
+    assert!(!stats[0].trailing.contains('/'));
+    // Bar with amounts: `used / total` then the countdown.
+    assert!(stats[1].trailing.contains("0 / 1000"));
+    assert!(stats[1].trailing.contains("resets in"));
+}
+
+/// Two bars sharing an inferred window are disambiguated by their type label so
+/// they stay distinguishable (mirrors z.ai's pair of short-window token limits).
+#[test]
+fn stats_from_bars_disambiguates_shared_windows() {
+    let now = crate::usage::now_epoch_secs();
+    let bars = vec![
+        tp_bar("time limit", 1.0, now + 4 * 3600, None, None),
+        tp_bar("tokens limit", 2.0, now + 4 * 3600, None, None),
+    ];
+    let stats = stats_from_bars(&bars);
+    assert_eq!(stats[0].label, "5h · time limit");
+    assert_eq!(stats[1].label, "5h · tokens limit");
+}
+
+fn tp_bar(
+    label: &str,
+    pct: f64,
+    reset_secs: i64,
+    used: Option<f64>,
+    total: Option<f64>,
+) -> crate::providers::UsageBar {
+    crate::providers::UsageBar {
+        label: label.to_string(),
+        pct,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(reset_secs)),
+        used,
+        total,
+    }
+}

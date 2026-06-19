@@ -159,7 +159,7 @@ fn find_plan(obj: &serde_json::Map<String, Value>) -> Option<String> {
 }
 
 /// A bar is an object carrying a percentage-like field in 0..=100, optionally a
-/// sibling reset timestamp and a label field.
+/// sibling reset timestamp, a label field, and absolute used/total amounts.
 fn extract_bar(obj: &serde_json::Map<String, Value>) -> Option<UsageBar> {
     let pct = obj.iter().find_map(|(k, v)| {
         is_pct_key(k)
@@ -179,11 +179,31 @@ fn extract_bar(obj: &serde_json::Map<String, Value>) -> Option<UsageBar> {
                 .map(humanize_label)
         })
         .unwrap_or_else(|| "usage".to_string());
+    // Absolute amounts. `total` prefers an explicit ceiling field; when the
+    // object only carries `used` + `remaining` (z.ai), `used + remaining` is the
+    // robust fallback so the bar still shows `x / y`.
+    let used = num_field(obj, is_used_key);
+    let total = num_field(obj, is_total_key)
+        .or_else(|| used.and_then(|u| num_field(obj, is_remaining_key).map(|r| u + r)));
     Some(UsageBar {
         label,
         pct,
         resets_at,
+        used,
+        total,
     })
+}
+
+/// First numeric value under a key matching `pred`, accepting ints, floats, and
+/// numeric strings (`"10.50"`).
+fn num_field(obj: &serde_json::Map<String, Value>, pred: fn(&str) -> bool) -> Option<f64> {
+    obj.iter()
+        .find_map(|(k, v)| pred(k).then(|| as_f64_loose(v)).flatten())
+}
+
+fn as_f64_loose(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
 }
 
 fn harvest_scalars(value: &Value, rows: &mut Vec<StatRow>) {
@@ -366,6 +386,28 @@ fn is_scalar_key(k: &str) -> bool {
             | "amount"
             | "quota"
     )
+}
+
+/// Consumed amount paired with a bar's percentage (the `x` of `x / y`).
+fn is_used_key(k: &str) -> bool {
+    matches!(
+        k.to_ascii_lowercase().as_str(),
+        "currentvalue" | "current_value" | "used" | "consumed" | "spent" | "usedamount"
+    )
+}
+
+/// Explicit window ceiling (the `y` of `x / y`). `usage` is deliberately
+/// excluded — it is provider-ambiguous (z.ai means the ceiling, others the
+/// consumed amount); the `used + remaining` fallback covers the z.ai shape.
+fn is_total_key(k: &str) -> bool {
+    matches!(
+        k.to_ascii_lowercase().as_str(),
+        "total" | "limit" | "quota" | "max" | "capacity" | "budget" | "allowance" | "ceiling"
+    )
+}
+
+fn is_remaining_key(k: &str) -> bool {
+    matches!(k.to_ascii_lowercase().as_str(), "remaining" | "left")
 }
 
 #[cfg(test)]

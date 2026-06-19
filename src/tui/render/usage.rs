@@ -12,9 +12,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::App;
 use super::super::theme;
-use super::format::{
-    activity_verb, bar_string_with_cells, format_reset, reset_in_secs, spinner_frame, spinner_style,
-};
+use super::format::{activity_verb, format_reset, reset_in_secs, spinner_frame, spinner_style};
 use super::panes::{
     SELECTOR_WIDTH, active_dot, draw_profile_selector, section_box, section_box_verbatim,
 };
@@ -535,13 +533,24 @@ fn build_tp_rows(profile: &Profile, _header: &HeaderState, inner_w: u16) -> Vec<
         return lines;
     };
 
-    // Percentage windows → bars (e.g. z.ai limits).
+    // Percentage windows → bars rendered through the same `Stat::render` path
+    // as OAuth window bars (near-full-width bar + two-line eyebrow), with
+    // inferred-window labels ordered smallest-first and absolute `used / total`
+    // trailing. Identical look to the OAuth bars above.
     if !stats.bars.is_empty() {
-        for (i, bar) in stats.bars.iter().enumerate() {
+        let bar_stats = stats_from_bars(&stats.bars);
+        let max_trailing = bar_stats
+            .iter()
+            .map(|s| s.trailing.chars().count())
+            .max()
+            .unwrap_or(0);
+        let bar_width = bar_width_for(inner_w, max_trailing);
+        let pct_col = (bar_width + max_trailing).min(inner_w as usize);
+        for (i, stat) in bar_stats.into_iter().enumerate() {
             if i > 0 {
                 lines.push(Line::from(""));
             }
-            lines.extend(bar_row(bar, inner_w));
+            lines.extend(stat.render(bar_width, pct_col, 0));
         }
         return lines;
     }
@@ -581,44 +590,99 @@ fn build_tp_rows(profile: &Profile, _header: &HeaderState, inner_w: u16) -> Vec<
     lines
 }
 
-/// One percentage window as a two-line block: label + right-aligned pct, then a
-/// bare bar with a reset suffix. Mirrors the OAuth `Stat::render` shape without
-/// burn-rate/pace (generic providers carry no history).
-fn bar_row(bar: &crate::providers::UsageBar, inner_w: u16) -> Vec<Line<'static>> {
-    let pct = bar.pct.clamp(0.0, 100.0);
-    let color = Style::default().fg(theme::util_color(pct));
-    let cells = ((inner_w as usize) / 3).clamp(8, 24);
+/// Build render [`Stat`]s from generic percentage bars: infer each window's
+/// length from its time-until-reset, label it in the 5h/7d/30d vocabulary
+/// (disambiguated by the bar's own type label when two share a window), and
+/// order smallest window first. Rendered through the same `Stat::render` path as
+/// OAuth window bars, so the two are visually identical.
+fn stats_from_bars(bars: &[crate::providers::UsageBar]) -> Vec<Stat> {
+    let now = now_epoch_secs();
+    // (remaining_secs, window_label, bar) — window length inferred from reset.
+    let mut info: Vec<(Option<i64>, String, &crate::providers::UsageBar)> = bars
+        .iter()
+        .map(|b| {
+            let rem = window_remaining(b, now);
+            (rem, window_label(rem), b)
+        })
+        .collect();
+    // Smallest inferred window first; unknown (no reset) sorts last. Stable, so
+    // ties keep source order.
+    info.sort_by_key(|(rem, _, _)| rem.unwrap_or(i64::MAX));
 
-    let pct_str = format!("{pct:>2.0}%");
-    let pad =
-        (inner_w as usize).saturating_sub(bar.label.chars().count() + pct_str.chars().count());
-    let line1 = Line::from(vec![
-        Span::styled(bar.label.clone(), theme::body()),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(pct_str, color.add_modifier(Modifier::BOLD)),
-    ]);
-
-    let mut line2 = vec![Span::styled(bar_string_with_cells(pct, cells), color)];
-    let reset = bar_reset_text(&bar.resets_at);
-    if !reset.is_empty() {
-        line2.push(Span::styled(reset, theme::faint()));
+    // Disambiguate equal window labels by appending the bar's type label, so two
+    // limits sharing a window (e.g. z.ai's token limits) stay distinguishable.
+    let mut dup_counts: HashMap<String, usize> = HashMap::new();
+    for (_, wl, _) in &info {
+        *dup_counts.entry(wl.clone()).or_default() += 1;
     }
-    vec![line1, Line::from(line2)]
+
+    info.into_iter()
+        .map(|(rem, wl, bar)| {
+            let label = if dup_counts.get(&wl).copied().unwrap_or(0) > 1 {
+                format!("{wl} · {}", bar.label)
+            } else {
+                wl
+            };
+            let pct = bar.pct.clamp(0.0, 100.0);
+            Stat {
+                label,
+                pct,
+                color: Style::default().fg(theme::util_color(pct)),
+                trailing: bar_trailing(bar, rem),
+                burn_rate: None,
+                rate_unit: "h",
+                pace_pct: None,
+                reset_secs: rem,
+            }
+        })
+        .collect()
 }
 
-/// `"  resets in …"` for an ISO reset timestamp, or empty when unknown/passed.
-fn bar_reset_text(resets_at: &Option<String>) -> String {
-    let Some(iso) = resets_at.as_ref() else {
-        return String::new();
+/// Seconds until `bar` resets (may be negative if overdue). `None` when the bar
+/// carries no reset stamp — its window length is then unknown.
+fn window_remaining(bar: &crate::providers::UsageBar, now: i64) -> Option<i64> {
+    let reset = crate::usage::iso_to_epoch_secs(bar.resets_at.as_deref()?)?;
+    Some(reset - now)
+}
+
+/// Compact window-length label inferred from time-until-reset, in the 5h/7d/30d
+/// vocabulary OAuth bars use. Coarse by design — the reset countdown in the
+/// trailing text carries the precise remaining time.
+fn window_label(rem: Option<i64>) -> String {
+    let Some(secs) = rem.filter(|&s| s > 0) else {
+        return "usage".to_string();
     };
-    let Some(reset) = crate::usage::iso_to_epoch_secs(iso) else {
-        return String::new();
-    };
-    let remaining = reset - now_epoch_secs();
-    if remaining <= 0 {
-        return String::new();
+    if secs <= 5 * 3600 {
+        "5h".to_string()
+    } else if secs <= 7 * 86_400 {
+        "7d".to_string()
+    } else {
+        format!("{}d", (secs / 86_400).max(1))
     }
-    format!("  resets in {}", crate::usage::humanize_duration(remaining))
+}
+
+/// Trailing text for a generic bar: absolute `used / total`, then the reset
+/// countdown. Mirrors OAuth `Stat` trailing (`  x / y`, `  resets in …`).
+fn bar_trailing(bar: &crate::providers::UsageBar, rem: Option<i64>) -> String {
+    let mut out = String::new();
+    if let (Some(used), Some(total)) = (bar.used, bar.total) {
+        out.push_str(&format!("  {} / {}", fmt_amount(used), fmt_amount(total)));
+    }
+    if let Some(secs) = rem.filter(|&s| s > 0) {
+        out.push_str(&format!(
+            "  resets in {}",
+            crate::usage::humanize_duration(secs)
+        ));
+    }
+    out
+}
+
+fn fmt_amount(n: f64) -> String {
+    if n.fract() == 0.0 {
+        format!("{n:.0}")
+    } else {
+        format!("{n:.2}")
+    }
 }
 
 /// Key column width for third-party stat rows (wider than `KEY_W` to fit

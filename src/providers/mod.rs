@@ -141,6 +141,15 @@ pub(crate) struct UsageBar {
     /// ISO-8601 reset timestamp when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resets_at: Option<String>,
+    /// Absolute amount consumed in the window, when the response carries one
+    /// (z.ai `currentValue`). Rendered as the `x` of the bar's trailing `x / y`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) used: Option<f64>,
+    /// Absolute window ceiling, when the response carries one — an explicit
+    /// total/limit field, or `used + remaining` as a robust fallback (z.ai has
+    /// no total field but carries `currentValue` + `remaining`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) total: Option<f64>,
 }
 
 impl ThirdPartyStats {
