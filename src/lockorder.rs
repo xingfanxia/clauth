@@ -98,6 +98,10 @@ pub(crate) mod rank {
         // Standalone leaves — never nested with another tracked lock.
         NextRefresh = 1100;
         RefetchQueue = 1200;
+        /// Session-scoped set of generic profiles suppressed from the timer until
+        /// a manual refresh (`usage::scheduler`). Leaf — acquired standalone in
+        /// `tick`/`fetch_third_party_due`, never under another lock.
+        SuppressedGeneric = 1300;
         PendingSwitch = 1500;
         PendingSwitchOff = 1700;
     }

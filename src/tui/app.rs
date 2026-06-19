@@ -47,10 +47,10 @@ use crate::update::{self, UpdateEvent};
 use crate::usage::{
     ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
     OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RateLimitStreaks,
-    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore, ThirdPartyList,
-    ThirdPartyStatusStore, ThirdPartyUsageStore, TokenEntry, TokenList, UsageInfo, UsageStore,
-    any_busy, bootstrap_fetch, clear_activity, collect_third_party_entries, is_idle, mark_activity,
-    now_ms, spawn_refresher,
+    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
+    SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
+    TokenEntry, TokenList, UsageInfo, UsageStore, any_busy, bootstrap_fetch, clear_activity,
+    collect_third_party_entries, is_idle, mark_activity, now_ms, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -1193,6 +1193,10 @@ impl App {
     /// Bundle scheduler `Arc`s and launch the background refresher.
     fn start_scheduler(&self) {
         let h = WorkerHandles::from_app(self);
+        // Session-scoped suppressed-generic set: rebuilt fresh each TUI launch,
+        // dropped on exit. Purely scheduler-internal — the App never touches it
+        // (manual refresh clears suppression via the shared forced queue).
+        let suppressed_generic: SuppressedGenericStore = Arc::new(RankedMutex::new(HashSet::new()));
         spawn_refresher(
             h.config,
             h.usage_tokens,
@@ -1209,6 +1213,7 @@ impl App {
             h.third_party_tokens,
             h.third_party_usage_store,
             h.third_party_status,
+            suppressed_generic,
             h.shutting_down,
         );
     }

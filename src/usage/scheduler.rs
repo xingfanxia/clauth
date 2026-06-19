@@ -132,6 +132,11 @@ pub(crate) type ThirdPartyUsageStore =
     Arc<RankedMutex<HashMap<String, ThirdPartyStats>, rank::ThirdPartyUsageStore>>;
 pub(crate) type ThirdPartyStatusStore =
     Arc<RankedMutex<HashMap<String, FetchStatus>, rank::ThirdPartyStatus>>;
+/// Session-scoped (in-memory) set of generic profiles whose last fetch yielded
+/// no data, suppressed from the timer until a manual refresh clears them. Never
+/// persisted — clears when the TUI process exits. Known providers and 429s are
+/// never added (429 keeps the server-directed deferral).
+pub(crate) type SuppressedGenericStore = Arc<RankedMutex<HashSet<String>, rank::SuppressedGeneric>>;
 
 /// Per-profile next-fetch epoch-ms. Written after each `partition_due` run for
 /// overview countdown display without re-running the partition math on the render thread.
@@ -708,6 +713,25 @@ pub(crate) fn collect_third_party_entries(
         .collect()
 }
 
+/// Remove session-suppressed generic profiles from the third-party snapshot so
+/// they aren't re-fetched on the timer. The set is cloned once (it is small) so
+/// no lock is held across the filter; a poisoned lock passes the snapshot through.
+fn filter_suppressed(
+    suppressed: &SuppressedGenericStore,
+    snapshot: Vec<ThirdPartyEntry>,
+) -> Vec<ThirdPartyEntry> {
+    let Some(sup) = suppressed.lock().ok() else {
+        return snapshot;
+    };
+    if sup.is_empty() {
+        return snapshot;
+    }
+    snapshot
+        .into_iter()
+        .filter(|e| !sup.contains(&e.name))
+        .collect()
+}
+
 /// Fetch a pre-partitioned set of due third-party entries and apply outcomes to
 /// the third-party stores. Partitioning + countdown publishing happen in `tick`
 /// so both legs share one publish window; this leg only fetches.
@@ -721,6 +745,12 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
         .into_iter()
         .map(|entry| {
             let name = entry.name.clone();
+            // Only generic no-data outcomes get session-suppressed; known
+            // providers keep retrying on their normal cadence.
+            let is_generic = matches!(
+                entry.target,
+                crate::providers::ThirdPartyTarget::Generic { .. }
+            );
             // Reuse the endpoint that last worked so steady state is one request.
             let hint = state
                 .third_party_usage_store
@@ -734,11 +764,11 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                     hint.as_deref(),
                 )
             });
-            (name, h)
+            (name, is_generic, h)
         })
         .collect();
 
-    for (name, h) in handles {
+    for (name, is_generic, h) in handles {
         match h.join() {
             Ok(Ok(stats)) => {
                 clear_activity(&state.activity, &name);
@@ -773,6 +803,16 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 }
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.clone(), status);
+                }
+                // A generic profile that tried and found nothing (no cache, not a
+                // 429) suppresses for the rest of the session — no timer retry,
+                // only a manual refresh re-admits it for one retry. 429 keeps the
+                // server-directed deferral; cached/known-provider legs are unaffected.
+                if is_generic
+                    && matches!(status, FetchStatus::Failed)
+                    && let Ok(mut sup) = state.suppressed_generic.lock()
+                {
+                    sup.insert(name.clone());
                 }
                 stamp_last_fetched(
                     &state.last_fetched,
@@ -867,6 +907,7 @@ pub(crate) struct SchedulerState {
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
+    suppressed_generic: SuppressedGenericStore,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -886,6 +927,18 @@ fn tick(state: &SchedulerState) {
         .map(|mut q| std::mem::take(&mut *q))
         .unwrap_or_default();
 
+    // A manual refresh (forced) clears session suppression so the profile
+    // retries once this tick. If it still yields no data it re-suppresses when
+    // the outcome lands. Done before the snapshot so the name survives the
+    // suppressed-name filter below.
+    if !forced.is_empty()
+        && let Ok(mut sup) = state.suppressed_generic.lock()
+    {
+        for name in &forced {
+            sup.remove(name);
+        }
+    }
+
     // Snapshot both legs. A poisoned OAuth lock yields an empty snapshot rather
     // than an early `return` — that would starve the third-party leg and drop
     // its already-drained forced names.
@@ -896,6 +949,10 @@ fn tick(state: &SchedulerState) {
         .lock()
         .map(|t| t.clone())
         .unwrap_or_default();
+    // Drop generic profiles suppressed this session (no-data on the timer) from
+    // the third-party leg so they aren't re-fetched every cadence. Only a manual
+    // refresh (forced, cleared above) re-admits one for a single retry.
+    let tp_snapshot = filter_suppressed(&state.suppressed_generic, tp_snapshot);
 
     // Partition both before either fetches, then publish in one window so the
     // countdown map never shows a leg as momentarily missing (and a deleted
@@ -1015,6 +1072,7 @@ pub(crate) fn spawn_refresher(
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
+    suppressed_generic: SuppressedGenericStore,
     shutting_down: Arc<AtomicBool>,
 ) {
     let state = SchedulerState {
@@ -1033,6 +1091,7 @@ pub(crate) fn spawn_refresher(
         third_party_tokens,
         third_party_usage_store,
         third_party_status,
+        suppressed_generic,
         shutting_down,
     };
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]

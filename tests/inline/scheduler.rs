@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::lockorder::RankedMutex;
@@ -6,8 +6,9 @@ use crate::lockorder::RankedMutex;
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
-    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, TokenEntry, clear_activity,
-    mark_activity, partition_due, window_lapsed,
+    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, SuppressedGenericStore,
+    ThirdPartyEntry, TokenEntry, clear_activity, filter_suppressed, mark_activity, partition_due,
+    window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -697,4 +698,33 @@ fn deadline_spread_is_bounded_per_profile_and_per_cycle() {
 
     // Degenerate interval → no spread.
     assert_eq!(deadline_spread("alpha", now, 0).0, 0);
+}
+
+/// `filter_suppressed` drops third-party entries whose name is in the session
+/// suppressed set and passes the rest through in order; an empty set (the steady
+/// state for healthy profiles) is a no-op fast path.
+#[test]
+fn filter_suppressed_drops_only_named_entries() {
+    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashSet::new()));
+    suppressed.lock().unwrap().insert("no-data".to_string());
+
+    let snap = vec![tp_entry("ok"), tp_entry("no-data"), tp_entry("also-ok")];
+    let out = filter_suppressed(&suppressed, snap);
+    let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["ok", "also-ok"]);
+
+    // Empty set → identity (the fast path).
+    let empty: SuppressedGenericStore = Arc::new(RankedMutex::new(HashSet::new()));
+    let snap2 = vec![tp_entry("ok"), tp_entry("no-data")];
+    assert_eq!(filter_suppressed(&empty, snap2).len(), 2);
+}
+
+fn tp_entry(name: &str) -> ThirdPartyEntry {
+    ThirdPartyEntry {
+        name: name.to_string(),
+        target: crate::providers::ThirdPartyTarget::Generic {
+            base_url: "https://example.com".to_string(),
+        },
+        api_key: "key".to_string(),
+    }
 }
