@@ -8,6 +8,13 @@ on:
 permissions:
   contents: write
 
+# Force HTTP/1.1 for registry downloads: curl's HTTP/2 multiplexing against the
+# crates.io CDN intermittently dies with "[16] Error in the HTTP2 framing layer"
+# on the hosted runners. Extra retries cover the remaining transient blips.
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 jobs:
   create-release:
     name: Create release
