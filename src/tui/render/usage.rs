@@ -115,7 +115,11 @@ fn build_usage_lines(
         return lines;
     }
 
-    if !profile.is_oauth() {
+    // API-key endpoint accounts (not OAuth, not a recognised third-party
+    // provider) also attempt the OAuth-shape usage fetch against their base_url.
+    // Show the windows when that returned a body; otherwise the static no-usage
+    // line — the silent-fail state.
+    if !profile.is_oauth() && profile.usage.is_none() {
         lines.push(Line::from(Span::styled(
             "API endpoint profile — no usage windows.",
             theme::faint(),

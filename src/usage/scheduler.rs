@@ -91,6 +91,9 @@ pub(crate) type PendingSwitchOff = Arc<RankedMutex<bool, rank::PendingSwitchOff>
 #[derive(Clone)]
 pub(crate) struct TokenEntry {
     pub(crate) name: String,
+    /// `None` for OAuth profiles (always the Anthropic host). An API-key profile
+    /// carries its `base_url` so the usage fetch targets that endpoint instead.
+    pub(crate) base_url: Option<String>,
     pub(crate) access_token: String,
     pub(crate) refresh_token: Option<String>,
     /// Opted into auto-start: the periodic tick opens a 5h window for this
@@ -252,16 +255,18 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
 ///
 /// Flips `activity[name]` to `Refreshing` during `oauth::refresh`, then back to
 /// `Fetching` for the retry. Caller owns the initial `Fetching` mark and final `Idle` clear.
+#[allow(clippy::too_many_arguments)]
 fn fetch_with_rotation(
     config: &crate::profile::ConfigHandle,
     name: &str,
+    base_url: Option<&str>,
     access_token: &str,
     refresh_token: Option<&str>,
     prev_plan: Option<PlanInfo>,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
 ) -> FetchOutcome {
-    match fetch_raw(name, access_token, prev_plan.clone(), false) {
+    match fetch_raw(name, base_url, access_token, prev_plan.clone(), false) {
         Ok(info) => return FetchOutcome::live(name, info, None),
         // Rate-limited: bail to cache, never rotate (see the doc comment).
         Err(FetchError::RateLimited { retry_after }) => {
@@ -310,7 +315,7 @@ fn fetch_with_rotation(
     let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
     // Post-rotation retry forces a `/profile` pull: the token just changed, so
     // refresh the plan alongside it (the 401 profile-fetch trigger).
-    match fetch_raw(name, &access, prev_plan, true) {
+    match fetch_raw(name, base_url, &access, prev_plan, true) {
         Ok(info) => FetchOutcome::live(name, info, rotated),
         Err(FetchError::RateLimited { retry_after }) => {
             // Retry itself rate-limited. Don't push to RefetchQueue — that risks
@@ -451,6 +456,7 @@ fn run_fetch(
     let mut outcome = fetch_with_rotation(
         config,
         &entry.name,
+        entry.base_url.as_deref(),
         &entry.access_token,
         entry.refresh_token.as_deref(),
         prev_plan,

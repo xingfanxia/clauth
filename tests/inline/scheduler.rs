@@ -13,6 +13,7 @@ use super::{
 fn token(name: &str) -> TokenEntry {
     TokenEntry {
         name: name.to_string(),
+        base_url: None,
         access_token: "access".to_string(),
         refresh_token: Some("refresh".to_string()),
         auto_start: false,
