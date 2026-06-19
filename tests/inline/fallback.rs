@@ -19,6 +19,7 @@ fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64
         api_key: None,
         auto_start: false,
         env: BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold: threshold,
         bell_threshold: None,
         credentials: None,

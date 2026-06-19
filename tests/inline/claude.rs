@@ -337,3 +337,49 @@ fn overwrite_cancel_leaves_stored_and_live_untouched() {
         "cancel must leave the live re-login bytes untouched",
     );
 }
+
+#[test]
+fn build_settings_writes_model_knobs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json"); // absent → starts from `{}`
+    let mut profile = crate::profile::Profile::new("p".to_string(), None, None);
+    profile.models = crate::profile::ModelSettings {
+        default: Some("opusplan".to_string()),
+        opus: Some("claude-opus-4-8[1m]".to_string()),
+        sonnet: None,
+        haiku: None,
+        subagent: Some("claude-haiku-4-5".to_string()),
+    };
+    let json = build_claude_settings_json(&base, &profile, &[]).expect("build settings");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
+    assert_eq!(v["model"], "opusplan", "default model → top-level `model`");
+    assert_eq!(
+        v["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+        "claude-opus-4-8[1m]"
+    );
+    assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "claude-haiku-4-5");
+    assert!(
+        v["env"].get("ANTHROPIC_DEFAULT_SONNET_MODEL").is_none(),
+        "an unset tier override writes no env key",
+    );
+}
+
+// A profile with no model config must strip a previous profile's model knobs
+// from the base settings.json, so a switch never inherits stale model routing.
+#[test]
+fn build_settings_clears_stale_model_knobs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json");
+    fs::write(
+        &base,
+        r#"{"model":"opus","env":{"ANTHROPIC_DEFAULT_OPUS_MODEL":"old","CLAUDE_CODE_SUBAGENT_MODEL":"old","KEEP":"1"}}"#,
+    )
+    .expect("seed base settings");
+    let profile = crate::profile::Profile::new("p".to_string(), None, None); // empty models
+    let json = build_claude_settings_json(&base, &profile, &[]).expect("build settings");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
+    assert!(v.get("model").is_none(), "top-level `model` cleared");
+    assert!(v["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
+    assert!(v["env"].get("CLAUDE_CODE_SUBAGENT_MODEL").is_none());
+    assert_eq!(v["env"]["KEEP"], "1", "unrelated env keys are preserved");
+}

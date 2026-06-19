@@ -117,6 +117,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         api_key: None,
         auto_start: false,
         env: std::collections::BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold: None,
         bell_threshold: None,
         credentials: Some(creds.clone()),
@@ -211,4 +212,33 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
         "usage_cache.json mode should be 0o600, got {:#o}",
         cache_mode & 0o777,
     );
+}
+
+#[test]
+fn profile_config_reads_models_table() {
+    let toml = "[models]\n\
+        default = \"opusplan\"\n\
+        haiku = \"claude-haiku-4-5\"\n";
+    let cfg: ProfileConfig = toml::from_str(toml).expect("parse models table");
+    assert_eq!(cfg.models.default.as_deref(), Some("opusplan"));
+    assert_eq!(cfg.models.haiku.as_deref(), Some("claude-haiku-4-5"));
+    assert_eq!(cfg.models.sonnet, None);
+}
+
+// Model config must survive a config.toml render→parse round-trip, or
+// `maybe_rewrite_config_toml` would either drop a hand-set value or thrash the
+// file on every reload.
+#[test]
+fn model_settings_round_trip_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.models = ModelSettings {
+        default: Some("opusplan".to_string()),
+        opus: Some("claude-opus-4-8[1m]".to_string()),
+        sonnet: None,
+        haiku: None,
+        subagent: Some("claude-haiku-4-5".to_string()),
+    };
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.models, profile.models);
 }

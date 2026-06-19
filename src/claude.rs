@@ -199,6 +199,7 @@ fn apply_profile_to_claude_settings_inner(
     let has_anything = profile.base_url.is_some()
         || profile.api_key.is_some()
         || !profile.env.is_empty()
+        || !profile.models.is_empty()
         || !prev_env_keys.is_empty();
     if !has_anything && !path.exists() {
         return Ok(());
@@ -213,6 +214,10 @@ fn apply_profile_to_claude_settings_inner(
 
 /// Build the merged settings.json content. `prev_env_keys` are stripped before
 /// the new profile's env is applied; pass `&[]` on start to leave existing keys.
+/// Also writes the profile's model config — the top-level `model` setting and
+/// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
+/// each set when present and removed when unset, so a switch never inherits the
+/// previous profile's model routing.
 pub(crate) fn build_claude_settings_json(
     base_path: &Path,
     profile: &Profile,
@@ -255,9 +260,42 @@ pub(crate) fn build_claude_settings_json(
         }
     }
 
+    // Model-tier and subagent overrides — clauth-owned env keys, always set or
+    // cleared deterministically so a switch never inherits the prior profile's.
+    let model_env = [
+        ("ANTHROPIC_DEFAULT_OPUS_MODEL", &profile.models.opus),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", &profile.models.sonnet),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", &profile.models.haiku),
+        ("CLAUDE_CODE_SUBAGENT_MODEL", &profile.models.subagent),
+    ];
+    for (key, value) in model_env {
+        match value {
+            Some(v) => {
+                env.insert(key.into(), v.clone().into());
+            }
+            None => {
+                env.remove(key);
+            }
+        }
+    }
+
     // Profile env last: explicit ANTHROPIC_* entries win over base_url/api_key.
     for (k, v) in &profile.env {
         env.insert(k.clone(), v.clone().into());
+    }
+
+    // Top-level `model` setting (not env). The `env` borrow above has ended, so
+    // `settings` is free to mutate again.
+    let obj = settings
+        .as_object_mut()
+        .context("settings.json is not an object")?;
+    match profile.models.default.as_deref() {
+        Some(model) => {
+            obj.insert("model".into(), model.into());
+        }
+        None => {
+            obj.remove("model");
+        }
     }
 
     serde_json::to_string_pretty(&settings).context("Failed to serialize settings.json")

@@ -23,8 +23,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{
     CaptureSnapshot, capture_into_profile, capture_snapshot, create_blank_profile, delete_profile,
-    edit_profile_endpoint, find_matching_oauth_profile, rename_profile, reorder_profile,
-    switch_off, switch_profile, validate_profile_name,
+    edit_profile_endpoint, edit_profile_model, find_matching_oauth_profile, rename_profile,
+    reorder_profile, switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, credentials_diverged,
@@ -37,7 +37,7 @@ use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
     AppConfig, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTERVAL_MS,
-    Profile, ThemeName, app_state_mtime, load_config, save_app_state, save_profile,
+    ModelSettings, Profile, ThemeName, app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
@@ -170,20 +170,42 @@ pub(crate) enum ConfigRow {
     Name,
     BaseUrl,
     ApiKey,
+    /// Default model (CC `model` setting). Hybrid: space cycles aliases, ⏎ types a custom value.
+    Model,
+    /// `ANTHROPIC_DEFAULT_OPUS_MODEL` — full id, free text.
+    OpusModel,
+    /// `ANTHROPIC_DEFAULT_SONNET_MODEL` — full id, free text.
+    SonnetModel,
+    /// `ANTHROPIC_DEFAULT_HAIKU_MODEL` — full id, free text.
+    HaikuModel,
+    /// `CLAUDE_CODE_SUBAGENT_MODEL` — full id, free text.
+    SubagentModel,
     AutoStart,
     Delete,
     Create,
 }
 
 impl ConfigRow {
-    /// Text rows capture keystrokes; the rest act on ⏎.
+    /// Text rows capture keystrokes and commit on ⏎; the rest act on ⏎. The
+    /// `Model` row is hybrid (space cycles, ⏎ opens a custom field) and is
+    /// driven out of band, so it is deliberately not a text row here.
     pub(crate) fn is_text(self) -> bool {
         matches!(
             self,
-            ConfigRow::Name | ConfigRow::BaseUrl | ConfigRow::ApiKey
+            ConfigRow::Name
+                | ConfigRow::BaseUrl
+                | ConfigRow::ApiKey
+                | ConfigRow::OpusModel
+                | ConfigRow::SonnetModel
+                | ConfigRow::HaikuModel
+                | ConfigRow::SubagentModel
         )
     }
 }
+
+/// The `model` row alias cycle (space advances it). `None` renders as `default`
+/// (no `model` key); a custom id set via ⏎ is outside this list.
+pub(crate) const MODEL_PRESETS: [&str; 4] = ["opus", "sonnet", "haiku", "opusplan"];
 
 /// One row on the program-wide Config tab. These back real persisted globals in
 /// [`AppState`] — no decorative toggles. ⏎/space cycles or flips in place.
@@ -211,10 +233,46 @@ pub(crate) struct ConfigDraft {
     pub(crate) name: InputState,
     pub(crate) base_url: InputState,
     pub(crate) api_key: InputState,
-    /// `Some(row)` while a text row owns the keyboard.
+    pub(crate) model: InputState,
+    pub(crate) opus_model: InputState,
+    pub(crate) sonnet_model: InputState,
+    pub(crate) haiku_model: InputState,
+    pub(crate) subagent_model: InputState,
+    /// `Some(row)` while a text row (or the `model` custom field) owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
     /// First ⏎ on delete arms it; second confirms. Any cursor move disarms.
     pub(crate) armed_delete: bool,
+}
+
+impl ConfigDraft {
+    /// The edit buffer behind a text or `Model` row; `None` for toggle/action rows.
+    pub(crate) fn field(&self, row: ConfigRow) -> Option<&InputState> {
+        Some(match row {
+            ConfigRow::Name => &self.name,
+            ConfigRow::BaseUrl => &self.base_url,
+            ConfigRow::ApiKey => &self.api_key,
+            ConfigRow::Model => &self.model,
+            ConfigRow::OpusModel => &self.opus_model,
+            ConfigRow::SonnetModel => &self.sonnet_model,
+            ConfigRow::HaikuModel => &self.haiku_model,
+            ConfigRow::SubagentModel => &self.subagent_model,
+            ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => return None,
+        })
+    }
+
+    pub(crate) fn field_mut(&mut self, row: ConfigRow) -> Option<&mut InputState> {
+        Some(match row {
+            ConfigRow::Name => &mut self.name,
+            ConfigRow::BaseUrl => &mut self.base_url,
+            ConfigRow::ApiKey => &mut self.api_key,
+            ConfigRow::Model => &mut self.model,
+            ConfigRow::OpusModel => &mut self.opus_model,
+            ConfigRow::SonnetModel => &mut self.sonnet_model,
+            ConfigRow::HaikuModel => &mut self.haiku_model,
+            ConfigRow::SubagentModel => &mut self.subagent_model,
+            ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2873,8 +2931,16 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                         app.config_action_cursor + 1
                     };
                 }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    run_config_row(app, rows[app.config_action_cursor]);
+                KeyCode::Enter => run_config_row(app, rows[app.config_action_cursor]),
+                KeyCode::Char(' ') => {
+                    let row = rows[app.config_action_cursor];
+                    // Space cycles the `model` alias in place; ⏎ opens its custom
+                    // field instead. Every other row treats space like ⏎.
+                    if row == ConfigRow::Model {
+                        cycle_model(app);
+                    } else {
+                        run_config_row(app, row);
+                    }
                 }
                 _ => {}
             }
@@ -2899,7 +2965,16 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         .get(app.profile_cursor)
         .map(|p| p.is_oauth())
         .unwrap_or(true);
-    let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl, ConfigRow::ApiKey];
+    let mut rows = vec![
+        ConfigRow::Name,
+        ConfigRow::BaseUrl,
+        ConfigRow::ApiKey,
+        ConfigRow::Model,
+        ConfigRow::OpusModel,
+        ConfigRow::SonnetModel,
+        ConfigRow::HaikuModel,
+        ConfigRow::SubagentModel,
+    ];
     if is_oauth {
         rows.push(ConfigRow::AutoStart);
     }
@@ -2935,6 +3010,11 @@ fn build_draft_new() -> ConfigDraft {
         name: InputState::new(""),
         base_url: InputState::new(""),
         api_key: InputState::new(""),
+        model: InputState::new(""),
+        opus_model: InputState::new(""),
+        sonnet_model: InputState::new(""),
+        haiku_model: InputState::new(""),
+        subagent_model: InputState::new(""),
         active: None,
         armed_delete: false,
     }
@@ -2943,11 +3023,17 @@ fn build_draft_new() -> ConfigDraft {
 fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
     let cfg = app.config();
     let profile = cfg.find(name);
+    let m = profile.map(|p| p.models.clone()).unwrap_or_default();
     ConfigDraft {
         editing_name: Some(name.to_string()),
         name: InputState::new(name),
         base_url: InputState::new(profile.and_then(|p| p.base_url.as_deref()).unwrap_or("")),
         api_key: InputState::new(profile.and_then(|p| p.api_key.as_deref()).unwrap_or("")),
+        model: InputState::new(m.default.as_deref().unwrap_or("")),
+        opus_model: InputState::new(m.opus.as_deref().unwrap_or("")),
+        sonnet_model: InputState::new(m.sonnet.as_deref().unwrap_or("")),
+        haiku_model: InputState::new(m.haiku.as_deref().unwrap_or("")),
+        subagent_model: InputState::new(m.subagent.as_deref().unwrap_or("")),
         active: None,
         armed_delete: false,
     }
@@ -2962,14 +3048,12 @@ fn disarm_delete(app: &mut App) {
 
 /// ⏎/space on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
 fn run_config_row(app: &mut App, row: ConfigRow) {
-    if row.is_text() {
+    // Text rows plus the `model` row's custom field open an inline editor.
+    if row.is_text() || row == ConfigRow::Model {
         if let Some(d) = app.config_draft.as_mut() {
             d.active = Some(row);
-            match row {
-                ConfigRow::Name => d.name.end(),
-                ConfigRow::BaseUrl => d.base_url.end(),
-                ConfigRow::ApiKey => d.api_key.end(),
-                _ => {}
+            if let Some(input) = d.field_mut(row) {
+                input.end();
             }
         }
         return;
@@ -3016,13 +3100,9 @@ fn handle_config_edit_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => cancel_config_edit(app, active),
         KeyCode::Enter => commit_config_field(app, active),
         _ => {
-            if let Some(d) = app.config_draft.as_mut() {
-                let input = match active {
-                    ConfigRow::Name => &mut d.name,
-                    ConfigRow::BaseUrl => &mut d.base_url,
-                    ConfigRow::ApiKey => &mut d.api_key,
-                    _ => return,
-                };
+            if let Some(d) = app.config_draft.as_mut()
+                && let Some(input) = d.field_mut(active)
+            {
                 apply_input_edit(input, key);
             }
         }
@@ -3039,25 +3119,42 @@ fn cancel_config_edit(app: &mut App, field: ConfigRow) {
     if let Some(name) = editing_name {
         let value = {
             let cfg = app.config();
-            let profile = cfg.find(&name);
-            match field {
-                ConfigRow::Name => name.clone(),
-                ConfigRow::BaseUrl => profile.and_then(|p| p.base_url.clone()).unwrap_or_default(),
-                ConfigRow::ApiKey => profile.and_then(|p| p.api_key.clone()).unwrap_or_default(),
-                _ => String::new(),
-            }
+            row_committed_value(cfg.find(&name), &name, field)
         };
-        if let Some(d) = app.config_draft.as_mut() {
-            match field {
-                ConfigRow::Name => d.name = InputState::new(&value),
-                ConfigRow::BaseUrl => d.base_url = InputState::new(&value),
-                ConfigRow::ApiKey => d.api_key = InputState::new(&value),
-                _ => {}
-            }
+        if let Some(d) = app.config_draft.as_mut()
+            && let Some(input) = d.field_mut(field)
+        {
+            *input = InputState::new(&value);
         }
     }
     if let Some(d) = app.config_draft.as_mut() {
         d.active = None;
+    }
+}
+
+/// The persisted value behind a buffered row, used to revert on ⎋ and to reseed
+/// the buffer after a commit. Toggle/action rows have no buffer → empty string.
+fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) -> String {
+    match row {
+        ConfigRow::Name => name.to_string(),
+        ConfigRow::BaseUrl => profile.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+        ConfigRow::ApiKey => profile.and_then(|p| p.api_key.clone()).unwrap_or_default(),
+        ConfigRow::Model => profile
+            .and_then(|p| p.models.default.clone())
+            .unwrap_or_default(),
+        ConfigRow::OpusModel => profile
+            .and_then(|p| p.models.opus.clone())
+            .unwrap_or_default(),
+        ConfigRow::SonnetModel => profile
+            .and_then(|p| p.models.sonnet.clone())
+            .unwrap_or_default(),
+        ConfigRow::HaikuModel => profile
+            .and_then(|p| p.models.haiku.clone())
+            .unwrap_or_default(),
+        ConfigRow::SubagentModel => profile
+            .and_then(|p| p.models.subagent.clone())
+            .unwrap_or_default(),
+        ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => String::new(),
     }
 }
 
@@ -3077,11 +3174,123 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
     match field {
         ConfigRow::Name => commit_rename(app),
         ConfigRow::BaseUrl | ConfigRow::ApiKey => commit_endpoint(app),
+        ConfigRow::Model
+        | ConfigRow::OpusModel
+        | ConfigRow::SonnetModel
+        | ConfigRow::HaikuModel
+        | ConfigRow::SubagentModel => commit_model_field(app, field),
         _ => {
             if let Some(d) = app.config_draft.as_mut() {
                 d.active = None;
             }
         }
+    }
+}
+
+/// ⏎ on a model field: fold the trimmed buffer into the profile's
+/// [`ModelSettings`], persist, then reseed the buffer from the saved value.
+fn commit_model_field(app: &mut App, field: ConfigRow) {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+    else {
+        return;
+    };
+    let raw = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.field(field))
+        .map(|i| i.trimmed().to_string())
+        .unwrap_or_default();
+    let mut models = {
+        let cfg = app.config();
+        cfg.find(&name)
+            .map(|p| p.models.clone())
+            .unwrap_or_default()
+    };
+    apply_model_field(&mut models, field, &raw);
+    let result = {
+        let mut cfg = app.config();
+        edit_profile_model(&mut cfg, &name, models)
+    };
+    match result {
+        Ok(()) => {
+            let value = {
+                let cfg = app.config();
+                row_committed_value(cfg.find(&name), &name, field)
+            };
+            if let Some(d) = app.config_draft.as_mut() {
+                if let Some(input) = d.field_mut(field) {
+                    *input = InputState::new(&value);
+                }
+                d.active = None;
+            }
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("model update failed: {e}")),
+    }
+}
+
+/// Fold a trimmed buffer into the matching [`ModelSettings`] field. Empty input
+/// clears it (scalar → `None`).
+fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
+    let scalar = (!raw.is_empty()).then(|| raw.to_string());
+    match field {
+        ConfigRow::Model => models.default = scalar,
+        ConfigRow::OpusModel => models.opus = scalar,
+        ConfigRow::SonnetModel => models.sonnet = scalar,
+        ConfigRow::HaikuModel => models.haiku = scalar,
+        ConfigRow::SubagentModel => models.subagent = scalar,
+        _ => {}
+    }
+}
+
+/// Space on the `model` row: advance the alias cycle and persist. A custom value
+/// (set via ⏎) is outside the cycle, so the first space resets it to `default`.
+fn cycle_model(app: &mut App) {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+    else {
+        return;
+    };
+    let mut models = {
+        let cfg = app.config();
+        cfg.find(&name)
+            .map(|p| p.models.clone())
+            .unwrap_or_default()
+    };
+    models.default = next_model_preset(models.default.as_deref());
+    let result = {
+        let mut cfg = app.config();
+        edit_profile_model(&mut cfg, &name, models)
+    };
+    match result {
+        Ok(()) => {
+            let value = {
+                let cfg = app.config();
+                cfg.find(&name)
+                    .and_then(|p| p.models.default.clone())
+                    .unwrap_or_default()
+            };
+            if let Some(d) = app.config_draft.as_mut() {
+                d.model = InputState::new(&value);
+            }
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("model update failed: {e}")),
+    }
+}
+
+/// Advance the `model` alias cycle: default → opus → sonnet → haiku → opusplan →
+/// default. A value outside [`MODEL_PRESETS`] (a custom id) collapses to default.
+fn next_model_preset(current: Option<&str>) -> Option<String> {
+    match current {
+        None => Some(MODEL_PRESETS[0].to_string()),
+        Some(cur) => match MODEL_PRESETS.iter().position(|p| *p == cur) {
+            Some(i) if i + 1 < MODEL_PRESETS.len() => Some(MODEL_PRESETS[i + 1].to_string()),
+            _ => None,
+        },
     }
 }
 

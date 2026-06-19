@@ -10,7 +10,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, ConfigFocus, ConfigRow, InputState, config_rows};
+use super::super::app::{
+    App, ConfigDraft, ConfigFocus, ConfigRow, InputState, MODEL_PRESETS, config_rows,
+};
 use super::super::theme;
 use super::panes::{
     SELECTOR_WIDTH, active_dot, draw_selector_list, head_cols, highlight_row, label_style,
@@ -68,10 +70,35 @@ struct Snap {
     name: String,
     base_url: String,
     api_key: String,
+    model: String,
+    opus: String,
+    sonnet: String,
+    haiku: String,
+    subagent: String,
     auto_start: bool,
     is_active: bool,
     /// Recognised third-party provider display name, if any.
     provider: Option<&'static str>,
+}
+
+impl Snap {
+    /// Blank snapshot for the `+ new` form and the empty fallback.
+    fn blank(title: &str) -> Snap {
+        Snap {
+            title: title.to_string(),
+            name: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            opus: String::new(),
+            sonnet: String::new(),
+            haiku: String::new(),
+            subagent: String::new(),
+            auto_start: false,
+            is_active: false,
+            provider: None,
+        }
+    }
 }
 
 fn build_snap(app: &App, with_text: bool) -> Snap {
@@ -84,15 +111,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
     };
     let cfg = app.config();
     if app.profile_cursor >= cfg.profiles.len() {
-        return Snap {
-            title: "+ new account".to_string(),
-            name: String::new(),
-            base_url: String::new(),
-            api_key: String::new(),
-            auto_start: false,
-            is_active: false,
-            provider: None,
-        };
+        return Snap::blank("+ new account");
     }
     match cfg.profiles.get(app.profile_cursor) {
         Some(p) => Snap {
@@ -105,18 +124,15 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             },
             base_url: text(&p.base_url),
             api_key: text(&p.api_key),
+            model: text(&p.models.default),
+            opus: text(&p.models.opus),
+            sonnet: text(&p.models.sonnet),
+            haiku: text(&p.models.haiku),
+            subagent: text(&p.models.subagent),
             auto_start: p.auto_start,
             provider: p.provider.map(|p| p.display_name()),
         },
-        None => Snap {
-            title: "settings".to_string(),
-            name: String::new(),
-            base_url: String::new(),
-            api_key: String::new(),
-            auto_start: false,
-            is_active: false,
-            provider: None,
-        },
+        None => Snap::blank("settings"),
     }
 }
 
@@ -151,23 +167,14 @@ fn draw_settings_rows(
     actions_focused: bool,
 ) {
     let draft = app.config_draft.as_ref();
-    let snap_inputs;
-    let (name_in, base_in, key_in) = match draft {
-        Some(d) => (&d.name, &d.base_url, &d.api_key),
-        None => {
-            snap_inputs = (
-                InputState::new(&snap.name),
-                InputState::new(&snap.base_url),
-                InputState::new(&snap.api_key),
-            );
-            (&snap_inputs.0, &snap_inputs.1, &snap_inputs.2)
-        }
-    };
     let editing = draft.and_then(|d| d.active);
     let armed_delete = draft.map(|d| d.armed_delete).unwrap_or(false);
 
     // Derived from the base-url buffer so it tracks the draft live.
-    let is_api = !base_in.value.trim().is_empty();
+    let is_api = !row_input(draft, snap, ConfigRow::BaseUrl)
+        .value
+        .trim()
+        .is_empty();
     let (type_value, type_style) = if is_api {
         ("API", theme::accent())
     } else {
@@ -201,26 +208,18 @@ fn draw_settings_rows(
     }
 
     lines.push(Line::from(""));
-    // Tracks the absolute line index of the active edit row for cursor placement after rendering.
-    // `lines` starts with [type (, provider), blank] before the loop.
-    let mut edit_line_y: Option<u16> = None;
+    // Tracks the absolute line index + buffer of the active edit row for cursor
+    // placement after rendering. `lines` starts with [type (, provider), blank].
+    let mut edit_caret: Option<(u16, InputState)> = None;
     let mut line_idx: u16 = if provider_label.is_some() { 3 } else { 2 };
 
     for (i, row) in rows.iter().enumerate() {
         let selected = actions_focused && i == cursor;
         let is_editing = editing == Some(*row);
-        let line = detail_row(
-            *row,
-            selected,
-            is_editing,
-            armed_delete,
-            snap,
-            name_in,
-            base_in,
-            key_in,
-        );
+        let input = row_input(draft, snap, *row);
+        let line = detail_row(*row, selected, is_editing, armed_delete, snap, &input);
         if is_editing {
-            edit_line_y = Some(line_idx);
+            edit_caret = Some((line_idx, input));
         }
         lines.push(if selected {
             highlight_row(line, inner.width as usize)
@@ -242,19 +241,37 @@ fn draw_settings_rows(
 
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 
-    // Position the native terminal cursor at the caret when a field is active.
-    if let (Some(row), Some(ly)) = (editing, edit_line_y) {
-        let input = match row {
-            ConfigRow::Name => name_in,
-            ConfigRow::BaseUrl => base_in,
-            ConfigRow::ApiKey => key_in,
-            _ => return,
-        };
+    // Position the native terminal cursor at the caret when a text/model field is active.
+    if let Some((ly, input)) = edit_caret {
         // x = "❯ " (2) + key+pad block (exactly KEY_W cols) + cols before caret
-        let prefix_cols = 2 + KEY_W + head_cols(input);
+        let prefix_cols = 2 + KEY_W + head_cols(&input);
         let cx = inner.x.saturating_add(prefix_cols as u16);
         let cy = inner.y.saturating_add(ly);
         frame.set_cursor_position((cx, cy));
+    }
+}
+
+/// The edit buffer for a row: the live draft buffer when present, else a
+/// throwaway `InputState` seeded from the read-only [`Snap`]. Toggle/action rows
+/// have no buffer and resolve to an empty one (never rendered as a field).
+fn row_input(draft: Option<&ConfigDraft>, snap: &Snap, row: ConfigRow) -> InputState {
+    draft
+        .and_then(|d| d.field(row))
+        .cloned()
+        .unwrap_or_else(|| InputState::new(snap_value(snap, row)))
+}
+
+fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
+    match row {
+        ConfigRow::Name => &snap.name,
+        ConfigRow::BaseUrl => &snap.base_url,
+        ConfigRow::ApiKey => &snap.api_key,
+        ConfigRow::Model => &snap.model,
+        ConfigRow::OpusModel => &snap.opus,
+        ConfigRow::SonnetModel => &snap.sonnet,
+        ConfigRow::HaikuModel => &snap.haiku,
+        ConfigRow::SubagentModel => &snap.subagent,
+        ConfigRow::AutoStart | ConfigRow::Delete | ConfigRow::Create => "",
     }
 }
 
@@ -263,21 +280,25 @@ fn row_hint(row: ConfigRow) -> Option<&'static str> {
     match row {
         ConfigRow::BaseUrl => Some("custom api endpoint; empty = claude.ai oauth"),
         ConfigRow::ApiKey => Some("x-api-key for a non-oauth endpoint"),
+        ConfigRow::Model => {
+            Some("default model for this account; space cycles, ⏎ sets a custom id")
+        }
+        ConfigRow::OpusModel => Some("what the `opus` alias resolves to (full model id)"),
+        ConfigRow::SonnetModel => Some("what the `sonnet` alias resolves to (full model id)"),
+        ConfigRow::HaikuModel => Some("what the `haiku` alias resolves to (full model id)"),
+        ConfigRow::SubagentModel => Some("model forced for every subagent in this account"),
         ConfigRow::AutoStart => Some("launch a session on idle to arm the 5h window"),
         ConfigRow::Name | ConfigRow::Delete | ConfigRow::Create => None,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn detail_row(
     row: ConfigRow,
     selected: bool,
     editing: bool,
     armed_delete: bool,
     snap: &Snap,
-    name_in: &InputState,
-    base_in: &InputState,
-    key_in: &InputState,
+    input: &InputState,
 ) -> Line<'static> {
     let arrow = if editing {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent())
@@ -287,9 +308,16 @@ fn detail_row(
         Span::raw("  ")
     };
     match row {
-        ConfigRow::Name => kv_field(arrow, "name", name_in, editing, selected, false),
-        ConfigRow::BaseUrl => kv_field(arrow, "base url", base_in, editing, selected, false),
-        ConfigRow::ApiKey => kv_field(arrow, "api key", key_in, editing, selected, true),
+        ConfigRow::Name => kv_field(arrow, "name", input, editing, selected, false),
+        ConfigRow::BaseUrl => kv_field(arrow, "base url", input, editing, selected, false),
+        ConfigRow::ApiKey => kv_field(arrow, "api key", input, editing, selected, true),
+        // Hybrid: the alias cycle at rest, a plain text field while typing a custom id.
+        ConfigRow::Model if !editing => model_cycle_line(arrow, &input.value, selected),
+        ConfigRow::Model => kv_field(arrow, "model", input, editing, selected, false),
+        ConfigRow::OpusModel => kv_field(arrow, "opus", input, editing, selected, false),
+        ConfigRow::SonnetModel => kv_field(arrow, "sonnet", input, editing, selected, false),
+        ConfigRow::HaikuModel => kv_field(arrow, "haiku", input, editing, selected, false),
+        ConfigRow::SubagentModel => kv_field(arrow, "subagent", input, editing, selected, false),
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
                 (theme::toggle_on().to_string(), theme::accent())
@@ -365,4 +393,43 @@ fn value_spans(input: &InputState, editing: bool, mask_value: bool) -> Vec<Span<
         .fg(theme::text_color())
         .bg(theme::bg_sunken());
     vec![Span::styled(input.value.clone(), body)]
+}
+
+/// The `model` row at rest: a segmented alias control (`default` + presets). The
+/// active option is `ACCENT`, bracketed only while the row is the cursor so focus
+/// never reflows the row. A custom id (set via ⏎) matches no preset, so the real
+/// value is appended in `ACCENT` rather than mis-bracketing the nearest alias.
+fn model_cycle_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'static> {
+    let pad = KEY_W.saturating_sub("model".len()).max(1);
+    let mut spans = vec![
+        arrow,
+        Span::styled(format!("model{}", " ".repeat(pad)), label_style(selected)),
+    ];
+    let mut options: Vec<(&str, bool)> = vec![("default", current.is_empty())];
+    options.extend(MODEL_PRESETS.iter().map(|p| (*p, *p == current)));
+    for (i, (label, active)) in options.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(model_cycle_option(label, *active, selected));
+    }
+    if !current.is_empty() && !MODEL_PRESETS.contains(&current) {
+        spans.push(Span::styled(format!("   {current}"), theme::accent()));
+    }
+    Line::from(spans)
+}
+
+/// One segment of the `model` cycle: active → `ACCENT` (`[label]` when the row is
+/// the cursor, ` label ` blurred); inactive → bare `TEXT_FAINT`.
+fn model_cycle_option(label: &str, active: bool, row_selected: bool) -> Span<'static> {
+    if active {
+        let text = if row_selected {
+            format!("[{label}]")
+        } else {
+            format!(" {label} ")
+        };
+        Span::styled(text, theme::accent())
+    } else {
+        Span::styled(label.to_string(), theme::faint())
+    }
 }

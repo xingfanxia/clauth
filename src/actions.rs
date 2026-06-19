@@ -17,7 +17,7 @@ use crate::lock::with_state_lock;
 use crate::lockorder::RankedMutex;
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ClaudeCredentials, Profile, profile_dir, save_app_state, save_profile,
+    AppConfig, ClaudeCredentials, ModelSettings, Profile, profile_dir, save_app_state, save_profile,
 };
 use crate::spinner::Spinner;
 
@@ -191,6 +191,33 @@ pub(crate) fn edit_profile_endpoint(
         save_profile(profile)?;
 
         if config.is_active(name) {
+            let profile = config.find(name).context("Profile not found")?;
+            let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
+            apply_profile_to_claude_settings(profile, &prev_env_keys)?;
+        }
+        Ok(())
+    })
+}
+
+/// Persist a profile's model configuration. Re-applies to the live
+/// `~/.claude/settings.json` when the profile is active so a running `claude`
+/// picks it up on its next settings read. Mirrors [`edit_profile_endpoint`].
+pub(crate) fn edit_profile_model(
+    config: &mut AppConfig,
+    name: &str,
+    models: ModelSettings,
+) -> Result<()> {
+    with_state_lock(|| {
+        let profile = config.find_mut(name).context("Profile not found")?;
+        profile.models = models;
+        save_profile(profile)?;
+
+        if config.is_active(name) {
+            // A model-only edit never touches the generic `env` map, so passing
+            // this profile's own keys as `prev` strips nothing (the removal loop
+            // keeps every key the profile still carries). The model env keys
+            // (`ANTHROPIC_DEFAULT_*`/`CLAUDE_CODE_SUBAGENT_MODEL`) are set or
+            // cleared unconditionally inside `build_claude_settings_json`.
             let profile = config.find(name).context("Profile not found")?;
             let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
             apply_profile_to_claude_settings(profile, &prev_env_keys)?;

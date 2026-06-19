@@ -10,6 +10,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         api_key: None,
         auto_start: false,
         env: BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
@@ -35,6 +36,7 @@ fn endpoint_profile(name: &str) -> Profile {
         api_key: Some("sk-x".to_string()),
         auto_start: false,
         env: BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold: None,
         bell_threshold: None,
         credentials: None,
@@ -52,6 +54,7 @@ fn blank_profile(name: &str) -> Profile {
         api_key: None,
         auto_start: false,
         env: BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold: None,
         bell_threshold: None,
         credentials: None,

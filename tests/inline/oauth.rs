@@ -19,6 +19,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         api_key: None,
         auto_start: false,
         env: BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
@@ -129,6 +130,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         api_key: None,
         auto_start: false,
         env: BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
@@ -190,6 +192,7 @@ fn rotate_one_inner_skips_live_session() {
         api_key: None,
         auto_start: false,
         env: BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
@@ -243,6 +246,7 @@ fn profile_without_refresh_token_excluded() {
         api_key: None,
         auto_start: false,
         env: BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {

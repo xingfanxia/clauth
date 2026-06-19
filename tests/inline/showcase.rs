@@ -298,6 +298,7 @@ fn oauth_profile(
         api_key: None,
         auto_start,
         env: BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold,
         bell_threshold: None,
         credentials: None,
@@ -329,6 +330,7 @@ fn api_profile(name: &str) -> Profile {
         ),
         auto_start: false,
         env: BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold: None,
         bell_threshold: None,
         credentials: None,
@@ -346,6 +348,7 @@ fn failed_profile(name: &str) -> Profile {
         api_key: None,
         auto_start: false,
         env: BTreeMap::new(),
+        models: Default::default(),
         fallback_threshold: Some(90.0),
         bell_threshold: None,
         credentials: None,
@@ -818,9 +821,10 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Up); // 2 → 1 (work)
     press(&mut app, KeyCode::Up); // → 0 (personal)
     press(&mut app, KeyCode::Enter); // focus detail for personal
-    press(&mut app, KeyCode::Down); // Name → BaseUrl
-    press(&mut app, KeyCode::Down); // BaseUrl → ApiKey
-    press(&mut app, KeyCode::Down); // ApiKey → AutoStart
+    // auto-start is the second-to-last row (before delete); wrap up to reach it
+    // without counting the model rows between api key and it.
+    press(&mut app, KeyCode::Up); // Name → Delete (wraps to last)
+    press(&mut app, KeyCode::Up); // Delete → AutoStart
     press(&mut app, KeyCode::Enter); // flip it
     assert!(
         !auto_start_of(&app, "personal"),
@@ -908,9 +912,7 @@ fn demo_data_drives_all_actions() {
         press(&mut app, KeyCode::Down); // 0 → 4 ("research")
     }
     press(&mut app, KeyCode::Enter); // focus detail
-    for _ in 0..4 {
-        press(&mut app, KeyCode::Down); // Name → Delete (last row)
-    }
+    press(&mut app, KeyCode::Up); // Name → Delete (wraps to last row)
     press(&mut app, KeyCode::Enter); // arm
     assert!(
         app.config_draft
@@ -989,14 +991,12 @@ fn demo_data_drives_all_actions() {
         "created profile must preserve api_key"
     );
 
-    // Clean up — delete what we just created
-    // "sandbox-test" has base_url set → is_oauth = false → 4 rows (Name, BaseUrl, ApiKey, Delete)
+    // Clean up — delete what we just created. "sandbox-test" has base_url set →
+    // is_oauth = false → delete is the last row (after name/endpoint/model rows).
     let before = app.profile_count();
     press(&mut app, KeyCode::Enter); // focus detail for sandbox-test
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
-    for _ in 0..3 {
-        press(&mut app, KeyCode::Down); // Name → BaseUrl → ApiKey → Delete
-    }
+    press(&mut app, KeyCode::Up); // Name → Delete (wraps to last row)
     press(&mut app, KeyCode::Enter); // arm
     assert!(
         app.config_draft

@@ -139,6 +139,9 @@ pub(crate) struct Profile {
     pub(crate) auto_start: bool,
     /// Extra env vars merged into `settings.json`'s `env` block while active; cleared on switch.
     pub(crate) env: BTreeMap<String, String>,
+    /// Per-account Claude Code model configuration, written into this profile's
+    /// runtime `settings.json` (and the live `~/.claude` settings while active).
+    pub(crate) models: ModelSettings,
     /// Utilization % to auto-switch off at (fallback chain only). None = use default.
     pub(crate) fallback_threshold: Option<f64>,
     /// Utilization % at/above which a bell toast fires in the overview tab.
@@ -162,6 +165,7 @@ impl Profile {
             api_key,
             auto_start: false,
             env: BTreeMap::new(),
+            models: ModelSettings::default(),
             fallback_threshold: None,
             bell_threshold: None,
             credentials: None,
@@ -359,6 +363,34 @@ impl AppConfig {
     }
 }
 
+/// Per-account model knobs written into the profile's Claude Code `settings.json`.
+/// `default` is the `model` setting; `opus`/`sonnet`/`haiku` are the
+/// `ANTHROPIC_DEFAULT_*_MODEL` env overrides; `subagent` is
+/// `CLAUDE_CODE_SUBAGENT_MODEL`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ModelSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) opus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sonnet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) haiku: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subagent: Option<String>,
+}
+
+impl ModelSettings {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.default.is_none()
+            && self.opus.is_none()
+            && self.sonnet.is_none()
+            && self.haiku.is_none()
+            && self.subagent.is_none()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
 struct ProfileConfig {
     base_url: Option<String>,
@@ -367,6 +399,8 @@ struct ProfileConfig {
     auto_start: bool,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    models: ModelSettings,
     #[serde(default)]
     fallback_threshold: Option<f64>,
     #[serde(default)]
@@ -660,6 +694,7 @@ fn load_profile(name: &str) -> Result<Profile> {
         api_key: config.api_key,
         auto_start: config.auto_start,
         env: config.env,
+        models: config.models,
         fallback_threshold: config.fallback_threshold.map(|v| v.clamp(0.0, 100.0)),
         bell_threshold: config.bell_threshold.map(|v| v.clamp(0.0, 100.0)),
         credentials,
@@ -687,6 +722,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 api_key: profile.api_key.clone(),
                 auto_start: profile.auto_start,
                 env: profile.env.clone(),
+                models: profile.models.clone(),
                 fallback_threshold: profile.fallback_threshold,
                 bell_threshold: profile.bell_threshold,
             };
@@ -843,6 +879,32 @@ fn render_config_toml(profile: &Profile) -> String {
     match profile.bell_threshold {
         Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
         None => out.push_str("# bell_threshold = 95.0\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# Per-account Claude Code model configuration, written into this profile's\n");
+    out.push_str("# settings.json. `default` is the `model` setting (an alias like `opusplan`\n");
+    out.push_str("# or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku` pin what\n");
+    out.push_str("# those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent` forces the\n");
+    out.push_str("# subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n");
+    let m = &profile.models;
+    let scalars = [
+        ("default", &m.default),
+        ("opus", &m.opus),
+        ("sonnet", &m.sonnet),
+        ("haiku", &m.haiku),
+        ("subagent", &m.subagent),
+    ];
+    if scalars.iter().all(|(_, v)| v.is_none()) {
+        out.push_str("# [models]\n");
+        out.push_str("# default = \"opusplan\"\n");
+    } else {
+        out.push_str("[models]\n");
+        for (k, v) in scalars {
+            if let Some(v) = v {
+                out.push_str(&format!("{k} = {}\n", toml_str(v)));
+            }
+        }
     }
     out.push('\n');
 

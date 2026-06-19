@@ -7,8 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{
-    App, ConfigFocus, FallbackFocus, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS,
-    GlobalConfigRow, StatusFocus, Tab, TokenView, fallback_hint,
+    App, ConfigFocus, ConfigRow, FallbackFocus, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS,
+    GlobalConfigRow, StatusFocus, Tab, TokenView, config_rows, fallback_hint,
 };
 use super::super::theme;
 
@@ -58,12 +58,28 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("a", "actions"),
                 ("?", "help"),
             ],
-            ConfigFocus::Actions => &[
-                ("↑↓", "row"),
-                ("↵", "edit / toggle"),
-                ("a", "actions"),
-                ("?", "help"),
-            ],
+            ConfigFocus::Actions => {
+                // The `model` row cycles on space and types a custom id on ⏎.
+                let on_model = config_rows(app)
+                    .get(app.config_action_cursor)
+                    .is_some_and(|r| *r == ConfigRow::Model);
+                if on_model {
+                    &[
+                        ("↑↓", "row"),
+                        ("space", "cycle"),
+                        ("↵", "custom"),
+                        ("a", "actions"),
+                        ("?", "help"),
+                    ]
+                } else {
+                    &[
+                        ("↑↓", "row"),
+                        ("↵", "edit / toggle"),
+                        ("a", "actions"),
+                        ("?", "help"),
+                    ]
+                }
+            }
         },
         Tab::Config => {
             if app.refresh_interval_draft.is_some() {
