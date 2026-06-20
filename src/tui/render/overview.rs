@@ -15,7 +15,9 @@ use super::format::{
 use super::panes::{bold_when, draw_scrollbar, empty_state, section_box, select_line};
 use crate::fallback::{SwitchAction, next_target, threshold_for};
 use crate::profile::{AppConfig, Profile};
-use crate::usage::{LABEL_5H, LABEL_7D, ProfileActivity, UsageInfo, humanize_duration, now_ms};
+use crate::usage::{
+    LABEL_5H, LABEL_7D, ProfileActivity, UsageInfo, UsageWindow, humanize_duration, now_ms,
+};
 
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
@@ -290,11 +292,10 @@ fn render_overview_row(
     spans.push(timer_span);
     // Bracketed bars ([███░░░]) for overview account rows only.
     // Usage-page gauges, chain bars, and fallback thresholds stay bracket-less.
-    let five_spans = window_summary_spans_bracketed(
-        profile.usage.as_ref().and_then(|u| u.five_hour.as_ref()),
-        widths.five_hour,
-        true,
-    );
+    // OAuth windows come from `usage`; api-key/provider profiles have no `usage`,
+    // so the 5h/7d windows are synthesized from the matching third-party bars.
+    let (five_window, seven_window) = overview_windows(profile);
+    let five_spans = window_summary_spans_bracketed(five_window.as_ref(), widths.five_hour, true);
     let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
     spans.extend(five_spans);
@@ -302,7 +303,7 @@ fn render_overview_row(
     if widths.seven_day > 0 {
         spans.push(gap(widths));
         let seven_spans = window_summary_spans_bracketed(
-            profile.usage.as_ref().and_then(|u| u.weekly_window()),
+            seven_window.as_ref(),
             widths.seven_day,
             widths.seven_day >= 18,
         );
@@ -318,6 +319,27 @@ fn render_overview_row(
     }
 
     Line::from(spans)
+}
+
+/// The `(5h, 7d)` windows to show in the overview row. OAuth profiles use their
+/// live `UsageInfo`; api-key/provider profiles have no `UsageInfo`, so each slot
+/// is synthesized from the third-party bar whose label matches (`5h` / `7d`) —
+/// the same labels `zai` decodes from its window codes. `None` per slot when no
+/// source exists (renders `—`).
+fn overview_windows(profile: &Profile) -> (Option<UsageWindow>, Option<UsageWindow>) {
+    if let Some(usage) = profile.usage.as_ref() {
+        return (usage.five_hour.clone(), usage.weekly_window().cloned());
+    }
+    let Some(bars) = profile.third_party_usage.as_ref().map(|s| &s.bars) else {
+        return (None, None);
+    };
+    let window_for = |label: &str| {
+        bars.iter().find(|b| b.label == label).map(|b| UsageWindow {
+            utilization: b.pct,
+            resets_at: b.resets_at.clone(),
+        })
+    };
+    (window_for(LABEL_5H), window_for(LABEL_7D))
 }
 
 fn gap(widths: &OverviewWidths) -> Span<'static> {
