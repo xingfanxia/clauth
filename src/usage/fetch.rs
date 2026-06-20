@@ -87,18 +87,91 @@ pub(crate) struct ExtraUsage {
     pub(crate) currency: Option<String>,
 }
 
+/// Canonical account tier, computed once at fetch time. The single source of
+/// truth that `plan_label` / `endpoint_label` render from — collapses the old
+/// four-field `PlanInfo` fan-out into one enum. `Serialize`/`Deserialize` keep it
+/// in the `usage_cache.json` shape; a field rename simply misses → refetches.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) enum PlanTier {
+    Max(#[serde(default)] Option<u8>),
+    Pro,
+    Team,
+    Enterprise,
+    Free,
+    #[default]
+    Unknown,
+}
+
+impl PlanTier {
+    /// Reproduce the old `plan_label` classification exactly from the raw
+    /// `/profile` fields. `rate_limit_tier` carries the Max multiplier when present.
+    pub(crate) fn from_profile(
+        org_type: Option<&str>,
+        has_max: bool,
+        has_pro: bool,
+        rate_limit_tier: Option<&str>,
+    ) -> Self {
+        match org_type.unwrap_or("") {
+            "claude_max" => PlanTier::Max(max_multiplier(rate_limit_tier)),
+            "claude_pro" => PlanTier::Pro,
+            "claude_team" | "claude_teams" => PlanTier::Team,
+            "claude_enterprise" => PlanTier::Enterprise,
+            "claude_free" | "free" => PlanTier::Free,
+            "" => {
+                if has_max {
+                    PlanTier::Max(None)
+                } else if has_pro {
+                    PlanTier::Pro
+                } else {
+                    PlanTier::Unknown
+                }
+            }
+            _ => PlanTier::Unknown,
+        }
+    }
+
+    /// Map the OAuth token's `subscription_type` so a not-yet-fetched profile
+    /// still shows a sane tier label.
+    pub(crate) fn from_subscription_type(s: Option<&str>) -> Self {
+        match s.unwrap_or("") {
+            "pro" => PlanTier::Pro,
+            "max" => PlanTier::Max(None),
+            "team" | "teams" => PlanTier::Team,
+            "enterprise" => PlanTier::Enterprise,
+            _ => PlanTier::Unknown,
+        }
+    }
+
+    /// Same strings the old `plan_label` emitted, for every tier.
+    pub(crate) fn display(&self) -> String {
+        match self {
+            PlanTier::Max(Some(n)) => format!("Claude Max {n}x"),
+            PlanTier::Max(None) => "Claude Max".to_string(),
+            PlanTier::Pro => "Claude Pro".to_string(),
+            PlanTier::Team => "Claude Team".to_string(),
+            PlanTier::Enterprise => "Claude Enterprise".to_string(),
+            PlanTier::Free => "Claude Free".to_string(),
+            PlanTier::Unknown => "Claude".to_string(),
+        }
+    }
+}
+
+/// Pull the trailing `Nx` multiplier out of a rate-limit tier like
+/// `default_claude_max_5x` / `default_claude_max_20x`.
+fn max_multiplier(tier: Option<&str>) -> Option<u8> {
+    let tier = tier?;
+    let last = tier.rsplit('_').next()?;
+    last.strip_suffix('x').and_then(|m| {
+        m.chars()
+            .all(|c| c.is_ascii_digit())
+            .then(|| m.parse().ok())?
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct PlanInfo {
-    /// e.g. "claude_max", "claude_pro", "claude_team", "claude_enterprise"
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) organization_type: Option<String>,
-    /// e.g. "default_claude_max_5x", "default_claude_max_20x"
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) rate_limit_tier: Option<String>,
     #[serde(default)]
-    pub(crate) has_max: bool,
-    #[serde(default)]
-    pub(crate) has_pro: bool,
+    pub(crate) tier: PlanTier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -411,17 +484,16 @@ pub(super) fn fetch_raw(
         get_json(PROFILE_ENDPOINT, access_token)
             .ok()
             .and_then(|text| serde_json::from_str::<RawProfile>(&text).ok())
-            .map(|p| PlanInfo {
-                organization_type: p
-                    .organization
-                    .as_ref()
-                    .and_then(|o| o.organization_type.clone()),
-                rate_limit_tier: p
-                    .organization
-                    .as_ref()
-                    .and_then(|o| o.rate_limit_tier.clone()),
-                has_max: p.account.as_ref().is_some_and(|a| a.has_claude_max),
-                has_pro: p.account.as_ref().is_some_and(|a| a.has_claude_pro),
+            .map(|p| {
+                let org = p.organization.as_ref();
+                PlanInfo {
+                    tier: PlanTier::from_profile(
+                        org.and_then(|o| o.organization_type.as_deref()),
+                        p.account.as_ref().is_some_and(|a| a.has_claude_max),
+                        p.account.as_ref().is_some_and(|a| a.has_claude_pro),
+                        org.and_then(|o| o.rate_limit_tier.as_deref()),
+                    ),
+                }
             })
             // Profile leg failed (transient / 401 on a stale token) — keep the
             // prior plan rather than dropping it from the snapshot.

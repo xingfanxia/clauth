@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use super::{TICK, Term, app, render, restore_terminal, setup_terminal};
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::usage::{
-    ExtraUsage, FetchStatus, PlanInfo, ProfileActivity, UsageInfo, UsageWindow, now_ms,
+    ExtraUsage, FetchStatus, PlanInfo, PlanTier, ProfileActivity, UsageInfo, UsageWindow, now_ms,
 };
 
 // ── Launch ──────────────────────────────────────────────────────────────────
@@ -304,10 +304,7 @@ fn oauth_profile(
         credentials: None,
         usage: Some(UsageInfo {
             plan: Some(PlanInfo {
-                organization_type: Some(plan_type.to_string()),
-                rate_limit_tier: Some(tier.to_string()),
-                has_max,
-                has_pro,
+                tier: PlanTier::from_profile(Some(plan_type), has_max, has_pro, Some(tier)),
             }),
             five_hour,
             seven_day: None,
