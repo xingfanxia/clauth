@@ -58,7 +58,7 @@ fn quota_stats(data: &QuotaData) -> ThirdPartyStats {
             _ => limit.usage,
         };
         bars.push(UsageBar {
-            label: limit_label(&limit.limit_type),
+            label: limit_label(limit),
             pct,
             resets_at: limit.next_reset_time.map(ms_to_iso),
             used,
@@ -68,7 +68,7 @@ fn quota_stats(data: &QuotaData) -> ThirdPartyStats {
         // anything has been used — an all-zero breakdown is noise.
         if limit.usage_details.iter().any(|d| d.usage > 0.0) {
             detail_rows.push(StatRow {
-                label: limit_label(&limit.limit_type),
+                label: limit_label(limit),
                 value: String::new(),
                 kind: StatRowKind::Heading,
             });
@@ -141,11 +141,40 @@ fn model_rows(total: &ModelTotalUsage) -> Vec<StatRow> {
     rows
 }
 
+/// Bar label for a limit. Prefers the window decoded from `unit`/`number`
+/// (`5h`, `7d`, `30d`) since GLM's token limits are per-window caps the user
+/// thinks of in those terms; falls back to the API type (`tokens limit`) when
+/// the window code is unknown. The two token limits thus read `5h` / `7d`
+/// instead of a duplicated `tokens limit`.
+fn limit_label(limit: &Limit) -> String {
+    window_label(limit.unit, limit.number).unwrap_or_else(|| type_label(&limit.limit_type))
+}
+
 /// `TIME_LIMIT` → "time limit", `TOKENS_LIMIT` → "tokens limit", any other type
-/// lowercased with `_` → space. Uses the API's own type as the label (no
-/// inferred window vocabulary).
-fn limit_label(limit_type: &str) -> String {
+/// lowercased with `_` → space.
+fn type_label(limit_type: &str) -> String {
     limit_type.to_ascii_lowercase().replace('_', " ")
+}
+
+/// Compact window label from z.ai's duration code `unit` × `number`. `unit` is a
+/// calendar code (3 = hour, 6 = week, 5 = month) carried on every limit — present
+/// even when `nextResetTime` is absent, which makes it the reliable mapping
+/// source. `< 1 day` → `Nh`, whole weeks → `Nd`, else `Nd`. `None` for an unknown
+/// code so the caller falls back to the API type label.
+fn window_label(unit: Option<i64>, number: Option<i64>) -> Option<String> {
+    let n = number.filter(|&n| n > 0)?;
+    let unit_secs = match unit? {
+        3 => 3600,        // hour
+        6 => 7 * 86_400,  // week
+        5 => 30 * 86_400, // month (nominal)
+        _ => return None,
+    };
+    let secs = n * unit_secs;
+    Some(if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    })
 }
 
 /// Compact token/count formatting: `52245057` → `52.2M`, `44456531` → `44.5M`,
@@ -212,6 +241,14 @@ struct QuotaData {
 struct Limit {
     #[serde(rename = "type", default)]
     limit_type: String,
+    /// Window duration code: 3 = hour, 6 = week, 5 = month (the codes z.ai uses).
+    /// Paired with `number` to give the window length — present even when
+    /// `nextResetTime` is absent, so it's the reliable mapping source.
+    #[serde(default)]
+    unit: Option<i64>,
+    /// Multiplier on `unit` — `number: 5` + `unit: 3` (hour) = a 5-hour window.
+    #[serde(default)]
+    number: Option<i64>,
     #[serde(default)]
     percentage: f64,
     #[serde(rename = "nextResetTime", default)]

@@ -33,11 +33,13 @@ fn quota_yields_bars_plan_and_detail_rows() {
     assert_eq!(stats.plan.as_deref(), Some("pro"));
     assert!(!stats.best_effort, "typed provider is not best-effort");
 
-    // Three bars, source order, API labels (no inferred 5h/7d vocabulary).
+    // Three bars, source order. Labels decode from unit/number: TIME_LIMIT
+    // unit=5 number=1 → 30d; the token limits unit=3 number=5 → 5h and unit=6
+    // number=1 → 7d (mapped, not the duplicated "tokens limit").
     assert_eq!(stats.bars.len(), 3);
-    assert_eq!(stats.bars[0].label, "time limit");
-    assert_eq!(stats.bars[1].label, "tokens limit");
-    assert_eq!(stats.bars[2].label, "tokens limit");
+    assert_eq!(stats.bars[0].label, "30d");
+    assert_eq!(stats.bars[1].label, "5h");
+    assert_eq!(stats.bars[2].label, "7d");
 
     // TIME_LIMIT absolutes: currentValue → used, currentValue+remaining → total.
     assert_eq!(stats.bars[0].used, Some(250.0));
@@ -112,6 +114,19 @@ fn model_usage_all_zero_yields_no_rows() {
         model_rows(&total).is_empty(),
         "an empty window adds nothing"
     );
+}
+
+#[test]
+fn window_label_decodes_unit_number() {
+    // z.ai's real codes: hour=3, week=6, month=5.
+    assert_eq!(window_label(Some(3), Some(5)).as_deref(), Some("5h"));
+    assert_eq!(window_label(Some(6), Some(1)).as_deref(), Some("7d"));
+    assert_eq!(window_label(Some(5), Some(1)).as_deref(), Some("30d"));
+    assert_eq!(window_label(Some(3), Some(1)).as_deref(), Some("1h"));
+    // Unknown code or missing field → no label (caller falls back to type).
+    assert_eq!(window_label(Some(99), Some(1)), None);
+    assert_eq!(window_label(None, Some(5)), None);
+    assert_eq!(window_label(Some(3), None), None);
 }
 
 #[test]
