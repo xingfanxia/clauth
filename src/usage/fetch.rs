@@ -93,7 +93,7 @@ pub(crate) struct ExtraUsage {
 /// in the `usage_cache.json` shape; a field rename simply misses → refetches.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) enum PlanTier {
-    Max(#[serde(default)] Option<u8>),
+    Max(#[serde(default)] Option<u16>),
     Pro,
     Team,
     Enterprise,
@@ -131,9 +131,10 @@ impl PlanTier {
     }
 
     /// Map the OAuth token's `subscription_type` so a not-yet-fetched profile
-    /// still shows a sane tier label.
+    /// still shows a sane tier label. A missing value defaults to `Pro`,
+    /// matching the old `endpoint_label` fallback (`unwrap_or("pro")`).
     pub(crate) fn from_subscription_type(s: Option<&str>) -> Self {
-        match s.unwrap_or("") {
+        match s.unwrap_or("pro") {
             "pro" => PlanTier::Pro,
             "max" => PlanTier::Max(None),
             "team" | "teams" => PlanTier::Team,
@@ -158,7 +159,7 @@ impl PlanTier {
 
 /// Pull the trailing `Nx` multiplier out of a rate-limit tier like
 /// `default_claude_max_5x` / `default_claude_max_20x`.
-fn max_multiplier(tier: Option<&str>) -> Option<u8> {
+fn max_multiplier(tier: Option<&str>) -> Option<u16> {
     let tier = tier?;
     let last = tier.rsplit('_').next()?;
     last.strip_suffix('x').and_then(|m| {
