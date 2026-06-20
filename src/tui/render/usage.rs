@@ -273,7 +273,10 @@ impl Stat {
         max_rate_w: usize,
         max_amount_w: usize,
     ) -> Vec<Line<'static>> {
-        let pct_str = format!("{:>3.0}%", self.pct);
+        // Natural width — `header_pad` right-aligns the whole block to `pct_col`,
+        // so the `%` lands in the same column every row without padding the
+        // number. (A fixed `{:>3.0}` width added stray spaces after the amount.)
+        let pct_str = format!("{:.0}%", self.pct);
 
         // The amount sits in its own right-aligned column just left of the %,
         // with a 2-space gap when present.
