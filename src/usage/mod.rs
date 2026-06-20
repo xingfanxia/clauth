@@ -15,6 +15,6 @@ pub(crate) use scheduler::{
     OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RateLimitStreaks,
     RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
-    TokenEntry, TokenList, UsageStore, any_busy, bootstrap_fetch, clear_activity,
-    collect_third_party_entries, is_idle, mark_activity, spawn_refresher,
+    TokenEntry, TokenList, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
+    clear_activity, collect_third_party_entries, is_idle, mark_activity, spawn_refresher,
 };

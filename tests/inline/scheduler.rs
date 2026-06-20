@@ -586,8 +586,9 @@ fn transient_errors_preserve_rate_limit_streak() {
 
 /// Startup seed gating: a profile whose cached 5h window is still open is seeded
 /// from disk regardless of cache age (store + `Fresh` + `last_fetched` stamped at
-/// the cache mtime, so an old cache falls due for a prompt background refresh). A
-/// cache whose 5h window has reset, or a missing cache, is left for the scheduler.
+/// `now`, so even an old-but-open cache waits a full interval rather than falling
+/// due immediately). A cache whose 5h window has reset, or a missing cache, is
+/// left for the scheduler.
 #[test]
 fn try_seed_recent_cache_seeds_open_window_only() {
     use std::time::{Duration, SystemTime};
@@ -643,8 +644,9 @@ fn try_seed_recent_cache_seeds_open_window_only() {
         Some(FetchStatus::Fresh),
         "a seeded open-window cache surfaces as Fresh, not a staleness warning"
     );
-    // Stamped at the cache mtime (2h ago), not now — so it falls due for a prompt
-    // background refresh on the scheduler's first tick.
+    // Stamped at `now` (startup), not the 2h-old cache mtime — so the seeded
+    // profile waits a full interval before its first background refresh instead
+    // of falling due immediately on the scheduler's first tick.
     let stamp = last_fetched
         .lock()
         .unwrap()
@@ -652,9 +654,10 @@ fn try_seed_recent_cache_seeds_open_window_only() {
         .copied()
         .unwrap()
         .as_millis();
+    let now = now_ms();
     assert!(
-        stamp < now_ms().saturating_sub(REFRESH_INTERVAL_MS),
-        "an old-but-open cache stamps last_fetched at its mtime, due for a background refresh"
+        stamp <= now && stamp >= now.saturating_sub(5_000),
+        "an old-but-open cache stamps last_fetched at startup (~now), not its 2h-old mtime"
     );
 }
 
@@ -727,4 +730,71 @@ fn tp_entry(name: &str) -> ThirdPartyEntry {
         },
         api_key: "key".to_string(),
     }
+}
+
+/// Third-party startup seed: a profile with an on-disk third-party cache is
+/// seeded into the store as `Fresh` with `last_fetched` stamped at `now` (so it
+/// waits a full interval rather than an immediate first-tick fetch); a profile
+/// with no cache is left unseeded and unstamped for the scheduler.
+#[test]
+fn bootstrap_third_party_seeds_cached_profiles_only() {
+    use super::{
+        FetchStatus, ThirdPartyStatusStore, ThirdPartyUsageStore, bootstrap_third_party, now_ms,
+    };
+    use crate::providers::{ThirdPartyStats, UsageBar, write_third_party_disk_cache};
+    use crate::testutil::HomeSandbox;
+
+    let _home = HomeSandbox::new();
+    let store: ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let stats = ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![UsageBar {
+            label: "5h".to_string(),
+            pct: 12.0,
+            resets_at: None,
+            used: None,
+            total: None,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    write_third_party_disk_cache("cached", &stats);
+
+    let entries = vec![tp_entry("cached"), tp_entry("missing")];
+    bootstrap_third_party(&store, &status, &last_fetched, &entries);
+
+    assert!(
+        store.lock().unwrap().contains_key("cached"),
+        "a profile with a third-party cache is seeded from disk"
+    );
+    assert!(
+        !store.lock().unwrap().contains_key("missing"),
+        "a profile with no cache is left for the scheduler"
+    );
+    assert_eq!(
+        status.lock().unwrap().get("cached").copied(),
+        Some(FetchStatus::Fresh),
+        "a seeded third-party cache surfaces as Fresh"
+    );
+    assert!(
+        !last_fetched.lock().unwrap().contains_key("missing"),
+        "a no-cache profile is left unstamped so it fetches on the first tick"
+    );
+    let now = now_ms();
+    let stamp = last_fetched
+        .lock()
+        .unwrap()
+        .get("cached")
+        .copied()
+        .unwrap()
+        .as_millis();
+    assert!(
+        stamp <= now && stamp >= now.saturating_sub(5_000),
+        "the seeded third-party profile stamps last_fetched at startup (~now)"
+    );
 }

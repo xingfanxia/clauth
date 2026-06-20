@@ -49,8 +49,8 @@ use crate::usage::{
     OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RateLimitStreaks,
     RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
-    TokenEntry, TokenList, UsageInfo, UsageStore, any_busy, bootstrap_fetch, clear_activity,
-    collect_third_party_entries, is_idle, mark_activity, now_ms, spawn_refresher,
+    TokenEntry, TokenList, UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
+    clear_activity, collect_third_party_entries, is_idle, mark_activity, now_ms, spawn_refresher,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -1121,10 +1121,12 @@ impl App {
     }
 
     /// Spawn the bootstrap on a background thread (never blocks first paint).
-    /// Re-links credentials, then seeds usage via `bootstrap_fetch` — on-disk
-    /// caches still inside their 5h window seed instantly (no round-trip), while
-    /// stale/missing ones are left for the scheduler to fetch in the background.
-    /// No proactive token rotation (401-recovery is lazy). Posts
+    /// Re-links credentials, then seeds usage from disk — OAuth caches still inside
+    /// their 5h window via `bootstrap_fetch`, api-key/provider caches via
+    /// `bootstrap_third_party` — so the UI shows last-known numbers instantly while
+    /// the scheduler refreshes on the normal cadence; profiles with no usable cache
+    /// are left for the scheduler to fetch in the background. No proactive token
+    /// rotation (401-recovery is lazy). Posts
     /// `StartupSignal::BootstrapDone` when done; the UI thread then rebuilds the
     /// token snapshot, starts the scheduler, applies usage, and runs the startup
     /// auto-switch.
@@ -1132,6 +1134,8 @@ impl App {
         let config = Arc::clone(&self.config);
         let usage_store = Arc::clone(&self.usage_store);
         let usage_status = Arc::clone(&self.usage_status);
+        let third_party_usage_store = Arc::clone(&self.third_party_usage_store);
+        let third_party_status = Arc::clone(&self.third_party_status);
         let last_fetched = Arc::clone(&self.last_fetched);
         let done = BootstrapDoneGuard {
             bootstrap_active: Arc::clone(&self.bootstrap_active),
@@ -1154,9 +1158,21 @@ impl App {
                 let _ = link_profile_credentials(&active);
             }
 
-            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-            let snapshot = collect_tokens(&config.lock().expect("config mutex poisoned").profiles);
+            let (snapshot, third_party) = {
+                #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+                let cfg = config.lock().expect("config mutex poisoned");
+                (
+                    collect_tokens(&cfg.profiles),
+                    collect_third_party_entries(&cfg.profiles),
+                )
+            };
             bootstrap_fetch(&usage_store, &usage_status, &last_fetched, &snapshot);
+            bootstrap_third_party(
+                &third_party_usage_store,
+                &third_party_status,
+                &last_fetched,
+                &third_party,
+            );
 
             // Seeded-but-due and stale/missing profiles are fetched by the
             // scheduler's first tick (started in `finish_bootstrap`); 5h windows
