@@ -8,8 +8,8 @@ use crate::lockorder::{RankedMutex, rank};
 use crate::providers::ThirdPartyStats;
 
 use super::fetch::{
-    FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso, fetch_raw, iso_to_epoch_secs,
-    load_disk_cache, now_epoch_secs, now_ms, write_disk_cache,
+    FetchError, PlanInfo, UsageInfo, UsageWindow, cache_mtime_ms, epoch_secs_to_iso, fetch_raw,
+    iso_to_epoch_secs, load_disk_cache, now_epoch_secs, now_ms, write_disk_cache,
 };
 
 /// Scheduler wake interval. Network work only fires for profiles whose cadence has elapsed.
@@ -630,55 +630,58 @@ fn mark_window_open(store: &UsageStore, name: &str, now_secs: i64) {
 }
 
 /// Startup usage seed — never blocks on HTTP. Each profile whose on-disk cache
-/// is still in its current 5h window is seeded straight from disk so the UI
-/// shows real numbers instantly; the seed stamps `last_fetched` at startup, so
-/// the first background refresh waits a full interval (see [`try_seed_recent_cache`]).
-/// A profile with a stale (post-reset) or missing cache is left unseeded and
-/// unstamped, so the scheduler fetches it fresh in the background on its first tick.
+/// was written less than one refresh interval ago is seeded straight from disk so
+/// the UI shows real numbers instantly, with `last_fetched` stamped at the cache
+/// mtime so the fixed cadence *resumes* across the restart (see
+/// [`try_seed_recent_cache`]) instead of resetting the countdown. A profile with a
+/// staler or missing cache is left unseeded and unstamped, so the scheduler
+/// fetches it fresh in the background on its first tick.
 pub(crate) fn bootstrap_fetch(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
     tokens: &[TokenEntry],
+    interval_ms: u64,
 ) {
-    let now_secs = now_epoch_secs();
+    let now = now_ms();
     for entry in tokens {
-        try_seed_recent_cache(store, status, last_fetched, &entry.name, now_secs);
+        try_seed_recent_cache(store, status, last_fetched, &entry.name, now, interval_ms);
     }
 }
 
-/// Seed `name` from its on-disk cache while that cache's 5h window is still open
-/// (same window timeframe), returning `true`. The `last_fetched` slot is stamped
-/// at `now` (startup), so the seeded data is treated as just-fetched: the next
-/// background refresh falls a full interval out and the overview countdown starts
-/// fresh — startup never queues an immediate refresh of an in-window cache (which
-/// would burst the shared, rate-limited OAuth endpoint). Returns `false` (leave it
-/// for the background fetch) when the cache is missing or its 5h window has reset —
-/// those numbers belong to a past window and must not be shown. Status is `Fresh`:
-/// the seeded numbers are current for this window, so the UI shows the normal
-/// countdown rather than a staleness warning.
+/// Seed `name` from its on-disk cache when that cache is fresher than one refresh
+/// interval, returning `true`. Freshness — not window state — is the gate: a cache
+/// written seconds ago is current truth whatever its 5h window says (an idle
+/// account whose window already rolled past its `resets_at` is still seeded), while
+/// a cache older than the cadence is left for the scheduler (its window may have
+/// rolled to numbers we shouldn't show). The `last_fetched` slot is stamped at the
+/// cache **mtime**, so `partition_due` resumes the fixed cadence from the last real
+/// write — the overview countdown continues where it left off across a restart
+/// rather than resetting to a full interval, and a fresh cache never falls due on
+/// the first tick (no startup refresh burst). Status is `Fresh`.
 fn try_seed_recent_cache(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
     name: &str,
-    now_secs: i64,
+    now: u64,
+    interval_ms: u64,
 ) -> bool {
+    let Some(mtime) = cache_mtime_ms(name) else {
+        return false;
+    };
+    if now.saturating_sub(mtime) >= interval_ms {
+        return false;
+    }
     let Some(info) = load_disk_cache(name) else {
         return false;
     };
-    // Same-timeframe rule: trust the cache only while its 5h window is still
-    // open. After it resets the utilization belongs to a past period, so leave
-    // the profile for the scheduler to fetch fresh.
-    if !five_hour_live(&info, now_secs) {
-        return false;
-    }
     if let Ok(mut s) = store.lock() {
         s.insert(name.to_string(), info);
     }
     // Ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350) — matches `apply_outcome`.
     if let Ok(mut lf) = last_fetched.lock() {
-        lf.insert(name.to_string(), EpochMs::from_millis(now_ms()));
+        lf.insert(name.to_string(), EpochMs::from_millis(mtime));
         if let Ok(mut st) = status.lock() {
             st.insert(name.to_string(), FetchStatus::Fresh);
         }
@@ -687,19 +690,26 @@ fn try_seed_recent_cache(
 }
 
 /// Startup third-party seed — the api-key/provider analogue of [`bootstrap_fetch`].
-/// Each profile with an on-disk third-party cache is seeded straight from disk
-/// (status `Fresh`, `last_fetched` stamped at `now`) so the UI shows last-known
-/// numbers instantly and the first background refresh waits a full interval rather
-/// than firing on the scheduler's first tick. A profile with no cache is left
-/// unstamped, so the scheduler fetches it fresh on its first tick.
+/// Each profile whose `third_party_cache.json` is fresher than one refresh interval
+/// is seeded straight from disk (status `Fresh`, `last_fetched` stamped at the cache
+/// mtime) so the UI shows last-known numbers instantly and the cadence resumes
+/// across the restart. A profile with a staler or missing cache is left unstamped,
+/// so the scheduler fetches it fresh on its first tick.
 pub(crate) fn bootstrap_third_party(
     store: &ThirdPartyUsageStore,
     status: &ThirdPartyStatusStore,
     last_fetched: &LastFetchedAt,
     entries: &[ThirdPartyEntry],
+    interval_ms: u64,
 ) {
-    let now = EpochMs::from_millis(now_ms());
+    let now = now_ms();
     for entry in entries {
+        let Some(mtime) = crate::providers::third_party_cache_mtime_ms(&entry.name) else {
+            continue;
+        };
+        if now.saturating_sub(mtime) >= interval_ms {
+            continue;
+        }
         let Some(stats) = crate::providers::load_third_party_disk_cache(&entry.name) else {
             continue;
         };
@@ -708,7 +718,7 @@ pub(crate) fn bootstrap_third_party(
         }
         // Ascending rank order: LAST_FETCHED(200) < THIRD_PARTY_STATUS(280).
         if let Ok(mut lf) = last_fetched.lock() {
-            lf.insert(entry.name.clone(), now);
+            lf.insert(entry.name.clone(), EpochMs::from_millis(mtime));
             if let Ok(mut st) = status.lock() {
                 st.insert(entry.name.clone(), FetchStatus::Fresh);
             }

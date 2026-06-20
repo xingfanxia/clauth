@@ -470,6 +470,17 @@ fn cache_path(profile_name: &str) -> Option<PathBuf> {
         .map(|p| p.join("usage_cache.json"))
 }
 
+/// Epoch-ms of the usage cache's last write (≈ the last live fetch), or `None`
+/// when no cache exists. Lets startup resume the refresh cadence from the last
+/// real write instead of resetting the countdown to a full interval.
+pub(crate) fn cache_mtime_ms(name: &str) -> Option<u64> {
+    let modified = std::fs::metadata(cache_path(name)?).ok()?.modified().ok()?;
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

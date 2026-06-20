@@ -1121,12 +1121,13 @@ impl App {
     }
 
     /// Spawn the bootstrap on a background thread (never blocks first paint).
-    /// Re-links credentials, then seeds usage from disk — OAuth caches still inside
-    /// their 5h window via `bootstrap_fetch`, api-key/provider caches via
-    /// `bootstrap_third_party` — so the UI shows last-known numbers instantly while
-    /// the scheduler refreshes on the normal cadence; profiles with no usable cache
-    /// are left for the scheduler to fetch in the background. No proactive token
-    /// rotation (401-recovery is lazy). Posts
+    /// Re-links credentials, then seeds usage from disk — OAuth caches via
+    /// `bootstrap_fetch`, api-key/provider caches via `bootstrap_third_party`, both
+    /// gated on the cache being fresher than one refresh interval and stamped at the
+    /// cache mtime so the refresh cadence resumes across the restart — so the UI
+    /// shows last-known numbers instantly while the scheduler refreshes on the normal
+    /// cadence; profiles with no fresh cache are left for the scheduler to fetch in
+    /// the background. No proactive token rotation (401-recovery is lazy). Posts
     /// `StartupSignal::BootstrapDone` when done; the UI thread then rebuilds the
     /// token snapshot, starts the scheduler, applies usage, and runs the startup
     /// auto-switch.
@@ -1137,6 +1138,7 @@ impl App {
         let third_party_usage_store = Arc::clone(&self.third_party_usage_store);
         let third_party_status = Arc::clone(&self.third_party_status);
         let last_fetched = Arc::clone(&self.last_fetched);
+        let refresh_interval = Arc::clone(&self.refresh_interval);
         let done = BootstrapDoneGuard {
             bootstrap_active: Arc::clone(&self.bootstrap_active),
             startup_sender: self.startup_sender.clone(),
@@ -1166,12 +1168,20 @@ impl App {
                     collect_third_party_entries(&cfg.profiles),
                 )
             };
-            bootstrap_fetch(&usage_store, &usage_status, &last_fetched, &snapshot);
+            let interval_ms = refresh_interval.load(Ordering::Relaxed);
+            bootstrap_fetch(
+                &usage_store,
+                &usage_status,
+                &last_fetched,
+                &snapshot,
+                interval_ms,
+            );
             bootstrap_third_party(
                 &third_party_usage_store,
                 &third_party_status,
                 &last_fetched,
                 &third_party,
+                interval_ms,
             );
 
             // Seeded-but-due and stale/missing profiles are fetched by the

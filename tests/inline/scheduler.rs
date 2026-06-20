@@ -584,19 +584,21 @@ fn transient_errors_preserve_rate_limit_streak() {
     );
 }
 
-/// Startup seed gating: a profile whose cached 5h window is still open is seeded
-/// from disk regardless of cache age (store + `Fresh` + `last_fetched` stamped at
-/// `now`, so even an old-but-open cache waits a full interval rather than falling
-/// due immediately). A cache whose 5h window has reset, or a missing cache, is
-/// left for the scheduler.
+/// Startup seed gating is by cache **freshness**, not 5h window state: a cache
+/// written less than one interval ago is seeded (store + `Fresh` + `last_fetched`
+/// stamped at the cache mtime so the cadence resumes) even when its 5h window has
+/// already reset — an idle account whose `resets_at` is in the past. A cache older
+/// than one interval, or a missing cache, is left for the scheduler.
 #[test]
-fn try_seed_recent_cache_seeds_open_window_only() {
+fn try_seed_recent_cache_seeds_fresh_cache_and_resumes_timer() {
     use std::time::{Duration, SystemTime};
 
-    use super::{FetchStatus, StatusStore, now_epoch_secs, now_ms, try_seed_recent_cache};
+    use super::{FetchStatus, StatusStore, now_ms, try_seed_recent_cache};
     use crate::profile::profile_subpath;
     use crate::testutil::{HomeSandbox, set_mtime};
-    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, write_disk_cache};
+    use crate::usage::{
+        UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs, write_disk_cache,
+    };
 
     let _home = HomeSandbox::new();
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -604,7 +606,7 @@ fn try_seed_recent_cache_seeds_open_window_only() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
 
     let now_secs = now_epoch_secs();
-    let with_window = |reset_secs: i64| UsageInfo {
+    let with_reset = |reset_secs: i64| UsageInfo {
         five_hour: Some(UsageWindow {
             utilization: 12.0,
             resets_at: Some(epoch_secs_to_iso(reset_secs)),
@@ -612,52 +614,77 @@ fn try_seed_recent_cache_seeds_open_window_only() {
         ..Default::default()
     };
 
-    // 5h window still open, but the cache itself is old (written 2h ago).
-    write_disk_cache("open", &with_window(now_secs + 3600));
-    let open_path = profile_subpath("open", "usage_cache.json").expect("open cache path");
+    // Fresh cache (mtime ~30s ago) whose 5h window already reset (resets_at in the
+    // past) — an idle account. Freshness, not window state, gates the seed.
+    write_disk_cache("idle", &with_reset(now_secs - 600));
+    let idle_path = profile_subpath("idle", "usage_cache.json").expect("idle path");
+    set_mtime(&idle_path, SystemTime::now() - Duration::from_secs(30));
+
+    // Stale cache (written 2h ago) whose window is still open — older than one
+    // interval, so left for the scheduler regardless of window state.
+    write_disk_cache("stale", &with_reset(now_secs + 3600));
+    let stale_path = profile_subpath("stale", "usage_cache.json").expect("stale path");
     set_mtime(
-        &open_path,
+        &stale_path,
         SystemTime::now() - Duration::from_secs(2 * 3600),
     );
 
-    // 5h window already reset (in the past).
-    write_disk_cache("reset", &with_window(now_secs - 60));
-
+    let now = now_ms();
     assert!(
-        try_seed_recent_cache(&store, &status, &last_fetched, "open", now_secs),
-        "an open 5h window seeds from cache even when the cache itself is old"
+        try_seed_recent_cache(
+            &store,
+            &status,
+            &last_fetched,
+            "idle",
+            now,
+            REFRESH_INTERVAL_MS
+        ),
+        "a fresh cache seeds even when its 5h window has reset (idle account)"
     );
     assert!(
-        !try_seed_recent_cache(&store, &status, &last_fetched, "reset", now_secs),
-        "a reset 5h window is left for the background fetch"
+        !try_seed_recent_cache(
+            &store,
+            &status,
+            &last_fetched,
+            "stale",
+            now,
+            REFRESH_INTERVAL_MS
+        ),
+        "a cache older than one interval is left for the background fetch"
     );
     assert!(
-        !try_seed_recent_cache(&store, &status, &last_fetched, "missing", now_secs),
+        !try_seed_recent_cache(
+            &store,
+            &status,
+            &last_fetched,
+            "missing",
+            now,
+            REFRESH_INTERVAL_MS
+        ),
         "a missing cache is left for the background fetch"
     );
 
-    assert!(store.lock().unwrap().contains_key("open"));
-    assert!(!store.lock().unwrap().contains_key("reset"));
+    assert!(store.lock().unwrap().contains_key("idle"));
+    assert!(!store.lock().unwrap().contains_key("stale"));
     assert!(!store.lock().unwrap().contains_key("missing"));
     assert_eq!(
-        status.lock().unwrap().get("open").copied(),
+        status.lock().unwrap().get("idle").copied(),
         Some(FetchStatus::Fresh),
-        "a seeded open-window cache surfaces as Fresh, not a staleness warning"
     );
-    // Stamped at `now` (startup), not the 2h-old cache mtime — so the seeded
-    // profile waits a full interval before its first background refresh instead
-    // of falling due immediately on the scheduler's first tick.
+
+    // Stamped at the ~30s-old cache mtime, not `now` — so `partition_due` resumes
+    // the cadence (next ≈ mtime + interval, ~30s short of full) instead of
+    // resetting the countdown.
     let stamp = last_fetched
         .lock()
         .unwrap()
-        .get("open")
+        .get("idle")
         .copied()
         .unwrap()
         .as_millis();
-    let now = now_ms();
     assert!(
-        stamp <= now && stamp >= now.saturating_sub(5_000),
-        "an old-but-open cache stamps last_fetched at startup (~now), not its 2h-old mtime"
+        stamp <= now.saturating_sub(20_000) && stamp >= now.saturating_sub(40_000),
+        "stamped at the ~30s-old cache mtime (resume), not now"
     );
 }
 
@@ -732,29 +759,32 @@ fn tp_entry(name: &str) -> ThirdPartyEntry {
     }
 }
 
-/// Third-party startup seed: a profile with an on-disk third-party cache is
-/// seeded into the store as `Fresh` with `last_fetched` stamped at `now` (so it
-/// waits a full interval rather than an immediate first-tick fetch); a profile
-/// with no cache is left unseeded and unstamped for the scheduler.
+/// Third-party startup seed mirrors the OAuth one: a profile whose cache is
+/// fresher than one interval is seeded `Fresh` with `last_fetched` stamped at the
+/// cache mtime (cadence resumes); a stale cache (older than one interval) or a
+/// missing cache is left for the scheduler.
 #[test]
-fn bootstrap_third_party_seeds_cached_profiles_only() {
+fn bootstrap_third_party_seeds_fresh_cache_only() {
+    use std::time::{Duration, SystemTime};
+
     use super::{
         FetchStatus, ThirdPartyStatusStore, ThirdPartyUsageStore, bootstrap_third_party, now_ms,
     };
+    use crate::profile::profile_subpath;
     use crate::providers::{ThirdPartyStats, UsageBar, write_third_party_disk_cache};
-    use crate::testutil::HomeSandbox;
+    use crate::testutil::{HomeSandbox, set_mtime};
 
     let _home = HomeSandbox::new();
     let store: ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
 
-    let stats = ThirdPartyStats {
+    let stats = |pct: f64| ThirdPartyStats {
         is_available: true,
         rows: Vec::new(),
         bars: vec![UsageBar {
             label: "5h".to_string(),
-            pct: 12.0,
+            pct,
             resets_at: None,
             used: None,
             total: None,
@@ -763,14 +793,31 @@ fn bootstrap_third_party_seeds_cached_profiles_only() {
         endpoint: None,
         best_effort: false,
     };
-    write_third_party_disk_cache("cached", &stats);
+    // Fresh cache (just written) seeds; a 2h-old cache is too stale.
+    write_third_party_disk_cache("cached", &stats(12.0));
+    write_third_party_disk_cache("stale", &stats(20.0));
+    let stale_path = profile_subpath("stale", "third_party_cache.json").expect("stale path");
+    set_mtime(
+        &stale_path,
+        SystemTime::now() - Duration::from_secs(2 * 3600),
+    );
 
-    let entries = vec![tp_entry("cached"), tp_entry("missing")];
-    bootstrap_third_party(&store, &status, &last_fetched, &entries);
+    let entries = vec![tp_entry("cached"), tp_entry("stale"), tp_entry("missing")];
+    bootstrap_third_party(
+        &store,
+        &status,
+        &last_fetched,
+        &entries,
+        REFRESH_INTERVAL_MS,
+    );
 
     assert!(
         store.lock().unwrap().contains_key("cached"),
-        "a profile with a third-party cache is seeded from disk"
+        "a fresh third-party cache is seeded from disk"
+    );
+    assert!(
+        !store.lock().unwrap().contains_key("stale"),
+        "a stale third-party cache is left for the scheduler"
     );
     assert!(
         !store.lock().unwrap().contains_key("missing"),
@@ -785,6 +832,7 @@ fn bootstrap_third_party_seeds_cached_profiles_only() {
         !last_fetched.lock().unwrap().contains_key("missing"),
         "a no-cache profile is left unstamped so it fetches on the first tick"
     );
+    // Stamped at the cache mtime (~now, just written), so the cadence resumes.
     let now = now_ms();
     let stamp = last_fetched
         .lock()
@@ -795,6 +843,6 @@ fn bootstrap_third_party_seeds_cached_profiles_only() {
         .as_millis();
     assert!(
         stamp <= now && stamp >= now.saturating_sub(5_000),
-        "the seeded third-party profile stamps last_fetched at startup (~now)"
+        "the seeded third-party profile stamps last_fetched at the cache mtime"
     );
 }

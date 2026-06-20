@@ -277,6 +277,17 @@ pub(crate) fn load_third_party_disk_cache(name: &str) -> Option<ThirdPartyStats>
     })
 }
 
+/// Epoch-ms of the third-party cache's last write, or `None` when none exists.
+/// Lets startup resume the refresh cadence from the last write (mirrors the OAuth
+/// `cache_mtime_ms`).
+pub(crate) fn third_party_cache_mtime_ms(name: &str) -> Option<u64> {
+    let modified = std::fs::metadata(cache_path(name)?).ok()?.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
 pub(crate) fn write_third_party_disk_cache(name: &str, stats: &ThirdPartyStats) {
     let Some(path) = cache_path(name) else {
         return;
