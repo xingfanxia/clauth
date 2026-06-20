@@ -72,7 +72,7 @@ fn stats_from_bars_keeps_api_labels_and_source_order() {
         // Short reset, percentage-only → stays second (no reordering).
         tp_bar("tokens limit", 1.0, now + 4 * 3600, None, None),
     ];
-    let stats = stats_from_bars(&bars);
+    let stats = stats_from_bars(&bars, true, true);
     assert_eq!(stats[0].label, "time limit", "API label kept verbatim");
     assert_eq!(stats[1].label, "tokens limit");
 
@@ -95,11 +95,55 @@ fn stats_from_bars_does_not_rename_duplicate_labels() {
         tp_bar("tokens limit", 0.0, now + 4 * 3600, None, None),
         tp_bar("tokens limit", 12.0, now + 6 * 86_400, None, None),
     ];
-    let stats = stats_from_bars(&bars);
+    let stats = stats_from_bars(&bars, true, true);
     assert_eq!(stats[0].label, "tokens limit");
     assert_eq!(stats[1].label, "tokens limit");
     assert_eq!(stats[0].pct, 0.0);
     assert_eq!(stats[1].pct, 12.0);
+}
+
+/// A bar whose label decodes to a window (`5h`/`7d`/`30d`) gets the OAuth window
+/// predictions: a window-anchored average pace (sub-day → %/h, `<n>d` → %/d) and
+/// the ideal-pace marker. Toggles gate them; non-window labels stay bare.
+#[test]
+fn stats_from_bars_fills_pace_for_windowed_labels() {
+    let approx = |a: Option<f64>, b: f64| a.is_some_and(|v| (v - b).abs() < 0.1);
+    let now = crate::usage::now_epoch_secs();
+    // 5h window 4h in (resets in 1h), 20% used → 5 %/h, 80% of the way through.
+    // 7d window 3.5d in, 35% used → 10 %/d, half elapsed.
+    // 30d window 15d in, 30% used → 2 %/d (proves the new 30d duration arm).
+    let bars = vec![
+        tp_bar("5h", 20.0, now + 3600, None, None),
+        tp_bar("7d", 35.0, now + 3 * 86_400 + 43_200, None, None),
+        tp_bar("30d", 30.0, now + 15 * 86_400, None, None),
+    ];
+
+    let stats = stats_from_bars(&bars, true, true);
+    assert_eq!(stats[0].rate_unit, "h");
+    assert!(approx(stats[0].burn_rate, 5.0), "5h shows %/h average pace");
+    assert!(approx(stats[0].pace_pct, 80.0), "5h ideal-pace marker");
+    assert_eq!(stats[1].rate_unit, "d");
+    assert!(
+        approx(stats[1].burn_rate, 10.0),
+        "7d shows %/d average pace"
+    );
+    assert!(
+        approx(stats[2].burn_rate, 2.0),
+        "30d window now resolves a pace"
+    );
+
+    // Both toggles off → no rate, no marker (matches the OAuth gating).
+    let bare = stats_from_bars(&bars, false, false);
+    assert!(bare.iter().all(|s| s.burn_rate.is_none()));
+    assert!(bare.iter().all(|s| s.pace_pct.is_none()));
+
+    // A label that isn't a `<n>h`/`<n>d` window carries no prediction.
+    let other = stats_from_bars(
+        &[tp_bar("balance", 50.0, now + 3600, None, None)],
+        true,
+        true,
+    );
+    assert!(other[0].burn_rate.is_none() && other[0].pace_pct.is_none());
 }
 
 fn tp_bar(

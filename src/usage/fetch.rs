@@ -158,6 +158,21 @@ pub(crate) fn window_duration_secs(label: &str) -> Option<i64> {
     match label {
         LABEL_5H => Some(5 * 3600),
         LABEL_7D | LABEL_7D_SONNET | LABEL_7D_OPUS => Some(7 * 86_400),
+        // Provider window labels of the form `<n>h` / `<n>d` (e.g. z.ai's
+        // `5h`/`7d`/`30d`) so any api-key account with a windowed limit gets the
+        // same average pace + ideal-pace line as the OAuth windows.
+        _ => parse_nh_nd_label(label),
+    }
+}
+
+/// Parse a `"<n>h"` / `"<n>d"` window label into a duration in seconds. `None`
+/// for any other shape.
+fn parse_nh_nd_label(label: &str) -> Option<i64> {
+    let (num, unit) = label.split_at(label.len().checked_sub(1)?);
+    let n = num.parse::<i64>().ok().filter(|&n| n > 0)?;
+    match unit {
+        "h" => Some(n * 3600),
+        "d" => Some(n * 86_400),
         _ => None,
     }
 }

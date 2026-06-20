@@ -249,6 +249,22 @@ fn window_avg_pace_is_util_over_elapsed_days() {
     );
 }
 
+/// Provider window labels shaped `<n>h`/`<n>d` resolve to a duration so api-key
+/// bars get the same pace + ideal-line as OAuth windows; named OAuth labels keep
+/// their fixed durations and non-window/malformed labels stay `None`.
+#[test]
+fn window_duration_parses_provider_labels() {
+    assert_eq!(window_duration_secs(LABEL_5H), Some(5 * 3600));
+    assert_eq!(window_duration_secs(LABEL_7D), Some(7 * 86_400));
+    assert_eq!(window_duration_secs("5h"), Some(5 * 3600));
+    assert_eq!(window_duration_secs("30d"), Some(30 * 86_400));
+    assert_eq!(window_duration_secs("14d"), Some(14 * 86_400));
+    assert_eq!(window_duration_secs("balance"), None);
+    assert_eq!(window_duration_secs("d"), None);
+    assert_eq!(window_duration_secs("0d"), None);
+    assert_eq!(window_duration_secs(""), None);
+}
+
 /// `/profile` re-fetch policy: fetches on first load (no stamp yet) and on a
 /// `force` (401 retry), reuses the plan within the hourly TTL, re-pulls once it
 /// lapses, and `expire_profile_ttl` (manual single refresh) re-arms it. A

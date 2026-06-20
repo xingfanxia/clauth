@@ -19,7 +19,9 @@ use super::panes::{
 use crate::format::plan_label;
 use crate::profile::Profile;
 use crate::providers::StatRowKind;
-use crate::usage::{FetchStatus, ProfileActivity, ideal_pace_pct, now_epoch_secs, now_ms};
+use crate::usage::{
+    FetchStatus, ProfileActivity, UsageWindow, ideal_pace_pct, now_epoch_secs, now_ms,
+};
 
 const KEY_W: usize = 8;
 
@@ -114,7 +116,7 @@ fn build_usage_lines(
     // rows/bars path; OAuth accounts — including OAuth run against a custom
     // base_url — fall through to their live window bars.
     if profile.api_key.is_some() || profile.is_third_party() {
-        lines.extend(build_tp_rows(profile, header, inner_w));
+        lines.extend(build_tp_rows(profile, inner_w, show_estimates, show_pace));
         return lines;
     }
 
@@ -566,7 +568,12 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
 
 /// Render provider-agnostic third-party stats. The header (plan + status) was
 /// already pushed by the caller; only the stats body goes here.
-fn build_tp_rows(profile: &Profile, _header: &HeaderState, inner_w: u16) -> Vec<Line<'static>> {
+fn build_tp_rows(
+    profile: &Profile,
+    inner_w: u16,
+    show_estimates: bool,
+    show_pace: bool,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     let Some(stats) = profile.third_party_usage.as_ref() else {
@@ -588,7 +595,7 @@ fn build_tp_rows(profile: &Profile, _header: &HeaderState, inner_w: u16) -> Vec<
     // API-provided label in source order and showing absolute `used / total` on
     // the eyebrow just before the %.
     if has_bars {
-        let bar_stats = stats_from_bars(&stats.bars);
+        let bar_stats = stats_from_bars(&stats.bars, show_estimates, show_pace);
         lines.extend(render_stat_block(&bar_stats, inner_w));
     }
 
@@ -646,21 +653,52 @@ fn build_tp_rows(profile: &Profile, _header: &HeaderState, inner_w: u16) -> Vec<
 /// reordering), shows absolute `used / total` on the eyebrow before the %, and a
 /// reset countdown on the bar line. Rendered through the same `Stat::render` path
 /// as OAuth window bars, so the two are visually identical.
-fn stats_from_bars(bars: &[crate::providers::UsageBar]) -> Vec<Stat> {
+///
+/// A bar with a `<n>h`/`<n>d` label and a reset stamp also gets the OAuth window
+/// predictions: a window-anchored average pace (`<n>d` → %/d, sub-day → %/h), a
+/// burn ETA, and the ideal-pace marker — gated by the same `show_estimates` /
+/// `show_pace` toggles. Providers never rotate, so the window-average pace is a
+/// stable read (no recency-weighted history is kept for third-party accounts).
+fn stats_from_bars(
+    bars: &[crate::providers::UsageBar],
+    show_estimates: bool,
+    show_pace: bool,
+) -> Vec<Stat> {
     let now = now_epoch_secs();
     bars.iter()
         .map(|bar| {
             let rem = window_remaining(bar, now);
             let pct = bar.pct.clamp(0.0, 100.0);
+            let window = UsageWindow {
+                utilization: pct,
+                resets_at: bar.resets_at.clone(),
+            };
+            let rate_unit = if bar.label.ends_with('d') { "d" } else { "h" };
+            let burn_rate = show_estimates
+                .then(|| {
+                    crate::usage::window_avg_pace_per_day(&bar.label, &window, now, 60 * 60).map(
+                        |per_day| {
+                            if rate_unit == "d" {
+                                per_day
+                            } else {
+                                per_day / 24.0
+                            }
+                        },
+                    )
+                })
+                .flatten();
+            let pace_pct = show_pace
+                .then(|| ideal_pace_pct(&bar.label, &window, now))
+                .flatten();
             Stat {
                 label: bar.label.clone(),
                 pct,
                 color: Style::default().fg(theme::util_color(pct)),
                 trailing: bar_reset_trailing(rem),
                 amount: bar_amount(bar),
-                burn_rate: None,
-                rate_unit: "h",
-                pace_pct: None,
+                burn_rate,
+                rate_unit,
+                pace_pct,
                 reset_secs: rem,
             }
         })
