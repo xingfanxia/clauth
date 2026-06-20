@@ -653,6 +653,27 @@ pub(crate) fn bootstrap_fetch(
     }
 }
 
+/// Freshness + load gate shared by both startup seed sites. Takes no locks so each
+/// caller stamps its own typed store and keeps its own lock rank (LAST_FETCHED then
+/// the status store). Returns the loaded value and the cache mtime only when the
+/// cache is fresher than one refresh interval AND loadable; `None` otherwise. See
+/// [`try_seed_recent_cache`] / [`bootstrap_third_party`] for why mtime — not window
+/// state — is the gate, and why `last_fetched` is stamped at the mtime.
+fn recent_seed<T>(
+    name: &str,
+    interval_ms: u64,
+    now: u64,
+    mtime_fn: impl Fn(&str) -> Option<u64>,
+    load_fn: impl Fn(&str) -> Option<T>,
+) -> Option<(T, u64)> {
+    let mtime = mtime_fn(name)?;
+    if now.saturating_sub(mtime) >= interval_ms {
+        return None;
+    }
+    let value = load_fn(name)?;
+    Some((value, mtime))
+}
+
 /// Seed `name` from its on-disk cache when that cache is fresher than one refresh
 /// interval, returning `true`. Freshness — not window state — is the gate: a cache
 /// written seconds ago is current truth whatever its 5h window says (an idle
@@ -671,13 +692,13 @@ fn try_seed_recent_cache(
     now: u64,
     interval_ms: u64,
 ) -> bool {
-    let Some(mtime) = profile_cache_mtime_ms(name, USAGE_CACHE_FILE) else {
-        return false;
-    };
-    if now.saturating_sub(mtime) >= interval_ms {
-        return false;
-    }
-    let Some(info) = load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) else {
+    let Some((info, mtime)) = recent_seed(
+        name,
+        interval_ms,
+        now,
+        |n| profile_cache_mtime_ms(n, USAGE_CACHE_FILE),
+        |n| load_profile_cache::<UsageInfo>(n, USAGE_CACHE_FILE),
+    ) else {
         return false;
     };
     if let Ok(mut s) = store.lock() {
@@ -708,15 +729,13 @@ pub(crate) fn bootstrap_third_party(
 ) {
     let now = now_ms();
     for entry in entries {
-        let Some(mtime) = profile_cache_mtime_ms(&entry.name, THIRD_PARTY_CACHE_FILE) else {
-            continue;
-        };
-        if now.saturating_sub(mtime) >= interval_ms {
-            continue;
-        }
-        let Some(stats) =
-            load_profile_cache::<ThirdPartyStats>(&entry.name, THIRD_PARTY_CACHE_FILE)
-        else {
+        let Some((stats, mtime)) = recent_seed(
+            &entry.name,
+            interval_ms,
+            now,
+            |n| profile_cache_mtime_ms(n, THIRD_PARTY_CACHE_FILE),
+            |n| load_profile_cache::<ThirdPartyStats>(n, THIRD_PARTY_CACHE_FILE),
+        ) else {
             continue;
         };
         if let Ok(mut s) = store.lock() {
