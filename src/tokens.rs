@@ -714,6 +714,11 @@ pub(crate) enum TokensEvent {
 /// result immediately, then loops on `refresh_rx.recv_timeout(REFRESH_INTERVAL)`
 /// reloading each time. Exits when `refresh_rx` disconnects (TUI shutdown).
 ///
+/// Unlike `status`/`pricing`, this loop is match-first-then-send (not
+/// `run_polling_loop`'s tick-first shape): the first reload after the cold load
+/// happens only once the interval elapses or a signal arrives, avoiding a
+/// duplicate emit at startup.
+///
 /// `claude_dir` must already be resolved by the caller — the worker never
 /// re-resolves `home_dir()`, matching the pattern in `status::spawn`.
 pub(crate) fn spawn(tx: Sender<TokensEvent>, refresh_rx: Receiver<()>, claude_dir: PathBuf) {

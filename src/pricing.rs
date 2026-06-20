@@ -33,11 +33,12 @@
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::poll::run_polling_loop;
 use crate::profile::{atomic_write, clauth_dir};
 use crate::tokens::ModelTokens;
 use crate::usage::now_ms;
@@ -163,15 +164,9 @@ pub(crate) fn spawn(tx: Sender<PricingEvent>, refresh_rx: Receiver<()>) {
             let _ = tx.send(PricingEvent::Loaded(Box::new(table)));
         }
 
-        loop {
-            run_fetch(&tx, &cache_file);
-
-            match refresh_rx.recv_timeout(REFRESH_INTERVAL) {
-                Ok(()) => while refresh_rx.try_recv().is_ok() {},
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-        }
+        run_polling_loop(&refresh_rx, REFRESH_INTERVAL, || {
+            run_fetch(&tx, &cache_file)
+        });
     });
 }
 

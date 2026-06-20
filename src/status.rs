@@ -16,11 +16,12 @@
 //! `#[serde(default)]` on every nullable/optional field and string-enum fallback
 //! so an unknown status / impact never errors the whole parse.
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::poll::run_polling_loop;
 use crate::profile::clauth_dir;
 use crate::usage::{iso_to_epoch_secs, now_ms};
 
@@ -527,19 +528,9 @@ pub(crate) fn spawn(tx: Sender<StatusEvent>, refresh_rx: Receiver<()>) {
             });
         }
 
-        loop {
-            run_fetch(&tx, &cache_file);
-
-            // Wait for the next tick or a manual refresh; exit on disconnect.
-            match refresh_rx.recv_timeout(REFRESH_INTERVAL) {
-                Ok(()) => {
-                    // Drain any coalesced extra signals before refetching.
-                    while refresh_rx.try_recv().is_ok() {}
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-        }
+        run_polling_loop(&refresh_rx, REFRESH_INTERVAL, || {
+            run_fetch(&tx, &cache_file)
+        });
     });
 }
 

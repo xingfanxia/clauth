@@ -8,6 +8,7 @@ mod lock;
 mod lockorder;
 mod oauth;
 mod platform;
+mod poll;
 mod pricing;
 mod profile;
 mod profile_cache;
