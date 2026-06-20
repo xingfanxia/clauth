@@ -12,7 +12,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::App;
 use super::super::theme;
-use super::format::{activity_verb, format_reset, reset_in_secs, spinner_frame, spinner_style};
+use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
 use super::panes::{
     SELECTOR_WIDTH, active_dot, draw_profile_selector, section_box, section_box_verbatim,
 };
@@ -366,6 +366,82 @@ impl Stat {
     }
 }
 
+/// Classify a window label into its rate unit. OAuth labels carry the unit at
+/// the front (`"7d sonnet"`, `"7d opus"`, `"5h"` → `starts_with("7d")`); the
+/// third-party bar labels carry it at the end (`"30d"`, `"7d"` → `ends_with('d')`
+/// with a leading ascii digit). Anything else is treated as an hour window.
+fn window_rate_unit(label: &str) -> &'static str {
+    if label.starts_with("7d") {
+        return "d";
+    }
+    if label.ends_with('d') && label.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+        return "d";
+    }
+    "h"
+}
+
+/// Pace-prediction toggles that always travel together (both originate from the
+/// same `AppState.show_*` flags). Grouped so [`make_window_stat`] stays under
+/// clippy's argument limit without an ad-hoc `#[allow]`.
+#[derive(Clone, Copy)]
+struct WindowGates {
+    show_estimates: bool,
+    show_pace: bool,
+}
+
+/// Shared core for both Stat-building paths (OAuth usage windows and third-party
+/// provider bars). Computes the clamped pct, theme color, rate unit, and the
+/// window-anchored burn pace / ideal-pace marker / reset countdown — all derived
+/// purely from `pct` + `resets_at`, so the two paths render identically. The
+/// caller supplies its own `trailing` (bar-line reset suffix) and `amount`
+/// (eyebrow `used / total`); `gates` controls the pace fields.
+fn make_window_stat(
+    label: &str,
+    pct: f64,
+    resets_at: Option<&str>,
+    now: i64,
+    amount: String,
+    trailing: String,
+    gates: WindowGates,
+) -> Stat {
+    let pct = pct.clamp(0.0, 100.0);
+    let rate_unit = window_rate_unit(label);
+    let window = UsageWindow {
+        utilization: pct,
+        resets_at: resets_at.map(str::to_string),
+    };
+    let burn_rate = gates
+        .show_estimates
+        .then(|| {
+            crate::usage::window_avg_pace_per_day(label, &window, now, 3600).map(|per_day| {
+                if rate_unit == "d" {
+                    per_day
+                } else {
+                    per_day / 24.0
+                }
+            })
+        })
+        .flatten();
+    let pace_pct = gates
+        .show_pace
+        .then(|| ideal_pace_pct(label, &window, now))
+        .flatten();
+    let reset_secs = resets_at
+        .and_then(crate::usage::iso_to_epoch_secs)
+        .map(|r| r - now);
+    Stat {
+        label: label.to_string(),
+        pct,
+        color: Style::default().fg(theme::util_color(pct)),
+        trailing,
+        amount,
+        burn_rate,
+        rate_unit,
+        pace_pct,
+        reset_secs,
+    }
+}
+
 fn collect_stats(profile: &Profile) -> Vec<Stat> {
     let Some(usage) = profile.usage.as_ref() else {
         return Vec::new();
@@ -373,30 +449,24 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
     let now_secs = now_epoch_secs();
     let mut stats: Vec<Stat> = Vec::new();
     for (label, w) in usage.windows() {
-        let pct = w.utilization.clamp(0.0, 100.0);
         let trailing = format_reset(w)
             .map(|r| format!("  resets in {r}"))
             .unwrap_or_default();
-        let rate_unit = if label.starts_with("7d") { "d" } else { "h" };
-        // 7d windows show a window-anchored average pace (%/d) — util spread
-        // over the time elapsed since the weekly reset, immune to rotation.
-        // The 5h recent-burn rate is filled later from history.
-        let burn_rate = if label.starts_with("7d") {
-            crate::usage::window_avg_pace_per_day(label, w, now_secs, 60 * 60)
-        } else {
-            None
-        };
-        stats.push(Stat {
-            label: label.to_string(),
-            pct,
-            color: Style::default().fg(theme::util_color(pct)),
+        // OAuth paths compute ungated here; the 5h recent-burn rate is filled
+        // later from history (overwriting whatever `make_window_stat` set), and
+        // the show_estimates / show_pace gates are applied by the caller.
+        stats.push(make_window_stat(
+            label,
+            w.utilization,
+            w.resets_at.as_deref(),
+            now_secs,
+            String::new(),
             trailing,
-            amount: String::new(),
-            burn_rate,
-            rate_unit,
-            pace_pct: ideal_pace_pct(label, w, now_secs),
-            reset_secs: reset_in_secs(w),
-        });
+            WindowGates {
+                show_estimates: true,
+                show_pace: true,
+            },
+        ));
     }
     if let Some(extra) = &usage.extra_usage
         && extra.is_enabled
@@ -665,42 +735,22 @@ fn stats_from_bars(
     show_pace: bool,
 ) -> Vec<Stat> {
     let now = now_epoch_secs();
+    let gates = WindowGates {
+        show_estimates,
+        show_pace,
+    };
     bars.iter()
         .map(|bar| {
             let rem = window_remaining(bar, now);
-            let pct = bar.pct.clamp(0.0, 100.0);
-            let window = UsageWindow {
-                utilization: pct,
-                resets_at: bar.resets_at.clone(),
-            };
-            let rate_unit = if bar.label.ends_with('d') { "d" } else { "h" };
-            let burn_rate = show_estimates
-                .then(|| {
-                    crate::usage::window_avg_pace_per_day(&bar.label, &window, now, 60 * 60).map(
-                        |per_day| {
-                            if rate_unit == "d" {
-                                per_day
-                            } else {
-                                per_day / 24.0
-                            }
-                        },
-                    )
-                })
-                .flatten();
-            let pace_pct = show_pace
-                .then(|| ideal_pace_pct(&bar.label, &window, now))
-                .flatten();
-            Stat {
-                label: bar.label.clone(),
-                pct,
-                color: Style::default().fg(theme::util_color(pct)),
-                trailing: bar_reset_trailing(rem),
-                amount: bar_amount(bar),
-                burn_rate,
-                rate_unit,
-                pace_pct,
-                reset_secs: rem,
-            }
+            make_window_stat(
+                &bar.label,
+                bar.pct,
+                bar.resets_at.as_deref(),
+                now,
+                bar_amount(bar),
+                bar_reset_trailing(rem),
+                gates,
+            )
         })
         .collect()
 }
