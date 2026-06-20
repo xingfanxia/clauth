@@ -33,21 +33,21 @@ fn quota_yields_bars_plan_and_detail_rows() {
     assert_eq!(stats.plan.as_deref(), Some("pro"));
     assert!(!stats.best_effort, "typed provider is not best-effort");
 
-    // Three bars, source order. Labels decode from unit/number: TIME_LIMIT
-    // unit=5 number=1 → 30d; the token limits unit=3 number=5 → 5h and unit=6
-    // number=1 → 7d (mapped, not the duplicated "tokens limit").
+    // Three bars, sorted shortest window first. Labels decode from unit/number:
+    // token limits unit=3 number=5 → 5h and unit=6 number=1 → 7d; TIME_LIMIT
+    // unit=5 number=1 → 30d sorts last (mapped, not a duplicated "tokens limit").
     assert_eq!(stats.bars.len(), 3);
-    assert_eq!(stats.bars[0].label, "30d");
-    assert_eq!(stats.bars[1].label, "5h");
-    assert_eq!(stats.bars[2].label, "7d");
+    assert_eq!(stats.bars[0].label, "5h");
+    assert_eq!(stats.bars[1].label, "7d");
+    assert_eq!(stats.bars[2].label, "30d");
 
-    // TIME_LIMIT absolutes: currentValue → used, currentValue+remaining → total.
-    assert_eq!(stats.bars[0].used, Some(250.0));
-    assert_eq!(stats.bars[0].total, Some(1000.0));
-    assert!(stats.bars[0].resets_at.is_some());
+    // TIME_LIMIT (now last) absolutes: currentValue → used, +remaining → total.
+    assert_eq!(stats.bars[2].used, Some(250.0));
+    assert_eq!(stats.bars[2].total, Some(1000.0));
+    assert!(stats.bars[2].resets_at.is_some());
 
-    // Percentage-only token bar carries no absolutes.
-    assert!(stats.bars[1].used.is_none() && stats.bars[1].total.is_none());
+    // Percentage-only 5h token bar carries no absolutes.
+    assert!(stats.bars[0].used.is_none() && stats.bars[0].total.is_none());
 
     // Per-web-tool breakdown surfaces only the non-empty TIME_LIMIT block, with a
     // heading + one row per tool.

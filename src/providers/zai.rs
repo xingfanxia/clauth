@@ -48,7 +48,11 @@ pub(super) fn fetch(api_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
 fn quota_stats(data: &QuotaData) -> ThirdPartyStats {
     let mut bars: Vec<UsageBar> = Vec::new();
     let mut detail_rows: Vec<StatRow> = Vec::new();
-    for limit in &data.limits {
+    // Shortest window first (5h → 7d → 30d). Limits with an undecodable window
+    // sort last; the stable sort keeps source order within a tier.
+    let mut ordered: Vec<&Limit> = data.limits.iter().collect();
+    ordered.sort_by_key(|l| window_secs(l.unit, l.number).unwrap_or(i64::MAX));
+    for limit in ordered {
         let pct = limit.percentage.clamp(0.0, 100.0);
         // `currentValue` (used) + `remaining` give the absolute window; the
         // ambiguously-named `usage` field equals the same total, used as fallback.
@@ -156,12 +160,11 @@ fn type_label(limit_type: &str) -> String {
     limit_type.to_ascii_lowercase().replace('_', " ")
 }
 
-/// Compact window label from z.ai's duration code `unit` × `number`. `unit` is a
-/// calendar code (3 = hour, 6 = week, 5 = month) carried on every limit — present
-/// even when `nextResetTime` is absent, which makes it the reliable mapping
-/// source. `< 1 day` → `Nh`, whole weeks → `Nd`, else `Nd`. `None` for an unknown
-/// code so the caller falls back to the API type label.
-fn window_label(unit: Option<i64>, number: Option<i64>) -> Option<String> {
+/// Window length in seconds from z.ai's duration code `unit` × `number`. `unit`
+/// is a calendar code (3 = hour, 6 = week, 5 = month) carried on every limit —
+/// present even when `nextResetTime` is absent, which makes it the reliable
+/// source for both the label and the bar ordering. `None` for an unknown code.
+fn window_secs(unit: Option<i64>, number: Option<i64>) -> Option<i64> {
     let n = number.filter(|&n| n > 0)?;
     let unit_secs = match unit? {
         3 => 3600,        // hour
@@ -169,7 +172,13 @@ fn window_label(unit: Option<i64>, number: Option<i64>) -> Option<String> {
         5 => 30 * 86_400, // month (nominal)
         _ => return None,
     };
-    let secs = n * unit_secs;
+    Some(n * unit_secs)
+}
+
+/// Compact window label (`5h`, `7d`, `30d`) from the decoded [`window_secs`], or
+/// `None` for an unknown code so the caller falls back to the API type label.
+fn window_label(unit: Option<i64>, number: Option<i64>) -> Option<String> {
+    let secs = window_secs(unit, number)?;
     Some(if secs < 86_400 {
         format!("{}h", secs / 3600)
     } else {
