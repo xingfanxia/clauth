@@ -21,8 +21,6 @@ mod deepseek;
 mod generic;
 mod zai;
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 // ── Provider ────────────────────────────────────────────────────────────────────
@@ -263,42 +261,9 @@ fn get_json(url: &str, api_key: &str) -> Result<String, ThirdPartyError> {
 }
 
 // ── Disk cache ──────────────────────────────────────────────────────────────────
-
-fn cache_path(profile_name: &str) -> Option<PathBuf> {
-    crate::profile::profile_dir(profile_name)
-        .ok()
-        .map(|p| p.join("third_party_cache.json"))
-}
-
-pub(crate) fn load_third_party_disk_cache(name: &str) -> Option<ThirdPartyStats> {
-    cache_path(name).and_then(|p| {
-        let text = std::fs::read_to_string(p).ok()?;
-        serde_json::from_str::<ThirdPartyStats>(&text).ok()
-    })
-}
-
-/// Epoch-ms of the third-party cache's last write, or `None` when none exists.
-/// Lets startup resume the refresh cadence from the last write (mirrors the OAuth
-/// `cache_mtime_ms`).
-pub(crate) fn third_party_cache_mtime_ms(name: &str) -> Option<u64> {
-    let modified = std::fs::metadata(cache_path(name)?).ok()?.modified().ok()?;
-    modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as u64)
-}
-
-pub(crate) fn write_third_party_disk_cache(name: &str, stats: &ThirdPartyStats) {
-    let Some(path) = cache_path(name) else {
-        return;
-    };
-    let Ok(json) = serde_json::to_string(stats) else {
-        return;
-    };
-    // Atomic tmp + rename — a torn plain write would parse-fail and read as no cache.
-    // 0o600 file + 0o700 parent dir: the cache holds account/provider state.
-    let _ = crate::profile::atomic_write_600(&path, json.as_bytes());
-}
+//
+// Per-profile JSON cache lives in `crate::profile_cache` (shared with the OAuth
+// usage layer); this layer only contributes its filename + concrete type.
 
 #[cfg(test)]
 #[path = "../../tests/inline/providers.rs"]

@@ -8,8 +8,12 @@ use crate::lockorder::{RankedMutex, rank};
 use crate::providers::ThirdPartyStats;
 
 use super::fetch::{
-    FetchError, PlanInfo, UsageInfo, UsageWindow, cache_mtime_ms, epoch_secs_to_iso, fetch_raw,
-    iso_to_epoch_secs, load_disk_cache, now_epoch_secs, now_ms, write_disk_cache,
+    FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso, fetch_raw, iso_to_epoch_secs,
+    now_epoch_secs, now_ms,
+};
+use crate::profile_cache::{
+    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
+    write_profile_cache,
 };
 
 /// Scheduler wake interval. Network work only fires for profiles whose cadence has elapsed.
@@ -238,7 +242,7 @@ pub(crate) type RotatedTokens = (String, Option<String>);
 
 /// Load disk cache as `(Some, status)` or `(None, Failed)` for the rotation bail-out path.
 fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo>, FetchStatus) {
-    match load_disk_cache(name) {
+    match load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) {
         Some(info) => (Some(info), status),
         None => (None, FetchStatus::Failed),
     }
@@ -564,7 +568,7 @@ fn apply_outcome(
     // so the staleness stays visible.
     let is_fresh = outcome.from_fetch;
     if is_fresh && let Some(info) = &outcome.info {
-        write_disk_cache(&outcome.name, info);
+        write_profile_cache(&outcome.name, USAGE_CACHE_FILE, info);
     }
 
     if let Ok(mut s) = store.lock()
@@ -667,13 +671,13 @@ fn try_seed_recent_cache(
     now: u64,
     interval_ms: u64,
 ) -> bool {
-    let Some(mtime) = cache_mtime_ms(name) else {
+    let Some(mtime) = profile_cache_mtime_ms(name, USAGE_CACHE_FILE) else {
         return false;
     };
     if now.saturating_sub(mtime) >= interval_ms {
         return false;
     }
-    let Some(info) = load_disk_cache(name) else {
+    let Some(info) = load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) else {
         return false;
     };
     if let Ok(mut s) = store.lock() {
@@ -704,13 +708,15 @@ pub(crate) fn bootstrap_third_party(
 ) {
     let now = now_ms();
     for entry in entries {
-        let Some(mtime) = crate::providers::third_party_cache_mtime_ms(&entry.name) else {
+        let Some(mtime) = profile_cache_mtime_ms(&entry.name, THIRD_PARTY_CACHE_FILE) else {
             continue;
         };
         if now.saturating_sub(mtime) >= interval_ms {
             continue;
         }
-        let Some(stats) = crate::providers::load_third_party_disk_cache(&entry.name) else {
+        let Some(stats) =
+            load_profile_cache::<ThirdPartyStats>(&entry.name, THIRD_PARTY_CACHE_FILE)
+        else {
             continue;
         };
         if let Ok(mut s) = store.lock() {
@@ -809,7 +815,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
         match h.join() {
             Ok(Ok(stats)) => {
                 clear_activity(&state.activity, &name);
-                crate::providers::write_third_party_disk_cache(&name, &stats);
+                write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
                 if let Ok(mut store) = state.third_party_usage_store.lock() {
                     store.insert(name.clone(), stats);
                 }
@@ -822,7 +828,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 clear_activity(&state.activity, &name);
                 // Cache cold-fills an absent entry only — never overwrites live
                 // store data with disk state (same rule as the OAuth path).
-                let cached = crate::providers::load_third_party_disk_cache(&name);
+                let cached = load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE);
                 // A 429 carries the server's `retry-after` and defers the next
                 // slot (same server-directed deferral as the OAuth 429 path);
                 // any other error falls back to cache without deferring.

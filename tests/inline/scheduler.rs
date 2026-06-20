@@ -595,10 +595,9 @@ fn try_seed_recent_cache_seeds_fresh_cache_and_resumes_timer() {
 
     use super::{FetchStatus, StatusStore, now_ms, try_seed_recent_cache};
     use crate::profile::profile_subpath;
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
     use crate::testutil::{HomeSandbox, set_mtime};
-    use crate::usage::{
-        UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs, write_disk_cache,
-    };
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
 
     let _home = HomeSandbox::new();
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -616,13 +615,13 @@ fn try_seed_recent_cache_seeds_fresh_cache_and_resumes_timer() {
 
     // Fresh cache (mtime ~30s ago) whose 5h window already reset (resets_at in the
     // past) — an idle account. Freshness, not window state, gates the seed.
-    write_disk_cache("idle", &with_reset(now_secs - 600));
+    write_profile_cache("idle", USAGE_CACHE_FILE, &with_reset(now_secs - 600));
     let idle_path = profile_subpath("idle", "usage_cache.json").expect("idle path");
     set_mtime(&idle_path, SystemTime::now() - Duration::from_secs(30));
 
     // Stale cache (written 2h ago) whose window is still open — older than one
     // interval, so left for the scheduler regardless of window state.
-    write_disk_cache("stale", &with_reset(now_secs + 3600));
+    write_profile_cache("stale", USAGE_CACHE_FILE, &with_reset(now_secs + 3600));
     let stale_path = profile_subpath("stale", "usage_cache.json").expect("stale path");
     set_mtime(
         &stale_path,
@@ -771,7 +770,8 @@ fn bootstrap_third_party_seeds_fresh_cache_only() {
         FetchStatus, ThirdPartyStatusStore, ThirdPartyUsageStore, bootstrap_third_party, now_ms,
     };
     use crate::profile::profile_subpath;
-    use crate::providers::{ThirdPartyStats, UsageBar, write_third_party_disk_cache};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
     use crate::testutil::{HomeSandbox, set_mtime};
 
     let _home = HomeSandbox::new();
@@ -794,8 +794,8 @@ fn bootstrap_third_party_seeds_fresh_cache_only() {
         best_effort: false,
     };
     // Fresh cache (just written) seeds; a 2h-old cache is too stale.
-    write_third_party_disk_cache("cached", &stats(12.0));
-    write_third_party_disk_cache("stale", &stats(20.0));
+    write_profile_cache("cached", THIRD_PARTY_CACHE_FILE, &stats(12.0));
+    write_profile_cache("stale", THIRD_PARTY_CACHE_FILE, &stats(20.0));
     let stale_path = profile_subpath("stale", "third_party_cache.json").expect("stale path");
     set_mtime(
         &stale_path,

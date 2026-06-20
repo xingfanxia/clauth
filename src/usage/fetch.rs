@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -439,46 +438,6 @@ pub(super) fn fetch_raw(
         seven_day_sonnet: raw.seven_day_sonnet,
         extra_usage: raw.extra_usage,
     })
-}
-
-/// Read the on-disk usage cache for `name`. Returns `None` when no cache exists.
-pub(crate) fn load_disk_cache(name: &str) -> Option<UsageInfo> {
-    cache_path(name).and_then(|p| {
-        let text = std::fs::read_to_string(p).ok()?;
-        serde_json::from_str::<UsageInfo>(&text).ok()
-    })
-}
-
-/// Write the live response to disk for use on future restart or API failure.
-pub(crate) fn write_disk_cache(name: &str, info: &UsageInfo) {
-    let Some(path) = cache_path(name) else {
-        return;
-    };
-    let Ok(json) = serde_json::to_string(info) else {
-        return;
-    };
-    // `atomic_write_600` creates any missing parent dir at 0o700 itself; a plain
-    // `create_dir_all` here would win the race and leave it world-readable.
-    let _ = crate::profile::atomic_write_600(&path, json.as_bytes());
-}
-
-fn cache_path(profile_name: &str) -> Option<PathBuf> {
-    // Use `profile_dir` (override-aware) rather than raw `dirs::home_dir` so
-    // tests never touch the real `~/.clauth`.
-    crate::profile::profile_dir(profile_name)
-        .ok()
-        .map(|p| p.join("usage_cache.json"))
-}
-
-/// Epoch-ms of the usage cache's last write (≈ the last live fetch), or `None`
-/// when no cache exists. Lets startup resume the refresh cadence from the last
-/// real write instead of resetting the countdown to a full interval.
-pub(crate) fn cache_mtime_ms(name: &str) -> Option<u64> {
-    let modified = std::fs::metadata(cache_path(name)?).ok()?.modified().ok()?;
-    modified
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as u64)
 }
 
 pub(crate) fn now_ms() -> u64 {

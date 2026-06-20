@@ -168,9 +168,10 @@ fn credential_and_cache_files_have_restricted_permissions() {
     );
 }
 
-/// The real `write_disk_cache` (usage/fetch.rs) must create usage_cache.json at
-/// 0o600 and, when it has to create the per-profile dir, that dir at 0o700.
-/// Driven on a FRESH profile name so the dir does not pre-exist.
+/// The real usage-cache writer (`profile_cache::write_profile_cache`) must
+/// create usage_cache.json at 0o600 and, when it has to create the per-profile
+/// dir, that dir at 0o700. Driven on a FRESH profile name so the dir does not
+/// pre-exist.
 #[cfg(unix)]
 #[test]
 fn usage_cache_write_creates_restricted_file_and_dir() {
@@ -186,9 +187,9 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
         "precondition: profile dir must not pre-exist for a fresh profile"
     );
 
-    // Drive the actual production writer (re-exported from `crate::usage`).
+    // Drive the actual production writer.
     let info = crate::usage::UsageInfo::default();
-    crate::usage::write_disk_cache(name, &info);
+    crate::profile_cache::write_profile_cache(name, crate::profile_cache::USAGE_CACHE_FILE, &info);
 
     let dir_mode = std::fs::metadata(&dir)
         .expect("freshly-created profile dir metadata")

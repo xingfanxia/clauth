@@ -688,7 +688,10 @@ fn load_profile(name: &str) -> Result<Profile> {
     // api-key endpoints (whose discovered usage is cached the same way).
     let third_party_usage =
         if provider.is_some() || (config.base_url.is_some() && config.api_key.is_some()) {
-            crate::providers::load_third_party_disk_cache(name)
+            crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+                name,
+                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            )
         } else {
             None
         };

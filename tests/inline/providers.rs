@@ -80,8 +80,16 @@ fn disk_cache_roundtrips_stats() {
         endpoint: None,
         best_effort: false,
     };
-    write_third_party_disk_cache("tp-cache-test", &stats);
-    let loaded = load_third_party_disk_cache("tp-cache-test").expect("cache present");
+    crate::profile_cache::write_profile_cache(
+        "tp-cache-test",
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+    let loaded = crate::profile_cache::load_profile_cache::<ThirdPartyStats>(
+        "tp-cache-test",
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache present");
     assert!(loaded.is_available);
     assert_eq!(loaded.rows.len(), 1);
     assert_eq!(loaded.rows[0].value, "110.00 USD");
@@ -90,7 +98,13 @@ fn disk_cache_roundtrips_stats() {
 #[test]
 fn disk_cache_missing_reads_as_none() {
     let _home = HomeSandbox::new();
-    assert!(load_third_party_disk_cache("tp-cache-absent").is_none());
+    assert!(
+        crate::profile_cache::load_profile_cache::<ThirdPartyStats>(
+            "tp-cache-absent",
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        )
+        .is_none()
+    );
 }
 
 // ── api_origin ───────────────────────────────────────────────────────────────

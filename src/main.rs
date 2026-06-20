@@ -10,6 +10,7 @@ mod oauth;
 mod platform;
 mod pricing;
 mod profile;
+mod profile_cache;
 mod providers;
 mod runtime;
 mod spinner;
