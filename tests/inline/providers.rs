@@ -78,6 +78,7 @@ fn disk_cache_roundtrips_stats() {
         bars: Vec::new(),
         plan: None,
         endpoint: None,
+        best_effort: false,
     };
     write_third_party_disk_cache("tp-cache-test", &stats);
     let loaded = load_third_party_disk_cache("tp-cache-test").expect("cache present");

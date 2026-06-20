@@ -129,15 +129,6 @@ fn build_usage_lines(
         return lines;
     }
 
-    let max_trailing = stats
-        .iter()
-        .map(|s| s.trailing.chars().count())
-        .max()
-        .unwrap_or(0);
-    let bar_width = bar_width_for(inner_w, max_trailing);
-    // Right-align % to far content edge so figures stack above the reset text.
-    let pct_col = (bar_width + max_trailing).min(inner_w as usize);
-
     let history = app
         .history_cache
         .get(profile.name.as_str())
@@ -184,17 +175,40 @@ fn build_usage_lines(
         }
     }
 
+    lines.extend(render_stat_block(&stats, inner_w));
+    lines
+}
+
+/// Render a list of [`Stat`]s as the shared two-line bar blocks (eyebrow + bar),
+/// computing the column widths (`max_trailing`/`max_rate_w`/`max_amount_w`) once
+/// so the `%` column lines up across rows. A blank line separates rows. Used by
+/// both the OAuth window path and the third-party bars path.
+fn render_stat_block(stats: &[Stat], inner_w: u16) -> Vec<Line<'static>> {
+    let max_trailing = stats
+        .iter()
+        .map(|s| s.trailing.chars().count())
+        .max()
+        .unwrap_or(0);
+    let bar_width = bar_width_for(inner_w, max_trailing);
+    // Right-align % to far content edge so figures stack above the reset text.
+    let pct_col = (bar_width + max_trailing).min(inner_w as usize);
     let max_rate_w = stats
         .iter()
         .map(|s| s.rate_section_width())
         .max()
         .unwrap_or(0);
+    let max_amount_w = stats
+        .iter()
+        .map(|s| s.amount.chars().count())
+        .max()
+        .unwrap_or(0);
 
-    for (i, stat) in stats.into_iter().enumerate() {
+    let mut lines = Vec::new();
+    for (i, stat) in stats.iter().enumerate() {
         if i > 0 {
             lines.push(Line::from(""));
         }
-        lines.extend(stat.render(bar_width, pct_col, max_rate_w));
+        lines.extend(stat.render(bar_width, pct_col, max_rate_w, max_amount_w));
     }
     lines
 }
@@ -204,6 +218,10 @@ struct Stat {
     pct: f64,
     color: Style,
     trailing: String,
+    /// Absolute `used / total` shown on the eyebrow line immediately before the
+    /// `%` (right-aligned in its own column). Empty when the window carries no
+    /// absolute amounts. Distinct from `trailing`, which sits on the bar line.
+    amount: String,
     burn_rate: Option<f64>,
     rate_unit: &'static str,
     /// Ideal-pace marker position as a percentage (0..=100), or `None` to draw
@@ -244,15 +262,30 @@ impl Stat {
         w
     }
 
-    /// Eyebrow + right-aligned %, then bar with trailing reset/credit suffix.
-    /// `bar_width` shared across rows; `pct_col` = far content edge for % alignment.
-    /// `max_rate_w` keeps the % column fixed across all rows regardless of per-row rate.
-    fn render(&self, bar_width: usize, pct_col: usize, max_rate_w: usize) -> Vec<Line<'static>> {
+    /// Eyebrow (label · rate · `used / total` · %) then bar with trailing reset
+    /// suffix. `bar_width` shared across rows; `pct_col` = far content edge for %
+    /// alignment. `max_rate_w` / `max_amount_w` keep the rate + amount columns
+    /// fixed across all rows so the `%` column never shifts.
+    fn render(
+        &self,
+        bar_width: usize,
+        pct_col: usize,
+        max_rate_w: usize,
+        max_amount_w: usize,
+    ) -> Vec<Line<'static>> {
         let pct_str = format!("{:>3.0}%", self.pct);
 
+        // The amount sits in its own right-aligned column just left of the %,
+        // with a 2-space gap when present.
+        let amount_section_w = if max_amount_w > 0 {
+            max_amount_w + 2
+        } else {
+            0
+        };
         let header_pad = pct_col
             .saturating_sub(self.label.chars().count())
             .saturating_sub(max_rate_w)
+            .saturating_sub(amount_section_w)
             .saturating_sub(pct_str.chars().count());
 
         let filled = (((self.pct / 100.0) * bar_width as f64).round() as usize).min(bar_width);
@@ -308,6 +341,15 @@ impl Stat {
             Line::from({
                 let mut spans = label_spans;
                 spans.push(Span::raw(" ".repeat(header_pad)));
+                if max_amount_w > 0 {
+                    // Right-align the amount in its fixed column, then a 2-space gap.
+                    let pad = max_amount_w.saturating_sub(self.amount.chars().count());
+                    spans.push(Span::raw(" ".repeat(pad)));
+                    if !self.amount.is_empty() {
+                        spans.push(Span::styled(self.amount.clone(), theme::faint()));
+                    }
+                    spans.push(Span::raw("  "));
+                }
                 spans.push(Span::styled(
                     pct_str,
                     self.color.add_modifier(Modifier::BOLD),
@@ -344,6 +386,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             pct,
             color: Style::default().fg(theme::util_color(pct)),
             trailing,
+            amount: String::new(),
             burn_rate,
             rate_unit,
             pace_pct: ideal_pace_pct(label, w, now_secs),
@@ -364,7 +407,9 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             label: "extra".to_string(),
             pct,
             color: Style::default().fg(theme::util_color(pct)),
-            trailing: format!("  {sym}{used:.2} / {sym}{limit:.2}"),
+            trailing: String::new(),
+            // Credits used/limit sits on the eyebrow before the %, like the bars.
+            amount: format!("{sym}{used:.2} / {sym}{limit:.2}"),
             burn_rate: None,
             rate_unit: "h",
             pace_pct: None,
@@ -533,102 +578,83 @@ fn build_tp_rows(profile: &Profile, _header: &HeaderState, inner_w: u16) -> Vec<
         return lines;
     };
 
-    // Percentage windows → bars rendered through the same `Stat::render` path
-    // as OAuth window bars (near-full-width bar + two-line eyebrow), with
-    // inferred-window labels ordered smallest-first and absolute `used / total`
-    // trailing. Identical look to the OAuth bars above.
-    if !stats.bars.is_empty() {
+    let has_bars = !stats.bars.is_empty();
+
+    // Percentage windows → bars rendered through the same `Stat::render` path as
+    // OAuth window bars (near-full-width bar + two-line eyebrow), using each bar's
+    // API-provided label in source order and showing absolute `used / total` on
+    // the eyebrow just before the %.
+    if has_bars {
         let bar_stats = stats_from_bars(&stats.bars);
-        let max_trailing = bar_stats
-            .iter()
-            .map(|s| s.trailing.chars().count())
-            .max()
-            .unwrap_or(0);
-        let bar_width = bar_width_for(inner_w, max_trailing);
-        let pct_col = (bar_width + max_trailing).min(inner_w as usize);
-        for (i, stat) in bar_stats.into_iter().enumerate() {
-            if i > 0 {
-                lines.push(Line::from(""));
-            }
-            lines.extend(stat.render(bar_width, pct_col, 0));
-        }
-        return lines;
+        lines.extend(render_stat_block(&bar_stats, inner_w));
     }
 
-    if stats.rows.is_empty() {
+    // Text rows (e.g. z.ai per-model token totals, DeepSeek balances) render
+    // below the bars. A provider can carry both.
+    if !stats.rows.is_empty() {
+        if has_bars {
+            lines.push(Line::from(""));
+        }
+        for row in &stats.rows {
+            if row.label.is_empty() {
+                let style = match row.kind {
+                    StatRowKind::Danger => theme::danger(),
+                    _ => theme::faint(),
+                };
+                lines.push(Line::from(Span::styled(row.value.to_string(), style)));
+            } else if row.kind == StatRowKind::Heading {
+                lines.push(Line::from(Span::styled(
+                    row.label.to_string(),
+                    theme::label(),
+                )));
+            } else {
+                let style = match row.kind {
+                    StatRowKind::Danger => theme::danger(),
+                    StatRowKind::Faint => theme::faint(),
+                    _ => theme::body(),
+                };
+                lines.push(Line::from(key_value_span(&row.label, &row.value, style)));
+            }
+        }
+    } else if !has_bars {
         let (msg, style) = if stats.is_available {
             ("no stats reported", theme::faint())
         } else {
             ("usage unavailable", theme::danger())
         };
         lines.push(Line::from(Span::styled(msg, style)));
-        return lines;
     }
 
-    for row in &stats.rows {
-        if row.label.is_empty() {
-            let style = match row.kind {
-                StatRowKind::Danger => theme::danger(),
-                _ => theme::faint(),
-            };
-            lines.push(Line::from(Span::styled(row.value.to_string(), style)));
-        } else if row.kind == StatRowKind::Heading {
-            lines.push(Line::from(Span::styled(
-                row.label.to_string(),
-                theme::label(),
-            )));
-        } else {
-            let style = match row.kind {
-                StatRowKind::Danger => theme::danger(),
-                StatRowKind::Faint => theme::faint(),
-                _ => theme::body(),
-            };
-            lines.push(Line::from(key_value_span(&row.label, &row.value, style)));
-        }
+    // Best-effort (unknown-provider) data is mapped heuristically — invite a
+    // report so a real integration can be added. Subtle, below everything.
+    if stats.best_effort && (has_bars || !stats.rows.is_empty()) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "looks wrong? report at github.com/uwuclxdy/clauth/issues",
+            theme::faint(),
+        )));
     }
 
     lines
 }
 
-/// Build render [`Stat`]s from generic percentage bars: infer each window's
-/// length from its time-until-reset, label it in the 5h/7d/30d vocabulary
-/// (disambiguated by the bar's own type label when two share a window), and
-/// order smallest window first. Rendered through the same `Stat::render` path as
-/// OAuth window bars, so the two are visually identical.
+/// Build render [`Stat`]s from third-party percentage bars: each bar keeps its
+/// API-provided label and source order (no inferred window vocabulary, no
+/// reordering), shows absolute `used / total` on the eyebrow before the %, and a
+/// reset countdown on the bar line. Rendered through the same `Stat::render` path
+/// as OAuth window bars, so the two are visually identical.
 fn stats_from_bars(bars: &[crate::providers::UsageBar]) -> Vec<Stat> {
     let now = now_epoch_secs();
-    // (remaining_secs, window_label, bar) — window length inferred from reset.
-    let mut info: Vec<(Option<i64>, String, &crate::providers::UsageBar)> = bars
-        .iter()
-        .map(|b| {
-            let rem = window_remaining(b, now);
-            (rem, window_label(rem), b)
-        })
-        .collect();
-    // Smallest inferred window first; unknown (no reset) sorts last. Stable, so
-    // ties keep source order.
-    info.sort_by_key(|(rem, _, _)| rem.unwrap_or(i64::MAX));
-
-    // Disambiguate equal window labels by appending the bar's type label, so two
-    // limits sharing a window (e.g. z.ai's token limits) stay distinguishable.
-    let mut dup_counts: HashMap<String, usize> = HashMap::new();
-    for (_, wl, _) in &info {
-        *dup_counts.entry(wl.clone()).or_default() += 1;
-    }
-
-    info.into_iter()
-        .map(|(rem, wl, bar)| {
-            let label = if dup_counts.get(&wl).copied().unwrap_or(0) > 1 {
-                format!("{wl} · {}", bar.label)
-            } else {
-                wl
-            };
+    bars.iter()
+        .map(|bar| {
+            let rem = window_remaining(bar, now);
             let pct = bar.pct.clamp(0.0, 100.0);
             Stat {
-                label,
+                label: bar.label.clone(),
                 pct,
                 color: Style::default().fg(theme::util_color(pct)),
-                trailing: bar_trailing(bar, rem),
+                trailing: bar_reset_trailing(rem),
+                amount: bar_amount(bar),
                 burn_rate: None,
                 rate_unit: "h",
                 pace_pct: None,
@@ -645,36 +671,21 @@ fn window_remaining(bar: &crate::providers::UsageBar, now: i64) -> Option<i64> {
     Some(reset - now)
 }
 
-/// Compact window-length label inferred from time-until-reset, in the 5h/7d/30d
-/// vocabulary OAuth bars use. Coarse by design — the reset countdown in the
-/// trailing text carries the precise remaining time.
-fn window_label(rem: Option<i64>) -> String {
-    let Some(secs) = rem.filter(|&s| s > 0) else {
-        return "usage".to_string();
-    };
-    if secs <= 5 * 3600 {
-        "5h".to_string()
-    } else if secs <= 7 * 86_400 {
-        "7d".to_string()
-    } else {
-        format!("{}d", (secs / 86_400).max(1))
+/// Bar-line trailing: the reset countdown (`  resets in …`), or empty when the
+/// bar carries no future reset. The absolute amount now lives on the eyebrow.
+fn bar_reset_trailing(rem: Option<i64>) -> String {
+    match rem.filter(|&s| s > 0) {
+        Some(secs) => format!("  resets in {}", crate::usage::humanize_duration(secs)),
+        None => String::new(),
     }
 }
 
-/// Trailing text for a generic bar: absolute `used / total`, then the reset
-/// countdown. Mirrors OAuth `Stat` trailing (`  x / y`, `  resets in …`).
-fn bar_trailing(bar: &crate::providers::UsageBar, rem: Option<i64>) -> String {
-    let mut out = String::new();
-    if let (Some(used), Some(total)) = (bar.used, bar.total) {
-        out.push_str(&format!("  {} / {}", fmt_amount(used), fmt_amount(total)));
+/// Eyebrow amount for a bar: `used / total` when both are present, else empty.
+fn bar_amount(bar: &crate::providers::UsageBar) -> String {
+    match (bar.used, bar.total) {
+        (Some(used), Some(total)) => format!("{} / {}", fmt_amount(used), fmt_amount(total)),
+        _ => String::new(),
     }
-    if let Some(secs) = rem.filter(|&s| s > 0) {
-        out.push_str(&format!(
-            "  resets in {}",
-            crate::usage::humanize_duration(secs)
-        ));
-    }
-    out
 }
 
 fn fmt_amount(n: f64) -> String {

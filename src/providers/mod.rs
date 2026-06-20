@@ -6,15 +6,20 @@
 //!
 //! Adding a provider:
 //! 1. Create `src/providers/<name>.rs` with `DISPLAY_NAME`, `matches_base_url`,
-//!    and `fetch` (mirror [`deepseek`]).
+//!    and `fetch` (mirror [`deepseek`] for balances, [`zai`] for limit bars +
+//!    per-model token rows).
 //! 2. Add a variant to [`Provider`] and wire it into `from_base_url`,
 //!    `display_name`, and [`fetch_third_party_usage`]'s match arms.
 //!
-//! No render-layer changes needed — [`ThirdPartyStats`] carries generic
-//! [`StatRow`]s that [`crate::tui::render::usage`] renders uniformly.
+//! No render-layer changes needed — [`ThirdPartyStats`] carries provider-agnostic
+//! [`UsageBar`]s (percentage windows) and [`StatRow`]s (text), which
+//! [`crate::tui::render::usage`] renders uniformly. Unknown api-key providers go
+//! through [`generic`]'s best-effort scanner, which sets `best_effort` so the UI
+//! invites a bug report.
 
 mod deepseek;
 mod generic;
+mod zai;
 
 use std::path::PathBuf;
 
@@ -26,6 +31,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Provider {
     DeepSeek,
+    Zai,
 }
 
 impl Provider {
@@ -33,6 +39,8 @@ impl Provider {
     pub(crate) fn from_base_url(url: &str) -> Option<Self> {
         if deepseek::matches_base_url(url) {
             Some(Self::DeepSeek)
+        } else if zai::matches_base_url(url) {
+            Some(Self::Zai)
         } else {
             None
         }
@@ -41,6 +49,7 @@ impl Provider {
     pub(crate) fn display_name(self) -> &'static str {
         match self {
             Self::DeepSeek => deepseek::DISPLAY_NAME,
+            Self::Zai => zai::DISPLAY_NAME,
         }
     }
 }
@@ -102,6 +111,7 @@ pub(crate) fn fetch_third_party_usage(
     match target {
         ThirdPartyTarget::Known(provider) => match provider {
             Provider::DeepSeek => deepseek::fetch(api_key),
+            Provider::Zai => zai::fetch(api_key),
         },
         ThirdPartyTarget::Generic { base_url } => generic::fetch(base_url, api_key, hint),
     }
@@ -130,6 +140,11 @@ pub(crate) struct ThirdPartyStats {
     /// next tick to skip re-probing. Recognised providers leave this `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) endpoint: Option<String>,
+    /// `true` when this came from the best-effort generic scanner (unknown
+    /// provider) rather than a typed integration — the render layer shows a
+    /// "looks wrong? open an issue" hint. Typed providers leave it `false`.
+    #[serde(default)]
+    pub(crate) best_effort: bool,
 }
 
 /// One percentage-based usage window for bar rendering.
@@ -160,6 +175,7 @@ impl ThirdPartyStats {
             bars: Vec::new(),
             plan: None,
             endpoint: None,
+            best_effort: false,
         }
     }
 
@@ -174,6 +190,7 @@ impl ThirdPartyStats {
             bars: Vec::new(),
             plan: None,
             endpoint: None,
+            best_effort: false,
         }
     }
 }

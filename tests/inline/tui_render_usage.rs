@@ -53,14 +53,15 @@ fn bar_spans_places_marker_without_changing_width() {
     assert_eq!(total(&oob), 10);
 }
 
-/// `stats_from_bars` infers each bar's window from its reset stamp, labels it in
-/// the 5h/7d/30d vocabulary, orders smallest window first, and surfaces absolute
-/// `used / total` only when both amounts are present.
+/// `stats_from_bars` keeps each bar's API label and source order (no inferred
+/// window vocabulary, no reordering), puts absolute `used / total` on the eyebrow
+/// `amount` (not the bar-line trailing), and leaves only the reset countdown on
+/// the trailing.
 #[test]
-fn stats_from_bars_infers_labels_orders_and_trails() {
+fn stats_from_bars_keeps_api_labels_and_source_order() {
     let now = crate::usage::now_epoch_secs();
     let bars = vec![
-        // ~30d (monthly) window with absolute amounts, given first.
+        // Far-future reset + absolute amounts, given first → stays first.
         tp_bar(
             "time limit",
             0.0,
@@ -68,33 +69,37 @@ fn stats_from_bars_infers_labels_orders_and_trails() {
             Some(0.0),
             Some(1000.0),
         ),
-        // ~4h window, percentage-only.
+        // Short reset, percentage-only → stays second (no reordering).
         tp_bar("tokens limit", 1.0, now + 4 * 3600, None, None),
     ];
     let stats = stats_from_bars(&bars);
-    // Smallest inferred window first regardless of source order.
-    assert_eq!(stats[0].label, "5h");
-    assert_eq!(stats[1].label, "30d");
-    // Percentage-only bar: countdown only, no absolute.
-    assert!(stats[0].trailing.contains("resets in"));
+    assert_eq!(stats[0].label, "time limit", "API label kept verbatim");
+    assert_eq!(stats[1].label, "tokens limit");
+
+    // Amounts live on the eyebrow now, not the bar-line trailing.
+    assert_eq!(stats[0].amount, "0 / 1000");
     assert!(!stats[0].trailing.contains('/'));
-    // Bar with amounts: `used / total` then the countdown.
-    assert!(stats[1].trailing.contains("0 / 1000"));
+    assert!(stats[0].trailing.contains("resets in"));
+
+    // Percentage-only bar: no amount, countdown only.
+    assert!(stats[1].amount.is_empty());
     assert!(stats[1].trailing.contains("resets in"));
 }
 
-/// Two bars sharing an inferred window are disambiguated by their type label so
-/// they stay distinguishable (mirrors z.ai's pair of short-window token limits).
+/// Two bars sharing the same API label are NOT renamed — z.ai's pair of token
+/// limits both read "tokens limit", in source order.
 #[test]
-fn stats_from_bars_disambiguates_shared_windows() {
+fn stats_from_bars_does_not_rename_duplicate_labels() {
     let now = crate::usage::now_epoch_secs();
     let bars = vec![
-        tp_bar("time limit", 1.0, now + 4 * 3600, None, None),
-        tp_bar("tokens limit", 2.0, now + 4 * 3600, None, None),
+        tp_bar("tokens limit", 0.0, now + 4 * 3600, None, None),
+        tp_bar("tokens limit", 12.0, now + 6 * 86_400, None, None),
     ];
     let stats = stats_from_bars(&bars);
-    assert_eq!(stats[0].label, "5h · time limit");
-    assert_eq!(stats[1].label, "5h · tokens limit");
+    assert_eq!(stats[0].label, "tokens limit");
+    assert_eq!(stats[1].label, "tokens limit");
+    assert_eq!(stats[0].pct, 0.0);
+    assert_eq!(stats[1].pct, 12.0);
 }
 
 fn tp_bar(

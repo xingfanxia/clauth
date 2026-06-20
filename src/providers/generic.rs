@@ -76,6 +76,9 @@ pub(super) fn fetch(
             bars,
             plan,
             endpoint: Some(path.to_string()),
+            // Unknown provider, mapped heuristically — flag it so the UI can hint
+            // "looks wrong? open an issue".
+            best_effort: true,
         });
     }
     // No candidate yielded usable data this pass — surface as a generic failure
