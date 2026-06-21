@@ -136,10 +136,13 @@ fn find_expected_sha_empty_sums_file() {
 ///
 /// # Safety
 /// `set_var`/`remove_var` are unsafe in Rust 2024 because they aren't
-/// thread-safe in a multi-threaded process.  These tests run under cargo's
-/// single-process test runner and the mutation is undone before the closure
-/// returns, so no other thread observes a torn value.
+/// thread-safe in a multi-threaded process. Serialized here by `HOME_TEST_LOCK`
+/// (the one mutex every env mutator across the suite takes) and undone before
+/// the closure returns, so no other thread observes a torn value.
 fn with_no_update_env<F: FnOnce()>(val: Option<&str>, f: F) {
+    let _guard = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let saved = std::env::var("CLAUTH_NO_UPDATE").ok();
     // SAFETY: test-only, single-threaded execution, restored unconditionally.
     unsafe {

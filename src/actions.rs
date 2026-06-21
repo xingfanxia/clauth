@@ -18,7 +18,8 @@ use crate::lock::with_state_lock;
 use crate::lockorder::RankedMutex;
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ClaudeCredentials, ModelSettings, Profile, profile_dir, save_app_state, save_profile,
+    AppConfig, ClaudeCredentials, DivergenceChoice, ModelSettings, Profile, profile_dir,
+    save_app_state, save_profile,
 };
 use crate::spinner::Spinner;
 
@@ -58,6 +59,20 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         snapshot_active_credentials(config)?;
         link_profile_credentials(name)?;
         finish_switch(config, name)
+    })
+}
+
+/// Discard the live login: force-relink to `target`'s stored creds WITHOUT
+/// capturing the foreign live file into any profile. Bypasses the non-force
+/// `link_profile_credentials` refuse-guard (which exists to protect an
+/// un-captured re-login) precisely because the caller chose to drop it.
+pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &str) -> Result<()> {
+    with_state_lock(|| {
+        if config.is_active(target) {
+            return Ok(());
+        }
+        force_link_profile_credentials(target)?;
+        finish_switch(config, target)
     })
 }
 
@@ -133,6 +148,59 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     }
     println!("switched to '{canonical}'");
     Ok(())
+}
+
+/// Headless switch for the MCP `switch` tool: relink the global active profile
+/// to `target` without prompting and without priming the 5h window (zero quota;
+/// the next spawned session primes its own).
+///
+/// On credential divergence (the active link is a regular file CC re-logged into)
+/// the caller-supplied `on_divergence` decides: `Overwrite` captures the live
+/// tokens into the outgoing profile then relinks ([`switch_profile_reconciled`]),
+/// `Discard` drops the foreign live login and force-relinks `target`'s stored
+/// tokens without capturing it into any profile ([`switch_profile_discard`]),
+/// `NewProfile` is interactive-only (would need a name prompt) so it errors, and
+/// `None` means no default is set so it errors. A non-diverged link
+/// (`LinkedTo`/`Missing`) always takes the plain [`switch_profile`].
+///
+/// Returns `(previous_active, new_active)`.
+///
+/// Accepted TOCTOU: the divergence classify runs before the locked relink (same
+/// shape as the CLI path); a live change in that gap self-heals on the next switch.
+pub(crate) fn switch_profile_noninteractive(
+    config: &mut AppConfig,
+    target: &str,
+    on_divergence: Option<DivergenceChoice>,
+) -> Result<(Option<String>, String)> {
+    let previous = config.state.active_profile.as_deref().map(str::to_string);
+
+    let diverged = match previous.as_deref() {
+        Some(active) => {
+            matches!(classify_credentials_link(active)?, LinkState::Diverged)
+                && !is_first_login(active)?
+        }
+        None => false,
+    };
+
+    if diverged {
+        match on_divergence {
+            Some(DivergenceChoice::Overwrite) => switch_profile_reconciled(config, target)?,
+            Some(DivergenceChoice::Discard) => switch_profile_discard(config, target)?,
+            Some(DivergenceChoice::NewProfile) => bail!(
+                "active profile has a divergent login and the divergence default is \
+                 'save as new profile', which needs an interactive name prompt; \
+                 resolve it in the clauth TUI"
+            ),
+            None => bail!(
+                "active profile has uncaptured credentials in ~/.claude and no \
+                 divergence default is set; resolve it in the clauth TUI"
+            ),
+        }
+    } else {
+        switch_profile(config, target)?;
+    }
+
+    Ok((previous, target.to_string()))
 }
 
 /// Snapshot active creds then clear them so Claude Code can't spend any account.
@@ -415,3 +483,7 @@ pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) ->
 #[cfg(test)]
 #[path = "../tests/inline/actions.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/inline/mcp_switch.rs"]
+mod tests_mcp_switch;

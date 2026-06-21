@@ -6,6 +6,7 @@ mod fallback;
 mod format;
 mod lock;
 mod lockorder;
+mod mcp;
 mod oauth;
 mod platform;
 mod poll;
@@ -75,6 +76,7 @@ fn dispatch(args: &[String]) -> Result<()> {
             anyhow::bail!("usage: clauth start <profile> [claude args...]");
         }
         [cmd, name, rest @ ..] if cmd == "start" => cmd_start(name, rest),
+        [cmd] if cmd == "mcp" => mcp::serve(),
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
         _ => anyhow::bail!(
