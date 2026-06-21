@@ -1139,6 +1139,7 @@ impl App {
         let third_party_status = Arc::clone(&self.third_party_status);
         let last_fetched = Arc::clone(&self.last_fetched);
         let refresh_interval = Arc::clone(&self.refresh_interval);
+        let activity = Arc::clone(&self.activity);
         let done = BootstrapDoneGuard {
             bootstrap_active: Arc::clone(&self.bootstrap_active),
             startup_sender: self.startup_sender.clone(),
@@ -1188,6 +1189,24 @@ impl App {
             // scheduler's first tick (started in `finish_bootstrap`); 5h windows
             // are armed by the windowless scan in `on_tick` after bootstrap
             // clears `bootstrap_active` — no startup-only fetch or kick pass.
+
+            // Profiles left unseeded (no fresh cache) are guaranteed due on that
+            // first tick. Mark them Fetching now so the overview timer and usage
+            // header show the fetch spinner from first paint instead of a
+            // misleading "up to date"/blank countdown over the not-yet-fetched
+            // window. The first tick re-marks (idempotent) and clears on landing.
+            let unseeded: Vec<String> = match last_fetched.lock() {
+                Ok(lf) => snapshot
+                    .iter()
+                    .map(|e| e.name.clone())
+                    .chain(third_party.iter().map(|e| e.name.clone()))
+                    .filter(|n| !lf.contains_key(n))
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            for name in &unseeded {
+                mark_activity(&activity, name, ProfileActivity::Fetching);
+            }
         });
     }
 
