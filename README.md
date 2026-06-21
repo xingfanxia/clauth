@@ -19,6 +19,7 @@
   <a href="#quickstart">Quickstart</a> ·
   <a href="#keys">Keys</a> ·
   <a href="#automatic-account-switching">Auto-switch</a> ·
+  <a href="#claude-code-plugin">Plugin</a> ·
   <a href="#alternatives">Alternatives</a> ·
   <a href="#faq">FAQ</a> ·
   <a href="#security">Security</a>
@@ -164,6 +165,31 @@ Keys are scoped to the current tab; <kbd>?</kbd> lists every binding for the tab
 **Claude Pro / Max / Team / Enterprise (OAuth):** leave the base URL blank. clauth captures the OAuth token from your running session, restores it on switch, and detects the plan tier for you.
 
 **API endpoint:** set a base URL and, optionally, an API key. Works with the official Anthropic API or any compatible proxy. Edit the URL or key any time without losing stored credentials.
+
+## Claude Code plugin
+
+clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Add this repo as a plugin marketplace in Claude Code, then install the `clauth` plugin:
+
+```
+/plugin marketplace add uwuclxdy/clauth
+/plugin install clauth@clauth
+```
+
+Claude Code launches `clauth mcp` in the background for the session's lifetime; `clauth` must be on `PATH` (it already is after any standard install).
+
+Once active, Claude Code can call four tools:
+
+| Tool | What it does | Quota |
+|------|--------------|-------|
+| `list_profiles` | All profiles with cached 5h/7d usage %, provider, active flag, live-session flag | zero (disk cache) |
+| `which` | Which profile owns the current session | zero (filesystem) |
+| `switch` | Relink the global active profile to another name | zero (no prime) |
+| `run` | Delegate a headless prompt to another profile and return the answer | **real usage window on the target account** |
+
+**Two caveats to know:**
+
+- `switch` affects the **next** spawned session, not the one already running. Claude Code loads credentials once at startup and cannot hot-swap them.
+- `run` burns a real 5h usage window on the target account. It is hard-capped at recursion depth 1, so a delegated session cannot call `run` again.
 
 ## Auto-starting the 5-hour timer
 
