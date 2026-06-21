@@ -45,7 +45,7 @@ use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityStore, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
+    ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
     OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RateLimitStreaks,
     RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
@@ -1218,7 +1218,22 @@ impl App {
         self.apply_usage();
         let switched = {
             let mut cfg = self.config();
-            auto_switch_if_needed(&mut cfg).ok().flatten()
+            // Run the startup one-shot on Fresh data only. A Cached seed may sit on
+            // a 5h window that has since rolled over, whose stale-high utilization
+            // would drive a false switch-away (`is_exhausted` ignores `resets_at`).
+            // Stale profiles are due on the scheduler's first tick, which fetches
+            // then auto-switches off the corrected numbers.
+            let active_fresh = cfg
+                .state
+                .active_profile
+                .as_deref()
+                .and_then(|n| cfg.find(n))
+                .is_some_and(|p| p.fetch_status == Some(FetchStatus::Fresh));
+            if active_fresh {
+                auto_switch_if_needed(&mut cfg).ok().flatten()
+            } else {
+                None
+            }
         };
         match switched {
             Some(SwitchAction::To(target)) => {

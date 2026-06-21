@@ -633,13 +633,13 @@ fn mark_window_open(store: &UsageStore, name: &str, now_secs: i64) {
     });
 }
 
-/// Startup usage seed — never blocks on HTTP. Each profile whose on-disk cache
-/// was written less than one refresh interval ago is seeded straight from disk so
-/// the UI shows real numbers instantly, with `last_fetched` stamped at the cache
-/// mtime so the fixed cadence *resumes* across the restart (see
-/// [`try_seed_recent_cache`]) instead of resetting the countdown. A profile with a
-/// staler or missing cache is left unseeded and unstamped, so the scheduler
-/// fetches it fresh in the background on its first tick.
+/// Startup usage seed — never blocks on HTTP. Each profile with an on-disk cache is
+/// seeded straight from disk so the UI shows last-known numbers instantly, with
+/// `last_fetched` stamped at the cache mtime so the fixed cadence *resumes* across
+/// the restart (see [`try_seed_cache`]) instead of resetting the countdown. A cache
+/// older than one interval is seeded `Cached` and refreshed in the background on the
+/// first tick; one younger is `Fresh` and left be. A profile with no cache at all is
+/// left unseeded and unstamped, so the scheduler fetches it fresh on its first tick.
 pub(crate) fn bootstrap_fetch(
     store: &UsageStore,
     status: &StatusStore,
@@ -649,42 +649,49 @@ pub(crate) fn bootstrap_fetch(
 ) {
     let now = now_ms();
     for entry in tokens {
-        try_seed_recent_cache(store, status, last_fetched, &entry.name, now, interval_ms);
+        try_seed_cache(store, status, last_fetched, &entry.name, now, interval_ms);
     }
 }
 
-/// Freshness + load gate shared by both startup seed sites. Takes no locks so each
-/// caller stamps its own typed store and keeps its own lock rank (LAST_FETCHED then
-/// the status store). Returns the loaded value and the cache mtime only when the
-/// cache is fresher than one refresh interval AND loadable; `None` otherwise. See
-/// [`try_seed_recent_cache`] / [`bootstrap_third_party`] for why mtime — not window
-/// state — is the gate, and why `last_fetched` is stamped at the mtime.
-fn recent_seed<T>(
+/// Load gate shared by both startup seed sites. Takes no locks so each caller
+/// stamps its own typed store and keeps its own lock rank (LAST_FETCHED then the
+/// status store). Returns the loaded value, the cache mtime, and a freshness-derived
+/// [`FetchStatus`] whenever a cache file exists AND is loadable; `None` only when
+/// there is no cache. The cache is seeded as a starting point regardless of age:
+/// `Fresh` when younger than one refresh interval (still in the fetch window — the
+/// scheduler leaves it be), `Cached` when older (shown immediately while the
+/// scheduler refreshes it in the background). See [`try_seed_cache`] /
+/// [`bootstrap_third_party`] for why `last_fetched` is stamped at the mtime.
+fn load_cache_seed<T>(
     name: &str,
     interval_ms: u64,
     now: u64,
     mtime_fn: impl Fn(&str) -> Option<u64>,
     load_fn: impl Fn(&str) -> Option<T>,
-) -> Option<(T, u64)> {
+) -> Option<(T, u64, FetchStatus)> {
     let mtime = mtime_fn(name)?;
-    if now.saturating_sub(mtime) >= interval_ms {
-        return None;
-    }
     let value = load_fn(name)?;
-    Some((value, mtime))
+    let status = if now.saturating_sub(mtime) < interval_ms {
+        FetchStatus::Fresh
+    } else {
+        FetchStatus::Cached
+    };
+    Some((value, mtime, status))
 }
 
-/// Seed `name` from its on-disk cache when that cache is fresher than one refresh
-/// interval, returning `true`. Freshness — not window state — is the gate: a cache
-/// written seconds ago is current truth whatever its 5h window says (an idle
-/// account whose window already rolled past its `resets_at` is still seeded), while
-/// a cache older than the cadence is left for the scheduler (its window may have
-/// rolled to numbers we shouldn't show). The `last_fetched` slot is stamped at the
+/// Seed `name` from its on-disk cache whenever one exists, returning `true`. The
+/// cache is the startup starting point regardless of age: a cache younger than one
+/// interval is `Fresh` (still in the fetch window — `partition_due` won't refetch
+/// it), an older one is `Cached` (shown immediately while the scheduler refreshes it
+/// in the background on the first tick). The `last_fetched` slot is stamped at the
 /// cache **mtime**, so `partition_due` resumes the fixed cadence from the last real
 /// write — the overview countdown continues where it left off across a restart
 /// rather than resetting to a full interval, and a fresh cache never falls due on
-/// the first tick (no startup refresh burst). Status is `Fresh`.
-fn try_seed_recent_cache(
+/// the first tick (no startup refresh burst). A `Cached` seed may sit on a 5h window
+/// that has since rolled over, so the startup auto-switch one-shot in
+/// `finish_bootstrap` acts on `Fresh` data only; stale profiles auto-switch off the
+/// corrected numbers on the scheduler's first tick.
+fn try_seed_cache(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
@@ -692,7 +699,7 @@ fn try_seed_recent_cache(
     now: u64,
     interval_ms: u64,
 ) -> bool {
-    let Some((info, mtime)) = recent_seed(
+    let Some((info, mtime, fetch_status)) = load_cache_seed(
         name,
         interval_ms,
         now,
@@ -708,18 +715,18 @@ fn try_seed_recent_cache(
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(name.to_string(), EpochMs::from_millis(mtime));
         if let Ok(mut st) = status.lock() {
-            st.insert(name.to_string(), FetchStatus::Fresh);
+            st.insert(name.to_string(), fetch_status);
         }
     }
     true
 }
 
 /// Startup third-party seed — the api-key/provider analogue of [`bootstrap_fetch`].
-/// Each profile whose `third_party_cache.json` is fresher than one refresh interval
-/// is seeded straight from disk (status `Fresh`, `last_fetched` stamped at the cache
-/// mtime) so the UI shows last-known numbers instantly and the cadence resumes
-/// across the restart. A profile with a staler or missing cache is left unstamped,
-/// so the scheduler fetches it fresh on its first tick.
+/// Each profile with a `third_party_cache.json` is seeded straight from disk
+/// (`last_fetched` stamped at the cache mtime so the cadence resumes across the
+/// restart) so the UI shows last-known numbers instantly: `Fresh` when younger than
+/// one interval, `Cached` when older (refreshed in the background on the first tick).
+/// A profile with no cache is left unstamped, so the scheduler fetches it fresh.
 pub(crate) fn bootstrap_third_party(
     store: &ThirdPartyUsageStore,
     status: &ThirdPartyStatusStore,
@@ -729,7 +736,7 @@ pub(crate) fn bootstrap_third_party(
 ) {
     let now = now_ms();
     for entry in entries {
-        let Some((stats, mtime)) = recent_seed(
+        let Some((stats, mtime, fetch_status)) = load_cache_seed(
             &entry.name,
             interval_ms,
             now,
@@ -745,7 +752,7 @@ pub(crate) fn bootstrap_third_party(
         if let Ok(mut lf) = last_fetched.lock() {
             lf.insert(entry.name.clone(), EpochMs::from_millis(mtime));
             if let Ok(mut st) = status.lock() {
-                st.insert(entry.name.clone(), FetchStatus::Fresh);
+                st.insert(entry.name.clone(), fetch_status);
             }
         }
     }

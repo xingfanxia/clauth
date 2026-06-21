@@ -584,16 +584,16 @@ fn transient_errors_preserve_rate_limit_streak() {
     );
 }
 
-/// Startup seed gating is by cache **freshness**, not 5h window state: a cache
-/// written less than one interval ago is seeded (store + `Fresh` + `last_fetched`
-/// stamped at the cache mtime so the cadence resumes) even when its 5h window has
-/// already reset — an idle account whose `resets_at` is in the past. A cache older
-/// than one interval, or a missing cache, is left for the scheduler.
+/// Any on-disk cache seeds at startup as a starting point (store + status +
+/// `last_fetched` stamped at the cache mtime so the cadence resumes), regardless of
+/// 5h window state. Freshness only picks the status: younger than one interval →
+/// `Fresh` (left be), older → `Cached` (refreshed in the background). A missing
+/// cache is left for the scheduler.
 #[test]
-fn try_seed_recent_cache_seeds_fresh_cache_and_resumes_timer() {
+fn try_seed_cache_seeds_any_cache_and_resumes_timer() {
     use std::time::{Duration, SystemTime};
 
-    use super::{FetchStatus, StatusStore, now_ms, try_seed_recent_cache};
+    use super::{FetchStatus, StatusStore, now_ms, try_seed_cache};
     use crate::profile::profile_subpath;
     use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
     use crate::testutil::{HomeSandbox, set_mtime};
@@ -614,13 +614,13 @@ fn try_seed_recent_cache_seeds_fresh_cache_and_resumes_timer() {
     };
 
     // Fresh cache (mtime ~30s ago) whose 5h window already reset (resets_at in the
-    // past) — an idle account. Freshness, not window state, gates the seed.
+    // past) — an idle account. Younger than one interval, so seeded `Fresh`.
     write_profile_cache("idle", USAGE_CACHE_FILE, &with_reset(now_secs - 600));
     let idle_path = profile_subpath("idle", "usage_cache.json").expect("idle path");
     set_mtime(&idle_path, SystemTime::now() - Duration::from_secs(30));
 
-    // Stale cache (written 2h ago) whose window is still open — older than one
-    // interval, so left for the scheduler regardless of window state.
+    // Stale cache (written 2h ago) whose window is still open — seeded as a starting
+    // point with `Cached` status; the scheduler refreshes it in the background.
     write_profile_cache("stale", USAGE_CACHE_FILE, &with_reset(now_secs + 3600));
     let stale_path = profile_subpath("stale", "usage_cache.json").expect("stale path");
     set_mtime(
@@ -630,7 +630,7 @@ fn try_seed_recent_cache_seeds_fresh_cache_and_resumes_timer() {
 
     let now = now_ms();
     assert!(
-        try_seed_recent_cache(
+        try_seed_cache(
             &store,
             &status,
             &last_fetched,
@@ -641,7 +641,7 @@ fn try_seed_recent_cache_seeds_fresh_cache_and_resumes_timer() {
         "a fresh cache seeds even when its 5h window has reset (idle account)"
     );
     assert!(
-        !try_seed_recent_cache(
+        try_seed_cache(
             &store,
             &status,
             &last_fetched,
@@ -649,10 +649,10 @@ fn try_seed_recent_cache_seeds_fresh_cache_and_resumes_timer() {
             now,
             REFRESH_INTERVAL_MS
         ),
-        "a cache older than one interval is left for the background fetch"
+        "a cache older than one interval is still seeded as a Cached starting point"
     );
     assert!(
-        !try_seed_recent_cache(
+        !try_seed_cache(
             &store,
             &status,
             &last_fetched,
@@ -664,11 +664,17 @@ fn try_seed_recent_cache_seeds_fresh_cache_and_resumes_timer() {
     );
 
     assert!(store.lock().unwrap().contains_key("idle"));
-    assert!(!store.lock().unwrap().contains_key("stale"));
+    assert!(store.lock().unwrap().contains_key("stale"));
     assert!(!store.lock().unwrap().contains_key("missing"));
     assert_eq!(
         status.lock().unwrap().get("idle").copied(),
         Some(FetchStatus::Fresh),
+        "a cache younger than one interval is Fresh",
+    );
+    assert_eq!(
+        status.lock().unwrap().get("stale").copied(),
+        Some(FetchStatus::Cached),
+        "a cache older than one interval is Cached",
     );
 
     // Stamped at the ~30s-old cache mtime, not `now` — so `partition_due` resumes
@@ -758,12 +764,12 @@ fn tp_entry(name: &str) -> ThirdPartyEntry {
     }
 }
 
-/// Third-party startup seed mirrors the OAuth one: a profile whose cache is
-/// fresher than one interval is seeded `Fresh` with `last_fetched` stamped at the
-/// cache mtime (cadence resumes); a stale cache (older than one interval) or a
+/// Third-party startup seed mirrors the OAuth one: any cached profile is seeded
+/// with `last_fetched` stamped at the cache mtime (cadence resumes) — `Fresh` when
+/// younger than one interval, `Cached` when older (refreshed in the background). A
 /// missing cache is left for the scheduler.
 #[test]
-fn bootstrap_third_party_seeds_fresh_cache_only() {
+fn bootstrap_third_party_seeds_any_cache() {
     use std::time::{Duration, SystemTime};
 
     use super::{
@@ -793,7 +799,7 @@ fn bootstrap_third_party_seeds_fresh_cache_only() {
         endpoint: None,
         best_effort: false,
     };
-    // Fresh cache (just written) seeds; a 2h-old cache is too stale.
+    // Fresh cache (just written) seeds `Fresh`; a 2h-old cache seeds `Cached`.
     write_profile_cache("cached", THIRD_PARTY_CACHE_FILE, &stats(12.0));
     write_profile_cache("stale", THIRD_PARTY_CACHE_FILE, &stats(20.0));
     let stale_path = profile_subpath("stale", "third_party_cache.json").expect("stale path");
@@ -816,8 +822,8 @@ fn bootstrap_third_party_seeds_fresh_cache_only() {
         "a fresh third-party cache is seeded from disk"
     );
     assert!(
-        !store.lock().unwrap().contains_key("stale"),
-        "a stale third-party cache is left for the scheduler"
+        store.lock().unwrap().contains_key("stale"),
+        "a stale third-party cache is still seeded as a Cached starting point"
     );
     assert!(
         !store.lock().unwrap().contains_key("missing"),
@@ -826,7 +832,12 @@ fn bootstrap_third_party_seeds_fresh_cache_only() {
     assert_eq!(
         status.lock().unwrap().get("cached").copied(),
         Some(FetchStatus::Fresh),
-        "a seeded third-party cache surfaces as Fresh"
+        "a third-party cache younger than one interval surfaces as Fresh"
+    );
+    assert_eq!(
+        status.lock().unwrap().get("stale").copied(),
+        Some(FetchStatus::Cached),
+        "a third-party cache older than one interval surfaces as Cached"
     );
     assert!(
         !last_fetched.lock().unwrap().contains_key("missing"),
