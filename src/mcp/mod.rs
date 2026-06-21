@@ -15,7 +15,7 @@ use anyhow::Result;
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerInfo},
+    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
@@ -408,7 +408,11 @@ fn truncate(s: &str, max: usize) -> String {
 impl ServerHandler for ClauthServer {
     fn get_info(&self) -> ServerInfo {
         // ServerInfo is #[non_exhaustive]; build from default then set fields.
+        // Tools capability must be advertised explicitly: ServerInfo::default() leaves
+        // capabilities empty, so a spec-compliant client (Claude Code) exposes no tools
+        // at all even though the server can answer tools/list.
         let mut info = ServerInfo::default();
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(build_instructions());
         info
     }
