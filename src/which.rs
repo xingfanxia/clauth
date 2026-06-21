@@ -20,27 +20,57 @@ use anyhow::Result;
 use crate::format::endpoint_label;
 use crate::profile::{AppConfig, ClaudeCredentials, Profile, claude_dir, load_config};
 
+/// Which resolution branch attributed the loaded credentials to a profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// Exact `refreshToken` match against a stored profile.
+    RefreshMatch,
+    /// Profile named by a `clauth start` runtime `CLAUDE_CONFIG_DIR`.
+    SessionDir,
+    /// Fresh first-login attributed to the credential-less active profile.
+    CredentialLessActive,
+}
+
+impl Source {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Source::RefreshMatch => "refresh_match",
+            Source::SessionDir => "session_dir",
+            Source::CredentialLessActive => "credential_less_active",
+        }
+    }
+}
+
 pub(crate) fn run(json: bool) -> Result<()> {
+    let config = load_config()?;
+    let resolved = resolve_active(&config);
+
+    if json {
+        emit_json(&config, resolved);
+    } else {
+        emit_plain(resolved.as_ref().map(|(name, _)| name.as_str()));
+    }
+    Ok(())
+}
+
+/// Gather the session env + loaded credentials and resolve them to the owning
+/// profile, returning an owned name plus the branch that matched, or `None` when
+/// nothing matched. Shared by `clauth which` and the MCP `which` tool.
+pub(crate) fn resolve_active(config: &AppConfig) -> Option<(String, Source)> {
     let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
     let session_profile = config_dir
         .as_deref()
         .and_then(session_profile_from_config_dir);
-    let path = credentials_path(config_dir.as_deref())?;
-    let creds = read_credentials(&path);
-    let config = load_config()?;
-    let matched = resolve_profile(
-        &config,
+    let creds = credentials_path(config_dir.as_deref())
+        .ok()
+        .and_then(|path| read_credentials(&path));
+    resolve_profile(
+        config,
         creds.as_ref(),
         config_dir.is_some(),
         session_profile.as_deref(),
-    );
-
-    if json {
-        emit_json(&config, matched);
-    } else {
-        emit_plain(matched);
-    }
-    Ok(())
+    )
+    .map(|(name, source)| (name.to_string(), source))
 }
 
 fn credentials_path(config_dir: Option<&Path>) -> Result<PathBuf> {
@@ -82,20 +112,22 @@ fn resolve_profile<'a>(
     creds: Option<&ClaudeCredentials>,
     in_session: bool,
     session_profile: Option<&str>,
-) -> Option<&'a str> {
+) -> Option<(&'a str, Source)> {
     if let Some(name) = creds
         .and_then(ClaudeCredentials::refresh_token)
         .and_then(|rt| match_by_refresh_token(config, rt))
     {
-        return Some(name);
+        return Some((name, Source::RefreshMatch));
     }
     if let Some(profile) = session_profile.and_then(|n| config.find(n)) {
-        return Some(profile.name.as_str());
+        return Some((profile.name.as_str(), Source::SessionDir));
     }
     if in_session {
         return None;
     }
-    creds.and_then(|c| match_credential_less_active(config, c))
+    creds
+        .and_then(|c| match_credential_less_active(config, c))
+        .map(|name| (name, Source::CredentialLessActive))
 }
 
 /// Matches a fresh first-login to the credential-less active profile.
@@ -135,10 +167,11 @@ fn emit_plain(matched: Option<&str>) {
     }
 }
 
-fn emit_json(config: &AppConfig, matched: Option<&str>) {
-    let profile = matched.and_then(|n| config.find(n));
+fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
+    let profile = resolved.as_ref().and_then(|(name, _)| config.find(name));
     let value = serde_json::json!({
         "profile": profile.map(|p| &p.name),
+        "source": resolved.as_ref().map(|(_, s)| s.as_str()),
         "tier": profile.map(endpoint_label),
         "oauth": profile.map(Profile::is_oauth),
         "active": profile.is_some_and(|p| config.is_active(&p.name)),

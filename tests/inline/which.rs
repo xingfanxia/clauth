@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::*;
 use std::collections::BTreeMap;
 
@@ -141,7 +143,7 @@ fn attributes_unmatched_login_to_credential_less_active() {
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
         resolve_profile(&config, Some(&live), false, None),
-        Some("new")
+        Some(("new", Source::CredentialLessActive))
     );
 }
 
@@ -157,7 +159,7 @@ fn token_match_wins_over_credential_less_active() {
     let live = live_oauth(Some("rt-personal"));
     assert_eq!(
         resolve_profile(&config, Some(&live), false, None),
-        Some("personal")
+        Some(("personal", Source::RefreshMatch))
     );
 }
 
@@ -204,7 +206,7 @@ fn token_match_still_works_inside_session() {
     let live = live_oauth(Some("rt-work"));
     assert_eq!(
         resolve_profile(&config, Some(&live), true, None),
-        Some("work")
+        Some(("work", Source::RefreshMatch))
     );
 }
 
@@ -218,7 +220,7 @@ fn resolves_started_profile_in_runtime_session() {
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
         resolve_profile(&config, Some(&live), true, Some("new")),
-        Some("new")
+        Some(("new", Source::SessionDir))
     );
 }
 
@@ -228,7 +230,7 @@ fn started_profile_resolves_with_no_loaded_creds() {
     let config = config_with(vec![blank_profile("new")], Some("work"));
     assert_eq!(
         resolve_profile(&config, None, true, Some("new")),
-        Some("new")
+        Some(("new", Source::SessionDir))
     );
 }
 
@@ -245,7 +247,7 @@ fn token_match_wins_over_started_profile() {
     let live = live_oauth(Some("rt-personal"));
     assert_eq!(
         resolve_profile(&config, Some(&live), true, Some("new")),
-        Some("personal")
+        Some(("personal", Source::RefreshMatch))
     );
 }
 
@@ -257,6 +259,16 @@ fn unknown_started_profile_is_not_resolved() {
     assert_eq!(
         resolve_profile(&config, Some(&live), true, Some("ghost")),
         None
+    );
+}
+
+#[test]
+fn source_maps_to_wire_strings() {
+    assert_eq!(Source::RefreshMatch.as_str(), "refresh_match");
+    assert_eq!(Source::SessionDir.as_str(), "session_dir");
+    assert_eq!(
+        Source::CredentialLessActive.as_str(),
+        "credential_less_active"
     );
 }
 
