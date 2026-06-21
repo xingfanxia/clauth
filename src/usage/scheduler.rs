@@ -549,7 +549,9 @@ fn update_rate_limit_streak(streaks: &RateLimitStreaks, name: &str, status: Fetc
     }
 }
 
-/// Write one outcome into the shared stores. Disk cache written on every live response.
+/// Write one outcome into the shared stores; returns the stamped next-fetch base
+/// (`last_fetched`) so the caller republishes this profile's countdown the instant
+/// it lands. Disk cache written on every live response.
 fn apply_outcome(
     outcome: FetchOutcome,
     store: &UsageStore,
@@ -557,7 +559,7 @@ fn apply_outcome(
     last_fetched: &LastFetchedAt,
     streaks: &RateLimitStreaks,
     interval_ms: u64,
-) {
+) -> EpochMs {
     let now = EpochMs::from_millis(now_ms());
 
     // Only a body that came off the live API may overwrite shared state. The
@@ -593,17 +595,16 @@ fn apply_outcome(
     } else {
         IntervalMs::from_millis(0)
     };
+    let stamped = now.saturating_add(defer).saturating_add(spread);
 
     // Both in one critical section — ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350).
     if let Ok(mut lf) = last_fetched.lock() {
-        lf.insert(
-            outcome.name.clone(),
-            now.saturating_add(defer).saturating_add(spread),
-        );
+        lf.insert(outcome.name.clone(), stamped);
         if let Ok(mut st) = status.lock() {
             st.insert(outcome.name.clone(), outcome.status);
         }
     }
+    stamped
 }
 
 /// Optimistically mark a just-kicked profile's 5h window open in the store. A
@@ -848,7 +849,14 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.clone(), FetchStatus::Fresh);
                 }
-                stamp_last_fetched(&state.last_fetched, name, None, false, interval_ms);
+                stamp_last_fetched(
+                    &state.last_fetched,
+                    &state.next_refresh_per_profile,
+                    name,
+                    None,
+                    false,
+                    interval_ms,
+                );
             }
             Ok(Err(err)) => {
                 clear_activity(&state.activity, &name);
@@ -885,6 +893,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 }
                 stamp_last_fetched(
                     &state.last_fetched,
+                    &state.next_refresh_per_profile,
                     name,
                     retry_after,
                     matches!(status, FetchStatus::RateLimited),
@@ -906,6 +915,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
 /// (capped by [`MAX_RETRY_AFTER_MS`]).
 fn stamp_last_fetched(
     last_fetched: &LastFetchedAt,
+    next_refresh: &NextRefreshPerProfile,
     name: String,
     retry_after: Option<Duration>,
     rate_limited: bool,
@@ -914,9 +924,11 @@ fn stamp_last_fetched(
     // Third-party providers are independent hosts with their own limits; keep the
     // flat base backoff (streak 1) rather than the per-account exponential ramp.
     let defer = next_slot_deferral(rate_limited, retry_after, 1, interval_ms);
+    let stamped = EpochMs::from_millis(now_ms()).saturating_add(defer);
     if let Ok(mut lf) = last_fetched.lock() {
-        lf.insert(name, EpochMs::from_millis(now_ms()).saturating_add(defer));
+        lf.insert(name.clone(), stamped);
     }
+    publish_one_countdown(next_refresh, name, stamped, interval_ms);
 }
 
 /// Partition a leg's snapshot into due entries + per-profile countdowns, with
@@ -958,6 +970,23 @@ fn publish_countdowns(
     }
 }
 
+/// Republish one profile's countdown (`stamped + interval`, mirroring
+/// [`partition_due`]) the instant its fetch lands, so the timer jumps straight
+/// from the fetch spinner to the real interval instead of holding the pre-fetch
+/// `0s` until the whole batch finishes. Per-key insert (not the full clear+replace
+/// of [`publish_countdowns`]) so it can't drop the other leg's keys. NEXT_REFRESH
+/// (1100) is acquired alone, after the caller's lower-ranked locks — rank-safe.
+fn publish_one_countdown(
+    nrpp: &NextRefreshPerProfile,
+    name: String,
+    stamped: EpochMs,
+    interval_ms: u64,
+) {
+    if let Ok(mut map) = nrpp.lock() {
+        map.insert(name, stamped.as_millis().saturating_add(interval_ms));
+    }
+}
+
 /// Background scheduler state. Holds **cloned `Arc`s only** — no live lock guards —
 /// so the struct carries no lock rank. `tick` acquires individual mutexes in rank order.
 pub(crate) struct SchedulerState {
@@ -981,8 +1010,9 @@ pub(crate) struct SchedulerState {
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
-/// countdowns once, fan out fetches (OAuth + third-party), propagate rotated
-/// tokens, evaluate auto-switch chain.
+/// countdowns, fan out fetches (OAuth + third-party) that republish each
+/// profile's countdown as it lands, propagate rotated tokens, evaluate
+/// auto-switch chain.
 fn tick(state: &SchedulerState) {
     let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
 
@@ -1032,8 +1062,6 @@ fn tick(state: &SchedulerState) {
     let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
-    let fetched = !oauth_due.is_empty() || !tp_due.is_empty();
-
     if !oauth_due.is_empty() {
         for entry in &oauth_due {
             mark_activity(&state.activity, &entry.name, ProfileActivity::Fetching);
@@ -1066,12 +1094,18 @@ fn tick(state: &SchedulerState) {
                         entry.access_token = new_access.clone();
                         entry.refresh_token = new_refresh.clone();
                     }
-                    apply_outcome(
+                    let stamped = apply_outcome(
                         outcome,
                         &state.store,
                         &state.status,
                         &state.last_fetched,
                         &state.rate_limit_streaks,
+                        interval_ms,
+                    );
+                    publish_one_countdown(
+                        &state.next_refresh_per_profile,
+                        name,
+                        stamped,
                         interval_ms,
                     );
                 }
@@ -1084,31 +1118,10 @@ fn tick(state: &SchedulerState) {
     }
 
     // Third-party providers — same cadence, separate stores. Owns the forced
-    // names the OAuth leg didn't consume.
+    // names the OAuth leg didn't consume. Each landing fetch republishes its own
+    // countdown via `publish_one_countdown`, so no post-batch recompute is needed.
     if !tp_due.is_empty() {
         fetch_third_party_due(state, tp_due);
-    }
-
-    // Recompute deadlines after fetches so countdowns reflect fresh stamps —
-    // one publish, both legs. Skipped on a fully-idle tick (nothing changed, so
-    // the pre-fetch publish already holds).
-    if fetched {
-        let now = now_ms();
-        let (_, oauth_after) = partition_due(
-            &oauth_snapshot,
-            now,
-            &state.last_fetched,
-            &state.activity,
-            interval_ms,
-        );
-        let (_, tp_after) = partition_due(
-            &tp_snapshot,
-            now,
-            &state.last_fetched,
-            &state.activity,
-            interval_ms,
-        );
-        publish_countdowns(&state.next_refresh_per_profile, oauth_after, tp_after);
     }
 
     // Auto-switch: evaluate every tick (not only OAuth fetch ticks) so a

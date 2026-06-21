@@ -1190,21 +1190,26 @@ impl App {
             // are armed by the windowless scan in `on_tick` after bootstrap
             // clears `bootstrap_active` — no startup-only fetch or kick pass.
 
-            // Profiles left unseeded (no fresh cache) are guaranteed due on that
-            // first tick. Mark them Fetching now so the overview timer and usage
-            // header show the fetch spinner from first paint instead of a
-            // misleading "up to date"/blank countdown over the not-yet-fetched
-            // window. The first tick re-marks (idempotent) and clears on landing.
-            let unseeded: Vec<String> = match last_fetched.lock() {
+            // Profiles already due on the first tick — never-fetched (no cache) or
+            // a cache older than one interval — are marked Fetching now so the
+            // overview timer and usage header show the fetch spinner from first
+            // paint instead of a stale `0s` countdown over the past deadline (a
+            // never-fetched profile's deadline is `0 + interval`, always in the
+            // past). The first tick re-marks (idempotent) and clears on landing.
+            let now = now_ms();
+            let due_now: Vec<String> = match last_fetched.lock() {
                 Ok(lf) => snapshot
                     .iter()
                     .map(|e| e.name.clone())
                     .chain(third_party.iter().map(|e| e.name.clone()))
-                    .filter(|n| !lf.contains_key(n))
+                    .filter(|n| {
+                        lf.get(n)
+                            .is_none_or(|t| t.as_millis().saturating_add(interval_ms) <= now)
+                    })
                     .collect(),
                 Err(_) => Vec::new(),
             };
-            for name in &unseeded {
+            for name in &due_now {
                 mark_activity(&activity, name, ProfileActivity::Fetching);
             }
         });
