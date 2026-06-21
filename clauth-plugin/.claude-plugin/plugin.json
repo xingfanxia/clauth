@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "clauth",
+  "version": "0.1.0",
+  "description": "Expose clauth profiles to the session: list/usage, switch, delegate.",
+  "author": {
+    "name": "uwuclxdy"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/uwuclxdy/clauth",
+  "repository": "https://github.com/uwuclxdy/clauth",
+  "keywords": ["claude-code", "oauth", "profiles", "mcp", "account-switch"],
+  "mcpServers": {
+    "clauth": {
+      "command": "clauth",
+      "args": ["mcp"]
+    }
+  }
+}

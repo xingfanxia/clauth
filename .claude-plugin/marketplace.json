@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "clauth",
+  "owner": {
+    "name": "uwuclxdy"
+  },
+  "plugins": [
+    {
+      "name": "clauth",
+      "source": "./clauth-plugin",
+      "version": "0.1.0",
+      "category": "developer-tools"
+    }
+  ]
+}
