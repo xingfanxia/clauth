@@ -191,7 +191,7 @@ fn count_cache_toggle_switches_token_basis() {
 #[test]
 fn normal_form_shows_all_tabs() {
     let app = empty_app(Tab::Overview);
-    let s = render_tabs(&app, 70);
+    let s = render_tabs(&app, 75);
     assert!(s.contains("overview"), "active tab missing");
     assert!(s.contains("usage"), "inactive tab missing");
     assert!(s.contains("tokens"), "inactive tab missing");
@@ -199,20 +199,21 @@ fn normal_form_shows_all_tabs() {
     assert!(s.contains("fallback"), "inactive tab missing");
     assert!(s.contains("config"), "inactive tab missing");
     assert!(s.contains("status"), "inactive tab missing");
+    assert!(s.contains("plugin"), "inactive tab missing");
 }
 
 #[test]
 fn normal_form_labels_untruncated_at_tight_boundary() {
     let app = empty_app(Tab::Overview);
-    // 7 labels (44 cols) + 6×3 separators = 62: the tight all-tabs-fit boundary.
-    let s = render_tabs(&app, 62);
+    // 8 labels (50 cols) + 7×3 separators = 71: the tight all-tabs-fit boundary.
+    let s = render_tabs(&app, 71);
     assert!(
         s.contains("overview"),
         "overview must not be truncated at tight boundary"
     );
     assert!(
-        s.contains("status"),
-        "status must not be truncated at tight boundary"
+        s.contains("plugin"),
+        "plugin must not be truncated at tight boundary"
     );
 }
 
@@ -261,7 +262,7 @@ fn overflow_no_left_chevron_at_first_tab() {
 
 #[test]
 fn overflow_no_right_chevron_at_last_tab() {
-    let app = empty_app(Tab::Status);
+    let app = empty_app(Tab::Plugin);
     let s = render_tabs(&app, 12);
     assert!(
         s.contains('‹'),

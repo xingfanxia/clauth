@@ -9,6 +9,7 @@ mod lockorder;
 mod mcp;
 mod oauth;
 mod platform;
+mod plugin_probe;
 mod poll;
 mod pricing;
 mod profile;

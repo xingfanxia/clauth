@@ -83,6 +83,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::DiscardDivergence(_) => "CONFIRM",
         ConfirmAction::RotateAll => "CONFIRM",
         ConfirmAction::RotateOne(_) => "CONFIRM",
+        ConfirmAction::WireMcpServers => "CONFIRM",
     };
 
     // Destructive/global ops carry a DANGER cue on their confirm button.
@@ -357,6 +358,16 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("\u{2191}\u{2193}", "pick incident / scroll detail"),
                 ("\u{23ce}", "open incident timeline"),
                 ("r", "refresh the feed"),
+            ][..],
+        )],
+        Tab::Plugin => vec![(
+            "plugin",
+            &[
+                ("\u{2191}\u{2193}", "pick check / profile · scroll detail"),
+                ("\u{23ce}", "open the selected row's detail"),
+                ("f", "apply the selected row's fix"),
+                ("r", "re-run all checks"),
+                ("esc", "back to the list"),
             ][..],
         )],
         Tab::Fallback => vec![(

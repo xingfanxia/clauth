@@ -8,7 +8,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackFocus, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS,
-    GlobalConfigRow, StatusFocus, Tab, TokenView, config_rows, fallback_hint,
+    GlobalConfigRow, PluginFocus, StatusFocus, Tab, TokenView, config_rows, fallback_hint,
 };
 use super::super::theme;
 
@@ -30,6 +30,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let has_sub_focus = (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
         || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
         || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
+        || (app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail)
         || (app.tab == Tab::Tokens && app.token_view == TokenView::Models);
     let q_label: &str = if has_sub_focus { "back" } else { "quit" };
 
@@ -120,6 +121,21 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("?", "help"),
             ],
             StatusFocus::Detail => &[("↑↓", "scroll"), ("a", "actions"), ("?", "help")],
+        },
+        Tab::Plugin => match app.plugin.focus {
+            PluginFocus::List => &[
+                ("↑↓", "row"),
+                ("↵", "detail"),
+                ("r", "refresh"),
+                ("f", "fix"),
+                ("?", "help"),
+            ],
+            PluginFocus::Detail => &[
+                ("↑↓", "scroll"),
+                ("r", "refresh"),
+                ("f", "fix"),
+                ("?", "help"),
+            ],
         },
         Tab::Fallback => match fallback_hint(app) {
             FallbackHint::Empty => &[("?", "help")],

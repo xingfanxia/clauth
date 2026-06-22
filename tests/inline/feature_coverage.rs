@@ -143,6 +143,16 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "total_cost_counts_unpriced",
         ],
     ),
+    (
+        "Integration health",
+        &[
+            "installed_records",
+            "marketplace_known",
+            "manual_mcp_wiring",
+            "wire_mcp_server",
+            "all_tabs_render",
+        ],
+    ),
 ];
 
 #[test]

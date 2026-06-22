@@ -333,6 +333,9 @@ pub(crate) enum ConfirmAction {
     /// Force-rotate one account's refresh token (action-menu "rotate tokens" on
     /// the focused account).
     RotateOne(String),
+    /// Plugin tab: write the `mcpServers.clauth` entry into `~/.claude.json`.
+    /// Reversible local write — non-destructive, so it keeps the plain button.
+    WireMcpServers,
 }
 
 #[derive(Debug, Clone)]
@@ -581,10 +584,12 @@ pub(crate) enum Tab {
     Config,
     /// Claude service status feed (incidents from status.claude.com).
     Status,
+    /// Claude Code integration health: MCP wiring, plugin install, per-profile runtime.
+    Plugin,
 }
 
 impl Tab {
-    pub(crate) const ALL: [Tab; 7] = [
+    pub(crate) const ALL: [Tab; 8] = [
         Tab::Overview,
         Tab::Usage,
         Tab::Tokens,
@@ -592,6 +597,7 @@ impl Tab {
         Tab::Fallback,
         Tab::Config,
         Tab::Status,
+        Tab::Plugin,
     ];
 
     pub(crate) fn title(self) -> &'static str {
@@ -603,6 +609,7 @@ impl Tab {
             Tab::Fallback => "Fallback",
             Tab::Config => "Config",
             Tab::Status => "Status",
+            Tab::Plugin => "Plugin",
         }
     }
 
@@ -726,6 +733,125 @@ pub(crate) fn incident_is_active(incident: &Incident) -> bool {
     incident.is_active()
 }
 
+// ── Plugin tab ─────────────────────────────────────────────────────────────────
+
+/// Which Plugin pane has focus. `List`: the checks + profiles selector (↑↓ moves,
+/// ⏎ descends, `f` fixes). `Detail`: the selected row's readout (↑↓ scrolls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PluginFocus {
+    List,
+    Detail,
+}
+
+/// Health bucket for a row's status dot — the same success / warning / danger
+/// buckets as the header `● status.claude.ai` dot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Health {
+    Ok,
+    Warn,
+    Danger,
+}
+
+/// A one-key fix offered on the selected row. `WireMcpServers` writes the manual
+/// entry (a [`ConfirmAction`]); `RepairDivergence` re-raises the existing
+/// divergence resolver for the named (active) profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PluginFix {
+    WireMcpServers,
+    RepairDivergence(String),
+}
+
+/// A computed integration-check row (global, profile-independent).
+#[derive(Debug, Clone)]
+pub(crate) struct Check {
+    pub(crate) label: &'static str,
+    pub(crate) health: Health,
+    /// Terse value shown right-aligned in the selector row.
+    pub(crate) value: String,
+    /// Full readout for the detail pane, one entry per line.
+    pub(crate) detail: Vec<String>,
+    pub(crate) fix: Option<PluginFix>,
+}
+
+/// A computed per-profile runtime row.
+#[derive(Debug, Clone)]
+pub(crate) struct ProfileRow {
+    pub(crate) name: String,
+    pub(crate) active: bool,
+    pub(crate) health: Health,
+    /// Terse selector value, e.g. `live opus ok`.
+    pub(crate) summary: String,
+    pub(crate) detail: Vec<String>,
+    pub(crate) fix: Option<PluginFix>,
+}
+
+/// UI-thread-only state for the Plugin tab. Recomputed synchronously on tab focus
+/// and on `r`; there is no background thread (all reads are local FS/`PATH`;
+/// `claude --version` is one cached subprocess gated by [`PluginState::cc_version`]).
+#[derive(Debug)]
+pub(crate) struct PluginState {
+    pub(crate) focus: PluginFocus,
+    /// Cursor across both groups: `0..checks.len()` then the profile rows.
+    pub(crate) cursor: usize,
+    pub(crate) detail_scroll: u16,
+    /// Max valid `detail_scroll` from the last render (`&App` interior mutability,
+    /// clamped by the key handler — same pattern as `StatusState`).
+    pub(crate) detail_max_scroll: std::cell::Cell<u16>,
+    /// True while a `claude --version` probe is in flight (title spinner). The
+    /// probe is synchronous, so this is mostly belt-and-suspenders for the spec.
+    pub(crate) fetching: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) checks: Vec<Check>,
+    pub(crate) profiles: Vec<ProfileRow>,
+    /// Cached `claude --version`: `None` = unprobed, `Some(None)` = probed and
+    /// missing/unparseable, `Some(Some(v))` = the version string. Re-probed only
+    /// on an explicit `r` so a tab switch never re-spawns the subprocess.
+    pub(crate) cc_version: Option<Option<String>>,
+}
+
+impl Default for PluginState {
+    fn default() -> Self {
+        Self {
+            focus: PluginFocus::List,
+            cursor: 0,
+            detail_scroll: 0,
+            detail_max_scroll: std::cell::Cell::new(0),
+            fetching: false,
+            error: None,
+            checks: Vec::new(),
+            profiles: Vec::new(),
+            cc_version: None,
+        }
+    }
+}
+
+impl PluginState {
+    /// Total selectable rows across both groups.
+    pub(crate) fn row_count(&self) -> usize {
+        self.checks.len() + self.profiles.len()
+    }
+
+    /// The check under the cursor, if the cursor sits in the integration group.
+    pub(crate) fn selected_check(&self) -> Option<&Check> {
+        self.checks.get(self.cursor)
+    }
+
+    /// The profile row under the cursor, if the cursor sits in the profile group.
+    pub(crate) fn selected_profile(&self) -> Option<&ProfileRow> {
+        self.cursor
+            .checked_sub(self.checks.len())
+            .and_then(|idx| self.profiles.get(idx))
+    }
+
+    /// The fix offered by the row under the cursor, if any.
+    pub(crate) fn selected_fix(&self) -> Option<&PluginFix> {
+        match self.selected_check() {
+            Some(check) => check.fix.as_ref(),
+            None => self.selected_profile().and_then(|row| row.fix.as_ref()),
+        }
+    }
+}
+
 // ── Footer alert ─────────────────────────────────────────────────────────────
 
 /// A transient message that replaces the hint bar in place until dismissed.
@@ -843,6 +969,9 @@ pub(crate) struct App {
     pub(crate) status_events: std::sync::mpsc::Receiver<StatusEvent>,
     /// Manual-refresh signal to the status thread; a `()` triggers a refetch.
     pub(crate) status_refresh: std::sync::mpsc::Sender<()>,
+
+    /// Plugin tab state; UI-thread-only, recomputed on focus + `r` (no thread).
+    pub(crate) plugin: PluginState,
 
     /// Global token-usage stats read from `~/.claude` (stats-cache + recent
     /// transcript top-up); `None` until the loader posts its first result.
@@ -1085,6 +1214,7 @@ impl App {
             status: StatusState::default(),
             status_events,
             status_refresh,
+            plugin: PluginState::default(),
             token_stats: None,
             token_view: TokenView::Dashboard,
             token_model_cursor: 0,
@@ -1720,6 +1850,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 trigger_status_refresh(app);
                 return;
             }
+            // Plugin checks re-run synchronously; `r` also re-probes `claude --version`.
+            if app.tab == Tab::Plugin {
+                recompute_plugin_checks(app, true);
+                app.toast(ToastKind::Info, "re-running plugin checks");
+                return;
+            }
             // Tokens `r` reloads the on-disk stats + recent transcripts, and
             // refetches model prices for the cost lens.
             if app.tab == Tab::Tokens {
@@ -1776,6 +1912,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 leave_fallback_detail(app);
             } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
                 app.status.focus = StatusFocus::List;
+            } else if app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail {
+                app.plugin.focus = PluginFocus::List;
             } else if app.tab == Tab::Tokens && app.token_view == TokenView::Models {
                 app.token_view = TokenView::Dashboard;
             }
@@ -1788,6 +1926,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             let has_sub_focus = (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
                 || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
                 || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
+                || (app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail)
                 || (app.tab == Tab::Tokens && app.token_view == TokenView::Models);
             if has_sub_focus {
                 app.disarm_quit();
@@ -1798,6 +1937,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                     leave_fallback_detail(app);
                 } else if app.tab == Tab::Tokens {
                     app.token_view = TokenView::Dashboard;
+                } else if app.tab == Tab::Plugin {
+                    app.plugin.focus = PluginFocus::List;
                 } else {
                     app.status.focus = StatusFocus::List;
                 }
@@ -1837,6 +1978,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         Tab::Fallback => handle_fallback_key(app, key),
         Tab::Config => handle_global_config_key(app, key),
         Tab::Status => handle_status_key(app, key),
+        Tab::Plugin => handle_plugin_key(app, key),
     }
 }
 
@@ -1912,6 +2054,13 @@ fn switch_tab(app: &mut App, tab: Tab) {
         Tab::Status => {
             // Keep the incident cursor; reset focus to the list per the contract.
             app.status.focus = StatusFocus::List;
+        }
+        Tab::Plugin => {
+            app.plugin.focus = PluginFocus::List;
+            app.plugin.cursor = 0;
+            app.plugin.detail_scroll = 0;
+            // Recompute on focus; the cached `claude --version` is not re-probed.
+            recompute_plugin_checks(app, false);
         }
     }
 }
@@ -1991,6 +2140,357 @@ fn trigger_status_refresh(app: &mut App) {
     let _ = app.status_refresh.send(());
     app.status.fetching = true;
     app.toast(ToastKind::Info, "refreshing status");
+}
+
+/// Plugin tab keymap. List focus: ↑↓ moves the cursor (wrapping over both
+/// groups), ⏎ descends to the detail pane, `f` applies the selected row's fix.
+/// Detail focus: ↑↓ scrolls (clamped by the render pass); `f` still fixes.
+fn handle_plugin_key(app: &mut App, key: KeyEvent) {
+    match app.plugin.focus {
+        PluginFocus::List => {
+            let len = app.plugin.row_count();
+            match key.code {
+                KeyCode::Up if len > 0 => {
+                    app.plugin.cursor = (app.plugin.cursor + len - 1) % len;
+                    app.plugin.detail_scroll = 0;
+                }
+                KeyCode::Down if len > 0 => {
+                    app.plugin.cursor = (app.plugin.cursor + 1) % len;
+                    app.plugin.detail_scroll = 0;
+                }
+                KeyCode::Enter if len > 0 => {
+                    app.plugin.focus = PluginFocus::Detail;
+                    app.plugin.detail_scroll = 0;
+                }
+                KeyCode::Char('f') => apply_plugin_fix(app),
+                _ => {}
+            }
+        }
+        PluginFocus::Detail => match key.code {
+            KeyCode::Up => {
+                app.plugin.detail_scroll = app.plugin.detail_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = app.plugin.detail_max_scroll.get();
+                app.plugin.detail_scroll = app.plugin.detail_scroll.saturating_add(1).min(max);
+            }
+            KeyCode::Char('f') => apply_plugin_fix(app),
+            _ => {}
+        },
+    }
+}
+
+/// Apply the selected row's fix. `WireMcpServers` opens a confirm modal; a
+/// diverged active profile re-raises the existing 3-way divergence resolver.
+fn apply_plugin_fix(app: &mut App) {
+    let Some(fix) = app.plugin.selected_fix().cloned() else {
+        return;
+    };
+    match fix {
+        PluginFix::WireMcpServers => {
+            app.disarm_quit();
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: "Wire clauth into Claude Code's mcpServers?".to_string(),
+                detail: Some(
+                    "Writes the clauth entry into ~/.claude.json; other fields are preserved."
+                        .to_string(),
+                ),
+                choice: false,
+                on_confirm: ConfirmAction::WireMcpServers,
+            }));
+        }
+        PluginFix::RepairDivergence(name) => {
+            app.disarm_quit();
+            app.modals.push(Modal::Divergence(DivergenceForm {
+                active: name,
+                cursor: 0,
+            }));
+        }
+    }
+}
+
+/// Recompute the Plugin tab's integration checks and per-profile rows. Every read
+/// is a local FS/`PATH` check; `claude --version` runs only when `refresh_version`
+/// is set or the cached result is absent. Synchronous — no background thread.
+fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
+    use crate::plugin_probe as probe;
+
+    app.plugin.error = None;
+
+    // CC version is cached; a tab switch reuses it, only `r` re-probes. Skipped
+    // under test so the suite never spawns the real `claude` binary.
+    if refresh_version || app.plugin.cc_version.is_none() {
+        app.plugin.fetching = true;
+        app.plugin.cc_version = Some(if cfg!(test) {
+            None
+        } else {
+            probe::cc_version()
+        });
+        app.plugin.fetching = false;
+    }
+    let cc_version = app.plugin.cc_version.clone().flatten();
+
+    let mut checks: Vec<Check> = Vec::with_capacity(4);
+
+    // clauth on PATH — CC spawns `clauth mcp` by name, so resolution is required.
+    let clauth_path = probe::on_path("clauth");
+    checks.push(Check {
+        label: "clauth PATH",
+        health: if clauth_path.is_some() {
+            Health::Ok
+        } else {
+            Health::Danger
+        },
+        value: if clauth_path.is_some() {
+            "resolved".to_string()
+        } else {
+            "not found".to_string()
+        },
+        detail: match &clauth_path {
+            Some(path) => vec![format!("resolved: {}", path.display())],
+            None => vec![
+                "clauth is not on PATH.".to_string(),
+                "Claude Code spawns `clauth mcp` by name, so the server won't start.".to_string(),
+                "install clauth so its bin directory is on PATH.".to_string(),
+            ],
+        },
+        fix: None,
+    });
+
+    // mcpServers wiring — a plugin install OR a manual `mcpServers.clauth` entry.
+    let records = probe::installed_records();
+    let installed = !records.is_empty();
+    let wiring = probe::manual_mcp_wiring();
+    let wired = installed || wiring != probe::McpWiring::None;
+    let mut mcp_detail = vec![
+        format!("present: {}", if wired { "yes" } else { "no" }),
+        match (installed, wiring) {
+            (true, _) => "source: plugin install".to_string(),
+            (false, probe::McpWiring::GlobalConfig) => {
+                "source: ~/.claude.json (manual)".to_string()
+            }
+            (false, probe::McpWiring::ProjectFile) => "source: ./.mcp.json (manual)".to_string(),
+            (false, probe::McpWiring::None) => "source: none".to_string(),
+        },
+        format!(
+            "tools advertised: {}/{}",
+            probe::MCP_TOOLS.len(),
+            probe::MCP_TOOLS.len()
+        ),
+        format!("  {}", probe::MCP_TOOLS.join(", ")),
+    ];
+    if !wired {
+        mcp_detail.push(String::new());
+        mcp_detail.push("[f] write the clauth entry into ~/.claude.json".to_string());
+    }
+    checks.push(Check {
+        label: "mcpServers",
+        health: if wired { Health::Ok } else { Health::Warn },
+        value: if wired {
+            "wired".to_string()
+        } else {
+            "not wired".to_string()
+        },
+        detail: mcp_detail,
+        fix: (!wired).then_some(PluginFix::WireMcpServers),
+    });
+
+    // plugin install record — installed-only verdict (CC exposes no clean per-scope
+    // "enabled" boolean, so v1 reports presence + scope, not enabled/disabled).
+    let marketplace = probe::marketplace_known();
+    let plugin_check = if let Some(record) = records.first() {
+        let mut detail = vec![format!(
+            "installed: yes ({})",
+            record.scope.clone().unwrap_or_else(|| "?".to_string())
+        )];
+        if let Some(version) = &record.version {
+            detail.push(format!("version: {version}"));
+        }
+        if let Some(sha) = &record.git_commit_sha {
+            detail.push(format!(
+                "commit: {}",
+                sha.chars().take(7).collect::<String>()
+            ));
+        }
+        if let Some(at) = &record.installed_at {
+            detail.push(format!("installed at: {at}"));
+        }
+        if let Some(project) = &record.project_path {
+            detail.push(format!("project: {project}"));
+        }
+        if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
+            detail.push(format!("marketplace: {repo}"));
+        }
+        Check {
+            label: "plugin",
+            health: Health::Ok,
+            value: "installed".to_string(),
+            detail,
+            fix: None,
+        }
+    } else {
+        let known = marketplace.is_some();
+        let mut detail = vec![format!(
+            "installed: no ({})",
+            if known {
+                "marketplace known"
+            } else {
+                "marketplace unknown"
+            }
+        )];
+        if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
+            detail.push(format!("marketplace: {repo}"));
+        }
+        detail.push(String::new());
+        detail.push("install (run in Claude Code):".to_string());
+        detail.push("  /plugin marketplace add uwuclxdy/clauth".to_string());
+        detail.push("  /plugin install clauth@clauth".to_string());
+        Check {
+            label: "plugin",
+            health: Health::Warn,
+            value: if known {
+                "not installed".to_string()
+            } else {
+                "unknown".to_string()
+            },
+            detail,
+            fix: None,
+        }
+    };
+    checks.push(plugin_check);
+
+    // CC version — `claude --version` only; no "newer available" probe.
+    checks.push(Check {
+        label: "CC version",
+        health: if cc_version.is_some() {
+            Health::Ok
+        } else {
+            Health::Warn
+        },
+        value: cc_version.clone().unwrap_or_else(|| "unknown".to_string()),
+        detail: match &cc_version {
+            Some(version) => vec![format!("claude --version: {version}")],
+            None => vec![
+                "`claude --version` failed or claude is not on PATH.".to_string(),
+                "install Claude Code so the `claude` binary resolves.".to_string(),
+            ],
+        },
+        fix: None,
+    });
+
+    app.plugin.checks = checks;
+
+    // Per-profile rows. Snapshot under the config lock, then drop it before the
+    // FS reads (`has_live_session`, `classify_credentials_link`) so no lock is
+    // held across I/O.
+    struct Snap {
+        name: String,
+        active: bool,
+        model: String,
+        kind: String,
+        opus: Option<String>,
+        sonnet: Option<String>,
+        haiku: Option<String>,
+        subagent: Option<String>,
+    }
+    let snaps: Vec<Snap> = {
+        let cfg = app.config();
+        cfg.profiles
+            .iter()
+            .map(|p| Snap {
+                name: p.name.as_str().to_string(),
+                active: cfg.is_active(p.name.as_str()),
+                model: p
+                    .models
+                    .default
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string()),
+                kind: if p.is_oauth() {
+                    "oauth (anthropic)".to_string()
+                } else {
+                    p.base_url.clone().unwrap_or_else(|| "api".to_string())
+                },
+                opus: p.models.opus.clone(),
+                sonnet: p.models.sonnet.clone(),
+                haiku: p.models.haiku.clone(),
+                subagent: p.models.subagent.clone(),
+            })
+            .collect()
+    };
+
+    let mut rows: Vec<ProfileRow> = Vec::with_capacity(snaps.len());
+    for snap in snaps {
+        let live = crate::runtime::has_live_session(&snap.name);
+        // Divergence is only meaningful for the active profile — its credentials
+        // are the ones linked into ~/.claude. Non-active profiles can't diverge.
+        let link = if snap.active {
+            classify_credentials_link(&snap.name).ok()
+        } else {
+            None
+        };
+        let diverged = matches!(link, Some(LinkState::Diverged));
+        let (health, state_label, fix) = if diverged {
+            (
+                Health::Warn,
+                "diverged",
+                Some(PluginFix::RepairDivergence(snap.name.clone())),
+            )
+        } else if snap.active && matches!(link, Some(LinkState::Missing)) {
+            (Health::Warn, "no creds", None)
+        } else {
+            (Health::Ok, "ok", None)
+        };
+        let session = if live { "live" } else { "idle" };
+        let summary = format!("{session} {} {state_label}", snap.model);
+
+        let mut detail = vec![
+            format!("type: {}", snap.kind),
+            format!("active: {}", if snap.active { "yes" } else { "no" }),
+            format!("session: {session}"),
+            format!("model: {}", snap.model),
+        ];
+        for (label, value) in [
+            ("opus", &snap.opus),
+            ("sonnet", &snap.sonnet),
+            ("haiku", &snap.haiku),
+            ("subagent", &snap.subagent),
+        ] {
+            if let Some(value) = value {
+                detail.push(format!("  {label}: {value}"));
+            }
+        }
+        if let Ok(dir) = crate::profile::profile_subpath(&snap.name, "runtime") {
+            detail.push(format!("runtime: {}", dir.display()));
+        }
+        detail.push(format!(
+            "link: {}",
+            match link {
+                Some(LinkState::LinkedTo) => "linked",
+                Some(LinkState::Diverged) => "diverged",
+                Some(LinkState::Missing) => "missing",
+                None => "\u{2014}",
+            }
+        ));
+        if diverged {
+            detail.push(String::new());
+            detail.push("[f] repair via the divergence resolver".to_string());
+        }
+        rows.push(ProfileRow {
+            name: snap.name,
+            active: snap.active,
+            health,
+            summary,
+            detail,
+            fix,
+        });
+    }
+    app.plugin.profiles = rows;
+
+    // Keep the cursor in range after the row set changes.
+    let max = app.plugin.row_count().saturating_sub(1);
+    if app.plugin.cursor > max {
+        app.plugin.cursor = max;
+    }
 }
 
 /// Open the selected incident's page in the default browser (detached).
@@ -2905,6 +3405,8 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 actions.push(OpenIncidentLink);
             }
         }
+        // Plugin: no action menu — `r` re-runs checks, `f` fixes, ⏎/esc navigate.
+        Tab::Plugin => {}
     }
 
     ActionMenuState::new(actions)
@@ -4110,6 +4612,16 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 oauth::rotate_one(&config, &target, &refetch, &activity, &sender);
             });
             app.toast(ToastKind::Info, format!("rotating '{name}'"));
+        }
+        ConfirmAction::WireMcpServers => {
+            match crate::plugin_probe::wire_mcp_server() {
+                Ok(()) => {
+                    app.toast(ToastKind::Success, "wired clauth into ~/.claude.json");
+                    // Reflect the new wiring in the rows without a fresh version probe.
+                    recompute_plugin_checks(app, false);
+                }
+                Err(e) => app.toast(ToastKind::Danger, format!("wire failed: {e}")),
+            }
         }
     }
 }

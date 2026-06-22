@@ -743,11 +743,13 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Status);
     press(&mut app, KeyCode::Right);
+    assert_eq!(app.tab, Tab::Plugin);
+    press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Overview, "→ wraps back to Overview");
     press(&mut app, KeyCode::Left);
-    assert_eq!(app.tab, Tab::Status, "← wraps to the last tab");
-    // Six ← from the last tab walk back to the first.
-    for _ in 0..6 {
+    assert_eq!(app.tab, Tab::Plugin, "← wraps to the last tab");
+    // Seven ← from the last tab walk back to the first.
+    for _ in 0..7 {
         press(&mut app, KeyCode::Left);
     }
     assert_eq!(app.tab, Tab::Overview);
@@ -1035,8 +1037,9 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right); // Setup → Fallback
     press(&mut app, KeyCode::Right); // Fallback → Config
     press(&mut app, KeyCode::Right); // Config → Status
+    press(&mut app, KeyCode::Right); // Status → Plugin
     // One more right wraps back to Overview
-    press(&mut app, KeyCode::Right); // Status → Overview
+    press(&mut app, KeyCode::Right); // Plugin → Overview
     assert_eq!(app.tab, Tab::Overview);
 
     // ── Quit ──
