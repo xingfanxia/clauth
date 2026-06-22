@@ -2299,10 +2299,11 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     // "enabled" boolean, so v1 reports presence + scope, not enabled/disabled).
     let marketplace = probe::marketplace_known();
     let plugin_check = if let Some(record) = records.first() {
-        let mut detail = vec![format!(
-            "installed: yes ({})",
-            record.scope.clone().unwrap_or_else(|| "?".to_string())
-        )];
+        let scope = record.scope.as_deref();
+        // "global" == CC `user` scope (active in every project). A `local`/`project`
+        // install binds clauth to one repo, so those warn and suggest a user install.
+        let is_global = records.iter().any(|r| r.scope.as_deref() == Some("user"));
+        let mut detail = vec![format!("installed: yes ({})", scope.unwrap_or("?"))];
         if let Some(version) = &record.version {
             detail.push(format!("version: {version}"));
         }
@@ -2321,12 +2322,38 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
             detail.push(format!("marketplace: {repo}"));
         }
-        Check {
-            label: "plugin",
-            health: Health::Ok,
-            value: "installed".to_string(),
-            detail,
-            fix: None,
+        if is_global {
+            Check {
+                label: "plugin",
+                health: Health::Ok,
+                value: "installed".to_string(),
+                detail,
+                fix: None,
+            }
+        } else {
+            detail.push(String::new());
+            detail.push("installed for this project only, not global.".to_string());
+            detail.push("make it global (run in shell):".to_string());
+            if let Some(scope) = scope {
+                detail.push(format!(
+                    "  claude plugin uninstall {} --scope {scope}",
+                    probe::PLUGIN_ID
+                ));
+            }
+            detail.push(format!(
+                "  claude plugin install {} --scope user",
+                probe::PLUGIN_ID
+            ));
+            Check {
+                label: "plugin",
+                health: Health::Warn,
+                value: match scope {
+                    Some(scope) => format!("{scope} only"),
+                    None => "not global".to_string(),
+                },
+                detail,
+                fix: None,
+            }
         }
     } else {
         let known = marketplace.is_some();

@@ -87,6 +87,57 @@ fn bare_app() -> App {
     })
 }
 
+/// Seed CC's plugin registry with one clauth install record at `scope`.
+fn write_plugin_install(scope: &str) {
+    let path = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("plugins")
+        .join("installed_plugins.json");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let body = serde_json::json!({
+        "plugins": { "clauth@clauth": [{ "scope": scope, "version": "0.1.0" }] }
+    });
+    std::fs::write(&path, serde_json::to_vec(&body).expect("serialize")).expect("write");
+}
+
+fn plugin_check(app: &App) -> &super::Check {
+    app.plugin
+        .checks
+        .iter()
+        .find(|c| c.label == "plugin")
+        .expect("plugin check present")
+}
+
+#[test]
+fn plugin_check_ok_when_installed_globally() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_plugin_install("user");
+    let mut app = bare_app();
+    super::recompute_plugin_checks(&mut app, false);
+    let check = plugin_check(&app);
+    assert_eq!(check.health, super::Health::Ok);
+    assert_eq!(check.value, "installed");
+}
+
+#[test]
+fn plugin_check_warns_and_suggests_global_when_project_local() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_plugin_install("local");
+    let mut app = bare_app();
+    super::recompute_plugin_checks(&mut app, false);
+    let check = plugin_check(&app);
+    assert_eq!(check.health, super::Health::Warn);
+    assert!(check.value.contains("local"));
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|line| line.contains("--scope user")),
+        "non-global install should suggest a user-scope install, got {:?}",
+        check.detail
+    );
+}
+
 #[test]
 fn compact_entry_sets_flag_no_toast() {
     let mut app = bare_app();
