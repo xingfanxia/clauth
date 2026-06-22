@@ -138,6 +138,40 @@ fn plugin_check_warns_and_suggests_global_when_project_local() {
     );
 }
 
+fn mcp_check(app: &App) -> &super::Check {
+    app.plugin
+        .checks
+        .iter()
+        .find(|c| c.label == "mcpServers")
+        .expect("mcpServers check present")
+}
+
+#[test]
+fn mcp_check_ok_when_globally_wired() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
+    let mut app = bare_app();
+    super::recompute_plugin_checks(&mut app, false);
+    let check = mcp_check(&app);
+    assert_eq!(check.health, super::Health::Ok);
+    assert_eq!(check.value, "wired");
+    assert!(check.fix.is_none());
+}
+
+#[test]
+fn mcp_check_warns_project_only_for_local_plugin() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // A project-scope plugin advertises the server for one repo only, and no
+    // global `~/.claude.json` entry exists in the sandbox to make it global.
+    write_plugin_install("local");
+    let mut app = bare_app();
+    super::recompute_plugin_checks(&mut app, false);
+    let check = mcp_check(&app);
+    assert_eq!(check.health, super::Health::Warn);
+    assert_eq!(check.value, "project only");
+    assert!(check.fix.is_some(), "should offer the global write fix");
+}
+
 #[test]
 fn compact_entry_sets_flag_no_toast() {
     let mut app = bare_app();

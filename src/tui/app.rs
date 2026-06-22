@@ -2257,21 +2257,34 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         fix: None,
     });
 
-    // mcpServers wiring — a plugin install OR a manual `mcpServers.clauth` entry.
+    // "global" == active in every project: a CC `user`-scope plugin install. A
+    // `local`/`project` install (or a `./.mcp.json`) binds clauth to one repo.
     let records = probe::installed_records();
     let installed = !records.is_empty();
+    let plugin_global = records.iter().any(|r| r.scope.as_deref() == Some("user"));
+
+    // mcpServers wiring — a plugin install OR a manual `mcpServers.clauth` entry.
+    // Globally wired = a `user`-scope plugin or the `~/.claude.json` entry; a
+    // project-scope plugin or a `./.mcp.json` wires this repo only, so it warns and
+    // offers the same global write fix as a missing wiring does.
     let wiring = probe::manual_mcp_wiring();
     let wired = installed || wiring != probe::McpWiring::None;
+    let globally_wired = plugin_global || wiring == probe::McpWiring::GlobalConfig;
+    let project_only = wired && !globally_wired;
+    let source = if plugin_global {
+        "source: plugin install (user)"
+    } else if wiring == probe::McpWiring::GlobalConfig {
+        "source: ~/.claude.json (manual)"
+    } else if installed {
+        "source: plugin install (project)"
+    } else if wiring == probe::McpWiring::ProjectFile {
+        "source: ./.mcp.json (manual)"
+    } else {
+        "source: none"
+    };
     let mut mcp_detail = vec![
         format!("present: {}", if wired { "yes" } else { "no" }),
-        match (installed, wiring) {
-            (true, _) => "source: plugin install".to_string(),
-            (false, probe::McpWiring::GlobalConfig) => {
-                "source: ~/.claude.json (manual)".to_string()
-            }
-            (false, probe::McpWiring::ProjectFile) => "source: ./.mcp.json (manual)".to_string(),
-            (false, probe::McpWiring::None) => "source: none".to_string(),
-        },
+        source.to_string(),
         format!(
             "tools advertised: {}/{}",
             probe::MCP_TOOLS.len(),
@@ -2279,20 +2292,29 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         ),
         format!("  {}", probe::MCP_TOOLS.join(", ")),
     ];
-    if !wired {
+    if !globally_wired {
         mcp_detail.push(String::new());
+        if project_only {
+            mcp_detail.push("wired for this project only, not global.".to_string());
+        }
         mcp_detail.push("[f] write the clauth entry into ~/.claude.json".to_string());
     }
     checks.push(Check {
         label: "mcpServers",
-        health: if wired { Health::Ok } else { Health::Warn },
-        value: if wired {
+        health: if globally_wired {
+            Health::Ok
+        } else {
+            Health::Warn
+        },
+        value: if globally_wired {
             "wired".to_string()
+        } else if project_only {
+            "project only".to_string()
         } else {
             "not wired".to_string()
         },
         detail: mcp_detail,
-        fix: (!wired).then_some(PluginFix::WireMcpServers),
+        fix: (!globally_wired).then_some(PluginFix::WireMcpServers),
     });
 
     // plugin install record — installed-only verdict (CC exposes no clean per-scope
@@ -2300,9 +2322,6 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     let marketplace = probe::marketplace_known();
     let plugin_check = if let Some(record) = records.first() {
         let scope = record.scope.as_deref();
-        // "global" == CC `user` scope (active in every project). A `local`/`project`
-        // install binds clauth to one repo, so those warn and suggest a user install.
-        let is_global = records.iter().any(|r| r.scope.as_deref() == Some("user"));
         let mut detail = vec![format!("installed: yes ({})", scope.unwrap_or("?"))];
         if let Some(version) = &record.version {
             detail.push(format!("version: {version}"));
@@ -2322,7 +2341,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
             detail.push(format!("marketplace: {repo}"));
         }
-        if is_global {
+        if plugin_global {
             Check {
                 label: "plugin",
                 health: Health::Ok,
