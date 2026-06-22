@@ -188,7 +188,7 @@ Once active, Claude Code can call four tools:
 
 **Two caveats to know:**
 
-- `switch` affects the **next** spawned session, not the one already running. Claude Code loads credentials once at startup and cannot hot-swap them.
+- `switch` relinks the global `~/.claude` credentials. A `clauth start` session runs against its own isolated profile and is unaffected; a session on the global credentials adopts the new profile on its next token refresh, so it changes the running account mid-session. To reach another profile without disturbing the current session, use `run`.
 - `run` burns a real 5h usage window on the target account. It is hard-capped at recursion depth 1, so a delegated session cannot call `run` again.
 
 ## Auto-starting the 5-hour timer
