@@ -73,6 +73,33 @@ pub(crate) fn resolve_active(config: &AppConfig) -> Option<(String, Source)> {
     .map(|(name, source)| (name.to_string(), source))
 }
 
+/// How this session reads its credentials, used to explain what `switch` does to
+/// *it*. The session's config dir is the discriminator: a `clauth start` runtime
+/// and a custom `CLAUDE_CONFIG_DIR` each read their own `.credentials.json`, which
+/// a global relink never touches; only a session on the global `~/.claude/` reads
+/// the very file `switch` repoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionAuth {
+    /// `clauth start <name>` runtime — pinned to its own creds; a global switch can't reach it.
+    IsolatedRuntime(String),
+    /// A non-clauth `CLAUDE_CONFIG_DIR` — reads its own creds; a global switch can't reach it.
+    IsolatedCustom,
+    /// No `CLAUDE_CONFIG_DIR` — reads the global `~/.claude/` creds that `switch` repoints.
+    Global,
+}
+
+/// Classify the current session's credential source from `CLAUDE_CONFIG_DIR` (the
+/// same env `clauth start` sets). An empty value is treated as unset.
+pub(crate) fn session_auth() -> SessionAuth {
+    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        Some(dir) => match session_profile_from_config_dir(Path::new(&dir)) {
+            Some(name) => SessionAuth::IsolatedRuntime(name),
+            None => SessionAuth::IsolatedCustom,
+        },
+        None => SessionAuth::Global,
+    }
+}
+
 fn credentials_path(config_dir: Option<&Path>) -> Result<PathBuf> {
     match config_dir {
         Some(dir) => Ok(dir.join(".credentials.json")),

@@ -152,7 +152,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
 
 /// Headless switch for the MCP `switch` tool: relink the global active profile
 /// to `target` without prompting and without priming the 5h window (zero quota;
-/// the next spawned session primes its own).
+/// the profile primes its own window when a session next uses it).
 ///
 /// On credential divergence (the active link is a regular file CC re-logged into)
 /// the caller-supplied `on_divergence` decides: `Overwrite` captures the live

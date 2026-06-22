@@ -4,6 +4,7 @@
 
 use crate::providers::ThirdPartyStats;
 use crate::usage::{UsageWindow, humanize_duration, iso_to_epoch_secs};
+use crate::which::SessionAuth;
 
 /// Per-profile snapshot fed to [`instructions_block`]: identity + the two cached
 /// usage windows (standard accounts) or a third-party headline (provider keys).
@@ -86,24 +87,53 @@ pub(crate) fn live_footer(
     parts.join(" | ")
 }
 
-/// Init-time `instructions` block: policy prose + per-profile inventory and
-/// usage snapshot, with the cache age and a "call `list_profiles`" nudge so the
-/// model treats every embedded number as a session-start snapshot.
+/// What a `switch` does to *this* session, keyed on how it reads its credentials.
+/// A global session reads the exact file `switch` repoints; an isolated session
+/// (a `clauth start` runtime or a custom `CLAUDE_CONFIG_DIR`) reads its own, so a
+/// switch can't disturb it. Pure mapping — the caller resolves the [`SessionAuth`].
+pub(crate) fn switch_effect(auth: &SessionAuth) -> String {
+    match auth {
+        SessionAuth::Global => "`switch` repoints the global `~/.claude` credentials THIS \
+session reads; Claude Code reloads them on its next token refresh, so this session would \
+start acting as the switched profile — disruptive mid-session. To use another account \
+without disturbing this one, delegate with `run`."
+            .to_string(),
+        SessionAuth::IsolatedRuntime(name) => format!(
+            "`switch` repoints the global `~/.claude` credentials, but THIS session runs in an \
+isolated `clauth start` runtime pinned to `{name}` and is unaffected — only a later session on \
+the global credentials adopts the change."
+        ),
+        SessionAuth::IsolatedCustom => "`switch` repoints the global `~/.claude` credentials, but \
+THIS session uses a custom `CLAUDE_CONFIG_DIR` and reads its own credentials, so it is \
+unaffected — only a later session on the global credentials adopts the change."
+            .to_string(),
+    }
+}
+
+/// Init-time `instructions` block: identity + when-to-use intro, a session-aware
+/// `switch` note, then the per-profile inventory and usage snapshot, with the
+/// cache age and a "call `list_profiles`" nudge so the model treats every embedded
+/// number as a session-start snapshot.
 pub(crate) fn instructions_block(
     profiles: &[ProfileSnapshot],
+    auth: &SessionAuth,
     cache_age_label: &str,
     now_secs: i64,
 ) -> String {
     let mut out = String::new();
     out.push_str(
-        "clauth exposes its account profiles to this session. \
-Tools: `list_profiles` (live cache + filesystem, zero quota), \
-`which` (resolve this session's active profile), \
-`switch` (relink the global active profile — affects the NEXT spawned session, not this one), \
-`run` (delegate a headless prompt to a profile; this BURNS a real account usage window). \
-`run` is hard-capped at depth 1 (a delegate cannot itself delegate). \
-The figures below are a snapshot as of ",
+        "clauth manages multiple Claude Code accounts (\"profiles\") — each an isolated \
+credential set / subscription. Use these tools to compare usage headroom across accounts, \
+relink the active account, or delegate a task to another account without spending this \
+session's window.\n\n\
+Tools: `list_profiles` (cached usage + filesystem, zero quota), \
+`which` (the profile that owns this session's credentials), \
+`switch` (relink the global active profile), \
+`run` (delegate a headless prompt to a profile; this BURNS a real account usage window, \
+hard-capped at depth 1 — a delegate cannot itself delegate).\n\nswitch & this session: ",
     );
+    out.push_str(&switch_effect(auth));
+    out.push_str("\n\nThe figures below are a snapshot as of ");
     out.push_str(cache_age_label);
     out.push_str("; call `list_profiles` for live figures.\n\nProfiles:\n");
 

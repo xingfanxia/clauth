@@ -180,7 +180,7 @@ impl ClauthServer {
     }
 
     #[tool(
-        description = "Relink the global active profile (takes effect for the NEXT spawned session, not this one)"
+        description = "Relink the global active profile (`~/.claude` credentials). A `clauth start` session is pinned to its own runtime and unaffected; a session on the global credentials adopts the change on its next token refresh"
     )]
     async fn switch(
         &self,
@@ -423,7 +423,7 @@ impl ServerHandler for ClauthServer {
 /// block rather than failing the handshake.
 fn build_instructions() -> String {
     let Ok(config) = load_config() else {
-        return "clauth exposes its account profiles to this session. \
+        return "clauth manages multiple Claude Code accounts (\"profiles\"). \
             Call `list_profiles` for live usage figures."
             .to_string();
     };
@@ -457,7 +457,7 @@ fn build_instructions() -> String {
         })
         .collect();
 
-    render::instructions_block(&snapshots, &age, now)
+    render::instructions_block(&snapshots, &crate::which::session_auth(), &age, now)
 }
 
 pub(crate) fn serve() -> Result<()> {

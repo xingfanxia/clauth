@@ -129,7 +129,7 @@ fn live_footer_omits_absent_parts() {
 #[test]
 fn instructions_block_carries_staleness_nudge_and_profile_lines() {
     let profiles = vec![snapshot("work", true), snapshot("personal", false)];
-    let out = instructions_block(&profiles, "3m ago", 0);
+    let out = instructions_block(&profiles, &SessionAuth::Global, "3m ago", 0);
 
     // staleness nudge: cache-age label + the "call list_profiles" pointer.
     assert!(out.contains("snapshot as of 3m ago"));
@@ -150,10 +150,34 @@ fn instructions_block_carries_staleness_nudge_and_profile_lines() {
         out.contains("hard-capped at depth 1"),
         "the delegation depth cap must survive a prose edit",
     );
+    // the session-aware switch note must survive a prose edit (Global variant here).
     assert!(
-        out.contains("NEXT spawned session"),
-        "the `switch` next-session caveat must survive a prose edit",
+        out.contains("switch & this session:"),
+        "the `switch` effect note must survive a prose edit",
     );
+    assert!(
+        out.contains("its next token refresh"),
+        "the global-session switch caveat must survive a prose edit",
+    );
+}
+
+#[test]
+fn switch_effect_distinguishes_global_from_isolated_sessions() {
+    // Global: warns the current session's identity changes on next refresh.
+    let global = switch_effect(&SessionAuth::Global);
+    assert!(global.contains("THIS session reads"));
+    assert!(global.contains("next token refresh"));
+    assert!(global.contains("delegate with `run`"));
+
+    // Isolated runtime: names the pinned profile and states it is unaffected.
+    let pinned = switch_effect(&SessionAuth::IsolatedRuntime("work".to_string()));
+    assert!(pinned.contains("pinned to `work`"));
+    assert!(pinned.contains("unaffected"));
+
+    // Custom config dir: also unaffected, no profile name.
+    let custom = switch_effect(&SessionAuth::IsolatedCustom);
+    assert!(custom.contains("custom `CLAUDE_CONFIG_DIR`"));
+    assert!(custom.contains("unaffected"));
 }
 
 #[test]
@@ -161,6 +185,6 @@ fn instructions_block_uses_third_party_headline_for_provider_profiles() {
     let mut p = snapshot("deepseek", false);
     p.provider = "deepseek".to_string();
     p.third_party = Some("balance: $4.20".to_string());
-    let out = instructions_block(&[p], "1h 0m ago", 0);
+    let out = instructions_block(&[p], &SessionAuth::Global, "1h 0m ago", 0);
     assert!(out.contains("- deepseek [deepseek, max]: balance: $4.20"));
 }
