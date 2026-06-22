@@ -99,6 +99,7 @@ On first launch, clauth offers to install shell completions. It asks before touc
 - **Token usage dashboard**: the Tokens tab reads Claude Code's own token history (the stats cache, topped up from live session transcripts). It rolls that into per-model totals with a today panel, daily peak, busiest hour, and usage sparklines. Press <kbd>c</kbd> to count cache reads/writes in the totals; models past 1M tokens break out on their own.
 - **API-equivalent cost**: the Tokens tab prices your recorded usage at live pay-as-you-go API rates, i.e. what those same tokens would cost on the API. Rates come from LiteLLM's price feed and are disk-cached, computed per model (families differ up to 10×) and cache-aware (reads and writes priced at their own rates). Cost shows on the today and total cards, the per-model detail, and the top-models bars. It stays blank until rates load.
 - **Claude status feed**: the Status tab pulls live incidents from status.claude.com, with per-component health (claude.ai, API, Claude Code, Cowork), severity, and timeline, cached to disk.
+- **Integration health**: the Plugin tab checks that clauth is wired into Claude Code — `clauth` on PATH, the `mcpServers` entry or plugin install, and `claude --version` — alongside each profile's runtime state, and offers one-key fixes for the writes clauth can safely make itself (wire `mcpServers`, repair a diverged credential link). Plugin install stays guided.
 
 ### Automate & stay safe
 
@@ -130,7 +131,7 @@ clauth start personal -- --model haiku
 # spawns claude with personal's credentials in an isolated CLAUDE_CONFIG_DIR
 ```
 
-The active profile shows in orange. Usage bars are cached locally, so they stay on screen even when the Anthropic API is rate-limited or offline. <kbd>←</kbd> <kbd>→</kbd> move between the seven tabs:
+The active profile shows in orange. Usage bars are cached locally, so they stay on screen even when the Anthropic API is rate-limited or offline. <kbd>←</kbd> <kbd>→</kbd> move between the eight tabs:
 
 | Tab | What it holds |
 |-----|---------------|
@@ -141,6 +142,7 @@ The active profile shows in orange. Usage bars are cached locally, so they stay 
 | **Fallback** | chain editor |
 | **Config** | theme, refresh interval, wrap-off, divergence default |
 | **Status** | Claude incident feed |
+| **Plugin** | Claude Code integration health + per-profile runtime, with one-key fixes |
 
 > [!TIP]
 > Dev-only: `cargo test showcase -- --ignored --nocapture` runs the real interactive TUI on fake data against a throwaway home dir (never built into the binary, no network). Handy for screenshots.
@@ -158,6 +160,7 @@ Keys are scoped to the current tab; <kbd>?</kbd> lists every binding for the tab
 | <kbd>+</kbd> <kbd>-</kbd> | nudge the selected threshold or interval |
 | <kbd>c</kbd> | Tokens tab: count cache reads/writes in the totals |
 | <kbd>p</kbd> | Usage tab: toggle the ideal-pace marker |
+| <kbd>f</kbd> | Plugin tab: apply the selected row's fix |
 | <kbd>?</kbd> | full keybinding help for the current tab |
 
 ## Profile types
