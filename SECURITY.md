@@ -58,7 +58,9 @@ analytics; it talks to the hosts above and no others.
 
 ## What acts on your behalf
 
-Two code paths can change account state. Both are narrow and both are documented.
+A few code paths can change account state. All are narrow and all are documented.
+
+Background, automatic:
 
 - **Auto-start kick.** A real, billed `/v1/messages` call (`max_tokens = 1`, a
   fraction of a cent) under your own OAuth token, with the Claude Code client
@@ -68,6 +70,16 @@ Two code paths can change account state. Both are narrow and both are documented
 - **Token refresh.** Anthropic refresh tokens are single-use, so refreshing spends
   the stored token for a fresh pair. It's lazy: it fires only when a usage query
   returns 401, never ahead of time, unless you press `t` to force it.
+
+Agent-invoked, only when the Claude Code plugin is installed:
+
+- **`run` (MCP tool).** Sends a real, billed `/v1/messages` request on a target
+  profile under its own OAuth token, opening a full 5-hour usage window on that
+  account. It fires only when an agent calls the tool, and is hard-capped at
+  recursion depth 1 (a delegated session cannot call `run` again).
+- **`switch` (MCP tool).** Relinks the global `~/.claude` credentials to another
+  profile, the same write `clauth switch` performs. It changes which account the
+  global session refreshes onto; it sends no inference itself.
 
 Nothing else sends inference or writes to your account.
 
