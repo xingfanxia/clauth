@@ -4,8 +4,9 @@
 //!
 //! The left panel is one cursor-driven selector over two groups: global
 //! integration checks (clauth on PATH, mcpServers wiring, plugin install, CC
-//! version) then a `profiles` group, one row per profile. Each row is a status
-//! dot + label + terse value. Enter descends into the detail pane; `f` applies
+//! version) then a `profiles` group, one row per profile. Each check row is a
+//! status dot + label (verdict in the detail pane); profile rows add a terse
+//! runtime value. Enter descends into the detail pane; `f` applies
 //! the selected row's fix (when one applies). All data is recomputed
 //! synchronously on tab focus and `r` — there is no background thread, so the
 //! title spinner only flickers while the cached `claude --version` is probed.
@@ -66,7 +67,10 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
             check.health,
             check.label,
             theme::body(),
-            &check.value,
+            // Checks are dot-only in the list; the dot color carries the verdict
+            // and the full readout lives in the detail pane.
+            "",
+            0,
             idx == app.plugin.cursor,
             focused,
             content_w,
@@ -76,6 +80,14 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if !app.plugin.profiles.is_empty() {
         let active = focused && app.plugin.selected_profile().is_some();
         rows.push(group_eyebrow("profiles", active));
+        // Pad names to the widest so the runtime values share a left edge.
+        let name_w = app
+            .plugin
+            .profiles
+            .iter()
+            .map(|p| p.name.chars().count())
+            .max()
+            .unwrap_or(0);
         for (idx, profile) in app.plugin.profiles.iter().enumerate() {
             let cursor = app.plugin.checks.len() + idx;
             if cursor == app.plugin.cursor {
@@ -85,9 +97,10 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 profile.health,
                 &profile.name,
                 name_color(profile.active),
-                // Dot-only: the health dot carries state; runtime metrics live in
-                // the detail pane, not echoed in the row.
-                "",
+                // Dot plus a terse runtime value (link state for the active
+                // profile, live-session count otherwise).
+                &profile.value,
+                name_w,
                 cursor == app.plugin.cursor,
                 focused,
                 content_w,
@@ -117,14 +130,18 @@ fn window_start(focus: usize, viewport: usize, total: usize) -> usize {
     }
 }
 
-/// One selector row: `❯ ● label             value`. The hover tint spans the
-/// full content width when selected (the ratatui filler-tint gotcha); the caret
-/// shows only in the focused pane.
+/// One selector row: `❯ ● label   value`. Checks render dot + label only
+/// (`value` empty); profile rows pad the label to `label_pad` so their values
+/// line up in a column. The hover tint spans the full content width when
+/// selected (the ratatui filler-tint gotcha); the caret shows only in the
+/// focused pane.
+#[allow(clippy::too_many_arguments)]
 fn selector_row(
     health: Health,
     label: &str,
     label_style: Style,
     value: &str,
+    label_pad: usize,
     selected: bool,
     focused: bool,
     content_w: usize,
@@ -154,10 +171,16 @@ fn selector_row(
         with_bg(label_style)
     };
 
-    // 2 (caret) + 2 (dot + space) + label, then a ragged value trailing a
-    // 2-space gap (selectable rows are never column-padded).
-    let head_w = 4 + label.chars().count();
+    let label_len = label.chars().count();
+    // Pad short labels to the group's widest so the values share a left edge.
+    let align = label_pad.saturating_sub(label_len);
+    // 2 (caret) + 2 (dot + space) + label + alignment pad, then the value trails
+    // a 2-space gap.
+    let head_w = 4 + label_len + align;
     let mut spans = vec![caret, dot, Span::styled(label.to_string(), label_style)];
+    if align > 0 {
+        spans.push(Span::styled(" ".repeat(align), with_bg(Style::default())));
+    }
 
     let value_room = content_w.saturating_sub(head_w + 2);
     if value_room > 0 && !value.is_empty() {
@@ -236,14 +259,12 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // their case (`section_box_verbatim`); check labels go through `section_box`.
     let (block, detail): (Block<'static>, &[String]) =
         if let Some(check) = app.plugin.selected_check() {
-            // `mcpServers` is a camelCase identifier, not a structural word — keep
-            // its case rather than uppercasing it like the other check labels.
-            let title = if check.label == "mcpServers" {
-                section_box_verbatim(check.label, focused, false)
-            } else {
-                section_box(check.label, focused, false)
-            };
-            (title, check.detail.as_slice())
+            // Check labels are lowercase prose, so they all uppercase into a
+            // structural title (the verbatim variant is for profile names only).
+            (
+                section_box(check.label, focused, false),
+                check.detail.as_slice(),
+            )
         } else if let Some(profile) = app.plugin.selected_profile() {
             (
                 section_box_verbatim(&profile.name, focused, false),
@@ -340,5 +361,7 @@ fn health_color(health: Health) -> ratatui::style::Color {
         Health::Ok => theme::success_color(),
         Health::Warn => theme::warning_color(),
         Health::Danger => theme::danger_color(),
+        // Neutral: a profile that is neither linked nor live — not green.
+        Health::Idle => theme::text_dim_color(),
     }
 }

@@ -116,7 +116,14 @@ fn plugin_check_ok_when_installed_globally() {
     super::recompute_plugin_checks(&mut app, false);
     let check = plugin_check(&app);
     assert_eq!(check.health, super::Health::Ok);
-    assert_eq!(check.value, "installed");
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|line| line.starts_with("installed: yes")),
+        "global install should read installed, got {:?}",
+        check.detail
+    );
 }
 
 #[test]
@@ -127,7 +134,11 @@ fn plugin_check_warns_and_suggests_global_when_project_local() {
     super::recompute_plugin_checks(&mut app, false);
     let check = plugin_check(&app);
     assert_eq!(check.health, super::Health::Warn);
-    assert!(check.value.contains("local"));
+    assert!(
+        check.detail.iter().any(|line| line.contains("(local)")),
+        "the project-local scope should surface in the readout, got {:?}",
+        check.detail
+    );
     assert!(
         check
             .detail
@@ -142,8 +153,8 @@ fn mcp_check(app: &App) -> &super::Check {
     app.plugin
         .checks
         .iter()
-        .find(|c| c.label == "mcpServers")
-        .expect("mcpServers check present")
+        .find(|c| c.label == "mcp servers")
+        .expect("mcp servers check present")
 }
 
 #[test]
@@ -154,7 +165,11 @@ fn mcp_check_ok_when_globally_wired() {
     super::recompute_plugin_checks(&mut app, false);
     let check = mcp_check(&app);
     assert_eq!(check.health, super::Health::Ok);
-    assert_eq!(check.value, "wired");
+    assert!(
+        check.detail.iter().any(|line| line == "present: yes"),
+        "a globally wired server should read present, got {:?}",
+        check.detail
+    );
     assert!(check.fix.is_none());
 }
 
@@ -168,8 +183,44 @@ fn mcp_check_warns_project_only_for_local_plugin() {
     super::recompute_plugin_checks(&mut app, false);
     let check = mcp_check(&app);
     assert_eq!(check.health, super::Health::Warn);
-    assert_eq!(check.value, "project only");
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|line| line == "wired for this project only, not global"),
+        "project-only wiring should say so in the readout, got {:?}",
+        check.detail
+    );
     assert!(check.fix.is_some(), "should offer the global write fix");
+}
+
+#[test]
+fn profile_row_carries_runtime_detail() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new("acct".to_string(), None, None)],
+    });
+    super::recompute_plugin_checks(&mut app, false);
+
+    let row = app.plugin.profiles.first().expect("one profile row");
+    // Idle, non-active, credential-less profile: no link, no live sessions → a
+    // neutral dot (not green) and no selector value.
+    assert_eq!(row.health, super::Health::Idle);
+    assert!(
+        row.value.is_empty(),
+        "an idle non-active row carries no selector value, got {:?}",
+        row.value
+    );
+    assert!(row.detail.iter().any(|l| l == "instances: 0"));
+    assert!(row.detail.iter().any(|l| l == "link: \u{2014}"));
+    assert!(row.detail.iter().any(|l| l == "expires: \u{2014}"));
+    assert!(
+        row.detail.iter().any(|l| l.starts_with("runtime: ")),
+        "the runtime path line is present, got {:?}",
+        row.detail
+    );
 }
 
 #[test]

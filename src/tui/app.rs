@@ -744,12 +744,14 @@ pub(crate) enum PluginFocus {
 }
 
 /// Health bucket for a row's status dot — the same success / warning / danger
-/// buckets as the header `● status.claude.ai` dot.
+/// buckets as the header `● status.claude.ai` dot, plus a neutral `Idle` for a
+/// profile that is neither linked nor running a live session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Health {
     Ok,
     Warn,
     Danger,
+    Idle,
 }
 
 /// A one-key fix offered on the selected row. `WireMcpServers` writes the manual
@@ -766,9 +768,9 @@ pub(crate) enum PluginFix {
 pub(crate) struct Check {
     pub(crate) label: &'static str,
     pub(crate) health: Health,
-    /// Terse value shown right-aligned in the selector row.
-    pub(crate) value: String,
-    /// Full readout for the detail pane, one entry per line.
+    /// Full readout for the detail pane, one entry per line. (Checks are
+    /// dot-only in the list — the dot color carries the verdict, the readout
+    /// lives here — so there is no separate terse value.)
     pub(crate) detail: Vec<String>,
     pub(crate) fix: Option<PluginFix>,
 }
@@ -779,6 +781,9 @@ pub(crate) struct ProfileRow {
     pub(crate) name: String,
     pub(crate) active: bool,
     pub(crate) health: Health,
+    /// Terse runtime state shown in the selector row: link state for the active
+    /// profile (its creds are the linked ones), live-session count otherwise.
+    pub(crate) value: String,
     pub(crate) detail: Vec<String>,
     pub(crate) fix: Option<PluginFix>,
 }
@@ -2228,30 +2233,46 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     }
     let cc_version = app.plugin.cc_version.clone().flatten();
 
-    let mut checks: Vec<Check> = Vec::with_capacity(4);
+    let mut checks: Vec<Check> = Vec::with_capacity(3);
 
-    // clauth on PATH — CC spawns `clauth mcp` by name, so resolution is required.
+    // about — clauth's data dir + PATH resolution (CC spawns `clauth mcp` by
+    // name, so resolution is load-bearing) and the Claude Code version. Combined
+    // health: clauth missing is danger (server can't start), CC missing is warn.
     let clauth_path = probe::on_path("clauth");
-    checks.push(Check {
-        label: "clauth PATH",
-        health: if clauth_path.is_some() {
-            Health::Ok
-        } else {
-            Health::Danger
-        },
-        value: if clauth_path.is_some() {
-            "resolved".to_string()
-        } else {
-            "not found".to_string()
-        },
-        detail: match &clauth_path {
-            Some(path) => vec![format!("resolved: {}", path.display())],
-            None => vec![
-                "clauth is not on PATH".to_string(),
+    let mut about_detail = vec![format!(
+        "data: {}",
+        crate::profile::clauth_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "\u{2014}".to_string())
+    )];
+    match &clauth_path {
+        Some(path) => about_detail.push(format!("path: {}", path.display())),
+        None => {
+            about_detail.push("path: not on PATH".to_string());
+            about_detail.push(
                 "Claude Code spawns `clauth mcp` by name, so the server won't start".to_string(),
-                "install clauth so its bin directory is on PATH".to_string(),
-            ],
+            );
+            about_detail.push("install clauth so its bin directory is on PATH".to_string());
+        }
+    }
+    match &cc_version {
+        Some(version) => about_detail.push(format!("claude: {version}")),
+        None => {
+            about_detail.push("claude: not found".to_string());
+            about_detail.push("`claude --version` failed or claude is not on PATH".to_string());
+            about_detail.push("install Claude Code so the `claude` binary resolves".to_string());
+        }
+    }
+    checks.push(Check {
+        label: "about",
+        health: if clauth_path.is_none() {
+            Health::Danger
+        } else if cc_version.is_none() {
+            Health::Warn
+        } else {
+            Health::Ok
         },
+        detail: about_detail,
         fix: None,
     });
 
@@ -2298,18 +2319,11 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         mcp_detail.push("[f] wire mcpServers into ~/.claude.json".to_string());
     }
     checks.push(Check {
-        label: "mcpServers",
+        label: "mcp servers",
         health: if globally_wired {
             Health::Ok
         } else {
             Health::Warn
-        },
-        value: if globally_wired {
-            "wired".to_string()
-        } else if project_only {
-            "project only".to_string()
-        } else {
-            "not wired".to_string()
         },
         detail: mcp_detail,
         fix: (!globally_wired).then_some(PluginFix::WireMcpServers),
@@ -2346,7 +2360,6 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             Check {
                 label: "plugin",
                 health: Health::Ok,
-                value: "installed".to_string(),
                 detail,
                 fix: None,
             }
@@ -2367,10 +2380,6 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             Check {
                 label: "plugin",
                 health: Health::Warn,
-                value: match scope {
-                    Some(scope) => format!("{scope} only"),
-                    None => "not global".to_string(),
-                },
                 detail,
                 fix: None,
             }
@@ -2395,35 +2404,11 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         Check {
             label: "plugin",
             health: Health::Warn,
-            value: if known {
-                "not installed".to_string()
-            } else {
-                "unknown".to_string()
-            },
             detail,
             fix: None,
         }
     };
     checks.push(plugin_check);
-
-    // CC version — `claude --version` only; no "newer available" probe.
-    checks.push(Check {
-        label: "CC version",
-        health: if cc_version.is_some() {
-            Health::Ok
-        } else {
-            Health::Warn
-        },
-        value: cc_version.clone().unwrap_or_else(|| "unknown".to_string()),
-        detail: match &cc_version {
-            Some(version) => vec![format!("claude --version: {version}")],
-            None => vec![
-                "`claude --version` failed or claude is not on PATH".to_string(),
-                "install Claude Code so the `claude` binary resolves".to_string(),
-            ],
-        },
-        fix: None,
-    });
 
     app.plugin.checks = checks;
 
@@ -2433,6 +2418,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     struct Snap {
         name: String,
         active: bool,
+        expires_at: Option<i64>,
     }
     let snaps: Vec<Snap> = {
         let cfg = app.config();
@@ -2441,6 +2427,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             .map(|p| Snap {
                 name: p.name.as_str().to_string(),
                 active: cfg.is_active(p.name.as_str()),
+                expires_at: p.access_token_expires_at(),
             })
             .collect()
     };
@@ -2456,6 +2443,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             None
         };
         let diverged = matches!(link, Some(LinkState::Diverged));
+        let linked = matches!(link, Some(LinkState::LinkedTo));
         let (health, fix) = if diverged {
             (
                 Health::Warn,
@@ -2463,24 +2451,53 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             )
         } else if snap.active && matches!(link, Some(LinkState::Missing)) {
             (Health::Warn, None)
-        } else {
+        } else if linked || instances > 0 {
+            // Green only when in use: the active profile's creds are linked, or
+            // the profile has at least one live session.
             (Health::Ok, None)
+        } else {
+            (Health::Idle, None)
         };
 
+        let link_label = match link {
+            Some(LinkState::LinkedTo) => "linked",
+            Some(LinkState::Diverged) => "diverged",
+            Some(LinkState::Missing) => "missing",
+            None => "\u{2014}",
+        };
+        // Selector value: the live-session count. The active row always shows it
+        // (even `0 live`); idle non-active rows stay blank. Divergence still
+        // surfaces via the dot color and the detail `link` row.
+        let value = if snap.active || instances > 0 {
+            format!("{instances} live")
+        } else {
+            String::new()
+        };
+        // Access-token freshness as a relative span; `—` when no OAuth expiry is
+        // known (third-party / api-key profiles).
+        let expires = match snap.expires_at {
+            Some(ms) => {
+                let secs = ms / 1000 - (crate::usage::now_ms() / 1000) as i64;
+                if secs <= 0 {
+                    "expired".to_string()
+                } else {
+                    crate::usage::humanize_duration(secs)
+                }
+            }
+            None => "\u{2014}".to_string(),
+        };
+        let runtime = crate::profile::profile_dir(&snap.name)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "\u{2014}".to_string());
+
         // Runtime health only — config (type / model / overrides) lives on the
-        // Setup tab. This pane answers "how many live sessions, and is the
-        // credential link healthy?".
+        // Setup tab. This pane answers "how many live sessions, is the credential
+        // link healthy, and how fresh is the token?".
         let mut detail = vec![
             format!("instances: {instances}"),
-            format!(
-                "link: {}",
-                match link {
-                    Some(LinkState::LinkedTo) => "linked",
-                    Some(LinkState::Diverged) => "diverged",
-                    Some(LinkState::Missing) => "missing",
-                    None => "\u{2014}",
-                }
-            ),
+            format!("link: {link_label}"),
+            format!("expires: {expires}"),
+            format!("runtime: {runtime}"),
         ];
         if diverged {
             detail.push(String::new());
@@ -2490,6 +2507,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             name: snap.name,
             active: snap.active,
             health,
+            value,
             detail,
             fix,
         });
