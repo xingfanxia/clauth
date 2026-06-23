@@ -1020,6 +1020,30 @@ fn has_live_session_true_with_mixed_alive_and_dead() {
 }
 
 #[test]
+fn live_session_count_counts_only_alive() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let sessions = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("counted")
+            .join("sessions");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(sessions.join("11111"), b"").expect("write dead pid"); // dead
+        let a = open_pid_file(&sessions.join("22222")).expect("open a");
+        a.lock().expect("lock a");
+        let b = open_pid_file(&sessions.join("33333")).expect("open b");
+        b.lock().expect("lock b");
+        assert_eq!(live_session_count("counted"), 2);
+        drop(a);
+        assert_eq!(live_session_count("counted"), 1);
+        assert_eq!(live_session_count("ghost"), 0); // no sessions dir → zero
+    });
+}
+
+#[test]
 fn acquire_creates_runtime_and_pid_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let _guard = HOME_MUTEX.lock().expect("home mutex");

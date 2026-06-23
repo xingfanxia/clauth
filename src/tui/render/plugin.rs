@@ -85,7 +85,9 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 profile.health,
                 &profile.name,
                 name_color(profile.active),
-                &profile.summary,
+                // Dot-only: the health dot carries state; runtime metrics live in
+                // the detail pane, not echoed in the row.
+                "",
                 cursor == app.plugin.cursor,
                 focused,
                 content_w,

@@ -83,6 +83,22 @@ pub(crate) fn has_live_session(name: &str) -> bool {
     entries.flatten().any(|e| is_session_alive(&e.path()))
 }
 
+/// Count of live `clauth start` sessions for the profile. Additive sibling of
+/// [`has_live_session`] (left untouched — it gates token rotation); a missing or
+/// unreadable sessions dir counts as zero.
+pub(crate) fn live_session_count(name: &str) -> usize {
+    let Ok(dir) = sessions_dir(name) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| is_session_alive(&e.path()))
+        .count()
+}
+
 fn canonical_credentials(name: &str) -> Result<PathBuf> {
     profile_subpath(name, "credentials.json")
 }

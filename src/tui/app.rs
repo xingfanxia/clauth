@@ -779,8 +779,6 @@ pub(crate) struct ProfileRow {
     pub(crate) name: String,
     pub(crate) active: bool,
     pub(crate) health: Health,
-    /// Terse selector value, e.g. `live opus ok`.
-    pub(crate) summary: String,
     pub(crate) detail: Vec<String>,
     pub(crate) fix: Option<PluginFix>,
 }
@@ -2429,18 +2427,12 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
 
     app.plugin.checks = checks;
 
-    // Per-profile rows. Snapshot under the config lock, then drop it before the
-    // FS reads (`has_live_session`, `classify_credentials_link`) so no lock is
-    // held across I/O.
+    // Per-profile rows. Snapshot the names under the config lock, then drop it
+    // before the FS reads (`live_session_count`, `classify_credentials_link`) so
+    // no lock is held across I/O.
     struct Snap {
         name: String,
         active: bool,
-        model: String,
-        kind: String,
-        opus: Option<String>,
-        sonnet: Option<String>,
-        haiku: Option<String>,
-        subagent: Option<String>,
     }
     let snaps: Vec<Snap> = {
         let cfg = app.config();
@@ -2449,27 +2441,13 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             .map(|p| Snap {
                 name: p.name.as_str().to_string(),
                 active: cfg.is_active(p.name.as_str()),
-                model: p
-                    .models
-                    .default
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string()),
-                kind: if p.is_oauth() {
-                    "oauth (anthropic)".to_string()
-                } else {
-                    p.base_url.clone().unwrap_or_else(|| "api".to_string())
-                },
-                opus: p.models.opus.clone(),
-                sonnet: p.models.sonnet.clone(),
-                haiku: p.models.haiku.clone(),
-                subagent: p.models.subagent.clone(),
             })
             .collect()
     };
 
     let mut rows: Vec<ProfileRow> = Vec::with_capacity(snaps.len());
     for snap in snaps {
-        let live = crate::runtime::has_live_session(&snap.name);
+        let instances = crate::runtime::live_session_count(&snap.name);
         // Divergence is only meaningful for the active profile — its credentials
         // are the ones linked into ~/.claude. Non-active profiles can't diverge.
         let link = if snap.active {
@@ -2478,53 +2456,32 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             None
         };
         let diverged = matches!(link, Some(LinkState::Diverged));
-        let (health, state_label, fix) = if diverged {
+        let (health, fix) = if diverged {
             (
                 Health::Warn,
-                "diverged",
                 Some(PluginFix::RepairDivergence(snap.name.clone())),
             )
         } else if snap.active && matches!(link, Some(LinkState::Missing)) {
-            (Health::Warn, "no creds", None)
+            (Health::Warn, None)
         } else {
-            (Health::Ok, "ok", None)
-        };
-        let session = if live { "live" } else { "idle" };
-        // The green dot already signals "ok"; only spell out a non-ok state.
-        let summary = if state_label == "ok" {
-            format!("{session} {}", snap.model)
-        } else {
-            format!("{session} {} {state_label}", snap.model)
+            (Health::Ok, None)
         };
 
+        // Runtime health only — config (type / model / overrides) lives on the
+        // Setup tab. This pane answers "how many live sessions, and is the
+        // credential link healthy?".
         let mut detail = vec![
-            format!("type: {}", snap.kind),
-            format!("active: {}", if snap.active { "yes" } else { "no" }),
-            format!("session: {session}"),
-            format!("model: {}", snap.model),
+            format!("instances: {instances}"),
+            format!(
+                "link: {}",
+                match link {
+                    Some(LinkState::LinkedTo) => "linked",
+                    Some(LinkState::Diverged) => "diverged",
+                    Some(LinkState::Missing) => "missing",
+                    None => "\u{2014}",
+                }
+            ),
         ];
-        for (label, value) in [
-            ("opus", &snap.opus),
-            ("sonnet", &snap.sonnet),
-            ("haiku", &snap.haiku),
-            ("subagent", &snap.subagent),
-        ] {
-            if let Some(value) = value {
-                detail.push(format!("  {label}: {value}"));
-            }
-        }
-        if let Ok(dir) = crate::profile::profile_subpath(&snap.name, "runtime") {
-            detail.push(format!("runtime: {}", dir.display()));
-        }
-        detail.push(format!(
-            "link: {}",
-            match link {
-                Some(LinkState::LinkedTo) => "linked",
-                Some(LinkState::Diverged) => "diverged",
-                Some(LinkState::Missing) => "missing",
-                None => "\u{2014}",
-            }
-        ));
         if diverged {
             detail.push(String::new());
             detail.push("[f] repair credentials".to_string());
@@ -2533,7 +2490,6 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             name: snap.name,
             active: snap.active,
             health,
-            summary,
             detail,
             fix,
         });
