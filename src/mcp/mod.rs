@@ -188,6 +188,20 @@ impl ClauthServer {
     ) -> Result<CallToolResult, ErrorData> {
         let mut config =
             load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        // Resolve the raw tool argument to a stored profile (case-insensitive)
+        // BEFORE any mutation — the same guard the CLI applies. Skipping it lets an
+        // unknown/wrong-case name reach `link_profile_credentials`, which strips the
+        // live `.credentials.json` symlink and creates no replacement (it only errors
+        // later at `finish_switch`), leaving the global session credential-less.
+        let Some(name) = config.canonical_name(&name) else {
+            let payload =
+                serde_json::json!({ "ok": false, "reason": format!("profile not found: {name}") });
+            return Ok(CallToolResult::error(with_footer(
+                payload,
+                active_footer(&config),
+            )));
+        };
         let on_divergence = config.state.default_divergence;
 
         match crate::actions::switch_profile_noninteractive(&mut config, &name, on_divergence) {
@@ -481,3 +495,7 @@ async fn run_server() -> Result<()> {
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_run.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_switch_tool.rs"]
+mod switch_tool_tests;
