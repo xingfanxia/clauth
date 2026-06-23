@@ -85,7 +85,7 @@ On first launch, clauth offers to install shell completions. It asks before touc
 - **One-key switching**: pick a profile, <kbd>⏎</kbd>, confirm. Or `clauth <profile>` straight from the shell.
 - **Account-change detection**: if Claude Code signed into a different account while clauth was closed, you get a `[Y/n]` prompt before stored tokens are overwritten.
 - **Non-destructive**: a switch touches only the API keys and the profile's declared `env` block in `settings.json`. Nothing else moves.
-- **Isolated launch**: `clauth start <profile> [claude args...]` runs `claude` in a per-call `CLAUDE_CONFIG_DIR` (symlink mirror; copies on Windows without symlink privilege), so account identity and billing caches never leak between profiles.
+- **Isolated launch**: `clauth start [--isolated] <profile> [claude args...]` runs `claude` in a per-profile `CLAUDE_CONFIG_DIR` (symlink mirror; copies on Windows without symlink privilege), so account identity and billing caches never leak between profiles. Add `--isolated` for a clean session that keeps the account's auth but drops your global `CLAUDE.md` memory, plugins, and hooks — for headless or blind runs (run it in an empty directory to also skip project memory).
 - **Status-line aware**: `clauth which [--json]` prints which profile owns the loaded `credentials.json`.
 - **Shell completions**: `clauth completions install [shell]` wires up bash, zsh, or fish.
 
@@ -128,7 +128,15 @@ Run claude under a profile without touching the global config:
 
 ```bash
 clauth start personal -- --model haiku
-# spawns claude with personal's credentials in an isolated CLAUDE_CONFIG_DIR
+# spawns claude with personal's credentials in a per-profile CLAUDE_CONFIG_DIR
+```
+
+For a clean, blind session — auth only, no global memory, plugins, or hooks:
+
+```bash
+clauth start --isolated personal -p < prompt.txt
+# pass the prompt on stdin: a variadic claude flag (e.g. --disallowedTools a,b,c)
+# would otherwise swallow a trailing positional prompt forwarded through clauth
 ```
 
 The active profile shows in orange. Usage bars are cached locally, so they stay on screen even when the Anthropic API is rate-limited or offline. <kbd>←</kbd> <kbd>→</kbd> move between the eight tabs:
@@ -184,15 +192,16 @@ Once active, Claude Code can call four tools:
 
 | Tool | What it does | Quota |
 |------|--------------|-------|
-| `list_profiles` | All profiles with cached 5h/7d usage %, provider, active flag, live-session flag | zero (disk cache) |
-| `which` | Which profile owns the current session | zero (filesystem) |
+| `list_profiles` | All profiles with cached 5h/7d usage %, provider, active flag, live-session flag, observed per-model throughput | zero (disk cache) |
+| `which` | Which profile owns the current session (+ its observed throughput) | zero (filesystem) |
 | `switch` | Relink the global active profile to another name | zero (no prime) |
 | `run` | Delegate a headless prompt to another profile and return the answer | **real usage window on the target account** |
 
-**Two caveats to know:**
+**Caveats to know:**
 
-- `switch` relinks the global `~/.claude` credentials. A `clauth start` session runs against its own isolated profile and is unaffected; a session on the global credentials adopts the new profile on its next token refresh, so it changes the running account mid-session. To reach another profile without disturbing the current session, use `run`.
+- `switch` relinks the global `~/.claude` credentials. A `clauth start` session runs against its own profile and is unaffected; a session on the global credentials adopts the new profile on its next token refresh, so it changes the running account mid-session. To reach another profile without disturbing the current session, use `run`.
 - `run` burns a real 5h usage window on the target account. It is hard-capped at recursion depth 1, so a delegated session cannot call `run` again.
+- `run` accepts `cwd`, `env`, `args`, `timeout_secs` (default 300, max 3600), and `isolated` (a clean delegate with no operator memory, plugins, or hooks). clauth records the delegate's observed tokens/sec per model and flags a model as degraded or recently rate-limited in `list_profiles` / `which` — the only throughput signal available, since subscription throttle is per-model and absent from the usage snapshot.
 
 ## Auto-starting the 5-hour timer
 
@@ -240,6 +249,9 @@ Install clauth, save each logged-in session as a profile once, then switch with 
 **Can I run Claude Code with multiple accounts at the same time?**
 Yes. `clauth start <profile>` launches `claude` in an isolated `CLAUDE_CONFIG_DIR`, so parallel sessions don't share identity, settings, or billing caches.
 
+**How do I run Claude Code without my global `CLAUDE.md`, plugins, or hooks?**
+`clauth start --isolated <profile>` keeps the account's auth but drops your operator memory, plugins, and hooks — a clean session for headless work or blind evals. Run it in an empty directory to skip project memory too. The same is available on the MCP `run` tool via `isolated: true`.
+
 **Can Claude Code switch accounts automatically when I hit the 5-hour limit?**
 With clauth open, yes: put accounts in the fallback chain and clauth switches to the next member with headroom the moment the active one crosses its threshold.
 
@@ -265,8 +277,11 @@ Locally under `~/.clauth/`, with `0600` permissions on Unix. Tokens only ever go
       config.toml        # base_url, api_key, auto_start, fallback_threshold, [env]
       credentials.json   # OAuth token snapshot (credentials.json.pending while a rotation is mid-write)
       usage_cache.json   # last known utilization + plan info
-      runtime/           # isolated CLAUDE_CONFIG_DIR tree for `clauth start`
+      runtime/           # per-profile CLAUDE_CONFIG_DIR tree for `clauth start`
+      runtime-isolated/  # same, for `clauth start --isolated` (no operator memory/plugins/hooks)
       sessions/          # per-session PID files (ref-counting live launches)
+      sessions-isolated/ # per-session PID files for isolated launches
+      throughput_cache.json  # observed delegate tok/s + rate-limit hits per model
     personal/
       ...
 ```
