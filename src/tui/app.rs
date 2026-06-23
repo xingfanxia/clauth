@@ -2249,9 +2249,9 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         detail: match &clauth_path {
             Some(path) => vec![format!("resolved: {}", path.display())],
             None => vec![
-                "clauth is not on PATH.".to_string(),
-                "Claude Code spawns `clauth mcp` by name, so the server won't start.".to_string(),
-                "install clauth so its bin directory is on PATH.".to_string(),
+                "clauth is not on PATH".to_string(),
+                "Claude Code spawns `clauth mcp` by name, so the server won't start".to_string(),
+                "install clauth so its bin directory is on PATH".to_string(),
             ],
         },
         fix: None,
@@ -2295,9 +2295,9 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     if !globally_wired {
         mcp_detail.push(String::new());
         if project_only {
-            mcp_detail.push("wired for this project only, not global.".to_string());
+            mcp_detail.push("wired for this project only, not global".to_string());
         }
-        mcp_detail.push("[f] write the clauth entry into ~/.claude.json".to_string());
+        mcp_detail.push("[f] wire mcpServers into ~/.claude.json".to_string());
     }
     checks.push(Check {
         label: "mcpServers",
@@ -2333,7 +2333,10 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             ));
         }
         if let Some(at) = &record.installed_at {
-            detail.push(format!("installed at: {at}"));
+            detail.push(format!(
+                "installed at: {}",
+                at.split('T').next().unwrap_or(at)
+            ));
         }
         if let Some(project) = &record.project_path {
             detail.push(format!("project: {project}"));
@@ -2351,7 +2354,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             }
         } else {
             detail.push(String::new());
-            detail.push("installed for this project only, not global.".to_string());
+            detail.push("installed for this project only, not global".to_string());
             detail.push("make it global (run in shell):".to_string());
             if let Some(scope) = scope {
                 detail.push(format!(
@@ -2417,8 +2420,8 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         detail: match &cc_version {
             Some(version) => vec![format!("claude --version: {version}")],
             None => vec![
-                "`claude --version` failed or claude is not on PATH.".to_string(),
-                "install Claude Code so the `claude` binary resolves.".to_string(),
+                "`claude --version` failed or claude is not on PATH".to_string(),
+                "install Claude Code so the `claude` binary resolves".to_string(),
             ],
         },
         fix: None,
@@ -2487,7 +2490,12 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             (Health::Ok, "ok", None)
         };
         let session = if live { "live" } else { "idle" };
-        let summary = format!("{session} {} {state_label}", snap.model);
+        // The green dot already signals "ok"; only spell out a non-ok state.
+        let summary = if state_label == "ok" {
+            format!("{session} {}", snap.model)
+        } else {
+            format!("{session} {} {state_label}", snap.model)
+        };
 
         let mut detail = vec![
             format!("type: {}", snap.kind),
@@ -2519,7 +2527,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         ));
         if diverged {
             detail.push(String::new());
-            detail.push("[f] repair via the divergence resolver".to_string());
+            detail.push("[f] repair credentials".to_string());
         }
         rows.push(ProfileRow {
             name: snap.name,

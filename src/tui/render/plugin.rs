@@ -74,7 +74,8 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     if !app.plugin.profiles.is_empty() {
-        rows.push(group_eyebrow("profiles"));
+        let active = focused && app.plugin.selected_profile().is_some();
+        rows.push(group_eyebrow("profiles", active));
         for (idx, profile) in app.plugin.profiles.iter().enumerate() {
             let cursor = app.plugin.checks.len() + idx;
             if cursor == app.plugin.cursor {
@@ -151,30 +152,32 @@ fn selector_row(
         with_bg(label_style)
     };
 
-    // 2 (caret) + 2 (dot + space) + label, then a right-aligned value.
+    // 2 (caret) + 2 (dot + space) + label, then a ragged value trailing a
+    // 2-space gap (selectable rows are never column-padded).
     let head_w = 4 + label.chars().count();
     let mut spans = vec![caret, dot, Span::styled(label.to_string(), label_style)];
 
-    let value_room = content_w.saturating_sub(head_w + 1);
+    let value_room = content_w.saturating_sub(head_w + 2);
     if value_room > 0 && !value.is_empty() {
-        let value = truncate(value, value_room);
-        let used = head_w + value.chars().count();
-        if used < content_w {
-            spans.push(Span::styled(
-                " ".repeat(content_w - used),
-                with_bg(Style::default()),
-            ));
-        }
-        spans.push(Span::styled(value, with_bg(theme::faint())));
+        spans.push(Span::styled("  ".to_string(), with_bg(Style::default())));
+        spans.push(Span::styled(
+            truncate(value, value_room),
+            with_bg(theme::dim()),
+        ));
     }
     pad_to(&mut spans, content_w, tint);
     Line::from(spans)
 }
 
-/// Group eyebrow: UPPERCASE label in `TEXT_DIM` (house eyebrow style, same as the
-/// Status tab's `TIMELINE`), separating the integration checks from the profiles.
-fn group_eyebrow(label: &str) -> Line<'static> {
-    Line::from(Span::styled(label.to_uppercase(), theme::dim()))
+/// Group eyebrow: UPPERCASE label in the always-bold eyebrow style, separating the
+/// integration checks from the profiles. Underlined when focus rests on a row
+/// within this group.
+fn group_eyebrow(label: &str, active: bool) -> Line<'static> {
+    let mut style = theme::label();
+    if active {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    Line::from(Span::styled(label.to_uppercase(), style))
 }
 
 /// Pad a span list with tinted filler so the hover tint spans the full width.
@@ -231,10 +234,14 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // their case (`section_box_verbatim`); check labels go through `section_box`.
     let (block, detail): (Block<'static>, &[String]) =
         if let Some(check) = app.plugin.selected_check() {
-            (
-                section_box(check.label, focused, false),
-                check.detail.as_slice(),
-            )
+            // `mcpServers` is a camelCase identifier, not a structural word — keep
+            // its case rather than uppercasing it like the other check labels.
+            let title = if check.label == "mcpServers" {
+                section_box_verbatim(check.label, focused, false)
+            } else {
+                section_box(check.label, focused, false)
+            };
+            (title, check.detail.as_slice())
         } else if let Some(profile) = app.plugin.selected_profile() {
             (
                 section_box_verbatim(&profile.name, focused, false),
@@ -254,7 +261,18 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let lines: Vec<Line<'static>> = detail.iter().map(|line| detail_line(line)).collect();
+    // Width of the key column = widest `key: value` key, capped so a long key
+    // can't shove the values off-pane.
+    let key_w = detail
+        .iter()
+        // Indented sub-lines (model overrides) render dim, never through the key
+        // column — exclude them so they can't inflate the real rows' gap.
+        .filter(|line| !line.starts_with("  "))
+        .filter_map(|line| line.split_once(": ").map(|(k, _)| k.chars().count()))
+        .max()
+        .unwrap_or(0)
+        .min(18);
+    let lines: Vec<Line<'static>> = detail.iter().map(|line| detail_line(line, key_w)).collect();
     let total = lines.len();
     let viewport = inner.height as usize;
 
@@ -271,31 +289,48 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_scrollbar(frame, inner, total, scroll as usize, viewport);
 }
 
-/// Detail key column width — keys render left-aligned in this column, the value
-/// follows in body text (house static-kv style: spacing + color, no `:` colon).
-const DETAIL_KEY_W: usize = 13;
-
-/// Style one detail line: `[f] …` in ACCENT, two-space-indented sub-lines faint,
-/// `key: value` source rows as a dim padded key column + body value (colon
-/// dropped), everything else body text.
-fn detail_line(text: &str) -> Line<'static> {
+/// Style one detail line: the `[f] …` fix row as a hint (ACCENT-bold `[f]` key +
+/// dim action, matching the footer hint bar), two-space-indented sub-lines (MCP
+/// tool list, copyable commands) dim, `key: value` source rows as a label key
+/// column + tone-colored value (colon dropped, gap-aligned to `key_w`), everything
+/// else body text.
+fn detail_line(text: &str, key_w: usize) -> Line<'static> {
     if text.is_empty() {
         return Line::from("");
     }
     if let Some(rest) = text.strip_prefix("[f]") {
-        return Line::from(Span::styled(format!("[f]{rest}"), theme::accent()));
+        let label = rest.trim_start();
+        return Line::from(vec![
+            Span::styled("[f]", theme::accent().add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(label.to_string(), theme::dim()),
+        ]);
     }
     if text.starts_with("  ") {
-        return Line::from(Span::styled(text.to_string(), theme::faint()));
+        return Line::from(Span::styled(text.to_string(), theme::dim()));
     }
     if let Some((key, value)) = text.split_once(": ") {
-        let pad = DETAIL_KEY_W.saturating_sub(key.chars().count()).max(2);
+        let pad = key_w.saturating_sub(key.chars().count()) + 2;
         return Line::from(vec![
             Span::styled(format!("{key}{}", " ".repeat(pad)), theme::label()),
-            Span::styled(value.to_string(), theme::body()),
+            Span::styled(value.to_string(), value_tone(key, value)),
         ]);
     }
     Line::from(Span::styled(text.to_string(), theme::body()))
+}
+
+/// Tone the value of a `key: value` row by health-bearing (key, value-head) pairs.
+/// Only genuinely health-bearing keys are colored; everything else stays body.
+fn value_tone(key: &str, value: &str) -> Style {
+    let head = value.split_whitespace().next().unwrap_or(value);
+    match (key, head) {
+        ("present" | "installed", "yes") => theme::success(),
+        ("present" | "installed", "no") => theme::warning(),
+        ("link", "linked") => theme::success(),
+        ("link", "diverged") => theme::warning(),
+        ("link", "missing") => theme::danger(),
+        _ => theme::body(),
+    }
 }
 
 fn health_color(health: Health) -> ratatui::style::Color {
