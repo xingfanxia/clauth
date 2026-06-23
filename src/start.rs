@@ -16,7 +16,7 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 use crate::profile::AppConfig;
-use crate::runtime::ProfileRuntime;
+use crate::runtime::{Isolation, ProfileRuntime};
 use crate::spinner::Spinner;
 
 #[cfg(unix)]
@@ -27,19 +27,30 @@ struct ChildOutcome {
     signal: Option<i32>,
 }
 
-pub(crate) fn run(config: &AppConfig, name: &str, claude_args: &[String]) -> Result<()> {
+pub(crate) fn run(
+    config: &AppConfig,
+    name: &str,
+    claude_args: &[String],
+    isolation: Isolation,
+) -> Result<()> {
     let profile = config.find(name).context("profile not found")?;
 
     let runtime = {
         let _spinner = Spinner::start("clauth: preparing runtime");
-        ProfileRuntime::acquire(profile)?
+        ProfileRuntime::acquire(profile, isolation)?
     };
 
     #[cfg(unix)]
     let signal_watcher = SignalWatcher::new()?;
 
-    let mut child = Command::new("claude")
-        .env("CLAUDE_CONFIG_DIR", runtime.config_dir())
+    let mut command = Command::new("claude");
+    command.env("CLAUDE_CONFIG_DIR", runtime.config_dir());
+    // Isolated: also suppress global/project MCP servers wired through
+    // `.claude.json`, so the only extension surface is what the caller passes.
+    if isolation == Isolation::Isolated {
+        command.arg("--strict-mcp-config");
+    }
+    let mut child = command
         .args(claude_args)
         .spawn()
         .context("failed to spawn claude")?;

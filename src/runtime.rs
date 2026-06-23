@@ -38,7 +38,8 @@ use anyhow::{Context, Result};
 use crate::claude::{build_claude_settings_json, create_symlink};
 use crate::lock::with_state_lock;
 use crate::profile::{
-    ClaudeCredentials, Profile, atomic_write, atomic_write_600, claude_dir, profile_subpath,
+    ClaudeCredentials, Profile, atomic_write, atomic_write_600, claude_dir, clauth_dir,
+    profile_subpath,
 };
 
 /// Watchdog tick. 1s instead of a longer interval because fake-symlink mode
@@ -63,31 +64,89 @@ enum LinkMode {
     Fake,
 }
 
-fn runtime_dir(name: &str) -> Result<PathBuf> {
-    profile_subpath(name, "runtime")
+/// Whether a session inherits the operator's full `~/.claude/` (memory,
+/// plugins, hooks, commands, agents) or runs authenticated-but-clean. An
+/// isolated session gets its OWN `runtime-isolated/` + `sessions-isolated/`
+/// trees so it never collides with a shared session of the same profile, while
+/// sharing the profile's canonical credentials and rotation lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Isolation {
+    /// Full mirror of `~/.claude/`: the session behaves like the operator's.
+    Shared,
+    /// Credentials injected, but operator memory/plugins/hooks/commands/agents
+    /// omitted and settings built from an empty base — no house style leaks.
+    Isolated,
 }
 
-fn sessions_dir(name: &str) -> Result<PathBuf> {
-    profile_subpath(name, "sessions")
+impl Isolation {
+    fn runtime_subdir(self) -> &'static str {
+        match self {
+            Isolation::Shared => "runtime",
+            Isolation::Isolated => "runtime-isolated",
+        }
+    }
+    fn sessions_subdir(self) -> &'static str {
+        match self {
+            Isolation::Shared => "sessions",
+            Isolation::Isolated => "sessions-isolated",
+        }
+    }
 }
 
-/// True iff the profile has at least one live `clauth start` session. A missing
-/// or unreadable sessions dir returns false (the profile is idle).
+/// Top-level `~/.claude/` entries omitted from an isolated runtime: operator
+/// memory, plugins, hooks, and the command/agent/style/skill extensions. Account
+/// state (`.claude.json`, `statsig/`, `projects/`, …) still comes across so the
+/// session stays authenticated and non-interactive.
+const ISOLATED_SKIP: &[&str] = &[
+    "CLAUDE.md",
+    "plugins",
+    "hooks",
+    "commands",
+    "agents",
+    "output-styles",
+    "skills",
+];
+
+/// The two runtime flavors a profile can hold concurrently. Liveness and GC
+/// must consider both so a rotation never spends a token an isolated session
+/// still holds.
+const SESSION_ISOLATIONS: [Isolation; 2] = [Isolation::Shared, Isolation::Isolated];
+
+fn runtime_dir(name: &str, isolation: Isolation) -> Result<PathBuf> {
+    profile_subpath(name, isolation.runtime_subdir())
+}
+
+fn sessions_dir(name: &str, isolation: Isolation) -> Result<PathBuf> {
+    profile_subpath(name, isolation.sessions_subdir())
+}
+
+fn profiles_root_dir() -> Result<PathBuf> {
+    Ok(clauth_dir()?.join("profiles"))
+}
+
+/// True iff the profile has at least one live `clauth start` session, of either
+/// flavor (shared or isolated). Gates token rotation, so it MUST see an isolated
+/// session too — otherwise a rotation could spend a refresh token the isolated
+/// session still holds. A missing or unreadable sessions dir counts as idle.
 pub(crate) fn has_live_session(name: &str) -> bool {
-    let Ok(dir) = sessions_dir(name) else {
-        return false;
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return false;
-    };
-    entries.flatten().any(|e| is_session_alive(&e.path()))
+    SESSION_ISOLATIONS
+        .iter()
+        .any(|&iso| live_sessions_in(name, iso) > 0)
 }
 
-/// Count of live `clauth start` sessions for the profile. Additive sibling of
-/// [`has_live_session`] (left untouched — it gates token rotation); a missing or
-/// unreadable sessions dir counts as zero.
+/// Count of live `clauth start` sessions for the profile across both flavors.
+/// Additive sibling of [`has_live_session`]; a missing or unreadable sessions
+/// dir counts as zero.
 pub(crate) fn live_session_count(name: &str) -> usize {
-    let Ok(dir) = sessions_dir(name) else {
+    SESSION_ISOLATIONS
+        .iter()
+        .map(|&iso| live_sessions_in(name, iso))
+        .sum()
+}
+
+/// Live-session count for one isolation flavor; zero when the dir is absent.
+fn live_sessions_in(name: &str, isolation: Isolation) -> usize {
+    let Ok(dir) = sessions_dir(name, isolation) else {
         return 0;
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -97,6 +156,43 @@ pub(crate) fn live_session_count(name: &str) -> usize {
         .flatten()
         .filter(|e| is_session_alive(&e.path()))
         .count()
+}
+
+/// Best-effort sweep removing runtime trees whose owning session died without
+/// running teardown (SIGKILL/crash leaves `runtime/` + a stale `sessions/<pid>`).
+/// Safe at any entry point: each removal re-checks liveness under the state lock
+/// (the same teardown gate `Drop` uses), so a profile with a live session — or
+/// one mid-acquire holding the lock — is never collected.
+pub(crate) fn gc_stale_runtimes() {
+    let Ok(root) = profiles_root_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        for iso in SESSION_ISOLATIONS {
+            let _ = gc_one_runtime(&name, iso);
+        }
+    }
+}
+
+fn gc_one_runtime(name: &str, isolation: Isolation) -> Result<()> {
+    let runtime = runtime_dir(name, isolation)?;
+    if runtime.symlink_metadata().is_err() {
+        return Ok(()); // nothing left behind for this flavor
+    }
+    let sessions = sessions_dir(name, isolation)?;
+    with_state_lock(|| {
+        if prune_stale_sessions(&sessions).unwrap_or(0) == 0 {
+            let _ = std::fs::remove_dir_all(&runtime);
+            let _ = std::fs::remove_dir(&sessions);
+        }
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 fn canonical_credentials(name: &str) -> Result<PathBuf> {
@@ -178,6 +274,7 @@ pub(crate) struct ProfileRuntime {
     canonical: PathBuf,
     sessions: PathBuf,
     mode: LinkMode,
+    isolation: Isolation,
     /// Held for the lifetime of the session so a sibling process's
     /// `try_lock` reveals we're still alive.
     _pid_lock: File,
@@ -188,14 +285,14 @@ pub(crate) struct ProfileRuntime {
 }
 
 impl ProfileRuntime {
-    pub(crate) fn acquire(profile: &Profile) -> Result<Self> {
+    pub(crate) fn acquire(profile: &Profile, isolation: Isolation) -> Result<Self> {
         let name = &profile.name;
         let claude_home = claude_dir()?;
         if !claude_home.exists() {
             anyhow::bail!("~/.claude not found; install Claude Code first");
         }
-        let runtime = runtime_dir(name)?;
-        let sessions = sessions_dir(name)?;
+        let runtime = runtime_dir(name, isolation)?;
+        let sessions = sessions_dir(name, isolation)?;
         let pid_file = sessions.join(std::process::id().to_string());
         let canonical = canonical_credentials(name)?;
 
@@ -221,7 +318,7 @@ impl ProfileRuntime {
             std::fs::create_dir_all(&runtime)
                 .with_context(|| format!("failed to create {}", runtime.display()))?;
             let mode = detect_link_mode(&runtime)?;
-            build_runtime_dir(&runtime, &claude_home, profile, &canonical, mode)?;
+            build_runtime_dir(&runtime, &claude_home, profile, &canonical, mode, isolation)?;
             let file = open_pid_file(&pid_file)
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
             file.lock()
@@ -253,6 +350,7 @@ impl ProfileRuntime {
                         until_cred = cred_every;
                         if let Err(e) = tick(
                             mode,
+                            isolation,
                             &watchdog_runtime,
                             &watchdog_claude_home,
                             &watchdog_canonical,
@@ -271,6 +369,7 @@ impl ProfileRuntime {
             canonical,
             sessions,
             mode,
+            isolation,
             _pid_lock: pid_lock,
             watchdog_signal: Some(tx),
             watchdog_handle: Some(watchdog_handle),
@@ -290,7 +389,13 @@ impl Drop for ProfileRuntime {
             let _ = h.join();
         }
 
-        if let Err(e) = tick(self.mode, &self.runtime, &self.claude_home, &self.canonical) {
+        if let Err(e) = tick(
+            self.mode,
+            self.isolation,
+            &self.runtime,
+            &self.claude_home,
+            &self.canonical,
+        ) {
             eprintln!("clauth: final sync failed: {e}");
         }
 
@@ -409,13 +514,26 @@ fn is_session_alive(pid_file: &Path) -> bool {
 ///   shared `~/.claude/.credentials.json` copy; `.claude.json` is reconciled
 ///   across all profiles by `crate::claude_json`, which propagates every field
 ///   except the account-specific ones (`oauthAccount` + billing caches).
+///
+/// In [`Isolation::Isolated`] mode the [`ISOLATED_SKIP`] entries (operator
+/// memory/plugins/hooks/commands/agents) are omitted and `settings.json` is
+/// built from an empty base, so an authenticated session inherits no house style.
 fn build_runtime_dir(
     runtime: &Path,
     claude_home: &Path,
     profile: &Profile,
     canonical: &Path,
     mode: LinkMode,
+    isolation: Isolation,
 ) -> Result<()> {
+    // Drop any top-level symlink whose `~/.claude/` target has vanished before
+    // the re-walk. A prior session's link can dangle once the operator moves the
+    // source aside (the reported `runtime/CLAUDE.md` → moved memory case); the
+    // walk below only visits entries still in `~/.claude/`, so it would never
+    // revisit — and skip — that stale link. Live entries stay; a still-present
+    // source gets re-linked by the walk.
+    prune_dangling_links(runtime)?;
+
     let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(claude_home)
         .with_context(|| format!("failed to read {}", claude_home.display()))?
@@ -425,6 +543,13 @@ fn build_runtime_dir(
         if file_name == "settings.json" || file_name == ".credentials.json" {
             continue;
         }
+        if isolation == Isolation::Isolated
+            && file_name
+                .to_str()
+                .is_some_and(|n| ISOLATED_SKIP.contains(&n))
+        {
+            continue;
+        }
         let dst = runtime.join(&file_name);
         if dst.symlink_metadata().is_ok() {
             continue;
@@ -432,7 +557,7 @@ fn build_runtime_dir(
         pending.push((entry.path(), dst));
     }
     materialize_entries(pending, mode)?;
-    write_merged_settings(runtime, claude_home, profile)?;
+    write_merged_settings(runtime, claude_home, profile, isolation)?;
 
     let creds_link = runtime.join(".credentials.json");
     reconcile_credentials(&creds_link, canonical, mode)?;
@@ -442,13 +567,46 @@ fn build_runtime_dir(
     Ok(())
 }
 
+/// Remove top-level symlinks in the runtime whose target no longer resolves
+/// (the `~/.claude/` source was moved or deleted). Self-heals the dangling-link
+/// artifact a prior build can leave; only symlinks are touched — regular files
+/// and directories are never removed. `.credentials.json` is reconciled
+/// separately afterwards, so pruning a stale one here is safe.
+fn prune_dangling_links(runtime: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(runtime) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(meta) = path.symlink_metadata()
+            && meta.file_type().is_symlink()
+            && !path.exists()
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
 /// Compute this profile's merged `settings.json` and write it into the runtime
 /// tree only when absent or byte-different. Concurrent sessions on the same
 /// profile each compute the same merge, so a byte-identical result needn't win
-/// a last-writer race and stomp a sibling's write.
-fn write_merged_settings(runtime: &Path, claude_home: &Path, profile: &Profile) -> Result<()> {
+/// a last-writer race and stomp a sibling's write. Isolated mode builds from an
+/// empty base (no operator hooks/permissions/statusline/plugin config), keeping
+/// only the profile's own env + model routing.
+fn write_merged_settings(
+    runtime: &Path,
+    claude_home: &Path,
+    profile: &Profile,
+    isolation: Isolation,
+) -> Result<()> {
     let settings_src = claude_home.join("settings.json");
-    let merged = build_claude_settings_json(&settings_src, profile, &[])?;
+    let base = match isolation {
+        Isolation::Shared => Some(settings_src.as_path()),
+        Isolation::Isolated => None,
+    };
+    let merged = build_claude_settings_json(base, profile, &[])?;
     let settings_dst = runtime.join("settings.json");
     let needs_write = std::fs::read(&settings_dst)
         .map(|existing| existing != merged.as_bytes())
@@ -597,12 +755,24 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 
 /// One watchdog iteration. Real mode only repairs `.credentials.json` (the rest
 /// is symlinks needing no maintenance). Fake mode reconciles every tree file by
-/// mtime, plus the credentials file.
-fn tick(mode: LinkMode, runtime: &Path, claude_home: &Path, canonical: &Path) -> Result<()> {
+/// mtime, plus the credentials file — except in isolated mode, where the tree
+/// mirror is skipped so it never re-seeds the operator memory/plugins the
+/// isolated runtime deliberately omits (`mirror_tree` is additive and would
+/// copy `~/.claude/CLAUDE.md` back in). Credentials still reconcile.
+fn tick(
+    mode: LinkMode,
+    isolation: Isolation,
+    runtime: &Path,
+    claude_home: &Path,
+    canonical: &Path,
+) -> Result<()> {
     match mode {
         LinkMode::Real => {
             let _ = sync_credentials(runtime, canonical)?;
             Ok(())
+        }
+        LinkMode::Fake if isolation == Isolation::Isolated => {
+            with_state_lock(|| mirror_credentials(&runtime.join(".credentials.json"), canonical))
         }
         LinkMode::Fake => {
             // Bulk tree walk + copies run WITHOUT the state lock: on a large

@@ -733,8 +733,15 @@ fn build_runtime_dir_writes_settings_not_symlink() {
         let profile = make_profile("test");
         let canonical = tmp.path().join("creds.json");
 
-        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
-            .expect("build");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
 
         let settings_dst = runtime.join("settings.json");
         let meta = settings_dst.symlink_metadata().expect("settings present");
@@ -744,7 +751,7 @@ fn build_runtime_dir_writes_settings_not_symlink() {
         );
 
         let expected =
-            build_claude_settings_json(&claude_home.join("settings.json"), &profile, &[])
+            build_claude_settings_json(Some(&claude_home.join("settings.json")), &profile, &[])
                 .expect("build_claude_settings_json");
         let actual = fs::read_to_string(&settings_dst).expect("read settings");
         assert_eq!(actual, expected);
@@ -764,8 +771,15 @@ fn build_runtime_dir_credentials_not_from_claude_home() {
         let profile = make_profile("test");
         let canonical = tmp.path().join("profile-creds.json"); // no canonical → runtime creds absent
 
-        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
-            .expect("build");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
 
         let runtime_creds = runtime.join(".credentials.json");
         assert!(
@@ -793,8 +807,15 @@ fn build_runtime_dir_fake_preserves_live_runtime_credentials() {
         set_mtime(&canonical, past);
         set_mtime(&runtime_creds, now);
 
-        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
-            .expect("build");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
 
         assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
         assert_eq!(fs::read(&runtime_creds).expect("read runtime"), CREDS_V2);
@@ -816,8 +837,15 @@ fn build_runtime_dir_real_preserves_live_runtime_credentials() {
         fs::write(&canonical, CREDS_V1).expect("write canonical");
         fs::write(&runtime_creds, CREDS_V2).expect("write runtime credentials");
 
-        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Real)
-            .expect("build");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("build");
 
         assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V2);
         assert!(
@@ -845,8 +873,15 @@ fn build_runtime_dir_real_keeps_invalid_runtime_credentials_for_retry() {
         fs::write(&canonical, CREDS_V1).expect("write canonical");
         fs::write(&runtime_creds, b"partial write").expect("write runtime credentials");
 
-        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Real)
-            .expect("build");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("build");
 
         assert_eq!(fs::read(&canonical).expect("read canonical"), CREDS_V1);
         assert_eq!(
@@ -870,8 +905,15 @@ fn build_runtime_dir_other_entries_materialized() {
         let profile = make_profile("test");
         let canonical = tmp.path().join("creds.json");
 
-        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
-            .expect("build");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
 
         assert!(runtime.join("projects").is_dir(), "projects dir copied"); // Fake mode: copied, not symlinked
         assert!(
@@ -894,8 +936,15 @@ fn build_runtime_dir_other_entries_symlinked_on_unix() {
         let profile = make_profile("test");
         let canonical = tmp.path().join("creds.json");
 
-        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Real)
-            .expect("build");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("build");
 
         let dst = runtime.join("todos.json");
         assert!(
@@ -922,8 +971,15 @@ fn build_runtime_dir_links_claude_json_from_parent() {
         let profile = make_profile("test");
         let canonical = tmp.path().join("creds.json");
 
-        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
-            .expect("build");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
 
         let dst = runtime.join(".claude.json");
         assert!(dst.exists(), ".claude.json must appear in runtime");
@@ -1051,7 +1107,7 @@ fn acquire_creates_runtime_and_pid_file() {
         fake_claude_home(tmp.path());
         let profile = make_profile("lifecycle");
 
-        let rt = ProfileRuntime::acquire(&profile).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared).expect("acquire");
 
         assert!(
             rt.config_dir().is_dir(),
@@ -1126,7 +1182,7 @@ fn acquire_isolates_credentials_from_real_home() {
             .expect("mkdir profile dir");
         fs::write(&canonical, CREDS_V2).expect("write canonical");
 
-        let rt = ProfileRuntime::acquire(&profile).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared).expect("acquire");
         let runtime_creds = rt.config_dir().join(".credentials.json");
 
         // The runtime's credentials resolve to the profile's OWN chain (V2),
@@ -1181,8 +1237,15 @@ fn build_runtime_dir_rewalk_picks_up_late_entries() {
         let profile = make_profile("rewalk");
         let canonical = tmp.path().join("creds.json");
 
-        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
-            .expect("first build");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("first build");
         assert!(
             runtime.join("existing.txt").exists(),
             "first build: existing.txt present"
@@ -1191,8 +1254,15 @@ fn build_runtime_dir_rewalk_picks_up_late_entries() {
         fs::write(claude_home.join("late_entry.txt"), b"new").expect("write late entry");
 
         // second build (second session's acquire) — late entry must appear
-        build_runtime_dir(&runtime, &claude_home, &profile, &canonical, LinkMode::Fake)
-            .expect("second build");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("second build");
         assert!(
             runtime.join("late_entry.txt").exists(),
             "second build must pick up late_entry.txt"
@@ -1296,4 +1366,225 @@ fn sync_credentials_unlocked_concurrent_same_link_consistent_end_state() {
         !tmp_name.exists(),
         "PID-suffixed tmp must not persist after sync completes"
     );
+}
+
+// ── isolated runtime layout ──────────────────────────────────────────────────
+
+/// Isolated mode omits operator memory/plugins/hooks but keeps account state.
+#[test]
+fn build_runtime_dir_isolated_omits_operator_extensions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(claude_home.join("CLAUDE.md"), b"# operator memory").expect("write memory");
+        fs::create_dir_all(claude_home.join("plugins")).expect("mkdir plugins");
+        fs::create_dir_all(claude_home.join("hooks")).expect("mkdir hooks");
+        fs::create_dir_all(claude_home.join("commands")).expect("mkdir commands");
+        fs::write(claude_home.join("history.jsonl"), b"{}").expect("write history");
+        let runtime = tmp.path().join("runtime-isolated");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("iso");
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Isolated,
+        )
+        .expect("build");
+
+        for omitted in ["CLAUDE.md", "plugins", "hooks", "commands"] {
+            assert!(
+                !runtime.join(omitted).exists(),
+                "isolated runtime must omit operator `{omitted}`"
+            );
+        }
+        assert!(
+            runtime.join("history.jsonl").exists(),
+            "account state still comes across"
+        );
+        assert!(
+            runtime.join("settings.json").exists(),
+            "settings.json still written"
+        );
+    });
+}
+
+/// Shared mode keeps the same entries isolated mode strips — the control case.
+#[test]
+fn build_runtime_dir_shared_keeps_operator_extensions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(claude_home.join("CLAUDE.md"), b"# operator memory").expect("write memory");
+        fs::create_dir_all(claude_home.join("plugins")).expect("mkdir plugins");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("shared");
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        assert!(runtime.join("CLAUDE.md").exists(), "shared keeps memory");
+        assert!(runtime.join("plugins").exists(), "shared keeps plugins");
+    });
+}
+
+/// Isolated settings start from an empty base, so operator hooks never leak.
+#[test]
+fn build_runtime_dir_isolated_settings_drop_operator_config() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(
+            claude_home.join("settings.json"),
+            br#"{"hooks":{"PreToolUse":[]},"statusLine":{"type":"command"},"env":{"OP":"1"}}"#,
+        )
+        .expect("write settings");
+        let runtime = tmp.path().join("runtime-isolated");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = make_profile("iso");
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Isolated,
+        )
+        .expect("build");
+
+        let raw = fs::read_to_string(runtime.join("settings.json")).expect("read settings");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse settings");
+        assert!(v.get("hooks").is_none(), "operator hooks dropped");
+        assert!(v.get("statusLine").is_none(), "operator statusLine dropped");
+        assert!(
+            v["env"].get("OP").is_none(),
+            "operator env entry dropped (empty base)"
+        );
+    });
+}
+
+/// A dangling top-level symlink (its `~/.claude/` source moved away) is removed
+/// on the next build — the reported `runtime/CLAUDE.md.benchbak` leftover.
+#[cfg(unix)]
+#[test]
+fn build_runtime_dir_prunes_dangling_symlink() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        // A link left from a prior build whose source no longer exists.
+        let dangling = runtime.join("CLAUDE.md.benchbak");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &dangling).expect("symlink");
+        assert!(
+            dangling.symlink_metadata().is_ok(),
+            "link exists (dangling)"
+        );
+        assert!(!dangling.exists(), "target is gone");
+
+        let profile = make_profile("heal");
+        let canonical = tmp.path().join("creds.json");
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        assert!(
+            dangling.symlink_metadata().is_err(),
+            "dangling symlink must be pruned on rebuild"
+        );
+    });
+}
+
+// ── isolation liveness + GC ──────────────────────────────────────────────────
+
+/// An isolated session must register as live so rotation never spends a token
+/// it still holds — `has_live_session` unions both flavors.
+#[test]
+fn has_live_session_sees_isolated_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let sessions = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("iso")
+            .join("sessions-isolated");
+        fs::create_dir_all(&sessions).expect("mkdir isolated sessions");
+        let pid = sessions.join("4242");
+        let file = open_pid_file(&pid).expect("open pid");
+        file.lock().expect("lock pid");
+        assert!(has_live_session("iso"), "isolated live session counts");
+        assert_eq!(live_session_count("iso"), 1);
+        drop(file);
+        assert!(!has_live_session("iso"));
+    });
+}
+
+/// GC removes a runtime tree left by a crashed session (no live PID), and never
+/// touches one with a live session.
+#[test]
+fn gc_removes_stale_runtime_but_spares_live() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+
+        // Stale: a runtime tree with a dead (unlocked) pid file.
+        let stale_runtime = profiles.join("stale").join("runtime");
+        let stale_sessions = profiles.join("stale").join("sessions");
+        fs::create_dir_all(&stale_runtime).expect("mkdir stale runtime");
+        fs::create_dir_all(&stale_sessions).expect("mkdir stale sessions");
+        fs::write(stale_runtime.join("settings.json"), b"{}").expect("seed runtime");
+        fs::write(stale_sessions.join("99999"), b"").expect("dead pid");
+
+        // Live: an isolated runtime with a flock-held pid file.
+        let live_runtime = profiles.join("live").join("runtime-isolated");
+        let live_sessions = profiles.join("live").join("sessions-isolated");
+        fs::create_dir_all(&live_runtime).expect("mkdir live runtime");
+        fs::create_dir_all(&live_sessions).expect("mkdir live sessions");
+        let held = open_pid_file(&live_sessions.join("1234")).expect("open live pid");
+        held.lock().expect("lock live pid");
+
+        gc_stale_runtimes();
+
+        assert!(
+            !stale_runtime.exists(),
+            "stale runtime with no live session must be collected"
+        );
+        assert!(
+            !stale_sessions.exists(),
+            "stale sessions dir cleaned alongside"
+        );
+        assert!(
+            live_runtime.exists(),
+            "a live session's runtime must be spared"
+        );
+        drop(held);
+    });
 }

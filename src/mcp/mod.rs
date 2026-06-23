@@ -8,6 +8,7 @@
 
 mod render;
 
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -25,9 +26,36 @@ use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
 };
 use crate::providers::ThirdPartyStats;
-use crate::runtime::ProfileRuntime;
+use crate::runtime::{Isolation, ProfileRuntime};
 use crate::usage::{UsageInfo, UsageWindow, humanize_duration, now_epoch_secs, now_ms};
 use render::ProfileSnapshot;
+
+/// Default per-call delegate timeout (seconds) when the caller doesn't set one.
+const DEFAULT_RUN_TIMEOUT_SECS: u64 = 300;
+/// Hard ceiling on a caller-supplied delegate timeout (seconds).
+const MAX_RUN_TIMEOUT_SECS: u64 = 3600;
+/// Raise the delegate's max output budget above CC's default so a long headless
+/// build doesn't die on the 32k cap. Overridable via the `env` arg.
+const DEFAULT_MAX_OUTPUT_TOKENS: &str = "64000";
+
+/// Compact per-model throughput rows for a profile (observed tok/s, degraded /
+/// rate-limited flags). Empty array when clauth has launched no runs for it.
+fn throughput_json(profile: &str, now: i64) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = crate::throughput::summary(profile, now)
+        .into_iter()
+        .map(|m| {
+            serde_json::json!({
+                "model": m.model,
+                "tok_s": (m.tok_s * 10.0).round() / 10.0,
+                "samples": m.samples,
+                "degraded": m.degraded,
+                "rate_limited_recent": m.rate_limited_recent,
+                "retry_after_s": m.retry_after_s,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rows)
+}
 
 /// Display provider for a profile: a recognised third-party name, else
 /// `anthropic` for an OAuth profile.
@@ -107,6 +135,22 @@ pub(crate) struct RunArgs {
     prompt: String,
     /// Optional model override for the delegated session.
     model: Option<String>,
+    /// Working directory for the delegate (must exist). Defaults to the MCP
+    /// server's cwd. Set a clean dir to keep the delegate from picking up a
+    /// project `CLAUDE.md`.
+    cwd: Option<String>,
+    /// Extra environment variables for the delegate (e.g.
+    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS`). `CLAUDE_CONFIG_DIR` and the depth guard
+    /// are always set by clauth and cannot be overridden here.
+    env: Option<HashMap<String, String>>,
+    /// Extra arguments appended to the `claude` invocation (after clauth's own
+    /// `-p`/`--output-format json`/`--strict-mcp-config`).
+    args: Option<Vec<String>>,
+    /// Per-call timeout in seconds (1..=3600). Defaults to 300.
+    timeout_secs: Option<u64>,
+    /// Run authenticated but without operator memory/plugins/hooks (a clean
+    /// blind session). Defaults to false.
+    isolated: Option<bool>,
 }
 
 #[tool_router]
@@ -120,6 +164,7 @@ impl ClauthServer {
     #[tool(description = "List all clauth profiles with cached 5h/7d usage and live-session state")]
     async fn list_profiles(&self) -> Result<CallToolResult, ErrorData> {
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let now = now_epoch_secs();
 
         let profiles: Vec<serde_json::Value> = config
             .profiles
@@ -155,6 +200,7 @@ impl ClauthServer {
                     "has_live_session": crate::runtime::has_live_session(name),
                     "windows": windows,
                     "third_party": third_party,
+                    "throughput": throughput_json(name, now),
                 })
             })
             .collect();
@@ -169,9 +215,14 @@ impl ClauthServer {
     async fn which(&self) -> Result<CallToolResult, ErrorData> {
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let resolved = crate::which::resolve_active(&config);
+        let throughput = resolved
+            .as_ref()
+            .map(|(name, _)| throughput_json(name, now_epoch_secs()))
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
         let payload = serde_json::json!({
             "profile": resolved.as_ref().map(|(name, _)| name),
             "source": resolved.as_ref().map(|(_, source)| source.as_str()),
+            "throughput": throughput,
         });
         Ok(CallToolResult::success(with_footer(
             payload,
@@ -227,7 +278,7 @@ impl ClauthServer {
     }
 
     #[tool(
-        description = "Delegate a headless task to a profile; spends that account's window. Returns the run envelope"
+        description = "Delegate a headless task to a profile; spends that account's window. Optional cwd/env/args/timeout_secs/isolated shape the spawned `claude`; `isolated` drops operator memory/plugins/hooks. Returns the run envelope"
     )]
     async fn run(
         &self,
@@ -235,6 +286,11 @@ impl ClauthServer {
             profile,
             prompt,
             model,
+            cwd,
+            env,
+            args,
+            timeout_secs,
+            isolated,
         }): Parameters<RunArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         // Fail closed: a present-but-unparseable value is treated as max depth
@@ -255,9 +311,30 @@ impl ClauthServer {
             )]));
         }
 
+        let timeout = Duration::from_secs(
+            timeout_secs
+                .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS)
+                .clamp(1, MAX_RUN_TIMEOUT_SECS),
+        );
+        let isolation = if isolated.unwrap_or(false) {
+            Isolation::Isolated
+        } else {
+            Isolation::Shared
+        };
+
         let target = profile.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            run_delegate(&target, &prompt, model.as_deref(), depth)
+            run_delegate(DelegateOpts {
+                profile: &target,
+                prompt: &prompt,
+                model: model.as_deref(),
+                cwd: cwd.as_deref(),
+                env: env.unwrap_or_default(),
+                extra_args: args.unwrap_or_default(),
+                timeout,
+                isolation,
+                depth,
+            })
         })
         .await
         .map_err(|e| ErrorData::internal_error(format!("delegate task panicked: {e}"), None))?;
@@ -272,7 +349,12 @@ impl ClauthServer {
         };
 
         let (five_h, seven_d) = load_windows(&profile);
-        let footer = render::live_footer(Some(profile.as_str()), five_h.as_ref(), seven_d.as_ref());
+        let mut footer =
+            render::live_footer(Some(profile.as_str()), five_h.as_ref(), seven_d.as_ref());
+        if let Some(note) = throughput_note(&profile, now_epoch_secs()) {
+            footer.push('\n');
+            footer.push_str(&note);
+        }
         let is_error = envelope
             .get("is_error")
             .and_then(|v| v.as_bool())
@@ -290,39 +372,59 @@ impl ClauthServer {
 /// `depth+1` so a delegate cannot itself delegate (hard cap at 1).
 const MCP_DEPTH_ENV: &str = "CLAUTH_MCP_DEPTH";
 
-/// Fixed internal timeout for a delegated `run` (not caller-tunable).
-const RUN_TIMEOUT: Duration = Duration::from_secs(300);
-
 /// Poll interval mirroring `start.rs`'s `wait_for_child` cadence.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Inputs for one delegated `run`. Grouped into a struct so `run_delegate`
+/// avoids a too-many-arguments signature as the surface grew (cwd/env/args/
+/// timeout/isolation).
+struct DelegateOpts<'a> {
+    profile: &'a str,
+    prompt: &'a str,
+    model: Option<&'a str>,
+    cwd: Option<&'a str>,
+    env: HashMap<String, String>,
+    extra_args: Vec<String>,
+    timeout: Duration,
+    isolation: Isolation,
+    depth: u32,
+}
+
 /// Blocking delegate: acquire the target profile's runtime, spawn a headless
-/// `claude -p` with piped stdio, enforce a fixed timeout, and parse its JSON
+/// `claude -p` with piped stdio, enforce the timeout, and parse its JSON
 /// envelope. Returns `Ok(envelope)` on a clean parse, or `Err(reason)` for a
 /// timeout, non-zero exit, or unparseable output (the caller wraps it in an
-/// `is_error` envelope). Never bubbles a transport-level error.
-fn run_delegate(
-    profile: &str,
-    prompt: &str,
-    model: Option<&str>,
-    depth: u32,
-) -> std::result::Result<serde_json::Value, String> {
+/// `is_error` envelope). Records observed throughput / rate-limit hits as a side
+/// effect. Never bubbles a transport-level error.
+fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value, String> {
     let config = load_config().map_err(|e| format!("failed to load config: {e}"))?;
     let target = config
-        .find(profile)
-        .ok_or_else(|| format!("profile not found: {profile}"))?;
+        .find(opts.profile)
+        .ok_or_else(|| format!("profile not found: {}", opts.profile))?;
+
+    if let Some(dir) = opts.cwd
+        && !std::path::Path::new(dir).is_dir()
+    {
+        return Err(format!("cwd does not exist or is not a directory: {dir}"));
+    }
 
     // Guard kept alive across spawn+wait; dropped on return for RAII teardown.
-    let runtime =
-        ProfileRuntime::acquire(target).map_err(|e| format!("failed to acquire runtime: {e}"))?;
+    let runtime = ProfileRuntime::acquire(target, opts.isolation)
+        .map_err(|e| format!("failed to acquire runtime: {e}"))?;
 
     let mut command = Command::new("claude");
+    // Caller env first so clauth's own keys below always win (a caller can't
+    // redirect CLAUDE_CONFIG_DIR or defeat the depth guard).
+    command.envs(&opts.env);
+    if !opts.env.contains_key("CLAUDE_CODE_MAX_OUTPUT_TOKENS") {
+        command.env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
+    }
     command
         .env("CLAUDE_CONFIG_DIR", runtime.config_dir())
-        .env(MCP_DEPTH_ENV, (depth + 1).to_string())
+        .env(MCP_DEPTH_ENV, (opts.depth + 1).to_string())
         .args([
             "-p",
-            prompt,
+            opts.prompt,
             "--output-format",
             "json",
             "--strict-mcp-config",
@@ -330,9 +432,13 @@ fn run_delegate(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
-    if let Some(m) = model {
+    if let Some(m) = opts.model {
         command.args(["--model", m]);
     }
+    if let Some(dir) = opts.cwd {
+        command.current_dir(dir);
+    }
+    command.args(&opts.extra_args);
 
     let mut child = command
         .spawn()
@@ -356,12 +462,12 @@ fn run_delegate(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if start.elapsed() >= RUN_TIMEOUT {
+                if start.elapsed() >= opts.timeout {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!(
                         "delegate timed out after {}s",
-                        RUN_TIMEOUT.as_secs()
+                        opts.timeout.as_secs()
                     ));
                 }
                 std::thread::sleep(RUN_POLL_INTERVAL);
@@ -373,8 +479,15 @@ fn run_delegate(
     let stdout_bytes = join_reader(stdout_reader);
     let stderr_bytes = join_reader(stderr_reader);
     let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let now = now_epoch_secs();
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr_bytes);
+        // A non-zero exit can be a throttle; record it so `which`/`list_profiles`
+        // can flag the model as rate-limited (clauth never sees inference 429s
+        // any other way).
+        if let Some(retry_after) = rate_limit_hint(&format!("{stderr}{stdout}")) {
+            crate::throughput::record_rate_limit(opts.profile, opts.model, retry_after, now);
+        }
         return Err(format!(
             "claude exited with {}: {}",
             status
@@ -383,12 +496,89 @@ fn run_delegate(
             truncate(stderr.trim(), 2000)
         ));
     }
-    serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|e| {
+    let envelope = serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|e| {
         format!(
             "failed to parse claude output: {e}: {}",
             truncate(stdout.trim(), 2000)
         )
-    })
+    })?;
+    // A clean exit can still carry an in-band error envelope (rate limit shows up
+    // there with `--output-format json`); branch on `is_error` so a throttle is
+    // recorded as one, not as a (bogus) throughput sample.
+    if envelope
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        if let Some(retry_after) = rate_limit_hint(&envelope.to_string()) {
+            crate::throughput::record_rate_limit(opts.profile, opts.model, retry_after, now);
+        }
+    } else {
+        record_throughput_from_envelope(opts.profile, opts.model, &envelope, now);
+    }
+    Ok(envelope)
+}
+
+/// Pull output-token throughput from a successful `claude` JSON envelope and
+/// record it. Best-effort: a missing usage/duration block records nothing.
+fn record_throughput_from_envelope(
+    profile: &str,
+    model: Option<&str>,
+    envelope: &serde_json::Value,
+    now: i64,
+) {
+    let output_tokens = envelope
+        .get("usage")
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let duration_ms = envelope
+        .get("duration_api_ms")
+        .or_else(|| envelope.get("duration_ms"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    crate::throughput::record_success(profile, model, output_tokens, duration_ms, now);
+}
+
+/// Detect a rate-limit / 429 signature in a delegate's output. `Some(retry)`
+/// when it looks rate-limited (inner `None` = no Retry-After hint found),
+/// `None` when it doesn't.
+fn rate_limit_hint(text: &str) -> Option<Option<u64>> {
+    let lower = text.to_lowercase();
+    let limited = lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("429")
+        || lower.contains("overloaded");
+    if !limited {
+        return None;
+    }
+    let retry_after = lower.find("retry").and_then(|i| {
+        lower[i..]
+            .split(|c: char| !c.is_ascii_digit())
+            .find(|s| !s.is_empty())
+            .and_then(|s| s.parse::<u64>().ok())
+    });
+    Some(retry_after)
+}
+
+/// One-line throughput warning for the live footer, or `None` when nothing is
+/// degraded or rate-limited.
+fn throughput_note(profile: &str, now: i64) -> Option<String> {
+    let flagged: Vec<String> = crate::throughput::summary(profile, now)
+        .into_iter()
+        .filter(|m| m.degraded || m.rate_limited_recent)
+        .map(|m| {
+            if m.rate_limited_recent {
+                match m.retry_after_s {
+                    Some(s) => format!("{} rate-limited (retry ~{s}s)", m.model),
+                    None => format!("{} rate-limited", m.model),
+                }
+            } else {
+                format!("{} slow (~{:.0} tok/s)", m.model, m.tok_s)
+            }
+        })
+        .collect();
+    (!flagged.is_empty()).then(|| format!("⚠ throughput: {}", flagged.join(", ")))
 }
 
 /// Read a child pipe to EOF into a buffer, swallowing read errors (a partial
@@ -475,6 +665,7 @@ fn build_instructions() -> String {
 }
 
 pub(crate) fn serve() -> Result<()> {
+    crate::runtime::gc_stale_runtimes();
     // rmcp's service loop arms a Tokio timer (needs `enable_time`), so a bare
     // current-thread runtime panics right after the initialize reply. `enable_all`
     // also turns on the I/O driver, covering a future transport that polls a real

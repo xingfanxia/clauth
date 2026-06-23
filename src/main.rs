@@ -19,6 +19,7 @@ mod runtime;
 mod spinner;
 mod start;
 mod status;
+mod throughput;
 mod tokens;
 mod tui;
 mod update;
@@ -31,6 +32,7 @@ mod testutil;
 use anyhow::Result;
 
 use crate::profile::{AppConfig, ThemeName, load_config};
+use crate::runtime::Isolation;
 
 fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<String> {
     config.canonical_name(name).ok_or_else(|| {
@@ -74,9 +76,19 @@ fn dispatch(args: &[String]) -> Result<()> {
             anyhow::bail!("usage: clauth which [--json]");
         }
         [cmd] if cmd == "start" => {
-            anyhow::bail!("usage: clauth start <profile> [claude args...]");
+            anyhow::bail!("usage: clauth start [--isolated] <profile> [claude args...]");
         }
-        [cmd, name, rest @ ..] if cmd == "start" => cmd_start(name, rest),
+        [cmd, flag] if cmd == "start" && flag == "--isolated" => {
+            anyhow::bail!("usage: clauth start --isolated <profile> [claude args...]");
+        }
+        [cmd, flag, name, rest @ ..] if cmd == "start" && flag == "--isolated" => {
+            cmd_start(name, rest, Isolation::Isolated)
+        }
+        [cmd, name, rest @ ..] if cmd == "start" => cmd_start(name, rest, Isolation::Shared),
+        [cmd, ..] if cmd == "run" => anyhow::bail!(
+            "`clauth run` isn't a command — for a headless delegate use \
+             `clauth start <profile> -p \"<prompt>\"` (or the MCP `run` tool)"
+        ),
         [cmd] if cmd == "mcp" => mcp::serve(),
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
@@ -108,11 +120,12 @@ fn peel_theme_flag(args: &[String]) -> (Option<tui::theme::Tier>, &[String]) {
     (None, args)
 }
 
-fn cmd_start(name: &str, rest: &[String]) -> Result<()> {
+fn cmd_start(name: &str, rest: &[String], isolation: Isolation) -> Result<()> {
     platform::init();
+    runtime::gc_stale_runtimes();
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
-    start::run(&config, &canonical, rest)
+    start::run(&config, &canonical, rest, isolation)
 }
 
 fn cmd_switch(name: &str) -> Result<()> {
@@ -124,6 +137,7 @@ fn cmd_switch(name: &str) -> Result<()> {
 
 fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
     platform::init();
+    runtime::gc_stale_runtimes();
     completions::auto_install_once();
     let config = load_config()?;
     // Config-file tier: profiles.toml `theme = "full"|"compatible"`.
@@ -142,8 +156,11 @@ fn print_help() {
          Usage:\n  \
            clauth [--theme=full|compatible] launch the TUI\n  \
            clauth <profile>                switch to profile by name and exit\n  \
-           clauth start <profile> [args]   launch claude with that profile's settings\n                                  \
-         in an isolated CLAUDE_CONFIG_DIR; extra args go to claude\n  \
+           clauth start [--isolated] <profile> [args]\n                                  \
+         launch claude with that profile's settings in a per-profile\n                                  \
+         CLAUDE_CONFIG_DIR; --isolated injects creds but drops operator\n                                  \
+         memory/plugins/hooks (run in a clean cwd for a blind session);\n                                  \
+         extra args go to claude\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
          credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \

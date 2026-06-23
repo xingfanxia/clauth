@@ -237,7 +237,7 @@ fn apply_profile_to_claude_settings_inner(
         return Ok(());
     }
 
-    let content = build_claude_settings_json(&path, profile, prev_env_keys)?;
+    let content = build_claude_settings_json(Some(&path), profile, prev_env_keys)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -250,15 +250,18 @@ fn apply_profile_to_claude_settings_inner(
 /// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
 /// each set when present and removed when unset, so a switch never inherits the
 /// previous profile's model routing.
+///
+/// `base` is the settings file to merge onto; `None` (or a missing path) starts
+/// from an empty object — used for an isolated runtime that must carry no
+/// operator settings.
 pub(crate) fn build_claude_settings_json(
-    base_path: &Path,
+    base: Option<&Path>,
     profile: &Profile,
     prev_env_keys: &[String],
 ) -> Result<String> {
-    let mut settings: serde_json::Value = if base_path.exists() {
-        read_json_file(base_path)?
-    } else {
-        serde_json::json!({})
+    let mut settings: serde_json::Value = match base {
+        Some(p) if p.exists() => read_json_file(p)?,
+        _ => serde_json::json!({}),
     };
 
     if settings.get("env").is_none() {

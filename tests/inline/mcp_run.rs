@@ -35,6 +35,11 @@ fn run_with_depth(depth: &str) -> CallToolResult {
                 profile: "any".to_string(),
                 prompt: "hello".to_string(),
                 model: None,
+                cwd: None,
+                env: None,
+                args: None,
+                timeout_secs: None,
+                isolated: None,
             }))
             .await
     });

@@ -350,7 +350,7 @@ fn build_settings_writes_model_knobs() {
         haiku: None,
         subagent: Some("claude-haiku-4-5".to_string()),
     };
-    let json = build_claude_settings_json(&base, &profile, &[]).expect("build settings");
+    let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
     let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
     assert_eq!(v["model"], "opusplan", "default model → top-level `model`");
     assert_eq!(
@@ -376,7 +376,7 @@ fn build_settings_clears_stale_model_knobs() {
     )
     .expect("seed base settings");
     let profile = crate::profile::Profile::new("p".to_string(), None, None); // empty models
-    let json = build_claude_settings_json(&base, &profile, &[]).expect("build settings");
+    let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
     let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
     assert!(v.get("model").is_none(), "top-level `model` cleared");
     assert!(v["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
