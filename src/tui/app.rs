@@ -2304,12 +2304,6 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     let mut mcp_detail = vec![
         format!("present: {}", if wired { "yes" } else { "no" }),
         source.to_string(),
-        format!(
-            "tools advertised: {}/{}",
-            probe::MCP_TOOLS.len(),
-            probe::MCP_TOOLS.len()
-        ),
-        format!("  {}", probe::MCP_TOOLS.join(", ")),
     ];
     if !globally_wired {
         mcp_detail.push(String::new());
@@ -2437,11 +2431,15 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         let instances = crate::runtime::live_session_count(&snap.name);
         // Divergence is only meaningful for the active profile — its credentials
         // are the ones linked into ~/.claude. Non-active profiles can't diverge.
-        let link = if snap.active {
-            classify_credentials_link(&snap.name).ok()
-        } else {
-            None
+        // A classify error (broken symlink mid-read, perms) must not read as
+        // healthy: surface it as a warn with an `unknown` link label rather than
+        // silently dropping to idle/ok.
+        let link_result = snap.active.then(|| classify_credentials_link(&snap.name));
+        let link = match &link_result {
+            Some(Ok(state)) => Some(*state),
+            _ => None,
         };
+        let link_err = matches!(&link_result, Some(Err(_)));
         let diverged = matches!(link, Some(LinkState::Diverged));
         let linked = matches!(link, Some(LinkState::LinkedTo));
         let (health, fix) = if diverged {
@@ -2449,7 +2447,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
                 Health::Warn,
                 Some(PluginFix::RepairDivergence(snap.name.clone())),
             )
-        } else if snap.active && matches!(link, Some(LinkState::Missing)) {
+        } else if link_err || (snap.active && matches!(link, Some(LinkState::Missing))) {
             (Health::Warn, None)
         } else if linked || instances > 0 {
             // Green only when in use: the active profile's creds are linked, or
@@ -2459,11 +2457,15 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             (Health::Idle, None)
         };
 
-        let link_label = match link {
-            Some(LinkState::LinkedTo) => "linked",
-            Some(LinkState::Diverged) => "diverged",
-            Some(LinkState::Missing) => "missing",
-            None => "\u{2014}",
+        let link_label = if link_err {
+            "unknown"
+        } else {
+            match link {
+                Some(LinkState::LinkedTo) => "linked",
+                Some(LinkState::Diverged) => "diverged",
+                Some(LinkState::Missing) => "missing",
+                None => "\u{2014}",
+            }
         };
         // Selector value: the live-session count. The active row always shows it
         // (even `0 live`); idle non-active rows stay blank. Divergence still

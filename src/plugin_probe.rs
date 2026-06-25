@@ -16,10 +16,6 @@ use serde_json::{Map, Value};
 
 use crate::profile::{atomic_write, claude_dir, home_dir};
 
-/// Tools clauth's MCP server advertises (`clauth mcp`). clauth *is* the server,
-/// so this is the static advertised set — it cannot observe CC's live client.
-pub(crate) const MCP_TOOLS: [&str; 4] = ["list_profiles", "which", "switch", "run"];
-
 /// Plugin id in the registry (`<plugin>@<marketplace>`).
 pub(crate) const PLUGIN_ID: &str = "clauth@clauth";
 /// Marketplace key in `known_marketplaces.json`.
