@@ -165,3 +165,30 @@ fn wire_mcp_server_creates_file_when_absent() {
     assert!(path.exists());
     assert_eq!(manual_mcp_wiring(), McpWiring::GlobalConfig);
 }
+
+#[test]
+fn global_entry_drifted_flags_stale_command_and_args() {
+    let _home = HomeSandbox::new();
+    let path = home_dir().expect("home").join(".claude.json");
+
+    // No entry → nothing to validate.
+    assert_eq!(global_entry_drifted(), None);
+
+    // Canonical entry (what the wire fix writes) → no drift.
+    wire_mcp_server().expect("wire");
+    assert_eq!(global_entry_drifted(), Some(false));
+
+    // A stale absolute command no longer matches the launch line → drift.
+    write_json(
+        &path,
+        &json!({ "mcpServers": { "clauth": { "command": "/old/bin/clauth", "args": ["mcp"] } } }),
+    );
+    assert_eq!(global_entry_drifted(), Some(true));
+
+    // Args missing the `mcp` subcommand → drift.
+    write_json(
+        &path,
+        &json!({ "mcpServers": { "clauth": { "command": "clauth", "args": [] } } }),
+    );
+    assert_eq!(global_entry_drifted(), Some(true));
+}

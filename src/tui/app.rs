@@ -336,6 +336,10 @@ pub(crate) enum ConfirmAction {
     /// Plugin tab: write the `mcpServers.clauth` entry into `~/.claude.json`.
     /// Reversible local write — non-destructive, so it keeps the plain button.
     WireMcpServers,
+    /// Plugin tab: relink `~/.claude/.credentials.json` to the active profile's
+    /// own stored credentials (repair a `missing` link). Spends no token — it only
+    /// re-points at creds the profile already holds — so it keeps the plain button.
+    RelinkCredentials(String),
 }
 
 #[derive(Debug, Clone)]
@@ -761,6 +765,8 @@ pub(crate) enum Health {
 pub(crate) enum PluginFix {
     WireMcpServers,
     RepairDivergence(String),
+    /// Relink a `missing` active-profile credential link to its own stored creds.
+    RelinkCredentials(String),
 }
 
 /// A computed integration-check row (global, profile-independent).
@@ -810,6 +816,10 @@ pub(crate) struct PluginState {
     /// missing/unparseable, `Some(Some(v))` = the version string. Re-probed only
     /// on an explicit `r` so a tab switch never re-spawns the subprocess.
     pub(crate) cc_version: Option<Option<String>>,
+    /// Cached `clauth mcp` initialize handshake: `None` = unprobed. Re-probed only
+    /// on `r` (heavier than the others — it boots the real server), never on a tab
+    /// switch or the per-tick refresh.
+    pub(crate) mcp_boot: Option<crate::plugin_probe::McpProbe>,
 }
 
 impl Default for PluginState {
@@ -824,6 +834,7 @@ impl Default for PluginState {
             checks: Vec::new(),
             profiles: Vec::new(),
             cc_version: None,
+            mcp_boot: None,
         }
     }
 }
@@ -1011,6 +1022,9 @@ pub(crate) struct App {
     pub(crate) banner: Option<Banner>,
     /// Last time the 1Hz divergence poll ran.
     pub(crate) last_divergence_check: Instant,
+    /// Throttle for the Plugin tab's per-tick live refresh (session counts + link
+    /// state); recompute fires at most once per `PLUGIN_REFRESH_INTERVAL`.
+    pub(crate) last_plugin_refresh: Instant,
     /// Set once reconcile reports back; gates bootstrap spawn.
     pub(crate) reconcile_done: bool,
     /// Set once `spawn_bootstrap` is dispatched; prevents double-dispatch.
@@ -1234,6 +1248,7 @@ impl App {
             footer_alert: None,
             banner: None,
             last_divergence_check: Instant::now(),
+            last_plugin_refresh: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
             refresh_interval,
@@ -2209,6 +2224,17 @@ fn apply_plugin_fix(app: &mut App) {
                 cursor: 0,
             }));
         }
+        PluginFix::RelinkCredentials(name) => {
+            app.disarm_quit();
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: format!("Relink ~/.claude credentials to '{name}'?"),
+                detail: Some(
+                    "Re-points .credentials.json at the profile's own stored tokens; spends nothing.".to_string(),
+                ),
+                choice: false,
+                on_confirm: ConfirmAction::RelinkCredentials(name),
+            }));
+        }
     }
 }
 
@@ -2276,6 +2302,24 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         fix: None,
     });
 
+    // `clauth mcp` boot self-probe — `r`-gated only (heavier than the other reads:
+    // it spawns the real server). Cleared when clauth no longer resolves so a stale
+    // "boots" can't linger. Skipped under test so the suite never boots the server.
+    if refresh_version {
+        app.plugin.fetching = true;
+        app.plugin.mcp_boot = if clauth_path.is_some() {
+            Some(if cfg!(test) {
+                probe::McpProbe::Ok
+            } else {
+                probe::mcp_boots()
+            })
+        } else {
+            None
+        };
+        app.plugin.fetching = false;
+    }
+    let mcp_boot = app.plugin.mcp_boot.clone();
+
     // "global" == active in every project: a CC `user`-scope plugin install. A
     // `local`/`project` install (or a `./.mcp.json`) binds clauth to one repo.
     let records = probe::installed_records();
@@ -2288,11 +2332,17 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     // offers the same global write fix as a missing wiring does.
     let wiring = probe::manual_mcp_wiring();
     let wired = installed || wiring != probe::McpWiring::None;
-    let globally_wired = plugin_global || wiring == probe::McpWiring::GlobalConfig;
-    let project_only = wired && !globally_wired;
+    let manual_global = wiring == probe::McpWiring::GlobalConfig;
+    // A manual `~/.claude.json` entry whose command/args no longer match the
+    // canonical launch line reads as wired but won't start the current server.
+    // Only the operative manual entry matters — a `user`-scope plugin install
+    // supersedes it, so drift under one is moot.
+    let drifted = manual_global && !plugin_global && probe::global_entry_drifted() == Some(true);
+    let globally_wired = plugin_global || (manual_global && !drifted);
+    let project_only = wired && !globally_wired && !drifted;
     let source = if plugin_global {
         "source: plugin install (user)"
-    } else if wiring == probe::McpWiring::GlobalConfig {
+    } else if manual_global {
         "source: ~/.claude.json (manual)"
     } else if installed {
         "source: plugin install (project)"
@@ -2305,22 +2355,35 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         format!("present: {}", if wired { "yes" } else { "no" }),
         source.to_string(),
     ];
-    if !globally_wired {
+    match &mcp_boot {
+        Some(probe::McpProbe::Ok) => mcp_detail.push("server: boots".to_string()),
+        Some(probe::McpProbe::Failed(reason)) => {
+            mcp_detail.push(format!("server: failed ({reason})"));
+        }
+        None => {}
+    }
+    let needs_wire = !globally_wired || drifted;
+    if needs_wire {
         mcp_detail.push(String::new());
-        if project_only {
+        if drifted {
+            mcp_detail.push("entry doesn't match the current launch line".to_string());
+        } else if project_only {
             mcp_detail.push("wired for this project only, not global".to_string());
         }
         mcp_detail.push("[f] wire mcpServers into ~/.claude.json".to_string());
     }
+    let boot_failed = matches!(mcp_boot, Some(probe::McpProbe::Failed(_)));
     checks.push(Check {
         label: "mcp servers",
-        health: if globally_wired {
-            Health::Ok
-        } else {
+        health: if boot_failed {
+            Health::Danger
+        } else if needs_wire {
             Health::Warn
+        } else {
+            Health::Ok
         },
         detail: mcp_detail,
-        fix: (!globally_wired).then_some(PluginFix::WireMcpServers),
+        fix: needs_wire.then_some(PluginFix::WireMcpServers),
     });
 
     // plugin install record — installed-only verdict (CC exposes no clean per-scope
@@ -2426,6 +2489,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             .collect()
     };
 
+    let now_secs = (crate::usage::now_ms() / 1000) as i64;
     let mut rows: Vec<ProfileRow> = Vec::with_capacity(snaps.len());
     for snap in snaps {
         let instances = crate::runtime::live_session_count(&snap.name);
@@ -2442,12 +2506,28 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         let link_err = matches!(&link_result, Some(Err(_)));
         let diverged = matches!(link, Some(LinkState::Diverged));
         let linked = matches!(link, Some(LinkState::LinkedTo));
-        let (health, fix) = if diverged {
+        let missing = snap.active && matches!(link, Some(LinkState::Missing));
+        // A `missing` active link is repairable only when the profile still holds
+        // stored creds to relink to; with none it needs a fresh login, not a relink.
+        let stored_creds = crate::profile::profile_dir(&snap.name)
+            .map(|dir| dir.join("credentials.json").exists())
+            .unwrap_or(false);
+        // Observed delegate throughput (MCP `run`); a recent rate-limit on any
+        // exercised model warns even when the credential link is healthy.
+        let throughput = crate::throughput::summary(&snap.name, now_secs);
+        let rate_limited = throughput.iter().any(|t| t.rate_limited_recent);
+
+        let (base_health, fix) = if diverged {
             (
                 Health::Warn,
                 Some(PluginFix::RepairDivergence(snap.name.clone())),
             )
-        } else if link_err || (snap.active && matches!(link, Some(LinkState::Missing))) {
+        } else if missing && stored_creds {
+            (
+                Health::Warn,
+                Some(PluginFix::RelinkCredentials(snap.name.clone())),
+            )
+        } else if link_err || missing {
             (Health::Warn, None)
         } else if linked || instances > 0 {
             // Green only when in use: the active profile's creds are linked, or
@@ -2455,6 +2535,13 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             (Health::Ok, None)
         } else {
             (Health::Idle, None)
+        };
+        // A recent rate-limit degrades an otherwise ok/idle profile to a warn dot;
+        // an already-warn row (diverged/missing) keeps its fix.
+        let health = if rate_limited && base_health != Health::Warn {
+            Health::Warn
+        } else {
+            base_health
         };
 
         let link_label = if link_err {
@@ -2501,9 +2588,26 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             format!("expires: {expires}"),
             format!("runtime: {runtime}"),
         ];
+        for t in &throughput {
+            let model = crate::tokens::model_display_name(&t.model);
+            let mut v = format!("{:.0} tok/s · {} samples", t.tok_s, t.samples);
+            if t.degraded {
+                v.push_str(" · degraded");
+            }
+            if t.rate_limited_recent {
+                match t.retry_after_s {
+                    Some(s) => v.push_str(&format!(" · rate-limited (retry {s}s)")),
+                    None => v.push_str(" · rate-limited"),
+                }
+            }
+            detail.push(format!("{model}: {v}"));
+        }
         if diverged {
             detail.push(String::new());
             detail.push("[f] repair credentials".to_string());
+        } else if matches!(fix, Some(PluginFix::RelinkCredentials(_))) {
+            detail.push(String::new());
+            detail.push("[f] relink credentials".to_string());
         }
         rows.push(ProfileRow {
             name: snap.name,
@@ -4653,6 +4757,17 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Err(e) => app.toast(ToastKind::Danger, format!("wire failed: {e}")),
             }
         }
+        ConfirmAction::RelinkCredentials(name) => match force_link_profile_credentials(&name) {
+            Ok(()) => {
+                app.refresh_tokens();
+                app.toast(
+                    ToastKind::Success,
+                    format!("relinked credentials to '{name}'"),
+                );
+                recompute_plugin_checks(app, false);
+            }
+            Err(e) => app.toast(ToastKind::Danger, format!("relink failed: {e}")),
+        },
     }
 }
 
@@ -4986,9 +5101,27 @@ pub(crate) fn on_tick(app: &mut App) {
     maybe_spawn_bootstrap(app);
 
     poll_credentials_divergence(app);
+    poll_plugin_refresh(app);
 
     update_banner(app);
     app.prune_toasts();
+}
+
+/// Plugin tab live refresh: re-run the cheap local checks (session counts + link
+/// state) at most once per interval while the tab is focused and no modal is open,
+/// so a session started elsewhere shows up without a manual `r`. Never re-probes
+/// `claude --version` or `clauth mcp` — both stay `r`-gated.
+fn poll_plugin_refresh(app: &mut App) {
+    const PLUGIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+    if app.tab != Tab::Plugin || !app.modals.is_empty() {
+        return;
+    }
+    if app.last_plugin_refresh.elapsed() < PLUGIN_REFRESH_INTERVAL {
+        return;
+    }
+    app.last_plugin_refresh = Instant::now();
+    recompute_plugin_checks(app, false);
 }
 
 /// Recompute the sticky banner from current app state. Called every tick.

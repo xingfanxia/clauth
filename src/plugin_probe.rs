@@ -8,8 +8,11 @@
 //! background thread. All path reads route through the test-overridable
 //! `home_dir()` / `claude_dir()`, so the inline tests can sandbox `$HOME`.
 
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Map, Value};
@@ -121,6 +124,112 @@ pub(crate) fn manual_mcp_wiring() -> McpWiring {
         McpWiring::ProjectFile
     } else {
         McpWiring::None
+    }
+}
+
+/// Whether the user-global `mcpServers.clauth` entry matches the canonical stdio
+/// entry clauth writes. `None` when no global manual entry exists (nothing to
+/// validate — a plugin install or a project file is judged elsewhere). `Some(false)`
+/// flags drift: a stale absolute `command` or `args` missing `mcp` reads as "wired"
+/// but won't launch the current server, so the tab re-offers the canonical write.
+pub(crate) fn global_entry_drifted() -> Option<bool> {
+    let entry = read_json(global_claude_json_path()).and_then(|root| {
+        root.get("mcpServers")
+            .and_then(|servers| servers.get("clauth"))
+            .cloned()
+    })?;
+    let canon = clauth_mcp_entry();
+    // `type` is allowed to be absent (CC defaults stdio); only command + args are
+    // load-bearing for the launch.
+    let same =
+        entry.get("command") == canon.get("command") && entry.get("args") == canon.get("args");
+    Some(!same)
+}
+
+/// Verdict of a live `clauth mcp` initialize handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum McpProbe {
+    /// Server answered `initialize` with a result.
+    Ok,
+    /// Server couldn't be spawned or didn't answer a valid result (reason).
+    Failed(String),
+}
+
+/// Spawn `clauth mcp`, send one JSON-RPC `initialize`, and confirm the reply is a
+/// success result. Client-faithful: catches a `clauth` that resolves on PATH but is
+/// too old to serve (no `mcp` subcommand) or boots then dies. Heavier than the
+/// other probes — the server runs `gc_stale_runtimes()` at startup — so the tab
+/// gates it behind `r` only. Drains stdout on a thread so a chatty server can't
+/// deadlock the pipe; 3s budget, then kill.
+pub(crate) fn mcp_boots() -> McpProbe {
+    let mut child = match Command::new("clauth")
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return McpProbe::Failed(format!("spawn failed: {e}")),
+    };
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return McpProbe::Failed("no stdio pipes".to_string());
+    };
+
+    // Conservative protocol version so a healthy server never errors on a too-new
+    // value — the probe only needs to prove it boots and speaks MCP.
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "clauth-probe", "version": env!("CARGO_PKG_VERSION") }
+        }
+    });
+    if writeln!(stdin, "{req}")
+        .and_then(|()| stdin.flush())
+        .is_err()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return McpProbe::Failed("write failed".to_string());
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+        let _ = tx.send(result);
+    });
+
+    let verdict = match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(line)) => parse_initialize_reply(&line),
+        Ok(Err(e)) => McpProbe::Failed(format!("read failed: {e}")),
+        Err(_) => McpProbe::Failed("no reply within 3s".to_string()),
+    };
+    // EOF on stdin + kill ends the server; the reader unblocks once stdout closes.
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(stdin);
+    let _ = reader.join();
+    verdict
+}
+
+/// Classify the first stdout line of an `initialize` handshake. A parseable result
+/// proves the server booted; an `error` reply or unparseable line is a failure.
+fn parse_initialize_reply(line: &str) -> McpProbe {
+    let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+        return McpProbe::Failed("unparseable reply".to_string());
+    };
+    if value.get("error").is_some() {
+        return McpProbe::Failed("server returned an error".to_string());
+    }
+    if value.get("result").is_some() {
+        McpProbe::Ok
+    } else {
+        McpProbe::Failed("no result in reply".to_string())
     }
 }
 

@@ -74,6 +74,7 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
             idx == app.plugin.cursor,
             focused,
             content_w,
+            check.fix.is_some(),
         ));
     }
 
@@ -104,6 +105,7 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 cursor == app.plugin.cursor,
                 focused,
                 content_w,
+                profile.fix.is_some(),
             ));
         }
     }
@@ -145,6 +147,7 @@ fn selector_row(
     selected: bool,
     focused: bool,
     content_w: usize,
+    has_fix: bool,
 ) -> Line<'static> {
     let tint = selected.then(theme::bg_hover);
     let with_bg = |style: Style| match tint {
@@ -182,7 +185,9 @@ fn selector_row(
         spans.push(Span::styled(" ".repeat(align), with_bg(Style::default())));
     }
 
-    let value_room = content_w.saturating_sub(head_w + 2);
+    // Reserve room at the right edge for a fix marker (`[f]`) when the row has one.
+    let marker_reserve = if has_fix { 4 } else { 0 };
+    let value_room = content_w.saturating_sub(head_w + 2 + marker_reserve);
     if value_room > 0 && !value.is_empty() {
         spans.push(Span::styled("  ".to_string(), with_bg(Style::default())));
         spans.push(Span::styled(
@@ -190,7 +195,16 @@ fn selector_row(
             with_bg(theme::dim()),
         ));
     }
-    pad_to(&mut spans, content_w, tint);
+    if has_fix {
+        // Right-aligned `[f]` cue so a fixable row is visible without descending.
+        pad_to(&mut spans, content_w.saturating_sub(3), tint);
+        spans.push(Span::styled(
+            "[f]".to_string(),
+            with_bg(theme::accent().add_modifier(Modifier::BOLD)),
+        ));
+    } else {
+        pad_to(&mut spans, content_w, tint);
+    }
     Line::from(spans)
 }
 
@@ -345,10 +359,17 @@ fn detail_line(text: &str, key_w: usize) -> Line<'static> {
 /// Tone the value of a `key: value` row by health-bearing (key, value-head) pairs.
 /// Only genuinely health-bearing keys are colored; everything else stays body.
 fn value_tone(key: &str, value: &str) -> Style {
+    // Throughput rows carry a variable model-name key, so they tone by content:
+    // a recent rate-limit or degraded pace warns.
+    if value.contains("rate-limited") || value.contains("degraded") {
+        return theme::warning();
+    }
     let head = value.split_whitespace().next().unwrap_or(value);
     match (key, head) {
         ("present" | "installed", "yes") => theme::success(),
         ("present" | "installed", "no") => theme::warning(),
+        ("server", "boots") => theme::success(),
+        ("server", "failed") => theme::danger(),
         ("link", "linked") => theme::success(),
         ("link", "diverged") => theme::warning(),
         ("link", "missing") => theme::danger(),

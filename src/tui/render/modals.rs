@@ -84,6 +84,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::RotateAll => "CONFIRM",
         ConfirmAction::RotateOne(_) => "CONFIRM",
         ConfirmAction::WireMcpServers => "CONFIRM",
+        ConfirmAction::RelinkCredentials(_) => "CONFIRM",
     };
 
     // Destructive/global ops carry a DANGER cue on their confirm button.
