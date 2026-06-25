@@ -195,7 +195,7 @@ fn mcp_check_warns_project_only_for_local_plugin() {
 }
 
 #[test]
-fn profile_row_carries_runtime_detail() {
+fn runtime_check_summarizes_profiles() {
     use crate::profile::{AppConfig, AppState, Profile};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = App::new(AppConfig {
@@ -204,23 +204,20 @@ fn profile_row_carries_runtime_detail() {
     });
     super::recompute_plugin_checks(&mut app, false);
 
-    let row = app.plugin.profiles.first().expect("one profile row");
-    // Idle, non-active, credential-less profile: no link, no live sessions → a
-    // neutral dot (not green) and no selector value.
-    assert_eq!(row.health, super::Health::Idle);
-    assert!(
-        row.value.is_empty(),
-        "an idle non-active row carries no selector value, got {:?}",
-        row.value
-    );
-    assert!(row.detail.iter().any(|l| l == "instances: 0"));
-    assert!(row.detail.iter().any(|l| l == "link: \u{2014}"));
-    assert!(row.detail.iter().any(|l| l == "expires: \u{2014}"));
-    assert!(
-        row.detail.iter().any(|l| l.starts_with("runtime: ")),
-        "the runtime path line is present, got {:?}",
-        row.detail
-    );
+    let check = app
+        .plugin
+        .checks
+        .iter()
+        .find(|c| c.label == "runtime")
+        .expect("runtime check");
+    // One idle, non-active, credential-less profile: no active link, no live
+    // sessions → a neutral dot (not green) and no fix.
+    assert_eq!(check.health, super::Health::Idle);
+    assert!(check.fix.is_none());
+    assert!(check.detail.iter().any(|l| l == "profiles: 1"));
+    assert!(check.detail.iter().any(|l| l == "sessions: 0"));
+    assert!(check.detail.iter().any(|l| l == "active: \u{2014}"));
+    assert!(check.detail.iter().any(|l| l == "link: \u{2014}"));
 }
 
 #[test]

@@ -781,26 +781,13 @@ pub(crate) struct Check {
     pub(crate) fix: Option<PluginFix>,
 }
 
-/// A computed per-profile runtime row.
-#[derive(Debug, Clone)]
-pub(crate) struct ProfileRow {
-    pub(crate) name: String,
-    pub(crate) active: bool,
-    pub(crate) health: Health,
-    /// Terse runtime state shown in the selector row: link state for the active
-    /// profile (its creds are the linked ones), live-session count otherwise.
-    pub(crate) value: String,
-    pub(crate) detail: Vec<String>,
-    pub(crate) fix: Option<PluginFix>,
-}
-
 /// UI-thread-only state for the Plugin tab. Recomputed synchronously on tab focus
 /// and on `r`; there is no background thread (all reads are local FS/`PATH`;
 /// `claude --version` is one cached subprocess gated by [`PluginState::cc_version`]).
 #[derive(Debug)]
 pub(crate) struct PluginState {
     pub(crate) focus: PluginFocus,
-    /// Cursor across both groups: `0..checks.len()` then the profile rows.
+    /// Cursor over the integration checks (`0..checks.len()`).
     pub(crate) cursor: usize,
     pub(crate) detail_scroll: u16,
     /// Max valid `detail_scroll` from the last render (`&App` interior mutability,
@@ -811,7 +798,6 @@ pub(crate) struct PluginState {
     pub(crate) fetching: bool,
     pub(crate) error: Option<String>,
     pub(crate) checks: Vec<Check>,
-    pub(crate) profiles: Vec<ProfileRow>,
     /// Cached `claude --version`: `None` = unprobed, `Some(None)` = probed and
     /// missing/unparseable, `Some(Some(v))` = the version string. Re-probed only
     /// on an explicit `r` so a tab switch never re-spawns the subprocess.
@@ -832,7 +818,6 @@ impl Default for PluginState {
             fetching: false,
             error: None,
             checks: Vec::new(),
-            profiles: Vec::new(),
             cc_version: None,
             mcp_boot: None,
         }
@@ -840,29 +825,19 @@ impl Default for PluginState {
 }
 
 impl PluginState {
-    /// Total selectable rows across both groups.
+    /// Total selectable rows (the integration checks).
     pub(crate) fn row_count(&self) -> usize {
-        self.checks.len() + self.profiles.len()
+        self.checks.len()
     }
 
-    /// The check under the cursor, if the cursor sits in the integration group.
+    /// The check under the cursor.
     pub(crate) fn selected_check(&self) -> Option<&Check> {
         self.checks.get(self.cursor)
     }
 
-    /// The profile row under the cursor, if the cursor sits in the profile group.
-    pub(crate) fn selected_profile(&self) -> Option<&ProfileRow> {
-        self.cursor
-            .checked_sub(self.checks.len())
-            .and_then(|idx| self.profiles.get(idx))
-    }
-
     /// The fix offered by the row under the cursor, if any.
     pub(crate) fn selected_fix(&self) -> Option<&PluginFix> {
-        match self.selected_check() {
-            Some(check) => check.fix.as_ref(),
-            None => self.selected_profile().and_then(|row| row.fix.as_ref()),
-        }
+        self.selected_check().and_then(|check| check.fix.as_ref())
     }
 }
 
@@ -2238,9 +2213,10 @@ fn apply_plugin_fix(app: &mut App) {
     }
 }
 
-/// Recompute the Plugin tab's integration checks and per-profile rows. Every read
-/// is a local FS/`PATH` check; `claude --version` runs only when `refresh_version`
-/// is set or the cached result is absent. Synchronous — no background thread.
+/// Recompute the Plugin tab's integration checks; the last (`runtime`) folds every
+/// profile into one summary. Every read is a local FS/`PATH` check; `claude
+/// --version` runs only when `refresh_version` is set or the cached result is
+/// absent. Synchronous — no background thread.
 fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     use crate::plugin_probe as probe;
 
@@ -2259,7 +2235,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     }
     let cc_version = app.plugin.cc_version.clone().flatten();
 
-    let mut checks: Vec<Check> = Vec::with_capacity(3);
+    let mut checks: Vec<Check> = Vec::with_capacity(4);
 
     // about — clauth's data dir + PATH resolution (CC spawns `clauth mcp` by
     // name, so resolution is load-bearing) and the Claude Code version. Combined
@@ -2467,11 +2443,10 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     };
     checks.push(plugin_check);
 
-    app.plugin.checks = checks;
-
-    // Per-profile rows. Snapshot the names under the config lock, then drop it
-    // before the FS reads (`live_session_count`, `classify_credentials_link`) so
-    // no lock is held across I/O.
+    // runtime — fold every profile's live sessions / credential link / token
+    // freshness into one summary row. Snapshot the names under the config lock,
+    // then drop it before the FS reads (`live_session_count`,
+    // `classify_credentials_link`) so no lock is held across I/O.
     struct Snap {
         name: String,
         active: bool,
@@ -2490,61 +2465,53 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     };
 
     let now_secs = (crate::usage::now_ms() / 1000) as i64;
-    let mut rows: Vec<ProfileRow> = Vec::with_capacity(snaps.len());
+    let total = snaps.len();
+    let mut live_sessions: usize = 0;
+    let mut live_profiles: usize = 0;
+    let mut rate_limited_names: Vec<String> = Vec::new();
+    // The active profile's link readout plus the one fix it can offer. Divergence
+    // and missing-link are meaningful only for the active profile — its creds are
+    // the ones linked into ~/.claude — so non-active profiles only contribute
+    // their live-session and rate-limit signal.
+    let mut active_name: Option<String> = None;
+    let mut active_link = "\u{2014}";
+    let mut active_expires = "\u{2014}".to_string();
+    let mut active_fix: Option<PluginFix> = None;
+    let mut active_bad = false; // diverged / missing / unknown link
+
     for snap in snaps {
         let instances = crate::runtime::live_session_count(&snap.name);
-        // Divergence is only meaningful for the active profile — its credentials
-        // are the ones linked into ~/.claude. Non-active profiles can't diverge.
-        // A classify error (broken symlink mid-read, perms) must not read as
-        // healthy: surface it as a warn with an `unknown` link label rather than
-        // silently dropping to idle/ok.
-        let link_result = snap.active.then(|| classify_credentials_link(&snap.name));
-        let link = match &link_result {
-            Some(Ok(state)) => Some(*state),
-            _ => None,
-        };
-        let link_err = matches!(&link_result, Some(Err(_)));
-        let diverged = matches!(link, Some(LinkState::Diverged));
-        let linked = matches!(link, Some(LinkState::LinkedTo));
-        let missing = snap.active && matches!(link, Some(LinkState::Missing));
-        // A `missing` active link is repairable only when the profile still holds
-        // stored creds to relink to; with none it needs a fresh login, not a relink.
-        let stored_creds = crate::profile::profile_dir(&snap.name)
-            .map(|dir| dir.join("credentials.json").exists())
-            .unwrap_or(false);
+        live_sessions += instances;
+        if instances > 0 {
+            live_profiles += 1;
+        }
         // Observed delegate throughput (MCP `run`); a recent rate-limit on any
         // exercised model warns even when the credential link is healthy.
         let throughput = crate::throughput::summary(&snap.name, now_secs);
-        let rate_limited = throughput.iter().any(|t| t.rate_limited_recent);
+        if throughput.iter().any(|t| t.rate_limited_recent) {
+            rate_limited_names.push(snap.name.clone());
+        }
 
-        let (base_health, fix) = if diverged {
-            (
-                Health::Warn,
-                Some(PluginFix::RepairDivergence(snap.name.clone())),
-            )
-        } else if missing && stored_creds {
-            (
-                Health::Warn,
-                Some(PluginFix::RelinkCredentials(snap.name.clone())),
-            )
-        } else if link_err || missing {
-            (Health::Warn, None)
-        } else if linked || instances > 0 {
-            // Green only when in use: the active profile's creds are linked, or
-            // the profile has at least one live session.
-            (Health::Ok, None)
-        } else {
-            (Health::Idle, None)
-        };
-        // A recent rate-limit degrades an otherwise ok/idle profile to a warn dot;
-        // an already-warn row (diverged/missing) keeps its fix.
-        let health = if rate_limited && base_health != Health::Warn {
-            Health::Warn
-        } else {
-            base_health
-        };
+        if !snap.active {
+            continue;
+        }
+        active_name = Some(snap.name.clone());
 
-        let link_label = if link_err {
+        // A classify error (broken symlink mid-read, perms) must not read as
+        // healthy: surface it as a warn with an `unknown` link label rather than
+        // silently dropping to idle/ok.
+        let link_result = classify_credentials_link(&snap.name);
+        let link = link_result.as_ref().ok().copied();
+        let link_err = link_result.is_err();
+        let diverged = matches!(link, Some(LinkState::Diverged));
+        let missing = matches!(link, Some(LinkState::Missing));
+        // A `missing` link is repairable only when the profile still holds stored
+        // creds to relink to; with none it needs a fresh login, not a relink.
+        let stored_creds = crate::profile::profile_dir(&snap.name)
+            .map(|dir| dir.join("credentials.json").exists())
+            .unwrap_or(false);
+
+        active_link = if link_err {
             "unknown"
         } else {
             match link {
@@ -2554,17 +2521,17 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
                 None => "\u{2014}",
             }
         };
-        // Selector value: the live-session count. The active row always shows it
-        // (even `0 live`); idle non-active rows stay blank. Divergence still
-        // surfaces via the dot color and the detail `link` row.
-        let value = if snap.active || instances > 0 {
-            format!("{instances} live")
+        active_bad = link_err || diverged || missing;
+        active_fix = if diverged {
+            Some(PluginFix::RepairDivergence(snap.name.clone()))
+        } else if missing && stored_creds {
+            Some(PluginFix::RelinkCredentials(snap.name.clone()))
         } else {
-            String::new()
+            None
         };
         // Access-token freshness as a relative span; `—` when no OAuth expiry is
         // known (third-party / api-key profiles).
-        let expires = match snap.expires_at {
+        active_expires = match snap.expires_at {
             Some(ms) => {
                 let secs = ms / 1000 - (crate::usage::now_ms() / 1000) as i64;
                 if secs <= 0 {
@@ -2575,52 +2542,67 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             }
             None => "\u{2014}".to_string(),
         };
-        let runtime = crate::profile::profile_dir(&snap.name)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "\u{2014}".to_string());
-
-        // Runtime health only — config (type / model / overrides) lives on the
-        // Setup tab. This pane answers "how many live sessions, is the credential
-        // link healthy, and how fresh is the token?".
-        let mut detail = vec![
-            format!("instances: {instances}"),
-            format!("link: {link_label}"),
-            format!("expires: {expires}"),
-            format!("runtime: {runtime}"),
-        ];
-        for t in &throughput {
-            let model = crate::tokens::model_display_name(&t.model);
-            let mut v = format!("{:.0} tok/s · {} samples", t.tok_s, t.samples);
-            if t.degraded {
-                v.push_str(" · degraded");
-            }
-            if t.rate_limited_recent {
-                match t.retry_after_s {
-                    Some(s) => v.push_str(&format!(" · rate-limited (retry {s}s)")),
-                    None => v.push_str(" · rate-limited"),
-                }
-            }
-            detail.push(format!("{model}: {v}"));
-        }
-        if diverged {
-            detail.push(String::new());
-            detail.push("[f] repair credentials".to_string());
-        } else if matches!(fix, Some(PluginFix::RelinkCredentials(_))) {
-            detail.push(String::new());
-            detail.push("[f] relink credentials".to_string());
-        }
-        rows.push(ProfileRow {
-            name: snap.name,
-            active: snap.active,
-            health,
-            value,
-            detail,
-            fix,
-        });
     }
-    app.plugin.profiles = rows;
 
-    // Keep the cursor in range after the row set changes.
+    // Health: a bad active link (diverged/missing/unknown) or any recent delegate
+    // rate-limit warns; an active `linked` creds link or any live session is ok;
+    // otherwise the fleet is idle (neutral, not green).
+    let runtime_health = if active_bad || !rate_limited_names.is_empty() {
+        Health::Warn
+    } else if active_link == "linked" || live_sessions > 0 {
+        Health::Ok
+    } else {
+        Health::Idle
+    };
+
+    let sessions_line = if live_sessions == 0 {
+        "0".to_string()
+    } else {
+        format!("{live_sessions} live across {live_profiles}")
+    };
+    let link_line = match &active_name {
+        Some(_) if active_expires != "\u{2014}" => format!("{active_link} · {active_expires}"),
+        Some(_) => active_link.to_string(),
+        None => "\u{2014}".to_string(),
+    };
+    // Runtime health only — config (type / model / overrides) lives on the Setup
+    // tab. This row answers "how many live sessions, is the active credential link
+    // healthy, and how fresh is its token?".
+    let mut runtime_detail = vec![
+        format!("profiles: {total}"),
+        format!("sessions: {sessions_line}"),
+        format!("active: {}", active_name.as_deref().unwrap_or("\u{2014}")),
+        format!("link: {link_line}"),
+    ];
+    if !rate_limited_names.is_empty() {
+        // "rate-limited" sits in the value so `value_tone` warns on it (the key is
+        // a plain label).
+        runtime_detail.push(format!(
+            "delegate: rate-limited ({})",
+            rate_limited_names.join(", ")
+        ));
+    }
+    match &active_fix {
+        Some(PluginFix::RepairDivergence(_)) => {
+            runtime_detail.push(String::new());
+            runtime_detail.push("[f] repair credentials".to_string());
+        }
+        Some(PluginFix::RelinkCredentials(_)) => {
+            runtime_detail.push(String::new());
+            runtime_detail.push("[f] relink credentials".to_string());
+        }
+        _ => {}
+    }
+    checks.push(Check {
+        label: "runtime",
+        health: runtime_health,
+        detail: runtime_detail,
+        fix: active_fix,
+    });
+
+    app.plugin.checks = checks;
+
+    // Keep the cursor in range after the check set changes.
     let max = app.plugin.row_count().saturating_sub(1);
     if app.plugin.cursor > max {
         app.plugin.cursor = max;

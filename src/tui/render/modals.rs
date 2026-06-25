@@ -364,7 +364,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Tab::Plugin => vec![(
             "plugin",
             &[
-                ("\u{2191}\u{2193}", "pick check / profile · scroll detail"),
+                ("\u{2191}\u{2193}", "pick check · scroll detail"),
                 ("\u{23ce}", "open the selected row's detail"),
                 ("f", "apply the selected row's fix"),
                 ("r", "re-run all checks"),

@@ -2,11 +2,11 @@
 //! readout on the right. Master-detail, mirroring the Status tab's two-pane
 //! machinery (counts as 2 of the 3-panel budget; no third panel).
 //!
-//! The left panel is one cursor-driven selector over two groups: global
-//! integration checks (clauth on PATH, mcpServers wiring, plugin install, CC
-//! version) then a `profiles` group, one row per profile. Each check row is a
-//! status dot + label (verdict in the detail pane); profile rows add a terse
-//! runtime value. Enter descends into the detail pane; `f` applies
+//! The left panel is one cursor-driven selector over the integration checks
+//! (clauth on PATH, mcpServers wiring, plugin install, CC version, and a
+//! `runtime` row that folds every profile's live sessions / credential link /
+//! token freshness into one summary). Each row is a status dot + label, the
+//! verdict in the detail pane. Enter descends into the detail pane; `f` applies
 //! the selected row's fix (when one applies). All data is recomputed
 //! synchronously on tab focus and `r` — there is no background thread, so the
 //! title spinner only flickers while the cached `claude --version` is probed.
@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use super::super::app::{App, Health, PluginFocus};
 use super::super::theme;
 use super::format::spinner_frame;
-use super::panes::{draw_scrollbar, empty_state, name_color, section_box, section_box_verbatim};
+use super::panes::{draw_scrollbar, empty_state, section_box};
 use crate::format::truncate;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -76,38 +76,6 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
             content_w,
             check.fix.is_some(),
         ));
-    }
-
-    if !app.plugin.profiles.is_empty() {
-        let active = focused && app.plugin.selected_profile().is_some();
-        rows.push(group_eyebrow("profiles", active));
-        // Pad names to the widest so the runtime values share a left edge.
-        let name_w = app
-            .plugin
-            .profiles
-            .iter()
-            .map(|p| p.name.chars().count())
-            .max()
-            .unwrap_or(0);
-        for (idx, profile) in app.plugin.profiles.iter().enumerate() {
-            let cursor = app.plugin.checks.len() + idx;
-            if cursor == app.plugin.cursor {
-                cursor_line = rows.len();
-            }
-            rows.push(selector_row(
-                profile.health,
-                &profile.name,
-                name_color(profile.active),
-                // Dot plus a terse runtime value (link state for the active
-                // profile, live-session count otherwise).
-                &profile.value,
-                name_w,
-                cursor == app.plugin.cursor,
-                focused,
-                content_w,
-                profile.fix.is_some(),
-            ));
-        }
     }
 
     let viewport = inner.height as usize;
@@ -208,17 +176,6 @@ fn selector_row(
     Line::from(spans)
 }
 
-/// Group eyebrow: UPPERCASE label in the always-bold eyebrow style, separating the
-/// integration checks from the profiles. Underlined when focus rests on a row
-/// within this group.
-fn group_eyebrow(label: &str, active: bool) -> Line<'static> {
-    let mut style = theme::label();
-    if active {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    Line::from(Span::styled(label.to_uppercase(), style))
-}
-
 /// Pad a span list with tinted filler so the hover tint spans the full width.
 fn pad_to(spans: &mut Vec<Span<'static>>, content_w: usize, tint: Option<ratatui::style::Color>) {
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -269,20 +226,13 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
 fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.plugin.focus == PluginFocus::Detail;
 
-    // Title + body for whichever group the cursor sits in. Profile names keep
-    // their case (`section_box_verbatim`); check labels go through `section_box`.
+    // Title + body for the selected check. Labels are lowercase prose, so they
+    // uppercase into a structural panel title via `section_box`.
     let (block, detail): (Block<'static>, &[String]) =
         if let Some(check) = app.plugin.selected_check() {
-            // Check labels are lowercase prose, so they all uppercase into a
-            // structural title (the verbatim variant is for profile names only).
             (
                 section_box(check.label, focused, false),
                 check.detail.as_slice(),
-            )
-        } else if let Some(profile) = app.plugin.selected_profile() {
-            (
-                section_box_verbatim(&profile.name, focused, false),
-                profile.detail.as_slice(),
             )
         } else {
             (section_box("plugin", focused, false), [].as_slice())
