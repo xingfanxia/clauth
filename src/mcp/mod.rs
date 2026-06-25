@@ -166,7 +166,8 @@ impl ClauthServer {
 `windows[]` carries the 5h/7d `{label, utilization_pct, resets_at}` where `utilization_pct` is \
 the percent of that window already USED (higher = less headroom) and `resets_at` is ISO-8601; \
 `has_live_session` = a clauth-managed `claude` session currently owns it; `throughput[]` = \
-observed per-model `{tok_s, degraded, rate_limited_recent}` from past `run` delegations; \
+observed per-model `{model, tok_s, samples, degraded, rate_limited_recent, retry_after_s}` from \
+past `run` delegations; \
 `third_party` = a cached one-line headline for provider-key profiles (deepseek/zai/…)"
     )]
     async fn list_profiles(&self) -> Result<CallToolResult, ErrorData> {
