@@ -25,22 +25,24 @@ pub(crate) struct ProfileSnapshot {
 pub(crate) fn usage_line(label: &str, w: &UsageWindow, now_secs: i64) -> String {
     let pct = w.utilization.round() as i64;
     match w.resets_at.as_deref() {
-        None => format!("{label} {pct}%"),
+        None => format!("{label} {pct}% used"),
         Some(raw) => match iso_to_epoch_secs(raw) {
             Some(reset) => {
                 format!(
-                    "{label} {pct}% (resets in {})",
+                    "{label} {pct}% used (resets in {})",
                     humanize_duration(reset - now_secs)
                 )
             }
-            None => format!("{label} {pct}% (resets {raw})"),
+            None => format!("{label} {pct}% used (resets {raw})"),
         },
     }
 }
 
 /// One-line cached headline for a third-party profile from
 /// `third_party_cache.json`: non-empty bars join as `label pct%`, else the first
-/// stat row's text; the plan label prefixes the line when present.
+/// stat row that carries a value; the plan label prefixes the line when present.
+/// Value-less rows (e.g. DeepSeek's `USD balance` heading) are skipped so the
+/// headline never renders a dangling `label:` with nothing after it.
 pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     let body = if !s.bars.is_empty() {
         s.bars
@@ -48,7 +50,7 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
             .map(|b| format!("{} {}%", b.label, b.pct.round() as i64))
             .collect::<Vec<_>>()
             .join(", ")
-    } else if let Some(row) = s.rows.first() {
+    } else if let Some(row) = s.rows.iter().find(|r| !r.value.is_empty()) {
         if row.label.is_empty() {
             row.value.clone()
         } else {
@@ -68,7 +70,9 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
 }
 
 /// Compact freshness footer appended to every `which`/`switch`/`run` result:
-/// active profile + 5h/7d headroom for the touched profile, read fresh from cache.
+/// active profile + 5h/7d percent-used for the touched profile, read fresh from
+/// cache. Percentages are the share of the window consumed (higher = less
+/// headroom), labeled `% used` so the reader can't invert it.
 pub(crate) fn live_footer(
     active: Option<&str>,
     five_h: Option<&UsageWindow>,
@@ -79,10 +83,10 @@ pub(crate) fn live_footer(
         parts.push(format!("active={a}"));
     }
     if let Some(w) = five_h {
-        parts.push(format!("5h {}%", w.utilization.round() as i64));
+        parts.push(format!("5h {}% used", w.utilization.round() as i64));
     }
     if let Some(w) = seven_d {
-        parts.push(format!("7d {}%", w.utilization.round() as i64));
+        parts.push(format!("7d {}% used", w.utilization.round() as i64));
     }
     parts.join(" | ")
 }
@@ -133,9 +137,14 @@ Tools: `list_profiles` (cached usage + filesystem, zero quota), \
 hard-capped at depth 1 — a delegate cannot itself delegate).\n\nswitch & this session: ",
     );
     out.push_str(&switch_effect(auth));
-    out.push_str("\n\nThe figures below are a snapshot as of ");
+    out.push_str(
+        "\n\nUsage percentages are the share of each window already used \
+(higher = less headroom). These figures are cached snapshots (active profile cached ",
+    );
     out.push_str(cache_age_label);
-    out.push_str("; call `list_profiles` for live figures.\n\nProfiles:\n");
+    out.push_str(
+        "; other profiles may be staler); call `list_profiles` for live figures.\n\nProfiles:\n",
+    );
 
     for p in profiles {
         out.push_str("- ");

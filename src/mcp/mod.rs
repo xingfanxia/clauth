@@ -161,7 +161,14 @@ impl ClauthServer {
         }
     }
 
-    #[tool(description = "List all clauth profiles with cached 5h/7d usage and live-session state")]
+    #[tool(
+        description = "List all clauth profiles from disk cache (zero quota). Per profile: \
+`windows[]` carries the 5h/7d `{label, utilization_pct, resets_at}` where `utilization_pct` is \
+the percent of that window already USED (higher = less headroom) and `resets_at` is ISO-8601; \
+`has_live_session` = a clauth-managed `claude` session currently owns it; `throughput[]` = \
+observed per-model `{tok_s, degraded, rate_limited_recent}` from past `run` delegations; \
+`third_party` = a cached one-line headline for provider-key profiles (deepseek/zai/…)"
+    )]
     async fn list_profiles(&self) -> Result<CallToolResult, ErrorData> {
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let now = now_epoch_secs();
@@ -211,7 +218,12 @@ impl ClauthServer {
         )]))
     }
 
-    #[tool(description = "Report which profile owns the credentials loaded by this session")]
+    #[tool(
+        description = "Report which profile owns the credentials this session loaded. `source` \
+explains how it resolved: `refresh_match` (a profile's stored token matches the live creds), \
+`session_dir` (this session's runtime dir pins the profile), `credential_less_active` (the \
+configured active profile, with no creds on disk to match). Appends a live usage footer (% used)"
+    )]
     async fn which(&self) -> Result<CallToolResult, ErrorData> {
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let resolved = crate::which::resolve_active(&config);
@@ -278,7 +290,12 @@ impl ClauthServer {
     }
 
     #[tool(
-        description = "Delegate a headless task to a profile; spends that account's window. Optional cwd/env/args/timeout_secs/isolated shape the spawned `claude`; `isolated` drops operator memory/plugins/hooks. Returns the run envelope"
+        description = "Delegate a headless task to a profile; SPENDS that account's real usage \
+window (hard-capped at depth 1 — a delegate cannot itself delegate). The delegate runs with NO \
+MCP servers (`--strict-mcp-config`) and starts in this server's cwd unless `cwd` is set. Optional \
+cwd/env/args/timeout_secs/isolated shape the spawned `claude`; `isolated` drops operator \
+memory/plugins/hooks. Returns the run envelope (`result`, `is_error`, `total_cost_usd`, token \
+usage) — read `total_cost_usd`/usage to self-throttle"
     )]
     async fn run(
         &self,

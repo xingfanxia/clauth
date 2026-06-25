@@ -59,7 +59,7 @@ fn row(label: &str, value: &str) -> StatRow {
 
 #[test]
 fn usage_line_without_reset_is_label_and_pct() {
-    assert_eq!(usage_line("5h", &window(42.4, None), 0), "5h 42%");
+    assert_eq!(usage_line("5h", &window(42.4, None), 0), "5h 42% used");
 }
 
 #[test]
@@ -71,13 +71,13 @@ fn usage_line_rounds_and_shows_reset_countdown() {
         &window(99.6, Some("2026-06-21T12:00:00Z")),
         reset - 3600,
     );
-    assert_eq!(line, "7d 100% (resets in 1h 0m)");
+    assert_eq!(line, "7d 100% used (resets in 1h 0m)");
 }
 
 #[test]
 fn usage_line_falls_back_to_raw_on_unparseable_reset() {
     let line = usage_line("5h", &window(10.0, Some("not-a-date")), 0);
-    assert_eq!(line, "5h 10% (resets not-a-date)");
+    assert_eq!(line, "5h 10% used (resets not-a-date)");
 }
 
 #[test]
@@ -94,6 +94,19 @@ fn third_party_headline_joins_bars_with_plan_prefix() {
 fn third_party_headline_falls_back_to_first_row() {
     let s = third_party_stats(vec![], vec![row("balance", "$4.20")], None);
     assert_eq!(third_party_headline(&s), "balance: $4.20");
+}
+
+#[test]
+fn third_party_headline_skips_value_less_heading_row() {
+    // DeepSeek's first row is a value-less `USD balance` heading; the headline must
+    // skip it and surface the first row that actually carries a value, never a
+    // dangling `USD balance:` with nothing after it.
+    let s = third_party_stats(
+        vec![],
+        vec![row("USD balance", ""), row("total", "$4.20")],
+        None,
+    );
+    assert_eq!(third_party_headline(&s), "total: $4.20");
 }
 
 #[test]
@@ -116,7 +129,7 @@ fn live_footer_joins_present_parts() {
     let seven = window(8.0, None);
     assert_eq!(
         live_footer(Some("work"), Some(&five), Some(&seven)),
-        "active=work | 5h 33% | 7d 8%"
+        "active=work | 5h 33% used | 7d 8% used"
     );
 }
 
@@ -131,14 +144,16 @@ fn instructions_block_carries_staleness_nudge_and_profile_lines() {
     let profiles = vec![snapshot("work", true), snapshot("personal", false)];
     let out = instructions_block(&profiles, &SessionAuth::Global, "3m ago", 0);
 
-    // staleness nudge: cache-age label + the "call list_profiles" pointer.
-    assert!(out.contains("snapshot as of 3m ago"));
+    // staleness nudge: the % used legend, active-profile cache age, and the
+    // "call list_profiles" pointer.
+    assert!(out.contains("share of each window already used"));
+    assert!(out.contains("active profile cached 3m ago"));
     assert!(out.contains("call `list_profiles` for live figures"));
 
     // at least one profile line, with the active marker and both usage windows.
     assert!(out.contains("- work (active) [anthropic, max]"));
-    assert!(out.contains("5h 42%"));
-    assert!(out.contains("7d 8%"));
+    assert!(out.contains("5h 42% used"));
+    assert!(out.contains("7d 8% used"));
     assert!(out.contains("- personal [anthropic, max]"));
 
     // load-bearing safety prose: dropping any of these warnings must fail here.
