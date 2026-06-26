@@ -164,7 +164,7 @@ pub(crate) struct DelegateArgs {
     /// are always set by clauth and cannot be overridden here.
     env: Option<HashMap<String, String>>,
     /// Extra arguments appended to the `claude` invocation (after clauth's own
-    /// `-p`/`--output-format json`/`--strict-mcp-config`).
+    /// `-p`/`--output-format json`, and the isolated-only `--strict-mcp-config`).
     args: Option<Vec<String>>,
     /// Per-call timeout in seconds (1..=3600). Defaults to 300.
     timeout_secs: Option<u64>,
@@ -326,11 +326,12 @@ configured active profile, with no creds on disk to match). Appends a live usage
     #[tool(
         description = "Delegate a headless task to a profile; SPENDS that account's real usage \
 window. The depth-1 cap blocks only a nested clauth `delegate` (a delegate cannot delegate again); \
-in-delegate subagents run, but under the SAME delegated profile, not other accounts. The delegate \
-runs with NO MCP servers (`--strict-mcp-config`); to grant a whitelist, pass \
-`args:[\"--mcp-config\",\"<json|path>\"]` (strict loads only those). Starts in this server's cwd \
+in-delegate subagents run, but under the SAME delegated profile, not other accounts. A normal \
+delegate inherits its runtime config-dir's MCP servers (so it can do research/codebase nav); \
+`isolated: true` runs a clean blind session with NO MCP servers. To scope a shared delegate, pass \
+`args:[\"--mcp-config\",\"<json|path>\",\"--strict-mcp-config\"]`. Starts in this server's cwd \
 unless `cwd` is set. Optional cwd/env/args/timeout_secs/isolated shape the spawned `claude`; \
-`isolated` drops operator memory/plugins/hooks. Returns the delegate envelope (`result`, \
+`isolated` drops operator memory/plugins/hooks/MCP. Returns the delegate envelope (`result`, \
 `is_error`, `total_cost_usd`, token usage) — read `total_cost_usd`/usage to self-throttle; the \
 `result` is the delegate's own self-report, so spot-verify it like any subagent. Set \
 `background: true` to get a `{job_id}` back at once instead of blocking; the result auto-arrives \
@@ -733,16 +734,19 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     command
         .env("CLAUDE_CONFIG_DIR", runtime.config_dir())
         .env(MCP_DEPTH_ENV, (opts.depth + 1).to_string())
-        .args([
-            "-p",
-            opts.prompt,
-            "--output-format",
-            "json",
-            "--strict-mcp-config",
-        ])
+        .args(["-p", opts.prompt, "--output-format", "json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
+    // Isolated only: suppress operator/project MCP servers for a clean blind
+    // session (mirrors `start.rs`). A shared delegate inherits its config-dir's
+    // MCP servers so it can do research/nav. Recursion stays capped either way:
+    // the `CLAUTH_MCP_DEPTH` guard refuses a nested `delegate` even when the child
+    // loads clauth's own server. Callers can still pass `--mcp-config` (and
+    // `--strict-mcp-config`) via `args` to scope a shared delegate.
+    if opts.isolation == Isolation::Isolated {
+        command.arg("--strict-mcp-config");
+    }
     if let Some(m) = opts.model {
         command.args(["--model", m]);
     }
