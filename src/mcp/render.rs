@@ -134,7 +134,9 @@ Tools: `list_profiles` (cached usage + filesystem, zero quota), \
 `which` (the profile that owns this session's credentials), \
 `switch` (relink the global active profile), \
 `delegate` (delegate a headless prompt to a profile; this BURNS a real account usage window, \
-hard-capped at depth 1 — a delegate cannot itself delegate).\n\nswitch & this session: ",
+hard-capped at depth 1 — a delegate cannot itself delegate; pass `background:true` for a `job_id` \
+now and the result later), \
+`delegate_result` (fetch a backgrounded delegate's result by `job_id`).\n\nswitch & this session: ",
     );
     out.push_str(&switch_effect(auth));
     out.push_str(

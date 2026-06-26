@@ -6,6 +6,7 @@
 //!
 //! All logging MUST go to stderr — stdout carries the JSON-RPC frame.
 
+mod jobs;
 mod render;
 
 use std::collections::HashMap;
@@ -151,6 +152,19 @@ pub(crate) struct DelegateArgs {
     /// Run authenticated but without operator memory/plugins/hooks (a clean
     /// blind session). Defaults to false.
     isolated: Option<bool>,
+    /// Return a `{job_id}` immediately instead of blocking for the result. The
+    /// delegate runs on a detached task; collect the result via the auto-delivery
+    /// hook or `delegate_result({job_id})`. Defaults to false.
+    background: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DelegateResultArgs {
+    /// Job id returned by a `delegate` call made with `background: true`.
+    job_id: String,
+    /// Seconds to long-poll for completion before returning (0..=60, default 0 =
+    /// reply instantly with the current state).
+    wait_secs: Option<u64>,
 }
 
 #[tool_router]
@@ -303,8 +317,10 @@ configured active profile, with no creds on disk to match). Appends a live usage
 window (hard-capped at depth 1 — a delegate cannot itself delegate). The delegate runs with NO \
 MCP servers (`--strict-mcp-config`) and starts in this server's cwd unless `cwd` is set. Optional \
 cwd/env/args/timeout_secs/isolated shape the spawned `claude`; `isolated` drops operator \
-memory/plugins/hooks. Returns the run envelope (`result`, `is_error`, `total_cost_usd`, token \
-usage) — read `total_cost_usd`/usage to self-throttle"
+memory/plugins/hooks. Returns the delegate envelope (`result`, `is_error`, `total_cost_usd`, \
+token usage) — read `total_cost_usd`/usage to self-throttle. Set `background: true` to get a \
+`{job_id}` back at once instead of blocking; the result then auto-arrives via a hook, or fetch it \
+with `delegate_result({job_id})`"
     )]
     async fn delegate(
         &self,
@@ -317,6 +333,7 @@ usage) — read `total_cost_usd`/usage to self-throttle"
             args,
             timeout_secs,
             isolated,
+            background,
         }): Parameters<DelegateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         // Fail closed: a present-but-unparseable value is treated as max depth
@@ -347,6 +364,54 @@ usage) — read `total_cost_usd`/usage to self-throttle"
         } else {
             Isolation::Shared
         };
+
+        // Background: persist a `running` job file, run the delegate on a detached
+        // blocking task that finalizes the file on completion, and return the
+        // handle now. The detached task outlives this call (it runs on the
+        // blocking pool, not this turn's future) so N delegates overlap.
+        if background.unwrap_or(false) {
+            let started_at = now_ms();
+            let job_id = jobs::new_job_id(started_at);
+            jobs::write_running(&job_id, &profile, started_at).map_err(|e| {
+                ErrorData::internal_error(format!("failed to record job: {e}"), None)
+            })?;
+
+            let job_id_task = job_id.clone();
+            let profile_task = profile.clone();
+            tokio::task::spawn_blocking(move || {
+                let envelope = match run_delegate(DelegateOpts {
+                    profile: &profile_task,
+                    prompt: &prompt,
+                    model: model.as_deref(),
+                    cwd: cwd.as_deref(),
+                    env: env.unwrap_or_default(),
+                    extra_args: args.unwrap_or_default(),
+                    timeout,
+                    isolation,
+                    depth,
+                }) {
+                    Ok(v) => v,
+                    // Mirror the sync contract: a failure finalizes the job with an
+                    // `is_error` envelope, never a dropped/torn job.
+                    Err(reason) => serde_json::json!({
+                        "profile": profile_task,
+                        "is_error": true,
+                        "result": reason,
+                    }),
+                };
+                let _ = jobs::write_done(&job_id_task, &profile_task, started_at, envelope);
+            });
+
+            let payload = serde_json::json!({
+                "job_id": job_id,
+                "profile": profile,
+                "started_at": started_at,
+                "status": "running",
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                payload.to_string(),
+            )]));
+        }
 
         let target = profile.clone();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -392,6 +457,77 @@ usage) — read `total_cost_usd`/usage to self-throttle"
             Ok(CallToolResult::success(content))
         }
     }
+
+    #[tool(
+        description = "Fetch the result of a `delegate` call made with `background: true`, by \
+`job_id`. `wait_secs` (0..=60, default 0) long-polls for completion. Returns the delegate \
+envelope when done (same shape as a blocking `delegate`, with the live usage footer), \
+`{status:\"running\"}` if it hasn't finished, or an error for an unknown `job_id`. Normally the \
+result auto-arrives via a hook — use this only when delegate hooks are disabled"
+    )]
+    async fn delegate_result(
+        &self,
+        Parameters(DelegateResultArgs { job_id, wait_secs }): Parameters<DelegateResultArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !jobs::is_safe_job_id(&job_id) {
+            let payload = serde_json::json!({ "is_error": true, "result": "invalid job_id" });
+            return Ok(CallToolResult::error(vec![Content::text(
+                payload.to_string(),
+            )]));
+        }
+        let wait = wait_secs.unwrap_or(0).min(MAX_RESULT_WAIT_SECS);
+        let jid = job_id.clone();
+        let outcome = tokio::task::spawn_blocking(move || wait_for_done(&jid, wait))
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("wait task panicked: {e}"), None))?;
+
+        match outcome {
+            WaitOutcome::Unknown => {
+                let payload = serde_json::json!({ "is_error": true, "result": format!("unknown job_id: {job_id}") });
+                Ok(CallToolResult::error(vec![Content::text(
+                    payload.to_string(),
+                )]))
+            }
+            WaitOutcome::Running => {
+                let payload = serde_json::json!({ "job_id": job_id, "status": "running" });
+                Ok(CallToolResult::success(vec![Content::text(
+                    payload.to_string(),
+                )]))
+            }
+            WaitOutcome::Done(record) => {
+                // Fallback path delivered it — evict so the file doesn't linger
+                // past its purpose (GC also reaps it on a TTL).
+                jobs::remove(&job_id);
+                let envelope = record.envelope.unwrap_or_else(|| {
+                    serde_json::json!({
+                        "profile": record.profile,
+                        "is_error": true,
+                        "result": "job finished without an envelope",
+                    })
+                });
+                let (five_h, seven_d) = load_windows(&record.profile);
+                let mut footer = render::live_footer(
+                    Some(record.profile.as_str()),
+                    five_h.as_ref(),
+                    seven_d.as_ref(),
+                );
+                if let Some(note) = throughput_note(&record.profile, now_epoch_secs()) {
+                    footer.push('\n');
+                    footer.push_str(&note);
+                }
+                let is_error = envelope
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let content = with_footer(envelope, footer);
+                if is_error {
+                    Ok(CallToolResult::error(content))
+                } else {
+                    Ok(CallToolResult::success(content))
+                }
+            }
+        }
+    }
 }
 
 /// Env var carrying the MCP delegation depth; the child `claude` inherits
@@ -400,6 +536,107 @@ const MCP_DEPTH_ENV: &str = "CLAUTH_MCP_DEPTH";
 
 /// Poll interval mirroring `start.rs`'s `wait_for_child` cadence.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Ceiling on `delegate_result`'s long-poll wait (seconds).
+const MAX_RESULT_WAIT_SECS: u64 = 60;
+/// Poll cadence for both `delegate_result` and the `mcp-await-job` hook.
+const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Self-deadline for the `mcp-await-job` hook: outlast the max delegate timeout
+/// plus slack so it never gives up before a legitimately long delegate finishes.
+const AWAIT_JOB_DEADLINE_SECS: u64 = MAX_RUN_TIMEOUT_SECS + 600;
+
+/// Result of polling a background job file.
+enum WaitOutcome {
+    Done(jobs::JobRecord),
+    /// Present but not yet finished (the wait deadline elapsed first).
+    Running,
+    /// No such job file (never created or already evicted).
+    Unknown,
+}
+
+/// Poll a job file until it reports `done` or `deadline_secs` elapses. `Unknown`
+/// when the file is absent (distinct from `Running` for a present-but-incomplete
+/// job). Blocking; callers wrap it in `spawn_blocking`.
+fn wait_for_done(job_id: &str, deadline_secs: u64) -> WaitOutcome {
+    let start = Instant::now();
+    let deadline = Duration::from_secs(deadline_secs);
+    loop {
+        match jobs::read(job_id) {
+            Some(r) if r.state == jobs::JobState::Done => return WaitOutcome::Done(r),
+            Some(_) if start.elapsed() >= deadline => return WaitOutcome::Running,
+            Some(_) => {}
+            None => return WaitOutcome::Unknown,
+        }
+        std::thread::sleep(JOB_POLL_INTERVAL);
+    }
+}
+
+/// `clauth mcp-await-job` — the body of the bundled PostToolUse `asyncRewake`
+/// hook. Reads the hook payload on stdin, finds the background job's `job_id`,
+/// waits for the result, prints it to stdout, and exits 2 to wake the model. A
+/// sync `delegate` (no `job_id` in the payload) is a no-op (exit 0). On its own
+/// deadline it exits 2 with a nudge to call `delegate_result` instead.
+pub(crate) fn await_job() -> ! {
+    use std::io::Read;
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let job_id = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .as_ref()
+        .and_then(find_job_id)
+        .filter(|id| jobs::is_safe_job_id(id));
+    let Some(job_id) = job_id else {
+        std::process::exit(0); // sync delegate or unparseable input: nothing to deliver
+    };
+
+    let start = Instant::now();
+    let deadline = Duration::from_secs(AWAIT_JOB_DEADLINE_SECS);
+    loop {
+        match jobs::read(&job_id) {
+            Some(r) if r.state == jobs::JobState::Done => {
+                let envelope = r.envelope.unwrap_or_else(|| {
+                    serde_json::json!({
+                        "profile": r.profile,
+                        "is_error": true,
+                        "result": "job finished without an envelope",
+                    })
+                });
+                println!("{envelope}");
+                std::process::exit(2); // wake the model with the result
+            }
+            Some(_) if start.elapsed() >= deadline => {
+                println!(
+                    "delegate job {job_id} still running; call `delegate_result` to retrieve it"
+                );
+                std::process::exit(2);
+            }
+            Some(_) => {}
+            None => std::process::exit(0), // unknown / already evicted
+        }
+        std::thread::sleep(JOB_POLL_INTERVAL);
+    }
+}
+
+/// Recursively search a hook-payload JSON for a string `job_id` field. A string
+/// that is itself JSON is parsed and descended (the MCP tool result nests the
+/// response envelope as a JSON-encoded string), so this stays agnostic to the
+/// exact `tool_response` shape, which the host does not pin down.
+fn find_job_id(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(s)) = map.get("job_id") {
+                return Some(s.clone());
+            }
+            map.values().find_map(find_job_id)
+        }
+        serde_json::Value::Array(arr) => arr.iter().find_map(find_job_id),
+        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
+            .ok()
+            .as_ref()
+            .and_then(find_job_id),
+        _ => None,
+    }
+}
 
 /// Inputs for one delegated `delegate`. Grouped into a struct so `run_delegate`
 /// avoids a too-many-arguments signature as the surface grew (cwd/env/args/
@@ -692,6 +929,7 @@ fn build_instructions() -> String {
 
 pub(crate) fn serve() -> Result<()> {
     crate::runtime::gc_stale_runtimes();
+    jobs::gc(now_ms());
     // rmcp's service loop arms a Tokio timer (needs `enable_time`), so a bare
     // current-thread runtime panics right after the initialize reply. `enable_all`
     // also turns on the I/O driver, covering a future transport that polls a real

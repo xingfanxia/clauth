@@ -90,6 +90,9 @@ fn dispatch(args: &[String]) -> Result<()> {
              `clauth start <profile> -p \"<prompt>\"` (or the MCP `run` tool)"
         ),
         [cmd] if cmd == "mcp" => mcp::serve(),
+        // Hidden: the bundled PostToolUse `asyncRewake` hook body. Reads the hook
+        // payload on stdin, waits for a background delegate, and wakes the model.
+        [cmd] if cmd == "mcp-await-job" => mcp::await_job(),
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
         _ => anyhow::bail!(

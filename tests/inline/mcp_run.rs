@@ -7,6 +7,7 @@
 //! the guard returns before `spawn_blocking`/`ProfileRuntime::acquire` runs.
 
 use super::*;
+use crate::testutil::HomeSandbox;
 
 /// Drive the async `delegate` tool with `CLAUTH_MCP_DEPTH = depth` on a current-thread
 /// runtime, restoring the prior env value before returning.
@@ -40,6 +41,7 @@ fn run_with_depth(depth: &str) -> CallToolResult {
                 args: None,
                 timeout_secs: None,
                 isolated: None,
+                background: None,
             }))
             .await
     });
@@ -96,3 +98,170 @@ fn depth_guard_also_refuses_above_one() {
 //   3. happy path: a valid prompt returns `{is_error:false, result, ...}` parsed
 //      from `claude -p --output-format json`, and the child inherits
 //      `CLAUTH_MCP_DEPTH=1` + `--strict-mcp-config`.
+
+// ---- background delegation + delegate_result ----
+
+/// Drive `delegate_result` on a current-thread runtime under a home sandbox the
+/// caller has already entered.
+fn call_delegate_result(job_id: &str, wait_secs: Option<u64>) -> CallToolResult {
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        server
+            .delegate_result(Parameters(DelegateResultArgs {
+                job_id: job_id.to_string(),
+                wait_secs,
+            }))
+            .await
+    })
+    .expect("delegate_result returns a tool result, never a transport error")
+}
+
+#[test]
+fn delegate_result_unknown_job_is_error() {
+    let _home = HomeSandbox::new();
+    let result = call_delegate_result("d-doesnotexist-0", Some(0));
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "unknown job_id is a tool error"
+    );
+}
+
+#[test]
+fn delegate_result_invalid_job_id_is_error() {
+    let _home = HomeSandbox::new();
+    let result = call_delegate_result("../escape", Some(0));
+    assert_eq!(result.is_error, Some(true), "path-unsafe job_id refused");
+}
+
+#[test]
+fn delegate_result_running_reports_status() {
+    let _home = HomeSandbox::new();
+    jobs::write_running("d-run-0", "work", 1).unwrap();
+    let result = call_delegate_result("d-run-0", Some(0));
+    assert_ne!(result.is_error, Some(true), "a running job is not an error");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("status text");
+    assert!(text.contains("running"), "running status surfaced");
+}
+
+#[test]
+fn delegate_result_done_returns_envelope_and_evicts() {
+    let _home = HomeSandbox::new();
+    let env = serde_json::json!({ "profile": "work", "is_error": false, "result": "all done" });
+    jobs::write_done("d-done-0", "work", 1, env).unwrap();
+
+    let result = call_delegate_result("d-done-0", Some(0));
+    assert_ne!(result.is_error, Some(true));
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("envelope text");
+    assert!(text.contains("all done"), "envelope result delivered");
+    assert!(
+        jobs::read("d-done-0").is_none(),
+        "done job evicted on fetch"
+    );
+}
+
+#[test]
+fn background_depth_guard_refuses_without_writing_job() {
+    let _home = HomeSandbox::new();
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
+    // restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "1") };
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let result = rt.block_on(async {
+        server
+            .delegate(Parameters(DelegateArgs {
+                profile: "any".to_string(),
+                prompt: "hello".to_string(),
+                model: None,
+                cwd: None,
+                env: None,
+                args: None,
+                timeout_secs: None,
+                isolated: None,
+                background: Some(true),
+            }))
+            .await
+    });
+
+    // SAFETY: restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+
+    let result = result.expect("delegate returns a tool result, never a transport error");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "depth-1 background delegate refuses"
+    );
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(
+        job_count, 0,
+        "a refused background delegate writes no job file"
+    );
+}
+
+// ---- mcp-await-job job_id extraction (shape-agnostic) ----
+
+#[test]
+fn find_job_id_extracts_from_nested_mcp_result() {
+    // Mirrors the host's documented mcp_result shape: the background response
+    // envelope is JSON-encoded as the content block's text.
+    let inner = serde_json::json!({ "job_id": "d-42-0", "profile": "work", "status": "running" });
+    let payload = serde_json::json!({
+        "tool_name": "mcp__plugin_clauth_clauth__delegate",
+        "tool_response": {
+            "type": "mcp_result",
+            "content": [{ "type": "text", "text": inner.to_string() }],
+        }
+    });
+    assert_eq!(find_job_id(&payload).as_deref(), Some("d-42-0"));
+}
+
+#[test]
+fn find_job_id_finds_direct_field() {
+    let payload = serde_json::json!({ "tool_response": { "job_id": "d-1-2" } });
+    assert_eq!(find_job_id(&payload).as_deref(), Some("d-1-2"));
+}
+
+#[test]
+fn find_job_id_none_for_sync_envelope() {
+    // a sync delegate response carries no job_id, so the hook no-ops.
+    let inner = serde_json::json!({ "profile": "work", "is_error": false, "result": "done" });
+    let payload = serde_json::json!({
+        "tool_response": { "content": [{ "type": "text", "text": inner.to_string() }] }
+    });
+    assert_eq!(find_job_id(&payload), None);
+}
+
+#[test]
+fn find_job_id_none_for_plain_text() {
+    let payload =
+        serde_json::json!({ "tool_response": { "content": [{ "text": "no json here" }] } });
+    assert_eq!(find_job_id(&payload), None);
+}
