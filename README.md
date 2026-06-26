@@ -196,13 +196,15 @@ Once active, Claude Code can call four tools:
 | `list_profiles` | All profiles with cached 5h/7d usage %, provider, active flag, live-session flag, observed per-model throughput | zero (disk cache) |
 | `which` | Which profile owns the current session (+ its observed throughput) | zero (filesystem) |
 | `switch` | Relink the global active profile to another name | zero (no prime) |
-| `run` | Delegate a headless prompt to another profile and return the answer | **real usage window on the target account** |
+| `delegate` | Delegate a headless prompt to another profile and return the answer (or a `job_id` with `background: true`) | **real usage window on the target account** |
+| `delegate_result` | Fetch a `background` delegate's result by `job_id` (optional `wait_secs` long-poll) | zero (filesystem) |
 
 **Caveats to know:**
 
-- `switch` relinks the global `~/.claude` credentials. A `clauth start` session runs against its own profile and is unaffected; a session on the global credentials adopts the new profile on its next token refresh, so it changes the running account mid-session. To reach another profile without disturbing the current session, use `run`.
-- `run` burns a real 5h usage window on the target account. It is hard-capped at recursion depth 1, so a delegated session cannot call `run` again.
-- `run` accepts `cwd`, `env`, `args`, `timeout_secs` (default 300, max 3600), and `isolated` (a clean delegate with no operator memory, plugins, or hooks). clauth records the delegate's observed tokens/sec per model and flags a model as degraded or recently rate-limited in `list_profiles` / `which` — the only throughput signal available, since subscription throttle is per-model and absent from the usage snapshot.
+- `switch` relinks the global `~/.claude` credentials. A `clauth start` session runs against its own profile and is unaffected; a session on the global credentials adopts the new profile on its next token refresh, so it changes the running account mid-session. To reach another profile without disturbing the current session, use `delegate`.
+- `delegate` burns a real 5h usage window on the target account. It is hard-capped at recursion depth 1, so a delegated session cannot call `delegate` again.
+- `delegate` accepts `cwd`, `env`, `args`, `timeout_secs` (default 300, max 3600), `isolated` (a clean delegate with no operator memory, plugins, or hooks), and `background`. clauth records the delegate's observed tokens/sec per model and flags a model as degraded or recently rate-limited in `list_profiles` / `which` — the only throughput signal available, since subscription throttle is per-model and absent from the usage snapshot.
+- `background: true` returns a `job_id` immediately so the session keeps working while the delegate runs. The result auto-arrives via a bundled `PostToolUse` hook; with hooks disabled, fetch it with `delegate_result`.
 
 ## Auto-starting the 5-hour timer
 
@@ -251,7 +253,7 @@ Install clauth, save each logged-in session as a profile once, then switch with 
 Yes. `clauth start <profile>` launches `claude` in an isolated `CLAUDE_CONFIG_DIR`, so parallel sessions don't share identity, settings, or billing caches.
 
 **How do I run Claude Code without my global `CLAUDE.md`, plugins, or hooks?**
-`clauth start --isolated <profile>` keeps the account's auth but drops your operator memory, plugins, and hooks — a clean session for headless work or blind evals. Run it in an empty directory to skip project memory too. The same is available on the MCP `run` tool via `isolated: true`.
+`clauth start --isolated <profile>` keeps the account's auth but drops your operator memory, plugins, and hooks — a clean session for headless work or blind evals. Run it in an empty directory to skip project memory too. The same is available on the MCP `delegate` tool via `isolated: true`.
 
 **Can Claude Code switch accounts automatically when I hit the 5-hour limit?**
 With clauth open, yes: put accounts in the fallback chain and clauth switches to the next member with headroom the moment the active one crosses its threshold.
