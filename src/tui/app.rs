@@ -2468,6 +2468,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     let total = snaps.len();
     let mut live_sessions: usize = 0;
     let mut live_profiles: usize = 0;
+    let mut live_names: Vec<String> = Vec::new();
     let mut rate_limited_names: Vec<String> = Vec::new();
     // The active profile's link readout plus the one fix it can offer. Divergence
     // and missing-link are meaningful only for the active profile — its creds are
@@ -2484,6 +2485,11 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         live_sessions += instances;
         if instances > 0 {
             live_profiles += 1;
+            live_names.push(if instances > 1 {
+                format!("{} ({instances})", snap.name)
+            } else {
+                snap.name.clone()
+            });
         }
         // Observed delegate throughput (MCP `run`); a recent rate-limit on any
         // exercised model warns even when the credential link is healthy.
@@ -2571,9 +2577,17 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     let mut runtime_detail = vec![
         format!("profiles: {total}"),
         format!("sessions: {sessions_line}"),
-        format!("active: {}", active_name.as_deref().unwrap_or("\u{2014}")),
-        format!("link: {link_line}"),
     ];
+    // Name each profile carrying a live session as an indented sub-line, so
+    // "live across N" is concrete rather than just a tally.
+    for name in &live_names {
+        runtime_detail.push(format!("  {name}"));
+    }
+    runtime_detail.push(format!(
+        "active: {}",
+        active_name.as_deref().unwrap_or("\u{2014}")
+    ));
+    runtime_detail.push(format!("link: {link_line}"));
     if !rate_limited_names.is_empty() {
         // "rate-limited" sits in the value so `value_tone` warns on it (the key is
         // a plain label).
