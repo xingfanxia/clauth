@@ -232,9 +232,17 @@ configured active profile, with no creds on disk to match). Appends a live usage
             .as_ref()
             .map(|(name, _)| throughput_json(name, now_epoch_secs()))
             .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+        let plan = resolved.as_ref().and_then(|(name, _)| {
+            config
+                .profiles
+                .iter()
+                .find(|p| p.name.as_str() == name.as_str())
+                .and_then(subscription_type)
+        });
         let payload = serde_json::json!({
             "profile": resolved.as_ref().map(|(name, _)| name),
             "source": resolved.as_ref().map(|(_, source)| source.as_str()),
+            "subscription_type": plan,
             "throughput": throughput,
         });
         Ok(CallToolResult::success(with_footer(
