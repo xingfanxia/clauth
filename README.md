@@ -6,10 +6,10 @@
 
 <p align="center">
   <a href="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml"><img src="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml/badge.svg" alt="Release build status" /></a>
-  <a href="https://crates.io/crates/clauth"><img src="https://img.shields.io/github/v/release/uwuclxdy/clauth?sort=semver&logo=rust&label=version&color=orange" alt="latest version" /></a>
-  <a href="https://github.com/uwuclxdy/clauth/releases"><img src="https://img.shields.io/github/downloads/uwuclxdy/clauth/total?label=downloads&color=blue" alt="GitHub release downloads" /></a>
-  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-2b90d9" alt="Linux, macOS, Windows" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license" /></a>
+  <a href="https://crates.io/crates/clauth"><img src="https://shields.uwuclxdy.dev/github/v/release/uwuclxdy/clauth?sort=semver&logo=rust&label=version&color=orange" alt="latest version" /></a>
+  <a href="https://github.com/uwuclxdy/clauth/releases"><img src="https://shields.uwuclxdy.dev/github/downloads/uwuclxdy/clauth/total?label=downloads&color=blue" alt="GitHub release downloads" /></a>
+  <img src="https://shields.uwuclxdy.dev/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-2b90d9" alt="Linux, macOS, Windows" />
+  <a href="LICENSE"><img src="https://shields.uwuclxdy.dev/badge/license-MIT-green" alt="MIT license" /></a>
 </p>
 
 <p align="center">
@@ -25,12 +25,13 @@
   <a href="#security">Security</a>
 </p>
 
-**clauth** is a terminal UI to **switch between multiple Claude Code accounts** without logging out, and a live **Claude Code usage monitor**. It handles Claude Pro, Max, Team, and Enterprise OAuth accounts plus custom API endpoints, hops to a fallback account when you hit the 5-hour limit, and runs parallel Claude Code sessions under different accounts. Linux, macOS, Windows.
+**clauth** is a terminal UI to **switch between multiple Claude Code accounts** without logging out, and a live **Claude Code usage monitor**. It handles Claude Pro, Max, Team, and Enterprise OAuth accounts plus custom API endpoints, hops to a fallback account when you hit the 5-hour limit, and runs parallel Claude Code sessions under different accounts. It also runs as a Claude Code plugin (MCP server) so a live session can switch accounts or delegate work without leaving the editor. Linux, macOS, Windows.
 
 - 🔄 **Switch** accounts with one keypress, or `clauth <name>` from the shell
 - 📊 **Monitor** live 5h / 7d usage bars, a global token dashboard, and API-equivalent cost
 - 🤖 **Auto-switch** to the next account in a fallback chain when you run out of budget
 - 🧩 **Parallel** sessions: run several accounts at once in isolated config dirs
+- 🔌 **Plugin**: list profiles, switch, and delegate prompts from inside a live Claude Code session via the MCP server
 
 ![clauth TUI demo: switching Claude Code accounts with live usage bars](media/demo.gif)
 
