@@ -155,6 +155,21 @@ impl PlanTier {
             PlanTier::Unknown => "Claude".to_string(),
         }
     }
+
+    /// Compact tier label without the `Claude ` prefix, for contexts that
+    /// already name the provider (e.g. the MCP inventory's `[anthropic, …]`).
+    /// `None` for an unknown tier so callers can omit it entirely.
+    pub(crate) fn short_label(&self) -> Option<String> {
+        Some(match self {
+            PlanTier::Max(Some(n)) => format!("Max {n}x"),
+            PlanTier::Max(None) => "Max".to_string(),
+            PlanTier::Pro => "Pro".to_string(),
+            PlanTier::Team => "Team".to_string(),
+            PlanTier::Enterprise => "Enterprise".to_string(),
+            PlanTier::Free => "Free".to_string(),
+            PlanTier::Unknown => return None,
+        })
+    }
 }
 
 /// Pull the trailing `Nx` multiplier out of a rate-limit tier like

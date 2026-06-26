@@ -28,7 +28,7 @@ use crate::profile_cache::{
 };
 use crate::providers::ThirdPartyStats;
 use crate::runtime::{Isolation, ProfileRuntime};
-use crate::usage::{UsageInfo, UsageWindow, humanize_duration, now_epoch_secs, now_ms};
+use crate::usage::{PlanTier, UsageInfo, UsageWindow, humanize_duration, now_epoch_secs, now_ms};
 use render::ProfileSnapshot;
 
 /// Default per-call delegate timeout (seconds) when the caller doesn't set one.
@@ -67,15 +67,31 @@ fn provider_label(profile: &Profile) -> String {
         .unwrap_or_else(|| "anthropic".to_string())
 }
 
-/// OAuth subscription tier from the stored token (`max`/`pro`/…), when present.
-fn subscription_type(profile: &Profile) -> Option<String> {
-    profile
-        .credentials
-        .as_ref()?
-        .claude_ai_oauth
-        .as_ref()?
-        .subscription_type
-        .clone()
+/// Human account-tier label for an OAuth profile, preferring the fetched plan
+/// tier (carries the Max multiplier, e.g. `Max 5x`) over the bare OAuth
+/// `subscription_type` token (`max`). `None` for third-party/api-key profiles
+/// and when neither a fetched plan nor a token hint is on disk.
+fn tier_label(profile: &Profile) -> Option<String> {
+    if profile.is_third_party() {
+        return None;
+    }
+    let fetched = load_profile_cache::<UsageInfo>(profile.name.as_str(), USAGE_CACHE_FILE)
+        .and_then(|u| u.plan)
+        .map(|p| p.tier)
+        .filter(|t| *t != PlanTier::Unknown);
+    match fetched {
+        Some(tier) => tier.short_label(),
+        None => {
+            let sub = profile
+                .credentials
+                .as_ref()?
+                .claude_ai_oauth
+                .as_ref()?
+                .subscription_type
+                .as_deref()?;
+            PlanTier::from_subscription_type(Some(sub)).short_label()
+        }
+    }
 }
 
 /// Fresh-from-cache 5h/7d windows for a profile. Each call re-reads the disk
@@ -229,7 +245,7 @@ past `delegate` calls; \
                     "active": config.is_active(name),
                     "provider": provider_label(p),
                     "base_url": p.base_url,
-                    "subscription_type": subscription_type(p),
+                    "tier": tier_label(p),
                     "has_live_session": crate::runtime::has_live_session(name),
                     "windows": windows_json(name),
                     "third_party": third_party,
@@ -257,17 +273,17 @@ configured active profile, with no creds on disk to match). Appends a live usage
             .as_ref()
             .map(|(name, _)| throughput_json(name, now_epoch_secs()))
             .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-        let plan = resolved.as_ref().and_then(|(name, _)| {
+        let tier = resolved.as_ref().and_then(|(name, _)| {
             config
                 .profiles
                 .iter()
                 .find(|p| p.name.as_str() == name.as_str())
-                .and_then(subscription_type)
+                .and_then(tier_label)
         });
         let payload = serde_json::json!({
             "profile": resolved.as_ref().map(|(name, _)| name),
             "source": resolved.as_ref().map(|(_, source)| source.as_str()),
-            "subscription_type": plan,
+            "tier": tier,
             "throughput": throughput,
         });
         Ok(CallToolResult::success(with_footer(
@@ -968,7 +984,7 @@ fn build_instructions() -> String {
                 active: config.is_active(name),
                 provider: provider_label(p),
                 base_url: p.base_url.clone(),
-                sub_type: subscription_type(p),
+                sub_type: tier_label(p),
                 five_h,
                 seven_d,
                 third_party,

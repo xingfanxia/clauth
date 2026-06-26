@@ -4,6 +4,18 @@ use super::*;
 const BASE_UTC: i64 = 1_779_027_600;
 
 #[test]
+fn short_label_drops_claude_prefix_and_keeps_max_multiplier() {
+    assert_eq!(
+        PlanTier::Max(Some(5)).short_label().as_deref(),
+        Some("Max 5x")
+    );
+    assert_eq!(PlanTier::Max(None).short_label().as_deref(), Some("Max"));
+    assert_eq!(PlanTier::Pro.short_label().as_deref(), Some("Pro"));
+    // an unknown tier carries no label so the MCP omits it entirely.
+    assert_eq!(PlanTier::Unknown.short_label(), None);
+}
+
+#[test]
 fn parses_z_suffix() {
     assert_eq!(iso_to_epoch_secs("2026-05-17T14:20:00Z"), Some(BASE_UTC));
     assert_eq!(
