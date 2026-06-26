@@ -379,24 +379,34 @@ with `delegate_result({job_id})`"
             let job_id_task = job_id.clone();
             let profile_task = profile.clone();
             tokio::task::spawn_blocking(move || {
-                let envelope = match run_delegate(DelegateOpts {
-                    profile: &profile_task,
-                    prompt: &prompt,
-                    model: model.as_deref(),
-                    cwd: cwd.as_deref(),
-                    env: env.unwrap_or_default(),
-                    extra_args: args.unwrap_or_default(),
-                    timeout,
-                    isolation,
-                    depth,
-                }) {
-                    Ok(v) => v,
-                    // Mirror the sync contract: a failure finalizes the job with an
-                    // `is_error` envelope, never a dropped/torn job.
-                    Err(reason) => serde_json::json!({
+                // Catch a panic in the detached task: the handle is dropped, so an
+                // unwind would otherwise be swallowed and leave the job stuck
+                // `running` until GC — the waiter would hang on its deadline. The
+                // job file is always finalized, mirroring the sync contract.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_delegate(DelegateOpts {
+                        profile: &profile_task,
+                        prompt: &prompt,
+                        model: model.as_deref(),
+                        cwd: cwd.as_deref(),
+                        env: env.unwrap_or_default(),
+                        extra_args: args.unwrap_or_default(),
+                        timeout,
+                        isolation,
+                        depth,
+                    })
+                }));
+                let envelope = match outcome {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(reason)) => serde_json::json!({
                         "profile": profile_task,
                         "is_error": true,
                         "result": reason,
+                    }),
+                    Err(_) => serde_json::json!({
+                        "profile": profile_task,
+                        "is_error": true,
+                        "result": "delegate task panicked",
                     }),
                 };
                 let _ = jobs::write_done(&job_id_task, &profile_task, started_at, envelope);
@@ -583,7 +593,7 @@ pub(crate) fn await_job() -> ! {
     let job_id = serde_json::from_str::<serde_json::Value>(&input)
         .ok()
         .as_ref()
-        .and_then(find_job_id)
+        .and_then(extract_job_id)
         .filter(|id| jobs::is_safe_job_id(id));
     let Some(job_id) = job_id else {
         std::process::exit(0); // sync delegate or unparseable input: nothing to deliver
@@ -615,6 +625,17 @@ pub(crate) fn await_job() -> ! {
         }
         std::thread::sleep(JOB_POLL_INTERVAL);
     }
+}
+
+/// Extract a background job's id from a hook payload, preferring the documented
+/// `tool_response` slot so a delegate prompt that happens to carry a `job_id`
+/// can't shadow the real handle; fall back to a whole-payload scan only if it's
+/// absent (the exact shape is not host-guaranteed).
+fn extract_job_id(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("tool_response")
+        .and_then(find_job_id)
+        .or_else(|| find_job_id(payload))
 }
 
 /// Recursively search a hook-payload JSON for a string `job_id` field. A string

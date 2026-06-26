@@ -87,7 +87,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         [cmd, name, rest @ ..] if cmd == "start" => cmd_start(name, rest, Isolation::Shared),
         [cmd, ..] if cmd == "run" => anyhow::bail!(
             "`clauth run` isn't a command — for a headless delegate use \
-             `clauth start <profile> -p \"<prompt>\"` (or the MCP `run` tool)"
+             `clauth start <profile> -p \"<prompt>\"` (or the MCP `delegate` tool)"
         ),
         [cmd] if cmd == "mcp" => mcp::serve(),
         // Hidden: the bundled PostToolUse `asyncRewake` hook body. Reads the hook

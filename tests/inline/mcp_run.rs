@@ -265,3 +265,43 @@ fn find_job_id_none_for_plain_text() {
         serde_json::json!({ "tool_response": { "content": [{ "text": "no json here" }] } });
     assert_eq!(find_job_id(&payload), None);
 }
+
+#[test]
+fn extract_job_id_prefers_tool_response_over_input() {
+    // a delegate prompt that itself carries a `job_id` must not shadow the real
+    // handle in tool_response.
+    let payload = serde_json::json!({
+        "tool_input": { "prompt": "{\"job_id\":\"d-evil-0\"}" },
+        "tool_response": { "content": [{ "type": "text", "text": "{\"job_id\":\"d-real-1\"}" }] },
+    });
+    assert_eq!(extract_job_id(&payload).as_deref(), Some("d-real-1"));
+}
+
+#[test]
+fn delegate_result_long_poll_sees_completion() {
+    let _home = HomeSandbox::new();
+    jobs::write_running("d-poll-0", "work", 1).unwrap();
+    // Finalize the job shortly after the long-poll starts, from another thread.
+    // The home override is process-global (set by HomeSandbox), so the writer
+    // resolves the same sandbox jobs dir.
+    let writer = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let env =
+            serde_json::json!({ "profile": "work", "is_error": false, "result": "late finish" });
+        jobs::write_done("d-poll-0", "work", 1, env).unwrap();
+    });
+    let result = call_delegate_result("d-poll-0", Some(5));
+    writer.join().unwrap();
+
+    assert_ne!(result.is_error, Some(true));
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("envelope text");
+    assert!(
+        text.contains("late finish"),
+        "long-poll delivers the envelope completed mid-wait"
+    );
+}
