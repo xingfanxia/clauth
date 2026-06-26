@@ -87,6 +87,25 @@ fn load_windows(name: &str) -> (Option<UsageWindow>, Option<UsageWindow>) {
     }
 }
 
+/// The profile's 5h + 7d windows as a JSON array of `{label, utilization_pct,
+/// resets_at}`, read fresh from the disk cache. Empty array when no cache yet.
+fn windows_json(name: &str) -> serde_json::Value {
+    let (five_h, seven_d) = load_windows(name);
+    let windows: Vec<serde_json::Value> = [("5h", &five_h), ("7d", &seven_d)]
+        .into_iter()
+        .filter_map(|(label, w)| {
+            w.as_ref().map(|w| {
+                serde_json::json!({
+                    "label": label,
+                    "utilization_pct": w.utilization,
+                    "resets_at": w.resets_at,
+                })
+            })
+        })
+        .collect();
+    serde_json::Value::Array(windows)
+}
+
 /// Compact "Nm ago" / "Nh ago" age label for the active profile's usage cache
 /// mtime, or `unknown` when no cache has been written yet.
 fn cache_age_label(active: Option<&str>) -> String {
@@ -156,6 +175,11 @@ pub(crate) struct DelegateArgs {
     /// delegate runs on a detached task; collect the result via the auto-delivery
     /// hook or `delegate_result({job_id})`. Defaults to false.
     background: Option<bool>,
+    /// Opt into progress reporting for a `background` run: a `delegate_result`
+    /// poll on the still-running job then also reports the target profile's live
+    /// usage windows (`quota`) alongside `elapsed_secs`. No effect on a blocking
+    /// call. Defaults to false.
+    monitor: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -193,7 +217,6 @@ past `delegate` calls; \
             .iter()
             .map(|p| {
                 let name = p.name.as_str();
-                let (five_h, seven_d) = load_windows(name);
                 let third_party = if p.is_third_party() {
                     load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
                         .as_ref()
@@ -201,18 +224,6 @@ past `delegate` calls; \
                 } else {
                     None
                 };
-                let windows: Vec<serde_json::Value> = [("5h", &five_h), ("7d", &seven_d)]
-                    .into_iter()
-                    .filter_map(|(label, w)| {
-                        w.as_ref().map(|w| {
-                            serde_json::json!({
-                                "label": label,
-                                "utilization_pct": w.utilization,
-                                "resets_at": w.resets_at,
-                            })
-                        })
-                    })
-                    .collect();
                 serde_json::json!({
                     "name": name,
                     "active": config.is_active(name),
@@ -220,7 +231,7 @@ past `delegate` calls; \
                     "base_url": p.base_url,
                     "subscription_type": subscription_type(p),
                     "has_live_session": crate::runtime::has_live_session(name),
-                    "windows": windows,
+                    "windows": windows_json(name),
                     "third_party": third_party,
                     "throughput": throughput_json(name, now),
                 })
@@ -314,13 +325,17 @@ configured active profile, with no creds on disk to match). Appends a live usage
 
     #[tool(
         description = "Delegate a headless task to a profile; SPENDS that account's real usage \
-window (hard-capped at depth 1 — a delegate cannot itself delegate). The delegate runs with NO \
-MCP servers (`--strict-mcp-config`) and starts in this server's cwd unless `cwd` is set. Optional \
-cwd/env/args/timeout_secs/isolated shape the spawned `claude`; `isolated` drops operator \
-memory/plugins/hooks. Returns the delegate envelope (`result`, `is_error`, `total_cost_usd`, \
-token usage) — read `total_cost_usd`/usage to self-throttle. Set `background: true` to get a \
-`{job_id}` back at once instead of blocking; the result then auto-arrives via a hook, or fetch it \
-with `delegate_result({job_id})`"
+window. The depth-1 cap blocks only a nested clauth `delegate` (a delegate cannot delegate again); \
+in-delegate subagents run, but under the SAME delegated profile, not other accounts. The delegate \
+runs with NO MCP servers (`--strict-mcp-config`); to grant a whitelist, pass \
+`args:[\"--mcp-config\",\"<json|path>\"]` (strict loads only those). Starts in this server's cwd \
+unless `cwd` is set. Optional cwd/env/args/timeout_secs/isolated shape the spawned `claude`; \
+`isolated` drops operator memory/plugins/hooks. Returns the delegate envelope (`result`, \
+`is_error`, `total_cost_usd`, token usage) — read `total_cost_usd`/usage to self-throttle; the \
+`result` is the delegate's own self-report, so spot-verify it like any subagent. Set \
+`background: true` to get a `{job_id}` back at once instead of blocking; the result auto-arrives \
+via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so a \
+`delegate_result` poll on the still-running job reports `elapsed_secs` + the target's live `quota`"
     )]
     async fn delegate(
         &self,
@@ -334,6 +349,7 @@ with `delegate_result({job_id})`"
             timeout_secs,
             isolated,
             background,
+            monitor,
         }): Parameters<DelegateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         // Fail closed: a present-but-unparseable value is treated as max depth
@@ -372,9 +388,9 @@ with `delegate_result({job_id})`"
         if background.unwrap_or(false) {
             let started_at = now_ms();
             let job_id = jobs::new_job_id(started_at);
-            jobs::write_running(&job_id, &profile, started_at).map_err(|e| {
-                ErrorData::internal_error(format!("failed to record job: {e}"), None)
-            })?;
+            jobs::write_running(&job_id, &profile, started_at, monitor.unwrap_or(false)).map_err(
+                |e| ErrorData::internal_error(format!("failed to record job: {e}"), None),
+            )?;
 
             let job_id_task = job_id.clone();
             let profile_task = profile.clone();
@@ -498,8 +514,18 @@ result auto-arrives via a hook — use this only when delegate hooks are disable
                     payload.to_string(),
                 )]))
             }
-            WaitOutcome::Running => {
-                let payload = serde_json::json!({ "job_id": job_id, "status": "running" });
+            WaitOutcome::Running(record) => {
+                let elapsed_secs = now_ms().saturating_sub(record.started_at) / 1000;
+                let mut payload = serde_json::json!({
+                    "job_id": job_id,
+                    "status": "running",
+                    "elapsed_secs": elapsed_secs,
+                });
+                // `monitor`-gated: attach the target's live usage windows so the
+                // poller sees remaining headroom without a separate list_profiles.
+                if record.monitor {
+                    payload["quota"] = windows_json(&record.profile);
+                }
                 Ok(CallToolResult::success(vec![Content::text(
                     payload.to_string(),
                 )]))
@@ -558,8 +584,9 @@ const AWAIT_JOB_DEADLINE_SECS: u64 = MAX_RUN_TIMEOUT_SECS + 600;
 /// Result of polling a background job file.
 enum WaitOutcome {
     Done(jobs::JobRecord),
-    /// Present but not yet finished (the wait deadline elapsed first).
-    Running,
+    /// Present but not yet finished (the wait deadline elapsed first). Carries the
+    /// record so the caller can report `elapsed_secs` / monitored `quota`.
+    Running(jobs::JobRecord),
     /// No such job file (never created or already evicted).
     Unknown,
 }
@@ -573,7 +600,7 @@ fn wait_for_done(job_id: &str, deadline_secs: u64) -> WaitOutcome {
     loop {
         match jobs::read(job_id) {
             Some(r) if r.state == jobs::JobState::Done => return WaitOutcome::Done(r),
-            Some(_) if start.elapsed() >= deadline => return WaitOutcome::Running,
+            Some(r) if start.elapsed() >= deadline => return WaitOutcome::Running(r),
             Some(_) => {}
             None => return WaitOutcome::Unknown,
         }

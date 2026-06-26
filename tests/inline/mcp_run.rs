@@ -42,6 +42,7 @@ fn run_with_depth(depth: &str) -> CallToolResult {
                 timeout_secs: None,
                 isolated: None,
                 background: None,
+                monitor: None,
             }))
             .await
     });
@@ -140,7 +141,7 @@ fn delegate_result_invalid_job_id_is_error() {
 #[test]
 fn delegate_result_running_reports_status() {
     let _home = HomeSandbox::new();
-    jobs::write_running("d-run-0", "work", 1).unwrap();
+    jobs::write_running("d-run-0", "work", 1, false).unwrap();
     let result = call_delegate_result("d-run-0", Some(0));
     assert_ne!(result.is_error, Some(true), "a running job is not an error");
     let text = result
@@ -150,6 +151,24 @@ fn delegate_result_running_reports_status() {
         .map(|t| t.text.clone())
         .expect("status text");
     assert!(text.contains("running"), "running status surfaced");
+    assert!(text.contains("elapsed_secs"), "elapsed always reported");
+    assert!(!text.contains("quota"), "quota gated off without monitor");
+}
+
+#[test]
+fn delegate_result_running_monitor_reports_quota() {
+    let _home = HomeSandbox::new();
+    jobs::write_running("d-mon-0", "work", 1, true).unwrap();
+    let result = call_delegate_result("d-mon-0", Some(0));
+    assert_ne!(result.is_error, Some(true), "a running job is not an error");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("status text");
+    assert!(text.contains("elapsed_secs"), "elapsed reported");
+    assert!(text.contains("quota"), "monitor attaches quota");
 }
 
 #[test]
@@ -197,6 +216,7 @@ fn background_depth_guard_refuses_without_writing_job() {
                 timeout_secs: None,
                 isolated: None,
                 background: Some(true),
+                monitor: None,
             }))
             .await
     });
@@ -280,7 +300,7 @@ fn extract_job_id_prefers_tool_response_over_input() {
 #[test]
 fn delegate_result_long_poll_sees_completion() {
     let _home = HomeSandbox::new();
-    jobs::write_running("d-poll-0", "work", 1).unwrap();
+    jobs::write_running("d-poll-0", "work", 1, false).unwrap();
     // Finalize the job shortly after the long-poll starts, from another thread.
     // The home override is process-global (set by HomeSandbox), so the writer
     // resolves the same sandbox jobs dir.

@@ -42,6 +42,11 @@ pub(crate) struct JobRecord {
     pub(crate) profile: String,
     pub(crate) state: JobState,
     pub(crate) started_at: u64,
+    /// Caller opted into progress reporting (`delegate({monitor: true})`): a
+    /// running `delegate_result` poll attaches the profile's live usage windows.
+    /// `#[serde(default)]` so pre-`monitor` job files still deserialize.
+    #[serde(default)]
+    pub(crate) monitor: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) envelope: Option<serde_json::Value>,
 }
@@ -86,12 +91,18 @@ fn write_atomic(record: &JobRecord) -> Result<()> {
 }
 
 /// Write the initial `running` record for a freshly-started background job.
-pub(crate) fn write_running(job_id: &str, profile: &str, started_at: u64) -> Result<()> {
+pub(crate) fn write_running(
+    job_id: &str,
+    profile: &str,
+    started_at: u64,
+    monitor: bool,
+) -> Result<()> {
     write_atomic(&JobRecord {
         job_id: job_id.to_string(),
         profile: profile.to_string(),
         state: JobState::Running,
         started_at,
+        monitor,
         envelope: None,
     })
 }
@@ -108,6 +119,7 @@ pub(crate) fn write_done(
         profile: profile.to_string(),
         state: JobState::Done,
         started_at,
+        monitor: false,
         envelope: Some(envelope),
     })
 }

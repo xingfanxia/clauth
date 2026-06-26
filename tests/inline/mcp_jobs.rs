@@ -11,11 +11,12 @@ use crate::testutil::HomeSandbox;
 fn write_read_roundtrip_running_then_done() {
     let _home = HomeSandbox::new();
     let id = new_job_id(1000);
-    write_running(&id, "work", 1000).unwrap();
+    write_running(&id, "work", 1000, true).unwrap();
 
     let r = read(&id).expect("running record");
     assert_eq!(r.state, JobState::Running);
     assert_eq!(r.profile, "work");
+    assert!(r.monitor, "monitor flag round-trips");
     assert!(r.envelope.is_none());
 
     let env = serde_json::json!({ "is_error": false, "result": "ok" });
@@ -66,7 +67,7 @@ fn gc_reaps_expired_running_and_done_keeps_fresh() {
     let now = 10_000_000_000u64; // far-future ms so "fresh" entries read as recent
 
     write_done("d-fresh-done", "p", now, serde_json::json!({ "ok": true })).unwrap();
-    write_running("d-fresh-run", "p", now).unwrap();
+    write_running("d-fresh-run", "p", now, false).unwrap();
     write_done(
         "d-old-done",
         "p",
@@ -74,7 +75,7 @@ fn gc_reaps_expired_running_and_done_keeps_fresh() {
         serde_json::json!({}),
     )
     .unwrap();
-    write_running("d-old-run", "p", now - RUNNING_TTL_MS - 1).unwrap();
+    write_running("d-old-run", "p", now - RUNNING_TTL_MS - 1, false).unwrap();
 
     gc(now);
 
