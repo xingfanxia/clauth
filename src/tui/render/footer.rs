@@ -122,21 +122,34 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ],
             StatusFocus::Detail => &[("↑↓", "scroll"), ("a", "actions"), ("?", "help")],
         },
-        Tab::Plugin => match app.plugin.focus {
-            PluginFocus::List => &[
-                ("↑↓", "row"),
-                ("↵", "detail"),
-                ("r", "refresh"),
-                ("f", "fix"),
-                ("?", "help"),
-            ],
-            PluginFocus::Detail => &[
-                ("↑↓", "scroll"),
-                ("r", "refresh"),
-                ("f", "fix"),
-                ("?", "help"),
-            ],
-        },
+        Tab::Plugin => {
+            // `f` only fixes a row that actually offers one — don't advertise it as a
+            // hint on rows where pressing it is a no-op.
+            match (app.plugin.focus, app.plugin.selected_fix().is_some()) {
+                (PluginFocus::List, true) => &[
+                    ("↑↓", "row"),
+                    ("↵", "detail"),
+                    ("r", "refresh"),
+                    ("f", "fix"),
+                    ("?", "help"),
+                ],
+                (PluginFocus::List, false) => &[
+                    ("↑↓", "row"),
+                    ("↵", "detail"),
+                    ("r", "refresh"),
+                    ("?", "help"),
+                ],
+                (PluginFocus::Detail, true) => &[
+                    ("↑↓", "scroll"),
+                    ("r", "refresh"),
+                    ("f", "fix"),
+                    ("?", "help"),
+                ],
+                (PluginFocus::Detail, false) => {
+                    &[("↑↓", "scroll"), ("r", "refresh"), ("?", "help")]
+                }
+            }
+        }
         Tab::Fallback => match fallback_hint(app) {
             FallbackHint::Empty => &[("?", "help")],
             FallbackHint::ChainMember => &[
