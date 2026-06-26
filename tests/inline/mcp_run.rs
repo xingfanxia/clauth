@@ -1,14 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(unsafe_code)]
 
-//! `run` recursion-guard coverage. With `CLAUTH_MCP_DEPTH >= 1` the delegate must
+//! `delegate` recursion-guard coverage. With `CLAUTH_MCP_DEPTH >= 1` the delegate must
 //! short-circuit to an `is_error` envelope BEFORE any `claude` spawn (the
 //! fork-bomb cap). We assert the error envelope without faking a `claude` binary;
 //! the guard returns before `spawn_blocking`/`ProfileRuntime::acquire` runs.
 
 use super::*;
 
-/// Drive the async `run` tool with `CLAUTH_MCP_DEPTH = depth` on a current-thread
+/// Drive the async `delegate` tool with `CLAUTH_MCP_DEPTH = depth` on a current-thread
 /// runtime, restoring the prior env value before returning.
 ///
 /// # Safety
@@ -31,7 +31,7 @@ fn run_with_depth(depth: &str) -> CallToolResult {
         .expect("runtime");
     let result = rt.block_on(async {
         server
-            .run(Parameters(RunArgs {
+            .delegate(Parameters(DelegateArgs {
                 profile: "any".to_string(),
                 prompt: "hello".to_string(),
                 model: None,
@@ -51,7 +51,7 @@ fn run_with_depth(depth: &str) -> CallToolResult {
             None => std::env::remove_var(MCP_DEPTH_ENV),
         }
     }
-    result.expect("run returns a tool result, never a transport error")
+    result.expect("delegate returns a tool result, never a transport error")
 }
 
 #[test]
@@ -88,10 +88,10 @@ fn depth_guard_also_refuses_above_one() {
 // TODO(manual/integration): the live-spawn paths cannot be unit-tested without a
 // real `claude` on PATH, and we deliberately do NOT fake one (a fake binary
 // would assert nothing about the real envelope contract). Verify by hand:
-//   1. concurrent-different-profile: `run` two different profiles at once; each
+//   1. concurrent-different-profile: `delegate` two different profiles at once; each
 //      gets its own runtime + PID namespace and they complete without contention.
 //   2. same-profile rotation safety: with an interactive session of profile P
-//      live, `run` P; the delegate shares P's runtime + `RotationGuard` flock and
+//      live, `delegate` P; the delegate shares P's runtime + `RotationGuard` flock and
 //      gets a fresh token chain only after the live watchdog reconciles.
 //   3. happy path: a valid prompt returns `{is_error:false, result, ...}` parsed
 //      from `claude -p --output-format json`, and the child inherits

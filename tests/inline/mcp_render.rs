@@ -159,7 +159,7 @@ fn instructions_block_carries_staleness_nudge_and_profile_lines() {
     // load-bearing safety prose: dropping any of these warnings must fail here.
     assert!(
         out.contains("BURNS a real account usage window"),
-        "the `run` quota-burn warning must survive a prose edit",
+        "the `delegate` quota-burn warning must survive a prose edit",
     );
     assert!(
         out.contains("hard-capped at depth 1"),
@@ -182,7 +182,7 @@ fn switch_effect_distinguishes_global_from_isolated_sessions() {
     let global = switch_effect(&SessionAuth::Global);
     assert!(global.contains("THIS session reads"));
     assert!(global.contains("next token refresh"));
-    assert!(global.contains("delegate with `run`"));
+    assert!(global.contains("use the `delegate` tool"));
 
     // Isolated runtime: names the pinned profile and states it is unaffected.
     let pinned = switch_effect(&SessionAuth::IsolatedRuntime("work".to_string()));

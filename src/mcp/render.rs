@@ -69,7 +69,7 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     }
 }
 
-/// Compact freshness footer appended to every `which`/`switch`/`run` result:
+/// Compact freshness footer appended to every `which`/`switch`/`delegate` result:
 /// active profile + 5h/7d percent-used for the touched profile, read fresh from
 /// cache. Percentages are the share of the window consumed (higher = less
 /// headroom), labeled `% used` so the reader can't invert it.
@@ -100,7 +100,7 @@ pub(crate) fn switch_effect(auth: &SessionAuth) -> String {
         SessionAuth::Global => "`switch` repoints the global `~/.claude` credentials THIS \
 session reads; Claude Code reloads them on its next token refresh, so this session would \
 start acting as the switched profile — disruptive mid-session. To use another account \
-without disturbing this one, delegate with `run`."
+without disturbing this one, use the `delegate` tool."
             .to_string(),
         SessionAuth::IsolatedRuntime(name) => format!(
             "`switch` repoints the global `~/.claude` credentials, but THIS session runs in an \
@@ -133,7 +133,7 @@ session's window.\n\n\
 Tools: `list_profiles` (cached usage + filesystem, zero quota), \
 `which` (the profile that owns this session's credentials), \
 `switch` (relink the global active profile), \
-`run` (delegate a headless prompt to a profile; this BURNS a real account usage window, \
+`delegate` (delegate a headless prompt to a profile; this BURNS a real account usage window, \
 hard-capped at depth 1 — a delegate cannot itself delegate).\n\nswitch & this session: ",
     );
     out.push_str(&switch_effect(auth));

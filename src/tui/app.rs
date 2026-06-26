@@ -2491,7 +2491,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
                 snap.name.clone()
             });
         }
-        // Observed delegate throughput (MCP `run`); a recent rate-limit on any
+        // Observed delegate throughput (MCP `delegate`); a recent rate-limit on any
         // exercised model warns even when the credential link is healthy.
         let throughput = crate::throughput::summary(&snap.name, now_secs);
         if throughput.iter().any(|t| t.rate_limited_recent) {

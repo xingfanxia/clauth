@@ -128,7 +128,7 @@ pub(crate) struct SwitchArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub(crate) struct RunArgs {
+pub(crate) struct DelegateArgs {
     /// Profile name to run the headless delegate session under.
     profile: String,
     /// Prompt passed to the delegated `claude -p` session.
@@ -167,7 +167,7 @@ impl ClauthServer {
 the percent of that window already USED (higher = less headroom) and `resets_at` is ISO-8601; \
 `has_live_session` = a clauth-managed `claude` session currently owns it; `throughput[]` = \
 observed per-model `{model, tok_s, samples, degraded, rate_limited_recent, retry_after_s}` from \
-past `run` delegations; \
+past `delegate` calls; \
 `third_party` = a cached one-line headline for provider-key profiles (deepseek/zai/…)"
     )]
     async fn list_profiles(&self) -> Result<CallToolResult, ErrorData> {
@@ -306,9 +306,9 @@ cwd/env/args/timeout_secs/isolated shape the spawned `claude`; `isolated` drops 
 memory/plugins/hooks. Returns the run envelope (`result`, `is_error`, `total_cost_usd`, token \
 usage) — read `total_cost_usd`/usage to self-throttle"
     )]
-    async fn run(
+    async fn delegate(
         &self,
-        Parameters(RunArgs {
+        Parameters(DelegateArgs {
             profile,
             prompt,
             model,
@@ -317,7 +317,7 @@ usage) — read `total_cost_usd`/usage to self-throttle"
             args,
             timeout_secs,
             isolated,
-        }): Parameters<RunArgs>,
+        }): Parameters<DelegateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         // Fail closed: a present-but-unparseable value is treated as max depth
         // (refuse), so a corrupt env can never re-enable delegation. Only a truly
@@ -401,7 +401,7 @@ const MCP_DEPTH_ENV: &str = "CLAUTH_MCP_DEPTH";
 /// Poll interval mirroring `start.rs`'s `wait_for_child` cadence.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Inputs for one delegated `run`. Grouped into a struct so `run_delegate`
+/// Inputs for one delegated `delegate`. Grouped into a struct so `run_delegate`
 /// avoids a too-many-arguments signature as the surface grew (cwd/env/args/
 /// timeout/isolation).
 struct DelegateOpts<'a> {

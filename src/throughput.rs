@@ -1,13 +1,13 @@
 //! Observed delegate throughput per (profile, model).
 //!
 //! clauth never sits in the inference request path, so the only throughput it
-//! can observe is from `run` delegations it launches itself. Each successful run
+//! can observe is from `delegate` calls it launches itself. Each successful delegate
 //! records output tokens / API duration; a short rolling window per model yields
 //! a recent tokens/sec and a `degraded` flag (recent pace well below that model's
 //! observed best on the same account). Subscription throttle is per-model, so a
 //! profile's 5h/7d utilization gives no signal here — this fills that gap for the
 //! models clauth has actually exercised. Rate-limit hits (429 / "rate limit"
-//! surfaced by a failed run) are recorded alongside.
+//! surfaced by a failed delegate) are recorded alongside.
 //!
 //! Best-effort, swallow-on-error: a missing or corrupt cache reads as "no data".
 
