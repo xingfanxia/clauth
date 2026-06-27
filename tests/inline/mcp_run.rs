@@ -406,3 +406,52 @@ fn delegate_result_long_poll_sees_completion() {
         "long-poll delivers the envelope completed mid-wait"
     );
 }
+
+// `parse_delegate_envelope` normalizes whatever `claude` writes to stdout down to
+// the single terminal result object. The regression that motivated it: a caller's
+// `--verbose` flips `--output-format json` to the full transcript ARRAY, which
+// parsed cleanly and got stored/dumped verbatim (~900K of per-token + tool-io
+// events for a multi-minute run) instead of the ~1K envelope.
+
+#[test]
+fn parse_envelope_passes_plain_json_object_through() {
+    let stdout = r#"{"type":"result","is_error":false,"result":"ok","total_cost_usd":0.01}"#;
+    let env = super::parse_delegate_envelope(stdout).expect("plain object parses");
+    assert_eq!(env["result"], "ok");
+    assert_eq!(env["is_error"], false);
+}
+
+#[test]
+fn parse_envelope_collapses_verbose_transcript_array() {
+    // `--output-format json --verbose`: a leading 10KB+ `system` event, an
+    // `assistant` turn, then the terminal `result`. Only the result must survive.
+    let stdout = r#"[
+        {"type":"system","subtype":"init","blob":"AAAAAAAAAAAAAAAAAAAA"},
+        {"type":"assistant","message":{"content":[{"type":"thinking","thinking":"x"}]}},
+        {"type":"result","is_error":false,"result":"final report","total_cost_usd":0.5}
+    ]"#;
+    let env = super::parse_delegate_envelope(stdout).expect("array collapses");
+    assert!(
+        env.is_object(),
+        "envelope is the result object, not the array"
+    );
+    assert_eq!(env["result"], "final report");
+    assert!(env.get("blob").is_none(), "transcript noise is dropped");
+    assert!(env.get("thinking").is_none());
+}
+
+#[test]
+fn parse_envelope_recovers_result_from_ndjson_stream() {
+    // `--output-format stream-json`: newline-delimited events, not a single value.
+    let stdout = "{\"type\":\"system\",\"subtype\":\"thinking_tokens\",\"estimated_tokens\":1}\n\
+                  {\"type\":\"assistant\"}\n\
+                  {\"type\":\"result\",\"is_error\":false,\"result\":\"streamed\"}";
+    let env = super::parse_delegate_envelope(stdout).expect("ndjson recovers result");
+    assert_eq!(env["result"], "streamed");
+}
+
+#[test]
+fn parse_envelope_errors_on_unparseable_output() {
+    let err = super::parse_delegate_envelope("not json at all").expect_err("garbage is an error");
+    assert!(err.contains("failed to parse claude output"));
+}

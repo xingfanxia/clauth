@@ -852,12 +852,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
             truncate(stderr.trim(), 2000)
         ));
     }
-    let envelope = serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|e| {
-        format!(
-            "failed to parse claude output: {e}: {}",
-            truncate(stdout.trim(), 2000)
-        )
-    })?;
+    let envelope = parse_delegate_envelope(stdout.trim())?;
     // A clean exit can still carry an in-band error envelope (rate limit shows up
     // there with `--output-format json`); branch on `is_error` so a throttle is
     // recorded as one, not as a (bogus) throughput sample.
@@ -873,6 +868,53 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         record_throughput_from_envelope(opts.profile, opts.model, &envelope, now);
     }
     Ok(envelope)
+}
+
+/// Reduce `claude`'s captured stdout to its single terminal `type:"result"`
+/// envelope. Plain `--output-format json` already emits exactly that object, but
+/// a caller-supplied `--verbose` flips the format to the full transcript ARRAY
+/// (every `system` thinking-token / tool-io / `assistant` event) and `stream-json`
+/// emits the same events as NDJSON — either is valid input that would otherwise be
+/// stored and dumped into the caller's context verbatim (a multi-minute run leaks
+/// ~1000x the envelope). Collapse all three to the terminal result object so the
+/// delegate envelope stays the documented shape regardless of caller `args`.
+fn parse_delegate_envelope(stdout: &str) -> std::result::Result<serde_json::Value, String> {
+    match serde_json::from_str::<serde_json::Value>(stdout) {
+        Ok(serde_json::Value::Array(items)) => result_event(items).ok_or_else(|| {
+            format!(
+                "no result event in claude output: {}",
+                truncate(stdout, 2000)
+            )
+        }),
+        Ok(other) => Ok(other),
+        // NDJSON (`stream-json`): not a single JSON value — recover the terminal
+        // result event from the per-line events.
+        Err(e) => {
+            let items = stdout
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+                .collect();
+            result_event(items).ok_or_else(|| {
+                format!(
+                    "failed to parse claude output: {e}: {}",
+                    truncate(stdout, 2000)
+                )
+            })
+        }
+    }
+}
+
+/// The last `type:"result"` element of a parsed claude event list (its terminal
+/// envelope), falling back to the last element when none is tagged. `None` for an
+/// empty list.
+fn result_event(mut items: Vec<serde_json::Value>) -> Option<serde_json::Value> {
+    match items
+        .iter()
+        .rposition(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("result"))
+    {
+        Some(i) => Some(items.swap_remove(i)),
+        None => items.pop(),
+    }
 }
 
 /// Pull output-token throughput from a successful `claude` JSON envelope and
