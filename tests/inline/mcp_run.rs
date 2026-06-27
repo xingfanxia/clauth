@@ -100,6 +100,87 @@ fn depth_guard_also_refuses_above_one() {
 //      from `claude -p --output-format json`, and the child inherits
 //      `CLAUTH_MCP_DEPTH=1` + `--strict-mcp-config`.
 
+// ---- delegate env composition (provider-routing isolation) ----
+
+/// Collect a `Command`'s queued env overrides: key → `Some(value)` for a set
+/// var, key → `None` for a removed one. `get_envs` reflects only the explicit
+/// `env`/`env_remove` ops, which is exactly what we assert — no process env or
+/// spawn needed, so this is lock-free and non-flaky.
+fn env_overrides(cmd: &Command) -> HashMap<String, Option<String>> {
+    cmd.get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.map(|s| s.to_string_lossy().into_owned()),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn delegate_env_strips_inherited_provider_routing() {
+    let mut cmd = Command::new("claude");
+    apply_delegate_env(&mut cmd, &HashMap::new(), std::path::Path::new("/cfg"), 0);
+    let envs = env_overrides(&cmd);
+
+    // every provider-routing key is queued for removal so a parent session's
+    // endpoint/token can't cross-route the delegate to the wrong provider.
+    for key in DELEGATE_ENV_STRIP {
+        assert_eq!(
+            envs.get(*key),
+            Some(&None),
+            "{key} must be stripped from the inherited env",
+        );
+    }
+    // clauth's own keys are always set.
+    assert_eq!(
+        envs.get("CLAUDE_CONFIG_DIR"),
+        Some(&Some("/cfg".to_string()))
+    );
+    assert_eq!(envs.get("CLAUTH_MCP_DEPTH"), Some(&Some("1".to_string())));
+    assert_eq!(
+        envs.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+        Some(&Some(DEFAULT_MAX_OUTPUT_TOKENS.to_string())),
+    );
+}
+
+#[test]
+fn delegate_env_caller_reauthority_and_clauth_keys_win() {
+    let mut caller = HashMap::new();
+    // a caller may deliberately re-route by re-adding a stripped key,
+    caller.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "https://example.test".to_string(),
+    );
+    // must NOT be able to defeat the depth guard,
+    caller.insert("CLAUTH_MCP_DEPTH".to_string(), "0".to_string());
+    // and a caller-set max-tokens is respected, not overwritten by the default.
+    caller.insert(
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS".to_string(),
+        "999".to_string(),
+    );
+
+    let mut cmd = Command::new("claude");
+    apply_delegate_env(&mut cmd, &caller, std::path::Path::new("/cfg"), 0);
+    let envs = env_overrides(&cmd);
+
+    assert_eq!(
+        envs.get("ANTHROPIC_BASE_URL"),
+        Some(&Some("https://example.test".to_string())),
+        "a caller can re-add a stripped routing key deliberately",
+    );
+    assert_eq!(
+        envs.get("CLAUTH_MCP_DEPTH"),
+        Some(&Some("1".to_string())),
+        "the depth guard always wins over a caller value",
+    );
+    assert_eq!(
+        envs.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+        Some(&Some("999".to_string())),
+        "a caller-set max-tokens is not clobbered by the default",
+    );
+}
+
 // ---- background delegation + delegate_result ----
 
 /// Drive `delegate_result` on a current-thread runtime under a home sandbox the
