@@ -328,12 +328,16 @@ configured active profile, with no creds on disk to match). Appends a live usage
     #[tool(
         description = "Delegate a headless task to a profile; SPENDS that account's real usage \
 window. The depth-1 cap blocks only a nested clauth `delegate` (a delegate cannot delegate again); \
-in-delegate subagents run, but under the SAME delegated profile, not other accounts. A normal \
-delegate inherits its runtime config-dir's MCP servers (so it can do research/codebase nav); \
-`isolated: true` runs a clean blind session with NO MCP servers. To scope a shared delegate, pass \
-`args:[\"--mcp-config\",\"<json|path>\",\"--strict-mcp-config\"]`. Starts in this server's cwd \
-unless `cwd` is set. Optional cwd/env/args/timeout_secs/isolated shape the spawned `claude`; \
-`isolated` drops operator memory/plugins/hooks/MCP. Returns the delegate envelope (`result`, \
+in-delegate subagents run, but under the SAME delegated profile, not other accounts. For a \
+one-shot task PREFER `isolated: true` — a clean blind session that skips the operator persona \
+(the runtime's `CLAUDE.md`, plugins, hooks, skills) and loads NO MCP servers, so it is cheaper \
+(and on an api-key profile, fewer billed tokens). A SHARED delegate (the default) instead inherits \
+that persona plus the runtime config-dir's MCP servers; use it only when the task needs repo tools \
+/ codebase nav. Scope a shared delegate with `args:[\"--mcp-config\",\"<json|path>\",\"--strict-mcp-config\"]`. \
+SEPARATELY, a delegate loads the project `CLAUDE.md` of its `cwd` (defaults to this server's cwd) \
+regardless of `isolated`, so set `cwd` to a clean dir for a one-shot to avoid an unrelated \
+project's house-style. Optional cwd/env/args/timeout_secs/isolated shape the spawned `claude`. \
+Returns the delegate envelope (`result`, \
 `is_error`, `total_cost_usd`, token usage) — read `total_cost_usd`/usage to self-throttle; the \
 `result` is the delegate's own self-report, so spot-verify it like any subagent. Set \
 `background: true` to get a `{job_id}` back at once instead of blocking; the result auto-arrives \

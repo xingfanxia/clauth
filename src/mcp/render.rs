@@ -116,7 +116,10 @@ now and the result later), \
     out.push_str(&switch_effect(auth));
     out.push_str(
         "\n\nCost: `delegate` to a subscription profile burns a rate-limited window (no per-token \
-charge); to an API-key profile (DeepSeek, Z.ai) it bills real USD; a local endpoint is free.\n\n\
+charge); to an API-key profile (DeepSeek, Z.ai) it bills real USD; a local endpoint is free. To \
+pick the cheapest target, call `list_profiles` for live windows + third-party balances.\n\n\
+A delegate sees nothing but the prompt you pass it — frame the task in that prompt; it has no view \
+of this conversation.\n\n\
 Profiles (at session start — call `list_profiles` for the live roster and usage):\n",
     );
 

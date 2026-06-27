@@ -130,6 +130,16 @@ fn instructions_block_emits_stable_roster_cost_model_and_safety_prose() {
     assert!(out.contains("Cost:"));
     assert!(out.contains("bills real USD"));
 
+    // cheapest-target pointer + delegate-framing nudge must survive a prose edit.
+    assert!(
+        out.contains("call `list_profiles` for live windows"),
+        "the cheapest-target routing pointer must survive a prose edit",
+    );
+    assert!(
+        out.contains("A delegate sees nothing but the prompt"),
+        "the delegate-framing nudge must survive a prose edit",
+    );
+
     // volatile figures are NOT baked in — they rot within a turn, so they must
     // stay on the per-call `list_profiles` path, never here.
     assert!(
