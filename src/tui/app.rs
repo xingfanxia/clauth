@@ -965,6 +965,9 @@ pub(crate) struct App {
     /// Global token-usage stats read from `~/.claude` (stats-cache + recent
     /// transcript top-up); `None` until the loader posts its first result.
     pub(crate) token_stats: Option<crate::tokens::TokenStats>,
+    /// Set when the loader reported a failure and no stats are cached — the tab
+    /// shows an error instead of a perpetual "reading ~/.claude".
+    pub(crate) tokens_failed: bool,
     /// Which view the Tokens tab is showing (Dashboard landing vs Models detail).
     pub(crate) token_view: TokenView,
     /// Cursor into the grouped model list on the Tokens `Models` view.
@@ -1208,6 +1211,7 @@ impl App {
             status_refresh,
             plugin: PluginState::default(),
             token_stats: None,
+            tokens_failed: false,
             token_view: TokenView::Dashboard,
             token_model_cursor: 0,
             tokens_events,
@@ -5026,7 +5030,17 @@ fn apply_status_incidents(
 fn drain_tokens_events(app: &mut App) {
     while let Ok(ev) = app.tokens_events.try_recv() {
         match ev {
+            // Base seeds the first paint only; on a refresh the prior topped-up
+            // snapshot stays visible until the new Loaded lands, so the cadence
+            // never flickers the tab back to base-only data.
+            crate::tokens::TokensEvent::Base(stats) => {
+                app.tokens_failed = false;
+                if app.token_stats.is_none() {
+                    app.token_stats = Some(*stats);
+                }
+            }
             crate::tokens::TokensEvent::Loaded(stats) => {
+                app.tokens_failed = false;
                 app.token_stats = Some(*stats);
                 // Re-clamp the model cursor in case the grouped list shrank.
                 let len = token_model_count(app);
@@ -5034,7 +5048,13 @@ fn drain_tokens_events(app: &mut App) {
                     app.token_model_cursor = len - 1;
                 }
             }
-            crate::tokens::TokensEvent::Failed => {}
+            // Surface failure only when there is nothing to show — a transient
+            // read error mid-session keeps the last good snapshot.
+            crate::tokens::TokensEvent::Failed => {
+                if app.token_stats.is_none() {
+                    app.tokens_failed = true;
+                }
+            }
         }
     }
 }

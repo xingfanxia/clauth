@@ -627,3 +627,96 @@ fn top_up_dedupes_same_message_across_files() {
     assert_eq!(opus.input, 100);
     assert_eq!(opus.output, 50);
 }
+
+#[test]
+fn top_up_dedupes_idless_usage_lines_by_content() {
+    // A usage line with no message.id / requestId, mirrored into two transcripts,
+    // must still count once. The old dedup keyed on (requestId, message.id) and
+    // bypassed the guard whenever either was absent, double-counting such lines.
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{
+            "lastComputedDate": "2026-06-10",
+            "totalSessions": 0, "totalMessages": 0,
+            "dailyActivity": [], "dailyModelTokens": [],
+            "modelUsage": {}, "hourCounts": {}
+        }"#,
+    );
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let line = jsonl_line("2026-06-11T10:00:00+00:00", "claude-opus-4", 100, 50, 0, 0);
+    for name in ["a.jsonl", "b.jsonl"] {
+        let p = proj_dir.join(name);
+        std::fs::write(&p, format!("{line}\n")).expect("write");
+        set_mtime(&p, SystemTime::now());
+    }
+
+    let stats = load(&claude_dir).expect("load");
+    let day = stats
+        .daily
+        .iter()
+        .find(|d| d.date == "2026-06-11")
+        .expect("2026-06-11 must be in daily");
+    assert_eq!(
+        day.tokens, 150,
+        "id-less duplicate counted once via composite key"
+    );
+}
+
+/// A role/uuid/session message line with no token usage — drives the
+/// message/session/hour reconstruction without touching token totals.
+fn jsonl_msg_line(timestamp: &str, uuid: &str, session: &str, role: &str) -> String {
+    format!(
+        r#"{{"timestamp":"{timestamp}","uuid":"{uuid}","sessionId":"{session}","message":{{"role":"{role}"}}}}"#
+    )
+}
+
+#[test]
+fn top_up_reconstructs_messages_sessions_hours_after_cutoff() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{
+            "lastComputedDate": "2026-06-10",
+            "totalSessions": 5, "totalMessages": 100,
+            "dailyActivity": [], "dailyModelTokens": [],
+            "modelUsage": {}, "hourCounts": {"9": 7}
+        }"#,
+    );
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let lines = [
+        jsonl_msg_line("2026-06-11T14:00:00+00:00", "u1", "sessA", "user"),
+        jsonl_msg_line("2026-06-11T14:05:00+00:00", "u2", "sessA", "assistant"),
+        jsonl_msg_line("2026-06-11T14:30:00+00:00", "u3", "sessB", "user"),
+        // Duplicate uuid (resumed/forked copy) — must count once.
+        jsonl_msg_line("2026-06-11T14:31:00+00:00", "u3", "sessB", "user"),
+        // Pre-cutoff line — must not count toward post-cutoff reconstruction.
+        jsonl_msg_line("2026-06-09T14:00:00+00:00", "u0", "sessOld", "user"),
+    ];
+    let p = proj_dir.join("sess.jsonl");
+    std::fs::write(&p, lines.join("\n")).expect("write");
+    set_mtime(&p, SystemTime::now());
+
+    let stats = load(&claude_dir).expect("load");
+    // 3 distinct post-cutoff messages (u1, u2, u3) added to base 100.
+    assert_eq!(stats.total_messages, 103);
+    // 2 distinct post-cutoff sessions (sessA, sessB) added to base 5.
+    assert_eq!(stats.total_sessions, 7);
+    // hour 14 gains 3; base hour 9 stays.
+    assert_eq!(stats.hour_counts[14], 3);
+    assert_eq!(stats.hour_counts[9], 7);
+    // Per-day activity appended for the new day.
+    let day = stats
+        .activity
+        .iter()
+        .find(|a| a.date == "2026-06-11")
+        .expect("2026-06-11 activity");
+    assert_eq!(day.messages, 3);
+    assert_eq!(day.sessions, 2);
+}

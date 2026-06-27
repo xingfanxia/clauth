@@ -244,12 +244,13 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let block = section_box("tokens", false, true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        let (msg, style) = if app.tokens_failed {
+            ("~/.claude/stats-cache.json unreadable", theme::danger())
+        } else {
+            ("reading ~/.claude", theme::faint())
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "reading ~/.claude",
-                theme::faint(),
-            )))
-            .style(theme::base()),
+            Paragraph::new(Line::from(Span::styled(msg, style))).style(theme::base()),
             inner,
         );
         return;

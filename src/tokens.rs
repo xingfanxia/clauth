@@ -2,17 +2,25 @@
 //!
 //! # Design
 //!
-//! Two-stage load:
-//! 1. **Base stats** — parsed from `~/.claude/stats-cache.json`, which Claude Code
-//!    maintains as a pre-aggregated lifetime snapshot. This is fast and always
-//!    available when the user has run Claude Code at least once.
-//! 2. **Live top-up** — appends recent days from `~/.claude/projects/` transcripts
-//!    whose mtime is strictly newer than the cache's `lastComputedDate`, avoiding
-//!    double-counting days already in the snapshot. The sweep is recursive, so it
-//!    also reaches subagent and workflow transcripts nested under
-//!    `<session>/subagents/`, and deduplicates each assistant message by
-//!    `(requestId, message.id)` so a response mirrored into more than one file
-//!    (resumed/forked sessions, sidechain turns) is counted once.
+//! Two-phase load, emitted as two events per run so the tab paints instantly:
+//! 1. **Base stats** ([`load_base`]) — parsed from `~/.claude/stats-cache.json`,
+//!    which Claude Code maintains as a pre-aggregated lifetime snapshot. A single
+//!    small JSON file, so it returns in well under a millisecond and is the tab's
+//!    first paint instead of a blank "reading ~/.claude".
+//! 2. **Live top-up** ([`merge_topup`]) — appends days from `~/.claude/projects/`
+//!    transcripts strictly newer than the cache's `lastComputedDate`, avoiding
+//!    double-counting days already in the snapshot. The recursive sweep also
+//!    reaches subagent/workflow transcripts under `<session>/subagents/`. Each
+//!    response is deduplicated by `message.id` (a content composite when absent,
+//!    so an id-less line still dedups), and each message by line `uuid`, so a
+//!    response mirrored into more than one file is counted once. Beyond tokens,
+//!    the top-up reconstructs post-cutoff message/session/hour counts so the
+//!    lifetime card and activity graph track the same live window as the token
+//!    bars rather than freezing at `lastComputedDate`.
+//!
+//! The background sweep keeps a per-file contribution cache ([`TopUpCache`]) so
+//! each 90s refresh re-reads only transcripts whose mtime advanced — the rest are
+//! re-merged from memory, avoiding a full multi-hundred-MB re-read every cycle.
 //!
 //! # Caveat
 //!
@@ -88,7 +96,7 @@ pub(crate) struct DaySummary {
     pub(crate) output: u64,
     pub(crate) cache_read: u64,
     pub(crate) cache_create: u64,
-    /// Usage-bearing (assistant) messages seen for the day.
+    /// User/assistant messages seen for the day (transcript-derived).
     pub(crate) messages: u64,
     /// Per-model breakdown of the day's tokens. Carried so cost can be priced
     /// per model (rates differ by family) — the day's lifetime totals can't be
@@ -295,8 +303,9 @@ struct WireModelUsage {
 #[serde(default)]
 struct TranscriptLine {
     timestamp: Option<String>,
-    #[serde(rename = "requestId")]
-    request_id: Option<String>,
+    uuid: Option<String>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
     message: Option<TranscriptMsg>,
 }
 
@@ -305,7 +314,18 @@ struct TranscriptLine {
 struct TranscriptMsg {
     id: Option<String>,
     model: Option<String>,
+    role: Option<String>,
     usage: Option<TranscriptUsage>,
+    content: Option<Vec<ContentBlock>>,
+}
+
+/// One content block of an assistant message; only its `type` is read, to count
+/// `tool_use` invocations for the per-day tool-call total.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ContentBlock {
+    #[serde(rename = "type")]
+    kind: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -319,10 +339,12 @@ struct TranscriptUsage {
 
 // ── Load ─────────────────────────────────────────────────────────────────────
 
-/// Load and aggregate from a `~/.claude` directory.
-/// Returns `None` if `stats-cache.json` is missing or unparseable.
-/// Runs the recent transcript top-up internally.
-pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
+/// Parse `stats-cache.json` into the base view-model — the fast first phase of
+/// the load. No transcript sweep, so it returns in well under a millisecond; the
+/// background loader emits this for an instant first paint, then merges the live
+/// transcript top-up ([`merge_topup`]). Returns `None` when the cache file is
+/// missing or unparseable.
+pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
     let cache_path = claude_dir.join("stats-cache.json");
     let raw = std::fs::read_to_string(&cache_path).ok()?;
     let wire: StatsCacheFile = serde_json::from_str(&raw).ok()?;
@@ -384,7 +406,7 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
         .map(|u| u.cache_creation_input_tokens)
         .sum();
 
-    let mut stats = TokenStats {
+    let stats = TokenStats {
         models,
         daily,
         activity,
@@ -401,15 +423,21 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
         today: None,
     };
 
-    let today = today_date();
-    top_up(
-        claude_dir,
-        wire.last_computed_date.as_deref(),
-        &today,
-        &mut stats,
-    );
-
     Some(stats)
+}
+
+/// Full synchronous load: parse the stats-cache, sweep transcripts once, merge.
+/// Test-only — the background [`spawn`] loader uses `load_base` + `merge_topup`
+/// directly so it can paint the base instantly and reuse its per-file cache.
+#[cfg(test)]
+pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
+    let mut base = load_base(claude_dir)?;
+    let today = today_date();
+    let lcd = base.last_computed_date.clone();
+    let mut cache = TopUpCache::default();
+    refresh_topup_cache(claude_dir, lcd.as_deref(), &mut cache);
+    merge_topup(&mut base, &cache, lcd.as_deref(), &today);
+    Some(base)
 }
 
 /// Current UTC calendar date as "YYYY-MM-DD".
@@ -457,262 +485,401 @@ fn collect_jsonl(dir: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Best-effort live top-up from every `*.jsonl` under `projects/` (recursive, so
-/// subagent and workflow transcripts count too) modified after the cutoff,
-/// deduplicated per assistant message by `(requestId, message.id)`. Also
-/// accumulates `today_date`'s usage into `stats.today` (independent of the
-/// historical cutoff, so it works even when the cache was computed today).
-fn top_up(
+/// One transcript line's contribution, cached per file so an unchanged file is
+/// re-merged from memory instead of re-read on the next 90s sweep. The dedup keys
+/// are carried so the cross-file merge counts each response / message once even
+/// when resumed or forked sessions copy lines forward.
+struct LineRec {
+    date: String,    // "YYYY-MM-DD"
+    hour: u8,        // 0..=23
+    uuid: String,    // line uuid ("" when absent) — message/hour/session dedup
+    session: String, // sessionId ("" when absent)
+    /// A user/assistant turn — counts toward messages, hours, sessions.
+    is_message: bool,
+    /// Token fields below are valid only when set (an assistant `usage` line).
+    has_usage: bool,
+    tok_key: String, // message.id, or a composite when absent — token dedup
+    model: String,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_create: u64,
+    tool_calls: u64,
+}
+
+struct FileContrib {
+    mtime: SystemTime,
+    recs: Vec<LineRec>,
+}
+
+/// Per-file transcript contributions persisted across the loader's 90s sweeps.
+/// Only files whose mtime advanced (or are new) get re-read; everything else is
+/// re-merged from memory, so the multi-hundred-MB full re-read that the old sweep
+/// paid every cycle is gone. Bounded by the post-cutoff transcript volume of the
+/// session — a few MB; rebuilt fresh on a cold start.
+#[derive(Default)]
+struct TopUpCache {
+    files: HashMap<PathBuf, FileContrib>,
+}
+
+/// Re-stat every `*.jsonl` under `projects/` (recursive, so subagent and workflow
+/// transcripts count too) and re-read only those modified since the last sweep,
+/// refreshing their cached records. Files at/under the cutoff or no longer present
+/// are dropped. The stat pass is cheap; the file IO that dominated the old sweep
+/// now runs only for what actually changed between ticks.
+fn refresh_topup_cache(
     claude_dir: &Path,
     last_computed_date: Option<&str>,
-    today_date: &str,
-    stats: &mut TokenStats,
+    cache: &mut TopUpCache,
 ) {
-    // Without a cutoff date we have no safe boundary — skip entirely.
-    let cutoff_date = match last_computed_date {
-        Some(d) => d,
-        None => return,
+    let Some(cutoff_date) = last_computed_date else {
+        cache.files.clear();
+        return;
     };
-    let cutoff_st = match date_to_cutoff(cutoff_date) {
-        Some(st) => st,
-        None => return,
+    let Some(cutoff_st) = date_to_cutoff(cutoff_date) else {
+        return;
     };
-
     let projects_dir = claude_dir.join("projects");
+    let mut paths: Vec<PathBuf> = Vec::new();
+    collect_jsonl(&projects_dir, 8, &mut paths);
 
-    // daily lookup by date for fast merge.
-    let mut daily_map: HashMap<String, u64> = stats
+    // Drop cache entries for files that vanished since the last sweep.
+    let present: HashSet<&PathBuf> = paths.iter().collect();
+    cache.files.retain(|p, _| present.contains(p));
+
+    for path in paths {
+        let mtime = match std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+        {
+            Some(t) => t,
+            None => {
+                cache.files.remove(&path);
+                continue;
+            }
+        };
+        // mtime guard: a file untouched since the cutoff can hold no post-cutoff
+        // lines, so it never enters the cache (and its today lines, if any, would
+        // also predate the cutoff day).
+        if mtime <= cutoff_st {
+            cache.files.remove(&path);
+            continue;
+        }
+        match cache.files.get(&path) {
+            Some(fc) if fc.mtime == mtime => {} // unchanged — keep cached records
+            _ => {
+                let recs = parse_file(&path);
+                cache.files.insert(path, FileContrib { mtime, recs });
+            }
+        }
+    }
+}
+
+/// Merge the cached per-file records into `base` (already holding stats-cache
+/// data). The cutoff/today split is applied here, not at parse time, so an
+/// advancing `last_computed_date` needs no re-read — the same records just flow to
+/// different buckets. Responses are deduped by token key, messages by line uuid,
+/// across all files. Token totals/models/daily extend the base; messages,
+/// sessions, hour buckets, and per-day activity for days strictly after the cutoff
+/// are reconstructed from transcripts (close to, but not byte-identical with,
+/// Claude Code's own counters) so the lifetime card and activity graph track the
+/// same live window as the token bars instead of freezing at the cutoff.
+fn merge_topup(
+    base: &mut TokenStats,
+    cache: &TopUpCache,
+    last_computed_date: Option<&str>,
+    today_date: &str,
+) {
+    let Some(cutoff_date) = last_computed_date else {
+        return; // no safe boundary
+    };
+
+    // Token aggregates seeded from base so post-cutoff days extend, never replace.
+    let mut daily_map: HashMap<String, u64> = base
         .daily
         .iter()
         .map(|d| (d.date.clone(), d.tokens))
         .collect();
-
-    // model lookup by name.
-    let mut model_map: HashMap<String, ModelTokens> = stats
+    let mut model_map: HashMap<String, ModelTokens> = base
         .models
         .iter()
         .cloned()
         .map(|m| (m.model.clone(), m))
         .collect();
 
-    let mut max_date: Option<String> = None;
+    // Per-day activity for post-cutoff days + lifetime deltas.
+    let mut day_msgs: HashMap<String, u64> = HashMap::new();
+    let mut day_sessions: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut day_tools: HashMap<String, u64> = HashMap::new();
+    let mut post_sessions: HashSet<String> = HashSet::new();
+    let mut new_hours = [0u64; 24];
+
     let mut today_acc = DaySummary {
         date: today_date.to_owned(),
         ..Default::default()
     };
-    // Per-model split of today's usage, accumulated alongside `today_acc` so the
-    // cost lens can price today per model (rates differ by family).
     let mut today_models: HashMap<String, ModelTokens> = HashMap::new();
 
-    // Usage lines already counted this pass, keyed by `(requestId, message.id)`.
-    // The same assistant response can appear in several transcripts (resumed or
-    // forked sessions copy lines forward; a sidechain turn is mirrored into its
-    // own subagent file), so this guards against counting one response twice.
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen_tok: HashSet<&str> = HashSet::new();
+    let mut seen_uuid: HashSet<&str> = HashSet::new();
+    let mut max_date: Option<String> = None;
 
-    // Recursive sweep: main-session transcripts sit at `projects/<slug>/<id>.jsonl`,
-    // but subagent and workflow transcripts live deeper under
-    // `projects/<slug>/<session>/subagents/`, so a flat read would miss them.
-    let mut jsonl_paths: Vec<PathBuf> = Vec::new();
-    collect_jsonl(&projects_dir, 8, &mut jsonl_paths);
+    for fc in cache.files.values() {
+        for r in &fc.recs {
+            // Message / hour / session counting (user+assistant), deduped by uuid.
+            // An empty uuid can't be keyed, so it counts as-is.
+            if r.is_message && (r.uuid.is_empty() || seen_uuid.insert(r.uuid.as_str())) {
+                if r.date == today_date {
+                    today_acc.messages = today_acc.messages.saturating_add(1);
+                }
+                if r.date.as_str() > cutoff_date {
+                    *day_msgs.entry(r.date.clone()).or_insert(0) += 1;
+                    *day_tools.entry(r.date.clone()).or_insert(0) += r.tool_calls;
+                    if (r.hour as usize) < 24 {
+                        new_hours[r.hour as usize] += 1;
+                    }
+                    if !r.session.is_empty() {
+                        day_sessions
+                            .entry(r.date.clone())
+                            .or_default()
+                            .insert(r.session.clone());
+                        post_sessions.insert(r.session.clone());
+                    }
+                }
+            }
 
-    for path in &jsonl_paths {
-        // mtime guard: skip files not modified after the cutoff.
-        let mtime = match std::fs::metadata(path).ok().and_then(|m| m.modified().ok()) {
-            Some(t) => t,
-            None => continue,
-        };
-        if mtime <= cutoff_st {
-            continue;
+            // Token / model accumulation (assistant usage lines), deduped by key.
+            if r.has_usage && (r.tok_key.is_empty() || seen_tok.insert(r.tok_key.as_str())) {
+                if r.date == today_date {
+                    today_acc.input = today_acc.input.saturating_add(r.input);
+                    today_acc.output = today_acc.output.saturating_add(r.output);
+                    today_acc.cache_read = today_acc.cache_read.saturating_add(r.cache_read);
+                    today_acc.cache_create = today_acc.cache_create.saturating_add(r.cache_create);
+                    let tm = today_models
+                        .entry(r.model.clone())
+                        .or_insert_with(|| ModelTokens {
+                            model: r.model.clone(),
+                            ..Default::default()
+                        });
+                    tm.input = tm.input.saturating_add(r.input);
+                    tm.output = tm.output.saturating_add(r.output);
+                    tm.cache_read = tm.cache_read.saturating_add(r.cache_read);
+                    tm.cache_create = tm.cache_create.saturating_add(r.cache_create);
+                }
+                if r.date.as_str() > cutoff_date {
+                    *daily_map.entry(r.date.clone()).or_insert(0) +=
+                        r.input.saturating_add(r.output);
+                    let e = model_map
+                        .entry(r.model.clone())
+                        .or_insert_with(|| ModelTokens {
+                            model: r.model.clone(),
+                            ..Default::default()
+                        });
+                    e.input = e.input.saturating_add(r.input);
+                    e.output = e.output.saturating_add(r.output);
+                    e.cache_read = e.cache_read.saturating_add(r.cache_read);
+                    e.cache_create = e.cache_create.saturating_add(r.cache_create);
+                    if max_date
+                        .as_deref()
+                        .is_none_or(|prev| r.date.as_str() > prev)
+                    {
+                        max_date = Some(r.date.clone());
+                    }
+                }
+            }
         }
-        process_jsonl(
-            path,
-            cutoff_date,
-            today_date,
-            &mut daily_map,
-            &mut model_map,
-            &mut today_acc,
-            &mut today_models,
-            &mut max_date,
-            &mut seen,
-        );
     }
 
-    // Publish today's rollup before any early return (it does not depend on the
-    // historical cutoff, so even a no-new-history pass can still have today data).
+    // Publish today's rollup (independent of the cutoff, so even a no-new-history
+    // pass can still carry today's data).
     if today_acc.messages > 0 || today_acc.total() > 0 {
         today_acc.models = today_models.into_values().collect();
         today_acc
             .models
             .sort_unstable_by_key(|m| std::cmp::Reverse(m.total()));
-        stats.today = Some(today_acc);
+        base.today = Some(today_acc);
     }
 
-    if max_date.is_none() {
+    if max_date.is_none() && day_msgs.is_empty() {
         return;
     }
 
-    // Flush daily_map back, preserving existing entries and appending new ones.
+    // Flush token daily/model back, recompute totals from the merged models.
     for (date, tokens) in &daily_map {
-        if let Some(existing) = stats.daily.iter_mut().find(|d| &d.date == date) {
+        if let Some(existing) = base.daily.iter_mut().find(|d| &d.date == date) {
             existing.tokens = *tokens;
         } else {
-            stats.daily.push(DayTokens {
+            base.daily.push(DayTokens {
                 date: date.clone(),
                 tokens: *tokens,
             });
         }
     }
-    stats.daily.sort_unstable_by_key(|d| d.date.clone());
+    base.daily.sort_unstable_by_key(|d| d.date.clone());
 
-    // Flush model_map back, recompute totals from scratch.
-    stats.models = model_map.into_values().collect();
-    stats
-        .models
+    base.models = model_map.into_values().collect();
+    base.models
         .sort_unstable_by_key(|m| std::cmp::Reverse(m.total()));
+    base.total_input = base.models.iter().map(|m| m.input).sum();
+    base.total_output = base.models.iter().map(|m| m.output).sum();
+    base.total_cache_read = base.models.iter().map(|m| m.cache_read).sum();
+    base.total_cache_create = base.models.iter().map(|m| m.cache_create).sum();
 
-    stats.total_input = stats.models.iter().map(|m| m.input).sum();
-    stats.total_output = stats.models.iter().map(|m| m.output).sum();
-    stats.total_cache_read = stats.models.iter().map(|m| m.cache_read).sum();
-    stats.total_cache_create = stats.models.iter().map(|m| m.cache_create).sum();
+    // Append post-cutoff activity days so the activity graph extends past the
+    // cutoff. Base days (≤ cutoff) are authoritative and untouched.
+    let mut added_msgs = 0u64;
+    for (date, msgs) in &day_msgs {
+        let sessions = day_sessions.get(date).map(|s| s.len() as u64).unwrap_or(0);
+        let tools = day_tools.get(date).copied().unwrap_or(0);
+        added_msgs = added_msgs.saturating_add(*msgs);
+        if let Some(a) = base.activity.iter_mut().find(|a| &a.date == date) {
+            a.messages = *msgs;
+            a.sessions = sessions;
+            a.tool_calls = tools;
+        } else {
+            base.activity.push(DayActivity {
+                date: date.clone(),
+                messages: *msgs,
+                sessions,
+                tool_calls: tools,
+            });
+        }
+    }
+    base.activity.sort_unstable_by_key(|d| d.date.clone());
 
-    // Token figures (models, daily, totals) are topped up above. `total_sessions`,
-    // `total_messages`, and `hour_counts` stay at stats-cache values — they are
-    // lifetime aggregates that lag at most a few days and are not reconstructed
-    // from transcripts (the JSONL has no comparable session/hour rollup).
-    stats.topped_up_through = max_date;
+    // Lifetime deltas. Sessions span days, so the total uses the global distinct
+    // post-cutoff set (not the per-day sum). A session straddling the cutoff is
+    // counted in both base and here — rare, since sessions are short-lived.
+    base.total_messages = base.total_messages.saturating_add(added_msgs);
+    base.total_sessions = base
+        .total_sessions
+        .saturating_add(post_sessions.len() as u64);
+    for (h, c) in new_hours.iter().enumerate() {
+        base.hour_counts[h] = base.hour_counts[h].saturating_add(*c);
+    }
+
+    base.topped_up_through = max_date;
 }
 
-/// Process one JSONL file: historical days strictly after `cutoff_date` flow into
-/// `daily_map`/`model_map`, today's lines into `today`/`today_models`. `seen`
-/// deduplicates usage lines by `(requestId, message.id)` across the whole pass.
-/// Silently skips any parse errors.
-#[allow(clippy::too_many_arguments)]
-fn process_jsonl(
-    path: &Path,
-    cutoff_date: &str,
-    today_date: &str,
-    daily_map: &mut HashMap<String, u64>,
-    model_map: &mut HashMap<String, ModelTokens>,
-    today: &mut DaySummary,
-    today_models: &mut HashMap<String, ModelTokens>,
-    max_date: &mut Option<String>,
-    seen: &mut HashSet<String>,
-) {
+/// Parse one JSONL transcript into per-line contribution records. Pure read —
+/// the cutoff/today split happens later in [`merge_topup`], so an advancing
+/// `last_computed_date` never forces a re-read. Silently skips parse errors.
+fn parse_file(path: &Path) -> Vec<LineRec> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_) => return Vec::new(),
     };
     let reader = std::io::BufReader::new(file);
+    let mut out = Vec::new();
     for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+        let Ok(line) = line else { continue };
         let parsed: TranscriptLine = match serde_json::from_str(&line) {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let timestamp = match &parsed.timestamp {
-            Some(t) => t,
-            None => continue,
+        let Some(ts) = parsed.timestamp.as_deref() else {
+            continue;
         };
-        if timestamp.len() < 10 {
+        if ts.len() < 10 {
             continue;
         }
-        let date = &timestamp[..10];
-        let msg = match &parsed.message {
-            Some(m) => m,
-            None => continue,
+        let date = ts[..10].to_owned();
+        // ISO 8601 `YYYY-MM-DDThh:mm:ss…` — hour is bytes 11..13.
+        let hour = ts
+            .get(11..13)
+            .and_then(|h| h.parse::<u8>().ok())
+            .filter(|h| *h < 24)
+            .unwrap_or(0);
+        let Some(msg) = parsed.message.as_ref() else {
+            continue;
         };
-        let usage = match &msg.usage {
-            Some(u) => u,
-            None => continue,
-        };
-
-        // Dedupe by `(requestId, message.id)`: the same assistant response can be
-        // written to multiple transcripts, so count it once. Lines missing either
-        // id can't be keyed and are left to count as-is.
-        if let (Some(req), Some(id)) = (parsed.request_id.as_deref(), msg.id.as_deref()) {
-            let mut dedup_key = String::with_capacity(req.len() + id.len() + 1);
-            dedup_key.push_str(req);
-            dedup_key.push('\0');
-            dedup_key.push_str(id);
-            if !seen.insert(dedup_key) {
-                continue;
-            }
-        }
-
-        let model_name = msg.model.as_deref().unwrap_or("unknown").to_owned();
-
-        // Today's rollup — independent of the historical cutoff, so it is also
-        // populated on the rare day the cache was last computed today.
-        if date == today_date {
-            today.input = today.input.saturating_add(usage.input_tokens);
-            today.output = today.output.saturating_add(usage.output_tokens);
-            today.cache_read = today
-                .cache_read
-                .saturating_add(usage.cache_read_input_tokens);
-            today.cache_create = today
-                .cache_create
-                .saturating_add(usage.cache_creation_input_tokens);
-            today.messages = today.messages.saturating_add(1);
-
-            let tm = today_models
-                .entry(model_name.clone())
-                .or_insert_with(|| ModelTokens {
-                    model: model_name.clone(),
-                    ..Default::default()
-                });
-            tm.input = tm.input.saturating_add(usage.input_tokens);
-            tm.output = tm.output.saturating_add(usage.output_tokens);
-            tm.cache_read = tm.cache_read.saturating_add(usage.cache_read_input_tokens);
-            tm.cache_create = tm
-                .cache_create
-                .saturating_add(usage.cache_creation_input_tokens);
-        }
-
-        // Historical top-up — only days strictly AFTER last_computed_date, so days
-        // already aggregated in the stats-cache are never double-counted.
-        if date <= cutoff_date {
+        let role = msg.role.as_deref().unwrap_or("");
+        let usage = msg.usage.as_ref();
+        // A user/assistant turn counts as a message; a usage-bearing line with no
+        // role (some synthesized/streaming entries) is still a real response, so
+        // count it too — in a normal transcript every usage line is role=assistant.
+        let is_message = role == "user" || role == "assistant" || usage.is_some();
+        if !is_message {
             continue;
         }
 
-        let in_out = usage.input_tokens.saturating_add(usage.output_tokens);
-        *daily_map.entry(date.to_owned()).or_insert(0) += in_out;
+        let (has_usage, tok_key, model, input, output, cache_read, cache_create) =
+            if let Some(u) = usage {
+                let model = msg.model.clone().unwrap_or_else(|| "unknown".to_owned());
+                // Dedup by `message.id` (present on every usage line); fall back to
+                // a content-derived composite when absent so an id-less line still
+                // dedups instead of bypassing the guard (the old over-count bug,
+                // hit by usage lines that carry no `requestId`).
+                let key = match msg.id.as_deref() {
+                    Some(id) if !id.is_empty() => id.to_owned(),
+                    _ => format!(
+                        "{date}|{model}|{}|{}|{}|{}",
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.cache_read_input_tokens,
+                        u.cache_creation_input_tokens
+                    ),
+                };
+                (
+                    true,
+                    key,
+                    model,
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cache_read_input_tokens,
+                    u.cache_creation_input_tokens,
+                )
+            } else {
+                (false, String::new(), String::new(), 0, 0, 0, 0)
+            };
 
-        let entry = model_map
-            .entry(model_name.clone())
-            .or_insert_with(|| ModelTokens {
-                model: model_name,
-                ..Default::default()
-            });
-        entry.input = entry.input.saturating_add(usage.input_tokens);
-        entry.output = entry.output.saturating_add(usage.output_tokens);
-        entry.cache_read = entry
-            .cache_read
-            .saturating_add(usage.cache_read_input_tokens);
-        entry.cache_create = entry
-            .cache_create
-            .saturating_add(usage.cache_creation_input_tokens);
+        let tool_calls = msg
+            .content
+            .as_ref()
+            .map(|c| {
+                c.iter()
+                    .filter(|b| b.kind.as_deref() == Some("tool_use"))
+                    .count() as u64
+            })
+            .unwrap_or(0);
 
-        if max_date.as_deref().is_none_or(|prev| date > prev) {
-            *max_date = Some(date.to_owned());
-        }
+        out.push(LineRec {
+            date,
+            hour,
+            uuid: parsed.uuid.clone().unwrap_or_default(),
+            session: parsed.session_id.clone().unwrap_or_default(),
+            is_message,
+            has_usage,
+            tok_key,
+            model,
+            input,
+            output,
+            cache_read,
+            cache_create,
+            tool_calls,
+        });
     }
+    out
 }
 
 // ── Background thread ─────────────────────────────────────────────────────────
 
 /// Events emitted by the background loader thread.
 pub(crate) enum TokensEvent {
+    /// Phase 1: stats-cache parsed, transcript sweep not yet run. Lets the tab
+    /// paint lifetime/model data instantly instead of blocking on the sweep.
+    Base(Box<TokenStats>),
+    /// Phase 2: the live transcript top-up merged in (today card, recent days,
+    /// reconstructed lifetime counts). Supersedes the matching `Base`.
     Loaded(Box<TokenStats>),
     Failed,
 }
 
-/// Spawn the token-stats background worker. Loads once on start and sends the
-/// result immediately, then loops on `refresh_rx.recv_timeout(REFRESH_INTERVAL)`
-/// reloading each time. Exits when `refresh_rx` disconnects (TUI shutdown).
+/// Spawn the token-stats background worker. Each run emits two events: `Base`
+/// (the instant stats-cache parse) then `Loaded` (after the transcript top-up).
+/// Loads once on start, then loops on `refresh_rx.recv_timeout(REFRESH_INTERVAL)`,
+/// reusing a per-file cache so each sweep re-reads only changed transcripts. Exits
+/// when `refresh_rx` disconnects (TUI shutdown).
 ///
 /// Unlike `status`/`pricing`, this loop is match-first-then-send (not
 /// `run_polling_loop`'s tick-first shape): the first reload after the cold load
@@ -723,15 +890,24 @@ pub(crate) enum TokensEvent {
 /// re-resolves `home_dir()`, matching the pattern in `status::spawn`.
 pub(crate) fn spawn(tx: Sender<TokensEvent>, refresh_rx: Receiver<()>, claude_dir: PathBuf) {
     std::thread::spawn(move || {
-        let send = |stats: Option<TokenStats>| {
-            let event = match stats {
-                Some(s) => TokensEvent::Loaded(Box::new(s)),
-                None => TokensEvent::Failed,
+        let mut cache = TopUpCache::default();
+
+        let run = |cache: &mut TopUpCache| {
+            let Some(mut base) = load_base(&claude_dir) else {
+                let _ = tx.send(TokensEvent::Failed);
+                return;
             };
-            let _ = tx.send(event);
+            // Phase 1 — instant lifetime/model data, no transcript IO.
+            let _ = tx.send(TokensEvent::Base(Box::new(base.clone())));
+            // Phase 2 — refresh the per-file cache (changed files only) and merge.
+            let today = today_date();
+            let lcd = base.last_computed_date.clone();
+            refresh_topup_cache(&claude_dir, lcd.as_deref(), cache);
+            merge_topup(&mut base, cache, lcd.as_deref(), &today);
+            let _ = tx.send(TokensEvent::Loaded(Box::new(base)));
         };
 
-        send(load(&claude_dir));
+        run(&mut cache);
 
         loop {
             match refresh_rx.recv_timeout(REFRESH_INTERVAL) {
@@ -739,7 +915,7 @@ pub(crate) fn spawn(tx: Sender<TokensEvent>, refresh_rx: Receiver<()>, claude_di
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
-            send(load(&claude_dir));
+            run(&mut cache);
         }
     });
 }
