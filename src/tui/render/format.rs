@@ -213,7 +213,7 @@ pub(super) fn spinner_style(activity: ProfileActivity) -> Style {
     match activity {
         ProfileActivity::Fetching => theme::accent(),
         ProfileActivity::Refreshing => theme::info(),
-        ProfileActivity::Idle => theme::faint(),
+        ProfileActivity::Queued | ProfileActivity::Idle => theme::faint(),
     }
 }
 
@@ -221,6 +221,7 @@ pub(super) fn activity_verb(activity: ProfileActivity) -> &'static str {
     match activity {
         ProfileActivity::Fetching => "fetching",
         ProfileActivity::Refreshing => "refreshing",
+        ProfileActivity::Queued => "queued",
         ProfileActivity::Idle => "idle",
     }
 }

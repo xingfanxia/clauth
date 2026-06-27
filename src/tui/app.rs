@@ -1314,11 +1314,12 @@ impl App {
             // clears `bootstrap_active` — no startup-only fetch or kick pass.
 
             // Profiles already due on the first tick — never-fetched (no cache) or
-            // a cache older than one interval — are marked Fetching now so the
-            // overview timer and usage header show the fetch spinner from first
+            // a cache older than one interval — are marked Queued now so the
+            // overview timer and usage header show a pending spinner from first
             // paint instead of a stale `0s` countdown over the past deadline (a
             // never-fetched profile's deadline is `0 + interval`, always in the
-            // past). The first tick re-marks (idempotent) and clears on landing.
+            // past). The first tick re-marks (idempotent); each worker flips itself
+            // to Fetching when its request fires and clears on landing.
             let now = now_ms();
             let due_now: Vec<String> = match last_fetched.lock() {
                 Ok(lf) => snapshot
@@ -1333,7 +1334,7 @@ impl App {
                 Err(_) => Vec::new(),
             };
             for name in &due_now {
-                mark_activity(&activity, name, ProfileActivity::Fetching);
+                mark_activity(&activity, name, ProfileActivity::Queued);
             }
         });
     }
@@ -1602,10 +1603,12 @@ impl App {
     /// `/profile` TTL so the next fetch re-pulls plan/tier — set for an explicit
     /// single-profile refresh, cleared for the bulk refresh-all.
     fn enqueue_refetch(&self, name: &str, refresh_plan: bool) {
-        // Light the spinner immediately so the UI reflects the keypress.
-        // Only when idle — don't clobber an in-flight switch/refresh marker.
+        // Light a pending spinner immediately so the UI reflects the keypress.
+        // Only when idle — don't clobber an in-flight switch/refresh marker. The
+        // next tick's worker flips Queued→Fetching when its request fires; a name
+        // no leg owns is cleared by the tick's orphan sweep.
         if is_idle(&self.activity, name) {
-            mark_activity(&self.activity, name, ProfileActivity::Fetching);
+            mark_activity(&self.activity, name, ProfileActivity::Queued);
         }
         if refresh_plan {
             crate::usage::expire_profile_ttl(name);

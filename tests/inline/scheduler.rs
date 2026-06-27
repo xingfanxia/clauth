@@ -7,8 +7,8 @@ use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
     ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, SuppressedGenericStore,
-    ThirdPartyEntry, TokenEntry, clear_activity, filter_suppressed, mark_activity, partition_due,
-    window_lapsed,
+    ThirdPartyEntry, TokenEntry, clear_activity, clear_orphaned_forced, filter_suppressed,
+    mark_activity, partition_due, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -91,6 +91,39 @@ fn partition_due_excludes_refreshing() {
     assert!(
         next.contains_key("a"),
         "countdown still publishes for excluded profiles"
+    );
+}
+
+/// A forced refetch marks `Queued`; if no leg schedules that name this tick (its
+/// profile vanished from both snapshots), the orphan sweep clears it so the
+/// spinner can't freeze — but a name that IS scheduled, and one mid-`Refreshing`,
+/// are both left alone.
+#[test]
+fn orphaned_forced_cleared_but_scheduled_and_refreshing_kept() {
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    mark_activity(&activity, "orphan", ProfileActivity::Queued);
+    mark_activity(&activity, "scheduled", ProfileActivity::Queued);
+    mark_activity(&activity, "rotating", ProfileActivity::Refreshing);
+
+    let forced: HashSet<String> = ["orphan", "scheduled", "rotating"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let scheduled: HashSet<String> = ["scheduled"].iter().map(|s| s.to_string()).collect();
+
+    clear_orphaned_forced(&activity, &forced, &scheduled);
+
+    let a = activity.lock().unwrap();
+    assert!(!a.contains_key("orphan"), "orphaned forced name is cleared");
+    assert_eq!(
+        a.get("scheduled").copied(),
+        Some(ProfileActivity::Queued),
+        "a scheduled name keeps its mark"
+    );
+    assert_eq!(
+        a.get("rotating").copied(),
+        Some(ProfileActivity::Refreshing),
+        "a refreshing name is owned by the rotate worker, left alone"
     );
 }
 

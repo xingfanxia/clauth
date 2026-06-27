@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::lockorder::{RankedMutex, rank};
 
+use super::scheduler::{ActivityStore, ProfileActivity, mark_activity};
+
 const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
 
@@ -429,8 +431,19 @@ pub(crate) fn http_agent() -> &'static ureq::Agent {
     &AGENT
 }
 
-fn get_json(url: &str, access_token: &str) -> std::result::Result<String, FetchError> {
+fn get_json(
+    url: &str,
+    access_token: &str,
+    activity: Option<&ActivityStore>,
+    name: &str,
+) -> std::result::Result<String, FetchError> {
     await_request_slot();
+    // The throttle wait is over and the request is about to leave the gate — flip
+    // the spinner from `Queued` to `Fetching` so only the profile actually in
+    // flight reads as fetching, not the whole batch waiting behind the spacing.
+    if let Some(activity) = activity {
+        mark_activity(activity, name, ProfileActivity::Fetching);
+    }
     let mut response = AGENT
         .get(url)
         .header("Authorization", &format!("Bearer {access_token}"))
@@ -492,12 +505,13 @@ pub(super) fn fetch_raw(
     access_token: &str,
     prev_plan: Option<PlanInfo>,
     force_profile: bool,
+    activity: Option<&ActivityStore>,
 ) -> std::result::Result<UsageInfo, FetchError> {
-    let usage_text = get_json(USAGE_ENDPOINT, access_token)?;
+    let usage_text = get_json(USAGE_ENDPOINT, access_token, activity, name)?;
     let raw: RawUsage = serde_json::from_str(&usage_text).map_err(|_| FetchError::Parse)?;
 
     let plan = if take_profile_fetch(name, force_profile, now_ms()) {
-        get_json(PROFILE_ENDPOINT, access_token)
+        get_json(PROFILE_ENDPOINT, access_token, activity, name)
             .ok()
             .and_then(|text| serde_json::from_str::<RawProfile>(&text).ok())
             .map(|p| {

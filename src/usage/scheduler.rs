@@ -154,6 +154,12 @@ pub(crate) type ActivityStore = Arc<RankedMutex<HashMap<String, ProfileActivity>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileActivity {
     Idle,
+    /// Marked due this tick but still waiting behind the OAuth request throttle
+    /// (`OAUTH_REQUEST_SPACING_MS`) — not yet firing HTTP. Flips to `Fetching` the
+    /// instant its request clears the gate. Distinguishing this from `Fetching`
+    /// keeps a batch of due profiles from all reading as "fetching" while only one
+    /// is actually in flight (the rest are queued behind the 5s spacing).
+    Queued,
     /// `/usage` HTTP fetch in flight.
     Fetching,
     /// OAuth token rotation in flight.
@@ -270,7 +276,7 @@ fn fetch_with_rotation(
     refetch: &RefetchQueue,
     activity: &ActivityStore,
 ) -> FetchOutcome {
-    match fetch_raw(name, access_token, prev_plan.clone(), false) {
+    match fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity)) {
         Ok(info) => return FetchOutcome::live(name, info, None),
         // Rate-limited: bail to cache, never rotate (see the doc comment).
         Err(FetchError::RateLimited { retry_after }) => {
@@ -319,7 +325,7 @@ fn fetch_with_rotation(
     let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
     // Post-rotation retry forces a `/profile` pull: the token just changed, so
     // refresh the plan alongside it (the 401 profile-fetch trigger).
-    match fetch_raw(name, &access, prev_plan, true) {
+    match fetch_raw(name, &access, prev_plan, true, Some(activity)) {
         Ok(info) => FetchOutcome::live(name, info, rotated),
         Err(FetchError::RateLimited { retry_after }) => {
             // Retry itself rate-limited. Don't push to RefetchQueue — that risks
@@ -1062,9 +1068,23 @@ fn tick(state: &SchedulerState) {
     let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
+    // Names actually scheduled this tick across both legs. A forced name absent
+    // from both (e.g. a profile whose creds were removed between the UI `r` and
+    // this tick) was marked Queued by `enqueue_refetch` but no worker owns it, so
+    // the orphan sweep at the tick's end clears it — otherwise its spinner freezes.
+    let scheduled: HashSet<String> = oauth_due
+        .iter()
+        .map(|e| e.name.clone())
+        .chain(tp_due.iter().map(|e| e.name.clone()))
+        .collect();
+
     if !oauth_due.is_empty() {
         for entry in &oauth_due {
-            mark_activity(&state.activity, &entry.name, ProfileActivity::Fetching);
+            // Marked `Queued`, not `Fetching`: the per-request throttle
+            // (`OAUTH_REQUEST_SPACING_MS`) serializes the actual HTTP, so each
+            // worker flips itself to `Fetching` (in `get_json`) only when its
+            // request clears the gate — the rest read as queued meanwhile.
+            mark_activity(&state.activity, &entry.name, ProfileActivity::Queued);
         }
 
         let handles: Vec<_> = oauth_due
@@ -1123,6 +1143,9 @@ fn tick(state: &SchedulerState) {
     if !tp_due.is_empty() {
         fetch_third_party_due(state, tp_due);
     }
+
+    // Orphan sweep: a forced name no leg scheduled keeps a stale Queued mark.
+    clear_orphaned_forced(&state.activity, &forced, &scheduled);
 
     // Auto-switch: evaluate every tick (not only OAuth fetch ticks) so a
     // profile that crossed its threshold is switched immediately, without
@@ -1377,6 +1400,29 @@ fn merge_forced<T: NamedEntry + Clone>(
         extras.push(entry.clone());
     }
     due.extend(extras);
+}
+
+/// Clear any forced name that no leg scheduled this tick — its profile vanished
+/// from both snapshots between the UI `r` and now, leaving a `Queued` mark that no
+/// worker owns and would otherwise spin forever. `Refreshing` names are owned by a
+/// rotate worker, so they are left in place.
+fn clear_orphaned_forced(
+    activity: &ActivityStore,
+    forced: &HashSet<String>,
+    scheduled: &HashSet<String>,
+) {
+    if forced.is_empty() {
+        return;
+    }
+    if let Ok(mut a) = activity.lock() {
+        for name in forced {
+            if !scheduled.contains(name)
+                && !matches!(a.get(name), Some(ProfileActivity::Refreshing))
+            {
+                a.remove(name);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
