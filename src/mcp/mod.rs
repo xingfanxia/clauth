@@ -23,12 +23,10 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::profile::{AppConfig, Profile, load_config};
-use crate::profile_cache::{
-    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
-};
+use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
 use crate::providers::ThirdPartyStats;
 use crate::runtime::{Isolation, ProfileRuntime};
-use crate::usage::{PlanTier, UsageInfo, UsageWindow, humanize_duration, now_epoch_secs, now_ms};
+use crate::usage::{PlanTier, UsageInfo, UsageWindow, now_epoch_secs, now_ms};
 use render::ProfileSnapshot;
 
 /// Default per-call delegate timeout (seconds) when the caller doesn't set one.
@@ -120,18 +118,6 @@ fn windows_json(name: &str) -> serde_json::Value {
         })
         .collect();
     serde_json::Value::Array(windows)
-}
-
-/// Compact "Nm ago" / "Nh ago" age label for the active profile's usage cache
-/// mtime, or `unknown` when no cache has been written yet.
-fn cache_age_label(active: Option<&str>) -> String {
-    let age_secs = active
-        .and_then(|n| profile_cache_mtime_ms(n, USAGE_CACHE_FILE))
-        .map(|ms| (now_ms().saturating_sub(ms) / 1000) as i64);
-    match age_secs {
-        Some(s) => format!("{} ago", humanize_duration(s)),
-        None => "unknown (no cached usage yet)".to_string(),
-    }
 }
 
 /// Live footer for the current active profile, read fresh from cache.
@@ -962,37 +948,22 @@ fn build_instructions() -> String {
             Call `list_profiles` for live usage figures."
             .to_string();
     };
-    let now = now_epoch_secs();
-    let active = config.state.active_profile.as_deref();
-    let age = cache_age_label(active);
-
     let snapshots: Vec<ProfileSnapshot> = config
         .profiles
         .iter()
         .map(|p| {
             let name = p.name.as_str();
-            let (five_h, seven_d) = load_windows(name);
-            let third_party = if p.is_third_party() {
-                load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
-                    .as_ref()
-                    .map(render::third_party_headline)
-            } else {
-                None
-            };
             ProfileSnapshot {
                 name: name.to_string(),
                 active: config.is_active(name),
                 provider: provider_label(p),
                 base_url: p.base_url.clone(),
                 sub_type: tier_label(p),
-                five_h,
-                seven_d,
-                third_party,
             }
         })
         .collect();
 
-    render::instructions_block(&snapshots, &crate::which::session_auth(), &age, now)
+    render::instructions_block(&snapshots, &crate::which::session_auth())
 }
 
 pub(crate) fn serve() -> Result<()> {

@@ -18,9 +18,6 @@ fn snapshot(name: &str, active: bool) -> ProfileSnapshot {
         provider: "anthropic".to_string(),
         base_url: None,
         sub_type: Some("max".to_string()),
-        five_h: Some(window(42.4, None)),
-        seven_d: Some(window(7.6, None)),
-        third_party: None,
     }
 }
 
@@ -55,29 +52,6 @@ fn row(label: &str, value: &str) -> StatRow {
         value: value.to_string(),
         kind: StatRowKind::Body,
     }
-}
-
-#[test]
-fn usage_line_without_reset_is_label_and_pct() {
-    assert_eq!(usage_line("5h", &window(42.4, None), 0), "5h 42% used");
-}
-
-#[test]
-fn usage_line_rounds_and_shows_reset_countdown() {
-    // now_secs one hour before the reset → "1h 0m".
-    let reset = iso_to_epoch_secs("2026-06-21T12:00:00Z").unwrap();
-    let line = usage_line(
-        "7d",
-        &window(99.6, Some("2026-06-21T12:00:00Z")),
-        reset - 3600,
-    );
-    assert_eq!(line, "7d 100% used (resets in 1h 0m)");
-}
-
-#[test]
-fn usage_line_falls_back_to_raw_on_unparseable_reset() {
-    let line = usage_line("5h", &window(10.0, Some("not-a-date")), 0);
-    assert_eq!(line, "5h 10% used (resets not-a-date)");
 }
 
 #[test]
@@ -140,23 +114,30 @@ fn live_footer_omits_absent_parts() {
 }
 
 #[test]
-fn instructions_block_carries_staleness_nudge_and_profile_lines() {
+fn instructions_block_emits_stable_roster_cost_model_and_safety_prose() {
     let profiles = vec![snapshot("work", true), snapshot("personal", false)];
-    let out = instructions_block(&profiles, &SessionAuth::Global, "3m ago", 0);
+    let out = instructions_block(&profiles, &SessionAuth::Global);
 
-    // staleness nudge: the % used legend, active-profile cache age, and the
-    // "call list_profiles" pointer.
-    assert!(out.contains("share of each window already used"));
-    assert!(out.contains("active profile cached 3m ago"));
-    assert!(out.contains("call `list_profiles` for live figures"));
-
-    // at least one profile line, with the active marker and both usage windows.
+    // roster lines: identity only, with the active marker.
     assert!(out.contains("- work (active) [anthropic, max]"));
-    assert!(out.contains("5h 42% used"));
-    assert!(out.contains("7d 8% used"));
     assert!(out.contains("- personal [anthropic, max]"));
 
-    // load-bearing safety prose: dropping any of these warnings must fail here.
+    // the roster is labelled a session-start snapshot with a live-refresh pointer.
+    assert!(out.contains("Profiles (at session start"));
+    assert!(out.contains("call `list_profiles`"));
+
+    // cost model is spelled out so delegate routing can account for money.
+    assert!(out.contains("Cost:"));
+    assert!(out.contains("bills real USD"));
+
+    // volatile figures are NOT baked in — they rot within a turn, so they must
+    // stay on the per-call `list_profiles` path, never here.
+    assert!(
+        !out.contains("% used"),
+        "no usage percentages in the boot block"
+    );
+
+    // load-bearing safety prose: dropping any of these must fail here.
     assert!(
         out.contains("BURNS a real account usage window"),
         "the `delegate` quota-burn warning must survive a prose edit",
@@ -193,13 +174,4 @@ fn switch_effect_distinguishes_global_from_isolated_sessions() {
     let custom = switch_effect(&SessionAuth::IsolatedCustom);
     assert!(custom.contains("custom `CLAUDE_CONFIG_DIR`"));
     assert!(custom.contains("unaffected"));
-}
-
-#[test]
-fn instructions_block_uses_third_party_headline_for_provider_profiles() {
-    let mut p = snapshot("deepseek", false);
-    p.provider = "deepseek".to_string();
-    p.third_party = Some("balance: $4.20".to_string());
-    let out = instructions_block(&[p], &SessionAuth::Global, "1h 0m ago", 0);
-    assert!(out.contains("- deepseek [deepseek, max]: balance: $4.20"));
 }

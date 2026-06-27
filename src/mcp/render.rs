@@ -3,39 +3,18 @@
 //! pass in already-loaded cache data so these stay unit-testable.
 
 use crate::providers::ThirdPartyStats;
-use crate::usage::{UsageWindow, humanize_duration, iso_to_epoch_secs};
+use crate::usage::UsageWindow;
 use crate::which::SessionAuth;
 
-/// Per-profile snapshot fed to [`instructions_block`]: identity + the two cached
-/// usage windows (standard accounts) or a third-party headline (provider keys).
+/// Per-profile snapshot fed to [`instructions_block`]: stable identity only (name,
+/// provider, tier, base url). Volatile usage figures rot within a turn, so they are
+/// served fresh per call by `list_profiles`, never baked into the boot-time block.
 pub(crate) struct ProfileSnapshot {
     pub(crate) name: String,
     pub(crate) active: bool,
     pub(crate) provider: String,
     pub(crate) base_url: Option<String>,
     pub(crate) sub_type: Option<String>,
-    pub(crate) five_h: Option<UsageWindow>,
-    pub(crate) seven_d: Option<UsageWindow>,
-    pub(crate) third_party: Option<String>,
-}
-
-/// Single `<label> <pct>% (resets in <dur>)` line for one usage window. Parses
-/// `resets_at` against `now_secs`; on an unparseable timestamp the raw string is
-/// shown, and a window with no reset time drops the parenthetical entirely.
-pub(crate) fn usage_line(label: &str, w: &UsageWindow, now_secs: i64) -> String {
-    let pct = w.utilization.round() as i64;
-    match w.resets_at.as_deref() {
-        None => format!("{label} {pct}% used"),
-        Some(raw) => match iso_to_epoch_secs(raw) {
-            Some(reset) => {
-                format!(
-                    "{label} {pct}% used (resets in {})",
-                    humanize_duration(reset - now_secs)
-                )
-            }
-            None => format!("{label} {pct}% used (resets {raw})"),
-        },
-    }
 }
 
 /// One-line cached headline for a third-party profile from
@@ -115,15 +94,11 @@ unaffected — only a later session on the global credentials adopts the change.
 }
 
 /// Init-time `instructions` block: identity + when-to-use intro, a session-aware
-/// `switch` note, then the per-profile inventory and usage snapshot, with the
-/// cache age and a "call `list_profiles`" nudge so the model treats every embedded
-/// number as a session-start snapshot.
-pub(crate) fn instructions_block(
-    profiles: &[ProfileSnapshot],
-    auth: &SessionAuth,
-    cache_age_label: &str,
-    now_secs: i64,
-) -> String {
+/// `switch` note, the `delegate` cost model, then the per-profile roster. Only
+/// stable facts are baked in — usage percentages and reset timers rot within a turn,
+/// so they live in `list_profiles` (read fresh per call), not here. The roster
+/// itself is a session-start snapshot.
+pub(crate) fn instructions_block(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
     let mut out = String::new();
     out.push_str(
         "clauth manages multiple Claude Code accounts (\"profiles\") — each an isolated \
@@ -140,12 +115,9 @@ now and the result later), \
     );
     out.push_str(&switch_effect(auth));
     out.push_str(
-        "\n\nUsage percentages are the share of each window already used \
-(higher = less headroom). These figures are cached snapshots (active profile cached ",
-    );
-    out.push_str(cache_age_label);
-    out.push_str(
-        "; other profiles may be staler); call `list_profiles` for live figures.\n\nProfiles:\n",
+        "\n\nCost: `delegate` to a subscription profile burns a rate-limited window (no per-token \
+charge); to an API-key profile (DeepSeek, Z.ai) it bills real USD; a local endpoint is free.\n\n\
+Profiles (at session start — call `list_profiles` for the live roster and usage):\n",
     );
 
     for p in profiles {
@@ -164,25 +136,7 @@ now and the result later), \
             out.push_str(", ");
             out.push_str(b);
         }
-        out.push(']');
-
-        if let Some(tp) = &p.third_party {
-            out.push_str(": ");
-            out.push_str(tp);
-        } else {
-            let mut windows = Vec::with_capacity(2);
-            if let Some(w) = &p.five_h {
-                windows.push(usage_line("5h", w, now_secs));
-            }
-            if let Some(w) = &p.seven_d {
-                windows.push(usage_line("7d", w, now_secs));
-            }
-            if !windows.is_empty() {
-                out.push_str(": ");
-                out.push_str(&windows.join(", "));
-            }
-        }
-        out.push('\n');
+        out.push_str("]\n");
     }
     out
 }
