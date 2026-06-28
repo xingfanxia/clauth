@@ -25,11 +25,12 @@ static PROFILE_FETCHED: LazyLock<RankedMutex<HashMap<String, u64>, rank::Profile
     LazyLock::new(|| RankedMutex::new(HashMap::new()));
 
 /// Minimum spacing between consecutive requests to the Anthropic OAuth endpoints
-/// (`/usage` + `/profile`), enforced process-wide. Every profile authenticates
-/// with the same OAuth client from one host, so the endpoint's rate limit is
-/// effectively a shared bucket; serializing requests this far apart stops a
-/// same-instant multi-profile burst (startup, refetch-queue drains) from tripping
-/// a 429. Steady polling sits well below this rate, so it only bites on bursts.
+/// (`/usage`, `/profile`, and the window-opening `/v1/messages` kick), enforced
+/// process-wide. Every profile authenticates with the same OAuth client from one
+/// host, so the endpoint's rate limit is effectively a shared bucket; serializing
+/// requests this far apart stops a same-instant multi-profile burst (startup,
+/// refetch-queue drains, a window-reset kick fan-out) from tripping a 429. Steady
+/// polling sits well below this rate, so it only bites on bursts.
 const OAUTH_REQUEST_SPACING_MS: u64 = 5_000;
 
 /// Earliest epoch-ms the next OAuth request may fire. Each caller reserves the
@@ -53,7 +54,7 @@ fn reserve_slot(current_slot: u64, now: u64) -> (u64, u64) {
 
 /// Block until this caller's spacing slot, reserving the following slot for the
 /// next caller. A poisoned lock skips throttling rather than stalling the fetch.
-fn await_request_slot() {
+pub(crate) fn await_request_slot() {
     let now = now_ms();
     let wait_ms = {
         let Ok(mut slot) = NEXT_REQUEST_SLOT.lock() else {
