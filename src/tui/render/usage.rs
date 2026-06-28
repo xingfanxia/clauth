@@ -658,9 +658,11 @@ fn build_tp_rows(
     let Some(stats) = profile.third_party_usage.as_ref() else {
         // No data yet. "loading" only while a fetch is pending or in flight; a
         // terminal Failed status means we tried and the provider has nothing to
-        // show — never spin on "loading" forever (the original z.ai bug).
+        // show, and a RateLimited one means the provider throttled us with
+        // nothing cached — never spin on "loading" forever (the original z.ai bug).
         let msg = match profile.fetch_status {
             Some(FetchStatus::Failed) => "no usage available",
+            Some(FetchStatus::RateLimited) => "rate limited — retrying",
             _ => "loading",
         };
         lines.push(Line::from(Span::styled(msg, theme::faint())));
