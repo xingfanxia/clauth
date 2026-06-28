@@ -350,6 +350,29 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
     );
 }
 
+/// The auto-start kick only fires on a lapsed window when no 429 streak is in
+/// flight. Mid-streak the kick is suppressed so it can't re-hit (and prolong) a
+/// throttled endpoint on every due slot; a live `/usage` body clears the streak
+/// and the next lapsed tick opens cleanly.
+#[test]
+fn kick_suppressed_during_rate_limit_streak() {
+    use super::should_open_window;
+
+    assert!(should_open_window(0, true), "lapsed + no streak → open");
+    assert!(
+        !should_open_window(1, true),
+        "lapsed but 429-streaking → suppress the kick"
+    );
+    assert!(
+        !should_open_window(5, true),
+        "deep streak → still suppressed"
+    );
+    assert!(
+        !should_open_window(0, false),
+        "a live window never kicks, streak or not"
+    );
+}
+
 /// A 429's `retry-after` hint defers the profile's next fetch slot: the
 /// `last_fetched` stamp lands `retry_after - interval` in the future so
 /// `partition_due` marks the profile due (and publishes its countdown) exactly

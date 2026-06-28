@@ -419,26 +419,50 @@ fn window_lapsed(store: &UsageStore, name: &str, now_secs: i64) -> bool {
     !five_hour_live(info, now_secs)
 }
 
+/// Current consecutive-429 streak for `name` (0 when absent or poisoned). Read
+/// alone and released before any higher-ranked lock — RATE_LIMIT_STREAK(220)
+/// sits below USAGE_STORE(300), so it must not be held across `window_lapsed`.
+fn rate_limit_streak(streaks: &RateLimitStreaks, name: &str) -> u32 {
+    streaks
+        .lock()
+        .ok()
+        .and_then(|m| m.get(name).copied())
+        .unwrap_or(0)
+}
+
+/// Whether `run_fetch` should open the 5h window before fetching: the window has
+/// lapsed AND we are not mid-429-streak. A streak means the endpoint is already
+/// throttling us, and a kick on a still-valid access token can neither rotate
+/// nor open anything (see `auto_start_kick`) — re-hitting it every due slot only
+/// adds load and can prolong the limit. The `/usage` retry detects recovery;
+/// once a live body resets the streak, the next lapsed tick opens cleanly.
+fn should_open_window(streak: u32, window_lapsed: bool) -> bool {
+    window_lapsed && streak == 0
+}
+
 /// Fetch one profile's usage on the periodic tick. When the profile opted into
-/// auto-start, open its 5h window first if the last-known window lapsed — kick
-/// (rotating once on 401 OR 429), mark the window open on success, then fetch
-/// with the possibly-rotated token.
+/// auto-start, open its 5h window first if the last-known window lapsed AND no
+/// 429 streak is in flight — kick (rotating once on 401 OR 429), mark the window
+/// open on success, then fetch with the possibly-rotated token.
 fn run_fetch(
     config: &crate::profile::ConfigHandle,
     mut entry: TokenEntry,
     store: &UsageStore,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
+    streaks: &RateLimitStreaks,
 ) -> FetchOutcome {
-    // Auto-start leg: open a window before fetching when this profile opted in
-    // and its last-known window has lapsed. The kick may rotate the chain (401
-    // OR 429 in this branch only); fold its rotated pair into both the local
-    // entry (so the fetch below uses the fresh token, never re-spending) and the
-    // returned outcome (so the tick syncs it into the live snapshot).
+    // Auto-start leg: open a window before fetching when this profile opted in,
+    // its last-known window has lapsed, and we aren't already 429-streaking (see
+    // `should_open_window`). The kick may rotate the chain (401 OR 429 in this
+    // branch only); fold its rotated pair into both the local entry (so the
+    // fetch below uses the fresh token, never re-spending) and the returned
+    // outcome (so the tick syncs it into the live snapshot).
     let mut kick_rotated: Option<RotatedTokens> = None;
     if entry.auto_start {
+        let streak = rate_limit_streak(streaks, &entry.name);
         let now_secs = now_epoch_secs();
-        if window_lapsed(store, &entry.name, now_secs) {
+        if should_open_window(streak, window_lapsed(store, &entry.name, now_secs)) {
             let kicked = crate::oauth::auto_start_kick(
                 config,
                 &entry.name,
@@ -1099,8 +1123,9 @@ fn tick(state: &SchedulerState) {
                 let store = Arc::clone(&state.store);
                 let refetch_queue = Arc::clone(&state.refetch_queue);
                 let activity = Arc::clone(&state.activity);
+                let streaks = Arc::clone(&state.rate_limit_streaks);
                 let h = std::thread::spawn(move || {
-                    run_fetch(&config, entry, &store, &refetch_queue, &activity)
+                    run_fetch(&config, entry, &store, &refetch_queue, &activity, &streaks)
                 });
                 (name, h)
             })
