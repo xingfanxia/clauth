@@ -404,6 +404,27 @@ fn five_hour_live(info: &UsageInfo, now_secs: i64) -> bool {
         .is_some_and(|resets_at| now_secs < resets_at)
 }
 
+/// Patch a just-opened live 5h window back into a Fresh body that lags it. A
+/// kick opens the window before `/usage` reflects it, so a Fresh body fetched in
+/// the same tick can still report the window closed; writing it verbatim would
+/// re-lapse the window and re-fire the kick. When `fresh` has no live 5h window
+/// but `prev` does, keep `prev`'s window; every other field takes the fresh
+/// value. A genuine new window (live in `fresh`) or a still-closed `prev` is left
+/// untouched.
+fn preserve_live_window(
+    mut fresh: UsageInfo,
+    prev: Option<&UsageInfo>,
+    now_secs: i64,
+) -> UsageInfo {
+    if !five_hour_live(&fresh, now_secs)
+        && let Some(prev) = prev
+        && five_hour_live(prev, now_secs)
+    {
+        fresh.five_hour = prev.five_hour.clone();
+    }
+    fresh
+}
+
 /// True iff we hold a fetched usage entry for `name` whose 5h window is absent
 /// or already past its reset — the signal to open a fresh window. An ABSENT
 /// store entry (never fetched this run) returns false on purpose: fetch first,
@@ -603,12 +624,28 @@ fn apply_outcome(
     // long as the rate limit lasts. `status` still surfaces RateLimited/Cached
     // so the staleness stays visible.
     let is_fresh = outcome.from_fetch;
-    if is_fresh && let Some(info) = &outcome.info {
+
+    // For a Fresh body, keep any just-opened live 5h window we already hold so a
+    // lagging `/usage` read can't re-close it (see `preserve_live_window`). The
+    // prev window is read under a short lock, released before the disk write.
+    let merged: Option<UsageInfo> = outcome.info.as_ref().map(|info| {
+        if !is_fresh {
+            return info.clone();
+        }
+        let now_secs = now_epoch_secs();
+        let prev = store
+            .lock()
+            .ok()
+            .and_then(|s| s.get(&outcome.name).cloned());
+        preserve_live_window(info.clone(), prev.as_ref(), now_secs)
+    });
+
+    if is_fresh && let Some(info) = &merged {
         write_profile_cache(&outcome.name, USAGE_CACHE_FILE, info);
     }
 
     if let Ok(mut s) = store.lock()
-        && let Some(info) = &outcome.info
+        && let Some(info) = &merged
     {
         // Don't clobber newer Fresh data with a Cached fallback snapshot.
         // Cached only fills the store when no entry exists (cold start).

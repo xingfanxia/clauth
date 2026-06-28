@@ -406,6 +406,52 @@ fn only_a_fresh_read_drives_a_switch_decision() {
     );
 }
 
+/// A Fresh `/usage` body fetched in the same tick as a kick can lag the
+/// just-opened window and still report it closed; `preserve_live_window` keeps
+/// the live window we already hold so it can't re-lapse and re-fire the kick.
+/// A body that already carries a live window, or has no live predecessor, is
+/// passed through untouched.
+#[test]
+fn fresh_body_lagging_a_kick_keeps_the_live_window() {
+    use super::{five_hour_live, preserve_live_window};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let now = 1_600_000_000i64; // 2020 — between the two reset stamps below
+    let win = |util: f64, resets: &str| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: util,
+            resets_at: Some(resets.to_string()),
+        }),
+        ..Default::default()
+    };
+    let live = |u| win(u, "2999-01-01T00:00:00+00:00");
+    let closed = |u| win(u, "2000-01-01T00:00:00+00:00");
+
+    // Lagging fresh body (closed window) over a just-opened live one → keep live.
+    let merged = preserve_live_window(closed(80.0), Some(&live(0.0)), now);
+    assert!(
+        five_hour_live(&merged, now),
+        "a lagging fresh body must not re-close a just-opened window"
+    );
+    assert_eq!(
+        merged.five_hour.unwrap().utilization,
+        0.0,
+        "keeps the live window verbatim"
+    );
+
+    // Fresh body already carries a live window → take it as-is.
+    let merged = preserve_live_window(live(12.0), Some(&live(0.0)), now);
+    assert_eq!(merged.five_hour.unwrap().utilization, 12.0);
+
+    // Prior window also closed → nothing live to preserve; the fresh body stands.
+    let merged = preserve_live_window(closed(80.0), Some(&closed(50.0)), now);
+    assert!(!five_hour_live(&merged, now));
+
+    // No prior entry at all → fresh body stands.
+    let merged = preserve_live_window(closed(80.0), None, now);
+    assert_eq!(merged.five_hour.unwrap().utilization, 80.0);
+}
+
 /// A 429's `retry-after` hint defers the profile's next fetch slot: the
 /// `last_fetched` stamp lands `retry_after - interval` in the future so
 /// `partition_due` marks the profile due (and publishes its countdown) exactly
