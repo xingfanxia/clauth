@@ -17,18 +17,19 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
 use super::format::{clock_label, relative_age, spinner_frame};
-use super::panes::{draw_scrollbar, empty_state, section_box};
+use super::panes::{draw_scrollbar, empty_state, section_box, selector_width};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase, shorten_component_status};
 
 /// Detail-pane key column width (matches the usage tab's `KEY_W`).
 const KEY_W: usize = 11;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // Selector width: 2/5 of the body, clamped 24–40 (spec).
-    let sel_w = (area.width.saturating_mul(2) / 5).clamp(24, 40);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(sel_w), Constraint::Min(20)])
+        .constraints([
+            Constraint::Length(selector_width(area.width)),
+            Constraint::Min(20),
+        ])
         .split(area);
 
     draw_incident_list(frame, cols[0], app);

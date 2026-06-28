@@ -394,6 +394,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("r", "refresh usage now"),
         ("t", "rotate all tokens"),
         ("?", "toggle this help"),
+        ("a", "actions"),
         ("q", "back / quit"),
         ("\u{2303}c", "quit from anywhere"),
     ];

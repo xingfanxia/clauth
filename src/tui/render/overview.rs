@@ -265,7 +265,8 @@ fn render_overview_row(
 
     let mut spans = vec![cursor];
     if app.bell_fired.contains_key(&name_str) {
-        spans.push(Span::styled("🔔", theme::accent()));
+        spans.push(Span::styled("!", theme::danger()));
+        spans.push(Span::raw(" "));
     } else if active {
         spans.push(Span::styled("●", theme::accent_2_color()));
         spans.push(Span::raw(" "));

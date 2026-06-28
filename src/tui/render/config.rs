@@ -15,8 +15,8 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    SELECTOR_WIDTH, active_dot, draw_selector_list, head_cols, highlight_row, label_style,
-    name_color, picker_row, section_box, section_box_verbatim,
+    active_pill, draw_selector_list, head_cols, highlight_row, label_style, name_color, picker_row,
+    section_box, section_box_verbatim, selector_width,
 };
 
 const KEY_W: usize = 11;
@@ -24,7 +24,10 @@ const KEY_W: usize = 11;
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(SELECTOR_WIDTH), Constraint::Min(20)])
+        .constraints([
+            Constraint::Length(selector_width(area.width)),
+            Constraint::Min(20),
+        ])
         .split(area);
 
     let profiles_focused = app.config_focus == ConfigFocus::Profiles;
@@ -192,14 +195,14 @@ fn draw_settings_rows(
         Span::styled(type_value, type_style),
     ];
     if snap.is_active {
-        // "● active" = 8 chars; left side = KEY_W + type_value chars; pad the gap.
+        // "[ active ]" = 10 chars; left side = KEY_W + type_value chars; pad the gap.
         let left_w = KEY_W + type_value.chars().count();
-        let indicator_w = "● active".chars().count();
+        let indicator_w = "[ active ]".chars().count(); // 10
         let pad = (inner.width as usize)
             .saturating_sub(left_w)
             .saturating_sub(indicator_w);
         type_spans.push(Span::raw(" ".repeat(pad)));
-        type_spans.extend(active_dot());
+        type_spans.extend(active_pill());
     }
     let mut lines: Vec<Line<'static>> = vec![Line::from(type_spans)];
 

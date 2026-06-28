@@ -20,8 +20,8 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    SELECTOR_WIDTH, active_dot, bold_when, draw_selector_list, head_cols, highlight_row,
-    label_style, name_color, section_box, section_box_verbatim, select_line,
+    active_pill, bold_when, draw_selector_list, head_cols, highlight_row, label_style, name_color,
+    section_box, section_box_verbatim, select_line, selector_width,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
 use crate::profile::AppConfig;
@@ -38,7 +38,10 @@ const ROWS_BEFORE: usize = 5;
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(SELECTOR_WIDTH), Constraint::Min(20)])
+        .constraints([
+            Constraint::Length(selector_width(area.width)),
+            Constraint::Min(20),
+        ])
         .split(area);
 
     let chain_focused = app.fallback_focus == FallbackFocus::Chain;
@@ -164,7 +167,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-/// Priority + `● active` dot, 5h gauge with threshold tick, headroom figure, and the
+/// Priority + `[ active ]` pill, 5h gauge with threshold tick, headroom figure, and the
 /// inline `rotate at` threshold stepper/editor + `remove` rows. Caret only when focused.
 #[allow(clippy::too_many_arguments)]
 fn member_detail(
@@ -204,10 +207,10 @@ fn member_detail(
     ];
     if active {
         let left_w = KEY_W + value.chars().count();
-        let indicator_w = "● active".chars().count(); // 8
+        let indicator_w = "[ active ]".chars().count(); // 10
         let pad = width.saturating_sub(left_w).saturating_sub(indicator_w);
         priority_spans.push(Span::raw(" ".repeat(pad)));
-        priority_spans.extend(active_dot());
+        priority_spans.extend(active_pill());
     }
     lines.push(Line::from(priority_spans));
     lines.push(Line::from(""));

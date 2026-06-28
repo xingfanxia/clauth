@@ -4666,7 +4666,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('y') => state.choice = true,
         KeyCode::Char('n') => state.choice = false,
-        KeyCode::Esc => {
+        KeyCode::Esc | KeyCode::Char('q') => {
             app.modals.pop();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
@@ -4795,8 +4795,8 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                 state.cursor + 1
             };
         }
-        KeyCode::Esc => {
-            // Esc dismisses; the 1Hz poll re-pushes if divergence persists.
+        KeyCode::Esc | KeyCode::Char('q') => {
+            // Esc / q dismiss; the 1Hz poll re-pushes if divergence persists.
             app.modals.pop();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
@@ -4864,7 +4864,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
         return;
     };
     match key.code {
-        KeyCode::Esc => {
+        KeyCode::Esc | KeyCode::Char('q') => {
             app.modals.pop();
         }
         KeyCode::Enter => {

@@ -21,15 +21,16 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use super::super::app::{App, Health, PluginFocus};
 use super::super::theme;
 use super::format::spinner_frame;
-use super::panes::{draw_scrollbar, empty_state, section_box};
+use super::panes::{draw_scrollbar, empty_state, section_box, selector_width};
 use crate::format::truncate;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // Selector width: 2/5 of the body, clamped 24–40 (same as Status, per spec).
-    let sel_w = (area.width.saturating_mul(2) / 5).clamp(24, 40);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(sel_w), Constraint::Min(20)])
+        .constraints([
+            Constraint::Length(selector_width(area.width)),
+            Constraint::Min(20),
+        ])
         .split(area);
 
     draw_selector(frame, cols[0], app);

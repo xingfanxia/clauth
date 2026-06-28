@@ -19,7 +19,7 @@ use super::super::app::{App, TokenView};
 use super::super::theme;
 use super::format::fixed;
 use super::panes::{
-    SELECTOR_WIDTH, draw_selector_list, picker_row, section_box, section_box_verbatim,
+    draw_selector_list, picker_row, section_box, section_box_verbatim, selector_width,
 };
 use crate::pricing::PriceTable;
 use crate::tokens::{ModelTokens, TokenStats, group_models, is_anthropic, model_display_name};
@@ -439,7 +439,7 @@ fn total_lines(
             ],
             vec![Span::styled(
                 format!("{:.0}% cached", stats.cache_hit_ratio() * 100.0),
-                Style::default().fg(theme::accent_2_color()),
+                Style::default().fg(theme::info_color()),
             )],
             w,
         ),
@@ -652,7 +652,10 @@ fn kv_accent(label: &str, value: String) -> Line<'static> {
 fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(SELECTOR_WIDTH), Constraint::Min(20)])
+        .constraints([
+            Constraint::Length(selector_width(area.width)),
+            Constraint::Min(20),
+        ])
         .split(area);
 
     let count_cache = app.config().state.count_cache;
@@ -804,7 +807,7 @@ fn draw_model_detail(
         (hit * 100.0) as u64,
         100,
         bar_w,
-        Style::default().fg(theme::accent_2_color()),
+        Style::default().fg(theme::info_color()),
     );
     hit_line.push(Span::styled(
         format!(" {:>3.0}%", hit * 100.0),

@@ -11,8 +11,11 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Parag
 use super::super::app::{App, InputState};
 use super::super::theme;
 
-/// Width of the account picker column on the master-detail tabs.
-pub(super) const SELECTOR_WIDTH: u16 = 24;
+/// Account-picker column width for a master-detail tab: ~30% of the body,
+/// clamped 20-40 cells (cloudy-tui master-detail contract).
+pub(super) fn selector_width(body_w: u16) -> u16 {
+    (body_w.saturating_mul(3) / 10).clamp(20, 40)
+}
 
 /// Display columns occupied by the text before the caret in `input`.
 /// `InputState::cursor` is a byte offset; every edited field is ASCII-only in
@@ -74,12 +77,14 @@ pub(super) fn name_color(active: bool) -> Style {
     }
 }
 
-/// `● active` dot: green dot + dim label. Canonical active-account marker
-/// shared by usage, setup, and fallback detail panes.
-pub(super) fn active_dot() -> Vec<Span<'static>> {
+/// `[ active ]` status pill: the active-account marker shared by usage, setup,
+/// and fallback detail panes (cloudy-tui status pill — brackets dim, label
+/// accent + bold).
+pub(super) fn active_pill() -> Vec<Span<'static>> {
     vec![
-        Span::styled("●", theme::success()),
-        Span::styled(" active", theme::dim()),
+        Span::styled("[ ", theme::dim()),
+        Span::styled("active", theme::accent().add_modifier(Modifier::BOLD)),
+        Span::styled(" ]", theme::dim()),
     ]
 }
 

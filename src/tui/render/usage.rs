@@ -14,7 +14,7 @@ use super::super::app::App;
 use super::super::theme;
 use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
 use super::panes::{
-    SELECTOR_WIDTH, active_dot, draw_profile_selector, section_box, section_box_verbatim,
+    active_pill, draw_profile_selector, section_box, section_box_verbatim, selector_width,
 };
 use crate::format::plan_label;
 use crate::profile::Profile;
@@ -36,7 +36,10 @@ struct HeaderState {
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(SELECTOR_WIDTH), Constraint::Min(20)])
+        .constraints([
+            Constraint::Length(selector_width(area.width)),
+            Constraint::Min(20),
+        ])
         .split(area);
 
     draw_profile_selector(frame, cols[0], app, app.profile_cursor, true);
@@ -564,14 +567,14 @@ fn header_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Li
         });
     let mut plan_spans = vec![key_span("plan"), Span::styled(plan.clone(), theme::body())];
     if header.is_active {
-        // "● active" = 8 chars; left side = KEY_W + plan chars; pad the gap.
+        // "[ active ]" = 10 chars; left side = KEY_W + plan chars; pad the gap.
         let left_w = KEY_W + plan.chars().count();
-        let indicator_w = "● active".chars().count(); // 8
+        let indicator_w = "[ active ]".chars().count(); // 10
         let pad = (inner_w as usize)
             .saturating_sub(left_w)
             .saturating_sub(indicator_w);
         plan_spans.push(Span::raw(" ".repeat(pad)));
-        plan_spans.extend(active_dot());
+        plan_spans.extend(active_pill());
     }
 
     let mut lines = vec![Line::from(plan_spans)];
