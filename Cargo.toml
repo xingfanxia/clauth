@@ -2,13 +2,13 @@
 name = "clauth"
 version = "0.6.3"
 edition = "2024"
-description = "Simple Claude Code account switcher and usage monitor"
+description = "Manage multiple Claude Code accounts, monitor 5h/7d usage with configurable auto-switch and delegation with an MCP plugin. CLI + TUI."
 license = "MIT"
 repository = "https://github.com/uwuclxdy/clauth"
 homepage = "https://github.com/uwuclxdy/clauth"
 readme = "README.md"
-keywords = ["claude-code", "account-switch", "cli", "profiles", "anthropic"]
-categories = ["command-line-utilities"]
+keywords = ["claude-code", "account-switcher", "usage-monitor", "mcp", "anthropic"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 ratatui = "0.30.1"
