@@ -373,6 +373,39 @@ fn kick_suppressed_during_rate_limit_streak() {
     );
 }
 
+/// Auto-switch and recovery decisions act only on a confirmed-live (`Fresh`)
+/// read. A `Cached` window may have rolled over and a `RateLimited` one may be a
+/// synthetic just-kicked 0% — both must be treated as undecidable, as must a
+/// profile with no read yet.
+#[test]
+fn only_a_fresh_read_drives_a_switch_decision() {
+    use super::{FetchStatus, StatusStore, decision_fresh};
+
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    {
+        let mut s = status.lock().unwrap();
+        s.insert("fresh".to_string(), FetchStatus::Fresh);
+        s.insert("cached".to_string(), FetchStatus::Cached);
+        s.insert("limited".to_string(), FetchStatus::RateLimited);
+        s.insert("failed".to_string(), FetchStatus::Failed);
+    }
+
+    assert!(decision_fresh(&status, "fresh"));
+    assert!(
+        !decision_fresh(&status, "cached"),
+        "a possibly rolled-over cached window must not drive a switch"
+    );
+    assert!(
+        !decision_fresh(&status, "limited"),
+        "a synthetic rate-limited window must not drive a switch"
+    );
+    assert!(!decision_fresh(&status, "failed"));
+    assert!(
+        !decision_fresh(&status, "absent"),
+        "no read yet → no decision"
+    );
+}
+
 /// A 429's `retry-after` hint defers the profile's next fetch slot: the
 /// `last_fetched` stamp lands `retry_after - interval` in the future so
 /// `partition_due` marks the profile due (and publishes its countdown) exactly

@@ -1182,11 +1182,17 @@ fn tick(state: &SchedulerState) {
     scan_auto_switch(
         &state.config,
         &state.store,
+        &state.status,
         &state.activity,
         &state.pending_switch,
         &state.pending_switch_off,
     );
-    scan_recovery(&state.config, &state.store, &state.pending_switch);
+    scan_recovery(
+        &state.config,
+        &state.store,
+        &state.status,
+        &state.pending_switch,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1251,9 +1257,23 @@ pub(crate) fn spawn_refresher(
 /// Snapshots the chain under `config` mutex (dropped before taking `usage_store`).
 /// This split is load-bearing: `App::apply_usage` takes `usage_store` then `config`,
 /// so the scheduler must never hold `config` while taking `usage_store`.
+/// A profile's store entry is trustworthy for an auto-switch / recovery decision
+/// only when its last fetch was live (`Fresh`). A `Cached` entry may be a 5h
+/// window that has since rolled over (its stale-high utilization would drive a
+/// false switch-away) and a `RateLimited` one may be the synthetic just-kicked
+/// 0% placeholder (which would never switch away, or switch toward a spent
+/// account) — the startup one-shot gates on `Fresh` for the same reason.
+fn decision_fresh(status: &StatusStore, name: &str) -> bool {
+    matches!(
+        status.lock().ok().and_then(|m| m.get(name).copied()),
+        Some(FetchStatus::Fresh)
+    )
+}
+
 fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
+    status: &StatusStore,
     _activity: &ActivityStore,
     pending_switch: &PendingSwitch,
     pending_switch_off: &PendingSwitchOff,
@@ -1287,6 +1307,12 @@ fn scan_auto_switch(
         return;
     };
 
+    // Only act on a confirmed-live read of the active profile — a stale or
+    // synthetic store entry would drive a false switch (see `decision_fresh`).
+    if !decision_fresh(status, &snapshot.active) {
+        return;
+    }
+
     match crate::fallback::next_auto_switch_target(&snapshot, store) {
         Some(crate::fallback::SwitchAction::To(name)) => {
             if let Ok(mut p) = pending_switch.lock() {
@@ -1311,6 +1337,7 @@ fn scan_auto_switch(
 fn scan_recovery(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
+    status: &StatusStore,
     pending_switch: &PendingSwitch,
 ) {
     // Skip when a previous switch is still pending.
@@ -1347,6 +1374,13 @@ fn scan_recovery(
             })
             .collect()
     };
+
+    // Relink only to a member with a confirmed-live read; a synthetic/stale 0%
+    // entry would relink to an unverified placeholder (see `decision_fresh`).
+    let members: Vec<crate::fallback::ChainMember> = members
+        .into_iter()
+        .filter(|m| decision_fresh(status, &m.name))
+        .collect();
 
     if let Some(name) = crate::fallback::find_recovered_member(&members, store)
         && let Ok(mut p) = pending_switch.lock()

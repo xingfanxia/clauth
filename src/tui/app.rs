@@ -1450,7 +1450,8 @@ impl App {
                         .as_ref()
                         .and_then(|u| u.five_hour.as_ref())
                         .map(|u| u.utilization);
-                    (p.name.to_string(), p.bell_threshold, util)
+                    let fresh = p.fetch_status == Some(FetchStatus::Fresh);
+                    (p.name.to_string(), p.bell_threshold, util, fresh)
                 })
                 .collect::<Vec<_>>();
 
@@ -1461,7 +1462,13 @@ impl App {
                 .filter_map(|p| p.usage.clone().map(|u| (p.name.to_string(), u)))
                 .collect::<Vec<_>>();
         }
-        for (name, threshold, util) in bells {
+        for (name, threshold, util, fresh) in bells {
+            // Ring or clear only on a live read — a synthetic/stale window (e.g.
+            // a just-kicked 0%) must not clear a real bell or fire a false one.
+            // Non-fresh profiles keep their prior bell state.
+            if !fresh {
+                continue;
+            }
             if let Some(t) = threshold
                 && let Some(u) = util
             {
