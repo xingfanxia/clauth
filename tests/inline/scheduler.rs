@@ -475,6 +475,24 @@ fn retry_after_defers_next_fetch_slot() {
         (before + capped..=after + capped).contains(&stamp("d")),
         "huge retry-after clamps to MAX_RETRY_AFTER_MS"
     );
+
+    // Explicit `retry-after: 0` (server says "retry now", same as an elapsed
+    // HTTP-date) keeps the cadence — it must NOT fall into the no-hint
+    // exponential backoff that a missing header gets.
+    let before = now_ms();
+    apply_outcome(
+        outcome("e", Some(Duration::ZERO)),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+    );
+    let after = now_ms();
+    assert!(
+        (before..=after).contains(&stamp("e")),
+        "a zero retry-after keeps the cadence, never escalates to backoff"
+    );
 }
 
 /// Consecutive 429s with no `retry-after` back off exponentially (10s → 30s →

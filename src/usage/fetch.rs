@@ -347,7 +347,8 @@ struct RawProfileOrg {
 pub(super) enum FetchError {
     Status(u16),
     /// HTTP 429. `retry_after` is the server's `retry-after` header when
-    /// present in delta-seconds form (the HTTP-date form is treated as absent).
+    /// present (delta-seconds or an IMF HTTP-date); an unparseable value is
+    /// absent, and a `0` / past date parses to `ZERO` ("retry now").
     RateLimited {
         retry_after: Option<Duration>,
     },
