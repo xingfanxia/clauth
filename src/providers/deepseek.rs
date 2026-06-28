@@ -8,10 +8,11 @@ use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, url_matches_
 
 pub(super) const DISPLAY_NAME: &str = "DeepSeek";
 
+pub(super) const ORIGIN: &str = "https://api.deepseek.com";
 const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 
 pub(super) fn matches_base_url(url: &str) -> bool {
-    url_matches_host(url, "https://api.deepseek.com")
+    url_matches_host(url, ORIGIN)
 }
 
 pub(super) fn fetch(api_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {

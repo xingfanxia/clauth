@@ -133,3 +133,43 @@ fn api_origin_keeps_port_drops_query_and_fragment() {
 fn api_origin_none_without_scheme_delimiter() {
     assert!(api_origin("api.z.ai/usage").is_none());
 }
+
+// ── ThirdPartyTarget::throttle_key ─────────────────────────────────────────────
+
+#[test]
+fn throttle_key_known_provider_uses_canonical_origin() {
+    // Distinct providers key distinct hosts so they pace independently.
+    assert_eq!(
+        ThirdPartyTarget::Known(Provider::DeepSeek).throttle_key(),
+        "https://api.deepseek.com"
+    );
+    assert_eq!(
+        ThirdPartyTarget::Known(Provider::Zai).throttle_key(),
+        "https://api.z.ai"
+    );
+}
+
+#[test]
+fn throttle_key_generic_strips_to_origin() {
+    // Two api-key profiles on the same host collapse to one pacing key (serialize);
+    // a different host yields a different key (parallel).
+    assert_eq!(
+        ThirdPartyTarget::Generic {
+            base_url: "https://proxy.example/v1".to_string(),
+        }
+        .throttle_key(),
+        "https://proxy.example"
+    );
+}
+
+#[test]
+fn throttle_key_generic_falls_back_to_raw_when_schemeless() {
+    // No `://` to parse an origin from — the raw base URL is still a stable key.
+    assert_eq!(
+        ThirdPartyTarget::Generic {
+            base_url: "localhost:1234".to_string(),
+        }
+        .throttle_key(),
+        "localhost:1234"
+    );
+}

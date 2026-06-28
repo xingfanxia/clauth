@@ -11,8 +11,8 @@ use crate::profile::{
 };
 use crate::runtime::{RotationGuard, has_live_session};
 use crate::usage::{
-    ActivityStore, OpResult, OpResultSender, ProfileActivity, RefetchQueue, await_request_slot,
-    clear_activity, mark_activity, now_ms,
+    ANTHROPIC_ORIGIN, ActivityStore, OpResult, OpResultSender, ProfileActivity, RefetchQueue,
+    await_request_slot, clear_activity, mark_activity, now_ms,
 };
 
 /// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup to
@@ -108,10 +108,11 @@ impl From<KickError> for anyhow::Error {
 }
 
 /// Sends a 1-token Haiku message to start the 5-hour usage window. Mirrors what
-/// Claude Code does silently on launch. Shares the OAuth request-spacing slot so
-/// a same-instant multi-profile window-reset doesn't burst `/v1/messages`.
+/// Claude Code does silently on launch. Shares the `api.anthropic.com` per-host
+/// request-spacing slot so a same-instant multi-profile window-reset doesn't burst
+/// `/v1/messages`.
 fn kick(access_token: &str) -> std::result::Result<(), KickError> {
-    await_request_slot();
+    await_request_slot(ANTHROPIC_ORIGIN);
     let body = serde_json::to_string(&serde_json::json!({
         "model": KICK_MODEL,
         "max_tokens": 1,

@@ -8,8 +8,8 @@ use crate::lockorder::{RankedMutex, rank};
 use crate::providers::ThirdPartyStats;
 
 use super::fetch::{
-    FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso, fetch_raw, iso_to_epoch_secs,
-    now_epoch_secs, now_ms,
+    FetchError, PlanInfo, UsageInfo, UsageWindow, await_request_slot, epoch_secs_to_iso, fetch_raw,
+    iso_to_epoch_secs, now_epoch_secs, now_ms,
 };
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
@@ -154,8 +154,8 @@ pub(crate) type ActivityStore = Arc<RankedMutex<HashMap<String, ProfileActivity>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileActivity {
     Idle,
-    /// Marked due this tick but still waiting behind the OAuth request throttle
-    /// (`OAUTH_REQUEST_SPACING_MS`) — not yet firing HTTP. Flips to `Fetching` the
+    /// Marked due this tick but still waiting behind the per-host request throttle
+    /// (`REQUEST_SPACING_MS`) — not yet firing HTTP. Flips to `Fetching` the
     /// instant its request clears the gate. Distinguishing this from `Fetching`
     /// keeps a batch of due profiles from all reading as "fetching" while only one
     /// is actually in flight (the rest are queued behind the 5s spacing).
@@ -873,13 +873,75 @@ fn filter_suppressed(
         .collect()
 }
 
+/// Fetch a pre-partitioned set of due OAuth profiles and apply outcomes to the
+/// usage stores. Mirrors [`fetch_third_party_due`]: partitioning + countdown
+/// publishing happen in `tick`; this leg only fetches. Each worker paces against
+/// the shared `api.anthropic.com` host inside `get_json`.
+fn fetch_oauth_due(state: &SchedulerState, due: Vec<TokenEntry>, interval_ms: u64) {
+    for entry in &due {
+        // Marked `Queued`, not `Fetching`: the per-host request throttle
+        // (`REQUEST_SPACING_MS`) serializes the actual HTTP, so each worker flips
+        // itself to `Fetching` (in `get_json`) only when its request clears the
+        // gate — the rest read as queued meanwhile.
+        mark_activity(&state.activity, &entry.name, ProfileActivity::Queued);
+    }
+
+    let handles: Vec<_> = due
+        .into_iter()
+        .map(|entry| {
+            let name = entry.name.clone();
+            let config = Arc::clone(&state.config);
+            let store = Arc::clone(&state.store);
+            let refetch_queue = Arc::clone(&state.refetch_queue);
+            let activity = Arc::clone(&state.activity);
+            let streaks = Arc::clone(&state.rate_limit_streaks);
+            let h = std::thread::spawn(move || {
+                run_fetch(&config, entry, &store, &refetch_queue, &activity, &streaks)
+            });
+            (name, h)
+        })
+        .collect();
+    for (name, h) in handles {
+        match h.join() {
+            Ok(outcome) => {
+                clear_activity(&state.activity, &outcome.name);
+                // Propagate rotated tokens back into the live snapshot — otherwise
+                // tick N+1 reuses the stale access token, 401s, and double-burns the chain.
+                if let Some((new_access, new_refresh)) = &outcome.rotated
+                    && let Ok(mut t) = state.tokens.lock()
+                    && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
+                {
+                    entry.access_token = new_access.clone();
+                    entry.refresh_token = new_refresh.clone();
+                }
+                let stamped = apply_outcome(
+                    outcome,
+                    &state.store,
+                    &state.status,
+                    &state.last_fetched,
+                    &state.rate_limit_streaks,
+                    interval_ms,
+                );
+                publish_one_countdown(&state.next_refresh_per_profile, name, stamped, interval_ms);
+            }
+            Err(_) => {
+                // Worker panicked — clear slot so the spinner doesn't freeze.
+                clear_activity(&state.activity, &name);
+            }
+        }
+    }
+}
+
 /// Fetch a pre-partitioned set of due third-party entries and apply outcomes to
 /// the third-party stores. Partitioning + countdown publishing happen in `tick`
 /// so both legs share one publish window; this leg only fetches.
 fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
     let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
     for entry in &due {
-        mark_activity(&state.activity, &entry.name, ProfileActivity::Fetching);
+        // `Queued`, not `Fetching`: same-host accounts wait behind the per-host
+        // spacing slot, so each worker flips itself to `Fetching` only once its
+        // request clears the gate (mirrors the OAuth leg's `get_json` flip).
+        mark_activity(&state.activity, &entry.name, ProfileActivity::Queued);
     }
 
     let handles: Vec<_> = due
@@ -898,7 +960,14 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 .lock()
                 .ok()
                 .and_then(|s| s.get(&entry.name).and_then(|st| st.endpoint.clone()));
+            // Pace against this provider's host only: accounts on the same endpoint
+            // serialize, distinct hosts (and the Anthropic OAuth leg) run in parallel.
+            let host = entry.target.throttle_key();
+            let activity = Arc::clone(&state.activity);
+            let worker_name = entry.name.clone();
             let h = std::thread::spawn(move || {
+                await_request_slot(&host);
+                mark_activity(&activity, &worker_name, ProfileActivity::Fetching);
                 crate::providers::fetch_third_party_usage(
                     &entry.target,
                     &entry.api_key,
@@ -1143,72 +1212,23 @@ fn tick(state: &SchedulerState) {
         .chain(tp_due.iter().map(|e| e.name.clone()))
         .collect();
 
-    if !oauth_due.is_empty() {
-        for entry in &oauth_due {
-            // Marked `Queued`, not `Fetching`: the per-request throttle
-            // (`OAUTH_REQUEST_SPACING_MS`) serializes the actual HTTP, so each
-            // worker flips itself to `Fetching` (in `get_json`) only when its
-            // request clears the gate — the rest read as queued meanwhile.
-            mark_activity(&state.activity, &entry.name, ProfileActivity::Queued);
+    // Both legs fan out concurrently so the third-party leg no longer waits behind
+    // the OAuth join loop. Per-host pacing (`await_request_slot`) keeps accounts on
+    // the same endpoint serialized while distinct hosts (the Anthropic OAuth host vs
+    // each api-key provider) run in parallel. The scope joins the third-party leg
+    // before the post-fetch scans below, preserving their "both legs done" ordering.
+    std::thread::scope(|s| {
+        let tp = (!tp_due.is_empty())
+            .then(move || s.spawn(move || fetch_third_party_due(state, tp_due)));
+        if !oauth_due.is_empty() {
+            fetch_oauth_due(state, oauth_due, interval_ms);
         }
-
-        let handles: Vec<_> = oauth_due
-            .into_iter()
-            .map(|entry| {
-                let name = entry.name.clone();
-                let config = Arc::clone(&state.config);
-                let store = Arc::clone(&state.store);
-                let refetch_queue = Arc::clone(&state.refetch_queue);
-                let activity = Arc::clone(&state.activity);
-                let streaks = Arc::clone(&state.rate_limit_streaks);
-                let h = std::thread::spawn(move || {
-                    run_fetch(&config, entry, &store, &refetch_queue, &activity, &streaks)
-                });
-                (name, h)
-            })
-            .collect();
-        for (name, h) in handles {
-            match h.join() {
-                Ok(outcome) => {
-                    clear_activity(&state.activity, &outcome.name);
-                    // Propagate rotated tokens back into the live snapshot — otherwise
-                    // tick N+1 reuses the stale access token, 401s, and double-burns the chain.
-                    if let Some((new_access, new_refresh)) = &outcome.rotated
-                        && let Ok(mut t) = state.tokens.lock()
-                        && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
-                    {
-                        entry.access_token = new_access.clone();
-                        entry.refresh_token = new_refresh.clone();
-                    }
-                    let stamped = apply_outcome(
-                        outcome,
-                        &state.store,
-                        &state.status,
-                        &state.last_fetched,
-                        &state.rate_limit_streaks,
-                        interval_ms,
-                    );
-                    publish_one_countdown(
-                        &state.next_refresh_per_profile,
-                        name,
-                        stamped,
-                        interval_ms,
-                    );
-                }
-                Err(_) => {
-                    // Worker panicked — clear slot so the spinner doesn't freeze.
-                    clear_activity(&state.activity, &name);
-                }
-            }
+        if let Some(h) = tp {
+            // Worker panics are already swallowed inside `fetch_third_party_due`;
+            // this join only reaps the leg thread itself.
+            let _ = h.join();
         }
-    }
-
-    // Third-party providers — same cadence, separate stores. Owns the forced
-    // names the OAuth leg didn't consume. Each landing fetch republishes its own
-    // countdown via `publish_one_countdown`, so no post-batch recompute is needed.
-    if !tp_due.is_empty() {
-        fetch_third_party_due(state, tp_due);
-    }
+    });
 
     // Orphan sweep: a forced name no leg scheduled keeps a stale Queued mark.
     clear_orphaned_forced(&state.activity, &forced, &scheduled);

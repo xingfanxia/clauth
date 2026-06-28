@@ -50,6 +50,15 @@ impl Provider {
             Self::Zai => zai::DISPLAY_NAME,
         }
     }
+
+    /// Canonical `scheme://host` this provider's requests target — the per-host
+    /// request-pacing key (see [`ThirdPartyTarget::throttle_key`]).
+    fn origin(self) -> &'static str {
+        match self {
+            Self::DeepSeek => deepseek::ORIGIN,
+            Self::Zai => zai::ORIGIN,
+        }
+    }
 }
 
 /// What a third-party scheduler entry fetches against: a recognised provider
@@ -62,6 +71,19 @@ pub(crate) enum ThirdPartyTarget {
     Generic {
         base_url: String,
     },
+}
+
+impl ThirdPartyTarget {
+    /// Origin (`scheme://host`) used as the per-host request-pacing key, so accounts
+    /// on the same endpoint serialize while distinct hosts run in parallel. A generic
+    /// base URL with no parseable scheme falls back to the raw string — still a
+    /// stable per-account key.
+    pub(crate) fn throttle_key(&self) -> String {
+        match self {
+            Self::Known(provider) => provider.origin().to_string(),
+            Self::Generic { base_url } => api_origin(base_url).unwrap_or_else(|| base_url.clone()),
+        }
+    }
 }
 
 /// `true` when `url` is exactly `base` or `base` followed by a real URL

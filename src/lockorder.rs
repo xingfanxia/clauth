@@ -72,7 +72,8 @@ pub(crate) mod rank {
     ranks! {
         /// `RotationGuard` (per-profile rotation flock). Held across HTTP, outermost.
         Rotation = 100;
-        /// Process-wide `/usage`+`/profile` request-spacing clock in `usage::fetch`.
+        /// Process-wide per-host request-spacing clock in `usage::fetch` (keyed by
+        /// endpoint origin: the Anthropic OAuth host and each api-key provider host).
         /// Held only to reserve the next request slot, never across the sleep or
         /// the HTTP round trip; ranked just inside `Rotation` because the
         /// post-rotation retry reserves a slot while the rotation flock is held.

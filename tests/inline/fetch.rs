@@ -163,20 +163,20 @@ fn retry_after_parses_delta_seconds_and_http_date() {
     );
 }
 
-/// `reserve_slot` spaces OAuth requests by `OAUTH_REQUEST_SPACING_MS`: a cold
-/// slot (now already past it) fires immediately, and a slot still ahead of now
-/// waits until it — each reservation advancing the slot by exactly one spacing.
+/// `reserve_slot` spaces same-host requests by `REQUEST_SPACING_MS`: a cold slot
+/// (now already past it) fires immediately, and a slot still ahead of now waits
+/// until it — each reservation advancing that host's slot by exactly one spacing.
 #[test]
 fn reserve_slot_spaces_requests() {
     let now = 1_000_000u64;
     // Cold slot in the past → fire now, reserve one spacing out.
     let (next, wait) = reserve_slot(0, now);
     assert_eq!(wait, 0);
-    assert_eq!(next, now + OAUTH_REQUEST_SPACING_MS);
+    assert_eq!(next, now + REQUEST_SPACING_MS);
     // Slot already ahead of now → wait until it, advance by one more spacing.
     let (next2, wait2) = reserve_slot(next, now);
-    assert_eq!(wait2, OAUTH_REQUEST_SPACING_MS);
-    assert_eq!(next2, next + OAUTH_REQUEST_SPACING_MS);
+    assert_eq!(wait2, REQUEST_SPACING_MS);
+    assert_eq!(next2, next + REQUEST_SPACING_MS);
 }
 
 /// The ideal-pace marker tracks the fraction of the window already elapsed:

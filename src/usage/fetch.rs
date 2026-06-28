@@ -24,42 +24,50 @@ const PROFILE_TTL_MS: u64 = 60 * 60 * 1000;
 static PROFILE_FETCHED: LazyLock<RankedMutex<HashMap<String, u64>, rank::ProfileTtl>> =
     LazyLock::new(|| RankedMutex::new(HashMap::new()));
 
-/// Minimum spacing between consecutive requests to the Anthropic OAuth endpoints
-/// (`/usage`, `/profile`, and the window-opening `/v1/messages` kick), enforced
-/// process-wide. Every profile authenticates with the same OAuth client from one
-/// host, so the endpoint's rate limit is effectively a shared bucket; serializing
-/// requests this far apart stops a same-instant multi-profile burst (startup,
-/// refetch-queue drains, a window-reset kick fan-out) from tripping a 429. Steady
+/// Minimum spacing between consecutive requests to the same endpoint host,
+/// enforced process-wide and keyed per host (see [`NEXT_REQUEST_SLOT`]). Accounts
+/// sharing a host (every Anthropic OAuth account hits `api.anthropic.com`) pace this
+/// far apart so a same-instant multi-profile burst (startup, refetch-queue drains, a
+/// window-reset kick fan-out) can't trip a 429; accounts on distinct hosts (each
+/// api-key provider) reserve independent slots and never wait on each other. Steady
 /// polling sits well below this rate, so it only bites on bursts.
-const OAUTH_REQUEST_SPACING_MS: u64 = 5_000;
+const REQUEST_SPACING_MS: u64 = 5_000;
 
-/// Earliest epoch-ms the next OAuth request may fire. Each caller reserves the
-/// next free slot (advancing this by [`OAUTH_REQUEST_SPACING_MS`]) and sleeps
-/// until it. Leaf-ranked and held only to reserve the slot — never across the
-/// sleep or the HTTP round trip.
-static NEXT_REQUEST_SLOT: LazyLock<RankedMutex<u64, rank::UsageThrottle>> =
-    LazyLock::new(|| RankedMutex::new(0));
+/// Origin all OAuth `/usage`, `/profile`, and `/v1/messages` kick requests target —
+/// they are hardcoded to this host regardless of a profile's `base_url`, so it is
+/// their per-host pacing key in [`NEXT_REQUEST_SLOT`].
+pub(crate) const ANTHROPIC_ORIGIN: &str = "https://api.anthropic.com";
 
-/// Pure slot reservation: from the current earliest-allowed slot and `now`,
-/// return `(advanced_slot, wait_ms)` — the slot reserved for the next caller
-/// (one [`OAUTH_REQUEST_SPACING_MS`] past this caller's fire time) and how long
-/// this caller must wait for its own slot.
+/// Earliest epoch-ms the next request to each host may fire, keyed by endpoint
+/// origin. Each caller reserves its host's next free slot (advancing it by
+/// [`REQUEST_SPACING_MS`]) and sleeps until then. Leaf-ranked and held only to
+/// reserve the slot — never across the sleep or the HTTP round trip.
+static NEXT_REQUEST_SLOT: LazyLock<RankedMutex<HashMap<String, u64>, rank::UsageThrottle>> =
+    LazyLock::new(|| RankedMutex::new(HashMap::new()));
+
+/// Pure slot reservation: from a host's current earliest-allowed slot and `now`,
+/// return `(advanced_slot, wait_ms)` — the slot reserved for the next caller on that
+/// host (one [`REQUEST_SPACING_MS`] past this caller's fire time) and how long this
+/// caller must wait for its own slot.
 fn reserve_slot(current_slot: u64, now: u64) -> (u64, u64) {
     let fire_at = current_slot.max(now);
     (
-        fire_at.saturating_add(OAUTH_REQUEST_SPACING_MS),
+        fire_at.saturating_add(REQUEST_SPACING_MS),
         fire_at.saturating_sub(now),
     )
 }
 
-/// Block until this caller's spacing slot, reserving the following slot for the
-/// next caller. A poisoned lock skips throttling rather than stalling the fetch.
-pub(crate) fn await_request_slot() {
+/// Block until this caller's spacing slot for `host`, reserving the following slot
+/// for the next caller on the same host. Distinct hosts hold independent slots, so
+/// requests to different endpoints never serialize against each other. A poisoned
+/// lock skips throttling rather than stalling the fetch.
+pub(crate) fn await_request_slot(host: &str) {
     let now = now_ms();
     let wait_ms = {
-        let Ok(mut slot) = NEXT_REQUEST_SLOT.lock() else {
+        let Ok(mut slots) = NEXT_REQUEST_SLOT.lock() else {
             return;
         };
+        let slot = slots.entry(host.to_string()).or_insert(0);
         let (next, wait) = reserve_slot(*slot, now);
         *slot = next;
         wait
@@ -439,7 +447,7 @@ fn get_json(
     activity: Option<&ActivityStore>,
     name: &str,
 ) -> std::result::Result<String, FetchError> {
-    await_request_slot();
+    await_request_slot(ANTHROPIC_ORIGIN);
     // The throttle wait is over and the request is about to leave the gate — flip
     // the spinner from `Queued` to `Fetching` so only the profile actually in
     // flight reads as fetching, not the whole batch waiting behind the spacing.

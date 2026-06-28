@@ -15,7 +15,7 @@ use crate::usage::epoch_secs_to_iso;
 
 pub(super) const DISPLAY_NAME: &str = "Z.ai";
 
-const ORIGIN: &str = "https://api.z.ai";
+pub(super) const ORIGIN: &str = "https://api.z.ai";
 const QUOTA_PATH: &str = "/api/monitor/usage/quota/limit";
 const MODEL_USAGE_PATH: &str = "/api/monitor/usage/model-usage";
 /// Window for the model-usage breakdown, in seconds (7 days).
