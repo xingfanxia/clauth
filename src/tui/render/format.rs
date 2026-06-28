@@ -43,7 +43,9 @@ pub(super) fn name_style(profile: &Profile) -> Style {
         return base;
     }
     match profile.fetch_status {
-        Some(FetchStatus::Cached) => base
+        // Cached and rate-limited both serve last-known numbers — same stale cue
+        // (matches the amber `rate limited` badge on the usage detail line).
+        Some(FetchStatus::Cached | FetchStatus::RateLimited) => base
             .underline_color(theme::warning_color())
             .add_modifier(Modifier::UNDERLINED),
         Some(FetchStatus::Failed) => base
