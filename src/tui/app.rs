@@ -1459,7 +1459,10 @@ impl App {
             usage_snapshots = cfg
                 .profiles
                 .iter()
-                .filter_map(|p| p.usage.clone().map(|u| (p.name.to_string(), u)))
+                .filter_map(|p| {
+                    let fresh = p.fetch_status == Some(FetchStatus::Fresh);
+                    p.usage.clone().map(|u| (p.name.to_string(), u, fresh))
+                })
                 .collect::<Vec<_>>();
         }
         for (name, threshold, util, fresh) in bells {
@@ -1484,7 +1487,13 @@ impl App {
             }
         }
 
-        for (name, usage) in &usage_snapshots {
+        for (name, usage, fresh) in &usage_snapshots {
+            // Record only live samples to the durable history file. A synthetic
+            // just-kicked 0% window or a stale cached snapshot would land a
+            // phantom reset that survives restart and skews the burn rate.
+            if !fresh {
+                continue;
+            }
             let old_usage = self.last_history_usage.get(name.as_str()).cloned();
             let changed = match &old_usage {
                 Some(last) => serde_json::to_string(last).ok() != serde_json::to_string(usage).ok(),
@@ -1529,7 +1538,7 @@ impl App {
             }
         }
 
-        for (name, _) in &usage_snapshots {
+        for (name, _, _) in &usage_snapshots {
             if let Ok(path) = crate::profile::profile_history_path(name)
                 && let Ok(mtime) = path.metadata().and_then(|m| m.modified())
                 && self.history_mtimes.get(name) != Some(&mtime)
