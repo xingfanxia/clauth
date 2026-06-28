@@ -230,12 +230,18 @@ pub(crate) fn auto_start_kick(
 
     let access = tok.access_token.clone();
     let new_refresh = tok.refresh_token.clone();
-    if apply_rotated_tokens_locked(config, name, tok).is_err() {
-        return KickResult::not_opened();
-    }
-    // The pair is persisted; carry it back so the caller syncs the live snapshot
-    // even if the retry kick below fails — the refresh token was spent either way.
+    // The refresh already spent the old single-use token, so this pair is now the
+    // only usable one — carry it back even when the persist below fails, or the
+    // caller's live snapshot keeps the dead token and 400s every tick until a
+    // restart adopts the staged sidecar. The retry kick may still fail (`opened`
+    // false), but a minted pair must always propagate (see `KickResult`).
     let rotated = Some((access.clone(), Some(new_refresh)));
+    if apply_rotated_tokens_locked(config, name, tok).is_err() {
+        return KickResult {
+            opened: false,
+            rotated,
+        };
+    }
     // Retry kick spends only the access token, so release the rotation lock
     // before the paced waits — a sibling worker shouldn't block on our sleeps.
     drop(rotation_guard);
