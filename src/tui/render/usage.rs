@@ -622,9 +622,15 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
             }
         }
         Some(FetchStatus::RateLimited) => {
+            // A staleness cue, not a failure: the endpoint is throttling us and
+            // the shown numbers are last-known — amber like `cached`, not the
+            // red `failed` gets, so it doesn't contradict the live-looking bar.
             spans.extend([
                 Span::styled("[ ", theme::dim()),
-                Span::styled("rate limited", theme::danger().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "rate limited",
+                    theme::warning().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" ]", theme::dim()),
             ]);
             if let Some(c) = countdown {
