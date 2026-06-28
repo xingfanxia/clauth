@@ -103,6 +103,15 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "Per-profile model routing",
+        &[
+            "profile_config_reads_models_table",
+            "model_settings_round_trip",
+            "build_settings_writes_model_knobs",
+            "build_settings_clears_stale_model_knobs",
+        ],
+    ),
+    (
         "Shell completions",
         &[
             "print_script_supports",
@@ -144,12 +153,13 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Integration health",
+        "Plugin wiring check",
         &[
             "installed_records",
             "marketplace_known",
             "manual_mcp_wiring",
             "wire_mcp_server",
+            "global_entry_drifted",
             "all_tabs_render",
         ],
     ),
