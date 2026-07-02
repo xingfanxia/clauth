@@ -268,6 +268,9 @@ fn window_avg_pace_is_util_over_elapsed_days() {
 fn window_duration_parses_provider_labels() {
     assert_eq!(window_duration_secs(LABEL_5H), Some(5 * 3600));
     assert_eq!(window_duration_secs(LABEL_7D), Some(7 * 86_400));
+    // Dynamic per-model labels resolve to the 7-day window.
+    assert_eq!(window_duration_secs("7d fable"), Some(7 * 86_400));
+    assert_eq!(window_duration_secs("7d opus"), Some(7 * 86_400));
     assert_eq!(window_duration_secs("5h"), Some(5 * 3600));
     assert_eq!(window_duration_secs("30d"), Some(30 * 86_400));
     assert_eq!(window_duration_secs("14d"), Some(14 * 86_400));
@@ -318,4 +321,66 @@ fn take_profile_fetch_honors_ttl_force_and_expiry() {
         take_profile_fetch("ttl-expire", false, t0 + 120_000),
         "expiring the TTL forces a re-pull"
     );
+}
+
+/// Windows are derived from the normalized `limits[]` array, not the legacy
+/// per-model top-level fields: `session` → 5h, `weekly_all` → 7d, and each
+/// `weekly_scoped` entry becomes a dynamic `"7d <model>"` window — so a model
+/// the server adds later (here Fable) is picked up with zero code change, and
+/// `limits[]` wins over any stale top-level `five_hour`/`seven_day`. `spend`
+/// parses its minor-unit money into dollars.
+#[test]
+fn limits_drive_windows_and_pick_up_new_models() {
+    let json = r#"{
+        "five_hour": {"utilization": 99, "resets_at": "2026-07-02T14:50:00+00:00"},
+        "seven_day": {"utilization": 99, "resets_at": "2026-07-06T23:59:59+00:00"},
+        "seven_day_opus": null,
+        "limits": [
+            {"kind": "session", "percent": 3, "resets_at": "2026-07-02T14:50:00+00:00"},
+            {"kind": "weekly_all", "percent": 9, "resets_at": "2026-07-06T23:59:59+00:00"},
+            {"kind": "weekly_scoped", "percent": 14, "resets_at": "2026-07-07T00:00:00+00:00",
+             "scope": {"model": {"display_name": "Fable"}}}
+        ],
+        "spend": {"enabled": true, "percent": 32,
+                  "used": {"amount_minor": 320, "currency": "USD", "exponent": 2},
+                  "limit": {"amount_minor": 1000, "currency": "USD", "exponent": 2}}
+    }"#;
+    let raw: RawUsage = serde_json::from_str(json).unwrap();
+
+    let (five, seven, scoped) = windows_from_raw(&raw);
+    // limits[] wins over the stale 99% top-level fields.
+    assert_eq!(five.map(|w| w.utilization), Some(3.0));
+    assert_eq!(seven.map(|w| w.utilization), Some(9.0));
+    // The new model is recognized purely from its scope name.
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].label, "7d fable");
+    assert_eq!(scoped[0].window.utilization, 14.0);
+    assert_eq!(window_duration_secs(&scoped[0].label), Some(7 * 86_400));
+
+    let spend = SpendInfo::from_raw(raw.spend.as_ref().unwrap());
+    assert!(spend.is_visible());
+    assert_eq!(spend.used, Some(3.20));
+    assert_eq!(spend.limit, Some(10.0));
+    assert_eq!(spend.percent, Some(32.0));
+    assert_eq!(spend.currency.as_deref(), Some("USD"));
+}
+
+/// A missing `session` / `weekly_all` limit falls back to the legacy top-level
+/// window so an unmigrated account still renders 5h/7d; a disabled `spend` block
+/// stays hidden.
+#[test]
+fn windows_fall_back_to_legacy_fields_when_limits_absent() {
+    let json = r#"{
+        "five_hour": {"utilization": 7, "resets_at": "2026-07-02T14:50:00+00:00"},
+        "seven_day": {"utilization": 11, "resets_at": "2026-07-06T23:59:59+00:00"},
+        "limits": [],
+        "spend": {"enabled": false, "limit": null}
+    }"#;
+    let raw: RawUsage = serde_json::from_str(json).unwrap();
+
+    let (five, seven, scoped) = windows_from_raw(&raw);
+    assert_eq!(five.map(|w| w.utilization), Some(7.0));
+    assert_eq!(seven.map(|w| w.utilization), Some(11.0));
+    assert!(scoped.is_empty());
+    assert!(!SpendInfo::from_raw(raw.spend.as_ref().unwrap()).is_visible());
 }

@@ -24,7 +24,8 @@ use tempfile::TempDir;
 use super::{TICK, Term, app, render, restore_terminal, setup_terminal};
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::usage::{
-    ExtraUsage, FetchStatus, PlanInfo, PlanTier, ProfileActivity, UsageInfo, UsageWindow, now_ms,
+    ExtraUsage, FetchStatus, PlanInfo, PlanTier, ProfileActivity, ScopedWindow, SpendInfo,
+    UsageInfo, UsageWindow, now_ms,
 };
 
 // ── Launch ──────────────────────────────────────────────────────────────────
@@ -82,6 +83,21 @@ impl ShowcaseHome {
 
 /// Build the same synthetic history used by [`seed_history`], returned as a map
 /// so callers can write it to disk or populate the in-memory cache.
+/// Build resets-less per-model weekly windows for the synthetic history (history
+/// snapshots carry only utilization; the pace math reads live `resets_at`).
+fn weekly_history(entries: &[(&str, f64)]) -> Vec<ScopedWindow> {
+    entries
+        .iter()
+        .map(|(label, util)| ScopedWindow {
+            label: (*label).to_string(),
+            window: UsageWindow {
+                utilization: *util,
+                resets_at: None,
+            },
+        })
+        .collect()
+}
+
 fn build_synthetic_history() -> std::collections::HashMap<String, Vec<(u64, UsageInfo)>> {
     use std::collections::HashMap;
     let now = now_ms();
@@ -97,14 +113,7 @@ fn build_synthetic_history() -> std::collections::HashMap<String, Vec<(u64, Usag
                     utilization: pct,
                     resets_at: None,
                 }),
-                seven_day_sonnet: Some(UsageWindow {
-                    utilization: 22.1,
-                    resets_at: None,
-                }),
-                seven_day_opus: Some(UsageWindow {
-                    utilization: 8.4,
-                    resets_at: None,
-                }),
+                weekly_scoped: weekly_history(&[("7d sonnet", 22.1), ("7d opus", 8.4)]),
                 ..UsageInfo::default()
             },
         ));
@@ -115,14 +124,7 @@ fn build_synthetic_history() -> std::collections::HashMap<String, Vec<(u64, Usag
             ts,
             UsageInfo {
                 five_hour: None,
-                seven_day_sonnet: Some(UsageWindow {
-                    utilization: 22.1,
-                    resets_at: None,
-                }),
-                seven_day_opus: Some(UsageWindow {
-                    utilization: 8.4,
-                    resets_at: None,
-                }),
+                weekly_scoped: weekly_history(&[("7d sonnet", 22.1), ("7d opus", 8.4)]),
                 ..UsageInfo::default()
             },
         ));
@@ -139,14 +141,7 @@ fn build_synthetic_history() -> std::collections::HashMap<String, Vec<(u64, Usag
                     utilization: pct,
                     resets_at: None,
                 }),
-                seven_day_sonnet: Some(UsageWindow {
-                    utilization: 61.2,
-                    resets_at: None,
-                }),
-                seven_day_opus: Some(UsageWindow {
-                    utilization: 33.9,
-                    resets_at: None,
-                }),
+                weekly_scoped: weekly_history(&[("7d sonnet", 61.2), ("7d opus", 33.9)]),
                 ..UsageInfo::default()
             },
         ));
@@ -157,14 +152,7 @@ fn build_synthetic_history() -> std::collections::HashMap<String, Vec<(u64, Usag
             ts,
             UsageInfo {
                 five_hour: None,
-                seven_day_sonnet: Some(UsageWindow {
-                    utilization: 61.2,
-                    resets_at: None,
-                }),
-                seven_day_opus: Some(UsageWindow {
-                    utilization: 33.9,
-                    resets_at: None,
-                }),
+                weekly_scoped: weekly_history(&[("7d sonnet", 61.2), ("7d opus", 33.9)]),
                 ..UsageInfo::default()
             },
         ));
@@ -275,23 +263,25 @@ fn oauth_profile(
     fallback_threshold: Option<f64>,
     five_util: f64,
     five_resets_in: Option<Duration>,
-    seven_sonnet: Option<(f64, Duration)>,
-    seven_opus: Option<(f64, Duration)>,
+    weekly: &[(&str, f64, Duration)],
     extra: Option<ExtraUsage>,
+    spend: Option<SpendInfo>,
     fetch_status: Option<FetchStatus>,
 ) -> Profile {
     let five_hour = Some(UsageWindow {
         utilization: five_util,
         resets_at: five_resets_in.map(future_iso),
     });
-    let seven_day_sonnet = seven_sonnet.map(|(u, reset)| UsageWindow {
-        utilization: u,
-        resets_at: Some(future_iso(reset)),
-    });
-    let seven_day_opus = seven_opus.map(|(u, reset)| UsageWindow {
-        utilization: u,
-        resets_at: Some(future_iso(reset)),
-    });
+    let weekly_scoped = weekly
+        .iter()
+        .map(|(label, util, reset)| ScopedWindow {
+            label: (*label).to_string(),
+            window: UsageWindow {
+                utilization: *util,
+                resets_at: Some(future_iso(*reset)),
+            },
+        })
+        .collect();
     Profile {
         name: name.into(),
         base_url: None,
@@ -308,9 +298,9 @@ fn oauth_profile(
             }),
             five_hour,
             seven_day: None,
-            seven_day_sonnet,
-            seven_day_opus,
+            weekly_scoped,
             extra_usage: extra,
+            spend,
         }),
         fetch_status,
         provider: None,
@@ -367,8 +357,12 @@ fn demo_config() -> AppConfig {
         Some(80.0),
         64.3,
         Some(Duration::from_secs(2 * 3600 + 17 * 60)), // ~2h17m
-        Some((22.1, Duration::from_secs(5 * 86400 + 6 * 3600))), // 7d sonnet ~5d
-        Some((8.4, Duration::from_secs(6 * 86400 + 2 * 3600))), // 7d opus ~6d
+        &[
+            ("7d sonnet", 22.1, Duration::from_secs(5 * 86400 + 6 * 3600)), // ~5d
+            ("7d opus", 8.4, Duration::from_secs(6 * 86400 + 2 * 3600)),    // ~6d
+            ("7d fable", 14.0, Duration::from_secs(4 * 86400 + 3600)), // dynamically-detected model
+        ],
+        None,
         None,
         None,
     );
@@ -390,9 +384,18 @@ fn demo_config() -> AppConfig {
         Some(90.0),
         88.7,
         Some(Duration::from_secs(45 * 60)), // ~45m
-        Some((61.2, Duration::from_secs(3 * 86400 + 9 * 3600))), // 7d sonnet ~3d
-        Some((33.9, Duration::from_secs(6 * 86400 + 3600))), // 7d opus ~6d
+        &[
+            ("7d sonnet", 61.2, Duration::from_secs(3 * 86400 + 9 * 3600)), // ~3d
+            ("7d opus", 33.9, Duration::from_secs(6 * 86400 + 3600)),       // ~6d
+        ],
         Some(extra),
+        Some(SpendInfo {
+            enabled: true,
+            used: Some(3.20),
+            limit: Some(10.00),
+            percent: Some(32.0),
+            currency: Some("USD".to_string()),
+        }),
         Some(FetchStatus::Cached), // cached → warning underline
     );
 
@@ -406,7 +409,7 @@ fn demo_config() -> AppConfig {
         Some(100.0),
         12.0,
         Some(Duration::from_secs(4 * 3600 + 5 * 60)),
-        None,
+        &[],
         None,
         None,
         None,
@@ -625,6 +628,13 @@ fn headless_showcase_renders() {
     };
     app.tab = app::Tab::Usage;
     term.draw(|f| render::draw(f, &app)).unwrap();
+    let personal_usage = flatten(&term);
+    // The dynamically-detected per-model window (no hardcoded field) renders as
+    // its own bar for the active profile.
+    assert!(
+        personal_usage.contains("7d fable"),
+        "a weekly_scoped model window renders as a dynamic bar"
+    );
     let without_pace = bars(&term);
     app.config().state.show_pace = true;
     term.draw(|f| render::draw(f, &app)).unwrap();
@@ -632,6 +642,16 @@ fn headless_showcase_renders() {
         bars(&term) > without_pace,
         "show_pace overlays ideal-pace markers on the usage bars ({without_pace} → {})",
         bars(&term),
+    );
+
+    // Select the profile carrying a populated spend cap. Real accounts return it
+    // disabled, so the demo is the only place the guarded spend bar is observable.
+    app.profile_cursor = 1; // personal → work
+    term.draw(|f| render::draw(f, &app)).unwrap();
+    let work_usage = flatten(&term);
+    assert!(
+        work_usage.contains("spend") && work_usage.contains("$3.20 / $10.00"),
+        "the spend/credit-cap bar renders for an account with a cap"
     );
 }
 

@@ -494,6 +494,31 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             reset_secs: None,
         });
     }
+    if let Some(spend) = &usage.spend
+        && spend.is_visible()
+    {
+        let pct = spend.percent.unwrap_or(0.0).clamp(0.0, 100.0);
+        let sym = match spend.currency.as_deref() {
+            Some("USD") | None => "$",
+            Some(other) => other,
+        };
+        let used = spend.used.unwrap_or(0.0);
+        let amount = match spend.limit {
+            Some(limit) => format!("{sym}{used:.2} / {sym}{limit:.2}"),
+            None => format!("{sym}{used:.2}"),
+        };
+        stats.push(Stat {
+            label: "spend".to_string(),
+            pct,
+            color: Style::default().fg(theme::util_color(pct)),
+            trailing: String::new(),
+            amount,
+            burn_rate: None,
+            rate_unit: "h",
+            pace_pct: None,
+            reset_secs: None,
+        });
+    }
     stats
 }
 

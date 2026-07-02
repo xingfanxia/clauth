@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::usage::{LABEL_5H, LABEL_7D, LABEL_7D_OPUS, LABEL_7D_SONNET, UsageInfo, UsageWindow};
+use crate::usage::{UsageInfo, UsageWindow};
 
+/// Utilization of the window named `label` in this snapshot, or `None` if the
+/// snapshot has no such window. Resolves dynamically against [`UsageInfo::windows`]
+/// so per-model labels (`"7d fable"`, …) work without a hardcoded arm.
 fn window_util(usage: &UsageInfo, label: &str) -> Option<f64> {
-    match label {
-        LABEL_5H => usage.five_hour.as_ref().map(|w| w.utilization),
-        LABEL_7D => usage.seven_day.as_ref().map(|w| w.utilization),
-        LABEL_7D_SONNET => usage.seven_day_sonnet.as_ref().map(|w| w.utilization),
-        LABEL_7D_OPUS => usage.seven_day_opus.as_ref().map(|w| w.utilization),
-        _ => None,
-    }
+    usage
+        .windows()
+        .into_iter()
+        .find(|(l, _)| *l == label)
+        .map(|(_, w)| w.utilization)
 }
 
 /// Walk `entries` (chronological) to find the index of the first entry after

@@ -98,6 +98,58 @@ pub(crate) struct ExtraUsage {
     pub(crate) currency: Option<String>,
 }
 
+/// A per-model weekly window derived from a `weekly_scoped` entry in the
+/// `/usage` `limits[]` array. `label` is built from the scope's model name
+/// (`"7d fable"`, `"7d opus"`, …), so a model the server adds later shows up as
+/// a bar with no code change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ScopedWindow {
+    pub(crate) label: String,
+    #[serde(flatten)]
+    pub(crate) window: UsageWindow,
+}
+
+/// Pay-as-you-go spend / credit cap from the `/usage` `spend` block. Distinct
+/// from [`ExtraUsage`] (the legacy credits field): the API now returns both, so
+/// each renders its own bar when populated. Dollar figures are normalized from
+/// the API's minor-unit money objects.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct SpendInfo {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) used: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) limit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) currency: Option<String>,
+}
+
+impl SpendInfo {
+    /// Build from the raw `spend` block, converting minor-unit money to dollars.
+    fn from_raw(s: &RawSpend) -> Self {
+        SpendInfo {
+            enabled: s.enabled,
+            used: s.used.as_ref().and_then(RawMoney::to_dollars),
+            limit: s.limit.as_ref().and_then(RawMoney::to_dollars),
+            percent: s.percent,
+            currency: s
+                .used
+                .as_ref()
+                .or(s.limit.as_ref())
+                .and_then(|m| m.currency.clone()),
+        }
+    }
+
+    /// A spend bar is worth showing once the account has a cap enabled or a
+    /// limit set; disabled accounts (the current default) render nothing.
+    pub(crate) fn is_visible(&self) -> bool {
+        self.enabled || self.limit.is_some()
+    }
+}
+
 /// Canonical account tier, computed once at fetch time. The single source of
 /// truth that `plan_label` / `endpoint_label` render from — collapses the old
 /// four-field `PlanInfo` fan-out into one enum. `Serialize`/`Deserialize` keep it
@@ -209,23 +261,25 @@ pub(crate) struct UsageInfo {
     pub(crate) five_hour: Option<UsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) seven_day: Option<UsageWindow>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) seven_day_opus: Option<UsageWindow>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) seven_day_sonnet: Option<UsageWindow>,
+    /// Per-model weekly windows (`weekly_scoped` limits) in `limits[]` order —
+    /// grows as the server exposes new models, no per-model field needed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) weekly_scoped: Vec<ScopedWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) extra_usage: Option<ExtraUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) spend: Option<SpendInfo>,
 }
 
-/// Display labels for each usage window — the single source of truth.
+/// Fixed labels for the two always-present windows. Per-model weekly labels are
+/// built dynamically from the scope name (see [`ScopedWindow`]).
 pub(crate) const LABEL_5H: &str = "5h";
 pub(crate) const LABEL_7D: &str = "7d";
-pub(crate) const LABEL_7D_SONNET: &str = "7d sonnet";
-pub(crate) const LABEL_7D_OPUS: &str = "7d opus";
 
 impl UsageInfo {
-    /// All available windows as `(label, &UsageWindow)` pairs.
-    pub(crate) fn windows(&self) -> Vec<(&'static str, &UsageWindow)> {
+    /// All available windows as `(label, &UsageWindow)` pairs: 5h, 7d, then each
+    /// per-model weekly window in `limits[]` order.
+    pub(crate) fn windows(&self) -> Vec<(&str, &UsageWindow)> {
         let mut out = Vec::new();
         if let Some(w) = &self.five_hour {
             out.push((LABEL_5H, w));
@@ -233,34 +287,34 @@ impl UsageInfo {
         if let Some(w) = &self.seven_day {
             out.push((LABEL_7D, w));
         }
-        if let Some(w) = &self.seven_day_sonnet {
-            out.push((LABEL_7D_SONNET, w));
-        }
-        if let Some(w) = &self.seven_day_opus {
-            out.push((LABEL_7D_OPUS, w));
+        for s in &self.weekly_scoped {
+            out.push((s.label.as_str(), &s.window));
         }
         out
     }
 
-    /// Most representative weekly window: Max returns per-model windows, Pro returns `seven_day`.
+    /// Most representative weekly window: the aggregate `seven_day` when present,
+    /// else the first per-model window.
     pub(crate) fn weekly_window(&self) -> Option<&UsageWindow> {
         self.seven_day
             .as_ref()
-            .or(self.seven_day_sonnet.as_ref())
-            .or(self.seven_day_opus.as_ref())
+            .or_else(|| self.weekly_scoped.first().map(|s| &s.window))
     }
 }
 
 /// Nominal length of the rolling window named by `label`, in seconds. `None`
 /// for labels with no fixed window (e.g. the monthly extra-credits bar).
 pub(crate) fn window_duration_secs(label: &str) -> Option<i64> {
-    match label {
-        LABEL_5H => Some(5 * 3600),
-        LABEL_7D | LABEL_7D_SONNET | LABEL_7D_OPUS => Some(7 * 86_400),
+    if label == LABEL_5H {
+        Some(5 * 3600)
+    } else if label == LABEL_7D || label.starts_with("7d ") {
+        // `7d` plus every per-model weekly label (`"7d fable"`, `"7d opus"`, …).
+        Some(7 * 86_400)
+    } else {
         // Provider window labels of the form `<n>h` / `<n>d` (e.g. z.ai's
         // `5h`/`7d`/`30d`) so any api-key account with a windowed limit gets the
         // same average pace + ideal-pace line as the OAuth windows.
-        _ => parse_nh_nd_label(label),
+        parse_nh_nd_label(label)
     }
 }
 
@@ -313,16 +367,120 @@ pub(crate) fn window_avg_pace_per_day(
 
 #[derive(Deserialize)]
 struct RawUsage {
+    // Legacy top-level windows — kept only as a fallback for when `limits[]`
+    // omits a `session` / `weekly_all` entry.
     #[serde(default)]
     five_hour: Option<UsageWindow>,
     #[serde(default)]
     seven_day: Option<UsageWindow>,
+    /// Normalized rate-limit list — the source of truth for every window.
     #[serde(default)]
-    seven_day_opus: Option<UsageWindow>,
-    #[serde(default)]
-    seven_day_sonnet: Option<UsageWindow>,
+    limits: Vec<RawLimit>,
     #[serde(default)]
     extra_usage: Option<ExtraUsage>,
+    #[serde(default)]
+    spend: Option<RawSpend>,
+}
+
+/// One entry of the `/usage` `limits[]` array. `kind` selects the window
+/// (`session` → 5h, `weekly_all` → 7d, `weekly_scoped` → per-model); `scope`
+/// carries the model name for scoped entries. `is_active` is intentionally not
+/// read — the array is already scoped to what applies, and 5h/7d must show
+/// regardless of it.
+#[derive(Deserialize)]
+struct RawLimit {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    percent: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<String>,
+    #[serde(default)]
+    scope: Option<RawScope>,
+}
+
+#[derive(Deserialize)]
+struct RawScope {
+    #[serde(default)]
+    model: Option<RawScopeModel>,
+}
+
+#[derive(Deserialize)]
+struct RawScopeModel {
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawSpend {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    used: Option<RawMoney>,
+    #[serde(default)]
+    limit: Option<RawMoney>,
+    #[serde(default)]
+    percent: Option<f64>,
+}
+
+/// A minor-unit money object (`{amount_minor, currency, exponent}`) as returned
+/// under `spend`. `exponent` defaults to 2 (cents) when absent.
+#[derive(Deserialize)]
+struct RawMoney {
+    #[serde(default)]
+    amount_minor: Option<i64>,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    exponent: Option<i32>,
+}
+
+impl RawMoney {
+    fn to_dollars(&self) -> Option<f64> {
+        Some(self.amount_minor? as f64 / 10f64.powi(self.exponent.unwrap_or(2)))
+    }
+}
+
+/// Derive the window set from a parsed `/usage` body. `limits[]` is the source
+/// of truth: `session` → 5h, `weekly_all` → 7d, and each `weekly_scoped` entry
+/// becomes a dynamic `"7d <model>"` window — so a model the server adds later is
+/// picked up automatically. A missing `session` / `weekly_all` limit falls back
+/// to the legacy top-level field.
+fn windows_from_raw(
+    raw: &RawUsage,
+) -> (Option<UsageWindow>, Option<UsageWindow>, Vec<ScopedWindow>) {
+    let mut five = None;
+    let mut seven = None;
+    let mut scoped = Vec::new();
+    for limit in &raw.limits {
+        let window = UsageWindow {
+            utilization: limit.percent.unwrap_or(0.0),
+            resets_at: limit.resets_at.clone(),
+        };
+        match limit.kind.as_deref() {
+            Some("session") => five = Some(window),
+            Some("weekly_all") => seven = Some(window),
+            Some("weekly_scoped") => {
+                if let Some(name) = limit
+                    .scope
+                    .as_ref()
+                    .and_then(|s| s.model.as_ref())
+                    .and_then(|m| m.display_name.as_deref())
+                {
+                    scoped.push(ScopedWindow {
+                        label: format!("{LABEL_7D} {}", name.to_lowercase()),
+                        window,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (
+        five.or_else(|| raw.five_hour.clone()),
+        seven.or_else(|| raw.seven_day.clone()),
+        scoped,
+    )
 }
 
 #[derive(Deserialize)]
@@ -542,13 +700,16 @@ pub(super) fn fetch_raw(
         prev_plan
     };
 
+    let (five_hour, seven_day, weekly_scoped) = windows_from_raw(&raw);
+    let spend = raw.spend.as_ref().map(SpendInfo::from_raw);
+
     Ok(UsageInfo {
         plan,
-        five_hour: raw.five_hour,
-        seven_day: raw.seven_day,
-        seven_day_opus: raw.seven_day_opus,
-        seven_day_sonnet: raw.seven_day_sonnet,
+        five_hour,
+        seven_day,
+        weekly_scoped,
         extra_usage: raw.extra_usage,
+        spend,
     })
 }
 
