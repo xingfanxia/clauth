@@ -96,6 +96,81 @@ pub(crate) struct ExtraUsage {
     pub(crate) utilization: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) currency: Option<String>,
+    /// Per-period credit breakdowns (`daily`/`weekly`) — shape is not yet
+    /// observable on any account, so they're held as raw JSON and read
+    /// defensively at render time (see [`ExtraPeriod::from_value`]); a number,
+    /// object, or null all parse without breaking the `/usage` body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) daily: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) weekly: Option<serde_json::Value>,
+}
+
+/// A defensively-extracted view of an `extra_usage.daily`/`weekly` sub-object.
+/// The real shape is undocumented and null on every reachable account, so this
+/// pulls only the numeric fields it recognizes and treats anything else as
+/// absent — never a parse failure.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExtraPeriod {
+    pub(crate) used_credits: Option<f64>,
+    pub(crate) utilization: Option<f64>,
+    pub(crate) monthly_limit: Option<f64>,
+    pub(crate) currency: Option<String>,
+}
+
+impl ExtraPeriod {
+    /// Pull the recognized numeric fields out of a raw `daily`/`weekly` value.
+    /// `None` when the value carries nothing renderable.
+    pub(crate) fn from_value(v: &serde_json::Value) -> Option<Self> {
+        let obj = v.as_object()?;
+        let num = |k: &str| obj.get(k).and_then(serde_json::Value::as_f64);
+        let p = ExtraPeriod {
+            used_credits: num("used_credits"),
+            utilization: num("utilization"),
+            monthly_limit: num("monthly_limit"),
+            currency: obj
+                .get("currency")
+                .and_then(|c| c.as_str())
+                .map(str::to_string),
+        };
+        (p.utilization.is_some() || p.used_credits.is_some()).then_some(p)
+    }
+}
+
+/// Absolute used/limit dollar figures for a usage window, from the raw
+/// `used_dollars`/`limit_dollars` fields. The wire shape is undetermined (Claude
+/// Code's own client ignores these), so they're parsed leniently (see
+/// [`json_to_dollars`]) and only surface when a value is actually present.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct WindowDollars {
+    pub(crate) label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) used: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) limit: Option<f64>,
+}
+
+/// Lenient money → dollars. Accepts a bare number (already dollars, per the
+/// `_dollars` field name), a `{amount_minor, exponent}` minor-unit object, or an
+/// `{amount}` object (number or numeric string). Anything else → `None`, never a
+/// panic or parse error — the wire shape is unconfirmed.
+fn json_to_dollars(v: &serde_json::Value) -> Option<f64> {
+    if let Some(n) = v.as_f64() {
+        return Some(n);
+    }
+    let obj = v.as_object()?;
+    if let Some(minor) = obj.get("amount_minor").and_then(serde_json::Value::as_i64) {
+        let exp = obj
+            .get("exponent")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(2) as i32;
+        return Some(minor as f64 / 10f64.powi(exp));
+    }
+    match obj.get("amount") {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.parse().ok(),
+        _ => None,
+    }
 }
 
 /// A per-model weekly window derived from a `weekly_scoped` entry in the
@@ -265,6 +340,10 @@ pub(crate) struct UsageInfo {
     /// grows as the server exposes new models, no per-model field needed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) weekly_scoped: Vec<ScopedWindow>,
+    /// Absolute dollar figures per window label (`5h`/`7d`), when the endpoint
+    /// carries `used_dollars`/`limit_dollars`. Empty on every current account.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) window_dollars: Vec<WindowDollars>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) extra_usage: Option<ExtraUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -367,12 +446,13 @@ pub(crate) fn window_avg_pace_per_day(
 
 #[derive(Deserialize)]
 struct RawUsage {
-    // Legacy top-level windows — kept only as a fallback for when `limits[]`
-    // omits a `session` / `weekly_all` entry.
+    // Legacy top-level windows — the fallback for when `limits[]` omits a
+    // `session` / `weekly_all` entry, and the only carrier of the per-window
+    // `*_dollars` figures (they never appear on `limits[]` entries).
     #[serde(default)]
-    five_hour: Option<UsageWindow>,
+    five_hour: Option<RawWindow>,
     #[serde(default)]
-    seven_day: Option<UsageWindow>,
+    seven_day: Option<RawWindow>,
     /// Normalized rate-limit list — the source of truth for every window.
     #[serde(default)]
     limits: Vec<RawLimit>,
@@ -380,6 +460,42 @@ struct RawUsage {
     extra_usage: Option<ExtraUsage>,
     #[serde(default)]
     spend: Option<RawSpend>,
+}
+
+/// A top-level window object (`five_hour`/`seven_day`). Carries the percentage +
+/// reset like [`UsageWindow`] plus the lenient `*_dollars` figures held as raw
+/// JSON (undetermined shape).
+#[derive(Deserialize)]
+struct RawWindow {
+    #[serde(default)]
+    utilization: f64,
+    #[serde(default)]
+    resets_at: Option<String>,
+    #[serde(default)]
+    used_dollars: Option<serde_json::Value>,
+    #[serde(default)]
+    limit_dollars: Option<serde_json::Value>,
+}
+
+impl RawWindow {
+    fn to_window(&self) -> UsageWindow {
+        UsageWindow {
+            utilization: self.utilization,
+            resets_at: self.resets_at.clone(),
+        }
+    }
+
+    /// The window's absolute dollar figures, labeled, or `None` when neither
+    /// `used_dollars` nor `limit_dollars` resolves to a number.
+    fn dollars(&self, label: &str) -> Option<WindowDollars> {
+        let used = self.used_dollars.as_ref().and_then(json_to_dollars);
+        let limit = self.limit_dollars.as_ref().and_then(json_to_dollars);
+        (used.is_some() || limit.is_some()).then(|| WindowDollars {
+            label: label.to_string(),
+            used,
+            limit,
+        })
+    }
 }
 
 /// One entry of the `/usage` `limits[]` array. `kind` selects the window
@@ -403,6 +519,30 @@ struct RawLimit {
 struct RawScope {
     #[serde(default)]
     model: Option<RawScopeModel>,
+    /// Consumption surface (web / desktop / code / …) for a surface-scoped
+    /// limit. Undetermined shape (string vs `{id, display_name}`), so held as
+    /// raw JSON and read leniently by [`RawScope::label`].
+    #[serde(default)]
+    surface: Option<serde_json::Value>,
+}
+
+impl RawScope {
+    /// Human label for a scoped limit: the model's display name when present,
+    /// else the surface name (string, or an object's `display_name`/`id`).
+    fn label(&self) -> Option<String> {
+        if let Some(name) = self.model.as_ref().and_then(|m| m.display_name.as_deref()) {
+            return Some(name.to_string());
+        }
+        let surface = self.surface.as_ref()?;
+        if let Some(s) = surface.as_str() {
+            return Some(s.to_string());
+        }
+        let obj = surface.as_object()?;
+        obj.get("display_name")
+            .or_else(|| obj.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
 }
 
 #[derive(Deserialize)]
@@ -441,14 +581,22 @@ impl RawMoney {
     }
 }
 
+/// The window set derived from a parsed `/usage` body.
+#[derive(Default)]
+struct DerivedWindows {
+    five_hour: Option<UsageWindow>,
+    seven_day: Option<UsageWindow>,
+    weekly_scoped: Vec<ScopedWindow>,
+    window_dollars: Vec<WindowDollars>,
+}
+
 /// Derive the window set from a parsed `/usage` body. `limits[]` is the source
 /// of truth: `session` → 5h, `weekly_all` → 7d, and each `weekly_scoped` entry
-/// becomes a dynamic `"7d <model>"` window — so a model the server adds later is
-/// picked up automatically. A missing `session` / `weekly_all` limit falls back
-/// to the legacy top-level field.
-fn windows_from_raw(
-    raw: &RawUsage,
-) -> (Option<UsageWindow>, Option<UsageWindow>, Vec<ScopedWindow>) {
+/// becomes a dynamic `"7d <model>"` window (from the scope's model or surface
+/// name) — so a model the server adds later is picked up automatically. A
+/// missing `session` / `weekly_all` limit falls back to the legacy top-level
+/// field, which is also the only carrier of the per-window `*_dollars` figures.
+fn windows_from_raw(raw: &RawUsage) -> DerivedWindows {
     let mut five = None;
     let mut seven = None;
     let mut scoped = Vec::new();
@@ -461,12 +609,7 @@ fn windows_from_raw(
             Some("session") => five = Some(window),
             Some("weekly_all") => seven = Some(window),
             Some("weekly_scoped") => {
-                if let Some(name) = limit
-                    .scope
-                    .as_ref()
-                    .and_then(|s| s.model.as_ref())
-                    .and_then(|m| m.display_name.as_deref())
-                {
+                if let Some(name) = limit.scope.as_ref().and_then(RawScope::label) {
                     scoped.push(ScopedWindow {
                         label: format!("{LABEL_7D} {}", name.to_lowercase()),
                         window,
@@ -476,11 +619,17 @@ fn windows_from_raw(
             _ => {}
         }
     }
-    (
-        five.or_else(|| raw.five_hour.clone()),
-        seven.or_else(|| raw.seven_day.clone()),
-        scoped,
-    )
+    // Dollar figures ride only the top-level window objects, never `limits[]`.
+    let window_dollars = [(LABEL_5H, &raw.five_hour), (LABEL_7D, &raw.seven_day)]
+        .into_iter()
+        .filter_map(|(label, w)| w.as_ref().and_then(|w| w.dollars(label)))
+        .collect();
+    DerivedWindows {
+        five_hour: five.or_else(|| raw.five_hour.as_ref().map(RawWindow::to_window)),
+        seven_day: seven.or_else(|| raw.seven_day.as_ref().map(RawWindow::to_window)),
+        weekly_scoped: scoped,
+        window_dollars,
+    }
 }
 
 #[derive(Deserialize)]
@@ -599,6 +748,19 @@ pub(crate) fn http_agent() -> &'static ureq::Agent {
     &AGENT
 }
 
+/// `User-Agent` for `/usage` + `/profile` requests. Anthropic rate-limits this
+/// endpoint far harder for clients that don't identify as Claude Code
+/// (anthropics/claude-code#31637), so mimic its UA using the locally-detected CC
+/// version (resolved once per process), falling back to a bare `claude-code`.
+static USER_AGENT: LazyLock<String> =
+    LazyLock::new(|| match crate::plugin_probe::cc_version().as_deref() {
+        Some(v) => match v.split_whitespace().next() {
+            Some(ver) if !ver.is_empty() => format!("claude-code/{ver}"),
+            _ => "claude-code".to_string(),
+        },
+        None => "claude-code".to_string(),
+    });
+
 fn get_json(
     url: &str,
     access_token: &str,
@@ -616,6 +778,7 @@ fn get_json(
         .get(url)
         .header("Authorization", &format!("Bearer {access_token}"))
         .header("anthropic-beta", "oauth-2025-04-20")
+        .header("User-Agent", USER_AGENT.as_str())
         .call()
         .map_err(|_| FetchError::Network)?;
     let status = response.status().as_u16();
@@ -700,14 +863,15 @@ pub(super) fn fetch_raw(
         prev_plan
     };
 
-    let (five_hour, seven_day, weekly_scoped) = windows_from_raw(&raw);
+    let windows = windows_from_raw(&raw);
     let spend = raw.spend.as_ref().map(SpendInfo::from_raw);
 
     Ok(UsageInfo {
         plan,
-        five_hour,
-        seven_day,
-        weekly_scoped,
+        five_hour: windows.five_hour,
+        seven_day: windows.seven_day,
+        weekly_scoped: windows.weekly_scoped,
+        window_dollars: windows.window_dollars,
         extra_usage: raw.extra_usage,
         spend,
     })

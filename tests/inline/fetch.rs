@@ -347,15 +347,18 @@ fn limits_drive_windows_and_pick_up_new_models() {
     }"#;
     let raw: RawUsage = serde_json::from_str(json).unwrap();
 
-    let (five, seven, scoped) = windows_from_raw(&raw);
+    let w = windows_from_raw(&raw);
     // limits[] wins over the stale 99% top-level fields.
-    assert_eq!(five.map(|w| w.utilization), Some(3.0));
-    assert_eq!(seven.map(|w| w.utilization), Some(9.0));
+    assert_eq!(w.five_hour.map(|w| w.utilization), Some(3.0));
+    assert_eq!(w.seven_day.map(|w| w.utilization), Some(9.0));
     // The new model is recognized purely from its scope name.
-    assert_eq!(scoped.len(), 1);
-    assert_eq!(scoped[0].label, "7d fable");
-    assert_eq!(scoped[0].window.utilization, 14.0);
-    assert_eq!(window_duration_secs(&scoped[0].label), Some(7 * 86_400));
+    assert_eq!(w.weekly_scoped.len(), 1);
+    assert_eq!(w.weekly_scoped[0].label, "7d fable");
+    assert_eq!(w.weekly_scoped[0].window.utilization, 14.0);
+    assert_eq!(
+        window_duration_secs(&w.weekly_scoped[0].label),
+        Some(7 * 86_400)
+    );
 
     let spend = SpendInfo::from_raw(raw.spend.as_ref().unwrap());
     assert!(spend.is_visible());
@@ -378,10 +381,10 @@ fn windows_fall_back_to_legacy_fields_when_limits_absent() {
     }"#;
     let raw: RawUsage = serde_json::from_str(json).unwrap();
 
-    let (five, seven, scoped) = windows_from_raw(&raw);
-    assert_eq!(five.map(|w| w.utilization), Some(7.0));
-    assert_eq!(seven.map(|w| w.utilization), Some(11.0));
-    assert!(scoped.is_empty());
+    let w = windows_from_raw(&raw);
+    assert_eq!(w.five_hour.map(|w| w.utilization), Some(7.0));
+    assert_eq!(w.seven_day.map(|w| w.utilization), Some(11.0));
+    assert!(w.weekly_scoped.is_empty());
     assert!(!SpendInfo::from_raw(raw.spend.as_ref().unwrap()).is_visible());
 }
 
@@ -419,4 +422,59 @@ fn spend_money_conversion_and_visibility() {
     let s = parse(r#"{"enabled": false}"#);
     assert!(!s.is_visible());
     assert_eq!(s.used, None);
+}
+
+/// The speculative fields (per-window `*_dollars`, surface-scoped limits,
+/// `extra_usage.daily/weekly`) are null on every reachable account and their
+/// shapes are unconfirmed, so they parse defensively: money in either shape, a
+/// surface-named scoped label, and a period breakdown — and an unexpected shape
+/// is ignored, never a `/usage` parse failure.
+#[test]
+fn blind_fields_parse_defensively() {
+    // Lenient money: bare number = dollars, `{amount_minor,exponent}` = minor
+    // units, `{amount}` = dollars, anything else = None.
+    assert_eq!(json_to_dollars(&serde_json::json!(12.5)), Some(12.5));
+    assert_eq!(
+        json_to_dollars(&serde_json::json!({"amount_minor": 1234, "exponent": 2})),
+        Some(12.34)
+    );
+    assert_eq!(
+        json_to_dollars(&serde_json::json!({"amount": "7.5"})),
+        Some(7.5)
+    );
+    assert_eq!(json_to_dollars(&serde_json::json!("garbage")), None);
+    assert_eq!(json_to_dollars(&serde_json::json!({})), None);
+
+    let json = r#"{
+        "five_hour": {"utilization": 40, "resets_at": "2026-07-02T14:50:00+00:00",
+                      "used_dollars": {"amount_minor": 320, "exponent": 2},
+                      "limit_dollars": 10},
+        "limits": [
+            {"kind": "session", "percent": 40, "resets_at": "2026-07-02T14:50:00+00:00"},
+            {"kind": "weekly_scoped", "percent": 5, "resets_at": "2026-07-07T00:00:00+00:00",
+             "scope": {"surface": {"display_name": "Code"}}}
+        ],
+        "extra_usage": {"is_enabled": true, "currency": "USD",
+                        "daily": {"used_credits": 1.5, "utilization": 15},
+                        "weekly": 999}
+    }"#;
+    let raw: RawUsage = serde_json::from_str(json).unwrap();
+    let w = windows_from_raw(&raw);
+
+    // #5: both dollar shapes land on the 5h window (from the top-level object).
+    let d = w.window_dollars.iter().find(|d| d.label == "5h").unwrap();
+    assert_eq!(d.used, Some(3.20));
+    assert_eq!(d.limit, Some(10.0));
+
+    // #6: a surface-scoped limit (no model) is labeled from the surface name.
+    assert_eq!(w.weekly_scoped.len(), 1);
+    assert_eq!(w.weekly_scoped[0].label, "7d code");
+
+    // #7: an object daily breakdown extracts; a bare-number weekly is ignored,
+    // not a parse error.
+    let extra = raw.extra_usage.as_ref().unwrap();
+    let daily = ExtraPeriod::from_value(extra.daily.as_ref().unwrap()).unwrap();
+    assert_eq!(daily.utilization, Some(15.0));
+    assert_eq!(daily.used_credits, Some(1.5));
+    assert!(ExtraPeriod::from_value(extra.weekly.as_ref().unwrap()).is_none());
 }

@@ -68,6 +68,7 @@ fn make_info(five_h: Option<f64>, seven_d: Option<f64>) -> UsageInfo {
         five_hour: five_h.map(make_win),
         seven_day: seven_d.map(make_win),
         weekly_scoped: Vec::new(),
+        window_dollars: Vec::new(),
         extra_usage: None,
         spend: None,
     }

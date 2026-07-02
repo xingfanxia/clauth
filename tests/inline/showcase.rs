@@ -299,6 +299,7 @@ fn oauth_profile(
             five_hour,
             seven_day: None,
             weekly_scoped,
+            window_dollars: Vec::new(),
             extra_usage: extra,
             spend,
         }),
@@ -373,6 +374,7 @@ fn demo_config() -> AppConfig {
         used_credits: Some(42.50),
         utilization: Some(42.5),
         currency: Some("USD".to_string()),
+        ..Default::default()
     };
     let max5 = oauth_profile(
         "work",

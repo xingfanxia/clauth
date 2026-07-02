@@ -20,7 +20,8 @@ use crate::format::plan_label;
 use crate::profile::Profile;
 use crate::providers::StatRowKind;
 use crate::usage::{
-    FetchStatus, ProfileActivity, UsageWindow, ideal_pace_pct, now_epoch_secs, now_ms,
+    ExtraPeriod, FetchStatus, ProfileActivity, UsageWindow, WindowDollars, ideal_pace_pct,
+    now_epoch_secs, now_ms,
 };
 
 const KEY_W: usize = 8;
@@ -445,6 +446,16 @@ fn make_window_stat(
     }
 }
 
+/// Eyebrow string for a window's absolute dollar figures (`$used / $limit`).
+fn fmt_window_dollars(d: &WindowDollars) -> String {
+    match (d.used, d.limit) {
+        (Some(u), Some(l)) => format!("${u:.2} / ${l:.2}"),
+        (Some(u), None) => format!("${u:.2}"),
+        (None, Some(l)) => format!("/ ${l:.2}"),
+        (None, None) => String::new(),
+    }
+}
+
 fn collect_stats(profile: &Profile) -> Vec<Stat> {
     let Some(usage) = profile.usage.as_ref() else {
         return Vec::new();
@@ -455,6 +466,14 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
         let trailing = format_reset(w)
             .map(|r| format!("  resets in {r}"))
             .unwrap_or_default();
+        // Absolute $ figures on the eyebrow when the window carries them (null on
+        // every current account; Claude Code itself drops these fields).
+        let amount = usage
+            .window_dollars
+            .iter()
+            .find(|d| d.label == label)
+            .map(fmt_window_dollars)
+            .unwrap_or_default();
         // OAuth paths compute ungated here; the 5h recent-burn rate is filled
         // later from history (overwriting whatever `make_window_stat` set), and
         // the show_estimates / show_pace gates are applied by the caller.
@@ -463,7 +482,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             w.utilization,
             w.resets_at.as_deref(),
             now_secs,
-            String::new(),
+            amount,
             trailing,
             WindowGates {
                 show_estimates: true,
@@ -493,6 +512,36 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             pace_pct: None,
             reset_secs: None,
         });
+    }
+    // Per-period extra-credit breakdowns (`daily`/`weekly`) — shape unconfirmed,
+    // absent on every current account; rendered only when a value is extractable.
+    if let Some(extra) = &usage.extra_usage {
+        for (label, raw) in [("extra (24h)", &extra.daily), ("extra (7d)", &extra.weekly)] {
+            let Some(period) = raw.as_ref().and_then(ExtraPeriod::from_value) else {
+                continue;
+            };
+            let pct = period.utilization.unwrap_or(0.0).clamp(0.0, 100.0);
+            let sym = match period.currency.as_deref().or(extra.currency.as_deref()) {
+                Some("USD") | None => "$",
+                Some(other) => other,
+            };
+            let amount = match (period.used_credits, period.monthly_limit) {
+                (Some(u), Some(l)) => format!("{sym}{u:.2} / {sym}{l:.2}"),
+                (Some(u), None) => format!("{sym}{u:.2}"),
+                _ => String::new(),
+            };
+            stats.push(Stat {
+                label: label.to_string(),
+                pct,
+                color: Style::default().fg(theme::util_color(pct)),
+                trailing: String::new(),
+                amount,
+                burn_rate: None,
+                rate_unit: "h",
+                pace_pct: None,
+                reset_secs: None,
+            });
+        }
     }
     if let Some(spend) = &usage.spend
         && spend.is_visible()
