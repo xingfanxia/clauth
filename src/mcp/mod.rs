@@ -17,7 +17,7 @@ use anyhow::Result;
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
@@ -133,8 +133,11 @@ fn active_footer(config: &AppConfig) -> String {
 }
 
 /// Append the live footer to a JSON text payload as a second content block.
-fn with_footer(json: serde_json::Value, footer: String) -> Vec<Content> {
-    vec![Content::text(json.to_string()), Content::text(footer)]
+fn with_footer(json: serde_json::Value, footer: String) -> Vec<ContentBlock> {
+    vec![
+        ContentBlock::text(json.to_string()),
+        ContentBlock::text(footer),
+    ]
 }
 
 #[derive(Clone)]
@@ -244,7 +247,7 @@ past `delegate` calls; \
             .collect();
 
         let payload = serde_json::json!({ "profiles": profiles });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             payload.to_string(),
         )]))
     }
@@ -375,7 +378,7 @@ via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so
                 "is_error": true,
                 "result": "delegation depth exceeded (max 1)",
             });
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 payload.to_string(),
             )]));
         }
@@ -444,7 +447,7 @@ via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so
                 "started_at": started_at,
                 "status": "running",
             });
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 payload.to_string(),
             )]));
         }
@@ -507,7 +510,7 @@ result auto-arrives via a hook — use this only when delegate hooks are disable
     ) -> Result<CallToolResult, ErrorData> {
         if !jobs::is_safe_job_id(&job_id) {
             let payload = serde_json::json!({ "is_error": true, "result": "invalid job_id" });
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 payload.to_string(),
             )]));
         }
@@ -520,7 +523,7 @@ result auto-arrives via a hook — use this only when delegate hooks are disable
         match outcome {
             WaitOutcome::Unknown => {
                 let payload = serde_json::json!({ "is_error": true, "result": format!("unknown job_id: {job_id}") });
-                Ok(CallToolResult::error(vec![Content::text(
+                Ok(CallToolResult::error(vec![ContentBlock::text(
                     payload.to_string(),
                 )]))
             }
@@ -536,7 +539,7 @@ result auto-arrives via a hook — use this only when delegate hooks are disable
                 if record.monitor {
                     payload["quota"] = windows_json(&record.profile);
                 }
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     payload.to_string(),
                 )]))
             }
