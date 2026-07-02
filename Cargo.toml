@@ -11,7 +11,7 @@ keywords = ["claude-code", "account-switcher", "usage-monitor", "mcp", "anthropi
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-ratatui = "0.30.2"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "macros", "all-widgets", "underline-color"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 toml = "1.1.2"
@@ -26,6 +26,12 @@ sha2 = "0.11.0"
 minisign-verify = "0.2.5"
 rmcp = { version = "2.0.0", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt", "io-std"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [lints.rust]
 unsafe_code = "deny"
