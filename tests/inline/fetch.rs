@@ -384,3 +384,39 @@ fn windows_fall_back_to_legacy_fields_when_limits_absent() {
     assert!(scoped.is_empty());
     assert!(!SpendInfo::from_raw(raw.spend.as_ref().unwrap()).is_visible());
 }
+
+/// `SpendInfo` money conversion + visibility edge cases (the bar is built blind
+/// against the schema since no reachable account enables it): `exponent` scales
+/// the minor units and defaults to cents when absent, a missing `limit` yields a
+/// used-only bar, currency passes through, and a disabled block with no cap stays
+/// hidden.
+#[test]
+fn spend_money_conversion_and_visibility() {
+    let parse = |json: &str| SpendInfo::from_raw(&serde_json::from_str::<RawSpend>(json).unwrap());
+
+    // exponent 3 → thousandths; non-USD currency preserved.
+    let s = parse(
+        r#"{"enabled": true, "percent": 50,
+            "used": {"amount_minor": 1500, "currency": "EUR", "exponent": 3},
+            "limit": {"amount_minor": 3000, "currency": "EUR", "exponent": 3}}"#,
+    );
+    assert_eq!(s.used, Some(1.5));
+    assert_eq!(s.limit, Some(3.0));
+    assert_eq!(s.currency.as_deref(), Some("EUR"));
+    assert!(s.is_visible());
+
+    // Missing exponent defaults to cents (2); missing limit → used-only, still
+    // visible because the cap is enabled.
+    let s = parse(r#"{"enabled": true, "used": {"amount_minor": 250, "currency": "USD"}}"#);
+    assert_eq!(s.used, Some(2.5));
+    assert_eq!(s.limit, None);
+    assert!(s.is_visible());
+
+    // A cap present but currently disabled is still worth showing.
+    assert!(parse(r#"{"enabled": false, "limit": {"amount_minor": 1000}}"#).is_visible());
+
+    // Fully disabled, no cap → hidden.
+    let s = parse(r#"{"enabled": false}"#);
+    assert!(!s.is_visible());
+    assert_eq!(s.used, None);
+}
