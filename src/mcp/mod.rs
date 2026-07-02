@@ -101,19 +101,21 @@ fn load_windows(name: &str) -> (Option<UsageWindow>, Option<UsageWindow>) {
     }
 }
 
-/// The profile's 5h + 7d windows as a JSON array of `{label, utilization_pct,
-/// resets_at}`, read fresh from the disk cache. Empty array when no cache yet.
+/// The profile's usage windows as a JSON array of `{label, utilization_pct,
+/// resets_at}` — 5h, 7d, then one entry per weekly model window (`7d <model>`) —
+/// read fresh from the disk cache. Empty array when no cache yet.
 fn windows_json(name: &str) -> serde_json::Value {
-    let (five_h, seven_d) = load_windows(name);
-    let windows: Vec<serde_json::Value> = [("5h", &five_h), ("7d", &seven_d)]
+    let Some(usage) = load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) else {
+        return serde_json::Value::Array(Vec::new());
+    };
+    let windows: Vec<serde_json::Value> = usage
+        .windows()
         .into_iter()
-        .filter_map(|(label, w)| {
-            w.as_ref().map(|w| {
-                serde_json::json!({
-                    "label": label,
-                    "utilization_pct": w.utilization,
-                    "resets_at": w.resets_at,
-                })
+        .map(|(label, w)| {
+            serde_json::json!({
+                "label": label,
+                "utilization_pct": w.utilization,
+                "resets_at": w.resets_at,
             })
         })
         .collect();
@@ -203,8 +205,9 @@ impl ClauthServer {
 
     #[tool(
         description = "List all clauth profiles from disk cache (zero quota). Per profile: \
-`windows[]` carries the 5h/7d `{label, utilization_pct, resets_at}` where `utilization_pct` is \
-the percent of that window already USED (higher = less headroom) and `resets_at` is ISO-8601; \
+`windows[]` carries the 5h, 7d, and per-model weekly (`7d <model>`) `{label, utilization_pct, \
+resets_at}` where `utilization_pct` is the percent of that window already USED (higher = less \
+headroom) and `resets_at` is ISO-8601; \
 `has_live_session` = a clauth-managed `claude` session currently owns it; `throughput[]` = \
 observed per-model `{model, tok_s, samples, degraded, rate_limited_recent, retry_after_s}` from \
 past `delegate` calls; \
