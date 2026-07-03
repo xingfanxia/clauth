@@ -83,6 +83,50 @@ fn classify_link_diverged_when_plain_file() {
     );
 }
 
+/// macOS reality: Claude Code rewrites `~/.claude/.credentials.json` as a plain-file
+/// mirror of the Keychain after every run, replacing clauth's symlink. When the live
+/// token still matches the active profile's stored token, that is NOT divergence —
+/// classify must report LinkedTo so an ordinary switch doesn't falsely prompt to
+/// capture credentials that already match. (Regression: the switch prompt fired on
+/// every `clauth <name>` because a plain file was unconditionally Diverged.)
+#[test]
+fn classify_link_linked_to_when_plain_file_token_matches_stored() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    let same = serde_json::to_vec(&creds("same-access", Some("same-refresh"))).expect("ser");
+    fs::write(&link, &same).expect("write live");
+    fs::write(&expected, &same).expect("write stored");
+    assert_eq!(
+        classify_link_at(&link, &expected).expect("classify"),
+        LinkState::LinkedTo,
+        "a plain file whose token matches the profile is CC's mirror, not divergence",
+    );
+}
+
+/// A plain file whose access token DIFFERS from the profile's stored token is a
+/// genuine CC re-login / rotation — still Diverged so the capture prompt fires.
+#[test]
+fn classify_link_diverged_when_plain_file_token_differs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    fs::write(
+        &link,
+        serde_json::to_vec(&creds("live-access", Some("r"))).expect("ser"),
+    )
+    .expect("write live");
+    fs::write(
+        &expected,
+        serde_json::to_vec(&creds("stored-access", Some("r"))).expect("ser"),
+    )
+    .expect("write stored");
+    assert_eq!(
+        classify_link_at(&link, &expected).expect("classify"),
+        LinkState::Diverged,
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn classify_link_linked_to_when_pointing_at_expected() {

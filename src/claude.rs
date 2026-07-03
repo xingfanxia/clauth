@@ -19,9 +19,13 @@ fn claude_settings_path() -> Result<PathBuf> {
 /// State of `~/.claude/.credentials.json` relative to a profile's stored credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkState {
-    /// Symlink resolves to the profile's stored credentials.
+    /// Symlink resolves to the profile's stored credentials, OR a regular file
+    /// whose live OAuth access token matches the profile's stored one (macOS: Claude
+    /// Code rewrites the file from the Keychain, replacing our symlink with an
+    /// identical-content regular file — not divergence).
     LinkedTo,
-    /// Path exists but is not our symlink — CC re-logged, user edited, or stale copy.
+    /// Path exists and its live credential differs from the profile's stored one —
+    /// a genuine CC re-login / token rotation the user may want to capture.
     Diverged,
     /// Path does not exist.
     Missing,
@@ -41,7 +45,26 @@ pub(crate) fn classify_link_at(link: &Path, expected: &Path) -> Result<LinkState
         Err(e) => return Err(e).context("Failed to stat .credentials.json"),
     };
     if !meta.file_type().is_symlink() {
-        return Ok(LinkState::Diverged);
+        // Not our symlink. On macOS, Claude Code rewrites ~/.claude/.credentials.json
+        // as a regular-file mirror of the Keychain after every run, clobbering the
+        // symlink we created. That is NOT divergence when the credential is unchanged
+        // — only a genuine re-login / token rotation (different access token) is.
+        // Compare content instead of trusting symlink identity so an ordinary switch
+        // doesn't falsely prompt to capture credentials that already match the profile.
+        return Ok(
+            match (
+                read_json_file::<ClaudeCredentials>(link),
+                read_json_file::<ClaudeCredentials>(expected),
+            ) {
+                (Ok(live), Ok(stored))
+                    if live.access_token().is_some()
+                        && live.access_token() == stored.access_token() =>
+                {
+                    LinkState::LinkedTo
+                }
+                _ => LinkState::Diverged,
+            },
+        );
     }
     let target = std::fs::read_link(link).context("Failed to read .credentials.json link")?;
     if paths_equivalent(&target, expected) {
