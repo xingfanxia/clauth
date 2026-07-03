@@ -19,6 +19,7 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         "One-key switching",
         &["auto_switch", "snapshot_chain", "resolves_started_profile"],
     ),
+    ("Sign in a new account", &["ensure_login"]),
     (
         "Automatic token refresh",
         &[

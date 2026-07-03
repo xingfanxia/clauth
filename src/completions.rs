@@ -11,8 +11,8 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start which" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "start" ]; then
+        COMPREPLY=( $(compgen -W "${profiles} start login which" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ]; }; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
@@ -32,8 +32,9 @@ _clauth() {
         _describe 'profile' profiles
         _values 'subcommand' \
             'start[launch claude with an isolated profile]' \
+            'login[sign an account in via claude /login]' \
             'which[print profile owning the loaded credentials]'
-    elif (( CURRENT == 3 )) && [[ "${words[2]}" == start ]]; then
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login) ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
@@ -50,8 +51,9 @@ end
 complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with an isolated profile"
+complete -c clauth -f -n __fish_is_first_token -a login -d "Sign an account in via claude /login"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
-complete -c clauth -f -n "__fish_seen_subcommand_from start" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from start login" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
 "#;
 

@@ -409,6 +409,19 @@ pub(crate) fn create_blank_profile(
     })
 }
 
+/// Resolve `name` for `clauth login`: an existing profile is reused (re-login
+/// into its runtime), a missing one is created blank after name validation.
+/// Returns true when a profile was created.
+pub(crate) fn ensure_login_profile(config: &mut AppConfig, name: &str) -> Result<bool> {
+    if config.find(name).is_some() {
+        return Ok(false);
+    }
+    let existing: Vec<&str> = config.names();
+    validate_profile_name(name, &existing, None)?;
+    create_blank_profile(config, name.trim().to_string(), None, None)?;
+    Ok(true)
+}
+
 /// Returns a profile whose `refresh_token` matches `live`. Matches on refresh
 /// token only (stable identity); access tokens rotate and would produce false
 /// misses and duplicate profiles.

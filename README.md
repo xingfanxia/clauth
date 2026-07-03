@@ -48,6 +48,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 ### Switch accounts
 
 - **One-key switching**: pick a profile, <kbd>⏎</kbd>, confirm. Or `clauth <profile>` straight from the shell.
+- **Sign in a new account**: `clauth login <profile>` opens Claude Code's own `/login` inside that profile's runtime and saves the completed login into the profile, without touching the session you're already signed into.
 - **Account-change detection**: if Claude Code signed into a different account while clauth was closed, you get a `[Y/n]` prompt before stored tokens are overwritten.
 - **Non-destructive**: a switch touches only the API keys and the profile's declared `env` block in `settings.json`. Nothing else moves.
 - **Isolated launch**: `clauth start [--isolated] <profile> [claude args...]` runs `claude` in a per-profile `CLAUDE_CONFIG_DIR` (symlink mirror; copies on Windows without symlink privilege), so account identity and billing caches never leak between profiles. Add `--isolated` for a clean session that keeps the account's auth but drops your global `CLAUDE.md` memory, plugins, and hooks, for headless or blind runs (run it in an empty directory to skip project memory too).

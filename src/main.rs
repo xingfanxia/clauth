@@ -85,6 +85,10 @@ fn dispatch(args: &[String]) -> Result<()> {
             cmd_start(name, rest, Isolation::Isolated)
         }
         [cmd, name, rest @ ..] if cmd == "start" => cmd_start(name, rest, Isolation::Shared),
+        [cmd, name] if cmd == "login" => cmd_login(name),
+        [cmd, ..] if cmd == "login" => {
+            anyhow::bail!("usage: clauth login <profile>");
+        }
         [cmd, ..] if cmd == "run" => anyhow::bail!(
             "`clauth run` isn't a command — for a headless delegate use \
              `clauth start <profile> -p \"<prompt>\"` (or the MCP `delegate` tool)"
@@ -96,7 +100,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
         _ => anyhow::bail!(
-            "usage: clauth [profile] | clauth start <profile> [claude args...] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
+            "usage: clauth [profile] | clauth start <profile> [claude args...] | clauth login <profile> | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
         ),
     }
 }
@@ -129,6 +133,39 @@ fn cmd_start(name: &str, rest: &[String], isolation: Isolation) -> Result<()> {
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
     start::run(&config, &canonical, rest, isolation)
+}
+
+/// `clauth login <name>` — sign an account in via Claude Code itself: run
+/// `claude` against the profile's runtime (creating the profile blank first
+/// when missing) and let the runtime watchdog adopt the completed `/login`
+/// into the profile's canonical credentials. clauth carries no OAuth sign-in
+/// leg of its own, so the flow inherits CC's credential handling wholesale —
+/// including wherever CC stores its login on each platform.
+fn cmd_login(name: &str) -> Result<()> {
+    platform::init();
+    runtime::gc_stale_runtimes();
+    let mut config = load_config()?;
+    let name = config
+        .canonical_name(name)
+        .unwrap_or_else(|| name.trim().to_string());
+    if actions::ensure_login_profile(&mut config, &name)? {
+        println!("clauth: created profile '{name}'");
+    }
+    println!("clauth: sign in with /login inside claude, then exit to save");
+    start::run(&config, &name, &[], Isolation::Shared)?;
+
+    // Runtime teardown just ran the final credential sync; re-read the store.
+    let config = load_config()?;
+    let has_login = config
+        .find(&name)
+        .and_then(|p| p.credentials.as_ref())
+        .is_some_and(|c| c.claude_ai_oauth.is_some());
+    if has_login {
+        println!("clauth: login saved to profile '{name}' — `clauth {name}` switches to it");
+    } else {
+        eprintln!("clauth: no login detected — profile '{name}' still has no credentials");
+    }
+    Ok(())
 }
 
 fn cmd_switch(name: &str) -> Result<()> {
@@ -164,6 +201,9 @@ fn print_help() {
          CLAUDE_CONFIG_DIR; --isolated injects creds but drops operator\n                                  \
          memory/plugins/hooks (run in a clean cwd for a blind session);\n                                  \
          extra args go to claude\n  \
+           clauth login <profile>          sign in via claude's own /login inside the\n                                  \
+         profile's runtime; creates the profile when missing and saves\n                                  \
+         the completed login into it\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
          credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \

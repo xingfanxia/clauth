@@ -117,3 +117,33 @@ fn edit_profile_env_strips_removed_keys_from_live_settings_when_active() {
         "a removed key is stripped from the live settings on re-apply"
     );
 }
+
+// ── ensure_login_profile ──────────────────────────────────────────────────────
+
+#[test]
+fn ensure_login_creates_blank_profile() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    assert!(ensure_login_profile(&mut config, "fresh").expect("create"));
+    let profile = config.find("fresh").expect("profile added");
+    assert!(profile.credentials.is_none(), "created blank");
+}
+
+#[test]
+fn ensure_login_reuses_existing_profile() {
+    let _home = HomeSandbox::new();
+    let mut config = acct_config();
+    assert!(!ensure_login_profile(&mut config, "acct").expect("reuse"));
+    assert_eq!(config.profiles.len(), 1, "no duplicate created");
+}
+
+#[test]
+fn ensure_login_rejects_invalid_name() {
+    let _home = HomeSandbox::new();
+    let mut config = acct_config();
+    assert!(ensure_login_profile(&mut config, ".hidden").is_err());
+    assert!(ensure_login_profile(&mut config, "").is_err());
+}
