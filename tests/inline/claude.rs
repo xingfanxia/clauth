@@ -127,6 +127,24 @@ fn classify_link_diverged_when_plain_file_token_differs() {
     );
 }
 
+/// A degenerate empty access token on both sides is a corrupt/partial write, not
+/// a completed login — it must NOT read as `LinkedTo` just because two empty
+/// strings compare equal. Matches the completed-login intent of `is_first_login`.
+#[test]
+fn classify_link_diverged_when_plain_file_access_token_empty() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    let empty = serde_json::to_vec(&creds("", Some("r"))).expect("ser");
+    fs::write(&link, &empty).expect("write live");
+    fs::write(&expected, &empty).expect("write stored");
+    assert_eq!(
+        classify_link_at(&link, &expected).expect("classify"),
+        LinkState::Diverged,
+        "an empty access token is not a completed login, so it is not a mirror",
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn classify_link_linked_to_when_pointing_at_expected() {

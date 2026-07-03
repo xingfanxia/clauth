@@ -57,7 +57,7 @@ pub(crate) fn classify_link_at(link: &Path, expected: &Path) -> Result<LinkState
                 read_json_file::<ClaudeCredentials>(expected),
             ) {
                 (Ok(live), Ok(stored))
-                    if live.access_token().is_some()
+                    if live.access_token().is_some_and(|t| !t.is_empty())
                         && live.access_token() == stored.access_token() =>
                 {
                     LinkState::LinkedTo
