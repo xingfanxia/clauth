@@ -161,3 +161,49 @@ fn tp_bar(
         total,
     }
 }
+
+// ── oauth empty states ────────────────────────────────────────────────────────
+//
+// The oauth body must not spin "loading" forever: a credential-less profile is
+// never fetched (issue #2's permanent "loading"), and a Failed fetch is
+// terminal. Only a still-possible fetch may show "loading".
+
+#[test]
+fn empty_msg_credless_profile_is_terminal() {
+    let profile = crate::testutil::blank_profile("a");
+    assert_eq!(
+        oauth_empty_msg(&profile),
+        "no credentials — capture or sign in"
+    );
+}
+
+#[test]
+fn empty_msg_failed_fetch_is_terminal() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    profile.fetch_status = Some(FetchStatus::Failed);
+    assert_eq!(oauth_empty_msg(&profile), "no usage available");
+}
+
+#[test]
+fn empty_msg_pending_fetch_loads() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    assert_eq!(oauth_empty_msg(&profile), "loading");
+}

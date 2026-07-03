@@ -1351,11 +1351,11 @@ impl App {
         self.apply_usage();
         let switched = {
             let mut cfg = self.config();
-            // Run the startup one-shot on Fresh data only. A Cached seed may sit on
-            // a 5h window that has since rolled over, whose stale-high utilization
-            // would drive a false switch-away (`is_exhausted` ignores `resets_at`).
-            // Stale profiles are due on the scheduler's first tick, which fetches
-            // then auto-switches off the corrected numbers.
+            // Run the startup one-shot on Fresh data only. A Cached seed's numbers
+            // are unverified — stale in either direction — so switching on them
+            // risks acting on a window the account no longer has. Stale profiles
+            // are due on the scheduler's first tick, which fetches then
+            // auto-switches off the corrected numbers.
             let active_fresh = cfg
                 .state
                 .active_profile
@@ -2810,6 +2810,20 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
             return;
         }
     };
+    // Refuse an all-empty snapshot: persisting it would create a
+    // credential-less profile behind a success toast (issue #1 — on macOS CC
+    // keeps its login in the Keychain, so the credentials file is absent).
+    let has_oauth = snapshot
+        .credentials
+        .as_ref()
+        .is_some_and(|c| c.claude_ai_oauth.is_some());
+    if !has_oauth && snapshot.base_url.is_none() && snapshot.api_key.is_none() {
+        app.toast(
+            ToastKind::Danger,
+            "no live login found — nothing to capture (macOS keychain isn't supported yet)",
+        );
+        return;
+    }
     let existing_match = {
         let cfg = app.config();
         find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref()).map(str::to_string)
@@ -5163,16 +5177,25 @@ fn poll_plugin_refresh(app: &mut App) {
 /// Winner ordering: `DANGER` > `WARNING`; ties broken by whichever condition
 /// is checked first. One condition per `if` block in priority order.
 fn update_banner(app: &mut App) {
-    // All accounts switched off because the fallback chain is exhausted.
-    // Condition: profiles exist but none is active (set by `perform_switch_off`).
+    // Profiles exist but none is active — either switch-off-all (set by
+    // `perform_switch_off`) or a profile that was never linked. Claim "all
+    // spent" only while some profile still shows a live spent window; without
+    // that evidence (e.g. a credential-less sole profile) the honest wording is
+    // "no active profile" (issue #2 read the generic banner as a stuck limit).
     let cfg = app.config();
-    let all_spent = !cfg.profiles.is_empty() && cfg.state.active_profile.is_none();
+    let no_active = !cfg.profiles.is_empty() && cfg.state.active_profile.is_none();
+    let any_spent = no_active && cfg.profiles.iter().any(crate::fallback::is_exhausted);
     drop(cfg);
 
-    app.banner = if all_spent {
+    app.banner = if no_active {
+        let message = if any_spent {
+            "all accounts spent · switch to a profile to resume"
+        } else {
+            "no active profile · select one to resume"
+        };
         Some(Banner {
             severity: BannerSeverity::Danger,
-            message: "all accounts spent · switch to a profile to resume".to_string(),
+            message: message.to_string(),
         })
     } else if app.compact {
         // Terminal too small for the full layout. Lower severity than the

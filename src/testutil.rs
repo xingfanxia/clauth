@@ -47,6 +47,26 @@ impl Drop for HomeSandbox {
     }
 }
 
+/// A minimal `Profile` with every optional field unset — tests fill in what
+/// they assert on.
+pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
+    crate::profile::Profile {
+        name: name.into(),
+        base_url: None,
+        api_key: None,
+        auto_start: false,
+        env: Default::default(),
+        models: Default::default(),
+        fallback_threshold: None,
+        bell_threshold: None,
+        credentials: None,
+        usage: None,
+        fetch_status: None,
+        provider: None,
+        third_party_usage: None,
+    }
+}
+
 /// Overwrite a file's modification time — for cache-staleness / tie-break tests.
 pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
     let file = std::fs::OpenOptions::new()

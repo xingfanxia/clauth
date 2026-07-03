@@ -125,13 +125,19 @@ fn build_usage_lines(
     }
 
     if profile.usage.is_none() {
-        lines.push(Line::from(Span::styled("  loading", theme::faint())));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", oauth_empty_msg(profile)),
+            theme::faint(),
+        )));
         return lines;
     }
 
     let mut stats = collect_stats(profile);
     if stats.is_empty() {
-        lines.push(Line::from(Span::styled("  loading", theme::faint())));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", oauth_empty_msg(profile)),
+            theme::faint(),
+        )));
         return lines;
     }
 
@@ -717,6 +723,24 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
         },
     }
     Line::from(spans)
+}
+
+/// Terminal message for an OAuth profile with nothing renderable. "loading"
+/// only while a fetch can still land: a credential-less profile is never
+/// scheduled (`collect_tokens` skips it) and a terminal `Failed` already tried
+/// — mirror `build_tp_rows`, never spin on "loading" forever (issue #2).
+fn oauth_empty_msg(profile: &Profile) -> &'static str {
+    let has_oauth = profile
+        .credentials
+        .as_ref()
+        .is_some_and(|c| c.claude_ai_oauth.is_some());
+    if !has_oauth {
+        "no credentials — capture or sign in"
+    } else if profile.fetch_status == Some(FetchStatus::Failed) {
+        "no usage available"
+    } else {
+        "loading"
+    }
 }
 
 /// Render provider-agnostic third-party stats. The header (plan + status) was

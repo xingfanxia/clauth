@@ -673,3 +673,73 @@ mod env_editor {
         );
     }
 }
+
+// ── banner wording ────────────────────────────────────────────────────────────
+//
+// "all accounts spent" needs evidence: a profile with a live spent window.
+// A no-active state without one (e.g. a credential-less sole profile) gets
+// the accurate "no active profile" wording instead (issue #2).
+
+fn app_with_unlinked_profiles(profiles: Vec<crate::profile::Profile>) -> App {
+    use crate::profile::{AppConfig, AppState};
+    let names: Vec<_> = profiles.iter().map(|p| p.name.clone()).collect();
+    App::new(AppConfig {
+        state: AppState {
+            profiles: names.clone(),
+            fallback_chain: names,
+            ..AppState::default()
+        },
+        profiles,
+    })
+}
+
+#[test]
+fn no_active_banner_without_spent_evidence() {
+    use super::update_banner;
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    update_banner(&mut app);
+    assert_eq!(
+        app.banner.as_ref().expect("banner").message,
+        "no active profile · select one to resume"
+    );
+}
+
+#[test]
+fn all_spent_banner_needs_live_spent_window() {
+    use super::update_banner;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mut spent = crate::testutil::blank_profile("a");
+    spent.usage = Some(UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..UsageInfo::default()
+    });
+    let mut app = app_with_unlinked_profiles(vec![spent]);
+    update_banner(&mut app);
+    assert_eq!(
+        app.banner.as_ref().expect("banner").message,
+        "all accounts spent · switch to a profile to resume"
+    );
+}
+
+// ── capture guard ─────────────────────────────────────────────────────────────
+
+// An empty snapshot (no creds file, no endpoint config — the macOS-keychain
+// state from issue #1) must refuse loudly instead of opening the name prompt
+// and persisting a credential-less profile behind a success toast.
+#[test]
+fn capture_refuses_empty_snapshot() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::begin_capture(&mut app, false);
+    assert!(app.modals.is_empty(), "no name prompt on an empty snapshot");
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("nothing to capture")),
+        "danger toast names the problem"
+    );
+}
