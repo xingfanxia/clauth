@@ -56,8 +56,30 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         if config.is_active(name) {
             return Ok(());
         }
+        // Is the outgoing live file an UNCAPTURED CC re-login? `snapshot_active_
+        // credentials` deliberately skips capturing that case (Diverged & not a
+        // first-login), so dropping it would strand a fresh `/login` chain — keep
+        // the non-force refuse-guard there. Every other state is captured or
+        // adoptable by the snapshot below, so force the relink: on macOS the live
+        // `.credentials.json` is always a regular-file Keychain mirror of the
+        // active account and thus legitimately differs from the target, which the
+        // non-force guard's live-vs-target byte check would wrongly reject on every
+        // switch. (Interactive callers already route a real divergence to the
+        // reconcile path, so this branch is only reachable uncaptured via the
+        // scheduler — where refusing, not dropping, is the safe outcome.)
+        let uncaptured_relogin = match config.state.active_profile.as_deref() {
+            Some(active) => {
+                matches!(classify_credentials_link(active)?, LinkState::Diverged)
+                    && !is_first_login(active)?
+            }
+            None => false,
+        };
         snapshot_active_credentials(config)?;
-        link_profile_credentials(name)?;
+        if uncaptured_relogin {
+            link_profile_credentials(name)?;
+        } else {
+            force_link_profile_credentials(name)?;
+        }
         finish_switch(config, name)
     })
 }

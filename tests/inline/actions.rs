@@ -69,6 +69,60 @@ fn classify_env_key_base_settings_only_for_external_keys() {
     assert_eq!(classify_env_key(&p, &base, "FRESH"), None);
 }
 
+/// macOS reality: `~/.claude/.credentials.json` is a regular-file Keychain mirror
+/// of the ACTIVE account (not clauth's symlink). Switching to another profile must
+/// succeed — the live file matches the active profile (already captured), so it is
+/// safe to replace even though it legitimately differs from the target. Regression
+/// for `Error: refusing to replace .credentials.json — live file differs from
+/// profile 'xfx'; resolve divergence first` on every `clauth <name>`.
+#[test]
+fn switch_replaces_active_account_mirror_without_refusing() {
+    let _home = HomeSandbox::new();
+
+    let mk = |name: &str, access: &str| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some(format!("{access}-refresh")),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        });
+        crate::profile::save_profile(&p).expect("save profile");
+        p
+    };
+    let active = mk("cl-ax", "cl-ax-access");
+    let target = mk("xfx", "xfx-access");
+
+    // Live file = a plain regular file whose content matches the ACTIVE profile
+    // (exactly what Claude Code mirrors from the Keychain on macOS).
+    let live_path = crate::profile::claude_dir().unwrap().join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(active.credentials.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![active, target],
+    };
+    config.state.active_profile = Some("cl-ax".into());
+
+    // Must NOT bail — the live file is the active account's captured mirror.
+    switch_profile(&mut config, "xfx").expect("switch replaces the active-account mirror");
+
+    assert!(config.is_active("xfx"));
+    assert_eq!(
+        classify_credentials_link("xfx").expect("classify"),
+        LinkState::LinkedTo,
+        "after the switch the live path resolves to xfx's stored creds",
+    );
+}
+
 #[test]
 fn edit_profile_env_persists_to_config_toml() {
     let _home = HomeSandbox::new();
