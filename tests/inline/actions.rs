@@ -98,7 +98,9 @@ fn switch_replaces_active_account_mirror_without_refusing() {
 
     // Live file = a plain regular file whose content matches the ACTIVE profile
     // (exactly what Claude Code mirrors from the Keychain on macOS).
-    let live_path = crate::profile::claude_dir().unwrap().join(".credentials.json");
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
     std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
     std::fs::write(
         &live_path,
