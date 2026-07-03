@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::actions::{switch_off, switch_profile};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile};
-use crate::usage::UsageStore;
+use crate::usage::{UsageStore, five_hour_live, now_epoch_secs};
 
 /// What the auto-switch evaluator decided when the active profile crossed its
 /// threshold.
@@ -26,11 +26,21 @@ pub(crate) fn threshold_for(profile: &Profile) -> f64 {
 }
 
 /// True when the profile's 5h utilization has crossed its own threshold.
-fn is_exhausted(profile: &Profile) -> bool {
-    let Some(window) = profile.usage.as_ref().and_then(|u| u.five_hour.as_ref()) else {
+/// Only a live window (future `resets_at`) can exhaust — a lapsed or windowless
+/// snapshot means the account has headroom again whatever its last-known
+/// utilization says (`five_hour_live`, the same reading the auto-start leg uses).
+/// Also drives the TUI's all-spent banner wording.
+pub(crate) fn is_exhausted(profile: &Profile) -> bool {
+    let Some(usage) = profile.usage.as_ref() else {
         return false;
     };
-    window.utilization >= threshold_for(profile)
+    if !five_hour_live(usage, now_epoch_secs()) {
+        return false;
+    }
+    usage
+        .five_hour
+        .as_ref()
+        .is_some_and(|w| w.utilization >= threshold_for(profile))
 }
 
 /// One chain member as observed when a `ChainSnapshot` was built. Holds enough
@@ -87,17 +97,17 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
 /// `apply_usage`). A poisoned store lock fails safe to "not exhausted" so a
 /// momentarily wedged mutex can't trigger a switch.
 fn is_exhausted_from_store(name: &str, threshold: f64, store: &UsageStore) -> bool {
-    let util = match store.lock() {
-        Ok(s) => s
-            .get(name)
-            .and_then(|u| u.five_hour.as_ref())
-            .map(|w| w.utilization),
-        Err(_) => return false,
-    };
-    let Some(util) = util else {
-        return false;
-    };
-    util >= threshold
+    let now = now_epoch_secs();
+    match store.lock() {
+        Ok(s) => s.get(name).is_some_and(|info| {
+            five_hour_live(info, now)
+                && info
+                    .five_hour
+                    .as_ref()
+                    .is_some_and(|w| w.utilization >= threshold)
+        }),
+        Err(_) => false,
+    }
 }
 
 /// Chain walk shared by [`next_target`] and [`next_auto_switch_target`]. Scans
@@ -225,18 +235,22 @@ pub(crate) fn next_auto_switch_target(
 /// (has recovered headroom after switch-off-all). Returns the member name.
 /// Safe to call without holding the config lock — reads from [`UsageStore`].
 pub(crate) fn find_recovered_member(chain: &[ChainMember], store: &UsageStore) -> Option<String> {
+    let now = now_epoch_secs();
     for member in chain {
-        let util = match store.lock() {
-            Ok(s) => s
-                .get(&member.name)
-                .and_then(|u| u.five_hour.as_ref())
-                .map(|w| w.utilization),
-            Err(_) => continue,
+        // A fetched entry whose 5h window is absent or past its reset is idle
+        // headroom; a live window recovers only below the member's threshold.
+        // An absent entry (never fetched) stays undecidable.
+        let recovered = match store.lock() {
+            Ok(s) => s.get(&member.name).map(|info| {
+                !five_hour_live(info, now)
+                    || info
+                        .five_hour
+                        .as_ref()
+                        .is_none_or(|w| w.utilization < member.threshold)
+            }),
+            Err(_) => None,
         };
-        let Some(util) = util else {
-            continue; // no usage data yet — can't determine recovery
-        };
-        if util < member.threshold {
+        if recovered == Some(true) {
             return Some(member.name.clone());
         }
     }

@@ -9,7 +9,7 @@ use crate::providers::ThirdPartyStats;
 
 use super::fetch::{
     FetchError, PlanInfo, UsageInfo, UsageWindow, await_request_slot, epoch_secs_to_iso, fetch_raw,
-    iso_to_epoch_secs, now_epoch_secs, now_ms,
+    five_hour_live, iso_to_epoch_secs, now_epoch_secs, now_ms,
 };
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
@@ -392,16 +392,6 @@ impl FetchOutcome {
             retry_after,
         }
     }
-}
-
-/// True iff `info`'s 5h usage window is still open — its reset time is in the
-/// future at `now_secs`. A windowless or unparseable snapshot is not live.
-fn five_hour_live(info: &UsageInfo, now_secs: i64) -> bool {
-    info.five_hour
-        .as_ref()
-        .and_then(|w| w.resets_at.as_deref())
-        .and_then(iso_to_epoch_secs)
-        .is_some_and(|resets_at| now_secs < resets_at)
 }
 
 /// Patch a just-opened live 5h window back into a Fresh body that lags it. A

@@ -884,6 +884,16 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// True iff `info`'s 5h usage window is still open — its reset time is in the
+/// future at `now_secs`. A windowless or unparseable snapshot is not live.
+pub(crate) fn five_hour_live(info: &UsageInfo, now_secs: i64) -> bool {
+    info.five_hour
+        .as_ref()
+        .and_then(|w| w.resets_at.as_deref())
+        .and_then(iso_to_epoch_secs)
+        .is_some_and(|resets_at| now_secs < resets_at)
+}
+
 /// Parse ISO-8601 timestamp (e.g. `2026-05-17T14:20:00.121699+00:00`) into Unix epoch seconds.
 pub(crate) fn iso_to_epoch_secs(s: &str) -> Option<i64> {
     let bytes = s.as_bytes();

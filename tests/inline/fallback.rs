@@ -9,9 +9,33 @@ use std::sync::Arc;
 
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
-use crate::usage::{UsageInfo, UsageStore, UsageWindow};
+use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
 
-fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64>) -> Profile {
+/// ISO reset an hour ahead — a live 5h window.
+fn live_reset() -> String {
+    epoch_secs_to_iso(now_epoch_secs() + 3600)
+}
+
+/// ISO reset an hour ago — a lapsed 5h window.
+fn expired_reset() -> String {
+    epoch_secs_to_iso(now_epoch_secs() - 3600)
+}
+
+fn window(utilization: f64, resets_at: Option<String>) -> UsageWindow {
+    UsageWindow {
+        utilization,
+        resets_at,
+    }
+}
+
+fn usage_info(five_hour: Option<UsageWindow>) -> UsageInfo {
+    UsageInfo {
+        five_hour,
+        ..UsageInfo::default()
+    }
+}
+
+fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInfo>) -> Profile {
     use std::collections::BTreeMap;
     Profile {
         name: name.into(),
@@ -23,17 +47,21 @@ fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64
         fallback_threshold: threshold,
         bell_threshold: None,
         credentials: None,
-        usage: utilization.map(|u| UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: u,
-                resets_at: None,
-            }),
-            ..UsageInfo::default()
-        }),
+        usage,
         fetch_status: None,
         provider: None,
         third_party_usage: None,
     }
+}
+
+/// Profile whose 5h window is live (future reset) at the given utilization —
+/// the exhaustion predicates only trust a live window.
+fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64>) -> Profile {
+    profile_with_usage(
+        name,
+        threshold,
+        utilization.map(|u| usage_info(Some(window(u, Some(live_reset()))))),
+    )
 }
 
 fn config_with_chain(profiles: Vec<Profile>, active: &str) -> AppConfig {
@@ -126,21 +154,20 @@ fn no_sink_available_returns_none() {
 // read utilization from UsageStore (not Profile.usage). The split avoids the
 // config ↔ store lock inversion against App::apply_usage.
 
+/// Store entries with live 5h windows (future reset) at the given utilizations.
 fn store_with_utils(pairs: &[(&str, f64)]) -> UsageStore {
-    let map: HashMap<String, UsageInfo> = pairs
-        .iter()
-        .map(|(name, util)| {
-            (
-                (*name).to_string(),
-                UsageInfo {
-                    five_hour: Some(UsageWindow {
-                        utilization: *util,
-                        resets_at: None,
-                    }),
-                    ..UsageInfo::default()
-                },
-            )
-        })
+    store_with_infos(
+        pairs
+            .iter()
+            .map(|(name, util)| (*name, usage_info(Some(window(*util, Some(live_reset()))))))
+            .collect(),
+    )
+}
+
+fn store_with_infos(entries: Vec<(&str, UsageInfo)>) -> UsageStore {
+    let map: HashMap<String, UsageInfo> = entries
+        .into_iter()
+        .map(|(name, info)| (name.to_string(), info))
         .collect();
     Arc::new(RankedMutex::new(map))
 }
@@ -404,6 +431,91 @@ fn find_recovered_uses_threshold_per_member() {
         find_recovered_member(&members, &store),
         Some("b".to_string()),
     );
+}
+
+// A member whose 5h window passed its reset has headroom again whatever its
+// last-known utilization says — the wall clock recovered it (issue #2: a sole
+// switched-off profile stayed "spent" forever on a stale 100% snapshot).
+#[test]
+fn find_recovered_recovers_when_window_expired() {
+    let members = vec![ChainMember {
+        name: "a".into(),
+        threshold: 95.0,
+    }];
+    let store = store_with_infos(vec![(
+        "a",
+        usage_info(Some(window(100.0, Some(expired_reset())))),
+    )]);
+    assert_eq!(
+        find_recovered_member(&members, &store),
+        Some("a".to_string()),
+    );
+}
+
+// A fetched entry with no 5h window at all (idle account after a reset) is
+// recovered; only an ABSENT store entry stays undecidable.
+#[test]
+fn find_recovered_recovers_when_windowless() {
+    let members = vec![ChainMember {
+        name: "a".into(),
+        threshold: 95.0,
+    }];
+    let store = store_with_infos(vec![("a", usage_info(None))]);
+    assert_eq!(
+        find_recovered_member(&members, &store),
+        Some("a".to_string()),
+    );
+}
+
+// No resets_at means the window can't be proven live, so it can't hold the
+// member exhausted — same reading `five_hour_live` gives the auto-start leg.
+#[test]
+fn find_recovered_treats_missing_resets_at_as_lapsed() {
+    let members = vec![ChainMember {
+        name: "a".into(),
+        threshold: 95.0,
+    }];
+    let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
+    assert_eq!(
+        find_recovered_member(&members, &store),
+        Some("a".to_string()),
+    );
+}
+
+// The scheduler-side gate must not switch away from an active whose spent
+// window already reset — stale-high utilization, wall clock passed.
+#[test]
+fn auto_switch_ignores_expired_window_active() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(expired_reset()))))),
+        ("b", usage_info(Some(window(50.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+// A chain member whose 100% window lapsed is a viable switch target again.
+#[test]
+fn next_target_accepts_member_with_expired_window() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_info(Some(window(100.0, Some(expired_reset()))))),
+            ),
+        ],
+        "a",
+    );
+    assert_eq!(next_target(&config), Some(SwitchAction::To("b".into())));
 }
 
 // next_auto_switch_target: wrap_off off, spent chain → legacy None.
