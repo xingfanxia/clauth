@@ -23,8 +23,10 @@ use crate::profile::{
 };
 use crate::spinner::Spinner;
 
-/// ASCII alphanumeric + `-_.", not leading-dot, not empty, not a duplicate
-/// (`exclude` exempts the current name for rename-in-place).
+/// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty, not a duplicate
+/// (`exclude` exempts the current name for rename-in-place). `@`/`+` let an
+/// account be named after its email; both are path-separator-free so the name
+/// stays a single `profiles/<name>` segment with no traversal.
 pub(crate) fn validate_profile_name(
     name: &str,
     existing: &[&str],
@@ -36,10 +38,10 @@ pub(crate) fn validate_profile_name(
     }
     let valid_chars = trimmed
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '+'));
     if !valid_chars || trimmed.starts_with('.') {
         bail!(
-            "Name must contain only letters, digits, '-', '_', or '.', and cannot start with '.'."
+            "Name must contain only letters, digits, '-', '_', '.', '@', or '+', and cannot start with '.'."
         );
     }
     if existing

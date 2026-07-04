@@ -203,3 +203,25 @@ fn ensure_login_rejects_invalid_name() {
     assert!(ensure_login_profile(&mut config, ".hidden").is_err());
     assert!(ensure_login_profile(&mut config, "").is_err());
 }
+
+#[test]
+fn validate_profile_name_accepts_email_rejects_path_chars() {
+    for name in [
+        "claude@domain.com",
+        "user2@domain.com",
+        "claude+work@gmail.com",
+    ] {
+        assert!(
+            validate_profile_name(name, &[], None).is_ok(),
+            "{name} rejected"
+        );
+    }
+    // path separators / windows-reserved chars stay blocked so the name can't
+    // escape its profiles/<name> directory segment.
+    for name in ["a/b", "a\\b", "a:b", ".lead", "a b"] {
+        assert!(
+            validate_profile_name(name, &[], None).is_err(),
+            "{name} accepted"
+        );
+    }
+}
