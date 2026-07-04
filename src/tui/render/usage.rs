@@ -496,16 +496,23 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             },
         ));
     }
+    // `spend` is the newer, correctly-typed view of the same credit cap; when it
+    // renders, the legacy `extra_usage` bar would just duplicate it. Fall back to
+    // `extra` only for accounts that expose the legacy field but no `spend` block.
+    let spend_shown = usage.spend.as_ref().is_some_and(|s| s.is_visible());
     if let Some(extra) = &usage.extra_usage
         && extra.is_enabled
+        && !spend_shown
     {
         let pct = extra.utilization.unwrap_or(0.0).clamp(0.0, 100.0);
         let sym = match extra.currency.as_deref() {
             Some("USD") | None => "$",
             Some(other) => other,
         };
-        let used = extra.used_credits.unwrap_or(0.0);
-        let limit = extra.monthly_limit.unwrap_or(0.0);
+        // Legacy `extra_usage` reports money as bare minor units (cents); `spend`
+        // carries the same figures already scaled to dollars. Divide to match.
+        let used = extra.used_credits.unwrap_or(0.0) / 100.0;
+        let limit = extra.monthly_limit.unwrap_or(0.0) / 100.0;
         stats.push(Stat {
             label: "extra".to_string(),
             pct,

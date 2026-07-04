@@ -207,3 +207,55 @@ fn empty_msg_pending_fetch_loads() {
     });
     assert_eq!(oauth_empty_msg(&profile), "loading");
 }
+
+// ── extra / spend credit bar ──────────────────────────────────────────────────
+//
+// `extra_usage` (legacy) and `spend` (newer) are the same credit cap on a real
+// account. `spend` carries dollars; `extra_usage` reports bare minor units.
+
+/// When both blocks are present the `extra` bar is suppressed (spend owns it),
+/// and the legacy fallback scales its cents to dollars instead of showing 100×.
+#[test]
+fn extra_bar_dedups_against_spend_and_scales_cents() {
+    let with = |extra: Option<crate::usage::ExtraUsage>, spend: Option<crate::usage::SpendInfo>| {
+        let mut profile = crate::testutil::blank_profile("a");
+        profile.usage = Some(crate::usage::UsageInfo {
+            plan: None,
+            five_hour: None,
+            seven_day: None,
+            weekly_scoped: Vec::new(),
+            window_dollars: Vec::new(),
+            extra_usage: extra,
+            spend,
+        });
+        collect_stats(&profile)
+    };
+    let extra = crate::usage::ExtraUsage {
+        is_enabled: true,
+        monthly_limit: Some(5000.0),
+        used_credits: Some(487.0),
+        utilization: Some(9.74),
+        currency: Some("USD".to_string()),
+        ..Default::default()
+    };
+    let spend = crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(4.87),
+        limit: Some(50.0),
+        percent: Some(10.0),
+        currency: Some("USD".to_string()),
+    };
+
+    // Real account (both blocks): only `spend` renders, no duplicate `extra`.
+    let both = with(Some(extra.clone()), Some(spend));
+    assert!(both.iter().any(|s| s.label == "spend"));
+    assert!(
+        !both.iter().any(|s| s.label == "extra"),
+        "extra suppressed while spend is visible"
+    );
+
+    // Legacy-only account: `extra` falls back, cents scaled to dollars.
+    let legacy = with(Some(extra), None);
+    let bar = legacy.iter().find(|s| s.label == "extra").unwrap();
+    assert_eq!(bar.amount, "$4.87 / $50.00");
+}
