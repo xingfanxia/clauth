@@ -254,8 +254,10 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
         "extra suppressed while spend is visible"
     );
 
-    // Legacy-only account: `extra` falls back, cents scaled to dollars.
+    // Legacy-only account: `extra` falls back, cents scaled to dollars, and the
+    // figure rides the trailing line (where window bars show `resets in`).
     let legacy = with(Some(extra), None);
     let bar = legacy.iter().find(|s| s.label == "extra").unwrap();
-    assert_eq!(bar.amount, "$4.87 / $50.00");
+    assert_eq!(bar.trailing, "$4.87 / $50.00");
+    assert!(bar.amount.is_empty());
 }

@@ -517,9 +517,10 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             label: "extra".to_string(),
             pct,
             color: Style::default().fg(theme::util_color(pct)),
-            trailing: String::new(),
-            // Credits used/limit sits on the eyebrow before the %, like the bars.
-            amount: format!("{sym}{used:.2} / {sym}{limit:.2}"),
+            // Credits used/limit ride the bar's trailing line, where window bars
+            // show their reset countdown, so the eyebrow carries just the %.
+            trailing: format!("{sym}{used:.2} / {sym}{limit:.2}"),
+            amount: String::new(),
             burn_rate: None,
             rate_unit: "h",
             pace_pct: None,
@@ -538,7 +539,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
                 Some("USD") | None => "$",
                 Some(other) => other,
             };
-            let amount = match (period.used_credits, period.monthly_limit) {
+            let cost = match (period.used_credits, period.monthly_limit) {
                 (Some(u), Some(l)) => format!("{sym}{u:.2} / {sym}{l:.2}"),
                 (Some(u), None) => format!("{sym}{u:.2}"),
                 _ => String::new(),
@@ -547,8 +548,8 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
                 label: label.to_string(),
                 pct,
                 color: Style::default().fg(theme::util_color(pct)),
-                trailing: String::new(),
-                amount,
+                trailing: cost,
+                amount: String::new(),
                 burn_rate: None,
                 rate_unit: "h",
                 pace_pct: None,
@@ -565,7 +566,7 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             Some(other) => other,
         };
         let used = spend.used.unwrap_or(0.0);
-        let amount = match spend.limit {
+        let cost = match spend.limit {
             Some(limit) => format!("{sym}{used:.2} / {sym}{limit:.2}"),
             None => format!("{sym}{used:.2}"),
         };
@@ -573,8 +574,8 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
             label: "spend".to_string(),
             pct,
             color: Style::default().fg(theme::util_color(pct)),
-            trailing: String::new(),
-            amount,
+            trailing: cost,
+            amount: String::new(),
             burn_rate: None,
             rate_unit: "h",
             pace_pct: None,
