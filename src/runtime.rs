@@ -21,14 +21,17 @@
 //!   other before another session can pick up a stale refresh token.
 //!
 //! Reference counting lives in a sibling `sessions/` directory: each
-//! session creates `sessions/<pid>` and holds an exclusive `flock(2)` on it
-//! for its lifetime. New sessions prune entries whose lock is free
-//! (previous holder died) and tear the runtime tree down when no live
-//! sessions remain.
+//! session creates `sessions/<pid>-<n>` and holds an exclusive `flock(2)` on
+//! it for its lifetime. The `-<n>` suffix keeps the file unique per acquire,
+//! so one process holding several concurrent sessions of the same profile
+//! (the `clauth mcp` server running overlapping `delegate`s) never collides
+//! on a single path. New sessions prune entries whose lock is free (previous
+//! holder died) and tear the runtime tree down when no live sessions remain.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
@@ -111,6 +114,15 @@ const ISOLATED_SKIP: &[&str] = &[
 /// must consider both so a rotation never spends a token an isolated session
 /// still holds.
 const SESSION_ISOLATIONS: [Isolation; 2] = [Isolation::Shared, Isolation::Isolated];
+
+/// Per-process counter making each `acquire`'s session file unique. A single
+/// process can hold several live sessions of the same profile+flavor at once —
+/// the `clauth mcp` server firing overlapping `delegate`s. Keying only on
+/// `sessions/<pid>` would make the second acquire block forever on the first's
+/// `flock(2)` (an exclusive lock on a second fd of the same path waits), hanging
+/// the delegate in `acquire` with no session ever spawned. The suffix gives each
+/// acquire its own liveness marker.
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn runtime_dir(name: &str, isolation: Isolation) -> Result<PathBuf> {
     profile_subpath(name, isolation.runtime_subdir())
@@ -293,7 +305,8 @@ impl ProfileRuntime {
         }
         let runtime = runtime_dir(name, isolation)?;
         let sessions = sessions_dir(name, isolation)?;
-        let pid_file = sessions.join(std::process::id().to_string());
+        let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid_file = sessions.join(format!("{}-{seq}", std::process::id()));
         let canonical = canonical_credentials(name)?;
 
         // Hold the per-profile rotation lock across the session-stamp window so

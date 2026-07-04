@@ -1114,16 +1114,28 @@ fn acquire_creates_runtime_and_pid_file() {
             "runtime dir must exist after acquire"
         );
 
-        let pid = std::process::id().to_string();
         let sessions = tmp
             .path()
             .join(".clauth")
             .join("profiles")
             .join("lifecycle")
             .join("sessions");
-        assert!(sessions.join(&pid).exists(), "PID file must exist");
+        let session_files: Vec<PathBuf> = fs::read_dir(&sessions)
+            .expect("read sessions")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(session_files.len(), 1, "exactly one PID file");
+        let pid_file = &session_files[0];
         assert!(
-            is_session_alive(&sessions.join(&pid)),
+            pid_file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&format!("{}-", std::process::id()))),
+            "session file must carry the `<pid>-` prefix"
+        );
+        assert!(
+            is_session_alive(pid_file),
             "PID file must be flock-held while runtime is alive"
         );
 
@@ -1142,7 +1154,6 @@ fn acquire_creates_runtime_and_pid_file() {
 
         drop(rt);
 
-        assert!(!sessions.join(&pid).exists(), "PID file removed on drop");
         assert!(
             !expected_runtime.exists(),
             "runtime dir torn down on last-session drop"
@@ -1222,9 +1233,55 @@ fn acquire_isolates_credentials_from_real_home() {
     });
 }
 
+/// Regression: one process holding two concurrent sessions of the same
+/// profile+flavor must not collide on the session file. Before the per-acquire
+/// `-<n>` suffix both keyed `sessions/<pid>`, so the second `acquire` blocked
+/// forever on the first's `flock(2)` — the background-`delegate` hang where a
+/// second same-profile job never spawned a session. Both must register live,
+/// and teardown must wait for the last drop.
+#[test]
+fn acquire_twice_same_process_counts_two_sessions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = make_profile("concurrent");
+
+        let rt1 = ProfileRuntime::acquire(&profile, Isolation::Shared).expect("first acquire");
+        // Pre-fix this second acquire blocks forever on the shared PID flock.
+        let rt2 = ProfileRuntime::acquire(&profile, Isolation::Shared).expect("second acquire");
+
+        assert_eq!(
+            live_session_count("concurrent"),
+            2,
+            "two concurrent same-process sessions must both register live"
+        );
+
+        let runtime = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("concurrent")
+            .join("runtime");
+
+        drop(rt2);
+        assert!(
+            runtime.exists(),
+            "runtime must survive while a sibling session is still live"
+        );
+        assert_eq!(live_session_count("concurrent"), 1);
+
+        drop(rt1);
+        assert!(
+            !runtime.exists(),
+            "runtime torn down once the last session drops"
+        );
+    });
+}
+
 /// `build_runtime_dir` re-walk must pick up entries added between two acquires.
-/// Uses underlying functions directly — two `ProfileRuntime::acquire` calls in
-/// the same process deadlock on the PID flock (`flock(LOCK_EX)` on same path).
+/// Drives `build_runtime_dir` directly to isolate the re-walk from the rest of
+/// the acquire path (watchdog spawn, flock, teardown).
 #[test]
 fn build_runtime_dir_rewalk_picks_up_late_entries() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1275,8 +1332,8 @@ fn build_runtime_dir_rewalk_picks_up_late_entries() {
     });
 }
 
-/// A second live session must prevent teardown. Direct calls only — two
-/// `ProfileRuntime::acquire` in the same process deadlock via `flock`.
+/// A second live session must prevent teardown. Drives `prune_stale_sessions`
+/// on hand-placed flock files to test the count logic in isolation.
 #[test]
 fn prune_with_two_live_sessions_returns_two() {
     let tmp = tempfile::tempdir().expect("tempdir");
