@@ -137,8 +137,8 @@ only); fish gets its own completions dir. The answer is saved to
 
 - `unsafe` is denied across the crate (`unsafe_code = "deny"`,
   `unsafe_op_in_unsafe_fn = "deny"`).
-- CI runs `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, and the test
-  suite on every push and PR.
+- CI runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  and the test suite (`--all-features`) on Linux, macOS, Windows for every push and PR.
 - `cargo-deny` (advisories denied by default, license allowlist, sources locked to
   crates.io, `openssl` banned in favor of rustls) and `cargo-audit` both run in CI.
 - `Cargo.lock` is committed and dependency versions are pinned.
