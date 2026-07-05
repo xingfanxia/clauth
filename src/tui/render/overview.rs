@@ -15,9 +15,7 @@ use super::format::{
 use super::panes::{bold_when, draw_scrollbar, empty_state, section_box, select_line};
 use crate::fallback::{SwitchAction, next_target, soonest_resume, threshold_for};
 use crate::profile::{AppConfig, Profile};
-use crate::usage::{
-    LABEL_5H, LABEL_7D, ProfileActivity, UsageInfo, UsageWindow, humanize_duration, now_ms,
-};
+use crate::usage::{LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_ms};
 
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
@@ -450,14 +448,18 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
         && let Some(usage) = usage_info.five_hour.as_ref()
     {
         let threshold = threshold_for(profile);
-        let eta_secs = burn_rate_eta(app, active_name, usage_info, usage.utilization, threshold);
+        // In-memory rate (`app.history_cache`) — no disk read while `cfg` (the
+        // config guard) is held. Shared by the ETA line below and the
+        // burn-aware projection passed into `next_target`.
+        let active_rate = app.active_burn_rate(active_name, usage_info);
+        let eta_secs = burn_rate_eta(active_rate, usage.utilization, threshold);
         let reset_secs = super::format::reset_in_secs(usage);
         // Only project a switch when the account crosses its threshold BEFORE the
         // 5h window resets — past the reset the window refills and no switch fires.
         if let Some(secs) = eta_secs
             && reset_secs.is_none_or(|reset| secs < reset)
         {
-            match next_target(&cfg) {
+            match next_target(&cfg, active_rate) {
                 Some(SwitchAction::To(target)) => {
                     lines.push(Line::from(vec![
                         Span::raw("  "),
@@ -591,33 +593,15 @@ fn chain_state_style(profile: Option<&Profile>, pct: f64, threshold: f64) -> Sty
     }
 }
 
-/// Project seconds until a profile's utilization crosses the threshold, based on
-/// 5h window burn rate. Returns `None` when there aren't enough samples, the
-/// rate is flat/negative, or utilization is already at/above the threshold.
-fn burn_rate_eta(
-    app: &App,
-    name: &str,
-    current_usage: &UsageInfo,
-    current: f64,
-    threshold: f64,
-) -> Option<i64> {
+/// Seconds until `current` crosses `threshold` at the given 5h-window burn
+/// `rate` (%/h, from [`App::active_burn_rate`]). Returns `None` when there's no
+/// rate yet, the rate is flat/negative, or utilization is already at/above the
+/// threshold.
+fn burn_rate_eta(rate: Option<f64>, current: f64, threshold: f64) -> Option<i64> {
     if current >= threshold {
         return None;
     }
-    let five_h = current_usage.five_hour.as_ref().map(|w| ("5h", w));
-    let rate = five_h.and_then(|pair| {
-        let mut rates = crate::usage::compute_burn_rates_from_history(
-            app.history_cache
-                .get(name)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]),
-            std::slice::from_ref(&pair),
-            60 * 60 * 1000, // lookback_ms: last 1h of samples, aligned with %/h
-            3,              // min_samples before a rate is shown
-            10 * 60 * 1000, // gap_cut_ms: cut idle gaps for ETA projection
-        );
-        rates.remove("5h").flatten()
-    })?;
+    let rate = rate?;
     if rate <= 0.0 {
         return None;
     }

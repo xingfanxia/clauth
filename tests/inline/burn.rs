@@ -227,3 +227,62 @@ fn recency_weighting_favors_recent_slope() {
         "rate={rate} should exceed the flat-average 10 %/h"
     );
 }
+
+// --- project_utilization (issue #8 follow-up b: burn-aware auto-switch) ---
+
+#[test]
+fn project_utilization_zero_burn_runs_flat() {
+    // Idle account: burn floored at 0, so the projection is just the current
+    // value regardless of the interval — "run to ~100" only via real
+    // accumulation, never a phantom drop or climb.
+    assert_eq!(project_utilization(42.0, 0.0, 90_000), 42.0);
+}
+
+#[test]
+fn project_utilization_negative_burn_cannot_drop_projection() {
+    // A negative slope (noisy fit artifact) can't project a *drop* mid-window
+    // — floored at 0, same as idle.
+    assert_eq!(project_utilization(50.0, -30.0, 90_000), 50.0);
+}
+
+#[test]
+fn project_utilization_nan_burn_treated_as_idle() {
+    // f64::max returns the non-NaN operand, so a NaN rate floors to 0 same as
+    // idle rather than poisoning the projection.
+    assert_eq!(project_utilization(42.0, f64::NAN, 90_000), 42.0);
+}
+
+#[test]
+fn project_utilization_heavy_burn_crosses_cap_within_one_poll() {
+    // 90% now, burning 1200 %/h, a 90s (0.025h) poll: 90 + 1200*0.025 = 120.
+    let projected = project_utilization(90.0, 1200.0, 90_000);
+    assert!((projected - 120.0).abs() < 0.01, "projected={projected}");
+    assert!(
+        projected >= 100.0,
+        "heavy burn must cross the cap before the next poll"
+    );
+}
+
+#[test]
+fn project_utilization_light_burn_stays_under_cap() {
+    // 90% now, a light 4 %/h burn over a 90s poll barely moves — nowhere near
+    // the cap, unlike the heavy-burn case above.
+    let projected = project_utilization(90.0, 4.0, 90_000);
+    assert!(projected < 91.0, "projected={projected}");
+    assert!(projected < 100.0);
+}
+
+#[test]
+fn project_utilization_already_at_cap_stays_at_cap() {
+    assert!(project_utilization(100.0, 0.0, 90_000) >= 100.0);
+    assert!(project_utilization(105.0, 0.0, 90_000) >= 100.0);
+}
+
+#[test]
+fn project_utilization_absurd_burn_clamps_to_finite_max() {
+    // burn * hours overflows to +inf (f64::MAX * 2.0 for a 2h poll); the clamp
+    // catches it instead of leaking NaN/inf into the caller's `>= 100` check.
+    let projected = project_utilization(50.0, f64::MAX, 7_200_000);
+    assert_eq!(projected, f64::MAX);
+    assert!(projected.is_finite());
+}

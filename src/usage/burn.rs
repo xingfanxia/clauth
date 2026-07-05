@@ -3,6 +3,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::usage::{UsageInfo, UsageWindow};
 
+/// Lookback window shared by the burn-aware switch projection (`fallback.rs`)
+/// and the Overview ETA line (`burn_rate_eta`) — both trust only the last hour
+/// of 5h-window samples, matching the `%/h` rate they display.
+pub(crate) const BURN_LOOKBACK_MS: u64 = 60 * 60 * 1000;
+/// Minimum distinct samples before either consumer trusts a computed rate.
+pub(crate) const BURN_MIN_SAMPLES: usize = 3;
+/// Idle-gap cutoff shared by the same two consumers — an idle stretch longer
+/// than this slices the history down to the active period after it.
+pub(crate) const BURN_GAP_CUT_MS: u64 = 10 * 60 * 1000;
+
 /// Utilization of the window named `label` in this snapshot, or `None` if the
 /// snapshot has no such window. Resolves dynamically against [`UsageInfo::windows`]
 /// so per-model labels (`"7d fable"`, …) work without a hardcoded arm.
@@ -153,6 +163,28 @@ fn weighted_rate_per_hour(entries: &[(u64, f64)], half_life_ms: f64) -> Option<f
     }
     let slope_per_ms = (sw * swxy - swx * swy) / denom;
     Some(slope_per_ms * 3_600_000.0)
+}
+
+/// Projects a window's utilization at the next scheduler poll: current value
+/// plus the recent burn rate (%/h, from [`compute_burn_rates_from_history`])
+/// times the refresh interval. Burn is floored at 0 — an idle or negative rate
+/// can't project a utilization *drop* mid-window, so an idle account simply
+/// projects flat at its current value ("run to ~100" only via real
+/// accumulation). The result is clamped finite so a corrupt or extreme rate
+/// can't produce NaN/overflow at the caller's `>= 100` comparison.
+///
+/// Drives the opt-in burn-aware auto-switch decision (issue #8 follow-up b,
+/// `fallback::is_exhausted_projected`): switch the ACTIVE profile when the
+/// projected value crosses the 100% cap, instead of waiting for the static
+/// per-profile threshold.
+pub(crate) fn project_utilization(util_pct: f64, burn_pct_per_hour: f64, interval_ms: u64) -> f64 {
+    let hours = interval_ms as f64 / 3_600_000.0;
+    let projected = util_pct + burn_pct_per_hour.max(0.0) * hours;
+    if projected.is_finite() {
+        projected
+    } else {
+        f64::MAX
+    }
 }
 
 #[cfg(test)]

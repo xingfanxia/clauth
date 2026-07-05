@@ -236,6 +236,10 @@ pub(crate) enum GlobalConfigRow {
     RefreshInterval,
     /// Default action when CC overwrites the credentials symlink. ⏎/space cycles.
     DivergenceDefault,
+    /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`, issue #8
+    /// follow-up b) — off by default, projects the ACTIVE profile's
+    /// utilization ahead of the next poll instead of the static threshold.
+    BurnAware,
 }
 
 /// Inline editor state for the Config detail pane. Built on entry, torn down
@@ -1353,6 +1357,29 @@ impl App {
         });
     }
 
+    /// Recency-weighted burn rate (%/h) for `name`'s 5h window, computed from
+    /// the in-memory `history_cache` — never touches disk. Shared by the
+    /// Overview ETA line (`render/overview.rs`) and the burn-aware auto-switch
+    /// one-shot below so neither the render pass nor this UI-thread check ever
+    /// reads `usage_history.jsonl` while holding the config guard;
+    /// `fallback::burn_rate_for_profile` is the disk-reading twin used off the
+    /// render/UI thread (the scheduler tick, after locks are dropped).
+    pub(crate) fn active_burn_rate(&self, name: &str, usage_info: &UsageInfo) -> Option<f64> {
+        let five_h = usage_info.five_hour.as_ref().map(|w| ("5h", w))?;
+        crate::usage::compute_burn_rates_from_history(
+            self.history_cache
+                .get(name)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            std::slice::from_ref(&five_h),
+            crate::usage::BURN_LOOKBACK_MS,
+            crate::usage::BURN_MIN_SAMPLES,
+            crate::usage::BURN_GAP_CUT_MS,
+        )
+        .remove("5h")
+        .flatten()
+    }
+
     /// UI-thread tail of bootstrap: rebuilds token snapshot, starts scheduler,
     /// applies usage, runs startup auto-switch. No HTTP.
     fn finish_bootstrap(&mut self) {
@@ -1366,14 +1393,21 @@ impl App {
             // risks acting on a window the account no longer has. Stale profiles
             // are due on the scheduler's first tick, which fetches then
             // auto-switches off the corrected numbers.
-            let active_fresh = cfg
+            let active_profile = cfg
                 .state
                 .active_profile
                 .as_deref()
-                .and_then(|n| cfg.find(n))
-                .is_some_and(|p| p.fetch_status == Some(FetchStatus::Fresh));
+                .and_then(|n| cfg.find(n));
+            let active_fresh =
+                active_profile.is_some_and(|p| p.fetch_status == Some(FetchStatus::Fresh));
             if active_fresh {
-                auto_switch_if_needed(&mut cfg).ok().flatten()
+                // In-memory rate only (`history_cache`) — never a disk read
+                // while the config guard is held; see `active_burn_rate`.
+                let rate = active_profile.and_then(|p| {
+                    let usage = p.usage.as_ref()?;
+                    self.active_burn_rate(p.name.as_str(), usage)
+                });
+                auto_switch_if_needed(&mut cfg, rate).ok().flatten()
             } else {
                 None
             }
@@ -2898,11 +2932,12 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
 ];
 
 /// Rows on the program-wide Config tab, in display order.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 4] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 5] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::WrapOff,
+    GlobalConfigRow::BurnAware,
 ];
 
 /// Config tab keymap (enumerated rows only, per the unified value-row grammar):
@@ -2953,6 +2988,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
         GlobalConfigRow::WrapOff => toggle_wrap_off(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
+        GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
     }
 }
 
@@ -3113,6 +3149,21 @@ fn toggle_wrap_off(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.wrap_off = !cfg.state.wrap_off;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+}
+
+/// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
+/// `wrap_off`'s persistence shape exactly: mutate the shared `AppConfig`,
+/// `save_app_state`, bump `last_state_mtime` — no separate propagation to the
+/// scheduler is needed since both `next_target` and `next_auto_switch_target`
+/// read the flag straight off the same shared `config` (`snapshot_chain`
+/// mirrors `wrap_off`'s copy into `ChainSnapshot`).
+fn toggle_burn_aware_switching(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.burn_aware_switching = !cfg.state.burn_aware_switching;
         let _ = save_app_state(&cfg.state);
     }
     app.last_state_mtime = app_state_mtime();

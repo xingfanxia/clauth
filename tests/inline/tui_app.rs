@@ -346,6 +346,62 @@ fn divergence_default_row_is_reachable_by_cursor() {
     assert_eq!(app.global_config_cursor, pos);
 }
 
+// ── burn-aware switching (issue #8 follow-up b) ─────────────────────────────
+
+#[test]
+fn burn_aware_row_is_reachable_by_cursor() {
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    let pos = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::BurnAware)
+        .unwrap();
+
+    app.global_config_cursor = pos;
+    let from_up = if pos == 0 {
+        GLOBAL_CONFIG_ROWS.len() - 1
+    } else {
+        pos - 1
+    };
+    super::handle_global_config_key(&mut app, key(KeyCode::Up));
+    assert_eq!(app.global_config_cursor, from_up);
+    super::handle_global_config_key(&mut app, key(KeyCode::Down));
+    assert_eq!(app.global_config_cursor, pos);
+}
+
+#[test]
+fn burn_aware_space_toggles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::BurnAware)
+        .unwrap();
+    assert!(!app.config().state.burn_aware_switching, "off by default");
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        app.config().state.burn_aware_switching,
+        "space toggles the mode on"
+    );
+
+    // Persisted to profiles.toml, not just the in-memory config — reload it
+    // fresh, the way a relaunch would pick up the flag.
+    let reloaded: crate::profile::AppState = toml::from_str(
+        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+            .expect("read profiles.toml"),
+    )
+    .expect("parse profiles.toml");
+    assert!(reloaded.burn_aware_switching, "toggle persists to disk");
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.burn_aware_switching,
+        "space toggles the mode back off"
+    );
+}
+
 // ── refresh interval custom value ──────────────────────────────────────────
 
 use super::parse_refresh_secs;

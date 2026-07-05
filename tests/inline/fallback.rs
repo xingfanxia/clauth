@@ -103,7 +103,7 @@ fn all_maxed_sinks_no_switch() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config), None);
+    assert_eq!(next_target(&config, None), None);
 }
 
 // Active (unmarked, threshold 95) at 100%; B is marked last_resort at an 80%
@@ -119,7 +119,7 @@ fn non_sink_active_migrates_to_sink_once() {
         "a",
     );
     assert_eq!(
-        next_target(&config),
+        next_target(&config, None),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -135,7 +135,7 @@ fn sink_active_maxed_stays_put() {
         ],
         "b",
     );
-    assert_eq!(next_target(&config), None);
+    assert_eq!(next_target(&config, None), None);
 }
 
 // Active marked last_resort (80% threshold, maxed), B has headroom (95% @
@@ -151,7 +151,7 @@ fn sink_active_switches_to_member_with_headroom() {
         "a",
     );
     assert_eq!(
-        next_target(&config),
+        next_target(&config, None),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -166,7 +166,7 @@ fn no_sink_available_returns_none() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config), None);
+    assert_eq!(next_target(&config, None), None);
 }
 
 // ── issue #8 follow-up: threshold no longer implies last_resort ─────────────
@@ -186,7 +186,7 @@ fn unmarked_hundred_threshold_active_no_longer_acts_as_sink() {
         "a",
     );
     config.state.wrap_off = true;
-    assert_eq!(next_target(&config), Some(SwitchAction::Off));
+    assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
 // Same decoupling from the other direction: an unmarked 100%-threshold OTHER
@@ -203,7 +203,7 @@ fn wrap_off_switches_off_when_unmarked_hundred_threshold_member_present() {
         "a",
     );
     config.state.wrap_off = true;
-    assert_eq!(next_target(&config), Some(SwitchAction::Off));
+    assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
 // ── next_auto_switch_target ───────────────────────────────────────────────────
@@ -379,7 +379,7 @@ fn wrap_off_switches_off_when_chain_spent() {
         "a",
     );
     config.state.wrap_off = true;
-    assert_eq!(next_target(&config), Some(SwitchAction::Off));
+    assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
 // next_target: wrap_off on but a last_resort member exists (at an 80%
@@ -395,7 +395,7 @@ fn wrap_off_prefers_sink_over_off() {
     );
     config.state.wrap_off = true;
     assert_eq!(
-        next_target(&config),
+        next_target(&config, None),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -412,7 +412,7 @@ fn wrap_off_skips_off_when_active_has_headroom() {
     );
     config.state.wrap_off = true;
     // a at 50% < 95% → not exhausted → stay
-    assert_eq!(next_target(&config), None);
+    assert_eq!(next_target(&config, None), None);
 }
 
 // next_target: same spent chain, wrap_off off → legacy None.
@@ -425,7 +425,7 @@ fn wrap_off_disabled_stays_put() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config), None);
+    assert_eq!(next_target(&config, None), None);
 }
 
 // ── soonest_resume ───────────────────────────────────────────────────────────
@@ -734,7 +734,10 @@ fn next_target_accepts_member_with_expired_window() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config), Some(SwitchAction::To("b".into())));
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".into()))
+    );
 }
 
 // next_auto_switch_target: wrap_off off, spent chain → legacy None.
@@ -750,4 +753,196 @@ fn auto_switch_wrap_off_disabled_stays_put() {
     let snap = snapshot_chain(&config).expect("snapshot");
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
     assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+// ── issue #8 follow-up b: burn-aware auto-switch (opt-in, default off) ─────
+//
+// `is_exhausted_projected`/`is_exhausted_active`/`is_exhausted_active_from_store`
+// only ever change the ACTIVE profile's own exhaustion decision; candidate
+// selection stays on the static `is_exhausted`/`is_exhausted_from_store`
+// tested above (unchanged by this section).
+
+#[test]
+fn is_exhausted_projected_none_burn_falls_back_to_static_threshold() {
+    assert!(
+        is_exhausted_projected(96.0, 95.0, None, 90_000),
+        "over threshold, no rate available → static check fires"
+    );
+    assert!(
+        !is_exhausted_projected(90.0, 95.0, None, 90_000),
+        "under threshold, no rate available → static check doesn't fire"
+    );
+}
+
+#[test]
+fn is_exhausted_projected_heavy_burn_fires_before_static_threshold() {
+    // 90% is under the 95% static threshold, but a 1200 %/h burn over a 90s
+    // poll projects to 120% — the cap fires ahead of the static check.
+    assert!(is_exhausted_projected(90.0, 95.0, Some(1200.0), 90_000));
+}
+
+#[test]
+fn is_exhausted_projected_light_burn_runs_past_static_threshold() {
+    // 96% is already over the 95% static threshold, but a light 4 %/h burn
+    // over a 90s poll barely moves — nowhere near the 100% cap, so burn-aware
+    // mode keeps running where mode-off would already have switched.
+    assert!(!is_exhausted_projected(96.0, 95.0, Some(4.0), 90_000));
+}
+
+#[test]
+fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
+    // Mode off must reproduce `is_exhausted` bit for bit — no divergence from
+    // today's static behavior regardless of what a rate would otherwise say.
+    let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
+    let headroom = profile_with_util("a", Some(95.0), Some(50.0));
+    assert_eq!(
+        is_exhausted_active(&exhausted, false, 90_000, None),
+        is_exhausted(&exhausted)
+    );
+    assert_eq!(
+        is_exhausted_active(&headroom, false, 90_000, None),
+        is_exhausted(&headroom)
+    );
+    assert!(is_exhausted_active(&exhausted, false, 90_000, None));
+    assert!(!is_exhausted_active(&headroom, false, 90_000, None));
+}
+
+// Burn-aware ON but no rate available (fresh profile / first tick, or the
+// caller's in-memory history is empty): falls back to the same static
+// comparison mode-off uses — never leaves an account uncovered for lack of
+// data. `is_exhausted_active` takes the rate as a parameter and never reads
+// disk itself (that's the caller's job — `App::active_burn_rate` in-memory on
+// the UI thread, `fallback::burn_rate_for_profile` on disk for the scheduler),
+// so this needs no sandboxed HOME.
+#[test]
+fn is_exhausted_active_burn_aware_falls_back_without_rate() {
+    let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
+    let headroom = profile_with_util("a", Some(95.0), Some(50.0));
+    assert!(is_exhausted_active(&exhausted, true, 90_000, None));
+    assert!(!is_exhausted_active(&headroom, true, 90_000, None));
+}
+
+// Same fallback, exercised through the full `next_target` entry point (wrap-off
+// path) rather than the `is_exhausted_active` unit — pins that mode-on with no
+// rate available agrees with mode-off all the way through the public walk.
+#[test]
+fn next_target_burn_aware_none_rate_falls_back_to_static_threshold() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(95.0), Some(100.0)),
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    config.state.burn_aware_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::Off),
+        "no rate available → static 100% >= 95% threshold fires, same as mode off"
+    );
+}
+
+/// Writes `entries` as `usage_history.jsonl` lines for `name` — the on-disk
+/// shape `crate::profile::load_usage_history` parses. Callers must hold a
+/// `HomeSandbox` so this lands in a sandboxed home, never the real one.
+fn write_history(name: &str, entries: &[(u64, UsageInfo)]) {
+    let path = crate::profile::profile_history_path(name).expect("history path");
+    std::fs::create_dir_all(path.parent().expect("parent dir")).expect("mkdir");
+    let mut body = String::new();
+    for (ts, usage) in entries {
+        let line = serde_json::json!({ "ts": ts, "name": name, "usage": usage });
+        body.push_str(&serde_json::to_string(&line).expect("serialize history line"));
+        body.push('\n');
+    }
+    std::fs::write(&path, body).expect("write history");
+}
+
+// End-to-end proof that the UI-thread walk (`next_target`) and the
+// scheduler-side walk (`next_auto_switch_target`) agree: a heavy burn on the
+// active flips the wrap-off decision from "stay" to "switch off" before it
+// ever reaches its 95% static threshold, on both paths.
+//
+// `b` is pinned exhausted (100%, no `last_resort`) on both members so the
+// headroom-walk and last-resort-walk (unaffected by burn-aware mode by
+// design) both come up empty either way; the only thing that can move the
+// outcome is the ACTIVE-only decision this issue changes — the wrap-off
+// Off-check inside `next_target`, and the entry gate inside
+// `next_auto_switch_target`.
+#[test]
+fn burn_aware_heavy_burn_flips_wrap_off_decision_on_both_walks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    // Perfectly linear climb, 30 → 90 over 6 minutes = 600 %/h.
+    write_history(
+        "a",
+        &[
+            (
+                now - 360_000,
+                usage_info(Some(window(30.0, Some(live_reset())))),
+            ),
+            (
+                now - 240_000,
+                usage_info(Some(window(50.0, Some(live_reset())))),
+            ),
+            (
+                now - 120_000,
+                usage_info(Some(window(70.0, Some(live_reset())))),
+            ),
+        ],
+    );
+
+    // Static (mode off): 90% is still under the 95% threshold — active isn't
+    // exhausted yet, so wrap-off's Off-check never fires.
+    let mut static_config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(90.0)),
+            profile_with_util("b", Some(95.0), Some(100.0)),
+        ],
+        "a",
+    );
+    static_config.state.wrap_off = true;
+    assert_eq!(
+        next_target(&static_config, None),
+        None,
+        "static mode: 90% is still under the 95% threshold, active stays"
+    );
+
+    // `next_target` takes the burn rate as a parameter — it never reads disk
+    // itself. Source it the same way `burn_rate_for_profile` does here,
+    // standing in for the caller's in-memory `history_cache` lookup
+    // (`App::active_burn_rate`) that feeds the real UI-thread call site.
+    let active_window = window(90.0, Some(live_reset()));
+    let rate = burn_rate_for_profile("a", &active_window).expect("rate computed from history");
+    assert!((rate - 600.0).abs() < 1.0, "expected ~600 %/h, got {rate}");
+
+    // Burn-aware: 90% + 600 %/h over a 90s poll projects to 105% — the active
+    // is judged exhausted a full 5 points before the static threshold, and
+    // with `b` exhausted too and no sink, wrap-off switches off.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(90.0)),
+            profile_with_util("b", Some(95.0), Some(100.0)),
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    config.state.burn_aware_switching = true;
+    config.state.refresh_interval_ms = 90_000;
+    assert_eq!(
+        next_target(&config, Some(rate)),
+        Some(SwitchAction::Off),
+        "burn-aware mode: heavy burn projects past 100% within one poll, no sink → Off"
+    );
+
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert!(snap.wrap_off);
+    assert!(snap.burn_aware);
+    assert_eq!(snap.interval_ms, 90_000);
+    let store = store_with_utils(&[("a", 90.0), ("b", 100.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::Off),
+        "scheduler-side walk agrees with next_target under burn-aware mode"
+    );
 }

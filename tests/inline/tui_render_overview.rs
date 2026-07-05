@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::profile::{AppState, ProfileName};
-use crate::usage::{epoch_secs_to_iso, now_epoch_secs};
+use crate::usage::{UsageInfo, epoch_secs_to_iso, now_epoch_secs};
 use std::collections::BTreeMap;
 
 /// ISO reset `secs` in the future.

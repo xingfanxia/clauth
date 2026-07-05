@@ -226,6 +226,17 @@ pub(crate) struct AppState {
     /// credentials and unsets the active profile instead of staying put.
     #[serde(default)]
     pub(crate) wrap_off: bool,
+    /// When true, the fallback-chain auto-switch decision for the ACTIVE
+    /// profile projects its utilization at the next poll (current + recent
+    /// burn rate × refresh interval) instead of comparing against the static
+    /// per-profile threshold — switching exactly when it would otherwise
+    /// cross 100% before the scheduler notices. Falls back to the static
+    /// threshold check when no burn rate is available yet. Off by default:
+    /// the static threshold stays the default auto-switch behavior (issue #8
+    /// follow-up b). Candidate selection and `soonest_resume` are unaffected
+    /// either way — see `fallback::is_exhausted_active`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) burn_aware_switching: bool,
     /// Config-file theme override. CLI `--theme` flag takes priority; auto-
     /// detect applies when this is `None` and no flag was passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,6 +297,7 @@ impl Default for AppState {
             profiles: Vec::new(),
             fallback_chain: Vec::new(),
             wrap_off: false,
+            burn_aware_switching: false,
             theme: None,
             show_estimates: true,
             show_pace: false,

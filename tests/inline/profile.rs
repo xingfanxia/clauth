@@ -54,6 +54,48 @@ fn last_resort_round_trips_through_config_toml() {
     assert!(parsed.last_resort);
 }
 
+// `burn_aware_switching` (issue #8 follow-up b) must default to `false` so
+// every existing profiles.toml written before this field existed keeps
+// loading unchanged, matching the `last_resort` guarantee above at the
+// `AppState` level.
+#[test]
+fn app_state_burn_aware_switching_defaults_false() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(!state.burn_aware_switching);
+}
+
+#[test]
+fn app_state_reads_burn_aware_switching_true() {
+    let toml = "profiles = []\nburn_aware_switching = true\n";
+    let state: AppState = toml::from_str(toml).expect("parse state");
+    assert!(state.burn_aware_switching);
+}
+
+// On must round-trip explicitly; off (the default) is omitted entirely from
+// the rendered profiles.toml, matching `show_pace`/`count_cache`'s treatment
+// of their own default-off booleans.
+#[test]
+fn burn_aware_switching_round_trips_and_is_omitted_when_off() {
+    let on = AppState {
+        burn_aware_switching: true,
+        ..AppState::default()
+    };
+    let rendered_on = toml::to_string_pretty(&on).expect("render on state");
+    assert!(
+        rendered_on.contains("burn_aware_switching = true"),
+        "on must render explicitly, got:\n{rendered_on}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_on).expect("reparse on state");
+    assert!(reparsed.burn_aware_switching);
+
+    let off = AppState::default();
+    let rendered_off = toml::to_string_pretty(&off).expect("render default state");
+    assert!(
+        !rendered_off.contains("burn_aware_switching"),
+        "off (default) must be omitted, got:\n{rendered_off}"
+    );
+}
+
 #[test]
 fn profile_name_is_serde_transparent() {
     // `ProfileName` must serialize as a bare string so profiles.toml stays

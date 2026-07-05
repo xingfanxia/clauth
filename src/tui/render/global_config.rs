@@ -1,7 +1,8 @@
 //! Program-wide Config tab — a single panel of global settings, distinct from
 //! the per-account Setup tab. Rows back real persisted state in `AppState`:
-//! the theme tier (`[theme]`), the divergence default, the refresh interval, and
-//! the chain-wide wrap-off default. ↑↓ walks the rows; space cycles a row's value
+//! the theme tier (`[theme]`), the divergence default, the refresh interval, the
+//! chain-wide wrap-off default, and the opt-in burn-aware auto-switch mode
+//! (issue #8 follow-up b). ↑↓ walks the rows; space cycles a row's value
 //! in place; ⏎ opens the refresh-interval custom-value editor and otherwise
 //! mirrors space. No left selector, no popups — these settings are global.
 
@@ -25,6 +26,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let wrap_off = app.config().state.wrap_off;
+    let burn_aware = app.config().state.burn_aware_switching;
     let refresh_interval_ms = app
         .refresh_interval
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -43,6 +45,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             *row,
             selected,
             wrap_off,
+            burn_aware,
             refresh_interval_ms,
             default_divergence,
             row_editing,
@@ -102,6 +105,10 @@ fn row_hint(row: GlobalConfigRow, default_divergence: Option<DivergenceChoice>) 
         GlobalConfigRow::WrapOff => {
             Some("default when every fallback member is over its threshold".to_string())
         }
+        GlobalConfigRow::BurnAware => Some(
+            "on: switch the active account when it's projected to cross 100% by the next poll"
+                .to_string(),
+        ),
     }
 }
 
@@ -109,6 +116,7 @@ fn detail_row(
     row: GlobalConfigRow,
     selected: bool,
     wrap_off: bool,
+    burn_aware: bool,
     refresh_interval_ms: u64,
     default_divergence: Option<DivergenceChoice>,
     editing: Option<&InputState>,
@@ -159,6 +167,12 @@ fn detail_row(
             arrow,
             "when spent",
             &[("stay on last", !wrap_off), ("switch off all", wrap_off)],
+            selected,
+        ),
+        GlobalConfigRow::BurnAware => cycle_row(
+            arrow,
+            "switching",
+            &[("static", !burn_aware), ("burn-aware", burn_aware)],
             selected,
         ),
     }

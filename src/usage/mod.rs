@@ -2,7 +2,10 @@ mod burn;
 mod fetch;
 mod scheduler;
 
-pub(crate) use burn::compute_burn_rates_from_history;
+pub(crate) use burn::{
+    BURN_GAP_CUT_MS, BURN_LOOKBACK_MS, BURN_MIN_SAMPLES, compute_burn_rates_from_history,
+    project_utilization,
+};
 #[allow(unused_imports)]
 pub(crate) use fetch::{
     ANTHROPIC_ORIGIN, ExtraPeriod, ExtraUsage, LABEL_5H, LABEL_7D, PlanInfo, PlanTier,

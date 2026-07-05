@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::actions::{switch_off, switch_profile};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile};
-use crate::usage::{UsageStore, five_hour_live, iso_to_epoch_secs, now_epoch_secs};
+use crate::usage::{UsageStore, UsageWindow, five_hour_live, iso_to_epoch_secs, now_epoch_secs};
 
 /// What the auto-switch evaluator decided when the active profile crossed its
 /// threshold.
@@ -28,22 +28,102 @@ pub(crate) fn threshold_for(profile: &Profile) -> f64 {
     profile.fallback_threshold.unwrap_or(DEFAULT_THRESHOLD)
 }
 
-/// True when the profile's 5h utilization has crossed its own threshold.
-/// Only a live window (future `resets_at`) can exhaust — a lapsed or windowless
+/// Live 5h window for `profile`, or `None` when there's no snapshot yet or its
+/// window isn't currently live (`five_hour_live`) — a lapsed or windowless
 /// snapshot means the account has headroom again whatever its last-known
-/// utilization says (`five_hour_live`, the same reading the auto-start leg uses).
-/// Also drives the TUI's all-spent banner wording.
+/// utilization says. Shared by [`is_exhausted`] and the burn-aware active
+/// check ([`is_exhausted_active`]): both refuse to act on a stale/rolled-over
+/// window the same way; they differ only in how they judge a live one.
+fn live_five_hour(profile: &Profile) -> Option<&UsageWindow> {
+    let usage = profile.usage.as_ref()?;
+    if !five_hour_live(usage, now_epoch_secs()) {
+        return None;
+    }
+    usage.five_hour.as_ref()
+}
+
+/// True when the profile's 5h utilization has crossed its own threshold. Also
+/// drives the TUI's all-spent banner wording. Static regardless of burn-aware
+/// mode (issue #8 follow-up b) — the target walk's candidates and
+/// `soonest_resume` keep this exact behavior by design; only the ACTIVE
+/// profile's own decision becomes projection-aware (see
+/// [`is_exhausted_active`]).
 pub(crate) fn is_exhausted(profile: &Profile) -> bool {
-    let Some(usage) = profile.usage.as_ref() else {
+    live_five_hour(profile).is_some_and(|w| w.utilization >= threshold_for(profile))
+}
+
+/// Recent burn rate (%/h) for `name`'s 5h window: durable per-profile history
+/// (`usage_history.jsonl`, a plain disk read — no shared lock, so this is safe
+/// to call without touching the order in `lockorder.rs`, but never while
+/// holding the `AppConfig` guard) plus the current live sample, run through
+/// the same recency-weighted computation and windowing `App::active_burn_rate`
+/// uses for the Overview ETA line. `None` until enough distinct samples exist.
+/// Sole caller is the scheduler-side [`is_exhausted_active_from_store`] — the
+/// UI-thread [`is_exhausted_active`] takes its rate as a parameter instead so
+/// the render pass never triggers this disk read under the config guard.
+fn burn_rate_for_profile(name: &str, window: &UsageWindow) -> Option<f64> {
+    let history = crate::profile::load_usage_history(name);
+    let pair = ("5h", window);
+    crate::usage::compute_burn_rates_from_history(
+        &history,
+        std::slice::from_ref(&pair),
+        crate::usage::BURN_LOOKBACK_MS,
+        crate::usage::BURN_MIN_SAMPLES,
+        crate::usage::BURN_GAP_CUT_MS,
+    )
+    .remove("5h")
+    .flatten()
+}
+
+/// Burn-aware exhaustion test shared by [`is_exhausted_active`] and its
+/// scheduler-side store variant (issue #8 follow-up b, opt-in — off by
+/// default). `None` burn (no history yet, a fresh profile, or a provider with
+/// none) falls back to the plain `util_pct >= threshold` check — never leaves
+/// an account uncovered for lack of data. With a rate, "exhausted" means the
+/// *projected* utilization at the next poll has crossed the 100% cap, not the
+/// per-profile threshold: a heavy burn switches ahead of the static
+/// threshold, a light one may run past it since it won't blow the cap before
+/// the next poll.
+fn is_exhausted_projected(
+    util_pct: f64,
+    threshold: f64,
+    burn_pct_per_hour: Option<f64>,
+    interval_ms: u64,
+) -> bool {
+    match burn_pct_per_hour {
+        Some(rate) => crate::usage::project_utilization(util_pct, rate, interval_ms) >= 100.0,
+        None => util_pct >= threshold,
+    }
+}
+
+/// ACTIVE-only exhaustion check (issue #8 follow-up b). `burn_aware` off
+/// reproduces [`is_exhausted`] bit for bit — mode off must never diverge from
+/// today's static behavior. On, `active_burn_pct_per_hour` — the caller's
+/// in-memory rate; this function never reads disk itself, see
+/// [`is_exhausted_active_from_store`] for the disk-reading scheduler twin —
+/// feeds [`is_exhausted_projected`]. Deliberately never applied to the target
+/// walk's candidates or `soonest_resume` — see docs/internals.md's auto-switch
+/// asymmetry; this only ever changes whether the ACTIVE profile itself is
+/// judged exhausted.
+pub(crate) fn is_exhausted_active(
+    profile: &Profile,
+    burn_aware: bool,
+    interval_ms: u64,
+    active_burn_pct_per_hour: Option<f64>,
+) -> bool {
+    let Some(window) = live_five_hour(profile) else {
         return false;
     };
-    if !five_hour_live(usage, now_epoch_secs()) {
-        return false;
+    let threshold = threshold_for(profile);
+    if !burn_aware {
+        return window.utilization >= threshold;
     }
-    usage
-        .five_hour
-        .as_ref()
-        .is_some_and(|w| w.utilization >= threshold_for(profile))
+    is_exhausted_projected(
+        window.utilization,
+        threshold,
+        active_burn_pct_per_hour,
+        interval_ms,
+    )
 }
 
 /// Name + seconds-until-reset of the chain member that resumes soonest — the
@@ -110,6 +190,16 @@ pub(crate) struct ChainSnapshot {
     pub(crate) chain: Vec<ChainMember>,
     /// Snapshot of `AppState::wrap_off` — drives the switch-off-all decision.
     pub(crate) wrap_off: bool,
+    /// Snapshot of `AppState::burn_aware_switching` (issue #8 follow-up b) —
+    /// gates whether the ACTIVE-side check in `next_auto_switch_target`
+    /// projects ahead of the next poll instead of using the static threshold.
+    pub(crate) burn_aware: bool,
+    /// Snapshot of `AppState::refresh_interval_ms` — the projection's poll
+    /// interval. Read through `config.state` here (this snapshot is already
+    /// built once under the config lock per tick) rather than the scheduler's
+    /// hot-path `Arc<AtomicU64>`, mirroring exactly how `wrap_off` reaches
+    /// this struct.
+    pub(crate) interval_ms: u64,
 }
 
 /// Snapshot active profile + chain + per-member thresholds out of `AppConfig`.
@@ -137,6 +227,8 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
         active,
         chain,
         wrap_off: config.state.wrap_off,
+        burn_aware: config.state.burn_aware_switching,
+        interval_ms: config.state.refresh_interval_ms,
     })
 }
 
@@ -156,6 +248,40 @@ fn is_exhausted_from_store(name: &str, threshold: f64, store: &UsageStore) -> bo
         }),
         Err(_) => false,
     }
+}
+
+/// Scheduler-side [`is_exhausted_active`]: reads the 5h window from
+/// `UsageStore` instead of `Profile.usage`, so the scheduler's periodic scan
+/// agrees with the UI-thread one-shot (`auto_switch_if_needed`) on the ACTIVE
+/// decision. The store lock is dropped before the (disk-only, unlocked) burn
+/// rate lookup — never held across that I/O. A poisoned store lock fails safe
+/// to "not exhausted".
+fn is_exhausted_active_from_store(
+    name: &str,
+    threshold: f64,
+    burn_aware: bool,
+    interval_ms: u64,
+    store: &UsageStore,
+) -> bool {
+    let now = now_epoch_secs();
+    let window: Option<UsageWindow> = match store.lock() {
+        Ok(s) => s.get(name).and_then(|info| {
+            if five_hour_live(info, now) {
+                info.five_hour.clone()
+            } else {
+                None
+            }
+        }),
+        Err(_) => None,
+    };
+    let Some(window) = window else {
+        return false;
+    };
+    if !burn_aware {
+        return window.utilization >= threshold;
+    }
+    let rate = burn_rate_for_profile(name, &window);
+    is_exhausted_projected(window.utilization, threshold, rate, interval_ms)
 }
 
 /// Chain walk shared by [`next_target`] and [`next_auto_switch_target`]. Scans
@@ -192,7 +318,15 @@ fn walk_chain(
 ///      last resort once nothing else has headroom.
 ///   3. Wrap-off only: no headroom, no `last_resort` member anywhere, and the
 ///      active profile itself exhausted → [`SwitchAction::Off`] to halt usage.
-pub(crate) fn next_target(config: &AppConfig) -> Option<SwitchAction> {
+///
+/// `active_burn_pct_per_hour` is the caller's in-memory 5h burn rate for the
+/// active profile, forwarded to [`is_exhausted_active`] for step 3's
+/// burn-aware projection; ignored unless `burn_aware_switching` is on. This
+/// function never reads disk — callers must supply the rate themselves.
+pub(crate) fn next_target(
+    config: &AppConfig,
+    active_burn_pct_per_hour: Option<f64>,
+) -> Option<SwitchAction> {
     let active = config.state.active_profile.as_deref()?;
     let chain = &config.state.fallback_chain;
     let active_idx = chain.iter().position(|n| n == active)?;
@@ -224,8 +358,20 @@ pub(crate) fn next_target(config: &AppConfig) -> Option<SwitchAction> {
 
     // No headroom, no `last_resort` member anywhere. In wrap-off mode, turn off
     // all accounts — but only when the active profile is itself exhausted,
-    // since this picker is also exercised on a healthy active.
-    if config.state.wrap_off && config.find(active).is_some_and(is_exhausted) {
+    // since this picker is also exercised on a healthy active. The ACTIVE
+    // check is burn-aware (issue #8 follow-up b) so this agrees with
+    // `next_auto_switch_target`'s scheduler-side gate; the candidate walk
+    // above stays on the static `is_exhausted`.
+    if config.state.wrap_off
+        && config.find(active).is_some_and(|p| {
+            is_exhausted_active(
+                p,
+                config.state.burn_aware_switching,
+                config.state.refresh_interval_ms,
+                active_burn_pct_per_hour,
+            )
+        })
+    {
         return Some(SwitchAction::Off);
     }
     None
@@ -250,7 +396,13 @@ pub(crate) fn next_auto_switch_target(
     let len = snapshot.chain.len();
 
     let active = &snapshot.chain[active_idx];
-    if !is_exhausted_from_store(&active.name, active.threshold, store) {
+    if !is_exhausted_active_from_store(
+        &active.name,
+        active.threshold,
+        snapshot.burn_aware,
+        snapshot.interval_ms,
+        store,
+    ) {
         return None;
     }
 
@@ -310,7 +462,14 @@ pub(crate) fn find_recovered_member(chain: &[ChainMember], store: &UsageStore) -
 /// If the active profile is a chain member past its threshold, switch to the
 /// next viable member — or, in wrap-off mode when the whole chain is spent and
 /// no sink exists, turn off all accounts. Returns the action taken, or None.
-pub(crate) fn auto_switch_if_needed(config: &mut AppConfig) -> Result<Option<SwitchAction>> {
+///
+/// `active_burn_pct_per_hour` is the caller's in-memory burn rate for the
+/// active profile (ignored unless burn-aware mode is on) — same contract as
+/// [`next_target`], which this forwards it to.
+pub(crate) fn auto_switch_if_needed(
+    config: &mut AppConfig,
+    active_burn_pct_per_hour: Option<f64>,
+) -> Result<Option<SwitchAction>> {
     with_state_lock(|| {
         let Some(active_name) = config.state.active_profile.as_deref() else {
             return Ok(None);
@@ -321,11 +480,16 @@ pub(crate) fn auto_switch_if_needed(config: &mut AppConfig) -> Result<Option<Swi
         let Some(active) = config.find(active_name) else {
             return Ok(None);
         };
-        if !is_exhausted(active) {
+        if !is_exhausted_active(
+            active,
+            config.state.burn_aware_switching,
+            config.state.refresh_interval_ms,
+            active_burn_pct_per_hour,
+        ) {
             return Ok(None);
         }
 
-        let Some(action) = next_target(config) else {
+        let Some(action) = next_target(config, active_burn_pct_per_hour) else {
             return Ok(None);
         };
 
