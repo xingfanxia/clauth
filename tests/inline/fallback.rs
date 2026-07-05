@@ -338,6 +338,124 @@ fn wrap_off_disabled_stays_put() {
     assert_eq!(next_target(&config), None);
 }
 
+// ── soonest_resume ───────────────────────────────────────────────────────────
+//
+// All-exhausted caption data source (issue #10 follow-up): names the chain
+// member that resumes soonest, valid only when EVERY member is currently
+// exhausted.
+
+/// ISO reset `secs` in the future.
+fn reset_in(secs: i64) -> String {
+    epoch_secs_to_iso(now_epoch_secs() + secs)
+}
+
+#[test]
+fn soonest_resume_empty_chain_is_none() {
+    let config = config_with_chain(vec![], "a");
+    assert_eq!(soonest_resume(&config), None);
+}
+
+#[test]
+fn soonest_resume_picks_the_soonest_reset() {
+    let config = config_with_chain(
+        vec![
+            profile_with_usage(
+                "a",
+                Some(95.0),
+                Some(usage_info(Some(window(100.0, Some(reset_in(3600)))))),
+            ),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_info(Some(window(100.0, Some(reset_in(1800)))))),
+            ),
+        ],
+        "a",
+    );
+    let (name, eta) = soonest_resume(&config).expect("all exhausted");
+    assert_eq!(name, "b", "b resets sooner than a");
+    assert!((1700..=1800).contains(&eta), "eta ~1800s, got {eta}");
+}
+
+// Ties on `resets_at` keep the earlier chain-order member.
+#[test]
+fn soonest_resume_ties_keep_earlier_chain_order() {
+    let reset = reset_in(3600);
+    let config = config_with_chain(
+        vec![
+            profile_with_usage(
+                "a",
+                Some(95.0),
+                Some(usage_info(Some(window(100.0, Some(reset.clone()))))),
+            ),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_info(Some(window(100.0, Some(reset))))),
+            ),
+        ],
+        "a",
+    );
+    let (name, _) = soonest_resume(&config).expect("all exhausted");
+    assert_eq!(name, "a", "a tie keeps the earlier chain-order member");
+}
+
+// b's utilization is below its own threshold — already recovered, so the
+// all-exhausted premise doesn't hold; recovery would relink it next tick.
+#[test]
+fn soonest_resume_none_when_one_member_recovered() {
+    let config = config_with_chain(
+        vec![
+            profile_with_usage(
+                "a",
+                Some(95.0),
+                Some(usage_info(Some(window(100.0, Some(reset_in(3600)))))),
+            ),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    assert_eq!(soonest_resume(&config), None);
+}
+
+// b's 5h window already reset — headroom again whatever its stale util says
+// (same wall-clock rule `find_recovered_member`/`is_exhausted` use).
+#[test]
+fn soonest_resume_none_when_a_member_window_expired() {
+    let config = config_with_chain(
+        vec![
+            profile_with_usage(
+                "a",
+                Some(95.0),
+                Some(usage_info(Some(window(100.0, Some(reset_in(3600)))))),
+            ),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_info(Some(window(100.0, Some(expired_reset()))))),
+            ),
+        ],
+        "a",
+    );
+    assert_eq!(soonest_resume(&config), None);
+}
+
+// A chain member with no resolvable profile (deleted, still listed) can't be
+// proven exhausted — bail rather than pick around it.
+#[test]
+fn soonest_resume_none_when_chain_member_missing_profile() {
+    let mut config = config_with_chain(
+        vec![profile_with_usage(
+            "a",
+            Some(95.0),
+            Some(usage_info(Some(window(100.0, Some(reset_in(3600)))))),
+        )],
+        "a",
+    );
+    config.state.fallback_chain.push("ghost".into());
+    assert_eq!(soonest_resume(&config), None);
+}
+
 // next_auto_switch_target: scheduler-side wrap-off → Off when chain spent.
 #[test]
 fn auto_switch_wrap_off_switches_off_when_chain_spent() {

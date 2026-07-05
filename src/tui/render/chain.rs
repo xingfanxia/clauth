@@ -23,8 +23,9 @@ use super::panes::{
     active_pill, bold_when, draw_selector_list, head_cols, highlight_row, label_style, name_color,
     section_box, section_box_verbatim, select_line, selector_width,
 };
-use crate::fallback::{DEFAULT_THRESHOLD, threshold_for};
+use crate::fallback::{DEFAULT_THRESHOLD, soonest_resume, threshold_for};
 use crate::profile::AppConfig;
+use crate::usage::humanize_duration;
 
 /// Wide enough to read a threshold tick.
 const GAUGE_W: usize = 22;
@@ -264,6 +265,18 @@ fn member_detail(
             }
         }
     }
+
+    // All-exhausted sibling of the Overview projection line: when EVERY chain
+    // member is currently maxed, name whichever one resumes first instead of
+    // leaving the recovery implicit (issue #10 follow-up). Chain-wide, so it
+    // renders under whichever member happens to be selected.
+    if let Some((resume_name, eta)) = soonest_resume(cfg) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("resumes: {resume_name} in ~{}", humanize_duration(eta)),
+            theme::faint(),
+        )));
+    }
     lines
 }
 
@@ -474,3 +487,7 @@ fn kv_key(key: &str) -> String {
     let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     format!("{key}{}", " ".repeat(pad))
 }
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_chain.rs"]
+mod tests;

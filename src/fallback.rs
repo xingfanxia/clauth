@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::actions::{switch_off, switch_profile};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile};
-use crate::usage::{UsageStore, five_hour_live, now_epoch_secs};
+use crate::usage::{UsageStore, five_hour_live, iso_to_epoch_secs, now_epoch_secs};
 
 /// What the auto-switch evaluator decided when the active profile crossed its
 /// threshold.
@@ -41,6 +41,46 @@ pub(crate) fn is_exhausted(profile: &Profile) -> bool {
         .five_hour
         .as_ref()
         .is_some_and(|w| w.utilization >= threshold_for(profile))
+}
+
+/// Name + seconds-until-reset of the chain member that resumes soonest — the
+/// all-exhausted caption's data source (issue #10: the implicit
+/// resume-at-soonest-reset behavior, made explicit). Valid only when the
+/// WHOLE chain is currently exhausted, covering both wrap-off's
+/// switch-off-all (active cleared) and wrap mode's stalled-active equivalent
+/// (`next_target` returns `None` with every member maxed). Reuses
+/// [`is_exhausted`]'s `five_hour_live` gate: a single member with no live
+/// window or a past reset already has headroom — `find_recovered_member` /
+/// `scan_recovery` would relink it on the very next tick — so that member's
+/// presence bails the WHOLE result to `None` rather than being skipped around;
+/// the caption's premise is that NOTHING in the chain is currently usable.
+/// Ties on `resets_at` keep the earlier chain-order member.
+pub(crate) fn soonest_resume(config: &AppConfig) -> Option<(String, i64)> {
+    let chain = &config.state.fallback_chain;
+    if chain.is_empty() {
+        return None;
+    }
+    let now = now_epoch_secs();
+    let mut best: Option<(&str, i64)> = None;
+    for name in chain {
+        let profile = config.find(name)?;
+        if !is_exhausted(profile) {
+            return None;
+        }
+        let resets_at = profile
+            .usage
+            .as_ref()?
+            .five_hour
+            .as_ref()?
+            .resets_at
+            .as_deref()
+            .and_then(iso_to_epoch_secs)?;
+        if best.is_none_or(|(_, cur)| resets_at < cur) {
+            best = Some((name.as_str(), resets_at));
+        }
+    }
+    let (name, resets_at) = best?;
+    Some((name.to_string(), (resets_at - now).max(0)))
 }
 
 /// One chain member as observed when a `ChainSnapshot` was built. Holds enough

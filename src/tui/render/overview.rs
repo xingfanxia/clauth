@@ -13,7 +13,7 @@ use super::format::{
     spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
 use super::panes::{bold_when, draw_scrollbar, empty_state, section_box, select_line};
-use crate::fallback::{SwitchAction, next_target, threshold_for};
+use crate::fallback::{SwitchAction, next_target, soonest_resume, threshold_for};
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{
     LABEL_5H, LABEL_7D, ProfileActivity, UsageInfo, UsageWindow, humanize_duration, now_ms,
@@ -480,6 +480,24 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
             }
         }
     }
+
+    // All-exhausted sibling of the projection above: when EVERY chain member
+    // is currently maxed (wrap-off's active-cleared state, or wrap mode's
+    // stalled-active equivalent), name whichever one resumes first instead of
+    // leaving the recovery implicit. Mutually exclusive with the projection
+    // block above — `burn_rate_eta` already returns `None` once the active
+    // crosses its own threshold, which is a precondition here.
+    if lines.len() < cap
+        && let Some((name, eta)) = soonest_resume(&cfg)
+    {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("resumes: {name} in ~{}", humanize_duration(eta)),
+                theme::faint(),
+            ),
+        ]));
+    }
     lines
 }
 
@@ -609,3 +627,7 @@ fn burn_rate_eta(
     }
     Some((hours * 3600.0) as i64)
 }
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_overview.rs"]
+mod tests;
