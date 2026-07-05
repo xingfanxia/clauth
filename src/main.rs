@@ -8,6 +8,7 @@ mod lock;
 mod lockorder;
 mod mcp;
 mod oauth;
+mod oauth_login;
 mod platform;
 mod plugin_probe;
 mod poll;
@@ -140,7 +141,7 @@ fn cmd_start(name: &str, rest: &[String], isolation: Isolation) -> Result<()> {
 /// `--model` with no value, an unrecognized flag, extra args) — the caller
 /// turns that into one usage bail. Kept as its own pure fn (dispatch's other
 /// subcommands hand-roll the match inline) so the shape is unit-testable
-/// without invoking `cmd_login`, which spawns a real `claude` process.
+/// without invoking `cmd_login`, which opens a real browser.
 fn parse_login_args(rest: &[String]) -> Option<(&str, Option<&str>)> {
     match rest {
         // A `--`-prefixed "name" is a typo'd/misplaced flag, not a profile —
@@ -153,47 +154,43 @@ fn parse_login_args(rest: &[String]) -> Option<(&str, Option<&str>)> {
     }
 }
 
-/// `clauth login <name>` — sign an account in via Claude Code itself: run
-/// `claude` against the profile's runtime (creating the profile blank first
-/// when missing) and let the runtime watchdog adopt the completed `/login`
-/// into the profile's canonical credentials. clauth carries no OAuth sign-in
-/// leg of its own, so the flow inherits CC's credential handling wholesale —
-/// including wherever CC stores its login on each platform. `--model` (any
-/// preset alias or a full custom id, same values the Setup tab's model row
-/// accepts) is persisted BEFORE `claude` launches, so the runtime settings
-/// this session builds already carry the routing.
+/// `clauth login <name>` — add a new OAuth account by real browser login, with
+/// visible progress. clauth reproduces Claude Code's own PKCE + loopback flow
+/// (see `oauth_login`) and writes the minted tokens straight into a fresh
+/// profile's `.credentials.json`, so it works identically on every platform —
+/// unlike running CC's own `/login`, which on macOS lands only in a per-config-
+/// dir hashed Keychain item and leaves the profile file empty (upstream #1/#3).
+/// Captures into the profile; does not switch to it (`clauth <name>` does that).
+/// `--model` (any preset alias or a full custom id, same values the Setup tab's
+/// model row accepts) is persisted onto the new profile after capture, so its
+/// sessions route to that model from the first launch. Tokens are never printed
+/// — only a sha256 prefix.
 fn cmd_login(name: &str, model: Option<&str>) -> Result<()> {
     platform::init();
-    runtime::gc_stale_runtimes();
     let mut config = load_config()?;
-    let name = config
-        .canonical_name(name)
-        .unwrap_or_else(|| name.trim().to_string());
-    if actions::ensure_login_profile(&mut config, &name, model)? {
-        println!("clauth: created profile '{name}'");
-    } else if let Some(model) = model {
-        // Reused profile: the model set is a separate edit, so a failure here
-        // must say the profile itself is intact and reusable.
-        actions::set_profile_default_model(&mut config, &name, model).map_err(|e| {
-            anyhow::anyhow!(
-                "profile '{name}' exists and is untouched; failed to set its model: {e}"
-            )
-        })?;
-    }
-    println!("clauth: sign in with /login inside claude, then exit to save");
-    start::run(&config, &name, &[], Isolation::Shared)?;
+    actions::validate_profile_name(name, &config.names(), None)?;
 
-    // Runtime teardown just ran the final credential sync; re-read the store.
-    let config = load_config()?;
-    let has_login = config
-        .find(&name)
-        .and_then(|p| p.credentials.as_ref())
-        .is_some_and(|c| c.claude_ai_oauth.is_some());
-    if has_login {
-        println!("clauth: login saved to profile '{name}' — `clauth {name}` switches to it");
-    } else {
-        eprintln!("clauth: no login detected — profile '{name}' still has no credentials");
+    println!("clauth: opening a browser to log in to a new account for '{name}'…");
+    let credentials = oauth_login::login_with(|url| {
+        println!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
+    })?;
+
+    println!(
+        "clauth: login complete.\n{}",
+        oauth_login::login_summary(&credentials)
+    );
+    let snapshot = actions::CaptureSnapshot {
+        credentials: Some(credentials),
+        base_url: None,
+        api_key: None,
+    };
+    actions::capture_into_profile(&mut config, name.to_string(), snapshot)?;
+    // Preserve upstream's `--model` support: apply the requested default model to
+    // the freshly-captured profile so its sessions route there from the first launch.
+    if let Some(model) = model {
+        actions::set_profile_default_model(&mut config, name, model)?;
     }
+    println!("clauth: captured into profile '{name}'. Switch to it with:  clauth {name}");
     Ok(())
 }
 

@@ -45,6 +45,8 @@ Every request clauth makes, and what rides along with it:
 |----------|------|---------|
 | `api.github.com/repos/uwuclxdy/clauth/releases/latest` + release assets | background update check on launch (binary installs only) | no credentials, just a `User-Agent` |
 | `api.anthropic.com/v1/oauth/token` | lazy token refresh (on a 401) and `t` force-rotate | your stored refresh token |
+| `claude.com/cai/oauth/authorize` | `clauth login` interactive sign-in, opened in your browser | no credentials; a PKCE challenge + random `state` |
+| `platform.claude.com/v1/oauth/token` | `clauth login` authorization-code exchange | the one-time auth code + PKCE verifier (mints a fresh token pair) |
 | `api.anthropic.com/api/oauth/usage` | usage poll on the refresh interval | access token (Bearer) |
 | `api.anthropic.com/api/oauth/profile` | plan-tier detection | access token |
 | `api.anthropic.com/v1/messages` | auto-start kick (opt-in, off by default) | access token; a 1-token Haiku request |
@@ -53,8 +55,11 @@ Every request clauth makes, and what rides along with it:
 | `api.deepseek.com/user/balance` | only for profiles whose base URL is DeepSeek | that provider's API key |
 | a custom base URL you set | requests against an API-endpoint profile | whatever you configured |
 
-OAuth tokens go to `api.anthropic.com` and nowhere else. clauth runs no telemetry or
-analytics; it talks to the hosts above and no others.
+Your stored access/refresh tokens go to `api.anthropic.com` and nowhere else. The only
+exception is the interactive `clauth login`, which follows Claude Code's own OAuth flow:
+it opens `claude.com` in your browser to authorize and posts the one-time authorization
+code to `platform.claude.com` to mint the new profile's token pair. clauth runs no
+telemetry or analytics; it talks to the hosts above and no others.
 
 ## What acts on your behalf
 
@@ -70,6 +75,16 @@ Background, automatic:
 - **Token refresh.** Anthropic refresh tokens are single-use, so refreshing spends
   the stored token for a fresh pair. It's lazy: it fires only when a usage query
   returns 401, never ahead of time, unless you press `t` to force it.
+
+User-invoked, only when you run the command:
+
+- **Interactive login (`clauth login <profile>`).** Opens your browser to Claude's
+  OAuth authorize page and binds a loopback listener on `127.0.0.1:<random port>` to
+  catch the redirect, then exchanges the returned code for a fresh token pair written
+  into the new profile. It reproduces Claude Code's own PKCE flow, touches no other
+  account, and never opens a usage window. On macOS this is why `clauth login` works at
+  all — Claude Code's own `/login` under a custom config dir writes only a per-config-dir
+  Keychain item, never the profile's credentials file.
 
 Agent-invoked, only when the Claude Code plugin is installed:
 

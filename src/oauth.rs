@@ -19,8 +19,14 @@ use crate::usage::{
 /// mint an access token from the stored refresh token.
 const TOKEN_ENDPOINT: &str = "https://api.anthropic.com/v1/oauth/token";
 
-/// UUID of the "Claude Code" OAuth application; required for refresh.
-const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// Token endpoint for the interactive authorization-code exchange. Paired with
+/// the `platform.claude.com` authorize host the current Claude Code binary uses
+/// (see `oauth_login`). Refresh stays on [`TOKEN_ENDPOINT`] (proven working).
+const LOGIN_TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
+
+/// UUID of the "Claude Code" OAuth application; required for refresh and the
+/// interactive login (`oauth_login` builds the authorize URL with it).
+pub(crate) const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// Minimal inference endpoint we use to "kick" the 5-hour usage window.
 /// Token refresh alone does NOT start the timer — only a real `/v1/messages`
@@ -72,6 +78,44 @@ pub(crate) fn refresh(refresh_token: &str) -> Result<TokenResponse> {
 
     let mut response = AGENT
         .post(TOKEN_ENDPOINT)
+        .header("Content-Type", "application/json")
+        .send(&body)
+        .map_err(anyhow::Error::from)?;
+    let status = response.status().as_u16();
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .map_err(anyhow::Error::from)?;
+    if status >= 400 {
+        anyhow::bail!("HTTP {status}: {text}");
+    }
+
+    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))
+}
+
+/// Exchange an authorization code (from the interactive loopback login in
+/// `oauth_login`) for an OAuth token pair. Uses the same client + HTTP agent as
+/// [`refresh`], against [`LOGIN_TOKEN_ENDPOINT`] (paired with the authorize host
+/// the current Claude Code binary uses). `redirect_uri` MUST byte-match the one
+/// sent to the authorize endpoint, and `state` echoes the value round-tripped
+/// through the browser.
+pub(crate) fn exchange_code(
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+    state: &str,
+) -> Result<TokenResponse> {
+    let body = serde_json::to_string(&serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "code_verifier": code_verifier,
+        "client_id": CLIENT_ID,
+        "state": state,
+    }))?;
+
+    let mut response = AGENT
+        .post(LOGIN_TOKEN_ENDPOINT)
         .header("Content-Type", "application/json")
         .send(&body)
         .map_err(anyhow::Error::from)?;

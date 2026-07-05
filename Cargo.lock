@@ -197,6 +197,7 @@ version = "0.7.3"
 dependencies = [
  "anyhow",
  "dirs",
+ "getrandom 0.4.3",
  "libc",
  "minisign-verify",
  "ratatui",

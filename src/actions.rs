@@ -450,31 +450,6 @@ pub(crate) fn create_blank_profile(
     })
 }
 
-/// Resolve `name` for `clauth login`: an existing profile is reused (re-login
-/// into its runtime), a missing one is created blank after name validation,
-/// carrying `model` into that one atomic create. Returns true when a profile
-/// was created; the reuse branch ignores `model` (the caller updates it as a
-/// separate edit so the failure message can say the profile itself is fine).
-pub(crate) fn ensure_login_profile(
-    config: &mut AppConfig,
-    name: &str,
-    model: Option<&str>,
-) -> Result<bool> {
-    if config.find(name).is_some() {
-        return Ok(false);
-    }
-    let existing: Vec<&str> = config.names();
-    validate_profile_name(name, &existing, None)?;
-    create_blank_profile(
-        config,
-        name.trim().to_string(),
-        None,
-        None,
-        model.map(str::to_string),
-    )?;
-    Ok(true)
-}
-
 /// Set a profile's default `model` (the Setup tab's base model row / the
 /// `clauth login --model` flag), preserving any alias overrides already on it.
 /// An empty (post-trim) value clears the default, matching the Setup tab's ⏎

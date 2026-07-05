@@ -877,6 +877,40 @@ pub(super) fn fetch_raw(
     })
 }
 
+/// Fetch `/profile` with a freshly minted OAuth access token and derive the
+/// subscription-type string Claude Code stores (`"max"`/`"pro"`/`"team"`/
+/// `"enterprise"`/`"free"`; `None` for an unrecognized tier). Used by the
+/// interactive login (`oauth_login`) to (a) confirm the minted token actually
+/// works against the API — a `401` here means the login produced a dud token —
+/// and (b) stamp the new profile's tier so it shows the real plan immediately
+/// instead of the unknown-tier "Pro" fallback. Reuses the same request path the
+/// usage poll uses. Returns the HTTP error text so the caller can surface it.
+pub(crate) fn probe_subscription_type(access_token: &str) -> anyhow::Result<Option<String>> {
+    let text = get_json(PROFILE_ENDPOINT, access_token, None, "login").map_err(|e| match e {
+        FetchError::Status(s) => anyhow::anyhow!("profile endpoint returned HTTP {s}"),
+        FetchError::RateLimited { .. } => anyhow::anyhow!("profile endpoint rate-limited (429)"),
+        FetchError::Network => anyhow::anyhow!("network error reaching the profile endpoint"),
+        FetchError::Parse => anyhow::anyhow!("profile response was not readable"),
+    })?;
+    let p: RawProfile = serde_json::from_str(&text)
+        .map_err(|_| anyhow::anyhow!("profile response was not JSON"))?;
+    let org = p.organization.as_ref();
+    let tier = PlanTier::from_profile(
+        org.and_then(|o| o.organization_type.as_deref()),
+        p.account.as_ref().is_some_and(|a| a.has_claude_max),
+        p.account.as_ref().is_some_and(|a| a.has_claude_pro),
+        org.and_then(|o| o.rate_limit_tier.as_deref()),
+    );
+    Ok(match tier {
+        PlanTier::Max(_) => Some("max".to_string()),
+        PlanTier::Pro => Some("pro".to_string()),
+        PlanTier::Team => Some("team".to_string()),
+        PlanTier::Enterprise => Some("enterprise".to_string()),
+        PlanTier::Free => Some("free".to_string()),
+        PlanTier::Unknown => None,
+    })
+}
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

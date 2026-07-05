@@ -174,53 +174,10 @@ fn edit_profile_env_strips_removed_keys_from_live_settings_when_active() {
     );
 }
 
-// ── ensure_login_profile ──────────────────────────────────────────────────────
-
-#[test]
-fn ensure_login_creates_blank_profile() {
-    let _home = HomeSandbox::new();
-    let mut config = AppConfig {
-        state: AppState::default(),
-        profiles: Vec::new(),
-    };
-    assert!(ensure_login_profile(&mut config, "fresh", None).expect("create"));
-    let profile = config.find("fresh").expect("profile added");
-    assert!(profile.credentials.is_none(), "created blank");
-    assert!(profile.models.default.is_none(), "no model unless asked");
-}
-
-#[test]
-fn ensure_login_create_carries_the_model_atomically() {
-    let _home = HomeSandbox::new();
-    let mut config = AppConfig {
-        state: AppState::default(),
-        profiles: Vec::new(),
-    };
-    assert!(ensure_login_profile(&mut config, "fresh", Some("opus")).expect("create"));
-    assert_eq!(
-        config.find("fresh").and_then(|p| p.models.default.clone()),
-        Some("opus".to_string()),
-        "the --model value lands in the same single create save"
-    );
-}
-
-#[test]
-fn ensure_login_reuses_existing_profile() {
-    let _home = HomeSandbox::new();
-    let mut config = acct_config();
-    assert!(!ensure_login_profile(&mut config, "acct", None).expect("reuse"));
-    assert_eq!(config.profiles.len(), 1, "no duplicate created");
-}
-
-#[test]
-fn ensure_login_rejects_invalid_name() {
-    let _home = HomeSandbox::new();
-    let mut config = acct_config();
-    assert!(ensure_login_profile(&mut config, ".hidden", None).is_err());
-    assert!(ensure_login_profile(&mut config, "", None).is_err());
-}
-
 // ── set_profile_default_model (`clauth login --model`, the create-form row) ──
+// (the ensure_login_profile tests were dropped with the fn — `clauth login` now
+//  mints tokens via the browser flow and captures a profile, rather than
+//  pre-creating a blank one; `--model` is applied to the captured profile.)
 
 #[test]
 fn set_profile_default_model_persists_to_config_toml() {
