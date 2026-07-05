@@ -1837,12 +1837,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
-        KeyCode::Right => {
+        KeyCode::Right | KeyCode::Tab => {
             app.disarm_quit();
             switch_tab(app, app.tab.next());
             return;
         }
-        KeyCode::Left => {
+        KeyCode::Left | KeyCode::BackTab => {
             app.disarm_quit();
             switch_tab(app, app.tab.prev());
             return;

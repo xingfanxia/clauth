@@ -1089,3 +1089,116 @@ fn demo_data_drives_all_actions() {
 
     // All disk writes landed in the tempdir — clean-up on drop.
 }
+
+// ── Tab / BackTab (#14) ──────────────────────────────────────────────────────
+
+#[test]
+fn tab_backtab_cycle_screens_like_arrow_keys_at_top_level() {
+    use app::Tab;
+    let _home = ShowcaseHome::new();
+    let mut app = app::App::new(demo_config());
+
+    assert_eq!(app.tab, Tab::Overview);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Usage);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Tokens);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Setup);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Fallback);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Config);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Status);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Plugin);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.tab, Tab::Overview, "Tab wraps back to Overview");
+
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(app.tab, Tab::Plugin, "BackTab wraps to the last tab");
+    // Seven BackTab from the last tab walk back to the first, same as ←.
+    for _ in 0..7 {
+        press(&mut app, KeyCode::BackTab);
+    }
+    assert_eq!(app.tab, Tab::Overview);
+}
+
+#[test]
+fn tab_key_does_not_leak_past_modal_or_field_capture() {
+    use app::Tab;
+    let _home = ShowcaseHome::new();
+    let mut app = app::App::new(demo_config());
+
+    // ── Setup field capture: Tab/BackTab must stay inert, not switch tabs ──
+    press(&mut app, KeyCode::Tab); // Overview → Usage
+    press(&mut app, KeyCode::Tab); // Usage → Tokens
+    press(&mut app, KeyCode::Tab); // Tokens → Setup
+    assert_eq!(app.tab, Tab::Setup);
+    press(&mut app, KeyCode::Enter); // focus detail pane for "personal" (cursor 0)
+    assert_eq!(app.config_focus, app::ConfigFocus::Actions);
+    press(&mut app, KeyCode::Down); // Name → AutoStart
+    press(&mut app, KeyCode::Down); // AutoStart → BaseUrl
+    press(&mut app, KeyCode::Enter); // start capturing BaseUrl
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        Some(app::ConfigRow::BaseUrl)
+    );
+
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(
+        app.tab,
+        Tab::Setup,
+        "Tab must not leak past the field-capture guard to switch tabs"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        Some(app::ConfigRow::BaseUrl),
+        "Tab must not disturb the in-progress field capture"
+    );
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(
+        app.tab,
+        Tab::Setup,
+        "BackTab must not leak past the field-capture guard to switch tabs"
+    );
+
+    press(&mut app, KeyCode::Esc); // stop capturing the field
+    press(&mut app, KeyCode::Esc); // back out of the detail pane
+    assert_eq!(app.config_focus, app::ConfigFocus::Profiles);
+
+    // ── Confirm modal: Tab keeps cycling the yes/no choice, unchanged ──
+    press(&mut app, KeyCode::BackTab); // Setup → Tokens
+    press(&mut app, KeyCode::BackTab); // Tokens → Usage
+    press(&mut app, KeyCode::BackTab); // Usage → Overview
+    assert_eq!(app.tab, Tab::Overview);
+    press(&mut app, KeyCode::Down); // cursor 0 (personal, active) → 1 (work)
+    press(&mut app, KeyCode::Enter); // request switch → confirm modal
+    assert_eq!(app.modals.len(), 1, "switch raises a confirm modal");
+    let choice = |app: &app::App| match app.modals.last() {
+        Some(app::Modal::Confirm(state)) => state.choice,
+        other => panic!("expected a Confirm modal, got {other:?}"),
+    };
+    let before = choice(&app);
+
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(
+        choice(&app),
+        !before,
+        "Tab must still cycle the modal's yes/no focus"
+    );
+    assert_eq!(
+        app.tab,
+        Tab::Overview,
+        "Tab consumed by the modal must not also switch tabs"
+    );
+
+    press(&mut app, KeyCode::Esc); // dismiss without confirming
+    assert!(app.modals.is_empty());
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("personal"),
+        "cancelling the modal must not have switched profiles"
+    );
+}

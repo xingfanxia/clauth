@@ -313,7 +313,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             &[
                 ("\u{2191}\u{2193}", "move cursor"),
                 ("\u{23ce}", "switch to selected account (confirm)"),
-                ("\u{21e7}\u{2191}\u{2193}", "reorder account up / down"),
+                ("shift \u{2191}\u{2193}", "reorder account up / down"),
             ][..],
         )],
         Tab::Usage => vec![(
@@ -371,7 +371,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "fallback chain",
             &[
                 ("\u{2191}\u{2193}", "move cursor / detail row"),
-                ("\u{21e7}\u{2191}\u{2193}", "reorder member = priority"),
+                ("shift \u{2191}\u{2193}", "reorder member = priority"),
                 (
                     "\u{23ce}",
                     "open \u{00b7} edit threshold \u{00b7} remove \u{00b7} add",
@@ -383,7 +383,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )],
     };
 
-    let nav: &[(&str, &str)] = &[("\u{2190} \u{2192}", "previous / next tab")];
+    let nav: &[(&str, &str)] = &[(
+        "\u{2190} \u{2192} \u{00b7} tab",
+        "previous / next tab (shift tab: previous)",
+    )];
 
     let global: &[(&str, &str)] = &[
         ("n", "new account"),
