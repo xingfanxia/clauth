@@ -8,37 +8,57 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref so rapid pushes don't stack.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # Force HTTP/1.1 for registry downloads: curl's HTTP/2 multiplexing against the
 # crates.io CDN intermittently dies with "[16] Error in the HTTP2 framing layer"
 # on the hosted runners. Extra retries cover the remaining transient blips.
 env:
+  CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
 
 jobs:
-  check:
+  fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-
+          components: rustfmt
       - name: fmt --check
         run: cargo fmt --all -- --check
 
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (-D warnings)
+        run: cargo clippy --all-targets --all-features --release -- -D warnings
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: test
-        run: cargo test --all-targets
+        run: cargo test --release --all-targets --all-features
 
   deny:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
 
   audit:
     runs-on: ubuntu-latest
