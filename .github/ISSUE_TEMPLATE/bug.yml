@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a bug or unexpected behavior in clauth
+title: "Bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before you paste any output or config here: redact secrets.** Strip OAuth
+        tokens, API keys, and the contents of `~/.claude/.credentials.json` or any
+        `~/.clauth/profiles/*` file. Watch for `sk-ant-*` strings in logs or error
+        output — those are live credentials, not IDs.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did clauth do wrong?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. see error
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: clauth version
+      description: Output of `clauth --version`, or commit hash if built from source.
+      placeholder: e.g. v0.7.3
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      description: Where did the bug show up?
+      options:
+        - TUI
+        - CLI
+        - MCP
+        - fallback-scheduler
+        - other
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: e.g. Linux 6.9, macOS 14.5, Windows 11
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Relevant error output, redacted per the warning above. Rendered as code, no backticks needed.
+      render: shell
+    validations:
+      required: false
