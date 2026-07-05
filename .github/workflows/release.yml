@@ -25,78 +25,33 @@ jobs:
         with:
           generate_release_notes: false
 
-  build-linux-windows:
+  build:
     name: Build ${{ matrix.asset_name }}
     needs: create-release
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash  # windows-latest ships Git Bash; keeps cp + forward-slash paths uniform across OSes
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
             asset_name: clauth-linux-x86_64
             ext: ""
-          - target: x86_64-pc-windows-gnu
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset_name: clauth-macos-aarch64
+            ext: ""
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            asset_name: clauth-macos-x86_64
+            ext: ""
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
             asset_name: clauth-windows-x86_64
             ext: .exe
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install mingw (Windows target)
-        if: matrix.ext == '.exe'
-        run: sudo apt-get install -y gcc-mingw-w64-x86-64
-
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
-
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Prepare asset (Unix)
-        if: matrix.ext == ''
-        run: cp target/${{ matrix.target }}/release/clauth ${{ matrix.asset_name }}
-
-      - name: Prepare asset (Windows)
-        if: matrix.ext == '.exe'
-        run: cp target/${{ matrix.target }}/release/clauth.exe ${{ matrix.asset_name }}.exe
-
-      - name: Upload to release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: ${{ matrix.asset_name }}${{ matrix.ext }}
-
-      - name: Upload artifact for checksum job
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset_name }}${{ matrix.ext }}
-          path: ${{ matrix.asset_name }}${{ matrix.ext }}
-          if-no-files-found: error
-
-  build-macos:
-    name: Build ${{ matrix.asset_name }}
-    needs: create-release
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            asset_name: clauth-macos-aarch64
-          - target: x86_64-apple-darwin
-            asset_name: clauth-macos-x86_64
 
     steps:
       - uses: actions/checkout@v6
@@ -120,23 +75,23 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare asset
-        run: cp target/${{ matrix.target }}/release/clauth ${{ matrix.asset_name }}
+        run: cp "target/${{ matrix.target }}/release/clauth${{ matrix.ext }}" "${{ matrix.asset_name }}${{ matrix.ext }}"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
-          files: ${{ matrix.asset_name }}
+          files: ${{ matrix.asset_name }}${{ matrix.ext }}
 
       - name: Upload artifact for checksum job
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}
+          name: ${{ matrix.asset_name }}${{ matrix.ext }}
+          path: ${{ matrix.asset_name }}${{ matrix.ext }}
           if-no-files-found: error
 
   checksums:
     name: Generate checksums
-    needs: [build-linux-windows, build-macos]
+    needs: [build]
     # Run even when some build legs failed so that binaries already published
     # always have a matching sha256sums.txt in the release.
     if: always()
