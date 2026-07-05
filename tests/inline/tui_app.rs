@@ -407,6 +407,68 @@ fn refresh_interval_space_cycles_without_opening_editor() {
 }
 
 #[test]
+fn refresh_interval_space_wraps_top_preset_to_min() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_refresh_row(&mut app);
+    app.refresh_interval.store(300_000, Ordering::Relaxed); // top preset
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.refresh_interval.load(Ordering::Relaxed),
+        15_000,
+        "space at the top preset wraps to the first preset, never clamps"
+    );
+}
+
+#[test]
+fn refresh_interval_space_from_custom_lands_on_next_preset() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_refresh_row(&mut app);
+    app.refresh_interval.store(45_000, Ordering::Relaxed); // custom, between 30s and 60s
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.refresh_interval.load(Ordering::Relaxed),
+        60_000,
+        "space from an off-ladder custom value steps to the next preset above it, not past it"
+    );
+}
+
+#[test]
+fn refresh_interval_plus_minus_are_unbound() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // Checked in isolation: pressing `+` then `-` would cancel back to the
+    // starting preset even if both still worked, which would hide a
+    // regression. Each key is asserted alone against a fresh app.
+    let mut app = bare_app();
+    on_refresh_row(&mut app);
+    let before = app.refresh_interval.load(Ordering::Relaxed);
+    super::handle_global_config_key(&mut app, key(KeyCode::Char('+')));
+    assert_eq!(
+        app.refresh_interval.load(Ordering::Relaxed),
+        before,
+        "+ no longer steps the refresh preset; removed in favor of space-only cycling"
+    );
+    assert!(
+        app.refresh_interval_draft.is_none(),
+        "+ must not open the custom-value editor either"
+    );
+
+    let mut app = bare_app();
+    on_refresh_row(&mut app);
+    let before = app.refresh_interval.load(Ordering::Relaxed);
+    super::handle_global_config_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.refresh_interval.load(Ordering::Relaxed),
+        before,
+        "- no longer steps the refresh preset either"
+    );
+}
+
+#[test]
 fn refresh_interval_custom_value_commits_and_clears() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
@@ -721,6 +783,39 @@ fn all_spent_banner_needs_live_spent_window() {
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
         "all accounts spent · switch to a profile to resume"
+    );
+}
+
+// ── fallback threshold: continuous row, unchanged grammar ────────────────────
+//
+// The `rotate at` threshold is the one CONTINUOUS row: unlike the enumerated
+// Config-tab rows, it keeps `+`/`-` for ±5 nudges alongside the `⏎` typed
+// editor. This must survive the enumerated-row grammar unification untouched.
+
+#[test]
+fn fallback_threshold_plus_minus_still_nudge_both_ways() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fallback_threshold = Some(50.0);
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = 0; // FALLBACK_ROWS[0] == Threshold
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.fallback_threshold),
+        Some(55.0),
+        "+ still raises the threshold by 5"
+    );
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.fallback_threshold),
+        Some(45.0),
+        "- still lowers the threshold by 5"
     );
 }
 

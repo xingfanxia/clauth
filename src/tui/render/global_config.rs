@@ -97,7 +97,7 @@ fn row_hint(row: GlobalConfigRow, default_divergence: Option<DivergenceChoice>) 
             Some(tip.to_string())
         }
         GlobalConfigRow::RefreshInterval => {
-            Some("space or +/- cycles presets · ⏎ types a custom value".to_string())
+            Some("space cycles presets, wraps at the top; ⏎ types a custom value".to_string())
         }
         GlobalConfigRow::WrapOff => {
             Some("default when every fallback member is over its threshold".to_string())

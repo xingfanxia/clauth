@@ -2882,10 +2882,12 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 4] = [
     GlobalConfigRow::WrapOff,
 ];
 
-/// Config tab keymap: ↑↓ walks rows; space cycles every row's value (theme tier,
-/// divergence default, refresh preset, wrap-off); ⏎ opens the refresh-interval
-/// custom-value editor and otherwise mirrors space; `+`/`-` steps the refresh
-/// preset in-place.
+/// Config tab keymap (enumerated rows only, per the unified value-row grammar):
+/// ↑↓ walks rows; space cycles every row's value forward, wrapping the top
+/// value back to the first (theme tier, divergence default, refresh preset,
+/// wrap-off); ⏎ opens the refresh-interval custom-value editor and otherwise
+/// mirrors space. No row here binds `+`/`-` (that's reserved for the Fallback
+/// tab's continuous `rotate at` threshold).
 fn handle_global_config_key(app: &mut App, key: KeyEvent) {
     let last = GLOBAL_CONFIG_ROWS.len() - 1;
     app.global_config_cursor = app.global_config_cursor.min(last);
@@ -2904,16 +2906,6 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
                 app.global_config_cursor + 1
             };
         }
-        KeyCode::Char('+') | KeyCode::Char('=') => {
-            if GLOBAL_CONFIG_ROWS[app.global_config_cursor] == GlobalConfigRow::RefreshInterval {
-                step_refresh_interval(app, 1);
-            }
-        }
-        KeyCode::Char('-') | KeyCode::Char('_') => {
-            if GLOBAL_CONFIG_ROWS[app.global_config_cursor] == GlobalConfigRow::RefreshInterval {
-                step_refresh_interval(app, -1);
-            }
-        }
         KeyCode::Char(' ') => {
             run_global_config_row(app, GLOBAL_CONFIG_ROWS[app.global_config_cursor]);
         }
@@ -2930,13 +2922,14 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Apply space (or ⏎ on non-refresh rows) on a Config-tab row: cycle the theme
-/// tier, flip wrap-off, or step the refresh interval forward through presets.
+/// tier, flip wrap-off, or step the refresh interval forward through presets
+/// (wrapping past the top preset back to the first).
 fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
     match row {
         GlobalConfigRow::Theme => cycle_theme(app),
         GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
         GlobalConfigRow::WrapOff => toggle_wrap_off(app),
-        GlobalConfigRow::RefreshInterval => step_refresh_interval(app, 1),
+        GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
     }
 }
 
@@ -3128,20 +3121,17 @@ fn toggle_show_pace(app: &mut App) {
     app.last_state_mtime = app_state_mtime();
 }
 
-/// Step the global refresh interval through preset values (`+` = faster, `-` = slower).
-fn step_refresh_interval(app: &mut App, dir: i32) {
+/// Advance the global refresh interval to the next-greater preset, wrapping
+/// past the top back to the first — space always cycles forward, never clamps.
+/// A custom off-ladder value lands on the next preset above it, not one past it.
+fn step_refresh_interval(app: &mut App) {
     const PRESETS: [u64; 6] = [15_000, 30_000, 60_000, 90_000, 120_000, 300_000];
     let current = app.refresh_interval.load(Ordering::Relaxed);
-    let pos = PRESETS
+    let new_interval = PRESETS
         .iter()
-        .position(|&p| p >= current)
-        .unwrap_or(PRESETS.len() - 1);
-    let new_pos = if dir > 0 {
-        (pos + 1).min(PRESETS.len() - 1)
-    } else {
-        pos.saturating_sub(1)
-    };
-    let new_interval = PRESETS[new_pos];
+        .copied()
+        .find(|&p| p > current)
+        .unwrap_or(PRESETS[0]);
     app.refresh_interval.store(new_interval, Ordering::Relaxed);
     {
         let mut cfg = app.config();
