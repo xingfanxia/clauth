@@ -218,8 +218,8 @@ The **Fallback** tab holds an ordered chain of profiles clauth hops between when
 
 - Each member has its own threshold (5h utilization %, default 95%); edit inline (<kbd>+</kbd> / <kbd>-</kbd> or type).
 - After each usage refresh (at startup and on every tick), clauth checks the active profile. If it's a chain member at or above its threshold, clauth walks the chain (wrapping) and switches to the first member under its own threshold. The `◆` marker shifts in place.
-- A **100%** threshold marks a last-resort sink: chosen only when every other member is past its threshold. Claude Code then surfaces its own *"out of 5h limit"* message after the switch lands.
-- The chain-global **wrap-off** toggle (Config tab) decides what happens when everyone is exhausted and no sink exists: off keeps you on the last account; on switches off all accounts, then re-arms once any member drops back under its threshold.
+- Mark a member **last resort** (a toggle row on its Fallback card) to make it the chain's parking spot: chosen only when every other member is past its threshold, never switched away from. Claude Code then surfaces its own *"out of 5h limit"* message once that account also runs out. The threshold itself only means "switch away at N%" — a 100% threshold is just a late switch point.
+- The chain-global **wrap-off** toggle (Config tab) decides what happens when everyone is exhausted and no member is marked last resort: off keeps you on the last account; on switches off all accounts, then re-arms once any member drops back under its threshold.
 - No eligible target keeps clauth put. If the active profile isn't in the chain, auto-switch is disabled. Profiles outside the chain are never switched away from or to. It's opt-in.
 
 <details>
