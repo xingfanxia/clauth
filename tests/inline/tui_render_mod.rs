@@ -230,6 +230,52 @@ fn fallback_threshold_editor_shows_range_tooltip() {
 }
 
 #[test]
+fn capture_name_caret_follows_edit_position() {
+    use crate::actions::CaptureSnapshot;
+    use crate::tui::app::{CaptureNameForm, InputState, Modal};
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+
+    let mut input = InputState::new("alice");
+    input.left();
+    input.left(); // caret now sits before "ce", not at the end
+    assert_ne!(input.cursor, input.value.len());
+
+    app.modals.push(Modal::CaptureName(CaptureNameForm {
+        snapshot: Box::new(CaptureSnapshot {
+            credentials: None,
+            base_url: None,
+            api_key: None,
+        }),
+        input,
+        from_divergence: false,
+    }));
+
+    let (w, h) = (90u16, 20u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let mid_caret = term.get_cursor_position().unwrap();
+
+    // Move the caret to the end of the same text and re-render: the terminal
+    // caret column must shift right, i.e. it tracks `InputState::cursor`
+    // instead of always snapping to the end of the string.
+    if let Some(Modal::CaptureName(form)) = app.modals.last_mut() {
+        form.input.end();
+    }
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let end_caret = term.get_cursor_position().unwrap();
+
+    assert_eq!(mid_caret.y, end_caret.y, "caret stays on the input row");
+    assert!(
+        mid_caret.x < end_caret.x,
+        "caret column must follow the edit position (mid={mid_caret:?}, end={end_caret:?})"
+    );
+}
+
+#[test]
 fn status_selected_row_tint_spans_both_lines() {
     let config = AppConfig {
         state: AppState::default(),

@@ -20,7 +20,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
     match modal {
         Modal::Confirm(state) => draw_confirm(frame, area, state),
         Modal::Divergence(form) => draw_divergence(frame, area, form),
-        Modal::CaptureName(form) => draw_capture_name(frame, area, form.input.value.as_str()),
+        Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input),
         Modal::Help => draw_help(frame, area, app),
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
         Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
@@ -264,18 +264,14 @@ fn env_collision_option_text(
     }
 }
 
-fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
-    let input = InputState {
-        value: value.to_string(),
-        cursor: value.len(),
-    };
+fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
     let lines = vec![
         Line::from(Span::styled(
             "stores the live ~/.claude/.credentials.json under this profile.",
             theme::dim(),
         )),
         Line::from(""),
-        labelled_input("name", &input, true),
+        labelled_input("name", input, true),
     ];
 
     // Replicate draw_modal's geometry to place the native terminal cursor on the
@@ -303,7 +299,7 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, value: &str) {
     draw_modal(frame, area, title, lines);
 
     // x = edit gutter "✎ " (2) + label "name" (4) + " " (1) + cols before caret
-    let cx = inner_x.saturating_add(2 + 4 + 1 + head_cols(&input) as u16);
+    let cx = inner_x.saturating_add(2 + 4 + 1 + head_cols(input) as u16);
     let cy = inner_y.saturating_add(2); // line index 2
     frame.set_cursor_position((cx, cy));
 }
