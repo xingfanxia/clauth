@@ -304,10 +304,12 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
     frame.set_cursor_position((cx, cy));
 }
 
-fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let title = "KEYS";
-
-    let tab_specific: Vec<(&str, &[(&str, &str)])> = match app.tab {
+/// Per-tab rows for the KEYS help modal, beneath the shared `tabs`/`global`
+/// sections. A standalone builder (not inlined into `draw_help`) so tests can
+/// enumerate every tab's real content without rendering a frame — see
+/// `every_sub_focus_tab_documents_esc_in_help`.
+fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
+    match tab {
         Tab::Overview => vec![(
             "accounts",
             &[
@@ -318,7 +320,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )],
         Tab::Usage => vec![(
             "usage",
-            &[("\u{2191}\u{2193}", "pick account to inspect")][..],
+            &[
+                ("\u{2191}\u{2193}", "pick account to inspect"),
+                ("r", "refresh account"),
+                ("e", "toggle estimates"),
+                ("p", "toggle pace marker"),
+            ][..],
         )],
         Tab::Tokens => vec![(
             "tokens",
@@ -336,9 +343,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("\u{2191}\u{2193}", "pick account / + new, then a row"),
                 ("\u{23ce}", "open settings · edit field · flip toggle"),
                 ("\u{23ce} on a field", "edit inline; \u{23ce} again saves"),
+                ("space", "cycle the model preset (model row)"),
                 ("env", "+ add env · \u{23ce} edits a value · a removes"),
                 ("delete", "\u{23ce} once to arm, again to confirm"),
-                ("\u{238b}", "stop editing / back to account list"),
+                ("esc", "stop editing / back to account list"),
             ][..],
         )],
         Tab::Config => vec![(
@@ -346,7 +354,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             &[
                 ("\u{2191}\u{2193}", "move between settings"),
                 ("space", "cycle the focused setting"),
-                ("\u{23ce}", "type a custom refresh interval"),
+                (
+                    "\u{23ce}",
+                    "same as space · custom value on refresh interval",
+                ),
             ][..],
         )],
         Tab::Status => vec![(
@@ -355,6 +366,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("\u{2191}\u{2193}", "pick incident / scroll detail"),
                 ("\u{23ce}", "open incident timeline"),
                 ("r", "refresh the feed"),
+                ("esc", "back to the list"),
             ][..],
         )],
         Tab::Plugin => vec![(
@@ -381,7 +393,13 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("esc", "back / cancel edit"),
             ][..],
         )],
-    };
+    }
+}
+
+fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let title = "KEYS";
+
+    let tab_specific = tab_specific_rows(app.tab);
 
     let nav: &[(&str, &str)] = &[(
         "\u{2190} \u{2192} \u{00b7} tab",
@@ -394,7 +412,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("t", "rotate all tokens"),
         ("?", "toggle this help"),
         ("a", "actions"),
+        ("x", "dismiss toast / alert"),
         ("q", "back / quit"),
+        ("esc", "back within a sub-view (no-op at the top level)"),
         ("\u{2303}c", "quit from anywhere"),
     ];
 
@@ -535,3 +555,7 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         frame.render_widget(Paragraph::new(line).style(row_bg), row_area);
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_modals.rs"]
+mod tests;

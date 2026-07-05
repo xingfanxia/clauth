@@ -7,8 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::super::app::{
-    App, ConfigFocus, ConfigRow, FallbackFocus, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS,
-    GlobalConfigRow, PluginFocus, StatusFocus, Tab, TokenView, config_rows, fallback_hint,
+    App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
+    PluginFocus, StatusFocus, Tab, TokenView, config_rows, fallback_hint, has_sub_focus,
 };
 use super::super::theme;
 
@@ -27,12 +27,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // `q` label: "back" in a sub-focus, "quit" at top level.
     // (While armed the alert row shows instead, so this label stays "quit".)
-    let has_sub_focus = (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
-        || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
-        || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
-        || (app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail)
-        || (app.tab == Tab::Tokens && app.token_view == TokenView::Models);
-    let q_label: &str = if has_sub_focus { "back" } else { "quit" };
+    let q_label: &str = if has_sub_focus(app) { "back" } else { "quit" };
 
     let tail: &[(&str, &str)] = match app.tab {
         Tab::Overview => &[("⇧↑↓", "reorder"), ("a", "actions"), ("?", "help")],

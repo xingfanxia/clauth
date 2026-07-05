@@ -1792,6 +1792,20 @@ pub(super) fn reconcile_startup(app: &mut App) {
 
 // ── Event handling ────────────────────────────────────────────────────────────
 
+/// True while `app.tab`'s descend/ascend sub-focus screen is active (Setup's
+/// Actions pane, Fallback's Detail pane, Status/Plugin's Detail pane, Tokens'
+/// Models view) — the state where `q`/`esc` ascend instead of arming quit /
+/// no-op. Single source of truth shared by the `q` handler and the footer's
+/// `q back` / `q quit` label; the help-modal esc-row test iterates it too, so
+/// a new sub-focus tab without an `esc` help row fails CI.
+pub(crate) fn has_sub_focus(app: &App) -> bool {
+    (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
+        || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
+        || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
+        || (app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail)
+        || (app.tab == Tab::Tokens && app.token_view == TokenView::Models)
+}
+
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind != KeyEventKind::Press {
         return;
@@ -1939,12 +1953,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // First `q` at the top level arms the 2-step quit; second confirms.
         // When there is a sub-focus to back out of, `q` ascends instead.
         KeyCode::Char('q') => {
-            let has_sub_focus = (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
-                || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
-                || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
-                || (app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail)
-                || (app.tab == Tab::Tokens && app.token_view == TokenView::Models);
-            if has_sub_focus {
+            if has_sub_focus(app) {
                 app.disarm_quit();
                 if app.tab == Tab::Setup {
                     app.config_focus = ConfigFocus::Profiles;
