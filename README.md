@@ -172,7 +172,7 @@ Keys are scoped to the current tab; <kbd>?</kbd> lists every binding for the tab
 
 | Keys | Action |
 |------|--------|
-| <kbd>←</kbd> <kbd>→</kbd> | move between tabs |
+| <kbd>←</kbd> <kbd>→</kbd> (or <kbd>tab</kbd> / <kbd>⇧tab</kbd> at the top level) | move between tabs |
 | <kbd>↑</kbd> <kbd>↓</kbd> | move the selection |
 | <kbd>⇧↑</kbd> <kbd>⇧↓</kbd> | reorder the selected account or fallback member |
 | <kbd>⏎</kbd> | switch to the selected profile, or confirm an edit |
@@ -180,7 +180,7 @@ Keys are scoped to the current tab; <kbd>?</kbd> lists every binding for the tab
 | <kbd>r</kbd> | refresh usage now (per-tab: reloads Tokens / Status / Plugin) |
 | <kbd>t</kbd> | force-refresh every account's token now |
 | <kbd>a</kbd> | open the context action menu for the current tab |
-| <kbd>+</kbd> <kbd>-</kbd> | nudge the selected threshold or interval |
+| <kbd>+</kbd> <kbd>-</kbd> | step the fallback threshold by 5% |
 | <kbd>c</kbd> | Tokens tab: count cache reads/writes in the totals |
 | <kbd>p</kbd> | Usage tab: toggle the ideal-pace marker |
 | <kbd>f</kbd> | Plugin tab: apply the selected row's fix |
