@@ -18,6 +18,8 @@ const BASH: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "login" ]; then
+        COMPREPLY=( $(compgen -W "--model" -- "${cur}") )
     fi
     return 0
 }
@@ -40,6 +42,8 @@ _clauth() {
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
+    elif (( CURRENT == 4 )) && [[ "${words[2]}" == login ]]; then
+        _values 'flag' '--model[set the default model before signing in]'
     fi
 }
 _clauth "$@"
@@ -55,6 +59,7 @@ complete -c clauth -f -n __fish_is_first_token -a login -d "Sign an account in v
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --model -d "Set default model before signing in"
 "#;
 
 pub(crate) fn print_script(shell: &str) -> Result<()> {

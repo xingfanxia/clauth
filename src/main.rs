@@ -85,10 +85,10 @@ fn dispatch(args: &[String]) -> Result<()> {
             cmd_start(name, rest, Isolation::Isolated)
         }
         [cmd, name, rest @ ..] if cmd == "start" => cmd_start(name, rest, Isolation::Shared),
-        [cmd, name] if cmd == "login" => cmd_login(name),
-        [cmd, ..] if cmd == "login" => {
-            anyhow::bail!("usage: clauth login <profile>");
-        }
+        [cmd, rest @ ..] if cmd == "login" => match parse_login_args(rest) {
+            Some((name, model)) => cmd_login(name, model),
+            None => anyhow::bail!("usage: clauth login <profile> [--model <id>]"),
+        },
         [cmd, ..] if cmd == "run" => anyhow::bail!(
             "`clauth run` isn't a command — for a headless delegate use \
              `clauth start <profile> -p \"<prompt>\"` (or the MCP `delegate` tool)"
@@ -100,7 +100,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
         _ => anyhow::bail!(
-            "usage: clauth [profile] | clauth start <profile> [claude args...] | clauth login <profile> | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
+            "usage: clauth [profile] | clauth start <profile> [claude args...] | clauth login <profile> [--model <id>] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
         ),
     }
 }
@@ -135,21 +135,50 @@ fn cmd_start(name: &str, rest: &[String], isolation: Isolation) -> Result<()> {
     start::run(&config, &canonical, rest, isolation)
 }
 
+/// `clauth login`'s args after the `login` token: bare `<profile>` or
+/// `<profile> --model <id>`. `None` on any other shape (missing profile,
+/// `--model` with no value, an unrecognized flag, extra args) — the caller
+/// turns that into one usage bail. Kept as its own pure fn (dispatch's other
+/// subcommands hand-roll the match inline) so the shape is unit-testable
+/// without invoking `cmd_login`, which spawns a real `claude` process.
+fn parse_login_args(rest: &[String]) -> Option<(&str, Option<&str>)> {
+    match rest {
+        // A `--`-prefixed "name" is a typo'd/misplaced flag, not a profile —
+        // `clauth login --model` must bail with usage, not create "--model".
+        [name] if !name.starts_with("--") => Some((name.as_str(), None)),
+        [name, flag, value] if flag == "--model" && !name.starts_with("--") => {
+            Some((name.as_str(), Some(value.as_str())))
+        }
+        _ => None,
+    }
+}
+
 /// `clauth login <name>` — sign an account in via Claude Code itself: run
 /// `claude` against the profile's runtime (creating the profile blank first
 /// when missing) and let the runtime watchdog adopt the completed `/login`
 /// into the profile's canonical credentials. clauth carries no OAuth sign-in
 /// leg of its own, so the flow inherits CC's credential handling wholesale —
-/// including wherever CC stores its login on each platform.
-fn cmd_login(name: &str) -> Result<()> {
+/// including wherever CC stores its login on each platform. `--model` (any
+/// preset alias or a full custom id, same values the Setup tab's model row
+/// accepts) is persisted BEFORE `claude` launches, so the runtime settings
+/// this session builds already carry the routing.
+fn cmd_login(name: &str, model: Option<&str>) -> Result<()> {
     platform::init();
     runtime::gc_stale_runtimes();
     let mut config = load_config()?;
     let name = config
         .canonical_name(name)
         .unwrap_or_else(|| name.trim().to_string());
-    if actions::ensure_login_profile(&mut config, &name)? {
+    if actions::ensure_login_profile(&mut config, &name, model)? {
         println!("clauth: created profile '{name}'");
+    } else if let Some(model) = model {
+        // Reused profile: the model set is a separate edit, so a failure here
+        // must say the profile itself is intact and reusable.
+        actions::set_profile_default_model(&mut config, &name, model).map_err(|e| {
+            anyhow::anyhow!(
+                "profile '{name}' exists and is untouched; failed to set its model: {e}"
+            )
+        })?;
     }
     println!("clauth: sign in with /login inside claude, then exit to save");
     start::run(&config, &name, &[], Isolation::Shared)?;
@@ -201,9 +230,11 @@ fn print_help() {
          CLAUDE_CONFIG_DIR; --isolated injects creds but drops operator\n                                  \
          memory/plugins/hooks (run in a clean cwd for a blind session);\n                                  \
          extra args go to claude\n  \
-           clauth login <profile>          sign in via claude's own /login inside the\n                                  \
-         profile's runtime; creates the profile when missing and saves\n                                  \
-         the completed login into it\n  \
+           clauth login <profile> [--model <id>]\n                                  \
+         sign in via claude's own /login inside the profile's runtime;\n                                  \
+         creates the profile when missing and saves the completed login\n                                  \
+         into it; --model sets its default model first (opus/sonnet/haiku/\n                                  \
+         opusplan or a full model id)\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
          credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \
@@ -223,3 +254,7 @@ fn print_help() {
 #[cfg(test)]
 #[path = "../tests/inline/feature_coverage.rs"]
 mod feature_coverage;
+
+#[cfg(test)]
+#[path = "../tests/inline/cli.rs"]
+mod tests;

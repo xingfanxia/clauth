@@ -3790,6 +3790,8 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
             rows.push(ConfigRow::ApiKey);
         }
+        // Base model only — the alias overrides + env rows stay existing-account-only.
+        rows.push(ConfigRow::Model);
         rows.push(ConfigRow::Create);
         return rows;
     }
@@ -4154,12 +4156,19 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
 
 /// Space on the `model` row: advance the alias cycle and persist. A custom value
 /// (set via ⏎) is outside the cycle, so the first space resets it to `default`.
+/// `editing_name` is `None` on the still-unsaved `+ new` draft — there's no
+/// profile yet to persist into, so it just advances the buffer in place; the
+/// value is folded in on `commit_new_account`.
 fn cycle_model(app: &mut App) {
-    let Some(name) = app
+    let editing_name = app
         .config_draft
         .as_ref()
-        .and_then(|d| d.editing_name.clone())
-    else {
+        .and_then(|d| d.editing_name.clone());
+    let Some(name) = editing_name else {
+        if let Some(d) = app.config_draft.as_mut() {
+            let next = next_model_preset(d.model.trimmed_some().as_deref()).unwrap_or_default();
+            d.model = InputState::new(&next);
+        }
         return;
     };
     let mut models = {
@@ -4593,6 +4602,7 @@ fn commit_new_account(app: &mut App) {
     let name = d.name.trimmed().to_string();
     let base_url = d.base_url.trimmed_some();
     let api_key = d.api_key.trimmed_some();
+    let model = d.model.trimmed_some();
     let validation = {
         let cfg = app.config();
         validate_profile_name(&name, &cfg.names(), None)
@@ -4604,7 +4614,7 @@ fn commit_new_account(app: &mut App) {
     let api_key = if base_url.is_some() { api_key } else { None };
     let result = {
         let mut cfg = app.config();
-        create_blank_profile(&mut cfg, name.clone(), base_url, api_key)
+        create_blank_profile(&mut cfg, name.clone(), base_url, api_key, model)
     };
     match result {
         Ok(()) => {

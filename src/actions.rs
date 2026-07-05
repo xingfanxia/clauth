@@ -425,9 +425,18 @@ pub(crate) fn create_blank_profile(
     name: String,
     base_url: Option<String>,
     api_key: Option<String>,
+    model: Option<String>,
 ) -> Result<()> {
     with_state_lock(|| {
-        let profile = Profile::new(name, base_url, api_key);
+        let mut profile = Profile::new(name, base_url, api_key);
+        // Part of the same single save as the profile itself — a chained
+        // edit-after-create would leave a saved-but-model-less profile behind
+        // when the second write fails, reported as a flat "create failed".
+        profile.models.default = model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
         save_profile(&profile)?;
         config.add(profile);
         save_app_state(&config.state)
@@ -435,16 +444,48 @@ pub(crate) fn create_blank_profile(
 }
 
 /// Resolve `name` for `clauth login`: an existing profile is reused (re-login
-/// into its runtime), a missing one is created blank after name validation.
-/// Returns true when a profile was created.
-pub(crate) fn ensure_login_profile(config: &mut AppConfig, name: &str) -> Result<bool> {
+/// into its runtime), a missing one is created blank after name validation,
+/// carrying `model` into that one atomic create. Returns true when a profile
+/// was created; the reuse branch ignores `model` (the caller updates it as a
+/// separate edit so the failure message can say the profile itself is fine).
+pub(crate) fn ensure_login_profile(
+    config: &mut AppConfig,
+    name: &str,
+    model: Option<&str>,
+) -> Result<bool> {
     if config.find(name).is_some() {
         return Ok(false);
     }
     let existing: Vec<&str> = config.names();
     validate_profile_name(name, &existing, None)?;
-    create_blank_profile(config, name.trim().to_string(), None, None)?;
+    create_blank_profile(
+        config,
+        name.trim().to_string(),
+        None,
+        None,
+        model.map(str::to_string),
+    )?;
     Ok(true)
+}
+
+/// Set a profile's default `model` (the Setup tab's base model row / the
+/// `clauth login --model` flag), preserving any alias overrides already on it.
+/// An empty (post-trim) value clears the default, matching the Setup tab's ⏎
+/// commit on the model row. Persists via [`edit_profile_model`], so a caller
+/// that runs this before starting a session (`clauth login`) has the model
+/// routed into that session's runtime settings from the first launch.
+pub(crate) fn set_profile_default_model(
+    config: &mut AppConfig,
+    name: &str,
+    raw_model: &str,
+) -> Result<()> {
+    let mut models = config
+        .find(name)
+        .map(|p| p.models.clone())
+        .unwrap_or_default();
+    let trimmed = raw_model.trim();
+    models.default = (!trimmed.is_empty()).then(|| trimmed.to_string());
+    edit_profile_model(config, name, models)
 }
 
 /// Returns a profile whose `refresh_token` matches `live`. Matches on refresh

@@ -974,8 +974,10 @@ fn demo_data_drives_all_actions() {
     type_str(&mut app, "sk-test-key-0000");
     press(&mut app, KeyCode::Enter); // commit ApiKey
 
-    // Navigate to Create row and commit
-    press(&mut app, KeyCode::Down); // ApiKey → Create
+    // Navigate to Create row and commit (skipping over the base model row —
+    // left untouched, so the created profile's default stays unset).
+    press(&mut app, KeyCode::Down); // ApiKey → Model
+    press(&mut app, KeyCode::Down); // Model → Create
 
     assert!(
         app.config_draft

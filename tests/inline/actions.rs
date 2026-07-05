@@ -183,16 +183,32 @@ fn ensure_login_creates_blank_profile() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    assert!(ensure_login_profile(&mut config, "fresh").expect("create"));
+    assert!(ensure_login_profile(&mut config, "fresh", None).expect("create"));
     let profile = config.find("fresh").expect("profile added");
     assert!(profile.credentials.is_none(), "created blank");
+    assert!(profile.models.default.is_none(), "no model unless asked");
+}
+
+#[test]
+fn ensure_login_create_carries_the_model_atomically() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    assert!(ensure_login_profile(&mut config, "fresh", Some("opus")).expect("create"));
+    assert_eq!(
+        config.find("fresh").and_then(|p| p.models.default.clone()),
+        Some("opus".to_string()),
+        "the --model value lands in the same single create save"
+    );
 }
 
 #[test]
 fn ensure_login_reuses_existing_profile() {
     let _home = HomeSandbox::new();
     let mut config = acct_config();
-    assert!(!ensure_login_profile(&mut config, "acct").expect("reuse"));
+    assert!(!ensure_login_profile(&mut config, "acct", None).expect("reuse"));
     assert_eq!(config.profiles.len(), 1, "no duplicate created");
 }
 
@@ -200,8 +216,62 @@ fn ensure_login_reuses_existing_profile() {
 fn ensure_login_rejects_invalid_name() {
     let _home = HomeSandbox::new();
     let mut config = acct_config();
-    assert!(ensure_login_profile(&mut config, ".hidden").is_err());
-    assert!(ensure_login_profile(&mut config, "").is_err());
+    assert!(ensure_login_profile(&mut config, ".hidden", None).is_err());
+    assert!(ensure_login_profile(&mut config, "", None).is_err());
+}
+
+// ── set_profile_default_model (`clauth login --model`, the create-form row) ──
+
+#[test]
+fn set_profile_default_model_persists_to_config_toml() {
+    let _home = HomeSandbox::new();
+    let mut config = acct_config();
+    set_profile_default_model(&mut config, "acct", "opus").expect("set model");
+
+    assert_eq!(
+        config.find("acct").unwrap().models.default.as_deref(),
+        Some("opus")
+    );
+    let toml = std::fs::read_to_string(profile_dir("acct").unwrap().join("config.toml"))
+        .expect("config.toml written");
+    assert!(toml.contains("opus"), "model persisted to config.toml");
+}
+
+#[test]
+fn set_profile_default_model_preserves_alias_overrides() {
+    let _home = HomeSandbox::new();
+    let mut config = acct_config();
+    edit_profile_model(
+        &mut config,
+        "acct",
+        ModelSettings {
+            opus: Some("claude-opus-4-8".to_string()),
+            ..ModelSettings::default()
+        },
+    )
+    .expect("seed opus alias");
+
+    set_profile_default_model(&mut config, "acct", "sonnet").expect("set default");
+
+    let profile = config.find("acct").unwrap();
+    assert_eq!(profile.models.default.as_deref(), Some("sonnet"));
+    assert_eq!(
+        profile.models.opus.as_deref(),
+        Some("claude-opus-4-8"),
+        "setting the default must not clobber an existing alias override"
+    );
+}
+
+#[test]
+fn set_profile_default_model_blank_clears_default() {
+    let _home = HomeSandbox::new();
+    let mut config = acct_config();
+    set_profile_default_model(&mut config, "acct", "opus").expect("set model");
+    set_profile_default_model(&mut config, "acct", "   ").expect("clear model");
+    assert!(
+        config.find("acct").unwrap().models.default.is_none(),
+        "blank input clears the default, mirroring the Setup tab's ⏎ commit"
+    );
 }
 
 #[test]

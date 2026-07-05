@@ -938,3 +938,138 @@ fn capture_overwrite_cancel_changes_nothing() {
         "profiles.toml byte-identical after cancel"
     );
 }
+
+// ── Setup tab: default-model row on the `+ new` create form (issue #12) ──────
+//
+// The row is the same hybrid alias-cycle field an existing account's model row
+// is; the create form otherwise stays minimal (no alias overrides, no env).
+
+mod new_account_model_row {
+    use super::super::{
+        App, ConfigFocus, ConfigRow, InputState, Tab, commit_new_account, config_rows, cycle_model,
+        enter_config_detail,
+    };
+    use crate::profile::{AppConfig, AppState};
+    use crate::testutil::HomeSandbox;
+
+    fn empty_app() -> App {
+        App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        })
+    }
+
+    fn enter_new_account_form(app: &mut App) {
+        app.tab = Tab::Setup;
+        app.profile_cursor = app.profile_count(); // trailing "+ new" row
+        enter_config_detail(app);
+        assert_eq!(app.config_focus, ConfigFocus::Actions);
+        assert_eq!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.editing_name.clone()),
+            None,
+            "a fresh draft has no profile yet to persist into"
+        );
+    }
+
+    #[test]
+    fn create_form_carries_the_model_row_before_create() {
+        let mut app = empty_app();
+        enter_new_account_form(&mut app);
+        let rows = config_rows(&app);
+        let model_pos = rows
+            .iter()
+            .position(|r| *r == ConfigRow::Model)
+            .expect("create form carries the base model row");
+        let create_pos = rows
+            .iter()
+            .position(|r| *r == ConfigRow::Create)
+            .expect("create row present");
+        assert!(model_pos < create_pos, "model row precedes create");
+        assert!(
+            !rows.contains(&ConfigRow::OpusModel) && !rows.contains(&ConfigRow::ModelOverrideAdd),
+            "the create form stays minimal: no alias overrides"
+        );
+    }
+
+    #[test]
+    fn space_cycles_the_draft_model_buffer_with_no_profile_to_persist_into() {
+        let mut app = empty_app();
+        enter_new_account_form(&mut app);
+
+        for expected in ["opus", "sonnet", "haiku", "opusplan"] {
+            cycle_model(&mut app);
+            assert_eq!(app.config_draft.as_ref().unwrap().model.value, expected);
+        }
+        cycle_model(&mut app);
+        assert_eq!(
+            app.config_draft.as_ref().unwrap().model.value,
+            "",
+            "cycling past the last preset collapses back to unset `default`"
+        );
+    }
+
+    #[test]
+    fn create_persists_the_picked_model_to_the_new_profile() {
+        let _home = HomeSandbox::new();
+        let mut app = empty_app();
+        enter_new_account_form(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name = InputState::new("fresh");
+        }
+        cycle_model(&mut app); // "" -> "opus"
+
+        commit_new_account(&mut app);
+
+        assert_eq!(
+            app.config()
+                .find("fresh")
+                .and_then(|p| p.models.default.clone()),
+            Some("opus".to_string()),
+            "the model picked on the create form persists to the new profile"
+        );
+    }
+
+    #[test]
+    fn create_persists_a_custom_model_id_too() {
+        let _home = HomeSandbox::new();
+        let mut app = empty_app();
+        enter_new_account_form(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name = InputState::new("fresh");
+            // The ⏎ custom-id editor edits this same draft buffer in place.
+            d.model = InputState::new("claude-fable-5");
+        }
+
+        commit_new_account(&mut app);
+
+        assert_eq!(
+            app.config()
+                .find("fresh")
+                .and_then(|p| p.models.default.clone()),
+            Some("claude-fable-5".to_string()),
+            "a typed custom id persists through create, not just presets"
+        );
+    }
+
+    #[test]
+    fn create_without_touching_model_leaves_it_unset() {
+        let _home = HomeSandbox::new();
+        let mut app = empty_app();
+        enter_new_account_form(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.name = InputState::new("bare");
+        }
+
+        commit_new_account(&mut app);
+
+        assert_eq!(
+            app.config()
+                .find("bare")
+                .and_then(|p| p.models.default.clone()),
+            None,
+            "default stays unset on purpose, matching default claude code behaviour"
+        );
+    }
+}
