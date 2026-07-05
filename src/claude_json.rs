@@ -158,6 +158,36 @@ fn sync_paths(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// Delete the stale `oauthAccount` identity block from the home
+/// `~/.claude.json` on profile switch (issue #17). Claude Code trusts a
+/// cached identity block and does not re-derive it from a relinked
+/// credentials file on a normal startup; dropping the block instead lets it
+/// self-heal — probed on CC 2.1.201 (`docs/issue-17-oauthaccount.md`): an
+/// absent block re-derives the correct identity from the token within
+/// seconds, a present-but-wrong one never self-corrects.
+///
+/// Read-then-parse first: a missing file is left uncreated, and a file that
+/// fails to parse (CC mid-write) is left untouched rather than clobbered. A
+/// write only happens when the key is actually present — an already-clean
+/// file is never touched, because [`sync_once`] picks the newest-mtime member
+/// as the sync winner; a pointless touch here would make home win the next
+/// tick and stomp a runtime copy's own fields.
+pub(crate) fn strip_home_oauth_account() -> Result<()> {
+    let path = home_dir()?.join(".claude.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(()); // missing — never create
+    };
+    let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(()); // unparseable (CC mid-write) — never clobber
+    };
+    if obj.remove("oauthAccount").is_none() {
+        return Ok(()); // already clean — avoid a pointless mtime bump
+    }
+    let bytes = serde_json::to_vec_pretty(&Value::Object(obj))
+        .context("failed to serialize .claude.json after stripping oauthAccount")?;
+    atomic_write(&path, &bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/claude_json.rs"]
 mod tests;

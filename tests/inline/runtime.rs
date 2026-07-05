@@ -991,6 +991,67 @@ fn build_runtime_dir_links_claude_json_from_parent() {
     });
 }
 
+/// Issue #17 systemic finding: a raw copy is born carrying whichever account
+/// was active at seed time, wrong for every non-active profile. Seeding must
+/// strip it so the fresh runtime starts identity-less and Claude Code
+/// re-derives it from THIS profile's own credentials.
+#[test]
+fn seed_claude_json_strips_oauth_account_from_fresh_member() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(
+            tmp.path().join(".claude.json"),
+            br#"{"oauthAccount":{"emailAddress":"active@x"},"numStartups":4}"#,
+        )
+        .expect("write global .claude.json");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+
+        seed_claude_json(&runtime, &claude_home).expect("seed");
+
+        let dst = runtime.join(".claude.json");
+        let seeded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&dst).expect("read seeded")).expect("parse");
+        assert!(
+            seeded.get("oauthAccount").is_none(),
+            "a freshly seeded runtime copy must not inherit the active profile's identity"
+        );
+        assert_eq!(seeded["numStartups"], serde_json::json!(4));
+    });
+}
+
+/// A profile whose runtime already has its own real `.claude.json` (its own
+/// prior login wrote a genuine identity) must keep it — seeding only applies
+/// to a missing file or a leftover shared symlink, never to an existing copy.
+#[test]
+fn seed_claude_json_leaves_existing_real_copy_untouched() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = HOME_MUTEX.lock().expect("home mutex");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(
+            tmp.path().join(".claude.json"),
+            br#"{"oauthAccount":{"emailAddress":"active@x"},"numStartups":4}"#,
+        )
+        .expect("write global .claude.json");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let dst = runtime.join(".claude.json");
+        let own: &[u8] = br#"{"oauthAccount":{"emailAddress":"own@x"},"numStartups":1}"#;
+        fs::write(&dst, own).expect("write existing runtime copy");
+
+        seed_claude_json(&runtime, &claude_home).expect("seed");
+
+        assert_eq!(
+            fs::read(&dst).expect("read"),
+            own,
+            "an existing real copy already has its own identity and must not be reseeded"
+        );
+    });
+}
+
 #[test]
 fn has_live_session_false_when_no_sessions_dir() {
     let tmp = tempfile::tempdir().expect("tempdir");

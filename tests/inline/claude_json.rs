@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::testutil::set_mtime;
+use crate::testutil::{HomeSandbox, set_mtime};
 
 fn write_json(path: &Path, value: &Value) {
     fs::write(path, serde_json::to_vec_pretty(value).expect("serialize")).expect("write");
@@ -172,4 +172,98 @@ fn single_file_is_noop() {
     let before = fs::read(&a).expect("read");
     sync_paths(std::slice::from_ref(&a)).expect("sync");
     assert_eq!(fs::read(&a).expect("read"), before);
+}
+
+// ── strip_home_oauth_account (issue #17 switch-time delete) ───────────────
+
+#[test]
+fn strip_home_oauth_account_removes_key_and_preserves_the_rest() {
+    let home = HomeSandbox::new();
+    let path = home.home().join(".claude.json");
+    write_json(
+        &path,
+        &json!({
+            "oauthAccount": {"emailAddress": "stale@x"},
+            "numStartups": 3,
+            "mcpServers": {"clauth": {"command": "clauth"}},
+        }),
+    );
+
+    strip_home_oauth_account().expect("strip");
+
+    let after = read_json(&path);
+    assert!(
+        after.get("oauthAccount").is_none(),
+        "stale identity block must be gone"
+    );
+    assert_eq!(after["numStartups"], json!(3));
+    assert_eq!(
+        after["mcpServers"],
+        json!({"clauth": {"command": "clauth"}})
+    );
+}
+
+#[test]
+fn strip_home_oauth_account_no_op_when_key_absent() {
+    let home = HomeSandbox::new();
+    let path = home.home().join(".claude.json");
+    write_json(&path, &json!({"numStartups": 3}));
+    let before_bytes = fs::read(&path).expect("read");
+    set_mtime(&path, t(1));
+    let before_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+
+    strip_home_oauth_account().expect("strip");
+
+    assert_eq!(
+        fs::read(&path).expect("read"),
+        before_bytes,
+        "a file with no oauthAccount must not be rewritten"
+    );
+    assert_eq!(
+        fs::metadata(&path).unwrap().modified().unwrap(),
+        before_mtime,
+        "an untouched file must not bump mtime (would make home win the next sync)"
+    );
+}
+
+#[test]
+fn strip_home_oauth_account_skips_unparseable_file() {
+    let home = HomeSandbox::new();
+    let path = home.home().join(".claude.json");
+    fs::write(&path, b"{ mid write, not valid json").expect("write garbage");
+    let before = fs::read(&path).expect("read");
+
+    strip_home_oauth_account().expect("strip must not fail on a CC mid-write file");
+
+    assert_eq!(
+        fs::read(&path).expect("read"),
+        before,
+        "an unparseable file must never be clobbered"
+    );
+}
+
+#[test]
+fn strip_home_oauth_account_skips_valid_json_that_is_not_an_object() {
+    let home = HomeSandbox::new();
+    let path = home.home().join(".claude.json");
+    fs::write(&path, b"[]").expect("write non-object json");
+    let before = fs::read(&path).expect("read");
+
+    strip_home_oauth_account().expect("strip must not fail on a non-object document");
+
+    assert_eq!(
+        fs::read(&path).expect("read"),
+        before,
+        "a parses-but-not-an-object file must be left untouched"
+    );
+}
+
+#[test]
+fn strip_home_oauth_account_skips_missing_file() {
+    let home = HomeSandbox::new();
+    let path = home.home().join(".claude.json");
+
+    strip_home_oauth_account().expect("strip must not fail when there is nothing to strip");
+
+    assert!(!path.exists(), "a missing file must never be created");
 }

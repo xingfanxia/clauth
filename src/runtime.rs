@@ -636,9 +636,13 @@ fn write_merged_settings(
 /// identity and won't re-derive it from the token on a normal startup, so a
 /// shared symlink leaks one account's identity into another. The background
 /// syncer (`crate::claude_json`) keeps the non-per-profile fields converged
-/// across all copies (latest write wins). A freshly seeded copy inherits the
-/// global file's `oauthAccount`; that profile's next OAuth login overwrites it
-/// with the correct identity, which the syncer then preserves.
+/// across all copies (latest write wins). A freshly seeded copy strips the
+/// global file's `oauthAccount` (issue #17: a raw copy is born carrying
+/// whichever account was active at seed time, wrong for every profile but the
+/// active one) so this profile starts identity-less and Claude Code re-derives
+/// it from THIS profile's own credentials on first boot; that boot (or the
+/// next OAuth login) writes the correct identity, which the syncer then
+/// preserves as this copy's own per-profile field.
 ///
 /// Seeds from the global file when this profile has no real copy yet, or
 /// migrates the old shared symlink (pre-per-profile behavior) to a copy.
@@ -657,9 +661,25 @@ fn seed_claude_json(runtime: &Path, claude_home: &Path) -> Result<()> {
     if (is_symlink || !dst.exists())
         && let Ok(bytes) = std::fs::read(&global)
     {
+        let bytes = strip_oauth_account_on_seed(bytes);
         atomic_write(&dst, &bytes).with_context(|| format!("failed to seed {}", dst.display()))?;
     }
     Ok(())
+}
+
+/// Remove `oauthAccount` from freshly seeded `.claude.json` bytes. A no-op
+/// (returns the bytes unchanged) when the key is already absent or the source
+/// doesn't parse as a JSON object, so the common case stays a plain byte copy.
+fn strip_oauth_account_on_seed(bytes: Vec<u8>) -> Vec<u8> {
+    let Ok(serde_json::Value::Object(mut obj)) =
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+    else {
+        return bytes;
+    };
+    if obj.remove("oauthAccount").is_none() {
+        return bytes;
+    }
+    serde_json::to_vec_pretty(&serde_json::Value::Object(obj)).unwrap_or(bytes)
 }
 
 fn materialize_entry(src: &Path, dst: &Path, mode: LinkMode) -> Result<()> {

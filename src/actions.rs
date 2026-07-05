@@ -239,6 +239,9 @@ pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
         }
         snapshot_active_credentials(config)?;
         clear_claude_credentials()?;
+        // No active account left to show; issue #17 applies here too — a
+        // stale identity block is just as wrong once creds are cleared.
+        crate::claude_json::strip_home_oauth_account()?;
         config.state.active_profile = None;
         save_app_state(&config.state)
     })
@@ -255,6 +258,10 @@ fn finish_switch(config: &mut AppConfig, name: &str) -> Result<()> {
         .unwrap_or_default();
     let profile = config.find(name).context("Profile not found")?;
     apply_profile_to_claude_settings(profile, &prev_env_keys)?;
+    // issue #17: drop the outgoing account's cached identity so Claude Code
+    // re-derives it from the just-relinked credentials instead of showing
+    // the wrong account until its next `/login`.
+    crate::claude_json::strip_home_oauth_account()?;
     config.state.active_profile = Some(name.into());
     save_app_state(&config.state)
 }

@@ -505,3 +505,81 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
         "no dangling .credentials.json symlink after credentials go to None while active"
     );
 }
+
+// ── issue #17: stale oauthAccount deleted on every switch path ────────────
+
+fn home_claude_json_path() -> std::path::PathBuf {
+    crate::profile::home_dir().unwrap().join(".claude.json")
+}
+
+fn write_home_claude_json_with_identity() {
+    std::fs::write(
+        home_claude_json_path(),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "oauthAccount": {"emailAddress": "stale@x"},
+            "numStartups": 7,
+        }))
+        .unwrap(),
+    )
+    .expect("write home .claude.json");
+}
+
+/// `finish_switch` is the shared convergence point for the manual CLI, TUI,
+/// MCP `switch`, and fallback switch paths (all four route through
+/// `switch_profile`/`switch_profile_reconciled`/`switch_profile_discard`,
+/// which call it under the state lock) — asserting on it directly pins the
+/// behaviour for all of them at once.
+#[test]
+fn finish_switch_deletes_stale_oauth_account_block() {
+    let _home = HomeSandbox::new();
+    write_home_claude_json_with_identity();
+
+    let mut config = acct_config();
+    finish_switch(&mut config, "acct").expect("finish_switch");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home_claude_json_path()).unwrap()).unwrap();
+    assert!(
+        after.get("oauthAccount").is_none(),
+        "the outgoing account's identity block must be gone after a switch"
+    );
+    assert_eq!(
+        after["numStartups"],
+        serde_json::json!(7),
+        "unrelated keys must survive the switch untouched"
+    );
+}
+
+/// `switch_off` (chain-exhausted / manual "turn off") clears live credentials
+/// without going through `finish_switch` — a stale identity block is just as
+/// wrong once creds are gone, so it needs its own coverage rather than relying
+/// on the shared path.
+#[test]
+fn switch_off_also_deletes_stale_oauth_account_block() {
+    let _home = HomeSandbox::new();
+    write_home_claude_json_with_identity();
+
+    let profile = Profile::new("acct".to_string(), None, None);
+    save_profile(&profile).expect("save profile");
+    crate::claude::link_profile_credentials("acct").expect("link acct live");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["acct".into()],
+            active_profile: Some("acct".into()),
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+
+    switch_off(&mut config).expect("switch_off");
+
+    assert!(config.state.active_profile.is_none());
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home_claude_json_path()).unwrap()).unwrap();
+    assert!(
+        after.get("oauthAccount").is_none(),
+        "no active account remains, so the stale identity block must be gone too"
+    );
+    assert_eq!(after["numStartups"], serde_json::json!(7));
+}
