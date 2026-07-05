@@ -24,8 +24,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::actions::{
     CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
     create_blank_profile, delete_profile, edit_profile_endpoint, edit_profile_env,
-    edit_profile_model, find_matching_oauth_profile, rename_profile, reorder_profile, switch_off,
-    switch_profile, validate_profile_name,
+    edit_profile_model, find_matching_oauth_profile, overwrite_captured_profile, rename_profile,
+    reorder_profile, switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -325,6 +325,12 @@ pub(crate) struct ConfirmState {
 pub(crate) enum ConfirmAction {
     /// `bool` = `from_divergence`, carried through for deferred-detach semantics.
     CaptureConflict(Box<CaptureSnapshot>, bool),
+    /// Capture-name collision (issue #7): the typed name already belongs to
+    /// another profile. `String` = that profile's existing (canonical-cased)
+    /// name, `bool` = `from_divergence`, both carried through to
+    /// `overwrite_captured_profile` the same way `CaptureConflict` carries them
+    /// to `capture_into_profile`.
+    CaptureOverwrite(Box<CaptureSnapshot>, String, bool),
     Switch(String),
     /// Confirm before discarding CC's freshly-written credentials and relinking.
     DiscardDivergence(String),
@@ -4719,6 +4725,33 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 from_divergence,
             }));
         }
+        ConfirmAction::CaptureOverwrite(snapshot, name, from_divergence) => {
+            // Same deferred detach as the non-colliding path: only disown the
+            // prior active profile once the overwrite is actually confirmed,
+            // so a cancel (handled entirely by `handle_confirm_key` popping
+            // without calling this) leaves it untouched.
+            if from_divergence {
+                let _ = detach_credentials_link();
+                let mut cfg = app.config();
+                cfg.state.active_profile = None;
+                let _ = save_app_state(&cfg.state);
+            }
+            let result = {
+                let mut cfg = app.config();
+                overwrite_captured_profile(&mut cfg, &name, *snapshot)
+            };
+            match result {
+                Ok(()) => {
+                    app.refresh_tokens();
+                    app.last_state_mtime = app_state_mtime();
+                    app.toast(
+                        ToastKind::Success,
+                        format!("overwrote '{name}' with the captured login"),
+                    );
+                }
+                Err(e) => app.toast(ToastKind::Danger, format!("overwrite failed: {e}")),
+            }
+        }
         ConfirmAction::Switch(name) => {
             if !is_idle(&app.activity, &name) {
                 app.toast(
@@ -4898,23 +4931,48 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
-            let validation = {
-                let cfg = app.config();
-                let existing = cfg.names();
-                validate_profile_name(&name, &existing, None)
-            };
-            if let Err(e) = validation {
+            // Chars/empty-only check here — the duplicate-name branch of
+            // `validate_profile_name` is skipped (empty `existing`) so a
+            // collision falls through to the canonical_name lookup below
+            // instead of dead-ending with an "already exists" error.
+            if let Err(e) = validate_profile_name(&name, &[], None) {
                 app.toast(ToastKind::Danger, format!("{e}"));
                 return;
             }
+            let collision = {
+                let cfg = app.config();
+                cfg.canonical_name(&name)
+            };
             let Some(Modal::CaptureName(form)) = app.modals.pop() else {
                 return;
             };
-            let snapshot = *form.snapshot;
+            let CaptureNameForm {
+                snapshot,
+                from_divergence,
+                ..
+            } = form;
+            if let Some(existing) = collision {
+                // Issue #7: typing an existing profile's name used to dead-end
+                // with an error. Route to the same confirm-modal machinery as
+                // every other destructive action instead of a picker/new modal.
+                app.modals.push(Modal::Confirm(ConfirmState {
+                    message: format!("Profile '{existing}' already exists."),
+                    detail: Some(
+                        "Overwrite its credentials with the captured login? Usage history, env, and model settings are kept.".to_string(),
+                    ),
+                    choice: false,
+                    on_confirm: ConfirmAction::CaptureOverwrite(
+                        snapshot,
+                        existing,
+                        from_divergence,
+                    ),
+                }));
+                return;
+            }
             // Divergence capture: detach + deactivate only after name is
             // confirmed so `capture_into_profile` sees `active_profile.is_none()`
             // and links the new one. On Esc this never runs.
-            if form.from_divergence {
+            if from_divergence {
                 let _ = detach_credentials_link();
                 let mut cfg = app.config();
                 cfg.state.active_profile = None;
@@ -4922,7 +4980,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             }
             let result = {
                 let mut cfg = app.config();
-                capture_into_profile(&mut cfg, name.clone(), snapshot)
+                capture_into_profile(&mut cfg, name.clone(), *snapshot)
             };
             match result {
                 Ok(()) => {

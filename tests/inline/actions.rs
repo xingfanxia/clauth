@@ -225,3 +225,213 @@ fn validate_profile_name_accepts_email_rejects_path_chars() {
         );
     }
 }
+
+// ── capture-name collision overwrite (issue #7) ────────────────────────────
+
+/// Overwriting an existing profile on a capture-name collision must mutate it
+/// in place: chain position, env, model/fallback config, and auto_start
+/// survive; only credentials/base_url/api_key change; usage_history.jsonl
+/// (a persisted log, not a cache) is untouched; the stale per-account fetch
+/// caches are dropped since they now describe the wrong credentials.
+#[test]
+fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
+    let _home = HomeSandbox::new();
+
+    // "acme" sits in the MIDDLE of a 3-profile chain — a blind delete+append
+    // would move it to the end, so this actually proves position survives an
+    // in-place mutation rather than merely proving membership.
+    let first = Profile::new("first".to_string(), None, None);
+    save_profile(&first).expect("save first");
+    let last = Profile::new("last".to_string(), None, None);
+    save_profile(&last).expect("save last");
+
+    let mut target = Profile::new("acme".to_string(), None, None);
+    target.auto_start = true;
+    target.env.insert("FOO".to_string(), "bar".to_string());
+    target.fallback_threshold = Some(42.0);
+    target.bell_threshold = Some(77.0);
+    target.models.opus = Some("claude-opus-4".to_string());
+    target.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&target).expect("save target");
+
+    let history_path = profile_dir("acme").unwrap().join("usage_history.jsonl");
+    std::fs::write(&history_path, b"{\"ts\":1}\n").expect("seed usage history");
+
+    // Seed the transient fetch-state caches the overwrite must drop.
+    for file in [
+        crate::profile_cache::USAGE_CACHE_FILE,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+    ] {
+        crate::profile_cache::write_profile_cache("acme", file, &"stale");
+    }
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["first".into(), "acme".into(), "last".into()],
+            fallback_chain: vec!["first".into(), "acme".into(), "last".into()],
+            active_profile: Some("first".into()),
+            ..AppState::default()
+        },
+        profiles: vec![first, target, last],
+    };
+
+    let snapshot = CaptureSnapshot {
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "new-access".to_string(),
+                refresh_token: Some("new-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }),
+        base_url: Some("https://api.example.com".to_string()),
+        api_key: Some("new-api-key".to_string()),
+    };
+
+    overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite in place");
+
+    assert_eq!(
+        config.profiles.len(),
+        3,
+        "no duplicate entry from a blind append"
+    );
+    let acme = config
+        .find("acme")
+        .expect("profile still present under the same name");
+    assert_eq!(
+        acme.access_token(),
+        Some("new-access"),
+        "credentials replaced"
+    );
+    assert_eq!(
+        acme.base_url.as_deref(),
+        Some("https://api.example.com"),
+        "base_url replaced"
+    );
+    assert_eq!(
+        acme.api_key.as_deref(),
+        Some("new-api-key"),
+        "api_key replaced"
+    );
+    assert!(acme.auto_start, "auto_start config preserved");
+    assert_eq!(
+        acme.env.get("FOO"),
+        Some(&"bar".to_string()),
+        "env map preserved"
+    );
+    assert_eq!(
+        acme.fallback_threshold,
+        Some(42.0),
+        "fallback_threshold preserved"
+    );
+    assert_eq!(acme.bell_threshold, Some(77.0), "bell_threshold preserved");
+    assert_eq!(
+        acme.models.opus.as_deref(),
+        Some("claude-opus-4"),
+        "model settings preserved"
+    );
+    assert!(
+        acme.usage.is_none() && acme.fetch_status.is_none() && acme.third_party_usage.is_none(),
+        "transient fetch state cleared"
+    );
+
+    assert_eq!(
+        config.state.fallback_chain,
+        vec![
+            crate::profile::ProfileName::from("first"),
+            crate::profile::ProfileName::from("acme"),
+            crate::profile::ProfileName::from("last"),
+        ],
+        "chain position must survive an in-place overwrite, not delete+append"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&history_path).unwrap(),
+        "{\"ts\":1}\n",
+        "usage_history.jsonl is the persisted log, not a cache — must survive"
+    );
+
+    for file in [
+        crate::profile_cache::USAGE_CACHE_FILE,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+    ] {
+        let path = crate::profile_cache::profile_cache_path("acme", file).unwrap();
+        assert!(
+            !path.exists(),
+            "{file} must be dropped — it describes the old account"
+        );
+    }
+}
+
+/// Overwriting the ACTIVE profile must re-apply to live `~/.claude` state —
+/// mirrors `edit_profile_endpoint`'s active-case handling. Without this a
+/// running `claude` keeps reading the OLD endpoint/token until the next
+/// explicit switch, and dropping OAuth creds on an active profile (a
+/// third-party recapture) would leave `.credentials.json` a dangling
+/// symlink instead of a clean absence.
+#[test]
+fn overwrite_captured_profile_reapplies_live_state_when_active() {
+    let _home = HomeSandbox::new();
+
+    let mut acme = Profile::new("acme".to_string(), None, None);
+    acme.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&acme).expect("save acme");
+    crate::claude::link_profile_credentials("acme").expect("link acme live");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["acme".into()],
+            fallback_chain: vec!["acme".into()],
+            active_profile: Some("acme".into()),
+            ..AppState::default()
+        },
+        profiles: vec![acme],
+    };
+
+    // Overwrite the active profile with a third-party (no-OAuth) snapshot.
+    let snapshot = CaptureSnapshot {
+        credentials: None,
+        base_url: Some("https://api.example.com".to_string()),
+        api_key: Some("new-api-key".to_string()),
+    };
+    overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite active profile");
+
+    let live_endpoint = crate::claude::read_claude_endpoint_config().expect("read live endpoint");
+    assert_eq!(
+        live_endpoint.base_url.as_deref(),
+        Some("https://api.example.com"),
+        "live settings.json must pick up the new base_url immediately, not on next switch"
+    );
+    assert_eq!(
+        live_endpoint.api_key.as_deref(),
+        Some("new-api-key"),
+        "live settings.json must pick up the new api_key immediately, not on next switch"
+    );
+
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    assert!(
+        live_path.symlink_metadata().is_err(),
+        "no dangling .credentials.json symlink after credentials go to None while active"
+    );
+}

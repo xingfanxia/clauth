@@ -79,6 +79,7 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let title = match state.on_confirm {
         ConfirmAction::CaptureConflict(..) => "CONFIRM",
+        ConfirmAction::CaptureOverwrite(..) => "CONFIRM",
         ConfirmAction::Switch(_) => "CONFIRM",
         ConfirmAction::DiscardDivergence(_) => "CONFIRM",
         ConfirmAction::RotateAll => "CONFIRM",
@@ -88,9 +89,14 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     };
 
     // Destructive/global ops carry a DANGER cue on their confirm button.
+    // `CaptureOverwrite` replaces an existing profile's credentials in
+    // place — irreversible like the other destructive actions here.
     let destructive = matches!(
         state.on_confirm,
-        ConfirmAction::Switch(_) | ConfirmAction::RotateAll | ConfirmAction::RotateOne(_)
+        ConfirmAction::Switch(_)
+            | ConfirmAction::RotateAll
+            | ConfirmAction::RotateOne(_)
+            | ConfirmAction::CaptureOverwrite(..)
     );
 
     let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(

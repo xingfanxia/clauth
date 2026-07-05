@@ -838,3 +838,103 @@ fn capture_refuses_empty_snapshot() {
         "danger toast names the problem"
     );
 }
+
+// ── capture-name collision (issue #7) ──────────────────────────────────────
+
+/// Typing an EXISTING profile's name in the capture-name prompt must open the
+/// confirm-overwrite modal instead of dead-ending with an "already exists"
+/// error toast.
+#[test]
+fn capture_name_collision_opens_overwrite_confirm_instead_of_erroring() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("acme")]);
+
+    let snapshot = crate::actions::CaptureSnapshot {
+        credentials: None,
+        base_url: Some("https://new.example.com".to_string()),
+        api_key: Some("new-key".to_string()),
+    };
+    app.modals
+        .push(super::Modal::CaptureName(super::CaptureNameForm {
+            snapshot: Box::new(snapshot),
+            input: super::InputState::new("acme"),
+            from_divergence: false,
+        }));
+
+    super::handle_capture_name_key(&mut app, key(KeyCode::Enter));
+
+    assert!(
+        app.toasts.iter().all(|t| t.kind != ToastKind::Danger),
+        "typing an existing name must not dead-end with an error toast"
+    );
+    match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => {
+            assert!(
+                matches!(
+                    &state.on_confirm,
+                    super::ConfirmAction::CaptureOverwrite(_, name, false) if name.as_str() == "acme"
+                ),
+                "collision must route to CaptureOverwrite targeting the existing profile"
+            );
+        }
+        other => panic!("expected a Confirm(CaptureOverwrite) modal, got {other:?}"),
+    }
+}
+
+/// Cancelling the overwrite confirm must leave everything untouched: the
+/// captured snapshot is dropped, config.toml/profiles.toml are byte-identical,
+/// and the previously active profile stays active.
+#[test]
+fn capture_overwrite_cancel_changes_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut existing = crate::testutil::blank_profile("acme");
+    existing.env.insert("FOO".to_string(), "bar".to_string());
+    crate::profile::save_profile(&existing).expect("save existing");
+
+    let mut app = app_with_unlinked_profiles(vec![existing]);
+    app.config().state.active_profile = Some("acme".into());
+    crate::profile::save_app_state(&app.config().state).expect("persist active profile");
+
+    let config_toml = crate::profile::profile_dir("acme")
+        .unwrap()
+        .join("config.toml");
+    let profiles_toml = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    let before_config = std::fs::read(&config_toml).expect("read config.toml");
+    let before_state = std::fs::read(&profiles_toml).expect("read profiles.toml");
+
+    let snapshot = crate::actions::CaptureSnapshot {
+        credentials: None,
+        base_url: Some("https://new.example.com".to_string()),
+        api_key: Some("new-key".to_string()),
+    };
+    app.modals.push(super::Modal::Confirm(super::ConfirmState {
+        message: "Profile 'acme' already exists.".to_string(),
+        detail: None,
+        choice: false, // cancel is the default-focused, safe choice
+        on_confirm: super::ConfirmAction::CaptureOverwrite(
+            Box::new(snapshot),
+            "acme".to_string(),
+            false,
+        ),
+    }));
+
+    super::handle_confirm_key(&mut app, key(KeyCode::Enter));
+
+    assert!(app.modals.is_empty(), "cancel dismisses the modal");
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("acme"),
+        "active profile unchanged"
+    );
+    assert_eq!(
+        std::fs::read(&config_toml).unwrap(),
+        before_config,
+        "config.toml byte-identical after cancel"
+    );
+    assert_eq!(
+        std::fs::read(&profiles_toml).unwrap(),
+        before_state,
+        "profiles.toml byte-identical after cancel"
+    );
+}

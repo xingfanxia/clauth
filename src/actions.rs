@@ -21,6 +21,7 @@ use crate::profile::{
     AppConfig, ClaudeCredentials, DivergenceChoice, ModelSettings, Profile, profile_dir,
     save_app_state, save_profile,
 };
+use crate::providers::Provider;
 use crate::spinner::Spinner;
 
 /// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty, not a duplicate
@@ -497,6 +498,72 @@ pub(crate) fn capture_into_profile(
         if config.state.active_profile.is_none() {
             link_profile_credentials(&name)?;
             config.state.active_profile = Some(name.into());
+        }
+        save_app_state(&config.state)
+    })
+}
+
+/// Capture-name collision (issue #7): replace an EXISTING profile's credential
+/// set with the freshly captured snapshot, mutating it in place. Never
+/// delete+append — that would duplicate the name and desync `state.profiles`
+/// and `fallback_chain`, which both index by name already, so the target
+/// simply keeps its chain position, env, model settings, and `auto_start`.
+/// `usage_history.jsonl` is a persisted log, not a cache, and is left alone;
+/// the per-profile fetch caches (`usage_cache.json`, `third_party_cache.json`,
+/// `throughput_cache.json`) describe the OLD account and are dropped so the
+/// UI doesn't show stale numbers under the swapped-in credentials.
+pub(crate) fn overwrite_captured_profile(
+    config: &mut AppConfig,
+    name: &str,
+    snapshot: CaptureSnapshot,
+) -> Result<()> {
+    with_state_lock(|| {
+        let CaptureSnapshot {
+            credentials,
+            base_url,
+            api_key,
+        } = snapshot;
+        let provider = base_url.as_deref().and_then(Provider::from_base_url);
+        let was_active = config.is_active(name);
+        let profile = config
+            .find_mut(name)
+            .with_context(|| format!("profile '{name}' vanished before overwrite"))?;
+        profile.base_url = base_url;
+        profile.api_key = api_key;
+        profile.credentials = credentials;
+        profile.provider = provider;
+        profile.usage = None;
+        profile.fetch_status = None;
+        profile.third_party_usage = None;
+        save_profile(profile)?;
+
+        for file in [
+            crate::profile_cache::USAGE_CACHE_FILE,
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            crate::throughput::THROUGHPUT_CACHE_FILE,
+        ] {
+            if let Some(path) = crate::profile_cache::profile_cache_path(name, file) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+
+        if config.state.active_profile.is_none() {
+            link_profile_credentials(name)?;
+            config.state.active_profile = Some(name.into());
+        } else if was_active {
+            // The overwritten profile is (and stays) the active one: unlike a
+            // brand-new capture, `save_profile` just rewrote credentials.json
+            // in place (or removed it, if the snapshot had none — a third-
+            // party capture). Re-run `link_profile_credentials` so the live
+            // `.credentials.json` symlink is recreated against the new file,
+            // or dropped instead of left dangling when the file is now gone;
+            // and re-apply `base_url`/`api_key` to `settings.json` the same
+            // way `edit_profile_endpoint` does, so a running `claude` doesn't
+            // keep reading the OLD endpoint/token until the next switch.
+            link_profile_credentials(name)?;
+            let profile = config.find(name).context("Profile not found")?;
+            let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
+            apply_profile_to_claude_settings(profile, &prev_env_keys)?;
         }
         save_app_state(&config.state)
     })
