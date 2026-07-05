@@ -116,6 +116,21 @@ pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
     read_json_file(&path).map(Some)
 }
 
+/// macOS: mirror a profile's stored OAuth login into the Keychain so Claude Code
+/// (which reads the Keychain, not the file) actually switches account. No-op when
+/// the profile has no stored `credentials.json` (a base_url profile, whose
+/// endpoint+token come from `settings.json`, or an OAuth profile not yet logged
+/// in) — the existing Keychain login is left untouched in that case.
+#[cfg(target_os = "macos")]
+fn keychain_write_profile(name: &str) -> Result<()> {
+    let path = profile_dir(name)?.join("credentials.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let creds: ClaudeCredentials = read_json_file(&path)?;
+    crate::keychain::keychain_write(&creds)
+}
+
 #[cfg(unix)]
 pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     std::os::unix::fs::symlink(target, link).context("Failed to create credential symlink")
@@ -164,6 +179,11 @@ pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
             create_symlink(&target, &link)?;
+            // macOS: make the switch real — Claude Code reads the Keychain.
+            #[cfg(target_os = "macos")]
+            if crate::keychain::enabled() {
+                keychain_write_profile(name)?;
+            }
         }
 
         Ok(())
@@ -175,6 +195,12 @@ pub(crate) fn clear_claude_credentials() -> Result<()> {
         let link = claude_credentials_path()?;
         if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("Failed to remove .credentials.json")?;
+        }
+        // macOS: also drop the live Keychain login so Claude Code can't spend the
+        // account (parity with removing the credential file).
+        #[cfg(target_os = "macos")]
+        if crate::keychain::enabled() {
+            crate::keychain::keychain_delete()?;
         }
         Ok(())
     })
@@ -419,6 +445,11 @@ pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
             create_symlink(&target, &link)?;
+            // macOS: make the switch real — Claude Code reads the Keychain.
+            #[cfg(target_os = "macos")]
+            if crate::keychain::enabled() {
+                keychain_write_profile(name)?;
+            }
         }
         Ok(())
     })
