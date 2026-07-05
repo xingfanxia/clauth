@@ -71,7 +71,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 ### Automate & stay safe
 
 - **Automatic token refresh**: OAuth refresh tokens are single-use, so rotation stays lazy. A stale access token rotates the moment a usage query 401s, never ahead of time. <kbd>t</kbd> force-rotates every account.
-- **Auto-switch on exhaustion**: opt accounts into an ordered fallback chain. When the active one crosses its 5h threshold (95% default), clauth hops to the next member with headroom. Needs clauth open.
+- **Auto-switch on exhaustion**: opt accounts into an ordered fallback chain. When the active one crosses its 5h threshold (95% default), clauth hops to the next member with headroom. An opt-in burn-aware mode (Config tab) switches on projected usage instead: heavy burn hops early, light burn rides closer to 100% before moving. Needs clauth open.
 - **Multi-instance safe**: state writes serialize through a file lock, each instance reloads on external changes, HTTP runs off the UI thread.
 - **In-app help**: <kbd>?</kbd> opens a keybinding reference scoped to the current tab.
 
@@ -220,6 +220,7 @@ The **Fallback** tab holds an ordered chain of profiles clauth hops between when
 - After each usage refresh (at startup and on every tick), clauth checks the active profile. If it's a chain member at or above its threshold, clauth walks the chain (wrapping) and switches to the first member under its own threshold. The `◆` marker shifts in place.
 - Mark a member **last resort** (a toggle row on its Fallback card) to make it the chain's parking spot: chosen only when every other member is past its threshold, never switched away from. Claude Code then surfaces its own *"out of 5h limit"* message once that account also runs out. The threshold itself only means "switch away at N%" — a 100% threshold is just a late switch point.
 - The chain-global **wrap-off** toggle (Config tab) decides what happens when everyone is exhausted and no member is marked last resort: off keeps you on the last account; on switches off all accounts, then re-arms once any member drops back under its threshold.
+- A chain-global **switching mode** toggle (Config tab, default `static`) picks how the active account's "time to move" is judged. `static` = the plain threshold check above. `burn-aware` = clauth projects utilization at the next refresh from your recent burn rate and switches once the projection would cross 100%: heavy burn moves you early, light burn rides past the threshold toward 100%. Accounts without enough burn history fall back to their static threshold.
 - No eligible target keeps clauth put. If the active profile isn't in the chain, auto-switch is disabled. Profiles outside the chain are never switched away from or to. It's opt-in.
 
 <details>
