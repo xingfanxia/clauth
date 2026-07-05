@@ -752,7 +752,8 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
     };
     if needs_rewrite {
         let _ = with_state_lock(|| {
-            let _ = atomic_write(config_path, &rendered);
+            // config.toml can carry `api_key` — same 0600 rule as save_profile.
+            let _ = atomic_write_600(config_path, &rendered);
             Ok(())
         });
     }
