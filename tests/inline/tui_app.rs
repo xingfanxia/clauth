@@ -819,6 +819,68 @@ fn fallback_threshold_plus_minus_still_nudge_both_ways() {
     );
 }
 
+// ── fallback last-resort toggle (issue #8 follow-up) ─────────────────────────
+//
+// Space/⏎ on the `last resort` row flips `Profile::last_resort` and persists
+// it, then kicks `refresh_tokens()` the same way `toggle_auto_start` does — a
+// per-profile config.toml write doesn't bump `profiles.toml`'s mtime, so
+// without the explicit kick the scheduler's cached token snapshot would lag
+// until the next unrelated reload.
+
+#[test]
+fn fallback_last_resort_toggle_persists_and_refreshes_tokens() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-a".to_string(),
+            refresh_token: Some("rt-a".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = 1; // FALLBACK_ROWS[1] == LastResort
+
+    assert!(
+        !app.config().find("a").is_some_and(|p| p.last_resort),
+        "precondition: last_resort starts false"
+    );
+
+    // Simulate a stale token cache (the observable proof `refresh_tokens` ran):
+    // App::new already populated it from `collect_tokens`, so clear it first.
+    app.usage_tokens.lock().unwrap().clear();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+
+    assert_eq!(
+        app.config().find("a").map(|p| p.last_resort),
+        Some(true),
+        "space toggles last_resort on and persists it"
+    );
+    assert!(
+        app.usage_tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.name == "a"),
+        "toggling last_resort must call refresh_tokens() to rebuild the token cache"
+    );
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config().find("a").map(|p| p.last_resort),
+        Some(false),
+        "⏎ toggles last_resort back off"
+    );
+}
+
 // ── capture guard ─────────────────────────────────────────────────────────────
 
 // An empty snapshot (no creds file, no endpoint config — the macOS-keychain

@@ -23,6 +23,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: Some(threshold),
+        last_resort: false,
         bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {

@@ -21,6 +21,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        last_resort: false,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -132,6 +133,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        last_resort: false,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -194,6 +196,7 @@ fn rotate_one_inner_skips_live_session() {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        last_resort: false,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -248,6 +251,7 @@ fn profile_without_refresh_token_excluded() {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        last_resort: false,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {

@@ -144,6 +144,13 @@ pub(crate) struct Profile {
     pub(crate) models: ModelSettings,
     /// Utilization % to auto-switch off at (fallback chain only). None = use default.
     pub(crate) fallback_threshold: Option<f64>,
+    /// Chain-walk terminal stop (fallback chain only): once the auto-switch
+    /// picker lands here with nothing else viable, it parks instead of turning
+    /// off all accounts. Independent of `fallback_threshold` — this profile
+    /// still switches away at its own threshold when another member has
+    /// headroom (issue #8 follow-up: a threshold no longer doubles as a sink
+    /// marker).
+    pub(crate) last_resort: bool,
     /// Utilization % at/above which a bell toast fires in the overview tab.
     /// None = no bell for this profile.
     pub(crate) bell_threshold: Option<f64>,
@@ -167,6 +174,7 @@ impl Profile {
             env: BTreeMap::new(),
             models: ModelSettings::default(),
             fallback_threshold: None,
+            last_resort: false,
             bell_threshold: None,
             credentials: None,
             usage: None,
@@ -403,6 +411,8 @@ struct ProfileConfig {
     models: ModelSettings,
     #[serde(default)]
     fallback_threshold: Option<f64>,
+    #[serde(default)]
+    last_resort: bool,
     #[serde(default)]
     bell_threshold: Option<f64>,
 }
@@ -704,6 +714,7 @@ fn load_profile(name: &str) -> Result<Profile> {
         env: config.env,
         models: config.models,
         fallback_threshold: config.fallback_threshold.map(|v| v.clamp(0.0, 100.0)),
+        last_resort: config.last_resort,
         bell_threshold: config.bell_threshold.map(|v| v.clamp(0.0, 100.0)),
         credentials,
         usage: None,
@@ -732,6 +743,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 env: profile.env.clone(),
                 models: profile.models.clone(),
                 fallback_threshold: profile.fallback_threshold,
+                last_resort: profile.last_resort,
                 bell_threshold: profile.bell_threshold,
             };
             canonical != on_disk
@@ -879,6 +891,18 @@ fn render_config_toml(profile: &Profile) -> String {
     match profile.fallback_threshold {
         Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
         None => out.push_str("# fallback_threshold = 95.0\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# Marks this profile as the fallback chain's last resort. Once the\n");
+    out.push_str("# auto-switch walk lands here with no other member having headroom, it\n");
+    out.push_str("# parks instead of turning off all accounts. Independent of\n");
+    out.push_str("# fallback_threshold — this profile still switches away at its own\n");
+    out.push_str("# threshold whenever another chain member has headroom.\n");
+    if profile.last_resort {
+        out.push_str("last_resort = true\n");
+    } else {
+        out.push_str("# last_resort = true\n");
     }
     out.push('\n');
 

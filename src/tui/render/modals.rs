@@ -392,7 +392,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("shift \u{2191}\u{2193}", "reorder member = priority"),
                 (
                     "\u{23ce}",
-                    "open \u{00b7} edit threshold \u{00b7} remove \u{00b7} add",
+                    "open \u{00b7} edit threshold \u{00b7} toggle last resort \u{00b7} remove \u{00b7} add",
                 ),
                 ("+ / -", "step threshold by 5"),
                 ("\u{23ce}", "type a threshold, \u{23ce} saves"),

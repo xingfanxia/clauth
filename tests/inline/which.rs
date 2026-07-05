@@ -14,6 +14,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        last_resort: false,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -40,6 +41,7 @@ fn endpoint_profile(name: &str) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        last_resort: false,
         bell_threshold: None,
         credentials: None,
         usage: None,
@@ -58,6 +60,7 @@ fn blank_profile(name: &str) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        last_resort: false,
         bell_threshold: None,
         credentials: None,
         usage: None,

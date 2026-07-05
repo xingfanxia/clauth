@@ -2,6 +2,11 @@
 //!
 //! Tests stay hermetic: no filesystem I/O, no `switch_profile`. All scenarios
 //! construct an in-memory `AppConfig` and assert on `next_target`'s return value.
+//!
+//! Issue #8 follow-up: `Profile::last_resort` replaced the old `threshold >=
+//! 100.0` sentinel as the chain-walk terminal-stop marker. Several scenarios
+//! below deliberately mark a member `last_resort` at a threshold OTHER than
+//! 100 to prove the two are now independent.
 
 use crate::lockorder::RankedMutex;
 use std::collections::HashMap;
@@ -45,6 +50,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: threshold,
+        last_resort: false,
         bell_threshold: None,
         credentials: None,
         usage,
@@ -64,6 +70,15 @@ fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64
     )
 }
 
+/// Marks a profile as the chain's last resort (`Profile::last_resort = true`).
+/// A separate wrapper — rather than threading a bool through every helper —
+/// so call sites read as "this member is the sink" instead of inferring it
+/// from an incidental threshold value.
+fn mark_last_resort(mut p: Profile) -> Profile {
+    p.last_resort = true;
+    p
+}
+
 fn config_with_chain(profiles: Vec<Profile>, active: &str) -> AppConfig {
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     AppConfig {
@@ -77,26 +92,29 @@ fn config_with_chain(profiles: Vec<Profile>, active: &str) -> AppConfig {
     }
 }
 
-// All sinks exhausted: A→B→A loop must not form; next_target returns None.
+// Both maxed and BOTH marked last_resort at a non-100 threshold: active is
+// itself the sink, so it stays parked without the walk ever reaching B.
 #[test]
 fn all_maxed_sinks_no_switch() {
     let config = config_with_chain(
         vec![
-            profile_with_util("a", Some(100.0), Some(100.0)),
-            profile_with_util("b", Some(100.0), Some(100.0)),
+            mark_last_resort(profile_with_util("a", Some(90.0), Some(95.0))),
+            mark_last_resort(profile_with_util("b", Some(90.0), Some(95.0))),
         ],
         "a",
     );
     assert_eq!(next_target(&config), None);
 }
 
-// Active threshold 95 at 100%; B is the 100% sink — one migration allowed.
+// Active (unmarked, threshold 95) at 100%; B is marked last_resort at an 80%
+// threshold — not 100 — proving the migration follows the mark, not the
+// threshold value. One migration allowed.
 #[test]
 fn non_sink_active_migrates_to_sink_once() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
-            profile_with_util("b", Some(100.0), Some(100.0)),
+            mark_last_resort(profile_with_util("b", Some(80.0), Some(100.0))),
         ],
         "a",
     );
@@ -106,25 +124,28 @@ fn non_sink_active_migrates_to_sink_once() {
     );
 }
 
-// B active as sink (threshold 100 at 100%) — no further migration.
+// B active and marked last_resort (80% threshold, not 100) — no further
+// migration, exactly like the old threshold==100 sentinel parked.
 #[test]
 fn sink_active_maxed_stays_put() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
-            profile_with_util("b", Some(100.0), Some(100.0)),
+            mark_last_resort(profile_with_util("b", Some(80.0), Some(100.0))),
         ],
         "b",
     );
     assert_eq!(next_target(&config), None);
 }
 
-// Active sink (100 at 100%), B has headroom (95 at 50%) — migrates to B.
+// Active marked last_resort (80% threshold, maxed), B has headroom (95% @
+// 50%) — migrates to B. The headroom pass always wins before the
+// last-resort loop guard is even consulted.
 #[test]
 fn sink_active_switches_to_member_with_headroom() {
     let config = config_with_chain(
         vec![
-            profile_with_util("a", Some(100.0), Some(100.0)),
+            mark_last_resort(profile_with_util("a", Some(80.0), Some(100.0))),
             profile_with_util("b", Some(95.0), Some(50.0)),
         ],
         "a",
@@ -135,7 +156,7 @@ fn sink_active_switches_to_member_with_headroom() {
     );
 }
 
-// No sink anywhere (both threshold 95 at 100%) — returns None.
+// No member marked last_resort (both threshold 95 at 100%) — returns None.
 #[test]
 fn no_sink_available_returns_none() {
     let config = config_with_chain(
@@ -146,6 +167,43 @@ fn no_sink_available_returns_none() {
         "a",
     );
     assert_eq!(next_target(&config), None);
+}
+
+// ── issue #8 follow-up: threshold no longer implies last_resort ─────────────
+
+// A threshold of 100 alone must NOT act as a sink anymore. With wrap_off on
+// and NEITHER member marked last_resort, switch-off-all still fires even
+// though the active sits at an unmarked 100% threshold. The OLD
+// `threshold >= 100.0` sentinel treated the active as a sink here and
+// returned `None` (the walk stopped dead) — this assertion fails against it.
+#[test]
+fn unmarked_hundred_threshold_active_no_longer_acts_as_sink() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(100.0), Some(100.0)),
+            profile_with_util("b", Some(100.0), Some(100.0)),
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    assert_eq!(next_target(&config), Some(SwitchAction::Off));
+}
+
+// Same decoupling from the other direction: an unmarked 100%-threshold OTHER
+// member (not the active) must not block switch-off-all either. The OLD
+// sentinel would have accepted B as a last-resort switch target instead of
+// firing Off; unmarked, B is just another exhausted, non-viable member.
+#[test]
+fn wrap_off_switches_off_when_unmarked_hundred_threshold_member_present() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(100.0), Some(100.0)),
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    assert_eq!(next_target(&config), Some(SwitchAction::Off));
 }
 
 // ── next_auto_switch_target ───────────────────────────────────────────────────
@@ -177,7 +235,7 @@ fn snapshot_chain_captures_thresholds_and_active() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(50.0)),
-            profile_with_util("b", Some(100.0), Some(20.0)),
+            mark_last_resort(profile_with_util("b", Some(80.0), Some(20.0))),
         ],
         "a",
     );
@@ -186,8 +244,13 @@ fn snapshot_chain_captures_thresholds_and_active() {
     assert_eq!(snap.chain.len(), 2);
     assert_eq!(snap.chain[0].name, "a");
     assert!((snap.chain[0].threshold - 95.0).abs() < f64::EPSILON);
+    assert!(!snap.chain[0].last_resort);
     assert_eq!(snap.chain[1].name, "b");
-    assert!((snap.chain[1].threshold - 100.0).abs() < f64::EPSILON);
+    assert!((snap.chain[1].threshold - 80.0).abs() < f64::EPSILON);
+    assert!(
+        snap.chain[1].last_resort,
+        "last_resort is captured independent of threshold"
+    );
 }
 
 #[test]
@@ -229,12 +292,14 @@ fn auto_switch_picks_member_with_headroom() {
     );
 }
 
+// Both marked last_resort at a non-100 threshold (80%) — active is itself the
+// sink; the loop guard holds and no migration to B forms.
 #[test]
 fn auto_switch_sink_loop_guard_holds() {
     let config = config_with_chain(
         vec![
-            profile_with_util("a", Some(100.0), None),
-            profile_with_util("b", Some(100.0), None),
+            mark_last_resort(profile_with_util("a", Some(80.0), None)),
+            mark_last_resort(profile_with_util("b", Some(80.0), None)),
         ],
         "a",
     );
@@ -243,17 +308,41 @@ fn auto_switch_sink_loop_guard_holds() {
     assert_eq!(next_auto_switch_target(&snap, &store), None);
 }
 
+// Parity with `next_target`'s decoupling on the snapshot walk: an unmarked
+// threshold-100 member is a late switch point, never a sink — with everyone
+// exhausted and nothing marked, wrap-off switches off instead of parking.
 #[test]
-fn auto_switch_non_sink_active_migrates_to_sink_once() {
-    let config = config_with_chain(
+fn auto_switch_unmarked_hundred_threshold_member_is_not_a_sink() {
+    let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), None),
             profile_with_util("b", Some(100.0), None),
         ],
         "a",
     );
+    config.state.wrap_off = true;
     let snap = snapshot_chain(&config).expect("snapshot");
-    let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]); // active threshold 95% (not a sink), B is sink → one migration
+    let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::Off),
+        "threshold 100 without the mark must not park the snapshot walk"
+    );
+}
+
+// A (unmarked, threshold 95%) is not a sink; B is marked last_resort at an
+// 80% threshold — one migration to B.
+#[test]
+fn auto_switch_non_sink_active_migrates_to_sink_once() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            mark_last_resort(profile_with_util("b", Some(80.0), None)),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]); // active not a sink, B is → one migration
     assert_eq!(
         next_auto_switch_target(&snap, &store),
         Some(SwitchAction::To("b".to_string())),
@@ -276,10 +365,10 @@ fn auto_switch_missing_util_is_not_exhausted() {
 
 // ── wrap-off mode ───────────────────────────────────────────────────────────
 //
-// When no sink exists and the whole chain is exhausted, wrap-off turns off all
-// accounts instead of staying put.
+// When no member is marked last_resort and the whole chain is exhausted,
+// wrap-off turns off all accounts instead of staying put.
 
-// next_target: wrap_off on, no sink, all exhausted → Off.
+// next_target: wrap_off on, no last_resort member, all exhausted → Off.
 #[test]
 fn wrap_off_switches_off_when_chain_spent() {
     let mut config = config_with_chain(
@@ -293,13 +382,14 @@ fn wrap_off_switches_off_when_chain_spent() {
     assert_eq!(next_target(&config), Some(SwitchAction::Off));
 }
 
-// next_target: wrap_off on but 100% sink exists → migrate to sink, not Off.
+// next_target: wrap_off on but a last_resort member exists (at an 80%
+// threshold, not 100) → migrate there, not Off.
 #[test]
 fn wrap_off_prefers_sink_over_off() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
-            profile_with_util("b", Some(100.0), Some(100.0)),
+            mark_last_resort(profile_with_util("b", Some(80.0), Some(100.0))),
         ],
         "a",
     );
@@ -487,10 +577,12 @@ fn find_recovered_returns_first_member_below_threshold() {
         ChainMember {
             name: "a".into(),
             threshold: 95.0,
+            last_resort: false,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
+            last_resort: false,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
@@ -506,10 +598,12 @@ fn find_recovered_skips_exhausted_members() {
         ChainMember {
             name: "a".into(),
             threshold: 95.0,
+            last_resort: false,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
+            last_resort: false,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
@@ -522,10 +616,12 @@ fn find_recovered_returns_none_when_no_member_has_data() {
         ChainMember {
             name: "a".into(),
             threshold: 95.0,
+            last_resort: false,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
+            last_resort: false,
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
@@ -538,10 +634,12 @@ fn find_recovered_uses_threshold_per_member() {
         ChainMember {
             name: "a".into(),
             threshold: 90.0,
+            last_resort: false,
         }, // 95% util ≥ 90 → exhausted
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
+            last_resort: false,
         }, // 94% util < 95 → recovered
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
@@ -559,6 +657,7 @@ fn find_recovered_recovers_when_window_expired() {
     let members = vec![ChainMember {
         name: "a".into(),
         threshold: 95.0,
+        last_resort: false,
     }];
     let store = store_with_infos(vec![(
         "a",
@@ -577,6 +676,7 @@ fn find_recovered_recovers_when_windowless() {
     let members = vec![ChainMember {
         name: "a".into(),
         threshold: 95.0,
+        last_resort: false,
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
@@ -592,6 +692,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
     let members = vec![ChainMember {
         name: "a".into(),
         threshold: 95.0,
+        last_resort: false,
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(

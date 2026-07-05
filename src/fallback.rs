@@ -13,12 +13,15 @@ pub(crate) enum SwitchAction {
     To(String),
     /// Turn off all accounts: clear the live credentials and unset the active
     /// profile. Emitted only in wrap-off mode when the whole chain is exhausted
-    /// and no 100%-threshold sink exists (every threshold is below 100%).
+    /// and no member is marked `last_resort`.
     Off,
 }
 
 /// Default 5-hour utilization threshold (percent) applied when a chain member
-/// has no per-profile override.
+/// has no per-profile override. Stays below 100 as poll-lag margin: at the
+/// fixed refresh cadence a window can blow past a 100% trigger between polls,
+/// so the default leaves headroom to switch before the account is already
+/// rate-limited.
 pub(crate) const DEFAULT_THRESHOLD: f64 = 95.0;
 
 pub(crate) fn threshold_for(profile: &Profile) -> f64 {
@@ -92,6 +95,10 @@ pub(crate) fn soonest_resume(config: &AppConfig) -> Option<(String, i64)> {
 pub(crate) struct ChainMember {
     pub(crate) name: String,
     pub(crate) threshold: f64,
+    /// Mirrors `Profile::last_resort` — a terminal stop for the chain walk,
+    /// decoupled from `threshold` (issue #8 follow-up: a threshold no longer
+    /// doubles as a sink marker).
+    pub(crate) last_resort: bool,
 }
 
 /// In-memory snapshot of the fields `next_auto_switch_target` needs: active
@@ -117,12 +124,13 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     }
     let chain = chain
         .iter()
-        .map(|name| ChainMember {
-            name: name.to_string(),
-            threshold: config
-                .find(name)
-                .map(threshold_for)
-                .unwrap_or(DEFAULT_THRESHOLD),
+        .map(|name| {
+            let profile = config.find(name);
+            ChainMember {
+                name: name.to_string(),
+                threshold: profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD),
+                last_resort: profile.is_some_and(|p| p.last_resort),
+            }
         })
         .collect();
     Some(ChainSnapshot {
@@ -177,9 +185,12 @@ fn walk_chain(
 ///
 ///   1. Any member with real headroom (5h utilization below threshold, or no
 ///      usage data fetched yet).
-///   2. Last resort: a member with threshold == 100%, accepted even at 100%.
-///      Claude Code shows its own "out of 5h limit" message on arrival.
-///   3. Wrap-off only: no headroom, no sink (every threshold < 100%), and the
+///   2. Last resort: a member marked `last_resort`, accepted even while
+///      exhausted. Claude Code shows its own "out of 5h limit" message on
+///      arrival. `last_resort` is independent of `threshold` — a member can
+///      still switch away at, say, 80% utilization and remain the chain's
+///      last resort once nothing else has headroom.
+///   3. Wrap-off only: no headroom, no `last_resort` member anywhere, and the
 ///      active profile itself exhausted → [`SwitchAction::Off`] to halt usage.
 pub(crate) fn next_target(config: &AppConfig) -> Option<SwitchAction> {
     let active = config.state.active_profile.as_deref()?;
@@ -199,22 +210,21 @@ pub(crate) fn next_target(config: &AppConfig) -> Option<SwitchAction> {
         return Some(SwitchAction::To(name));
     }
 
-    // Only fall back to a 100%-threshold sink when the active profile is NOT
-    // itself such a sink. Two maxed sinks switching to each other indefinitely
-    // gains nothing — one migration is fine, but the next tick must stay put.
-    let active_is_sink = config
-        .find(active)
-        .is_some_and(|p| threshold_for(p) >= 100.0);
-    if active_is_sink {
+    // Only fall back to a `last_resort` member when the active profile is NOT
+    // itself marked `last_resort`. Two last-resort members switching to each
+    // other indefinitely gains nothing — one migration is fine, but the next
+    // tick must stay put.
+    let active_is_last_resort = config.find(active).is_some_and(|p| p.last_resort);
+    if active_is_last_resort {
         return None;
     }
-    if let Some(name) = walk(&|p| threshold_for(p) >= 100.0) {
+    if let Some(name) = walk(&|p| p.last_resort) {
         return Some(SwitchAction::To(name));
     }
 
-    // No headroom, no sink anywhere (every threshold < 100%). In wrap-off mode,
-    // turn off all accounts — but only when the active profile is itself
-    // exhausted, since this picker is also exercised on a healthy active.
+    // No headroom, no `last_resort` member anywhere. In wrap-off mode, turn off
+    // all accounts — but only when the active profile is itself exhausted,
+    // since this picker is also exercised on a healthy active.
     if config.state.wrap_off && config.find(active).is_some_and(is_exhausted) {
         return Some(SwitchAction::Off);
     }
@@ -254,17 +264,17 @@ pub(crate) fn next_auto_switch_target(
         return Some(SwitchAction::To(name));
     }
 
-    let active_is_sink = active.threshold >= 100.0;
-    if active_is_sink {
+    let active_is_last_resort = active.last_resort;
+    if active_is_last_resort {
         return None;
     }
-    if let Some(name) = walk(&|m| m.threshold >= 100.0) {
+    if let Some(name) = walk(&|m| m.last_resort) {
         return Some(SwitchAction::To(name));
     }
 
-    // No headroom, no sink anywhere (every threshold < 100%), and the active
-    // profile is already exhausted (gated above). In wrap-off mode, halt all
-    // usage instead of staying on the spent profile.
+    // No headroom, no `last_resort` member anywhere, and the active profile is
+    // already exhausted (gated above). In wrap-off mode, halt all usage
+    // instead of staying on the spent profile.
     if snapshot.wrap_off {
         return Some(SwitchAction::Off);
     }

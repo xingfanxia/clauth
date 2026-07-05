@@ -2,11 +2,12 @@
 //! chain (plus a trailing `+ add` row), cursor = `❯`, active member name in
 //! orange. Right: the selected member's rotation card — labeled
 //! key:value rows (`priority`, `5h usage` gauge with a threshold tick, `rotate at`
-//! threshold stepper, `remove`) — or, on `+ add`, a candidate picker. Order =
-//! priority (reorder with ⇧↑↓). The chain-global wrap-off setting lives on the
-//! Config tab, not here. Editing happens in place: ⏎ on the left drops focus into
-//! the right pane, `+` / `-` step the threshold (or ⏎ on it to type a value),
-//! ⏎ on remove arms then confirms. No popups.
+//! threshold stepper, `last resort` toggle, `remove`) — or, on `+ add`, a
+//! candidate picker. Order = priority (reorder with ⇧↑↓). The chain-global
+//! wrap-off setting lives on the Config tab, not here. Editing happens in
+//! place: ⏎ on the left drops focus into the right pane, `+` / `-` step the
+//! threshold (or ⏎ on it to type a value), space/⏎ flips `last resort`, ⏎ on
+//! remove arms then confirms. No popups.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -169,7 +170,8 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// Priority + `[ active ]` pill, 5h gauge with threshold tick, headroom figure, and the
-/// inline `rotate at` threshold stepper/editor + `remove` rows. Caret only when focused.
+/// inline `rotate at` threshold stepper/editor + `last resort` toggle + `remove` rows.
+/// Caret only when focused.
 #[allow(clippy::too_many_arguments)]
 fn member_detail(
     cfg: &AppConfig,
@@ -245,7 +247,14 @@ fn member_detail(
         } else {
             None
         };
-        let line = detail_row(*row, selected, threshold, armed_remove, row_editing);
+        let line = detail_row(
+            *row,
+            selected,
+            threshold,
+            profile.last_resort,
+            armed_remove,
+            row_editing,
+        );
         lines.push(if selected {
             highlight_row(line, width)
         } else {
@@ -263,6 +272,12 @@ fn member_detail(
                 )),
                 None => {}
             }
+        }
+        if *row == FallbackRow::LastResort && selected {
+            lines.push(tooltip(
+                "park here once every other member is exhausted, instead of switching off all",
+                theme::faint(),
+            ));
         }
     }
 
@@ -314,6 +329,7 @@ fn detail_row(
     row: FallbackRow,
     selected: bool,
     threshold: f64,
+    last_resort: bool,
     armed_remove: bool,
     editing: Option<&InputState>,
 ) -> Line<'static> {
@@ -357,6 +373,18 @@ fn detail_row(
                 }
             }
             Line::from(spans)
+        }
+        FallbackRow::LastResort => {
+            let (value, style) = if last_resort {
+                (theme::toggle_on().to_string(), theme::accent())
+            } else {
+                (theme::toggle_off().to_string(), theme::faint())
+            };
+            Line::from(vec![
+                arrow,
+                Span::styled(kv_key("last resort"), label_style(selected)),
+                Span::styled(value, style),
+            ])
         }
         FallbackRow::Remove => {
             let label = if armed_remove {

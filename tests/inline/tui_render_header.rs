@@ -15,6 +15,7 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        last_resort: false,
         bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {
@@ -39,6 +40,7 @@ fn provider_profile(name: &str) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        last_resort: false,
         bell_threshold: None,
         credentials: None,
         usage: None,

@@ -58,6 +58,7 @@ pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
         env: Default::default(),
         models: Default::default(),
         fallback_threshold: None,
+        last_resort: false,
         bell_threshold: None,
         credentials: None,
         usage: None,

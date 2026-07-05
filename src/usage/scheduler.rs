@@ -1412,12 +1412,15 @@ fn scan_recovery(
         cfg.state
             .fallback_chain
             .iter()
-            .map(|name| crate::fallback::ChainMember {
-                name: name.to_string(),
-                threshold: cfg
-                    .find(name)
-                    .map(crate::fallback::threshold_for)
-                    .unwrap_or(crate::fallback::DEFAULT_THRESHOLD),
+            .map(|name| {
+                let profile = cfg.find(name);
+                crate::fallback::ChainMember {
+                    name: name.to_string(),
+                    threshold: profile
+                        .map(crate::fallback::threshold_for)
+                        .unwrap_or(crate::fallback::DEFAULT_THRESHOLD),
+                    last_resort: profile.is_some_and(|p| p.last_resort),
+                }
             })
             .collect()
     };

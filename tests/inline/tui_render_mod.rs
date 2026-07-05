@@ -16,6 +16,7 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: Some(80.0),
+        last_resort: false,
         bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {

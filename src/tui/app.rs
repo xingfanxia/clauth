@@ -156,11 +156,13 @@ impl InputState {
 // ── Modals ────────────────────────────────────────────────────────────────────
 
 /// One interactive line in the Fallback tab's detail pane for a chain member.
-/// `Threshold` is a stepper (±5 on `+`/`-`); `Remove` arms then confirms. The
+/// `Threshold` is a stepper (±5 on `+`/`-`); `LastResort` is a boolean toggle
+/// (space/⏎, per the enumerated-row grammar); `Remove` arms then confirms. The
 /// chain-global wrap-off setting lives on the program-wide Config tab, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FallbackRow {
     Threshold,
+    LastResort,
     Remove,
 }
 
@@ -441,6 +443,7 @@ pub(crate) enum ActionMenuAction {
     ReorderDown,
     // Fallback detail
     EditThreshold,
+    ToggleLastResort,
     RemoveMember,
     // Config detail actions (proxied through run_config_row)
     ToggleAutoStart,
@@ -523,6 +526,7 @@ impl ActionMenuAction {
             Self::ReorderUp => "reorder up",
             Self::ReorderDown => "reorder down",
             Self::EditThreshold => "edit threshold",
+            Self::ToggleLastResort => "toggle last resort",
             Self::RemoveMember => "remove member",
             Self::ToggleAutoStart => "toggle auto-start",
             Self::DeleteProfile => "delete profile",
@@ -2886,8 +2890,12 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
     items
 }
 
-/// Detail rows for a chain member: threshold stepper, remove.
-pub(crate) const FALLBACK_ROWS: [FallbackRow; 2] = [FallbackRow::Threshold, FallbackRow::Remove];
+/// Detail rows for a chain member: threshold stepper, last-resort toggle, remove.
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
+    FallbackRow::Threshold,
+    FallbackRow::LastResort,
+    FallbackRow::Remove,
+];
 
 /// Rows on the program-wide Config tab, in display order.
 pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 4] = [
@@ -2976,6 +2984,7 @@ pub(crate) enum FallbackHint {
     ChainAdd,
     DetailThreshold,
     DetailThresholdEdit,
+    DetailLastResort,
     DetailRemove,
     DetailRemoveArmed,
     DetailAdd,
@@ -3001,6 +3010,7 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
             let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
             match FALLBACK_ROWS[cursor] {
                 FallbackRow::Threshold => FallbackHint::DetailThreshold,
+                FallbackRow::LastResort => FallbackHint::DetailLastResort,
                 FallbackRow::Remove if app.fallback_armed_remove => FallbackHint::DetailRemoveArmed,
                 FallbackRow::Remove => FallbackHint::DetailRemove,
             }
@@ -3348,6 +3358,7 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
                 app.fallback_threshold_draft = Some(InputState::new(&format!("{current:.0}")));
             }
         }
+        FallbackRow::LastResort => toggle_last_resort(app),
         FallbackRow::Remove => {
             if app.fallback_armed_remove {
                 remove_chain_member(app);
@@ -3428,6 +3439,49 @@ fn write_threshold(app: &mut App, value: f64) {
 fn adjust_threshold(app: &mut App, delta: f64) {
     if let Some(current) = selected_threshold(app) {
         write_threshold(app, (current + delta).clamp(0.0, 100.0));
+    }
+}
+
+/// ⏎/space on the `last resort` row: flip `Profile::last_resort` and persist.
+/// The `refresh_tokens()` kick is not load-bearing here (the chain snapshot
+/// reads the shared config directly, unlike `auto_start` which lives in the
+/// `TokenList`); it's kept so every per-profile toggle path re-derives the
+/// scheduler snapshot the same way.
+fn toggle_last_resort(app: &mut App) {
+    enum Outcome {
+        Missing,
+        Saved,
+        SaveFailed(anyhow::Error),
+    }
+    let Some(pos) = selected_chain_member(app) else {
+        return;
+    };
+    let outcome = {
+        let mut cfg = app.config();
+        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
+            return;
+        };
+        match cfg.find_mut(&name) {
+            None => Outcome::Missing,
+            Some(profile) => {
+                profile.last_resort = !profile.last_resort;
+                let now_on = profile.last_resort;
+                match save_profile(profile) {
+                    Ok(()) => Outcome::Saved,
+                    Err(e) => {
+                        if let Some(p) = cfg.find_mut(&name) {
+                            p.last_resort = !now_on;
+                        }
+                        Outcome::SaveFailed(e)
+                    }
+                }
+            }
+        }
+    };
+    match outcome {
+        Outcome::Missing => {}
+        Outcome::Saved => app.refresh_tokens(),
+        Outcome::SaveFailed(e) => app.toast(ToastKind::Danger, format!("save failed: {e}")),
     }
 }
 
@@ -3565,6 +3619,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 if let Some(&row) = FALLBACK_ROWS.get(app.fallback_detail_cursor) {
                     match row {
                         FallbackRow::Threshold => actions.push(EditThreshold),
+                        FallbackRow::LastResort => actions.push(ToggleLastResort),
                         FallbackRow::Remove => actions.push(RemoveMember),
                     }
                 }
@@ -3686,6 +3741,9 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::ReorderDown => reorder_chain_member(app, 1),
         ActionMenuAction::EditThreshold => {
             run_fallback_row(app, FallbackRow::Threshold);
+        }
+        ActionMenuAction::ToggleLastResort => {
+            run_fallback_row(app, FallbackRow::LastResort);
         }
         ActionMenuAction::RemoveMember => {
             run_fallback_row(app, FallbackRow::Remove);

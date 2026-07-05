@@ -28,6 +28,32 @@ fn profile_config_reads_bell_threshold() {
     assert_eq!(cfg.bell_threshold, Some(90.0));
 }
 
+// `last_resort` (issue #8 follow-up) must default to `false` so every existing
+// config.toml written before this field existed keeps loading unchanged.
+#[test]
+fn profile_config_last_resort_defaults_false() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert!(!cfg.last_resort);
+}
+
+#[test]
+fn profile_config_reads_last_resort_true() {
+    let toml = "last_resort = true\n";
+    let cfg: ProfileConfig = toml::from_str(toml).expect("parse last_resort config");
+    assert!(cfg.last_resort);
+}
+
+// `last_resort` must survive a config.toml render→parse round-trip, matching
+// the guarantee `model_settings_round_trip_through_config_toml` pins for models.
+#[test]
+fn last_resort_round_trips_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.last_resort = true;
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert!(parsed.last_resort);
+}
+
 #[test]
 fn profile_name_is_serde_transparent() {
     // `ProfileName` must serialize as a bare string so profiles.toml stays
@@ -119,6 +145,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         env: std::collections::BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        last_resort: false,
         bell_threshold: None,
         credentials: Some(creds.clone()),
         usage: None,
