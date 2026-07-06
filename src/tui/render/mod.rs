@@ -38,7 +38,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(background, area);
 
     // Content frame's top border doubles as the header/content separator; the
-    // header claims a 4th row for the account gauge only when one renders.
+    // header is always 3 rows (brand / count+status / tabs+gauge).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

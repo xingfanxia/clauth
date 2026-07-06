@@ -48,14 +48,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         build_overflow(app)
     };
-
-    let para = Paragraph::new(Line::from(spans)).style(theme::base());
-    frame.render_widget(para, area);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::base()), area);
 }
 
 /// Total width of the tab strip in normal form (all labels + separators),
-/// before any truncation. Uses raw label widths since all current labels are ASCII.
-fn full_strip_width() -> usize {
+/// before any truncation. Exposed for the header's gauge-placement logic.
+pub(super) fn full_strip_width() -> usize {
     Tab::ALL
         .iter()
         .enumerate()

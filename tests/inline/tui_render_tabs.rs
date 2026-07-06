@@ -109,21 +109,23 @@ fn tokens_dashboard_uses_alignment_not_middot() {
         .flat_map(|y| (0..100usize).map(move |x| (x, y)))
         .map(|(x, y)| buf.content[y * 100 + x].symbol().to_owned())
         .collect();
+    // Skip the 3-row header which now has a middot in the gauge area.
+    let body: String = text
+        .chars()
+        .skip(3 * 100)
+        .take(27 * 100)
+        .collect();
     assert!(
-        !text.contains('·'),
+        !body.contains('·'),
         "tokens dashboard must use alignment, not `·` separators"
     );
-    // Active span: earliest and latest both present (aligned to card edges).
     assert!(text.contains("jan 18"), "span start missing");
     assert!(text.contains("jun 15"), "span end / freshness missing");
     assert!(text.contains("TODAY"), "today card missing");
-    // Model names render via the friendly mapping, expanded (not truncated).
     assert!(
         text.contains("opus 4.8"),
         "top models should show the mapped display name in full"
     );
-    // TODAY tokens use the in+out basis (13.7M), not the cache-inflated total
-    // (~107M) — so it stays comparable to the daily trend.
     assert!(
         text.contains("13.7M"),
         "today should headline in+out tokens"
@@ -172,7 +174,6 @@ fn count_cache_toggle_switches_token_basis() {
             .collect()
     };
 
-    // Default (off): in+out basis → 10.0M, never the cache-inflated 100M.
     {
         app.config().state.count_cache = false;
     }
@@ -180,7 +181,6 @@ fn count_cache_toggle_switches_token_basis() {
     assert!(off.contains("10.0M"), "off must headline in+out (10.0M)");
     assert!(!off.contains("100M"), "off must not count cache");
 
-    // On: total-incl-cache basis → 100M.
     {
         app.config().state.count_cache = true;
     }
@@ -205,7 +205,6 @@ fn normal_form_shows_all_tabs() {
 #[test]
 fn normal_form_labels_untruncated_at_tight_boundary() {
     let app = empty_app(Tab::Overview);
-    // 8 labels (50 cols) + 7×3 separators = 71: the tight all-tabs-fit boundary.
     let s = render_tabs(&app, 71);
     assert!(
         s.contains("overview"),

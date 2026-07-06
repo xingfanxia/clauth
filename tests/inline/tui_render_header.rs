@@ -1,6 +1,6 @@
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
-use crate::tui::app::App;
+use crate::tui::app::{App, Tab};
 use crate::usage::{UsageInfo, UsageWindow};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -63,8 +63,7 @@ fn app_with(profiles: Vec<Profile>, active: Option<&str>) -> App {
     App::new(config)
 }
 
-/// Renders only the header block (sized by `header_height`) so these tests
-/// are independent of body/footer layout.
+/// Renders only the header block (sized by `header_height`).
 fn render_header_rows(app: &App, width: u16) -> Vec<String> {
     let height = header_height(app);
     let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -83,9 +82,7 @@ fn render_header_rows(app: &App, width: u16) -> Vec<String> {
         .collect()
 }
 
-/// A header row's content past the claude-glyph column (0..10) — the glyph
-/// itself uses `█`/block glyphs that would otherwise collide with the gauge
-/// bar's own fill characters in a naive whole-row substring check.
+/// A header row's content past the claude-glyph column (0..10).
 fn row_content(app: &App, width: u16, row: usize) -> String {
     render_header_rows(app, width)[row]
         .chars()
@@ -93,9 +90,7 @@ fn row_content(app: &App, width: u16, row: usize) -> String {
         .collect()
 }
 
-// ── `gauge_fit` — the collapse ladder (pure) ────────────────────────────────
-//
-// Full gauge width = name + 2 + [bar+2 brackets] + 1 + 4 ("100%").
+// ── `gauge_fit` — collapse ladder: bar before name ──────────────────────
 
 #[test]
 fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
@@ -111,36 +106,26 @@ fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
 }
 
 #[test]
-fn gauge_fit_truncates_name_before_touching_bar() {
-    // Full = 8 + 2 + 10 + 1 + 4 = 25; at 23 the name gives up exactly 2 cells.
+fn gauge_fit_shrinks_bar_first_before_name() {
     let fit = gauge_fit(23, 8, true);
-    assert_eq!(fit.name_w, 6);
-    assert_eq!(
-        fit.bar_cells, 8,
-        "bar must stay full while the name still has room to shrink"
-    );
+    assert_eq!(fit.name_w, 8, "name must stay full while bar still shrinks");
+    assert_eq!(fit.bar_cells, 6, "bar must shrink first");
     assert!(fit.visible);
 }
 
 #[test]
-fn gauge_fit_shrinks_bar_only_after_name_hits_its_floor() {
-    // Name floored at 3: 3 + 2 + (bar+2) + 1 + 4 = bar + 12 → bar 7 at 19.
+fn gauge_fit_drops_bar_entirely_before_touching_name() {
     let fit = gauge_fit(19, 8, true);
-    assert_eq!(
-        fit.name_w, GAUGE_NAME_MIN,
-        "name must already be at its floor"
-    );
-    assert_eq!(fit.bar_cells, 7);
+    assert_eq!(fit.name_w, 8, "name must not shrink after bar drops");
+    assert_eq!(fit.bar_cells, 0, "bar must drop before name trims");
     assert!(fit.visible);
 }
 
 #[test]
-fn gauge_fit_drops_bar_before_name() {
-    // Below the bar floor (3 + 2 + 5 + 1 + 4 = 15) the bar drops entirely:
-    // name(3) + 2 + pct(4) = 9 still fits at 14.
-    let fit = gauge_fit(14, 8, true);
-    assert_eq!(fit.bar_cells, 0, "bar drops entirely before the name does");
-    assert_eq!(fit.name_w, GAUGE_NAME_MIN);
+fn gauge_fit_truncates_name_only_after_bar_is_already_gone() {
+    let fit = gauge_fit(13, 8, true);
+    assert_eq!(fit.bar_cells, 0);
+    assert_eq!(fit.name_w, 7);
     assert!(fit.visible);
 }
 
@@ -160,8 +145,6 @@ fn gauge_fit_hides_entirely_below_the_percent_width() {
 
 #[test]
 fn gauge_fit_provider_profile_never_shows_a_bar() {
-    // `has_pct = false` (api-key/provider profile, no OAuth 5h window): only
-    // the name collapses on the way down to the bare `—` placeholder.
     let roomy = gauge_fit(100, 10, false);
     assert_eq!(
         roomy,
@@ -172,7 +155,6 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
         }
     );
 
-    // name + 2 + dash(1): at 9 the name shrinks to 6.
     let tight = gauge_fit(9, 10, false);
     assert_eq!(tight.bar_cells, 0);
     assert_eq!(tight.name_w, 6);
@@ -185,12 +167,12 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
     );
 }
 
-// ── `header_height` — the gauge row is claimed only when it renders ─────────
+// ── `header_height` ─────────────────────────────────────────────────────
 
 #[test]
-fn header_height_is_four_only_with_an_active_gauge() {
+fn header_height_is_always_three() {
     let with_active = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    assert_eq!(header_height(&with_active), 4);
+    assert_eq!(header_height(&with_active), 3);
 
     let no_active = app_with(vec![oauth_profile("uwuclxdy", 42.0)], None);
     assert_eq!(header_height(&no_active), 3);
@@ -200,67 +182,95 @@ fn header_height_is_four_only_with_an_active_gauge() {
     assert_eq!(header_height(&compact), 3);
 }
 
-// ── Full render — row placement and gauge form ──────────────────────────────
+// ── Gauge on row 1, after account count ─────────────────────────────────
 
 #[test]
-fn header_renders_gauge_on_its_own_row_below_the_feed_dot() {
-    let app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    let row1 = row_content(&app, 90, 1);
-    assert!(row1.contains("1 account"));
-    assert!(row1.contains("● status.claude.ai"));
+fn gauge_after_account_count_on_wide_terminal() {
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    let row1 = row_content(&app, 120, 1);
     assert!(
-        !row1.contains("uwuclxdy"),
-        "gauge must not share the feed-dot row"
+        row1.starts_with("1 account"),
+        "row 1 starts with account count"
     );
-
-    let row2 = row_content(&app, 90, 2);
-    assert!(row2.contains("uwuclxdy  ["));
-    assert!(
-        row2.contains("] 42%"),
-        "bracketed bar with trailing percent"
-    );
-    assert!(row2.contains('█'), "bar renders fill cells");
-    assert!(
-        row2.trim_end().ends_with("42%"),
-        "gauge right-aligns under the feed dot"
-    );
+    assert!(row1.contains("·"), "middot separates count and gauge");
+    assert!(row1.contains("uwuclxdy"), "gauge name on row 1 after count");
+    assert!(row1.contains("42%"), "gauge percent on row 1");
 }
 
 #[test]
-fn header_keeps_three_rows_in_compact_mode() {
+fn gauge_after_account_count_shows_bar_when_roomy() {
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    let row1 = row_content(&app, 120, 1);
+    assert!(row1.contains('█'), "gauge bar visible on row 1 at 120 wide");
+}
+
+#[test]
+fn gauge_dash_for_provider_after_account_count() {
+    let mut app = app_with(vec![provider_profile("z.ai")], Some("z.ai"));
+    app.tab = Tab::Tokens;
+    let row1 = row_content(&app, 90, 1);
+    assert!(row1.starts_with("1 account"), "row 1 starts with count");
+    assert!(row1.contains("·"), "middot present for provider profile");
+    assert!(row1.contains("z.ai"));
+    assert!(row1.contains('—'), "provider shows dash, not bar/percent");
+    assert!(!row1.contains('█'), "provider must not render a bar");
+}
+
+#[test]
+fn gauge_hidden_in_compact_mode() {
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.compact = true;
     let rows = render_header_rows(&app, 90);
     assert_eq!(rows.len(), 3);
-    assert!(rows[1].contains("1 account"));
     assert!(
         !rows.iter().any(|r| r.contains("uwuclxdy")),
         "gauge must not render in compact mode"
     );
-    assert!(rows[1].contains("● status.claude.ai"));
+    assert!(rows[1].contains("1 account"));
 }
 
 #[test]
-fn header_hides_gauge_when_no_active_profile() {
+fn gauge_hidden_when_no_active_profile() {
     let app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], None);
     let rows = render_header_rows(&app, 90);
-    assert_eq!(rows.len(), 3, "no gauge row is reserved without a gauge");
-    assert!(rows[1].contains("1 account"));
+    assert_eq!(rows.len(), 3);
     assert!(!rows.iter().any(|r| r.contains("uwuclxdy")));
-    assert!(rows[1].contains("● status.claude.ai"));
+    assert!(rows[1].contains("1 account"));
 }
 
 #[test]
-fn header_renders_dash_for_provider_active_profile() {
-    let app = app_with(vec![provider_profile("z.ai")], Some("z.ai"));
-    let row2 = row_content(&app, 90, 2);
-    assert!(row2.contains("z.ai"));
+fn gauge_collapses_to_name_only_on_narrow_terminal() {
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    let row1 = row_content(&app, 60, 1);
     assert!(
-        row2.contains('—'),
-        "provider profile shows a bare dash, no bar/percent"
+        row1.contains("uwuclxdy"),
+        "gauge name still visible at 60 wide"
     );
+    assert!(row1.contains("·"), "middot present");
+    assert!(row1.contains("1 account"), "account count always visible");
+}
+
+#[test]
+fn gauge_on_row1_with_status_dot() {
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    let row1 = row_content(&app, 100, 1);
+    assert!(row1.contains("●"), "status dot still visible");
+    assert!(row1.contains("status.claude.ai"), "status label visible");
+    assert!(row1.contains("1 account ·"), "count middot gauge");
+}
+
+#[test]
+fn row2_is_tabs_only() {
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+    let row2 = row_content(&app, 90, 2);
+    assert!(row2.contains("overview"), "tabs on row 2");
     assert!(
-        !row2.contains('█'),
-        "provider profile must not render a bar"
+        !row2.contains("uwuclxdy"),
+        "gauge not on row 2 (it's on row 1)"
     );
 }

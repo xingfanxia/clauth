@@ -1,8 +1,10 @@
-//! Top bar: claude glyph on the left; brand, account count, active-account
-//! gauge, and the tab bar stacked in the text column to the right. Four rows
-//! with an active account (`brand / count + feed dot / gauge / tabs`), three
-//! without one or in compact mode — [`header_height`] keeps `render::draw`'s
-//! layout in step so no dead row is ever reserved.
+//! Top bar: claude glyph on the left; brand and account count in the text
+//! column to the right. Three rows always — [`header_height`] keeps
+//! `render::draw`'s layout in step.
+//!
+//! The active-profile usage gauge sits on row 1 to the right of the account
+//! count, separated by a middle dot. The collapse ladder drops the usage bar
+//! before the name.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -10,41 +12,30 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::App;
+use super::super::app::{App, Tab};
 use super::super::theme;
 use super::format::{bar_string_with_cells, fixed_split, name_style};
-use super::tabs;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// ── Account gauge (issue #16) ────────────────────────────────────────────────
+// ── Account gauge ────────────────────────────────────────────────────────
 //
-// `name  [███░░░░░] 38%` for the active profile's 5h window, on its own row
-// right-aligned under the feed dot (brackets dim, house deviation shared with
-// the overview bars). Collapse ladder, in sacrifice order:
-//   1. profile name truncates                         [`gauge_fit`]
-//   2. bar cells shrink                                [`gauge_fit`]
-//   3. bar drops entirely                              [`gauge_fit`]
-//   4. name drops entirely                             [`gauge_fit`]
-//   5. whole gauge drops                               [`gauge_fit`]
+// `name  [███░░░░░] 38%` for the active profile's 5h window. Collapse
+// ladder sacrifices the bar before the name (bar shrinks → bar drops →
+// name truncates → name drops → hide).
 
 const GAUGE_NAME_GAP: usize = 2;
 const GAUGE_BAR_FULL: usize = 8;
 const GAUGE_BAR_MIN: usize = 3;
 const GAUGE_NAME_MAX: usize = 16;
 const GAUGE_NAME_MIN: usize = 3;
-const GAUGE_PCT_W: usize = 4; // "100%" / " 42%"
-const GAUGE_DASH_W: usize = 1; // "—" — api-key/provider profiles have no 5h OAuth window
+const GAUGE_PCT_W: usize = 4;
+const GAUGE_DASH_W: usize = 1;
 
-// ── Account-name pulse ───────────────────────────────────────────────────────
-//
-// cloudy-tui attention-shimmer, periodic-pulse mode: a pale-orange crest sweeps
-// the name left→right, then rests flat — tint, never saturate. Full tier only
-// (the per-cell blend needs truecolor). Feel lives in these constants.
+// ── Account-name pulse ───────────────────────────────────────────────────
 
 const PULSE_SWEEP_MS: u64 = 900;
 const PULSE_REST_MS: u64 = 1700;
-/// Cap on how far a char leans toward the crest color (0 = off, 1 = full flip).
 const PULSE_DEPTH: f32 = 0.45;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,9 +53,6 @@ impl GaugeFit {
     };
 }
 
-/// Active profile's gauge content: full (untruncated) name, 5h utilization
-/// (`None` for api-key/provider profiles — no OAuth window, renders `—`),
-/// and the name's stale-cache style (same convention as the overview list).
 struct ActiveGauge {
     name: String,
     pct: Option<f64>,
@@ -80,9 +68,6 @@ fn active_gauge(app: &App) -> Option<ActiveGauge> {
             .usage
             .as_ref()
             .and_then(|u| u.five_hour.as_ref())
-            // Clamped at this boundary like every other utilization display:
-            // the ladder reserves exactly 4 tail cells ("100%"), so an
-            // out-of-range wire value must never widen the printed number.
             .map(|w| w.utilization.clamp(0.0, 100.0))
     } else {
         None
@@ -98,8 +83,6 @@ fn gauge_tail_w(has_pct: bool) -> usize {
     if has_pct { GAUGE_PCT_W } else { GAUGE_DASH_W }
 }
 
-/// Cells the gauge occupies: `name  [bar] pct` — the bar carries its 2 bracket
-/// cells and a 1-cell gap before the percent; the name a 2-cell gap after it.
 fn gauge_total_w(name_w: usize, bar_cells: usize, has_pct: bool) -> usize {
     let mut w = gauge_tail_w(has_pct);
     if bar_cells > 0 {
@@ -111,9 +94,7 @@ fn gauge_total_w(name_w: usize, bar_cells: usize, has_pct: bool) -> usize {
     w
 }
 
-/// The collapse ladder: given the cells available to the gauge (`avail`), the
-/// untruncated name length, and whether it has a percent (bar) tail at all,
-/// degrade name → bar → drop-bar → drop-name → hide entirely until it fits.
+/// Collapse ladder: bar shrinks → bar drops → name truncates → name drops → hide.
 fn gauge_fit(avail: usize, name_len: usize, has_pct: bool) -> GaugeFit {
     if avail < gauge_tail_w(has_pct) {
         return GaugeFit::HIDDEN;
@@ -122,14 +103,14 @@ fn gauge_fit(avail: usize, name_len: usize, has_pct: bool) -> GaugeFit {
     let mut bar_cells = if has_pct { GAUGE_BAR_FULL } else { 0 };
     let name_floor = GAUGE_NAME_MIN.min(name_len);
 
-    while gauge_total_w(name_w, bar_cells, has_pct) > avail && name_w > name_floor {
-        name_w -= 1;
-    }
     while gauge_total_w(name_w, bar_cells, has_pct) > avail && bar_cells > GAUGE_BAR_MIN {
         bar_cells -= 1;
     }
     if bar_cells > 0 && gauge_total_w(name_w, bar_cells, has_pct) > avail {
         bar_cells = 0;
+    }
+    while gauge_total_w(name_w, bar_cells, has_pct) > avail && name_w > name_floor {
+        name_w -= 1;
     }
     if name_w > 0 && gauge_total_w(name_w, bar_cells, has_pct) > avail {
         name_w = 0;
@@ -155,7 +136,7 @@ fn gauge_spans(
     if fit.name_w > 0 {
         let (nt, _pad) = fixed_split(name, fit.name_w);
         spans.extend(pulse_name_spans(&nt, style, elapsed_ms));
-        spans.push(Span::raw(" ".repeat(GAUGE_NAME_GAP)));
+        spans.push(Span::raw("  "));
     }
     match pct {
         Some(pct) if fit.bar_cells > 0 => {
@@ -179,9 +160,6 @@ fn gauge_spans(
     spans
 }
 
-/// Per-char spans for the account name with the periodic pale-orange pulse.
-/// Compatible tier (or mid-rest) renders the name plain — the crest lean is a
-/// truecolor blend, and the rest gap is what keeps the motion a nudge.
 fn pulse_name_spans(name: &str, style: Style, elapsed_ms: u64) -> Vec<Span<'static>> {
     use std::f32::consts::{PI, TAU};
     let plain = || vec![Span::styled(name.to_string(), style)];
@@ -194,7 +172,6 @@ fn pulse_name_spans(name: &str, style: Style, elapsed_ms: u64) -> Vec<Span<'stat
         return plain();
     }
     let progress = t / sweep;
-    // Rising/falling envelope so the sweep fades in and out at the row edges.
     let envelope = (PI * progress).sin();
     let head = progress * TAU;
     let len = name.chars().count().max(1) as f32;
@@ -211,16 +188,13 @@ fn pulse_name_spans(name: &str, style: Style, elapsed_ms: u64) -> Vec<Span<'stat
         .collect()
 }
 
-/// Rows the header needs this frame: 4 with an active-account gauge row, 3
-/// otherwise (compact mode or no active profile). `render::draw` sizes the
-/// top chunk with this so the gauge row is never reserved empty.
-pub(super) fn header_height(app: &App) -> u16 {
-    if !app.compact && active_gauge(app).is_some() {
-        4
-    } else {
-        3
-    }
+// ── Height ───────────────────────────────────────────────────────────────
+
+pub(super) fn header_height(_app: &App) -> u16 {
+    3
 }
+
+// ── Draw ─────────────────────────────────────────────────────────────────
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
@@ -230,17 +204,21 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     draw_logo(frame, cols[0], app);
 
-    let gauge = if app.compact { None } else { active_gauge(app) };
-    let row_count = if gauge.is_some() { 4 } else { 3 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(vec![Constraint::Length(1); row_count])
+        .constraints([Constraint::Length(1); 3])
         .split(cols[1]);
 
     let n = app.config().profiles.len();
-
-    // Row 0: brand (TEXT + bold; house deviation from ACCENT_2) left, version (TEXT_DIM) right.
     let info_width = rows[0].width as usize;
+
+    let gauge = if app.tab == Tab::Overview || app.compact {
+        None
+    } else {
+        active_gauge(app)
+    };
+
+    // ── Row 0: brand + version ────────────────────────────────────────────
     let brand = "clauth";
     let ver = format!("v{VERSION}");
     let gap = info_width.saturating_sub(brand.len() + ver.len());
@@ -249,59 +227,56 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(" ".repeat(gap), theme::base()),
         Span::styled(ver, theme::dim()),
     ]);
-
-    // Row 1: account count left; `● status.claude.ai` right-aligned under the
-    // version, kept only while a >= 3-cell gap separates it from the count.
-    let count_txt = format!("{n} account{}", plural(n));
-    let count_w = count_txt.chars().count();
-    let feed = "status.claude.ai"; // display label per user choice; feed itself is status.claude.com
-    let ind_width = 2 + feed.len(); // `● ` + label
-
-    let mut row1_spans: Vec<Span<'static>> = vec![Span::styled(count_txt, theme::faint())];
-    if info_width >= count_w + ind_width + 3 {
-        let dot_gap = info_width - count_w - ind_width;
-        row1_spans.push(Span::raw(" ".repeat(dot_gap)));
-        row1_spans.push(Span::styled(
-            "●",
-            Style::default().fg(status_dot_color(app)),
-        ));
-        row1_spans.push(Span::styled(format!(" {feed}"), theme::dim()));
-    }
-
     frame.render_widget(Paragraph::new(title).style(theme::base()), rows[0]);
+
+    // ── Row 1: N accounts · [gauge] ... ● status.claude.ai ──────────────
+    // The count + gauge are left-aligned together; the status dot is the
+    // only thing right-aligned, with an elastic gap in between.
+    let row1_width = rows[1].width as usize;
+    let prefix = if gauge.is_some() {
+        format!("{n} account{} · ", plural(n))
+    } else {
+        format!("{n} account{}", plural(n))
+    };
+    let feed = "status.claude.ai";
+    let status_head = "● ";
+    let status_w = status_head.chars().count() + feed.chars().count();
+    let reserve: usize = 1;
+
+    let mut left_spans: Vec<Span<'static>> = vec![Span::styled(prefix, theme::faint())];
+    if let Some(ref g) = gauge {
+        let gauge_budget = row1_width.saturating_sub(
+            left_spans.iter().map(|s| s.content.chars().count()).sum::<usize>()
+                + status_w + reserve,
+        );
+        let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
+        if fit.visible {
+            let elapsed = app.started_at.elapsed().as_millis() as u64;
+            left_spans.extend(gauge_spans(fit, &g.name, g.style, g.pct, elapsed));
+        }
+    }
+    let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let mut row1_spans = left_spans;
+    if row1_width >= left_w + status_w + reserve {
+        let gap = row1_width - left_w - status_w;
+        row1_spans.push(Span::raw(" ".repeat(gap)));
+    }
+    row1_spans.push(Span::styled(status_head, Style::default().fg(status_dot_color(app))));
+    row1_spans.push(Span::styled(feed, theme::dim()));
+
     frame.render_widget(
         Paragraph::new(Line::from(row1_spans)).style(theme::base()),
         rows[1],
     );
 
-    // Row 2 (active profile only): the 5h gauge on its own row, right-aligned
-    // under the feed dot. `gauge_fit` degrades it on narrow terminals.
-    if let Some(g) = &gauge {
-        let fit = gauge_fit(info_width, g.name.chars().count(), g.pct.is_some());
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        if fit.visible {
-            let elapsed = app.started_at.elapsed().as_millis() as u64;
-            let gspans = gauge_spans(fit, &g.name, g.style, g.pct, elapsed);
-            let gw: usize = gspans.iter().map(|s| s.content.chars().count()).sum();
-            spans.push(Span::raw(" ".repeat(info_width.saturating_sub(gw))));
-            spans.extend(gspans);
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(theme::base()),
-            rows[2],
-        );
-    }
-
-    tabs::draw(frame, rows[row_count - 1], app);
+    // ── Row 2: tabs ──────────────────────────────────────────────────────
+    super::tabs::draw(frame, rows[2], app);
 }
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Feed-health color for the header status dot — when active incidents exist,
-/// uses the worst impact's semantic color (critical/major → DANGER, minor →
-/// WARNING, maintenance → TEXT_DIM). Stale cache or no data → SUCCESS.
 fn status_dot_color(app: &App) -> ratatui::style::Color {
     use crate::status::Impact;
     match app.status.worst_active_impact() {
@@ -312,7 +287,6 @@ fn status_dot_color(app: &App) -> ratatui::style::Color {
     }
 }
 
-/// Claude glyph in the top-left. Eyes blank for ~200ms every ~6s as a subtle sign of life.
 fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let elapsed = app.started_at.elapsed().as_millis() as u64;
     let blink = (elapsed % 6000) < 200;
