@@ -973,6 +973,70 @@ fn fallback_last_resort_is_exclusive_across_the_chain() {
     assert_eq!(app.config().find("b").map(|p| p.last_resort), Some(false));
 }
 
+// ── tokens tab: model filter via the action menu ─────────────────────────────
+
+#[test]
+fn tokens_action_menu_sets_and_swaps_the_model_filter() {
+    use super::{ActionMenuAction, TokenFilter, build_action_menu, dispatch_action_menu_action};
+    use crate::tokens::{ModelTokens, TokenStats};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Tokens;
+    // Both models sit above OTHERS_THRESHOLD, so they group individually.
+    app.token_stats = Some(TokenStats {
+        models: vec![
+            ModelTokens {
+                model: "claude-opus-4-8".to_string(),
+                input: 10_000_000,
+                ..Default::default()
+            },
+            ModelTokens {
+                model: "gpt-x".to_string(),
+                input: 5_000_000,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    assert_eq!(super::token_model_count(&app), 2);
+
+    // The menu offers the two inactive lenses plus the page-key mirrors.
+    let labels: Vec<&str> = build_action_menu(&app)
+        .items
+        .iter()
+        .map(|i| i.label)
+        .collect();
+    assert_eq!(
+        labels,
+        vec![
+            "show claude models",
+            "show other models",
+            "toggle cache counting",
+            "reload stats"
+        ]
+    );
+
+    // Narrow to claude models; the cursor re-clamps into the shorter list.
+    app.token_model_cursor = 1;
+    dispatch_action_menu_action(&mut app, ActionMenuAction::TokensShowClaude);
+    assert_eq!(app.token_filter, TokenFilter::Claude);
+    assert_eq!(super::token_model_count(&app), 1);
+    assert_eq!(
+        app.token_model_cursor, 0,
+        "cursor clamps into the filtered list"
+    );
+
+    // The active lens drops out of the menu; "show all" takes its place.
+    let labels: Vec<&str> = build_action_menu(&app)
+        .items
+        .iter()
+        .map(|i| i.label)
+        .collect();
+    assert!(labels.contains(&"show all models"));
+    assert!(!labels.contains(&"show claude models"));
+}
+
 // ── capture guard ─────────────────────────────────────────────────────────────
 
 // An empty snapshot (no creds file, no endpoint config — the macOS-keychain

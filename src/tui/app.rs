@@ -462,6 +462,12 @@ pub(crate) enum ActionMenuAction {
     // Usage
     ToggleEstimates,
     TogglePace,
+    // Tokens
+    TokensShowAll,
+    TokensShowClaude,
+    TokensShowOthers,
+    ToggleCountCache,
+    ReloadTokenStats,
 }
 
 /// State for the action-menu modal.
@@ -515,6 +521,9 @@ impl ActionMenuAction {
             Self::RotateTokens => Some('t'),
             Self::ToggleEstimates => Some('e'),
             Self::TogglePace => Some('p'),
+            // Mirror the Tokens tab's page keys so the menu teaches them.
+            Self::ToggleCountCache => Some('c'),
+            Self::ReloadTokenStats => Some('r'),
             _ => None,
         }
     }
@@ -541,6 +550,11 @@ impl ActionMenuAction {
             Self::OpenIncidentLink => "open in browser",
             Self::ToggleEstimates => "toggle estimates",
             Self::TogglePace => "toggle pace marker",
+            Self::TokensShowAll => "show all models",
+            Self::TokensShowClaude => "show claude models",
+            Self::TokensShowOthers => "show other models",
+            Self::ToggleCountCache => "toggle cache counting",
+            Self::ReloadTokenStats => "reload stats",
         }
     }
 }
@@ -650,6 +664,38 @@ impl Tab {
 pub(crate) enum TokenView {
     Dashboard,
     Models,
+}
+
+/// Display filter over the Tokens tab's grouped model list (top-models card +
+/// the Models view), set from the tab's action menu. Session-only — a lens,
+/// not a setting. The aggregate cards (today/total/daily/…) stay unfiltered:
+/// the daily trend has no per-model split, so filtering only some cards would
+/// let "today" contradict the trend next to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TokenFilter {
+    #[default]
+    All,
+    Claude,
+    Others,
+}
+
+impl TokenFilter {
+    pub(crate) fn matches(self, model: &str) -> bool {
+        match self {
+            TokenFilter::All => true,
+            TokenFilter::Claude => crate::tokens::is_anthropic(model),
+            TokenFilter::Others => !crate::tokens::is_anthropic(model),
+        }
+    }
+
+    /// Title-right meta badge for the filtered model surfaces; `None` when off.
+    pub(crate) fn badge(self) -> Option<&'static str> {
+        match self {
+            TokenFilter::All => None,
+            TokenFilter::Claude => Some("claude only"),
+            TokenFilter::Others => Some("others only"),
+        }
+    }
 }
 
 /// Which Config pane owns the cursor.
@@ -986,6 +1032,8 @@ pub(crate) struct App {
     pub(crate) token_view: TokenView,
     /// Cursor into the grouped model list on the Tokens `Models` view.
     pub(crate) token_model_cursor: usize,
+    /// Model filter over the Tokens tab's model surfaces (action-menu driven).
+    pub(crate) token_filter: TokenFilter,
     /// Token-stats load results from the background loader; drained in `on_tick`.
     pub(crate) tokens_events: std::sync::mpsc::Receiver<crate::tokens::TokensEvent>,
     /// Manual-refresh signal to the token loader; a `()` triggers a reload.
@@ -1228,6 +1276,7 @@ impl App {
             tokens_failed: false,
             token_view: TokenView::Dashboard,
             token_model_cursor: 0,
+            token_filter: TokenFilter::default(),
             tokens_events,
             tokens_refresh,
             price_table: None,
@@ -1930,12 +1979,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 app.toast(ToastKind::Info, "re-running plugin checks");
                 return;
             }
-            // Tokens `r` reloads the on-disk stats + recent transcripts, and
-            // refetches model prices for the cost lens.
             if app.tab == Tab::Tokens {
-                let _ = app.tokens_refresh.send(());
-                let _ = app.pricing_refresh.send(());
-                app.toast(ToastKind::Info, "reloading token usage");
+                reload_token_stats(app);
                 return;
             }
             if app.tab == Tab::Usage {
@@ -2051,12 +2096,26 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Number of rows in the Tokens `Models` master list (grouped models).
+/// Number of rows in the Tokens `Models` master list (grouped models, after
+/// the active display filter).
 fn token_model_count(app: &App) -> usize {
     app.token_stats
         .as_ref()
-        .map(|s| crate::tokens::group_models(&s.models).len())
+        .map(|s| {
+            crate::tokens::group_models(&s.models)
+                .iter()
+                .filter(|m| app.token_filter.matches(&m.model))
+                .count()
+        })
         .unwrap_or(0)
+}
+
+/// Tokens `r` / action-menu reload: re-read the on-disk stats + recent
+/// transcripts and refetch model prices for the cost lens.
+fn reload_token_stats(app: &mut App) {
+    let _ = app.tokens_refresh.send(());
+    let _ = app.pricing_refresh.send(());
+    app.toast(ToastKind::Info, "reloading token usage");
 }
 
 /// Tokens tab: `c` toggles cache-counting (persisted) on either view; Dashboard
@@ -3653,8 +3712,21 @@ fn build_action_menu(app: &App) -> ActionMenuState {
             actions.push(ToggleEstimates);
             actions.push(TogglePace);
         }
-        // Tokens: no menu actions — `r` reloads, ⏎/esc navigate.
-        Tab::Tokens => {}
+        // Tokens: the model-filter lenses (minus the one already active) plus
+        // the page keys (`c` cache basis, `r` reload) for discoverability.
+        Tab::Tokens => {
+            if app.token_filter != TokenFilter::All {
+                actions.push(TokensShowAll);
+            }
+            if app.token_filter != TokenFilter::Claude {
+                actions.push(TokensShowClaude);
+            }
+            if app.token_filter != TokenFilter::Others {
+                actions.push(TokensShowOthers);
+            }
+            actions.push(ToggleCountCache);
+            actions.push(ReloadTokenStats);
+        }
         Tab::Setup => match app.config_focus {
             ConfigFocus::Profiles => {
                 if app.profile_cursor < app.profile_count() {
@@ -3856,6 +3928,21 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
         ActionMenuAction::TogglePace => toggle_show_pace(app),
+        ActionMenuAction::TokensShowAll => set_token_filter(app, TokenFilter::All),
+        ActionMenuAction::TokensShowClaude => set_token_filter(app, TokenFilter::Claude),
+        ActionMenuAction::TokensShowOthers => set_token_filter(app, TokenFilter::Others),
+        ActionMenuAction::ToggleCountCache => toggle_count_cache(app),
+        ActionMenuAction::ReloadTokenStats => reload_token_stats(app),
+    }
+}
+
+/// Swap the Tokens model filter and re-clamp the Models cursor — the filtered
+/// list can be shorter than where the cursor sat.
+fn set_token_filter(app: &mut App, filter: TokenFilter) {
+    app.token_filter = filter;
+    let len = token_model_count(app);
+    if app.token_model_cursor >= len {
+        app.token_model_cursor = len.saturating_sub(1);
     }
 }
 

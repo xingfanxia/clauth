@@ -382,3 +382,45 @@ fn banner_renders() {
         "banner text present when banner is None"
     );
 }
+
+// A filter that empties the grouped model list (set from the menu while on the
+// Models view) must explain itself — not fall back to the shared account
+// empty-state ("no accounts yet · n to create one").
+#[test]
+fn tokens_models_view_empty_filter_names_the_filter() {
+    use crate::tokens::{ModelTokens, TokenStats};
+    use crate::tui::app::{TokenFilter, TokenView};
+
+    let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: names,
+            ..AppState::default()
+        },
+        profiles,
+    };
+    let mut app = App::new(config);
+    app.tab = Tab::Tokens;
+    app.token_view = TokenView::Models;
+    app.token_filter = TokenFilter::Others;
+    app.token_stats = Some(TokenStats {
+        models: vec![ModelTokens {
+            model: "claude-opus-4-8".to_string(),
+            input: 10_000_000,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let out = dump(&app, 100, 30);
+    assert!(
+        out.contains("no models match the filter"),
+        "filtered-empty models view must name the filter:\n{out}"
+    );
+    assert!(
+        !out.contains("no accounts yet"),
+        "must not fall back to the accounts empty state:\n{out}"
+    );
+}

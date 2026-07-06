@@ -15,7 +15,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, TokenView};
+use super::super::app::{App, TokenFilter, TokenView};
 use super::super::theme;
 use super::format::fixed;
 use super::panes::{
@@ -229,10 +229,11 @@ fn model_metric(m: &ModelTokens, count_cache: bool) -> u64 {
     if count_cache { m.total() } else { m.in_out() }
 }
 
-/// Grouped models ranked DESC by the active basis (so the bars descend by the
-/// value actually shown).
-fn ranked_models(stats: &TokenStats, count_cache: bool) -> Vec<ModelTokens> {
+/// Grouped models after the display filter, ranked DESC by the active basis
+/// (so the bars descend by the value actually shown).
+fn ranked_models(stats: &TokenStats, count_cache: bool, filter: TokenFilter) -> Vec<ModelTokens> {
     let mut g = group_models(&stats.models);
+    g.retain(|m| filter.matches(&m.model));
     g.sort_unstable_by_key(|m| std::cmp::Reverse(model_metric(m, count_cache)));
     g
 }
@@ -304,13 +305,21 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 
     let mid = halves(rows[2], 55);
+    // The active model filter shows as the card's title-right meta badge.
     card(
         frame,
         mid[0],
         "top models",
-        None,
+        app.token_filter.badge(),
         false,
-        model_lines(stats, inner_w(mid[0]), 5, count_cache, prices),
+        model_lines(
+            stats,
+            inner_w(mid[0]),
+            5,
+            count_cache,
+            prices,
+            app.token_filter,
+        ),
     );
     card(
         frame,
@@ -495,8 +504,15 @@ fn model_lines(
     n: usize,
     count_cache: bool,
     prices: Option<&PriceTable>,
+    filter: TokenFilter,
 ) -> Vec<Line<'static>> {
-    let grouped = ranked_models(stats, count_cache);
+    let grouped = ranked_models(stats, count_cache, filter);
+    if grouped.is_empty() {
+        return vec![Line::from(Span::styled(
+            "no models match the filter",
+            theme::faint(),
+        ))];
+    }
     let max = grouped
         .first()
         .map(|m| model_metric(m, count_cache))
@@ -662,11 +678,34 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let grouped = app
         .token_stats
         .as_ref()
-        .map(|s| ranked_models(s, count_cache))
+        .map(|s| ranked_models(s, count_cache, app.token_filter))
         .unwrap_or_default();
     let sel = app.token_model_cursor.min(grouped.len().saturating_sub(1));
 
-    draw_selector_list(frame, cols[0], "models", true, sel, |w| {
+    // The selector title carries the filter so the narrowed list reads as such.
+    let title = match app.token_filter.badge() {
+        Some(badge) => format!("models  {badge}"),
+        None => "models".to_string(),
+    };
+    // A filter can empty the list mid-view (menu on the Models view) —
+    // `draw_selector_list`'s shared empty state talks about accounts, so
+    // render the filter-specific message instead.
+    if grouped.is_empty() {
+        let block = section_box(&title, true, true);
+        let inner = block.inner(cols[0]);
+        frame.render_widget(block, cols[0]);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no models match the filter",
+                theme::faint(),
+            )))
+            .style(theme::base()),
+            inner,
+        );
+        draw_model_detail(frame, cols[1], None, 0, app.price_table.as_ref());
+        return;
+    }
+    draw_selector_list(frame, cols[0], &title, true, sel, |w| {
         grouped
             .iter()
             .enumerate()

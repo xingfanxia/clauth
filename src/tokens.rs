@@ -117,7 +117,7 @@ impl DaySummary {
 }
 
 /// Aggregated token statistics view-model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct TokenStats {
     /// All models individually, sorted DESC by total(). Grouping is a render concern.
     pub(crate) models: Vec<ModelTokens>,
