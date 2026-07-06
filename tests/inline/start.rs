@@ -1,4 +1,5 @@
 use super::*;
+use std::process::Command;
 
 #[cfg(unix)]
 fn signal_status(signal: i32) -> ExitStatus {

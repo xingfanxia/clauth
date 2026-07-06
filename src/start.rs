@@ -2,7 +2,7 @@
 //! runtime directory. See [`crate::runtime`] for the shared-runtime design;
 //! this module is just the thin wrapper that owns the lifetime guard.
 
-use std::process::{Command, ExitStatus};
+use std::process::ExitStatus;
 #[cfg(unix)]
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 #[cfg(unix)]
@@ -44,7 +44,7 @@ pub(crate) fn run(
     #[cfg(unix)]
     let signal_watcher = SignalWatcher::new()?;
 
-    let mut command = Command::new("claude");
+    let mut command = crate::runtime::claude_command();
     command.env("CLAUDE_CONFIG_DIR", runtime.config_dir());
     // Isolated: also suppress global/project MCP servers wired through
     // `.claude.json`, so the only extension surface is what the caller passes.

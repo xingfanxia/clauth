@@ -236,7 +236,7 @@ fn parse_initialize_reply(line: &str) -> McpProbe {
 /// `claude --version`, trimmed to its first line. `None` when the binary is
 /// missing or the call fails — the row then reports "unknown".
 pub(crate) fn cc_version() -> Option<String> {
-    let output = Command::new("claude")
+    let output = crate::runtime::claude_command()
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

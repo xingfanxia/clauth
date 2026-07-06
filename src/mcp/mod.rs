@@ -778,7 +778,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let runtime = ProfileRuntime::acquire(target, opts.isolation)
         .map_err(|e| format!("failed to acquire runtime: {e}"))?;
 
-    let mut command = Command::new("claude");
+    let mut command = crate::runtime::claude_command();
     apply_delegate_env(&mut command, &opts.env, runtime.config_dir(), opts.depth);
     command
         .args(["-p", opts.prompt, "--output-format", "json"])

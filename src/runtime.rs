@@ -436,6 +436,31 @@ impl Drop for ProfileRuntime {
     }
 }
 
+/// A [`Command`](std::process::Command) for the `claude` CLI, resolved so an
+/// npm-installed shim launches on Windows too. Rust's bare `Command::new`
+/// appends only `.exe` and skips `PATHEXT`, so a `claude.cmd`/`claude.bat` (npm
+/// global) is invisible and `start`/`delegate` fail with "program not found"
+/// even though the user runs `claude` fine by hand. `which_all` enumerates every
+/// `PATHEXT` match in `PATH` order; we prefer a native `.exe` over a `.cmd`/
+/// `.bat` shim whenever both resolve (the shim adds a cmd.exe hop, and PATH dir
+/// order could otherwise surface it first), else take the first match and let
+/// std route it through cmd.exe with hardened escaping (post-CVE-2024-24576).
+/// Unix keeps the bare lookup.
+pub(crate) fn claude_command() -> std::process::Command {
+    #[cfg(windows)]
+    if let Ok(matches) = which::which_all("claude") {
+        let all: Vec<std::path::PathBuf> = matches.collect();
+        let chosen = all
+            .iter()
+            .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")))
+            .or_else(|| all.first());
+        if let Some(path) = chosen {
+            return std::process::Command::new(path);
+        }
+    }
+    std::process::Command::new("claude")
+}
+
 /// Probe the OS by attempting a real symlink in the runtime root. Anything
 /// other than success — privilege denial, unsupported filesystem, the
 /// `cfg(not(any(unix, windows)))` fallback — drops to fake-symlink mode.
