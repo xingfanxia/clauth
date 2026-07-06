@@ -121,6 +121,10 @@ pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
 /// the profile has no stored `credentials.json` (a base_url profile, whose
 /// endpoint+token come from `settings.json`, or an OAuth profile not yet logged
 /// in) — the existing Keychain login is left untouched in that case.
+///
+/// Runs after the symlink swap and is `?`-fatal: a failure leaves the file layer
+/// switched while CC still reads the old Keychain login. Loud + recoverable —
+/// both writes are idempotent, so retrying the switch re-runs the pair.
 #[cfg(target_os = "macos")]
 fn keychain_write_profile(name: &str) -> Result<()> {
     let path = profile_dir(name)?.join("credentials.json");
@@ -197,7 +201,11 @@ pub(crate) fn clear_claude_credentials() -> Result<()> {
             std::fs::remove_file(&link).context("Failed to remove .credentials.json")?;
         }
         // macOS: also drop the live Keychain login so Claude Code can't spend the
-        // account (parity with removing the credential file).
+        // account (parity with removing the credential file). This deletes
+        // whatever the item holds at that moment — possibly a chain CC rotated
+        // after our last capture, or a login clauth never wrote. The write-only
+        // design can't snapshot it first (reading Claude's item prompts on every
+        // call), so that tail is lost and needs a re-login; see keychain.rs.
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
             crate::keychain::keychain_delete()?;

@@ -163,7 +163,7 @@ fn parse_login_args(rest: &[String]) -> Option<(&str, Option<&str>)> {
 /// (see `oauth_login`) and writes the minted tokens straight into a fresh
 /// profile's `.credentials.json`, so it works identically on every platform —
 /// unlike running CC's own `/login`, which on macOS lands only in a per-config-
-/// dir hashed Keychain item and leaves the profile file empty (upstream #1/#3).
+/// dir hashed Keychain item and leaves the profile file empty (#1/#3).
 /// Captures into the profile; does not switch to it (`clauth <name>` does that).
 /// `--model` (any preset alias or a full custom id, same values the Setup tab's
 /// model row accepts) is persisted onto the new profile after capture, so its

@@ -8,7 +8,7 @@
 //! NOT mint claude.ai credentials), sends `code=true` plus the 6-scope set below,
 //! and uses a loopback redirect to `http://localhost:<port>/callback`. The code is
 //! then exchanged at `platform.claude.com/v1/oauth/token` via [`crate::oauth`].
-//! See `.agent/PROGRESS.md` for the capture + the authorize-host risk knob.
+//! The authorize-host risk knob is documented on [`AUTHORIZE_URL`].
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
