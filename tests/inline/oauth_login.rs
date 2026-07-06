@@ -1,9 +1,13 @@
-//! OAUTH-1 — deterministic, network-free tests for the PKCE + URL machinery.
+//! OAUTH-1 — deterministic, network-free tests for the PKCE + URL machinery,
+//! plus the loopback callback's security paths over in-process sockets.
 //! The browser round-trip and token exchange are manual acceptance.
 
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+
 use super::{
-    authorize_url, base64url_nopad, challenge_from_verifier, percent_decode, percent_encode,
-    query_param, request_target,
+    authorize_url, base64url_nopad, challenge_from_verifier, handle_callback, percent_decode,
+    percent_encode, query_param, request_target, wait_for_code,
 };
 
 #[test]
@@ -87,4 +91,87 @@ fn authorize_url_uses_claude_ai_host_code_true_and_six_scopes() {
     assert!(url.contains(
         "scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload"
     ));
+}
+
+// ── handle_callback / wait_for_code: the redirect's security paths ────────────
+
+/// Feed one request line through `handle_callback` over a real loopback socket
+/// pair; returns its verdict and the raw HTTP response the "browser" received.
+fn callback_roundtrip(
+    request_line: &str,
+    expected_state: &str,
+) -> (anyhow::Result<Option<String>>, String) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let mut client = TcpStream::connect(addr).expect("connect");
+    client
+        .write_all(request_line.as_bytes())
+        .expect("send request");
+    let (server, _) = listener.accept().expect("accept");
+    let verdict = handle_callback(server, expected_state);
+    // handle_callback dropped its stream → EOF, so this reads the full response.
+    let mut response = String::new();
+    client.read_to_string(&mut response).expect("read response");
+    (verdict, response)
+}
+
+#[test]
+fn callback_accepts_matching_state_and_extracts_the_code() {
+    let (verdict, response) = callback_roundtrip(
+        "GET /callback?code=authcode-1&state=STATE HTTP/1.1\r\n",
+        "STATE",
+    );
+    assert_eq!(
+        verdict.expect("valid callback").as_deref(),
+        Some("authcode-1")
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+}
+
+#[test]
+fn callback_aborts_on_a_state_mismatch() {
+    let (verdict, response) = callback_roundtrip(
+        "GET /callback?code=authcode-1&state=EVIL HTTP/1.1\r\n",
+        "STATE",
+    );
+    let err = verdict
+        .expect_err("a state mismatch must abort the login")
+        .to_string();
+    assert!(err.contains("state mismatch"), "err was: {err}");
+    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+}
+
+#[test]
+fn callback_aborts_on_an_oauth_error_param() {
+    let (verdict, response) = callback_roundtrip(
+        "GET /callback?error=access_denied&error_description=denied HTTP/1.1\r\n",
+        "STATE",
+    );
+    let err = verdict
+        .expect_err("an OAuth error param is fatal")
+        .to_string();
+    assert!(err.contains("authorization failed"), "err was: {err}");
+    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+}
+
+#[test]
+fn callback_ignores_unrelated_requests_and_keeps_waiting() {
+    // A favicon probe is answered 404 and is NOT fatal — the login keeps waiting.
+    let (verdict, response) = callback_roundtrip("GET /favicon.ico HTTP/1.1\r\n", "STATE");
+    assert!(verdict.expect("non-callback path is ignored").is_none());
+    assert!(response.starts_with("HTTP/1.1 404"), "got: {response}");
+
+    // /callback with no code at all → 400, still not fatal.
+    let (verdict, response) = callback_roundtrip("GET /callback?state=STATE HTTP/1.1\r\n", "STATE");
+    assert!(verdict.expect("missing code is ignored").is_none());
+    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+}
+
+#[test]
+fn wait_for_code_times_out_at_the_deadline() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let err = wait_for_code(&listener, "STATE", std::time::Instant::now())
+        .expect_err("an already-passed deadline must bail")
+        .to_string();
+    assert!(err.contains("timed out"), "err was: {err}");
 }
