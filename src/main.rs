@@ -4,6 +4,10 @@ mod claude_json;
 mod completions;
 mod fallback;
 mod format;
+// macOS-only: Claude Code reads its login from the Keychain, not the credentials
+// file, so a switch must also write there. Gated so non-macOS builds stay clean.
+#[cfg(target_os = "macos")]
+mod keychain;
 mod lock;
 mod lockorder;
 mod mcp;
