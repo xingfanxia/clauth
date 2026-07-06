@@ -1,12 +1,11 @@
-name: Release
+name: release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: write  # softprops/action-gh-release creates the release
 
 # Force HTTP/1.1 for registry downloads: curl's HTTP/2 multiplexing against the
 # crates.io CDN intermittently dies with "[16] Error in the HTTP2 framing layer"
@@ -20,8 +19,7 @@ jobs:
     name: Create release
     runs-on: ubuntu-latest
     steps:
-      - name: Create release notes
-        uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: false
 
@@ -52,36 +50,20 @@ jobs:
             os: windows-latest
             asset_name: clauth-windows-x86_64
             ext: .exe
-
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Cache cargo
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
-
+      - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
-
       - name: Prepare asset
         run: cp "target/${{ matrix.target }}/release/clauth${{ matrix.ext }}" "${{ matrix.asset_name }}${{ matrix.ext }}"
-
       - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.asset_name }}${{ matrix.ext }}
-
       - name: Upload artifact for checksum job
         uses: actions/upload-artifact@v7
         with:
@@ -90,10 +72,10 @@ jobs:
           if-no-files-found: error
 
   checksums:
-    name: Generate checksums
+    name: Checksums + signature
     needs: [build]
-    # Run even when some build legs failed so that binaries already published
-    # always have a matching sha256sums.txt in the release.
+    # Run even when a build leg fails so the binaries that DID ship always have
+    # a matching sums file covering exactly what was published.
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -102,19 +84,16 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-
       - name: Generate sha256sums.txt
-        # Glob whatever was actually downloaded so a partial build still
-        # produces a sums file that matches exactly what shipped.
+        # Glob whatever was actually built so a partial release still produces
+        # a sums file matching exactly what shipped.
         run: |
           cd artifacts
           sha256sum clauth-* > ../sha256sums.txt
-
       - name: Upload sha256sums.txt to release
         uses: softprops/action-gh-release@v3
         with:
           files: sha256sums.txt
-
       - name: Sign sha256sums.txt with minisign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -135,7 +114,6 @@ jobs:
           printf '%s\n' "${MINISIGN_SECRET_KEY}" > minisign.key
           minisign -S -s minisign.key -m sha256sums.txt -t "clauth ${GITHUB_REF_NAME} checksums"
           echo "Signed → sha256sums.txt.minisig"
-
       - name: Upload signature to release
         if: hashFiles('sha256sums.txt.minisig') != ''
         uses: softprops/action-gh-release@v3
