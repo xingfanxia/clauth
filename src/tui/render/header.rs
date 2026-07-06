@@ -1,5 +1,8 @@
-//! Top bar: claude glyph on the left; brand, account count, and the tab bar
-//! stacked in the text column to the right. Three rows, no dead space.
+//! Top bar: claude glyph on the left; brand, account count, active-account
+//! gauge, and the tab bar stacked in the text column to the right. Four rows
+//! with an active account (`brand / count + feed dot / gauge / tabs`), three
+//! without one or in compact mode — [`header_height`] keeps `render::draw`'s
+//! layout in step so no dead row is ever reserved.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -16,19 +19,16 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── Account gauge (issue #16) ────────────────────────────────────────────────
 //
-// Bare (bracket-less) mini usage bar for the active profile's 5h window,
-// row 1, left of the feed dot. Collapse ladder, in sacrifice order:
-//   0. row gap FULL(2) -> MIN(1)                     [`resolve_gauge_row`]
-//   1. account-count text drops entirely              [`resolve_gauge_row`]
-//   2. profile name truncates                         [`gauge_fit`]
-//   3. bar cells shrink                                [`gauge_fit`]
-//   4. bar drops entirely                              [`gauge_fit`]
-//   5. name drops entirely                             [`gauge_fit`]
-//   6. whole gauge drops                               [`gauge_fit`]
-// The feed dot keeps its pre-existing, independent ">= 3-cell gap" rule.
+// `name  [███░░░░░] 38%` for the active profile's 5h window, on its own row
+// right-aligned under the feed dot (brackets dim, house deviation shared with
+// the overview bars). Collapse ladder, in sacrifice order:
+//   1. profile name truncates                         [`gauge_fit`]
+//   2. bar cells shrink                                [`gauge_fit`]
+//   3. bar drops entirely                              [`gauge_fit`]
+//   4. name drops entirely                             [`gauge_fit`]
+//   5. whole gauge drops                               [`gauge_fit`]
 
-const GAUGE_GAP_FULL: usize = 2;
-const GAUGE_GAP_MIN: usize = 1;
+const GAUGE_NAME_GAP: usize = 2;
 const GAUGE_BAR_FULL: usize = 8;
 const GAUGE_BAR_MIN: usize = 3;
 const GAUGE_NAME_MAX: usize = 16;
@@ -36,11 +36,21 @@ const GAUGE_NAME_MIN: usize = 3;
 const GAUGE_PCT_W: usize = 4; // "100%" / " 42%"
 const GAUGE_DASH_W: usize = 1; // "—" — api-key/provider profiles have no 5h OAuth window
 
+// ── Account-name pulse ───────────────────────────────────────────────────────
+//
+// cloudy-tui attention-shimmer, periodic-pulse mode: a pale-orange crest sweeps
+// the name left→right, then rests flat — tint, never saturate. Full tier only
+// (the per-cell blend needs truecolor). Feel lives in these constants.
+
+const PULSE_SWEEP_MS: u64 = 900;
+const PULSE_REST_MS: u64 = 1700;
+/// Cap on how far a char leans toward the crest color (0 = off, 1 = full flip).
+const PULSE_DEPTH: f32 = 0.45;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GaugeFit {
     name_w: usize,
     bar_cells: usize,
-    gap: usize,
     visible: bool,
 }
 
@@ -48,7 +58,6 @@ impl GaugeFit {
     const HIDDEN: GaugeFit = GaugeFit {
         name_w: 0,
         bar_cells: 0,
-        gap: 0,
         visible: false,
     };
 }
@@ -89,119 +98,128 @@ fn gauge_tail_w(has_pct: bool) -> usize {
     if has_pct { GAUGE_PCT_W } else { GAUGE_DASH_W }
 }
 
-fn gauge_total_w(name_w: usize, bar_cells: usize, gap: usize, tail_w: usize) -> usize {
-    let mut w = tail_w;
+/// Cells the gauge occupies: `name  [bar] pct` — the bar carries its 2 bracket
+/// cells and a 1-cell gap before the percent; the name a 2-cell gap after it.
+fn gauge_total_w(name_w: usize, bar_cells: usize, has_pct: bool) -> usize {
+    let mut w = gauge_tail_w(has_pct);
     if bar_cells > 0 {
-        w += bar_cells + gap;
+        w += bar_cells + 2 + 1;
     }
     if name_w > 0 {
-        w += name_w + gap;
+        w += name_w + GAUGE_NAME_GAP;
     }
     w
 }
 
-/// Steps 2-6 of the ladder: given the cells available to the gauge alone
-/// (`avail`), the untruncated name length, whether it has a percent (bar)
-/// tail at all, and the already-decided inter-piece `gap`, degrade name →
-/// bar → drop-bar → drop-name → hide entirely until it fits.
-fn gauge_fit(avail: usize, name_len: usize, has_pct: bool, gap: usize) -> GaugeFit {
-    let tail_w = gauge_tail_w(has_pct);
-    if avail < tail_w {
+/// The collapse ladder: given the cells available to the gauge (`avail`), the
+/// untruncated name length, and whether it has a percent (bar) tail at all,
+/// degrade name → bar → drop-bar → drop-name → hide entirely until it fits.
+fn gauge_fit(avail: usize, name_len: usize, has_pct: bool) -> GaugeFit {
+    if avail < gauge_tail_w(has_pct) {
         return GaugeFit::HIDDEN;
     }
     let mut name_w = name_len.min(GAUGE_NAME_MAX);
     let mut bar_cells = if has_pct { GAUGE_BAR_FULL } else { 0 };
     let name_floor = GAUGE_NAME_MIN.min(name_len);
 
-    while gauge_total_w(name_w, bar_cells, gap, tail_w) > avail && name_w > name_floor {
+    while gauge_total_w(name_w, bar_cells, has_pct) > avail && name_w > name_floor {
         name_w -= 1;
     }
-    while gauge_total_w(name_w, bar_cells, gap, tail_w) > avail && bar_cells > GAUGE_BAR_MIN {
+    while gauge_total_w(name_w, bar_cells, has_pct) > avail && bar_cells > GAUGE_BAR_MIN {
         bar_cells -= 1;
     }
-    if bar_cells > 0 && gauge_total_w(name_w, bar_cells, gap, tail_w) > avail {
+    if bar_cells > 0 && gauge_total_w(name_w, bar_cells, has_pct) > avail {
         bar_cells = 0;
     }
-    if name_w > 0 && gauge_total_w(name_w, bar_cells, gap, tail_w) > avail {
+    if name_w > 0 && gauge_total_w(name_w, bar_cells, has_pct) > avail {
         name_w = 0;
     }
-    if gauge_total_w(name_w, bar_cells, gap, tail_w) > avail {
+    if gauge_total_w(name_w, bar_cells, has_pct) > avail {
         return GaugeFit::HIDDEN;
     }
     GaugeFit {
         name_w,
         bar_cells,
-        gap,
         visible: true,
     }
 }
 
-/// Steps 0-1 of the ladder: shrink the row gap (FULL -> MIN) before dropping
-/// the account-count text, before ever asking the gauge itself to sacrifice
-/// anything (`gauge_fit`). Returns whether the count text survives and the
-/// gauge's resolved fit.
-fn resolve_gauge_row(
-    info_width: usize,
-    count_w: usize,
-    gauge: &Option<ActiveGauge>,
-) -> (bool, GaugeFit) {
-    let Some(g) = gauge else {
-        return (true, GaugeFit::HIDDEN);
-    };
-    let name_len = g.name.chars().count();
-    let has_pct = g.pct.is_some();
-    let bar_full = if has_pct { GAUGE_BAR_FULL } else { 0 };
-    let name_full = name_len.min(GAUGE_NAME_MAX);
-    let tail_w = gauge_tail_w(has_pct);
-    let full_w = |gap: usize| gauge_total_w(name_full, bar_full, gap, tail_w);
-    let full_fit = |gap: usize| GaugeFit {
-        name_w: name_full,
-        bar_cells: bar_full,
-        gap,
-        visible: true,
-    };
-
-    for gap in [GAUGE_GAP_FULL, GAUGE_GAP_MIN] {
-        if count_w + gap + full_w(gap) <= info_width {
-            return (true, full_fit(gap));
-        }
-    }
-
-    // Account count gives way before the gauge sacrifices anything of its own.
-    let gap = GAUGE_GAP_MIN;
-    if full_w(gap) <= info_width {
-        return (false, full_fit(gap));
-    }
-
-    (false, gauge_fit(info_width, name_len, has_pct, gap))
-}
-
-fn gauge_spans(fit: GaugeFit, name: &str, style: Style, pct: Option<f64>) -> Vec<Span<'static>> {
+fn gauge_spans(
+    fit: GaugeFit,
+    name: &str,
+    style: Style,
+    pct: Option<f64>,
+    elapsed_ms: u64,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if fit.name_w > 0 {
         let (nt, _pad) = fixed_split(name, fit.name_w);
-        spans.push(Span::styled(nt, style));
-        spans.push(Span::raw(" ".repeat(fit.gap)));
+        spans.extend(pulse_name_spans(&nt, style, elapsed_ms));
+        spans.push(Span::raw(" ".repeat(GAUGE_NAME_GAP)));
     }
     match pct {
         Some(pct) if fit.bar_cells > 0 => {
             let style = Style::default().fg(theme::util_color(pct));
+            spans.push(Span::styled("[", theme::dim()));
             spans.push(Span::styled(
                 bar_string_with_cells(pct, fit.bar_cells),
                 style,
             ));
-            spans.push(Span::raw(" ".repeat(fit.gap)));
-            spans.push(Span::styled(format!("{pct:>3.0}%"), style));
+            spans.push(Span::styled("]", theme::dim()));
+            spans.push(Span::styled(format!(" {pct:.0}%"), style));
         }
         Some(pct) => {
             spans.push(Span::styled(
-                format!("{pct:>3.0}%"),
+                format!("{pct:.0}%"),
                 Style::default().fg(theme::util_color(pct)),
             ));
         }
         None => spans.push(Span::styled("—", theme::faint())),
     }
     spans
+}
+
+/// Per-char spans for the account name with the periodic pale-orange pulse.
+/// Compatible tier (or mid-rest) renders the name plain — the crest lean is a
+/// truecolor blend, and the rest gap is what keeps the motion a nudge.
+fn pulse_name_spans(name: &str, style: Style, elapsed_ms: u64) -> Vec<Span<'static>> {
+    use std::f32::consts::{PI, TAU};
+    let plain = || vec![Span::styled(name.to_string(), style)];
+    if theme::tier() != theme::Tier::Full {
+        return plain();
+    }
+    let t = (elapsed_ms % (PULSE_SWEEP_MS + PULSE_REST_MS)) as f32;
+    let sweep = PULSE_SWEEP_MS as f32;
+    if t >= sweep {
+        return plain();
+    }
+    let progress = t / sweep;
+    // Rising/falling envelope so the sweep fades in and out at the row edges.
+    let envelope = (PI * progress).sin();
+    let head = progress * TAU;
+    let len = name.chars().count().max(1) as f32;
+    let base = style.fg.unwrap_or_else(theme::text_color);
+    name.chars()
+        .enumerate()
+        .map(|(i, ch)| {
+            let col = (i as f32 / len) * TAU;
+            let crest = ((col - head).cos() * 0.5 + 0.5).powi(2);
+            let lean = f64::from(crest * envelope * PULSE_DEPTH);
+            let fg = theme::blend_over(base, theme::accent_2_pale_color(), lean);
+            Span::styled(ch.to_string(), style.fg(fg))
+        })
+        .collect()
+}
+
+/// Rows the header needs this frame: 4 with an active-account gauge row, 3
+/// otherwise (compact mode or no active profile). `render::draw` sizes the
+/// top chunk with this so the gauge row is never reserved empty.
+pub(super) fn header_height(app: &App) -> u16 {
+    if !app.compact && active_gauge(app).is_some() {
+        4
+    } else {
+        3
+    }
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -212,13 +230,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     draw_logo(frame, cols[0], app);
 
+    let gauge = if app.compact { None } else { active_gauge(app) };
+    let row_count = if gauge.is_some() { 4 } else { 3 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
+        .constraints(vec![Constraint::Length(1); row_count])
         .split(cols[1]);
 
     let n = app.config().profiles.len();
@@ -234,40 +250,16 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(ver, theme::dim()),
     ]);
 
-    // Row 1: count left; then (space permitting) the active profile's 5h
-    // gauge (issue #16); `● status.claude.ai` right-aligned. The gauge
-    // claims space before the account count (`resolve_gauge_row`); the feed
-    // dot keeps its original, independent "only if a >= 3-cell gap fits"
-    // rule, now measured against whatever actually rendered before it.
-    // Suppressed outright in compact mode.
+    // Row 1: account count left; `● status.claude.ai` right-aligned under the
+    // version, kept only while a >= 3-cell gap separates it from the count.
     let count_txt = format!("{n} account{}", plural(n));
     let count_w = count_txt.chars().count();
     let feed = "status.claude.ai"; // display label per user choice; feed itself is status.claude.com
     let ind_width = 2 + feed.len(); // `● ` + label
 
-    let gauge = if app.compact { None } else { active_gauge(app) };
-    let (show_count, fit) = resolve_gauge_row(info_width, count_w, &gauge);
-
-    let mut row1_spans: Vec<Span<'static>> = Vec::new();
-    let mut prefix_w = 0usize;
-    if show_count {
-        row1_spans.push(Span::styled(count_txt, theme::faint()));
-        prefix_w += count_w;
-    }
-    if let Some(g) = &gauge
-        && fit.visible
-    {
-        if prefix_w > 0 {
-            row1_spans.push(Span::raw(" ".repeat(fit.gap)));
-            prefix_w += fit.gap;
-        }
-        let gspans = gauge_spans(fit, &g.name, g.style, g.pct);
-        let gw: usize = gspans.iter().map(|s| s.content.chars().count()).sum();
-        row1_spans.extend(gspans);
-        prefix_w += gw;
-    }
-    if info_width >= prefix_w + ind_width + 3 {
-        let dot_gap = info_width - prefix_w - ind_width;
+    let mut row1_spans: Vec<Span<'static>> = vec![Span::styled(count_txt, theme::faint())];
+    if info_width >= count_w + ind_width + 3 {
+        let dot_gap = info_width - count_w - ind_width;
         row1_spans.push(Span::raw(" ".repeat(dot_gap)));
         row1_spans.push(Span::styled(
             "●",
@@ -281,7 +273,26 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(Line::from(row1_spans)).style(theme::base()),
         rows[1],
     );
-    tabs::draw(frame, rows[2], app);
+
+    // Row 2 (active profile only): the 5h gauge on its own row, right-aligned
+    // under the feed dot. `gauge_fit` degrades it on narrow terminals.
+    if let Some(g) = &gauge {
+        let fit = gauge_fit(info_width, g.name.chars().count(), g.pct.is_some());
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if fit.visible {
+            let elapsed = app.started_at.elapsed().as_millis() as u64;
+            let gspans = gauge_spans(fit, &g.name, g.style, g.pct, elapsed);
+            let gw: usize = gspans.iter().map(|s| s.content.chars().count()).sum();
+            spans.push(Span::raw(" ".repeat(info_width.saturating_sub(gw))));
+            spans.extend(gspans);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(theme::base()),
+            rows[2],
+        );
+    }
+
+    tabs::draw(frame, rows[row_count - 1], app);
 }
 
 fn plural(n: usize) -> &'static str {

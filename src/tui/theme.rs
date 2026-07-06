@@ -144,6 +144,13 @@ pub(crate) fn accent_color() -> Color {
 pub(crate) fn accent_2_color() -> Color {
     pick(Color::Rgb(217, 119, 87), Color::Indexed(173))
 }
+/// Pale warm crest for the header account-name pulse — `ACCENT_2` lifted toward
+/// `TEXT` so the sweep tints instead of saturating (cloudy-tui motion rule).
+/// Meaningful on the full tier only; callers gate the pulse on [`tier`].
+#[inline]
+pub(crate) fn accent_2_pale_color() -> Color {
+    blend_over(text_color(), accent_2_color(), 0.55)
+}
 
 // ── Semantic ──────────────────────────────────────────────────────────────────
 #[inline]

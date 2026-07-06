@@ -63,17 +63,18 @@ fn app_with(profiles: Vec<Profile>, active: Option<&str>) -> App {
     App::new(config)
 }
 
-/// Renders only the header block (not the full frame) so these tests are
-/// independent of body/footer layout.
+/// Renders only the header block (sized by `header_height`) so these tests
+/// are independent of body/footer layout.
 fn render_header_rows(app: &App, width: u16) -> Vec<String> {
-    let mut term = Terminal::new(TestBackend::new(width, 3)).unwrap();
+    let height = header_height(app);
+    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
     term.draw(|f| {
         let area = f.area();
         super::draw(f, area, app);
     })
     .unwrap();
     let buf = term.backend().buffer().clone();
-    (0..3u16)
+    (0..height)
         .map(|y| {
             (0..width)
                 .map(|x| buf.content[(y as usize) * (width as usize) + (x as usize)].symbol())
@@ -82,33 +83,28 @@ fn render_header_rows(app: &App, width: u16) -> Vec<String> {
         .collect()
 }
 
-/// Row 1 (account count / gauge / feed dot), columns past the claude-glyph
-/// column (0..10) — the glyph itself uses `█`/block glyphs that would
-/// otherwise collide with the gauge bar's own fill characters in a naive
-/// whole-row substring check.
-fn row1_content(app: &App, width: u16) -> String {
-    render_header_rows(app, width)[1].chars().skip(10).collect()
+/// A header row's content past the claude-glyph column (0..10) — the glyph
+/// itself uses `█`/block glyphs that would otherwise collide with the gauge
+/// bar's own fill characters in a naive whole-row substring check.
+fn row_content(app: &App, width: u16, row: usize) -> String {
+    render_header_rows(app, width)[row]
+        .chars()
+        .skip(10)
+        .collect()
 }
 
-fn gauge(name: &str, pct: Option<f64>) -> Option<ActiveGauge> {
-    Some(ActiveGauge {
-        name: name.to_string(),
-        pct,
-        style: Style::default(),
-    })
-}
-
-// ── `gauge_fit` — steps 2-6 of the ladder (pure) ────────────────────────────
+// ── `gauge_fit` — the collapse ladder (pure) ────────────────────────────────
+//
+// Full gauge width = name + 2 + [bar+2 brackets] + 1 + 4 ("100%").
 
 #[test]
 fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
-    let fit = gauge_fit(100, 8, true, 2);
+    let fit = gauge_fit(100, 8, true);
     assert_eq!(
         fit,
         GaugeFit {
             name_w: 8,
             bar_cells: 8,
-            gap: 2,
             visible: true,
         }
     );
@@ -116,7 +112,8 @@ fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
 
 #[test]
 fn gauge_fit_truncates_name_before_touching_bar() {
-    let fit = gauge_fit(22, 8, true, 2);
+    // Full = 8 + 2 + 10 + 1 + 4 = 25; at 23 the name gives up exactly 2 cells.
+    let fit = gauge_fit(23, 8, true);
     assert_eq!(fit.name_w, 6);
     assert_eq!(
         fit.bar_cells, 8,
@@ -127,7 +124,8 @@ fn gauge_fit_truncates_name_before_touching_bar() {
 
 #[test]
 fn gauge_fit_shrinks_bar_only_after_name_hits_its_floor() {
-    let fit = gauge_fit(16, 8, true, 1);
+    // Name floored at 3: 3 + 2 + (bar+2) + 1 + 4 = bar + 12 → bar 7 at 19.
+    let fit = gauge_fit(19, 8, true);
     assert_eq!(
         fit.name_w, GAUGE_NAME_MIN,
         "name must already be at its floor"
@@ -138,7 +136,9 @@ fn gauge_fit_shrinks_bar_only_after_name_hits_its_floor() {
 
 #[test]
 fn gauge_fit_drops_bar_before_name() {
-    let fit = gauge_fit(11, 8, true, 1);
+    // Below the bar floor (3 + 2 + 5 + 1 + 4 = 15) the bar drops entirely:
+    // name(3) + 2 + pct(4) = 9 still fits at 14.
+    let fit = gauge_fit(14, 8, true);
     assert_eq!(fit.bar_cells, 0, "bar drops entirely before the name does");
     assert_eq!(fit.name_w, GAUGE_NAME_MIN);
     assert!(fit.visible);
@@ -146,7 +146,7 @@ fn gauge_fit_drops_bar_before_name() {
 
 #[test]
 fn gauge_fit_drops_name_only_after_bar_is_already_gone() {
-    let fit = gauge_fit(7, 8, true, 1);
+    let fit = gauge_fit(7, 8, true);
     assert_eq!(fit.bar_cells, 0);
     assert_eq!(fit.name_w, 0);
     assert!(fit.visible, "the percent figure alone should still render");
@@ -154,7 +154,7 @@ fn gauge_fit_drops_name_only_after_bar_is_already_gone() {
 
 #[test]
 fn gauge_fit_hides_entirely_below_the_percent_width() {
-    let fit = gauge_fit(3, 8, true, 1);
+    let fit = gauge_fit(3, 8, true);
     assert_eq!(fit, GaugeFit::HIDDEN);
 }
 
@@ -162,22 +162,22 @@ fn gauge_fit_hides_entirely_below_the_percent_width() {
 fn gauge_fit_provider_profile_never_shows_a_bar() {
     // `has_pct = false` (api-key/provider profile, no OAuth 5h window): only
     // the name collapses on the way down to the bare `—` placeholder.
-    let roomy = gauge_fit(100, 10, false, 1);
+    let roomy = gauge_fit(100, 10, false);
     assert_eq!(
         roomy,
         GaugeFit {
             name_w: 10,
             bar_cells: 0,
-            gap: 1,
             visible: true
         }
     );
 
-    let tight = gauge_fit(8, 10, false, 1);
+    // name + 2 + dash(1): at 9 the name shrinks to 6.
+    let tight = gauge_fit(9, 10, false);
     assert_eq!(tight.bar_cells, 0);
     assert_eq!(tight.name_w, 6);
 
-    let dash_only = gauge_fit(1, 10, false, 1);
+    let dash_only = gauge_fit(1, 10, false);
     assert_eq!(dash_only.name_w, 0);
     assert!(
         dash_only.visible,
@@ -185,135 +185,82 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
     );
 }
 
-// ── `resolve_gauge_row` — steps 0-1 (row gap, account-count priority) ───────
+// ── `header_height` — the gauge row is claimed only when it renders ─────────
 
 #[test]
-fn resolve_gauge_row_keeps_count_at_comfortable_gap_when_roomy() {
-    let g = gauge("uwuclxdy", Some(42.0));
-    let (show_count, fit) = resolve_gauge_row(60, 9, &g);
-    assert!(show_count);
-    assert_eq!(fit.gap, GAUGE_GAP_FULL);
-    assert_eq!(fit.name_w, 8);
-    assert_eq!(fit.bar_cells, GAUGE_BAR_FULL);
+fn header_height_is_four_only_with_an_active_gauge() {
+    let with_active = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    assert_eq!(header_height(&with_active), 4);
+
+    let no_active = app_with(vec![oauth_profile("uwuclxdy", 42.0)], None);
+    assert_eq!(header_height(&no_active), 3);
+
+    let mut compact = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    compact.compact = true;
+    assert_eq!(header_height(&compact), 3);
 }
 
-#[test]
-fn resolve_gauge_row_shrinks_gap_before_dropping_count() {
-    let g = gauge("uwuclxdy", Some(42.0));
-    // 9 (count) + 2 (full gap) + 24 (full gauge) = 35 is the comfortable-gap
-    // boundary: exactly at it nothing is sacrificed; one below it the gap
-    // alone shrinks to 1 and everything else stays intact.
-    let (show_count, fit) = resolve_gauge_row(35, 9, &g);
-    assert!(show_count);
-    assert_eq!(fit.gap, GAUGE_GAP_FULL, "exact fit keeps the full gap");
-    let (show_count, fit) = resolve_gauge_row(34, 9, &g);
-    assert!(show_count);
-    assert_eq!(fit.gap, GAUGE_GAP_MIN);
-    assert_eq!(fit.name_w, 8);
-    assert_eq!(fit.bar_cells, GAUGE_BAR_FULL);
-}
+// ── Full render — row placement and gauge form ──────────────────────────────
 
 #[test]
-fn resolve_gauge_row_drops_count_before_the_gauge_sacrifices_anything() {
-    let g = gauge("uwuclxdy", Some(42.0));
-    // 9 + 1 (min gap) + 22 (full gauge) = 32 is the min-gap boundary: exactly
-    // at it the count still renders; one below it the count gives way while
-    // the gauge stays completely intact.
-    let (show_count, fit) = resolve_gauge_row(32, 9, &g);
-    assert!(show_count, "exact min-gap fit keeps the count");
-    assert_eq!(fit.gap, GAUGE_GAP_MIN);
-    let (show_count, fit) = resolve_gauge_row(31, 9, &g);
-    assert!(
-        !show_count,
-        "account count must give way before the gauge shrinks"
-    );
-    assert_eq!(
-        fit.name_w, 8,
-        "gauge itself is untouched once the count is gone"
-    );
-    assert_eq!(fit.bar_cells, GAUGE_BAR_FULL);
-    assert_eq!(fit.gap, GAUGE_GAP_MIN);
-}
-
-#[test]
-fn resolve_gauge_row_finally_hands_off_to_the_gauges_own_ladder() {
-    let g = gauge("uwuclxdy", Some(42.0));
-    // Below 22 not even the count-free full gauge fits — `gauge_fit` degrades it.
-    let (show_count, fit) = resolve_gauge_row(16, 9, &g);
-    assert!(!show_count);
-    assert_eq!(fit.name_w, GAUGE_NAME_MIN);
-    assert_eq!(fit.bar_cells, 7);
-}
-
-#[test]
-fn resolve_gauge_row_is_absent_without_an_active_profile() {
-    let (show_count, fit) = resolve_gauge_row(80, 9, &None);
-    assert!(show_count);
-    assert!(!fit.visible);
-}
-
-#[test]
-fn resolve_gauge_row_provider_profile_uses_the_dash_tail() {
-    let g = gauge("z.ai", None);
-    let (show_count, fit) = resolve_gauge_row(60, 9, &g);
-    assert!(show_count);
-    assert_eq!(fit.bar_cells, 0);
-    assert_eq!(fit.name_w, 4);
-}
-
-// ── Full render — integration-level sacrifice order ─────────────────────────
-
-#[test]
-fn header_renders_full_gauge_alongside_count_and_dot() {
+fn header_renders_gauge_on_its_own_row_below_the_feed_dot() {
     let app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    let row1 = row1_content(&app, 90);
+    let row1 = row_content(&app, 90, 1);
     assert!(row1.contains("1 account"));
-    assert!(row1.contains("uwuclxdy"));
-    assert!(row1.contains("42%"));
-    assert!(
-        row1.contains('█'),
-        "bar must render bare fill cells (no brackets)"
-    );
-    assert!(
-        !row1.contains('['),
-        "header gauge bar must stay bracket-less"
-    );
     assert!(row1.contains("● status.claude.ai"));
-}
-
-#[test]
-fn header_suppresses_gauge_in_compact_mode() {
-    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    app.compact = true;
-    let row1 = row1_content(&app, 90);
-    assert!(row1.contains("1 account"));
     assert!(
         !row1.contains("uwuclxdy"),
+        "gauge must not share the feed-dot row"
+    );
+
+    let row2 = row_content(&app, 90, 2);
+    assert!(row2.contains("uwuclxdy  ["));
+    assert!(
+        row2.contains("] 42%"),
+        "bracketed bar with trailing percent"
+    );
+    assert!(row2.contains('█'), "bar renders fill cells");
+    assert!(
+        row2.trim_end().ends_with("42%"),
+        "gauge right-aligns under the feed dot"
+    );
+}
+
+#[test]
+fn header_keeps_three_rows_in_compact_mode() {
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.compact = true;
+    let rows = render_header_rows(&app, 90);
+    assert_eq!(rows.len(), 3);
+    assert!(rows[1].contains("1 account"));
+    assert!(
+        !rows.iter().any(|r| r.contains("uwuclxdy")),
         "gauge must not render in compact mode"
     );
-    assert!(row1.contains("● status.claude.ai"));
+    assert!(rows[1].contains("● status.claude.ai"));
 }
 
 #[test]
 fn header_hides_gauge_when_no_active_profile() {
     let app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], None);
-    let row1 = row1_content(&app, 90);
-    assert!(row1.contains("1 account"));
-    assert!(!row1.contains("uwuclxdy"));
-    assert!(row1.contains("● status.claude.ai"));
+    let rows = render_header_rows(&app, 90);
+    assert_eq!(rows.len(), 3, "no gauge row is reserved without a gauge");
+    assert!(rows[1].contains("1 account"));
+    assert!(!rows.iter().any(|r| r.contains("uwuclxdy")));
+    assert!(rows[1].contains("● status.claude.ai"));
 }
 
 #[test]
 fn header_renders_dash_for_provider_active_profile() {
     let app = app_with(vec![provider_profile("z.ai")], Some("z.ai"));
-    let row1 = row1_content(&app, 90);
-    assert!(row1.contains("z.ai"));
+    let row2 = row_content(&app, 90, 2);
+    assert!(row2.contains("z.ai"));
     assert!(
-        row1.contains('—'),
+        row2.contains('—'),
         "provider profile shows a bare dash, no bar/percent"
     );
     assert!(
-        !row1.contains('█'),
+        !row2.contains('█'),
         "provider profile must not render a bar"
     );
 }

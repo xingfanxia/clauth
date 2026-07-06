@@ -32,18 +32,17 @@ use ratatui::widgets::Block;
 use super::app::{App, Tab};
 use super::theme;
 
-/// Content frame's top border doubles as the header/content separator.
-pub(super) const HEADER_HEIGHT: u16 = 3;
-
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     let background = Block::default().style(theme::base());
     frame.render_widget(background, area);
 
+    // Content frame's top border doubles as the header/content separator; the
+    // header claims a 4th row for the account gauge only when one renders.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(HEADER_HEIGHT),
+            Constraint::Length(header::header_height(app)),
             Constraint::Min(5),
             Constraint::Length(1),
         ])
