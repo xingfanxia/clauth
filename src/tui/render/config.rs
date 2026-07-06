@@ -85,6 +85,9 @@ struct Snap {
     /// Whether the profile holds stored OAuth credentials — drives the `Login`
     /// row's re-login vs first-login label and the `DeleteCreds` row's presence.
     logged_in: bool,
+    /// `+ new` form only: the draft holds a minted login awaiting `create
+    /// account` — flips the `Login` row to its `✓ logged in` state.
+    captured: bool,
     /// Recognised third-party provider display name, if any.
     provider: Option<&'static str>,
 }
@@ -106,6 +109,7 @@ impl Snap {
             auto_start: false,
             is_active: false,
             logged_in: false,
+            captured: false,
             provider: None,
         }
     }
@@ -121,7 +125,14 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
     };
     let cfg = app.config();
     if app.profile_cursor >= cfg.profiles.len() {
-        return Snap::blank("+ new account");
+        let mut snap = Snap::blank("+ new account");
+        // Mirror commit_new_account's consume rule: a typed base url flips the
+        // form to API mode and the mint will be discarded, so no stale ✓.
+        snap.captured = app
+            .config_draft
+            .as_ref()
+            .is_some_and(|d| d.captured_creds.is_some() && d.base_url.value.trim().is_empty());
+        return snap;
     }
     match cfg.profiles.get(app.profile_cursor) {
         Some(p) => Snap {
@@ -144,6 +155,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             auto_start: p.auto_start,
             logged_in: p.credentials.is_some(),
+            captured: false,
             provider: p.provider.map(|p| p.display_name()),
         },
         None => Snap::blank("settings"),
@@ -395,12 +407,18 @@ fn detail_row(
             Line::from(vec![arrow, Span::styled("create account", theme::accent())])
         }
         ConfigRow::Login => {
-            let label = if snap.logged_in {
-                "re-login"
+            // A draft-held mint renders the done state; ⏎ still re-runs the
+            // login and replaces the stash.
+            if snap.captured {
+                Line::from(vec![arrow, Span::styled("✓ logged in", theme::success())])
             } else {
-                "+ login"
-            };
-            Line::from(vec![arrow, Span::styled(label, theme::accent())])
+                let label = if snap.logged_in {
+                    "re-login"
+                } else {
+                    "+ login"
+                };
+                Line::from(vec![arrow, Span::styled(label, theme::accent())])
+            }
         }
         ConfigRow::DeleteCreds => Line::from(vec![
             arrow,

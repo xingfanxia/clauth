@@ -345,10 +345,34 @@ fn config_rows_login_hidden_when_draft_types_a_base_url() {
     );
 }
 
+/// Minted-credential fixture for the login tests.
+fn login_creds(refresh: &str) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    }
+}
+
+/// An in-flight login session fixture at the waiting stage.
+fn login_session(name: &str, is_new: bool, generation: u64) -> super::LoginSession {
+    super::LoginSession {
+        name: name.to_string(),
+        is_new,
+        generation,
+        url: None,
+        stage: super::LoginStage::WaitingBrowser,
+    }
+}
+
 #[test]
 fn drain_login_events_discards_a_superseded_result() {
-    use super::{LoginSession, drain_login_events};
-    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken};
+    use super::drain_login_events;
+    use crate::profile::{AppConfig, AppState};
     let _home = crate::testutil::HomeSandbox::new();
 
     let mut app = App::new(AppConfig {
@@ -359,22 +383,10 @@ fn drain_login_events_discards_a_superseded_result() {
     // The user superseded (or canceled) the first login: the live session now
     // carries generation 2, but a worker for generation 1 is still finishing.
     app.login_generation = 2;
-    app.login = Some(LoginSession {
-        name: "ghost".to_string(),
-        is_new: true,
-        generation: 2,
-        url: None,
-    });
-    let stale = ClaudeCredentials {
-        claude_ai_oauth: Some(OAuthToken {
-            access_token: "acc".to_string(),
-            refresh_token: Some("ref".to_string()),
-            expires_at: None,
-            scopes: None,
-            subscription_type: None,
-        }),
-    };
-    app.login_result_tx.send((1, Ok(stale))).unwrap();
+    app.login = Some(login_session("ghost", true, 2));
+    app.login_result_tx
+        .send((1, Ok(login_creds("ref"))))
+        .unwrap();
 
     drain_login_events(&mut app);
 
@@ -385,6 +397,313 @@ fn drain_login_events_discards_a_superseded_result() {
     assert!(
         app.login.is_some(),
         "the current (gen 2) session stays live; only the stale result is dropped"
+    );
+}
+
+#[test]
+fn login_result_on_the_new_form_stashes_into_the_draft() {
+    use super::{ConfigRow, Modal, build_draft_new, config_rows, drain_login_events};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.profile_cursor = 0; // == profile_count() → the `+ new` form
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("fresh");
+    app.config_draft = Some(draft);
+    app.login_generation = 1;
+    app.login = Some(login_session("fresh", true, 1));
+    app.modals.push(Modal::Login);
+    app.login_result_tx
+        .send((1, Ok(login_creds("ref"))))
+        .unwrap();
+
+    drain_login_events(&mut app);
+
+    assert!(
+        app.config().find("fresh").is_none(),
+        "capture-then-commit: no profile is persisted until create fires"
+    );
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.captured_creds.is_some()),
+        "the mint lands in the draft"
+    );
+    assert!(app.login.is_none(), "the session ends with the result");
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Login)),
+        "the progress modal closes with the result"
+    );
+    let rows = config_rows(&app);
+    assert_eq!(
+        rows.get(app.config_action_cursor),
+        Some(&ConfigRow::Create),
+        "the cursor lands on `create account`"
+    );
+}
+
+#[test]
+fn login_result_with_the_form_closed_is_dropped_with_a_warning() {
+    use super::{ToastKind, drain_login_events};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.config_draft = None; // form abandoned during the browser round-trip
+    app.login_generation = 1;
+    app.login = Some(login_session("fresh", true, 1));
+    app.login_result_tx
+        .send((1, Ok(login_creds("ref"))))
+        .unwrap();
+
+    drain_login_events(&mut app);
+
+    assert!(app.config().find("fresh").is_none());
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Warning && t.body.contains("no longer open")),
+        "dropping a real browser round-trip must be surfaced"
+    );
+}
+
+#[test]
+fn commit_new_account_consumes_the_draft_mint() {
+    use super::{build_draft_new, commit_new_account};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.profile_cursor = 0;
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("fresh");
+    draft.model = InputState::new("opus");
+    draft.captured_creds = Some(Box::new(login_creds("minted")));
+    app.config_draft = Some(draft);
+
+    commit_new_account(&mut app);
+
+    let cfg = app.config();
+    let profile = cfg
+        .find("fresh")
+        .expect("create account persists the profile");
+    assert_eq!(
+        profile.refresh_token(),
+        Some("minted"),
+        "the draft-held mint is saved with the profile"
+    );
+    assert_eq!(
+        profile.models.default.as_deref(),
+        Some("opus"),
+        "the model row folds into the same create"
+    );
+    assert_eq!(
+        cfg.state.active_profile.as_deref(),
+        Some("fresh"),
+        "the first profile links and activates like a capture"
+    );
+}
+
+#[test]
+fn login_stage_events_advance_the_session() {
+    use super::{LoginEvent, LoginStage, drain_login_events};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.login_generation = 1;
+    app.login = Some(login_session("fresh", true, 1));
+
+    app.login_event_tx
+        .send((1, LoginEvent::Url("https://example.test/auth".to_string())))
+        .unwrap();
+    app.login_event_tx
+        .send((1, LoginEvent::Stage(LoginStage::ExchangingCode)))
+        .unwrap();
+    // A stale generation's stage bump is ignored.
+    app.login_event_tx
+        .send((7, LoginEvent::Stage(LoginStage::Verifying)))
+        .unwrap();
+
+    drain_login_events(&mut app);
+
+    let session = app.login.as_ref().expect("session stays live");
+    assert_eq!(session.url.as_deref(), Some("https://example.test/auth"));
+    assert_eq!(session.stage, LoginStage::ExchangingCode);
+}
+
+#[test]
+fn login_modal_esc_collapses_without_canceling() {
+    use super::{KeyCode, Modal, handle_key, start_login};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.login_generation = 1;
+    app.login = Some(login_session("fresh", true, 1));
+    app.modals.push(Modal::Login);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "esc pops the modal");
+    assert!(
+        app.login.is_some(),
+        "the login keeps running while collapsed"
+    );
+    assert_eq!(
+        app.login_generation, 1,
+        "collapsing must not bump the generation"
+    );
+
+    // ⏎ on the login row while one is in flight re-expands instead of
+    // starting a second login.
+    start_login(&mut app, "other".to_string(), false);
+    assert!(
+        app.modals.iter().any(|m| matches!(m, Modal::Login)),
+        "a repeat login request reopens the progress modal"
+    );
+    assert_eq!(
+        app.login.as_ref().map(|s| s.name.as_str()),
+        Some("fresh"),
+        "the in-flight session is untouched"
+    );
+    app.modals.clear();
+
+    // Collapsed, top-level q cancels too (symmetric with esc) — it must not
+    // arm the 2-step quit or ascend out of a Setup form while a login runs.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('q')));
+    assert!(app.login.is_none(), "top-level q cancels the login");
+    assert!(!app.quit, "canceling a login must not quit the app");
+
+    // And esc is the equivalent cancel path.
+    app.login_generation = 2;
+    app.login = Some(login_session("fresh", true, 2));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.login.is_none(), "top-level esc cancels the login");
+}
+
+#[test]
+fn relogin_gate_maps_divergence_defaults() {
+    use super::{ConfirmAction, Modal, apply_login};
+    use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let profile_with = |refresh: &str| {
+        let mut p = Profile::new("work".to_string(), None, None);
+        p.credentials = Some(login_creds(refresh));
+        p
+    };
+
+    // Unset default (ask) → confirm modal, stored creds untouched.
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile_with("old")],
+    });
+    apply_login(
+        &mut app,
+        login_session("work", false, 1),
+        login_creds("new"),
+    );
+    assert!(
+        matches!(
+            app.modals.last(),
+            Some(Modal::Confirm(state))
+                if matches!(&state.on_confirm, ConfirmAction::CaptureOverwrite(_, name, false) if name == "work")
+        ),
+        "an unset divergence default must ask before overwriting"
+    );
+    assert_eq!(
+        app.config().find("work").and_then(|p| p.refresh_token()),
+        Some("old"),
+        "stored creds stay until the user confirms"
+    );
+    // Confirming actually lands the deferred overwrite.
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        unreachable!("asserted above");
+    };
+    super::run_confirm_action(&mut app, state.on_confirm);
+    assert_eq!(
+        app.config().find("work").and_then(|p| p.refresh_token()),
+        Some("new"),
+        "the confirmed re-login replaces the stored creds"
+    );
+
+    // NewProfile / Discard defaults also ask — only Overwrite applies silently.
+    for choice in [DivergenceChoice::NewProfile, DivergenceChoice::Discard] {
+        let mut app = App::new(AppConfig {
+            state: AppState {
+                default_divergence: Some(choice),
+                ..AppState::default()
+            },
+            profiles: vec![profile_with("old")],
+        });
+        apply_login(
+            &mut app,
+            login_session("work", false, 1),
+            login_creds("new"),
+        );
+        assert!(
+            matches!(app.modals.last(), Some(Modal::Confirm(_))),
+            "{choice:?} must gate the overwrite behind a confirm"
+        );
+    }
+
+    // Overwrite default → applied immediately, no modal.
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            default_divergence: Some(DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+        profiles: vec![profile_with("old")],
+    });
+    apply_login(
+        &mut app,
+        login_session("work", false, 1),
+        login_creds("new"),
+    );
+    assert!(
+        app.modals.is_empty(),
+        "an Overwrite default applies silently"
+    );
+    assert_eq!(
+        app.config().find("work").and_then(|p| p.refresh_token()),
+        Some("new"),
+        "the re-login replaced the stored creds"
+    );
+
+    // Credential-less profile: nothing diverges → silent apply even when unset.
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new("work".to_string(), None, None)],
+    });
+    apply_login(
+        &mut app,
+        login_session("work", false, 1),
+        login_creds("new"),
+    );
+    assert!(
+        app.modals.is_empty(),
+        "no stored creds means no divergence to gate on"
+    );
+    assert_eq!(
+        app.config().find("work").and_then(|p| p.refresh_token()),
+        Some("new"),
+        "the first login adopts silently"
     );
 }
 

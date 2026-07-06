@@ -175,8 +175,12 @@ fn cmd_login(name: &str, model: Option<&str>) -> Result<()> {
     actions::validate_profile_name(name, &config.names(), None)?;
 
     println!("clauth: opening a browser to log in to a new account for '{name}'…");
-    let credentials = oauth_login::login_with(|url| {
-        println!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
+    let credentials = oauth_login::login_with(|progress| {
+        // The CLI surfaces only the paste-fallback URL; the later milestones
+        // are TUI-modal fodder and would just be noise between the prints here.
+        if let oauth_login::LoginProgress::AuthorizeUrl(url) = progress {
+            println!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
+        }
     })?;
 
     println!(

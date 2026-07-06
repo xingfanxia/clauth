@@ -1,4 +1,6 @@
-//! Interactive browser OAuth login for a fresh Claude Code account.
+//! Interactive browser OAuth login for a fresh Claude Code account, shared by
+//! the `clauth login` CLI and the TUI Setup tab (login / re-login rows). Both
+//! observe the flow through [`LoginProgress`] callbacks.
 //!
 //! Reproduces the Claude Code `/login` PKCE + RFC 8252 loopback flow so a new
 //! profile can be populated from a real login instead of a snapshot. Ground truth
@@ -154,11 +156,77 @@ fn request_target(request_line: &str) -> Option<&str> {
     parts.next()
 }
 
-/// Write a tiny HTML response and close.
-fn write_response(mut stream: &TcpStream, status: &str, body: &str) {
+/// Progress milestones reported through `login_with`'s callback. The CLI
+/// prints the authorize URL; the TUI login modal also renders the later
+/// milestones as a live stage line.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LoginProgress<'a> {
+    /// The authorize URL is built, just before the browser opens — surfaced so
+    /// the flow is observable and the URL can be pasted if the open fails.
+    AuthorizeUrl(&'a str),
+    /// The loopback callback landed; exchanging the code for tokens.
+    ExchangingCode,
+    /// Tokens minted; probing the plan tier to confirm they work.
+    Verifying,
+}
+
+/// Visual tone of a callback page — picks the card's accent color.
+enum Tone {
+    Success,
+    Warning,
+    Danger,
+}
+
+impl Tone {
+    /// `(dark, light)` accent hex pair (Mocha / Latte semantic colors).
+    fn hex(&self) -> (&'static str, &'static str) {
+        match self {
+            Tone::Success => ("#A6E3A1", "#40A02B"),
+            Tone::Warning => ("#F9E2AF", "#DF8E1D"),
+            Tone::Danger => ("#F38BA8", "#D20F39"),
+        }
+    }
+}
+
+/// One browser-facing callback page. Copy is always static — OAuth error
+/// strings from the query are untrusted input and are never reflected into
+/// the HTML (they go to the terminal error only).
+struct Page {
+    tone: Tone,
+    title: &'static str,
+    detail: &'static str,
+    /// Try `window.close()` after paint. Browsers often refuse to close a tab
+    /// a script didn't open, so the copy always covers closing it by hand.
+    auto_close: bool,
+}
+
+/// Write a small self-contained styled page and close. Dark by default with a
+/// light-scheme override; everything is inline, so the page makes no requests.
+fn write_response(mut stream: &TcpStream, status: &str, page: Page) {
+    let (tone, tone_light) = page.tone.hex();
+    let script = if page.auto_close {
+        // Let the page paint before trying to close; refusal is expected.
+        "<script>setTimeout(function(){window.close()},900)</script>"
+    } else {
+        ""
+    };
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>clauth</title></head>\
-         <body style=\"font-family:system-ui;padding:2rem\"><p>{body}</p></body></html>"
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>clauth</title><style>\
+         :root{{--bg:#1E1E2E;--raised:#181825;--line:#313244;--text:#CDD6F4;--dim:#A6ADC8;--faint:#7F849C;--tone:{tone}}}\
+         @media(prefers-color-scheme:light){{:root{{--bg:#EFF1F5;--raised:#FFFFFF;--line:#CCD0DA;--text:#1E1E2E;--dim:#6C6F85;--faint:#9CA0B0;--tone:{tone_light}}}}}\
+         *{{box-sizing:border-box;margin:0;padding:0}}\
+         body{{font-family:Onest,ui-sans-serif,system-ui,\"Segoe UI\",sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}}\
+         main{{background:var(--raised);border:1px solid var(--line);border-left:3px solid var(--tone);border-radius:1px;padding:32px 40px;max-width:440px}}\
+         .eyebrow{{font-size:11px;font-weight:450;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);margin-bottom:12px}}\
+         h1{{font-size:22px;font-weight:550;letter-spacing:-.01em;margin-bottom:8px}}\
+         p{{font-size:14px;line-height:1.55;color:var(--dim)}}\
+         </style></head><body><main>\
+         <div class=\"eyebrow\">clauth</div><h1>{title}</h1><p>{detail}</p>\
+         </main>{script}</body></html>",
+        title = page.title,
+        detail = page.detail,
     );
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
@@ -187,35 +255,95 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
     }
 
     let Some(target) = request_target(&request_line) else {
-        write_response(&stream, "400 Bad Request", "Bad request.");
+        write_response(
+            &stream,
+            "400 Bad Request",
+            Page {
+                tone: Tone::Danger,
+                title: "That request didn't parse",
+                detail: "clauth expected an OAuth callback here. Close this tab and retry \
+                         the login from clauth.",
+                auto_close: false,
+            },
+        );
         return Ok(None);
     };
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if path != "/callback" {
-        write_response(&stream, "404 Not Found", "Not found.");
+        write_response(
+            &stream,
+            "404 Not Found",
+            Page {
+                tone: Tone::Warning,
+                title: "Nothing at this address",
+                detail: "The sign-in callback arrives at /callback on its own. \
+                         You can close this tab.",
+                auto_close: false,
+            },
+        );
         return Ok(None);
     }
     if let Some(err) = query_param(query, "error") {
         let desc = query_param(query, "error_description").unwrap_or_default();
-        write_response(
-            &stream,
-            "400 Bad Request",
-            "Login failed — you can close this tab.",
-        );
+        // A user-declined consent screen reads differently from a broken flow.
+        let page = if err == "access_denied" {
+            Page {
+                tone: Tone::Warning,
+                title: "Sign-in canceled",
+                detail: "You declined the authorization request, so no login was \
+                         captured. Close this tab; you can retry from clauth any time.",
+                auto_close: false,
+            }
+        } else {
+            Page {
+                tone: Tone::Danger,
+                title: "Sign-in failed",
+                detail: "Claude reported an error during authorization. Close this \
+                         tab and retry the login from clauth.",
+                auto_close: false,
+            }
+        };
+        write_response(&stream, "400 Bad Request", page);
         anyhow::bail!("authorization failed: {err} {desc}");
     }
     let Some(code) = query_param(query, "code") else {
-        write_response(&stream, "400 Bad Request", "Missing authorization code.");
+        write_response(
+            &stream,
+            "400 Bad Request",
+            Page {
+                tone: Tone::Danger,
+                title: "No code in the callback",
+                detail: "The redirect arrived without an authorization code. Close \
+                         this tab; clauth is still waiting for the real callback.",
+                auto_close: false,
+            },
+        );
         return Ok(None);
     };
     if query_param(query, "state").as_deref() != Some(expected_state) {
-        write_response(&stream, "400 Bad Request", "State mismatch — aborting.");
+        write_response(
+            &stream,
+            "400 Bad Request",
+            Page {
+                tone: Tone::Danger,
+                title: "Sign-in blocked",
+                detail: "This callback didn't match the login clauth started, so it \
+                         was rejected for safety. Retry the login from clauth.",
+                auto_close: false,
+            },
+        );
         anyhow::bail!("OAuth state mismatch — possible CSRF; login aborted");
     }
     write_response(
         &stream,
         "200 OK",
-        "Login complete — you can close this tab and return to clauth.",
+        Page {
+            tone: Tone::Success,
+            title: "You're signed in",
+            detail: "clauth captured the login. This tab will try to close itself; \
+                     if it sticks around, close it and head back to the terminal.",
+            auto_close: true,
+        },
     );
     Ok(Some(code))
 }
@@ -270,12 +398,13 @@ fn credentials_from_token(token: crate::oauth::TokenResponse) -> ClaudeCredentia
 
 /// Run the full interactive login: open the browser, catch the loopback
 /// redirect, exchange the code, and return a completed `ClaudeCredentials`.
-/// `announce` is called with the authorize URL just before opening the browser —
-/// the `clauth login` CLI prints it so the flow is observable and the URL can be
-/// pasted if the browser doesn't open. Opening the browser is best-effort: on
+/// `progress` receives [`LoginProgress`] milestones — the `AuthorizeUrl` event
+/// fires just before opening the browser (the CLI prints it so the flow is
+/// observable and the URL can be pasted if the browser doesn't open; the TUI
+/// also renders the later stages). Opening the browser is best-effort: on
 /// failure the announced URL is the fallback and the listener still waits.
 /// Blocks the caller for the browser round-trip (up to [`LOGIN_TIMEOUT_SECS`]).
-pub(crate) fn login_with(announce: impl Fn(&str)) -> Result<ClaudeCredentials> {
+pub(crate) fn login_with(progress: impl Fn(LoginProgress<'_>)) -> Result<ClaudeCredentials> {
     let (verifier, challenge) = new_pkce()?;
     let state = random_b64url(32)?;
 
@@ -285,14 +414,16 @@ pub(crate) fn login_with(announce: impl Fn(&str)) -> Result<ClaudeCredentials> {
     let redirect_uri = format!("http://localhost:{port}/callback");
     let url = authorize_url(&redirect_uri, &challenge, &state);
 
-    announce(&url);
+    progress(LoginProgress::AuthorizeUrl(&url));
     let _ = crate::platform::open_url(&url);
 
     let deadline = Instant::now() + Duration::from_secs(LOGIN_TIMEOUT_SECS);
     let code = wait_for_code(&listener, &state, deadline)?;
+    progress(LoginProgress::ExchangingCode);
     let token = crate::oauth::exchange_code(&code, &verifier, &redirect_uri, &state)?;
     let mut creds = credentials_from_token(token);
 
+    progress(LoginProgress::Verifying);
     // Confirm the minted token works against the API and stamp the real plan tier,
     // so the captured profile shows e.g. "Claude Max" immediately instead of the
     // unknown-tier "Pro" fallback. Best-effort: a probe failure never fails the

@@ -11,9 +11,10 @@ use crate::profile::DivergenceChoice;
 
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceForm, EnvCollisionChoice,
-    EnvCollisionForm, InputState, Modal, Tab,
+    EnvCollisionForm, InputState, LoginStage, Modal, Tab,
 };
 use super::super::theme;
+use super::format::spinner_frame;
 use super::panes::{bold_when, head_cols};
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
@@ -24,7 +25,59 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::Help => draw_help(frame, area, app),
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
         Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
+        Modal::Login => draw_login_progress(frame, area, app),
     }
+}
+
+/// In-flight login progress. Renders live from `App::login` (the URL and the
+/// stage land async), so the modal variant carries no state of its own. The
+/// authorize URL must stay copyable as the paste fallback, so it wraps into
+/// fixed-width chunks instead of truncating.
+fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(session) = app.login.as_ref() else {
+        return; // login ended this frame; the modal pops on the next drain
+    };
+    let stage = match session.stage {
+        LoginStage::WaitingBrowser => "waiting for the browser sign-in",
+        LoginStage::ExchangingCode => "exchanging the code for tokens",
+        LoginStage::Verifying => "verifying the minted token",
+    };
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled(
+            format!("logging in '{}'", session.name),
+            theme::body(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", spinner_frame(app.tick_count)),
+                theme::accent(),
+            ),
+            Span::styled(stage, theme::dim()),
+        ]),
+        Line::from(""),
+    ];
+    match &session.url {
+        Some(url) => {
+            lines.push(Line::from(Span::styled(
+                "if no browser opened, use this url:",
+                theme::dim(),
+            )));
+            const URL_CHUNK: usize = 64;
+            let chars: Vec<char> = url.chars().collect();
+            for chunk in chars.chunks(URL_CHUNK) {
+                lines.push(Line::from(Span::styled(
+                    chunk.iter().collect::<String>(),
+                    theme::dim(),
+                )));
+            }
+        }
+        None => lines.push(Line::from(Span::styled(
+            "opening your browser…",
+            theme::dim(),
+        ))),
+    }
+    draw_modal(frame, area, "LOGIN", lines);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {

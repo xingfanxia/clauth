@@ -526,6 +526,36 @@ pub(crate) fn capture_into_profile(
     })
 }
 
+/// Create a fresh OAuth profile from an in-memory minted login — the Setup
+/// tab's capture-then-commit path (`create account` consuming the draft-held
+/// mint). One save carries credentials + model so a failed write never leaves
+/// a half-configured profile behind; the first profile links + activates
+/// exactly like [`capture_into_profile`].
+pub(crate) fn create_profile_from_login(
+    config: &mut AppConfig,
+    name: String,
+    model: Option<String>,
+    credentials: ClaudeCredentials,
+) -> Result<()> {
+    with_state_lock(|| {
+        let mut profile = Profile::new(name.clone(), None, None);
+        profile.models.default = model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        profile.credentials = Some(credentials);
+        save_profile(&profile)?;
+        config.add(profile);
+
+        if config.state.active_profile.is_none() {
+            link_profile_credentials(&name)?;
+            config.state.active_profile = Some(name.into());
+        }
+        save_app_state(&config.state)
+    })
+}
+
 /// Capture-name collision (issue #7): replace an EXISTING profile's credential
 /// set with the freshly captured snapshot, mutating it in place. Never
 /// delete+append — that would duplicate the name and desync `state.profiles`

@@ -12,6 +12,7 @@ use super::super::app::{
     has_sub_focus,
 };
 use super::super::theme;
+use super::format::spinner_frame;
 
 const TAB_NAV: (&str, &str) = ("←→", "tabs");
 
@@ -23,7 +24,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // A login in flight owns the footer, independent of `footer_alert` so key
     // handling that clears alerts can't hide it.
     if let Some(session) = &app.login {
-        draw_login(frame, area, session);
+        // Any open modal owns esc/q (the login modal collapses, others handle
+        // their own keys), so the hint flips to `q back` for the whole stack.
+        let modal_open = !app.modals.is_empty();
+        draw_login(frame, area, session, modal_open, app.tick_count);
         return;
     }
 
@@ -265,12 +269,24 @@ fn draw_alert(frame: &mut Frame<'_>, area: Rect, alert: &FooterAlert) {
 }
 
 /// Login-in-progress line. Independent of `footer_alert` so key handling that
-/// clears alerts never hides it. The authorize URL isn't shown — too long for
-/// one footer row; a login modal that wraps it is the upgrade path if
-/// browser-open failures ever need the paste-fallback surfaced here.
-fn draw_login(frame: &mut Frame<'_>, area: Rect, session: &LoginSession) {
+/// clears alerts never hides it. The authorize URL and live stage render in
+/// the login modal; this row is the collapsed view. The trailing hint tracks
+/// what esc/q actually do this frame: with any modal open they go to the
+/// modal (`q back`); collapsed, both cancel the login (`esc cancel`).
+fn draw_login(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    session: &LoginSession,
+    modal_open: bool,
+    tick: u64,
+) {
+    let (key, action) = if modal_open {
+        ("   q ", "back")
+    } else {
+        ("   esc ", "cancel")
+    };
     let spans = vec![
-        Span::styled("⟳ ", theme::accent()),
+        Span::styled(format!("{} ", spinner_frame(tick)), theme::accent()),
         Span::styled(
             format!(
                 "logging in '{}' — complete it in your browser",
@@ -278,8 +294,8 @@ fn draw_login(frame: &mut Frame<'_>, area: Rect, session: &LoginSession) {
             ),
             theme::dim(),
         ),
-        Span::styled("   esc ", theme::accent().add_modifier(Modifier::BOLD)),
-        Span::styled("cancel", theme::dim()),
+        Span::styled(key, theme::accent().add_modifier(Modifier::BOLD)),
+        Span::styled(action, theme::dim()),
     ];
     frame.render_widget(
         Paragraph::new(Line::from(spans))

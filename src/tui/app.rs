@@ -23,9 +23,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{
     CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
-    clear_profile_credentials, create_blank_profile, delete_profile, edit_profile_endpoint,
-    edit_profile_env, edit_profile_model, find_matching_oauth_profile, overwrite_captured_profile,
-    rename_profile, reorder_profile, switch_off, switch_profile, validate_profile_name,
+    clear_profile_credentials, create_blank_profile, create_profile_from_login, delete_profile,
+    edit_profile_endpoint, edit_profile_env, edit_profile_model, find_matching_oauth_profile,
+    overwrite_captured_profile, rename_profile, reorder_profile, switch_off, switch_profile,
+    validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -274,6 +275,10 @@ pub(crate) struct ConfigDraft {
     /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
     /// collapsed (set overrides still render; unset ones hide behind the chip).
     pub(crate) overrides_expanded: bool,
+    /// Minted credentials from a `+ new`-form browser login, held in memory
+    /// until `create account` consumes them (capture-then-commit). Dropped
+    /// with the draft; never set on an existing account's draft.
+    pub(crate) captured_creds: Option<Box<crate::profile::ClaudeCredentials>>,
 }
 
 impl ConfigDraft {
@@ -585,6 +590,9 @@ pub(crate) enum Modal {
     ActionMenu(ActionMenuState),
     /// Custom env key collides with an existing source; overwrite/keep/cancel.
     EnvCollision(EnvCollisionForm),
+    /// In-flight browser login progress; renders live from [`App::login`].
+    /// esc/q collapse it to the footer indicator — the login keeps running.
+    Login,
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -962,12 +970,32 @@ pub(crate) enum MainItemKind {
 /// superseded (esc-cancel or a fresh login start).
 pub(crate) struct LoginSession {
     pub(crate) name: String,
-    /// true → create a new profile from the mint (capture); false → re-login an
-    /// existing profile in place (overwrite).
+    /// true → the mint lands in the `+ new` draft (capture-then-commit);
+    /// false → re-login an existing profile in place (overwrite).
     pub(crate) is_new: bool,
     pub(crate) generation: u64,
-    /// The authorize URL once the worker announces it; shown in the footer.
+    /// The authorize URL once the worker announces it; shown in the login modal.
     pub(crate) url: Option<String>,
+    /// Live milestone for the modal's stage line.
+    pub(crate) stage: LoginStage,
+}
+
+/// Where an in-flight login currently sits, mapped from
+/// [`crate::oauth_login::LoginProgress`] worker events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginStage {
+    /// Waiting for the user to finish the browser round-trip.
+    WaitingBrowser,
+    /// Callback landed; exchanging the code for tokens.
+    ExchangingCode,
+    /// Tokens minted; verifying them against the API.
+    Verifying,
+}
+
+/// Worker→UI login channel payload: the announced URL or a stage bump.
+pub(crate) enum LoginEvent {
+    Url(String),
+    Stage(LoginStage),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -1048,8 +1076,8 @@ pub(crate) struct App {
     /// Monotonic login id; bumped on each start so a superseded worker's result
     /// is discarded when it lands.
     pub(crate) login_generation: u64,
-    pub(crate) login_url_rx: std::sync::mpsc::Receiver<(u64, String)>,
-    pub(crate) login_url_tx: std::sync::mpsc::Sender<(u64, String)>,
+    pub(crate) login_event_rx: std::sync::mpsc::Receiver<(u64, LoginEvent)>,
+    pub(crate) login_event_tx: std::sync::mpsc::Sender<(u64, LoginEvent)>,
     pub(crate) login_result_rx: std::sync::mpsc::Receiver<(
         u64,
         std::result::Result<crate::profile::ClaudeCredentials, String>,
@@ -1279,7 +1307,7 @@ impl App {
             crate::pricing::spawn(pricing_sender, pricing_refresh_rx);
         }
 
-        let (login_url_tx, login_url_rx) = std::sync::mpsc::channel();
+        let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
 
         Self {
@@ -1320,8 +1348,8 @@ impl App {
             update_handle,
             login: None,
             login_generation: 0,
-            login_url_rx,
-            login_url_tx,
+            login_event_rx,
+            login_event_tx,
             login_result_rx,
             login_result_tx,
             status: StatusState::default(),
@@ -1971,14 +1999,6 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Esc abandons an in-flight login (the detached worker's result is discarded
-    // by the generation guard).
-    if app.login.is_some() && key.code == KeyCode::Esc && app.modals.is_empty() {
-        app.login = None;
-        app.toast(ToastKind::Info, "login canceled");
-        return;
-    }
-
     // Config text field capturing keystrokes owns keyboard (like a modal)
     // so typing into a name can't fire global shortcuts.
     if app.tab == Tab::Setup
@@ -2004,6 +2024,18 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     // Same for the Config-tab refresh-interval custom-value editor.
     if app.tab == Tab::Config && app.refresh_interval_draft.is_some() {
         handle_refresh_interval_edit_key(app, key);
+        return;
+    }
+
+    // Esc/q abandon an in-flight login (the detached worker's result is
+    // discarded by the generation guard). Catching q here keeps it symmetric
+    // with esc — otherwise q would ascend out of the Setup form (orphaning the
+    // draft that receives the mint) or silently arm the 2-step quit under a
+    // footer whose login line never yields to the armed alert. Sits BELOW the
+    // editor captures so typing a literal `q` into a field can't cancel.
+    if app.login.is_some() && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.login = None;
+        app.toast(ToastKind::Info, "login canceled");
         return;
     }
 
@@ -2089,8 +2121,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.disarm_quit();
             if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
-                app.config_focus = ConfigFocus::Profiles;
-                app.config_draft = None;
+                leave_config_detail(app);
             } else if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
                 leave_fallback_detail(app);
             } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
@@ -2109,8 +2140,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             if has_sub_focus(app) {
                 app.disarm_quit();
                 if app.tab == Tab::Setup {
-                    app.config_focus = ConfigFocus::Profiles;
-                    app.config_draft = None;
+                    leave_config_detail(app);
                 } else if app.tab == Tab::Fallback {
                     leave_fallback_detail(app);
                 } else if app.tab == Tab::Tokens {
@@ -3742,6 +3772,14 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
+        Modal::Login => {
+            // Collapse to the footer indicator; the login keeps running (the
+            // generation is untouched). A real cancel is the top-level esc
+            // once collapsed; ⏎ on the login row re-expands.
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                app.modals.pop();
+            }
+        }
     }
 }
 
@@ -4207,6 +4245,7 @@ fn build_draft_new() -> ConfigDraft {
         active: None,
         armed_delete: false,
         overrides_expanded: false,
+        captured_creds: None,
     }
 }
 
@@ -4229,6 +4268,25 @@ fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
         active: None,
         armed_delete: false,
         overrides_expanded: false,
+        captured_creds: None,
+    }
+}
+
+/// Back out of the Setup detail pane, dropping the draft. A `+ new` draft
+/// holding a minted login loses it with the form — say so instead of
+/// discarding a real browser round-trip silently.
+fn leave_config_detail(app: &mut App) {
+    let mint_dropped = app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.editing_name.is_none() && d.captured_creds.is_some());
+    app.config_focus = ConfigFocus::Profiles;
+    app.config_draft = None;
+    if mint_dropped {
+        app.toast(
+            ToastKind::Warning,
+            "the captured login was dropped with the form",
+        );
     }
 }
 
@@ -4335,34 +4393,59 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
     }
 }
 
-/// Kick a browser OAuth login on a worker. `is_new` → the profile is created
-/// from the mint when it lands; else an existing profile is overwritten. Refuses
-/// a second concurrent login.
+/// Kick a browser OAuth login on a worker. `is_new` → the mint lands in the
+/// `+ new` draft when it arrives; else an existing profile is overwritten
+/// (divergence-gated in `apply_login`). A second ⏎ while one is in flight
+/// re-expands the progress modal instead of starting another login.
 fn start_login(app: &mut App, name: String, is_new: bool) {
-    if app.login.is_some() {
-        app.toast(ToastKind::Warning, "a login is already in progress");
+    if let Some(session) = app.login.as_ref() {
+        // A ⏎ aimed at a different account can't start a second login — say
+        // so instead of silently re-showing the in-flight session's modal.
+        if session.name != name || session.is_new != is_new {
+            app.toast(
+                ToastKind::Warning,
+                format!("a login for '{}' is already in progress", session.name),
+            );
+        }
+        open_login_modal(app);
         return;
     }
     app.login_generation += 1;
     let generation = app.login_generation;
     app.login = Some(LoginSession {
-        name: name.clone(),
+        name,
         is_new,
         generation,
         url: None,
+        stage: LoginStage::WaitingBrowser,
     });
-    let url_tx = app.login_url_tx.clone();
+    let event_tx = app.login_event_tx.clone();
     let result_tx = app.login_result_tx.clone();
     spawn_worker(move || {
-        let res = crate::oauth_login::login_with(|url| {
-            let _ = url_tx.send((generation, url.to_string()));
+        let res = crate::oauth_login::login_with(|progress| {
+            use crate::oauth_login::LoginProgress;
+            let event = match progress {
+                LoginProgress::AuthorizeUrl(url) => LoginEvent::Url(url.to_string()),
+                LoginProgress::ExchangingCode => LoginEvent::Stage(LoginStage::ExchangingCode),
+                LoginProgress::Verifying => LoginEvent::Stage(LoginStage::Verifying),
+            };
+            let _ = event_tx.send((generation, event));
         });
         let _ = result_tx.send((generation, res.map_err(|e| e.to_string())));
     });
-    app.toast(
-        ToastKind::Info,
-        format!("opening a browser to log in '{name}'"),
-    );
+    open_login_modal(app);
+}
+
+/// Show the login progress modal (no-op when already open).
+fn open_login_modal(app: &mut App) {
+    if !app.modals.iter().any(|m| matches!(m, Modal::Login)) {
+        app.modals.push(Modal::Login);
+    }
+}
+
+/// Drop the login progress modal (login finished, failed, or was canceled).
+fn close_login_modal(app: &mut App) {
+    app.modals.retain(|m| !matches!(m, Modal::Login));
 }
 
 /// Arm the delete row (first ⏎).
@@ -4987,6 +5070,14 @@ fn commit_new_account(app: &mut App) {
     let base_url = d.base_url.trimmed_some();
     let api_key = d.api_key.trimmed_some();
     let model = d.model.trimmed_some();
+    // A draft-held mint only makes sense for an OAuth create; a typed base url
+    // flipped the form to API mode (login row hidden), so the mint is dropped.
+    let captured = if base_url.is_none() {
+        d.captured_creds.clone()
+    } else {
+        None
+    };
+    let mint_discarded = base_url.is_some() && d.captured_creds.is_some();
     let validation = {
         let cfg = app.config();
         validate_profile_name(&name, &cfg.names(), None)
@@ -4998,10 +5089,19 @@ fn commit_new_account(app: &mut App) {
     let api_key = if base_url.is_some() { api_key } else { None };
     let result = {
         let mut cfg = app.config();
-        create_blank_profile(&mut cfg, name.clone(), base_url, api_key, model)
+        match captured {
+            Some(creds) => create_profile_from_login(&mut cfg, name.clone(), model, *creds),
+            None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, model),
+        }
     };
     match result {
         Ok(()) => {
+            if mint_discarded {
+                app.toast(
+                    ToastKind::Info,
+                    "base url set · the captured oauth login was discarded",
+                );
+            }
             app.refresh_tokens();
             app.last_state_mtime = app_state_mtime();
             let new_idx = app
@@ -5568,14 +5668,17 @@ fn drain_pricing_events(app: &mut App) {
     }
 }
 
-/// Drain the login worker: stash the announced URL, and on a result apply it
-/// (create or overwrite) — discarding a stale result from a superseded login.
+/// Drain the login worker: track URL/stage events, and on a result apply it
+/// (stash or overwrite) — discarding a stale result from a superseded login.
 fn drain_login_events(app: &mut App) {
-    while let Ok((generation, url)) = app.login_url_rx.try_recv() {
+    while let Ok((generation, event)) = app.login_event_rx.try_recv() {
         if let Some(session) = app.login.as_mut()
             && session.generation == generation
         {
-            session.url = Some(url);
+            match event {
+                LoginEvent::Url(url) => session.url = Some(url),
+                LoginEvent::Stage(stage) => session.stage = stage,
+            }
         }
     }
     while let Ok((generation, result)) = app.login_result_rx.try_recv() {
@@ -5585,6 +5688,7 @@ fn drain_login_events(app: &mut App) {
         let Some(session) = app.login.take() else {
             continue;
         };
+        close_login_modal(app);
         match result {
             Ok(creds) => apply_login(app, session, creds),
             Err(e) => app.toast(
@@ -5595,30 +5699,87 @@ fn drain_login_events(app: &mut App) {
     }
 }
 
-/// Fold a completed login into the profile store on the UI thread. Re-validates
-/// name uniqueness / existence at apply time — the store may have changed during
-/// the browser round-trip.
+/// Fold a completed login into the app on the UI thread. A new-account login
+/// stashes the mint into the live `+ new` draft — the profile is created only
+/// when `create account` fires (capture-then-commit). A re-login re-checks
+/// existence at apply time and, since fresh creds replacing stored ones IS a
+/// divergence, gates the overwrite on `AppState.default_divergence`: only an
+/// `Overwrite` default applies silently; anything else asks first.
 fn apply_login(app: &mut App, session: LoginSession, creds: crate::profile::ClaudeCredentials) {
+    if session.is_new {
+        // The `+ new` form may have been closed during the browser round-trip;
+        // the mint lives only in the draft, so without one it is dropped.
+        let stashed = match app
+            .config_draft
+            .as_mut()
+            .filter(|d| d.editing_name.is_none())
+        {
+            Some(draft) => {
+                draft.captured_creds = Some(Box::new(creds));
+                true
+            }
+            None => false,
+        };
+        if stashed {
+            // Land the cursor on `create account`, the one step left.
+            if let Some(idx) = config_rows(app)
+                .iter()
+                .position(|r| *r == ConfigRow::Create)
+            {
+                app.config_action_cursor = idx;
+            }
+            app.toast(ToastKind::Success, "logged in · create account saves it");
+        } else {
+            app.toast(
+                ToastKind::Warning,
+                "login finished but the new-account form is no longer open · log in again",
+            );
+        }
+        return;
+    }
+
+    let (exists, has_creds) = {
+        let cfg = app.config();
+        let profile = cfg.find(&session.name);
+        (
+            profile.is_some(),
+            profile.and_then(|p| p.credentials.as_ref()).is_some(),
+        )
+    };
+    if !exists {
+        app.toast(
+            ToastKind::Danger,
+            format!("login failed: profile '{}' no longer exists", session.name),
+        );
+        return;
+    }
     let snapshot = CaptureSnapshot {
         credentials: Some(creds),
         base_url: None,
         api_key: None,
     };
+    // No stored creds → nothing diverges; adopt silently (mirrors the
+    // first-login adopt in `poll_credentials_divergence`).
+    let apply_now = !has_creds
+        || matches!(
+            app.config().state.default_divergence,
+            Some(DivergenceChoice::Overwrite)
+        );
+    if !apply_now {
+        app.modals.push(Modal::Confirm(ConfirmState {
+            message: format!("Replace the stored credentials for '{}'?", session.name),
+            detail: Some(
+                "A fresh browser login finished for this account. The old tokens are dropped; chain slot, env, and model settings stay."
+                    .to_string(),
+            ),
+            choice: false,
+            on_confirm: ConfirmAction::CaptureOverwrite(Box::new(snapshot), session.name, false),
+        }));
+        return;
+    }
     let result = {
         let mut cfg = app.config();
-        if session.is_new {
-            match validate_profile_name(&session.name, &cfg.names(), None) {
-                Ok(()) => capture_into_profile(&mut cfg, session.name.clone(), snapshot),
-                Err(e) => Err(e),
-            }
-        } else if cfg.find(&session.name).is_some() {
-            overwrite_captured_profile(&mut cfg, &session.name, snapshot)
-        } else {
-            Err(anyhow::anyhow!(
-                "profile '{}' no longer exists",
-                session.name
-            ))
-        }
+        overwrite_captured_profile(&mut cfg, &session.name, snapshot)
     };
     match result {
         Ok(()) => {
