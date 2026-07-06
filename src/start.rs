@@ -5,6 +5,7 @@
 use std::process::{Command, ExitStatus};
 #[cfg(unix)]
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+#[cfg(unix)]
 use std::thread::JoinHandle;
 #[cfg(unix)]
 use std::time::Duration;
