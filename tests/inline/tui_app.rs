@@ -937,6 +937,42 @@ fn fallback_last_resort_toggle_persists_and_refreshes_tokens() {
     );
 }
 
+// The chain has one parking spot: marking a member clears the mark everywhere
+// else (radio), so two accounts can never both read `last resort ─●`.
+#[test]
+fn fallback_last_resort_is_exclusive_across_the_chain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut b = crate::testutil::blank_profile("b");
+    b.last_resort = true;
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a"), b]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0; // member "a"
+    app.fallback_detail_cursor = 1; // FALLBACK_ROWS[1] == LastResort
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+
+    assert_eq!(
+        app.config().find("a").map(|p| p.last_resort),
+        Some(true),
+        "space marks the selected member"
+    );
+    assert_eq!(
+        app.config().find("b").map(|p| p.last_resort),
+        Some(false),
+        "marking one member clears the previous last resort"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("moved from 'b'")),
+        "the move away from the old member is surfaced"
+    );
+
+    // Turning the mark OFF touches nobody else.
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(app.config().find("a").map(|p| p.last_resort), Some(false));
+    assert_eq!(app.config().find("b").map(|p| p.last_resort), Some(false));
+}
+
 // ── capture guard ─────────────────────────────────────────────────────────────
 
 // An empty snapshot (no creds file, no endpoint config — the macOS-keychain

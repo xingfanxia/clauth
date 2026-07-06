@@ -3494,6 +3494,11 @@ fn adjust_threshold(app: &mut App, delta: f64) {
 }
 
 /// ⏎/space on the `last resort` row: flip `Profile::last_resort` and persist.
+/// The chain has ONE parking spot, so turning the mark on here clears it on
+/// every other profile (radio). The target saves first (the user's intent);
+/// each cleared profile then saves on its own, and a failed clear reverts only
+/// that profile — the chain walk tolerates a transiently double-marked chain
+/// (first marked member after the active wins), so nothing lies about disk.
 /// The `refresh_tokens()` kick is not load-bearing here (the chain snapshot
 /// reads the shared config directly, unlike `auto_start` which lives in the
 /// `TokenList`); it's kept so every per-profile toggle path re-derives the
@@ -3501,7 +3506,7 @@ fn adjust_threshold(app: &mut App, delta: f64) {
 fn toggle_last_resort(app: &mut App) {
     enum Outcome {
         Missing,
-        Saved,
+        Saved { moved_from: Option<String> },
         SaveFailed(anyhow::Error),
     }
     let Some(pos) = selected_chain_member(app) else {
@@ -3518,7 +3523,25 @@ fn toggle_last_resort(app: &mut App) {
                 profile.last_resort = !profile.last_resort;
                 let now_on = profile.last_resort;
                 match save_profile(profile) {
-                    Ok(()) => Outcome::Saved,
+                    Ok(()) => {
+                        let mut moved_from = None;
+                        if now_on {
+                            for p in cfg
+                                .profiles
+                                .iter_mut()
+                                .filter(|p| p.last_resort && p.name != name)
+                            {
+                                p.last_resort = false;
+                                match save_profile(p) {
+                                    Ok(()) => {
+                                        moved_from.get_or_insert_with(|| p.name.to_string());
+                                    }
+                                    Err(_) => p.last_resort = true,
+                                }
+                            }
+                        }
+                        Outcome::Saved { moved_from }
+                    }
                     Err(e) => {
                         if let Some(p) = cfg.find_mut(&name) {
                             p.last_resort = !now_on;
@@ -3531,7 +3554,12 @@ fn toggle_last_resort(app: &mut App) {
     };
     match outcome {
         Outcome::Missing => {}
-        Outcome::Saved => app.refresh_tokens(),
+        Outcome::Saved { moved_from } => {
+            if let Some(prev) = moved_from {
+                app.toast(ToastKind::Info, format!("last resort moved from '{prev}'"));
+            }
+            app.refresh_tokens();
+        }
         Outcome::SaveFailed(e) => app.toast(ToastKind::Danger, format!("save failed: {e}")),
     }
 }
