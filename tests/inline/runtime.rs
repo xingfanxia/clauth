@@ -693,16 +693,14 @@ fn detect_link_mode_returns_real_on_unix() {
 // must be held for the entire test to avoid races on the env var.
 use crate::profile::HOME_TEST_LOCK as HOME_MUTEX;
 
-/// Set $HOME to `root` for the duration of `f`. Caller must hold `HOME_MUTEX`.
+/// Redirect `home_dir()` into `root` for the duration of `f`. Caller must hold
+/// `HOME_MUTEX`. Uses the process-global `HOME_OVERRIDE` rather than `$HOME` so
+/// resolution matches on Windows too, where `dirs::home_dir()` reads
+/// `USERPROFILE`, not `HOME`.
 fn with_fake_home<T>(root: &Path, f: impl FnOnce() -> T) -> T {
-    let prev = std::env::var_os("HOME");
-    // SAFETY: caller holds HOME_MUTEX — single-threaded access on HOME.
-    unsafe { std::env::set_var("HOME", root) };
+    crate::profile::set_home_override(root.to_path_buf());
     let result = f();
-    match prev {
-        Some(v) => unsafe { std::env::set_var("HOME", v) },
-        None => unsafe { std::env::remove_var("HOME") },
-    }
+    crate::profile::clear_home_override();
     result
 }
 
