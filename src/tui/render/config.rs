@@ -82,6 +82,9 @@ struct Snap {
     env: Vec<(String, String)>,
     auto_start: bool,
     is_active: bool,
+    /// Whether the profile holds stored OAuth credentials — drives the `Login`
+    /// row's re-login vs first-login label and the `DeleteCreds` row's presence.
+    logged_in: bool,
     /// Recognised third-party provider display name, if any.
     provider: Option<&'static str>,
 }
@@ -102,6 +105,7 @@ impl Snap {
             env: Vec::new(),
             auto_start: false,
             is_active: false,
+            logged_in: false,
             provider: None,
         }
     }
@@ -139,6 +143,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             // they're always populated — even while a draft owns the text fields.
             env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             auto_start: p.auto_start,
+            logged_in: p.credentials.is_some(),
             provider: p.provider.map(|p| p.display_name()),
         },
         None => Snap::blank("settings"),
@@ -295,6 +300,8 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::EnvAdd
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::AutoStart
+        | ConfigRow::Login
+        | ConfigRow::DeleteCreds
         | ConfigRow::Delete
         | ConfigRow::Create => "",
     }
@@ -319,6 +326,8 @@ fn row_hint(row: ConfigRow) -> Option<&'static str> {
         ConfigRow::ModelOverrideAdd => {
             Some("pin what an alias resolves to, or force the subagent model")
         }
+        ConfigRow::Login => Some("browser oauth login; mints fresh tokens for this account"),
+        ConfigRow::DeleteCreds => Some("drop the stored oauth tokens; keeps the profile shell"),
         ConfigRow::Name | ConfigRow::Delete | ConfigRow::Create => None,
     }
 }
@@ -385,6 +394,21 @@ fn detail_row(
         ConfigRow::Create => {
             Line::from(vec![arrow, Span::styled("create account", theme::accent())])
         }
+        ConfigRow::Login => {
+            let label = if snap.logged_in {
+                "re-login"
+            } else {
+                "+ login"
+            };
+            Line::from(vec![arrow, Span::styled(label, theme::accent())])
+        }
+        ConfigRow::DeleteCreds => Line::from(vec![
+            arrow,
+            Span::styled(
+                "delete credentials",
+                theme::danger().add_modifier(Modifier::BOLD),
+            ),
+        ]),
     }
 }
 

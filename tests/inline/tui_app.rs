@@ -221,6 +221,174 @@ fn runtime_check_summarizes_profiles() {
 }
 
 #[test]
+fn config_rows_login_and_delete_creds_visibility() {
+    use super::{ConfigRow, config_rows};
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let creds = || ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some("ref".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+
+    let mut oauth_with = Profile::new("oauth-with".to_string(), None, None);
+    oauth_with.credentials = Some(creds());
+    let oauth_without = Profile::new("oauth-without".to_string(), None, None);
+    let api = Profile::new(
+        "api".to_string(),
+        Some("https://api.example.com".to_string()),
+        None,
+    );
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_with, oauth_without, api],
+    });
+    app.config_draft = None;
+
+    // OAuth account holding creds → re-login row plus delete-creds row.
+    app.profile_cursor = 0;
+    let rows = config_rows(&app);
+    assert!(rows.contains(&ConfigRow::Login), "oauth+creds shows login");
+    assert!(
+        rows.contains(&ConfigRow::DeleteCreds),
+        "oauth+creds shows delete-creds"
+    );
+
+    // OAuth shell with no creds → login only.
+    app.profile_cursor = 1;
+    let rows = config_rows(&app);
+    assert!(rows.contains(&ConfigRow::Login), "oauth blank shows login");
+    assert!(
+        !rows.contains(&ConfigRow::DeleteCreds),
+        "oauth blank hides delete-creds"
+    );
+
+    // API account (base_url set) → neither.
+    app.profile_cursor = 2;
+    let rows = config_rows(&app);
+    assert!(!rows.contains(&ConfigRow::Login), "api hides login");
+    assert!(
+        !rows.contains(&ConfigRow::DeleteCreds),
+        "api hides delete-creds"
+    );
+
+    // `+ new` form with an empty base_url buffer → login before create.
+    app.profile_cursor = 3;
+    let rows = config_rows(&app);
+    let login_idx = rows
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("new form shows login");
+    let create_idx = rows
+        .iter()
+        .position(|r| *r == ConfigRow::Create)
+        .expect("new form shows create");
+    assert!(
+        login_idx < create_idx,
+        "login precedes create on the new form"
+    );
+}
+
+#[test]
+fn config_rows_login_hidden_when_draft_types_a_base_url() {
+    use super::{ConfigRow, InputState, build_draft_existing, build_draft_new, config_rows};
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut oauth = Profile::new("oauth".to_string(), None, None);
+    oauth.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some("ref".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth],
+    });
+
+    // Existing OAuth draft that types a base url flips the row to API mode:
+    // both OAuth-only login rows disappear even though the saved profile is OAuth.
+    app.profile_cursor = 0;
+    let mut draft = build_draft_existing(&app, "oauth");
+    draft.base_url = InputState::new("https://api.example.com");
+    app.config_draft = Some(draft);
+    let rows = config_rows(&app);
+    assert!(
+        !rows.contains(&ConfigRow::Login),
+        "typing a base url hides login on an existing account"
+    );
+    assert!(
+        !rows.contains(&ConfigRow::DeleteCreds),
+        "typing a base url hides delete-creds on an existing account"
+    );
+
+    // `+ new` form with a typed base url is an API create → no login row.
+    app.profile_cursor = 1;
+    let mut draft = build_draft_new();
+    draft.base_url = InputState::new("https://api.example.com");
+    app.config_draft = Some(draft);
+    let rows = config_rows(&app);
+    assert!(
+        !rows.contains(&ConfigRow::Login),
+        "the new form hides login once a base url makes it an API account"
+    );
+}
+
+#[test]
+fn drain_login_events_discards_a_superseded_result() {
+    use super::{LoginSession, drain_login_events};
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+
+    // The user superseded (or canceled) the first login: the live session now
+    // carries generation 2, but a worker for generation 1 is still finishing.
+    app.login_generation = 2;
+    app.login = Some(LoginSession {
+        name: "ghost".to_string(),
+        is_new: true,
+        generation: 2,
+        url: None,
+    });
+    let stale = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some("ref".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    app.login_result_tx.send((1, Ok(stale))).unwrap();
+
+    drain_login_events(&mut app);
+
+    assert!(
+        app.config().find("ghost").is_none(),
+        "a superseded login result must not create a profile"
+    );
+    assert!(
+        app.login.is_some(),
+        "the current (gen 2) session stays live; only the stale result is dropped"
+    );
+}
+
+#[test]
 fn compact_entry_sets_flag_no_toast() {
     let mut app = bare_app();
     app.update_compact(13);

@@ -592,6 +592,46 @@ pub(crate) fn overwrite_captured_profile(
     })
 }
 
+/// Blank a profile's OAuth login: drop its stored credentials and per-account
+/// fetch caches, returning it to the credential-less shell `Profile::new`
+/// produces. Keeps name, model, env, and chain slot. When it's the active
+/// profile, clear the live `~/.claude` link and deactivate — a credential-less
+/// profile can't be meaningfully active, and the honest state is "no active".
+pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &str) -> Result<()> {
+    with_state_lock(|| {
+        let was_active = config.is_active(name);
+        let profile = config
+            .find_mut(name)
+            .with_context(|| format!("profile '{name}' not found"))?;
+        profile.credentials = None;
+        profile.usage = None;
+        profile.fetch_status = None;
+        profile.third_party_usage = None;
+        save_profile(profile)?;
+        // Drop any uncommitted rotation sidecar too: with credentials.json gone,
+        // `recover_pending_credentials` would treat the sidecar as a failed commit
+        // and resurrect the just-deleted login on next load.
+        crate::profile::clear_staged_credentials(name);
+
+        for file in [
+            crate::profile_cache::USAGE_CACHE_FILE,
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            crate::throughput::THROUGHPUT_CACHE_FILE,
+        ] {
+            if let Some(path) = crate::profile_cache::profile_cache_path(name, file) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+
+        if was_active {
+            clear_claude_credentials()?;
+            config.state.active_profile = None;
+            save_app_state(&config.state)?;
+        }
+        Ok(())
+    })
+}
+
 pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) -> Result<()> {
     if from == to || from >= config.profiles.len() || to >= config.profiles.len() {
         return Ok(());

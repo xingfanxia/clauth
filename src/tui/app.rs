@@ -23,9 +23,9 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{
     CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
-    create_blank_profile, delete_profile, edit_profile_endpoint, edit_profile_env,
-    edit_profile_model, find_matching_oauth_profile, overwrite_captured_profile, rename_profile,
-    reorder_profile, switch_off, switch_profile, validate_profile_name,
+    clear_profile_credentials, create_blank_profile, delete_profile, edit_profile_endpoint,
+    edit_profile_env, edit_profile_model, find_matching_oauth_profile, overwrite_captured_profile,
+    rename_profile, reorder_profile, switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -195,6 +195,11 @@ pub(crate) enum ConfigRow {
     /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
     AutoStart,
+    /// Browser OAuth login: mint fresh tokens into this account (or, on the
+    /// `+ new` form, create the account from the login). Async — runs on a worker.
+    Login,
+    /// Drop this account's stored OAuth credentials, keeping the profile shell.
+    DeleteCreds,
     Delete,
     Create,
 }
@@ -291,6 +296,8 @@ impl ConfigDraft {
             | ConfigRow::EnvAdd
             | ConfigRow::ModelOverrideAdd
             | ConfigRow::AutoStart
+            | ConfigRow::Login
+            | ConfigRow::DeleteCreds
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
         })
@@ -312,6 +319,8 @@ impl ConfigDraft {
             | ConfigRow::EnvAdd
             | ConfigRow::ModelOverrideAdd
             | ConfigRow::AutoStart
+            | ConfigRow::Login
+            | ConfigRow::DeleteCreds
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
         })
@@ -352,6 +361,8 @@ pub(crate) enum ConfirmAction {
     /// own stored credentials (repair a `missing` link). Spends no token — it only
     /// re-points at creds the profile already holds — so it keeps the plain button.
     RelinkCredentials(String),
+    /// Setup tab: drop a profile's stored OAuth credentials, keeping the shell.
+    BlankCredentials(String),
 }
 
 #[derive(Debug, Clone)]
@@ -453,6 +464,8 @@ pub(crate) enum ActionMenuAction {
     ToggleAutoStart,
     DeleteProfile,
     CreateProfile,
+    LoginAccount,
+    ClearCredentials,
     EditField,
     /// Remove the focused custom env entry from the account.
     RemoveEnvField,
@@ -544,6 +557,8 @@ impl ActionMenuAction {
             Self::ToggleAutoStart => "toggle auto-start",
             Self::DeleteProfile => "delete profile",
             Self::CreateProfile => "create profile",
+            Self::LoginAccount => "log in",
+            Self::ClearCredentials => "delete credentials",
             Self::EditField => "edit field",
             Self::RemoveEnvField => "remove field",
             Self::RefreshStatus => "refresh status",
@@ -939,6 +954,22 @@ pub(crate) enum MainItemKind {
     Profile(usize),
 }
 
+// ── Login session ─────────────────────────────────────────────────────────────
+
+/// An in-flight browser OAuth login. The worker blocks up to 180s in
+/// `oauth_login::login_with`; the UI stays live and applies the result in
+/// `on_tick`. `generation` discards a stale result from a login the user
+/// superseded (esc-cancel or a fresh login start).
+pub(crate) struct LoginSession {
+    pub(crate) name: String,
+    /// true → create a new profile from the mint (capture); false → re-login an
+    /// existing profile in place (overwrite).
+    pub(crate) is_new: bool,
+    pub(crate) generation: u64,
+    /// The authorize URL once the worker announces it; shown in the footer.
+    pub(crate) url: Option<String>,
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub(crate) struct App {
@@ -1011,6 +1042,22 @@ pub(crate) struct App {
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
     /// Join handle for the update check thread; joined on TUI exit for clean shutdown.
     pub(crate) update_handle: Option<JoinHandle<()>>,
+
+    /// In-flight browser OAuth login (Setup tab); `None` when idle.
+    pub(crate) login: Option<LoginSession>,
+    /// Monotonic login id; bumped on each start so a superseded worker's result
+    /// is discarded when it lands.
+    pub(crate) login_generation: u64,
+    pub(crate) login_url_rx: std::sync::mpsc::Receiver<(u64, String)>,
+    pub(crate) login_url_tx: std::sync::mpsc::Sender<(u64, String)>,
+    pub(crate) login_result_rx: std::sync::mpsc::Receiver<(
+        u64,
+        std::result::Result<crate::profile::ClaudeCredentials, String>,
+    )>,
+    pub(crate) login_result_tx: std::sync::mpsc::Sender<(
+        u64,
+        std::result::Result<crate::profile::ClaudeCredentials, String>,
+    )>,
 
     /// Claude status feed state; UI-thread-only (no shared lock).
     pub(crate) status: StatusState,
@@ -1232,6 +1279,9 @@ impl App {
             crate::pricing::spawn(pricing_sender, pricing_refresh_rx);
         }
 
+        let (login_url_tx, login_url_rx) = std::sync::mpsc::channel();
+        let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
+
         Self {
             config: Arc::new(RankedMutex::new(config)),
             usage_store,
@@ -1268,6 +1318,12 @@ impl App {
             compact: false,
             update_results,
             update_handle,
+            login: None,
+            login_generation: 0,
+            login_url_rx,
+            login_url_tx,
+            login_result_rx,
+            login_result_tx,
             status: StatusState::default(),
             status_events,
             status_refresh,
@@ -1912,6 +1968,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
 
     if !app.modals.is_empty() {
         handle_modal_key(app, key);
+        return;
+    }
+
+    // Esc abandons an in-flight login (the detached worker's result is discarded
+    // by the generation guard).
+    if app.login.is_some() && key.code == KeyCode::Esc && app.modals.is_empty() {
+        app.login = None;
+        app.toast(ToastKind::Info, "login canceled");
         return;
     }
 
@@ -3739,6 +3803,8 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 if let Some(&row) = rows.get(app.config_action_cursor) {
                     match row {
                         ConfigRow::AutoStart => actions.push(ActionMenuAction::ToggleAutoStart),
+                        ConfigRow::Login => actions.push(ActionMenuAction::LoginAccount),
+                        ConfigRow::DeleteCreds => actions.push(ActionMenuAction::ClearCredentials),
                         ConfigRow::Delete => actions.push(ActionMenuAction::DeleteProfile),
                         ConfigRow::Create => actions.push(ActionMenuAction::CreateProfile),
                         ConfigRow::EnvEntry(_) => {
@@ -3917,6 +3983,18 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                 run_config_row(app, row);
             }
         }
+        ActionMenuAction::LoginAccount => {
+            let rows = config_rows(app);
+            if let Some(&row) = rows.get(app.config_action_cursor) {
+                run_config_row(app, row);
+            }
+        }
+        ActionMenuAction::ClearCredentials => {
+            let rows = config_rows(app);
+            if let Some(&row) = rows.get(app.config_action_cursor) {
+                run_config_row(app, row);
+            }
+        }
         ActionMenuAction::EditField => {
             let rows = config_rows(app);
             if let Some(&row) = rows.get(app.config_action_cursor) {
@@ -4016,6 +4094,9 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         }
         // Base model only — the alias overrides + env rows stay existing-account-only.
         rows.push(ConfigRow::Model);
+        if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
+            rows.push(ConfigRow::Login);
+        }
         rows.push(ConfigRow::Create);
         return rows;
     }
@@ -4076,6 +4157,14 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     let env_count = profile.map(|p| p.env.len()).unwrap_or(0);
     rows.extend((0..env_count).map(ConfigRow::EnvEntry));
     rows.push(ConfigRow::EnvAdd);
+    if !is_api {
+        // OAuth account: log in (or re-login), and drop creds only when some exist.
+        rows.push(ConfigRow::Login);
+        let has_creds = profile.and_then(|p| p.credentials.as_ref()).is_some();
+        if has_creds {
+            rows.push(ConfigRow::DeleteCreds);
+        }
+    }
     rows.push(ConfigRow::Delete);
     rows
 }
@@ -4203,8 +4292,77 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
             }
         }
         ConfigRow::Create => commit_new_account(app),
+        ConfigRow::Login => {
+            // New-form draft has no editing_name → validate the typed name now and
+            // create-on-mint; an existing draft re-logs in place.
+            let editing = app
+                .config_draft
+                .as_ref()
+                .and_then(|d| d.editing_name.clone());
+            match editing {
+                Some(name) => start_login(app, name, false),
+                None => {
+                    let typed = app
+                        .config_draft
+                        .as_ref()
+                        .map(|d| d.name.trimmed().to_string())
+                        .unwrap_or_default();
+                    let validation = {
+                        let cfg = app.config();
+                        validate_profile_name(&typed, &cfg.names(), None)
+                    };
+                    match validation {
+                        Ok(()) => start_login(app, typed, true),
+                        Err(e) => app.toast(ToastKind::Danger, format!("{e}")),
+                    }
+                }
+            }
+        }
+        ConfigRow::DeleteCreds => {
+            if let Some(name) = name {
+                app.modals.push(Modal::Confirm(ConfirmState {
+                    message: format!("Delete stored OAuth credentials for '{name}'?"),
+                    detail: Some(
+                        "Blanks the login; keeps the profile, model, env, and chain slot. Re-login any time."
+                            .to_string(),
+                    ),
+                    choice: false,
+                    on_confirm: ConfirmAction::BlankCredentials(name),
+                }));
+            }
+        }
         _ => {}
     }
+}
+
+/// Kick a browser OAuth login on a worker. `is_new` → the profile is created
+/// from the mint when it lands; else an existing profile is overwritten. Refuses
+/// a second concurrent login.
+fn start_login(app: &mut App, name: String, is_new: bool) {
+    if app.login.is_some() {
+        app.toast(ToastKind::Warning, "a login is already in progress");
+        return;
+    }
+    app.login_generation += 1;
+    let generation = app.login_generation;
+    app.login = Some(LoginSession {
+        name: name.clone(),
+        is_new,
+        generation,
+        url: None,
+    });
+    let url_tx = app.login_url_tx.clone();
+    let result_tx = app.login_result_tx.clone();
+    spawn_worker(move || {
+        let res = crate::oauth_login::login_with(|url| {
+            let _ = url_tx.send((generation, url.to_string()));
+        });
+        let _ = result_tx.send((generation, res.map_err(|e| e.to_string())));
+    });
+    app.toast(
+        ToastKind::Info,
+        format!("opening a browser to log in '{name}'"),
+    );
 }
 
 /// Arm the delete row (first ⏎).
@@ -4284,6 +4442,8 @@ fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) ->
         ConfigRow::EnvAdd
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::AutoStart
+        | ConfigRow::Login
+        | ConfigRow::DeleteCreds
         | ConfigRow::Delete
         | ConfigRow::Create => String::new(),
     }
@@ -5067,6 +5227,23 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
             Err(e) => app.toast(ToastKind::Danger, format!("relink failed: {e}")),
         },
+        ConfirmAction::BlankCredentials(name) => {
+            let result = {
+                let mut cfg = app.config();
+                clear_profile_credentials(&mut cfg, &name)
+            };
+            match result {
+                Ok(()) => {
+                    app.refresh_tokens();
+                    app.last_state_mtime = app_state_mtime();
+                    app.toast(
+                        ToastKind::Success,
+                        format!("cleared credentials for '{name}'"),
+                    );
+                }
+                Err(e) => app.toast(ToastKind::Danger, format!("clear credentials failed: {e}")),
+            }
+        }
     }
 }
 
@@ -5391,6 +5568,68 @@ fn drain_pricing_events(app: &mut App) {
     }
 }
 
+/// Drain the login worker: stash the announced URL, and on a result apply it
+/// (create or overwrite) — discarding a stale result from a superseded login.
+fn drain_login_events(app: &mut App) {
+    while let Ok((generation, url)) = app.login_url_rx.try_recv() {
+        if let Some(session) = app.login.as_mut()
+            && session.generation == generation
+        {
+            session.url = Some(url);
+        }
+    }
+    while let Ok((generation, result)) = app.login_result_rx.try_recv() {
+        if app.login.as_ref().map(|s| s.generation) != Some(generation) {
+            continue; // superseded login; drop it
+        }
+        let Some(session) = app.login.take() else {
+            continue;
+        };
+        match result {
+            Ok(creds) => apply_login(app, session, creds),
+            Err(e) => app.toast(
+                ToastKind::Danger,
+                format!("login for '{}' failed: {e}", session.name),
+            ),
+        }
+    }
+}
+
+/// Fold a completed login into the profile store on the UI thread. Re-validates
+/// name uniqueness / existence at apply time — the store may have changed during
+/// the browser round-trip.
+fn apply_login(app: &mut App, session: LoginSession, creds: crate::profile::ClaudeCredentials) {
+    let snapshot = CaptureSnapshot {
+        credentials: Some(creds),
+        base_url: None,
+        api_key: None,
+    };
+    let result = {
+        let mut cfg = app.config();
+        if session.is_new {
+            match validate_profile_name(&session.name, &cfg.names(), None) {
+                Ok(()) => capture_into_profile(&mut cfg, session.name.clone(), snapshot),
+                Err(e) => Err(e),
+            }
+        } else if cfg.find(&session.name).is_some() {
+            overwrite_captured_profile(&mut cfg, &session.name, snapshot)
+        } else {
+            Err(anyhow::anyhow!(
+                "profile '{}' no longer exists",
+                session.name
+            ))
+        }
+    };
+    match result {
+        Ok(()) => {
+            app.refresh_tokens();
+            app.last_state_mtime = app_state_mtime();
+            app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("login failed: {e}")),
+    }
+}
+
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
 
@@ -5415,6 +5654,7 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_status_events(app);
     drain_tokens_events(app);
     drain_pricing_events(app);
+    drain_login_events(app);
 
     if app.reload_if_state_changed() {
         app.clamp_profile_cursor();

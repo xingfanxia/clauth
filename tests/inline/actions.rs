@@ -463,6 +463,159 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
     );
 }
 
+/// Blanking an active profile drops its credentials + per-account fetch caches
+/// and clears the live link + `active_profile`, while name/env/model survive.
+#[test]
+fn clear_profile_credentials_blanks_active_profile_keeping_shell() {
+    let _home = HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.auto_start = true;
+    acct.env.insert("FOO".to_string(), "bar".to_string());
+    acct.models.opus = Some("claude-opus-4".to_string());
+    acct.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some("ref".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&acct).expect("save acct");
+    crate::claude::link_profile_credentials("acct").expect("link acct live");
+
+    for file in [
+        crate::profile_cache::USAGE_CACHE_FILE,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+    ] {
+        crate::profile_cache::write_profile_cache("acct", file, &"stale");
+    }
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["acct".into()],
+            fallback_chain: vec!["acct".into()],
+            active_profile: Some("acct".into()),
+            ..AppState::default()
+        },
+        profiles: vec![acct],
+    };
+
+    clear_profile_credentials(&mut config, "acct").expect("clear credentials");
+
+    let profile = config.find("acct").expect("profile still present");
+    assert!(profile.credentials.is_none(), "credentials dropped");
+    assert!(profile.auto_start, "shell preserved: auto_start");
+    assert_eq!(
+        profile.env.get("FOO"),
+        Some(&"bar".to_string()),
+        "shell preserved: env"
+    );
+    assert_eq!(
+        profile.models.opus.as_deref(),
+        Some("claude-opus-4"),
+        "shell preserved: model"
+    );
+    assert!(
+        config.state.active_profile.is_none(),
+        "active profile deactivated"
+    );
+
+    let cred_path = profile_dir("acct").unwrap().join("credentials.json");
+    assert!(!cred_path.exists(), "credentials.json removed");
+
+    for file in [
+        crate::profile_cache::USAGE_CACHE_FILE,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+    ] {
+        let path = crate::profile_cache::profile_cache_path("acct", file).unwrap();
+        assert!(!path.exists(), "{file} must be dropped");
+    }
+
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    assert!(
+        live_path.symlink_metadata().is_err(),
+        "live .credentials.json link cleared on blanking the active profile"
+    );
+}
+
+/// Blanking a NON-active profile must not touch the active link / `active_profile`,
+/// and a lingering rotation sidecar must not resurrect the deleted login on the
+/// next disk load (`recover_pending_credentials` treats a missing credentials.json
+/// as a failed commit and adopts the sidecar).
+#[test]
+fn clear_profile_credentials_non_active_and_no_sidecar_resurrection() {
+    let _home = HomeSandbox::new();
+
+    let creds = || ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some("ref".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(creds());
+    save_profile(&acct).expect("save acct");
+    // A rotation sidecar that never committed — the resurrection vector.
+    crate::profile::stage_rotated_credentials("acct", &creds()).expect("stage sidecar");
+
+    let mut other = Profile::new("other".to_string(), None, None);
+    other.credentials = Some(creds());
+    save_profile(&other).expect("save other");
+    crate::claude::link_profile_credentials("other").expect("link other live");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["acct".into(), "other".into()],
+            fallback_chain: vec!["acct".into(), "other".into()],
+            active_profile: Some("other".into()),
+            ..AppState::default()
+        },
+        profiles: vec![acct, other],
+    };
+
+    // Persist the profile list so `load_config` below can find both by name.
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    clear_profile_credentials(&mut config, "acct").expect("clear credentials");
+
+    // The active profile and its live link are untouched — only "acct" changed.
+    assert_eq!(
+        config.state.active_profile.as_deref(),
+        Some("other"),
+        "blanking a non-active profile leaves the active one set"
+    );
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    assert!(
+        live_path.symlink_metadata().is_ok(),
+        "the active profile's live link survives a non-active blank"
+    );
+
+    // Reload from disk: the sidecar must be gone, so the login stays deleted.
+    let reloaded = crate::profile::load_config().expect("reload config");
+    let acct = reloaded.find("acct").expect("acct still present");
+    assert!(
+        acct.credentials.is_none(),
+        "a lingering sidecar must not resurrect the blanked login"
+    );
+    let cred_path = profile_dir("acct").unwrap().join("credentials.json");
+    assert!(
+        !cred_path.exists(),
+        "credentials.json stays gone after reload (sidecar not adopted)"
+    );
+}
+
 // ── issue #17: stale oauthAccount deleted on every switch path ────────────
 
 fn home_claude_json_path() -> std::path::PathBuf {

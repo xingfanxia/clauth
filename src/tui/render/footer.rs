@@ -8,7 +8,8 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
-    PluginFocus, StatusFocus, Tab, TokenView, config_rows, fallback_hint, has_sub_focus,
+    LoginSession, PluginFocus, StatusFocus, Tab, TokenView, config_rows, fallback_hint,
+    has_sub_focus,
 };
 use super::super::theme;
 
@@ -18,6 +19,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // 1-col breathing room on each side; the alert row (which replaces this in
     // place) shares the same inset so the left margin never jumps.
     let area = inset_x(area, 1);
+
+    // A login in flight owns the footer, independent of `footer_alert` so key
+    // handling that clears alerts can't hide it.
+    if let Some(session) = &app.login {
+        draw_login(frame, area, session);
+        return;
+    }
 
     // A live alert replaces the hint bar in place — one footer row, never stacked.
     if let Some(alert) = &app.footer_alert {
@@ -247,6 +255,31 @@ fn draw_alert(frame: &mut Frame<'_>, area: Rect, alert: &FooterAlert) {
     let spans = vec![
         Span::styled("! ", Style::default().fg(theme::warning_color())),
         Span::styled(msg.as_str(), theme::dim()),
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .style(theme::base())
+            .alignment(Alignment::Left),
+        area,
+    );
+}
+
+/// Login-in-progress line. Independent of `footer_alert` so key handling that
+/// clears alerts never hides it. The authorize URL isn't shown — too long for
+/// one footer row; a login modal that wraps it is the upgrade path if
+/// browser-open failures ever need the paste-fallback surfaced here.
+fn draw_login(frame: &mut Frame<'_>, area: Rect, session: &LoginSession) {
+    let spans = vec![
+        Span::styled("⟳ ", theme::accent()),
+        Span::styled(
+            format!(
+                "logging in '{}' — complete it in your browser",
+                session.name
+            ),
+            theme::dim(),
+        ),
+        Span::styled("   esc ", theme::accent().add_modifier(Modifier::BOLD)),
+        Span::styled("cancel", theme::dim()),
     ];
     frame.render_widget(
         Paragraph::new(Line::from(spans))
