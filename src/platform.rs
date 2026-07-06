@@ -23,9 +23,14 @@ pub(crate) fn open_url(url: &str) -> anyhow::Result<()> {
     let mut cmd = Command::new("xdg-open");
     #[cfg(windows)]
     let mut cmd = {
-        let mut c = Command::new("cmd");
-        // Empty title arg so a quoted URL isn't consumed as the window title.
-        c.args(["/C", "start", ""]);
+        // Not `cmd /C start`: cmd.exe re-tokenizes its command line, so every
+        // bare `&` in the query splits the URL into separate commands (std
+        // quotes an arg only on space/tab/quote — verified on a real Windows
+        // box), and the `%xx` percent-encodes risk variable expansion even
+        // inside quotes. rundll32 ShellExecutes the URL with no shell
+        // tokenizer in between.
+        let mut c = Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
         c
     };
 
