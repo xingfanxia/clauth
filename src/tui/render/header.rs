@@ -25,7 +25,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // name truncates → name drops → hide).
 
 const GAUGE_NAME_GAP: usize = 2;
-const GAUGE_BAR_FULL: usize = 8;
+const GAUGE_BAR_FULL: usize = 10;
 const GAUGE_BAR_MIN: usize = 3;
 const GAUGE_NAME_MAX: usize = 16;
 const GAUGE_NAME_MIN: usize = 3;
@@ -36,7 +36,7 @@ const GAUGE_DASH_W: usize = 1;
 
 const PULSE_SWEEP_MS: u64 = 900;
 const PULSE_REST_MS: u64 = 1700;
-const PULSE_DEPTH: f32 = 0.45;
+const PULSE_DEPTH: f32 = 0.4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GaugeFit {
@@ -182,7 +182,7 @@ fn pulse_name_spans(name: &str, style: Style, elapsed_ms: u64) -> Vec<Span<'stat
             let col = (i as f32 / len) * TAU;
             let crest = ((col - head).cos() * 0.5 + 0.5).powi(2);
             let lean = f64::from(crest * envelope * PULSE_DEPTH);
-            let fg = theme::blend_over(base, theme::accent_2_pale_color(), lean);
+            let fg = theme::blend_over(base, theme::accent_2_color(), lean);
             Span::styled(ch.to_string(), style.fg(fg))
         })
         .collect()
@@ -246,8 +246,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut left_spans: Vec<Span<'static>> = vec![Span::styled(prefix, theme::faint())];
     if let Some(ref g) = gauge {
         let gauge_budget = row1_width.saturating_sub(
-            left_spans.iter().map(|s| s.content.chars().count()).sum::<usize>()
-                + status_w + reserve,
+            left_spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+                + status_w
+                + reserve,
         );
         let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
         if fit.visible {
@@ -261,7 +265,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let gap = row1_width - left_w - status_w;
         row1_spans.push(Span::raw(" ".repeat(gap)));
     }
-    row1_spans.push(Span::styled(status_head, Style::default().fg(status_dot_color(app))));
+    row1_spans.push(Span::styled(
+        status_head,
+        Style::default().fg(status_dot_color(app)),
+    ));
     row1_spans.push(Span::styled(feed, theme::dim()));
 
     frame.render_widget(

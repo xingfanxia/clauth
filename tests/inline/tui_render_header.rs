@@ -99,7 +99,7 @@ fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
         fit,
         GaugeFit {
             name_w: 8,
-            bar_cells: 8,
+            bar_cells: 10,
             visible: true,
         }
     );

@@ -110,11 +110,7 @@ fn tokens_dashboard_uses_alignment_not_middot() {
         .map(|(x, y)| buf.content[y * 100 + x].symbol().to_owned())
         .collect();
     // Skip the 3-row header which now has a middot in the gauge area.
-    let body: String = text
-        .chars()
-        .skip(3 * 100)
-        .take(27 * 100)
-        .collect();
+    let body: String = text.chars().skip(3 * 100).take(27 * 100).collect();
     assert!(
         !body.contains('·'),
         "tokens dashboard must use alignment, not `·` separators"
