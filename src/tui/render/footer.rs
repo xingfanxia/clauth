@@ -149,7 +149,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             FallbackHint::Empty => &[("?", "help")],
             FallbackHint::ChainMember => &[
                 ("↑↓", "move"),
-                ("⇧↑↓", "reorder = priority"),
+                ("⇧↑↓", "reorder"),
                 ("↵", "open"),
                 ("a", "actions"),
                 ("?", "help"),

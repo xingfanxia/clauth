@@ -8,7 +8,6 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -16,7 +15,9 @@ use crate::profile::{DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTE
 
 use super::super::app::{App, GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState, parse_refresh_secs};
 use super::super::theme::{self, Tier};
-use super::panes::{head_cols, highlight_row, label_style, section_box};
+use super::panes::{
+    head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, label_style, section_box,
+};
 
 const KEY_W: usize = 12;
 
@@ -61,7 +62,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 let cy = inner.y.saturating_add(lines.len() as u16);
                 caret = Some((cx, cy));
                 lines.push(line);
-                lines.push(refresh_range_tooltip(input));
+                lines.extend(refresh_range_tooltip(input, inner.width as usize));
             }
             None => {
                 lines.push(if selected {
@@ -69,8 +70,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 } else {
                     line
                 });
-                if selected && let Some(tip) = row_hint(*row, default_divergence) {
-                    lines.push(help_tooltip(&tip));
+                if selected
+                    && let Some(tip) = row_hint(*row, default_divergence, wrap_off, burn_aware)
+                {
+                    lines.extend(help_tooltip_lines(&tip, inner.width as usize));
                 }
             }
         }
@@ -82,34 +85,45 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-/// Inline help for rows whose value doesn't self-describe.
-fn row_hint(row: GlobalConfigRow, default_divergence: Option<DivergenceChoice>) -> Option<String> {
-    match row {
-        GlobalConfigRow::Theme => None,
-        GlobalConfigRow::DivergenceDefault => {
-            let tip = match default_divergence {
-                None => "show the divergence modal when CC overwrites the symlink",
-                Some(DivergenceChoice::Overwrite) => "adopt the new login into the current profile",
-                Some(DivergenceChoice::NewProfile) => {
-                    "save the new login as a separate profile, leave current profile alone"
-                }
-                Some(DivergenceChoice::Discard) => {
-                    "restore the previous profile, clobbering the new login"
-                }
-            };
-            Some(tip.to_string())
-        }
-        GlobalConfigRow::RefreshInterval => {
-            Some("space cycles presets, wraps at the top; ⏎ types a custom value".to_string())
-        }
+/// Inline help for rows whose value doesn't self-describe. Phrased for the
+/// value currently selected, so cycling a row re-explains what it now does.
+fn row_hint(
+    row: GlobalConfigRow,
+    default_divergence: Option<DivergenceChoice>,
+    wrap_off: bool,
+    burn_aware: bool,
+) -> Option<String> {
+    let tip = match row {
+        GlobalConfigRow::Theme => return None,
+        GlobalConfigRow::DivergenceDefault => match default_divergence {
+            None => "ask what to do when claude code signs in over the active account",
+            Some(DivergenceChoice::Overwrite) => {
+                "fold a new login into the active account, replacing its credentials"
+            }
+            Some(DivergenceChoice::NewProfile) => {
+                "save a new login as its own account and keep the current one"
+            }
+            Some(DivergenceChoice::Discard) => {
+                "restore the previous credentials and drop the new login"
+            }
+        },
+        GlobalConfigRow::RefreshInterval => "how often usage is refetched for every account",
         GlobalConfigRow::WrapOff => {
-            Some("default when every fallback member is over its threshold".to_string())
+            if wrap_off {
+                "once every account is spent, switch everything off until one recovers"
+            } else {
+                "once every account is spent, stay on the last one until one recovers"
+            }
         }
-        GlobalConfigRow::BurnAware => Some(
-            "on: switch the active account when it's projected to cross 100% by the next poll"
-                .to_string(),
-        ),
-    }
+        GlobalConfigRow::BurnAware => {
+            if burn_aware {
+                "switch away once the burn rate projects 100% before the next poll"
+            } else {
+                "switch away once usage crosses the account's threshold"
+            }
+        }
+    };
+    Some(tip.to_string())
 }
 
 fn detail_row(
@@ -248,35 +262,18 @@ fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
     vec![Span::styled(input.value.clone(), body)]
 }
 
-/// A `  └ text` help sub-line: `LINE` leader, reason in `faint`.
-fn help_tooltip(text: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("  └ ", Style::default().fg(theme::line_color())),
-        Span::styled(text.to_string(), theme::faint()),
-    ])
-}
-
-/// A `  └ text` Invalid-input sub-line: both the `└ ` leader and the reason in
-/// `DANGER`, distinguishing it from a plain help tooltip.
-fn invalid_tooltip(text: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("  └ ", theme::danger()),
-        Span::styled(text.to_string(), theme::danger()),
-    ])
-}
-
 /// Sub-line under the refresh field while typing: the valid range, in DANGER
 /// when the current buffer parses out of range (or non-numeric), else faint.
-fn refresh_range_tooltip(input: &InputState) -> Line<'static> {
+fn refresh_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
     let range = format!(
         "{}–{} s",
         MIN_REFRESH_INTERVAL_MS / 1000,
         MAX_REFRESH_INTERVAL_MS / 1000
     );
     if parse_refresh_secs(input.trimmed()).is_none() {
-        invalid_tooltip(&range)
+        invalid_tooltip_lines(&range, width)
     } else {
-        help_tooltip(&range)
+        help_tooltip_lines(&range, width)
     }
 }
 

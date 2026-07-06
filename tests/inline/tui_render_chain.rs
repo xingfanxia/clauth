@@ -87,3 +87,49 @@ fn partially_exhausted_chain_hides_resumes_hint() {
         "must not show when the chain isn't fully exhausted"
     );
 }
+
+// ── help-hint wrapping + dynamic copy ────────────────────────────────────────
+
+// A narrow detail pane wraps the selected row's hint into `└ `-led +
+// indented continuation lines instead of clipping it off the pane edge.
+#[test]
+fn last_resort_hint_wraps_on_a_narrow_pane() {
+    let a = profile("a", 95.0, 20.0, 3600);
+    let b = profile("b", 95.0, 20.0, 3600);
+    let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
+
+    // Focused on the `last resort` row (FALLBACK_ROWS[1]) at 28 cols.
+    let lines = member_detail(&cfg, "a", 0, 2, true, 1, false, None, 28);
+    let texts: Vec<String> = lines.iter().map(line_text).collect();
+    let lead = texts
+        .iter()
+        .position(|t| t.starts_with("  └ "))
+        .expect("hint leader line renders");
+    assert!(
+        texts[lead].chars().count() <= 28,
+        "first hint line must fit the pane: {:?}",
+        texts[lead]
+    );
+    assert!(
+        texts[lead + 1].starts_with("    "),
+        "hint continues on an indented line instead of clipping: {:?}",
+        texts[lead + 1]
+    );
+}
+
+// The last-resort hint names the member the exclusive mark would move from.
+#[test]
+fn last_resort_hint_names_the_currently_marked_member() {
+    let a = profile("a", 95.0, 20.0, 3600);
+    let mut b = profile("b", 95.0, 20.0, 3600);
+    b.last_resort = true;
+    let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
+
+    let lines = member_detail(&cfg, "a", 0, 2, true, 1, false, None, 80);
+    let hint = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("└"))
+        .expect("hint renders");
+    assert!(hint.contains("from 'b'"), "{hint}");
+}

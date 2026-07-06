@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
 use super::format::{clock_label, relative_age, spinner_frame};
-use super::panes::{draw_scrollbar, empty_state, section_box, selector_width};
+use super::panes::{draw_scrollbar, empty_state, section_box, selector_width, wrap_words};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase, shorten_component_status};
 
 /// Detail-pane key column width (matches the usage tab's `KEY_W`).
@@ -402,7 +402,7 @@ fn update_lines(
     let phase = pad_right(&update.phase.word(), phase_col);
     let phase_color = phase_text_color(&update.phase);
 
-    let wrapped = wrap_text(&update.text, body_w);
+    let wrapped = wrap_words(&update.text, body_w);
     let mut out = Vec::with_capacity(wrapped.len() + update.transitions.len());
     let first_body = wrapped.first().cloned().unwrap_or_default();
     out.push(Line::from(vec![
@@ -628,48 +628,4 @@ fn pad_right(s: &str, width: usize) -> String {
         return truncate(s, width);
     }
     format!("{s}{}", " ".repeat(width - count))
-}
-
-/// Greedy word-wrap to `width` chars; long words are hard-split.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if word.chars().count() > width {
-            if !line.is_empty() {
-                lines.push(std::mem::take(&mut line));
-            }
-            let mut chunk = String::new();
-            for ch in word.chars() {
-                if chunk.chars().count() == width {
-                    lines.push(std::mem::take(&mut chunk));
-                }
-                chunk.push(ch);
-            }
-            if !chunk.is_empty() {
-                line = chunk;
-            }
-            continue;
-        }
-        let extra = if line.is_empty() { 0 } else { 1 };
-        if line.chars().count() + extra + word.chars().count() > width {
-            lines.push(std::mem::take(&mut line));
-            line.push_str(word);
-        } else {
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
-        }
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
 }

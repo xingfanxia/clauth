@@ -11,7 +11,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -21,8 +21,9 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    active_pill, bold_when, draw_selector_list, head_cols, highlight_row, label_style, name_color,
-    section_box, section_box_verbatim, select_line, selector_width,
+    active_pill, bold_when, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
+    invalid_tooltip_lines, label_style, name_color, section_box, section_box_verbatim, select_line,
+    selector_width, wrap_words,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, soonest_resume, threshold_for};
 use crate::profile::AppConfig;
@@ -265,18 +266,18 @@ fn member_detail(
         // of range) — mirroring the Config-tab refresh editor.
         if *row == FallbackRow::Threshold {
             match row_editing {
-                Some(input) => lines.push(threshold_range_tooltip(input)),
-                None if selected => lines.push(tooltip(
-                    "switch to the next account once 5h usage reaches this",
-                    theme::faint(),
+                Some(input) => lines.extend(threshold_range_tooltip(input, width)),
+                None if selected => lines.extend(help_tooltip_lines(
+                    &format!("switches to the next account once 5h usage hits {threshold:.0}%"),
+                    width,
                 )),
                 None => {}
             }
         }
         if *row == FallbackRow::LastResort && selected {
-            lines.push(tooltip(
-                "park here once every other member is exhausted, instead of switching off all",
-                theme::faint(),
+            lines.extend(help_tooltip_lines(
+                &last_resort_hint(cfg, name, profile.last_resort),
+                width,
             ));
         }
     }
@@ -295,33 +296,32 @@ fn member_detail(
     lines
 }
 
-/// A `  └ text` help sub-line: the `└ ` chrome stays `LINE`, the reason renders
-/// in `text_style` (e.g. `faint`).
-fn tooltip(text: &str, text_style: Style) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("  └ ", theme::line()),
-        Span::styled(text.to_string(), text_style),
-    ])
-}
-
-/// A `  └ text` Invalid-input sub-line: both the `└ ` leader and the reason
-/// render in `DANGER` (an Invalid-input tooltip, unlike a help tooltip).
-fn invalid_tooltip(text: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("  └ ", theme::danger()),
-        Span::styled(text.to_string(), theme::danger()),
-    ])
+/// Hint under the `last resort` toggle — phrased for the state flipping it
+/// would produce: on → describes the standing behavior; off → what turning it
+/// on does, naming the member the (exclusive) mark would move away from.
+fn last_resort_hint(cfg: &AppConfig, name: &str, on: bool) -> String {
+    if on {
+        return "the chain parks here once every account is spent".to_string();
+    }
+    match cfg
+        .profiles
+        .iter()
+        .find(|p| p.last_resort && p.name != *name)
+    {
+        Some(marked) => format!("move the chain's parking spot here from '{}'", marked.name),
+        None => "park the chain here once every account is spent".to_string(),
+    }
 }
 
 /// Sub-line under the `rotate at` field while typing: the valid range, in DANGER
 /// when the current buffer parses out of range (or non-numeric), else faint —
 /// the threshold twin of the Config-tab refresh editor's `refresh_range_tooltip`.
-fn threshold_range_tooltip(input: &InputState) -> Line<'static> {
+fn threshold_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
     let range = "0–100 %";
     if parse_threshold(input.trimmed()).is_none() {
-        invalid_tooltip(range)
+        invalid_tooltip_lines(range, width)
     } else {
-        tooltip(range, theme::faint())
+        help_tooltip_lines(range, width)
     }
 }
 
@@ -418,16 +418,17 @@ fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled("add an account to the rotation", theme::dim())),
         Line::from(""),
-        Line::from(Span::styled(
-            "clauth auto-switches off a member when its 5h window crosses the",
-            theme::dim(),
-        )),
-        Line::from(Span::styled(
-            "member's threshold, moving to the next account in the chain.",
-            theme::dim(),
-        )),
-        Line::from(""),
     ];
+    lines.extend(
+        wrap_words(
+            "when an account's 5h usage crosses its threshold, clauth hands the \
+             session to the next account in the chain.",
+            width,
+        )
+        .into_iter()
+        .map(|seg| Line::from(Span::styled(seg, theme::dim()))),
+    );
+    lines.push(Line::from(""));
 
     if candidates.is_empty() {
         lines.push(Line::from(Span::styled(

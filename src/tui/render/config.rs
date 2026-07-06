@@ -15,8 +15,8 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    active_pill, draw_selector_list, head_cols, highlight_row, label_style, name_color, picker_row,
-    section_box, section_box_verbatim, selector_width,
+    active_pill, draw_selector_list, head_cols, help_tooltip_lines, highlight_row, label_style,
+    name_color, picker_row, section_box, section_box_verbatim, selector_width,
 };
 
 const KEY_W: usize = 11;
@@ -240,11 +240,9 @@ fn draw_settings_rows(
             && !is_editing
             && let Some(text) = row_hint(*row)
         {
-            lines.push(Line::from(vec![
-                Span::styled("  └ ", Style::default().fg(theme::line_color())),
-                Span::styled(text, theme::faint()),
-            ]));
-            line_idx += 1;
+            let hint = help_tooltip_lines(text, inner.width as usize);
+            line_idx += hint.len() as u16;
+            lines.extend(hint);
         }
     }
 
@@ -305,11 +303,12 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
 /// Inline help for rows whose labels don't self-describe.
 fn row_hint(row: ConfigRow) -> Option<&'static str> {
     match row {
-        ConfigRow::BaseUrl => Some("custom api endpoint; empty = claude.ai oauth"),
-        ConfigRow::ApiKey => Some("x-api-key for a non-oauth endpoint"),
-        ConfigRow::Model => {
-            Some("default model for this account; space cycles, ⏎ sets a custom id")
+        ConfigRow::BaseUrl => {
+            Some("api endpoint for this account; leave empty for claude.ai oauth")
         }
+        ConfigRow::ApiKey => Some("x-api-key sent to the custom endpoint"),
+        // The value grammar (`space cycle · ↵ custom`) already lives in the footer.
+        ConfigRow::Model => Some("default model for this account"),
         ConfigRow::OpusModel => Some("what the `opus` alias resolves to (full model id)"),
         ConfigRow::SonnetModel => Some("what the `sonnet` alias resolves to (full model id)"),
         ConfigRow::HaikuModel => Some("what the `haiku` alias resolves to (full model id)"),

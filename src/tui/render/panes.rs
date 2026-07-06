@@ -201,6 +201,84 @@ pub(super) fn draw_selector_list(
     draw_scrollbar(frame, inner, total, state.offset(), viewport);
 }
 
+/// Greedy word-wrap to `width` chars; long words are hard-split. Shared by the
+/// status-tab timeline, the tooltip sub-lines, and the chain add-pane prose.
+pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if word.chars().count() > width {
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            if !chunk.is_empty() {
+                line = chunk;
+            }
+            continue;
+        }
+        let extra = if line.is_empty() { 0 } else { 1 };
+        if line.chars().count() + extra + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+            line.push_str(word);
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// A `  └ text` help sub-line wrapped to `width`: the `└ ` leader stays `LINE`,
+/// the reason renders `faint`; continuation lines indent under the text so the
+/// hint reads as one block instead of clipping off the pane edge.
+pub(super) fn help_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    tooltip_lines(text, width, theme::line(), theme::faint())
+}
+
+/// Invalid-input twin of [`help_tooltip_lines`]: both the leader and the
+/// reason render in `DANGER` (cloudy-tui Invalid-input tooltip).
+pub(super) fn invalid_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    tooltip_lines(text, width, theme::danger(), theme::danger())
+}
+
+fn tooltip_lines(
+    text: &str,
+    width: usize,
+    leader_style: Style,
+    text_style: Style,
+) -> Vec<Line<'static>> {
+    const LEAD_W: usize = 4; // "  └ " and the matching continuation indent
+    wrap_words(text, width.saturating_sub(LEAD_W).max(8))
+        .into_iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            let lead = if i == 0 { "  └ " } else { "    " };
+            Line::from(vec![
+                Span::styled(lead, leader_style),
+                Span::styled(seg, text_style),
+            ])
+        })
+        .collect()
+}
+
 /// Form-row label style: `TEXT + bold` when focused, `TEXT_DIM` when blurred.
 pub(super) fn label_style(focused: bool) -> Style {
     if focused {
