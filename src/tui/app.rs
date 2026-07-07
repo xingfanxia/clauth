@@ -2886,14 +2886,8 @@ fn open_incident_link(app: &mut App) {
         app.toast(ToastKind::Info, "no link for this incident");
         return;
     }
-    let spawned = std::process::Command::new("xdg-open")
-        .arg(&link)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    match spawned {
-        Ok(_) => app.toast(ToastKind::Info, "opening in browser"),
+    match crate::platform::open_url(&link) {
+        Ok(()) => app.toast(ToastKind::Info, "opening in browser"),
         Err(_) => app.toast(ToastKind::Danger, "failed to open browser"),
     }
 }
