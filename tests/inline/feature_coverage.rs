@@ -20,8 +20,14 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         &["auto_switch", "snapshot_chain", "resolves_started_profile"],
     ),
     (
-        "Sign in a new account",
-        &["authorize_url", "pkce_challenge", "base64url_nopad"],
+        "Sign in an account",
+        &[
+            "authorize_url",
+            "pkce_challenge",
+            "base64url_nopad",
+            "login_route",
+            "reauth_confirmed",
+        ],
     ),
     (
         "Automatic token refresh",
