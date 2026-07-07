@@ -8,6 +8,7 @@ use ratatui::widgets::{Clear, Paragraph};
 
 use super::super::app::{App, Toast, ToastKind};
 use super::super::theme;
+use super::panes::wrap_words;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.toasts.is_empty() {
@@ -55,14 +56,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let first = lines_iter.next().unwrap_or("");
 
         let mut render_lines: Vec<Line<'_>> = Vec::new();
-        for wrapped in word_wrap(first, max_content_width as usize) {
+        for wrapped in wrap_words(first, max_content_width as usize) {
             render_lines.push(Line::from(vec![
                 Span::styled("┃ ", bar_style),
                 Span::styled(wrapped, title_style),
             ]));
         }
         for detail in lines_iter {
-            for wrapped in word_wrap(detail, max_content_width as usize) {
+            for wrapped in wrap_words(detail, max_content_width as usize) {
                 render_lines.push(Line::from(vec![
                     Span::styled("┃ ", bar_style),
                     Span::styled(wrapped, detail_style),
@@ -121,85 +122,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         row += height;
     }
-}
-
-/// Soft-wrap `text` to at most `max_width` chars per visual line.
-///
-/// Splits on whitespace boundaries where possible; a single word longer than
-/// `max_width` is emitted as its own line (hard-break fallback).  Returns at
-/// least one element even for an empty input.
-fn word_wrap(text: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 {
-        return vec![text.to_owned()];
-    }
-    let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut current_len: usize = 0;
-
-    for word in text.split_whitespace() {
-        let word_len = word.chars().count();
-        if current_len == 0 {
-            if word_len > max_width {
-                // Hard-break: word alone exceeds cap — emit in max_width-char chunks.
-                let mut chars = word.chars();
-                let mut chunk = String::new();
-                let mut chunk_len = 0;
-                for ch in chars.by_ref() {
-                    chunk.push(ch);
-                    chunk_len += 1;
-                    if chunk_len == max_width {
-                        lines.push(chunk.clone());
-                        chunk.clear();
-                        chunk_len = 0;
-                    }
-                }
-                if !chunk.is_empty() {
-                    current = chunk;
-                    current_len = chunk_len;
-                }
-            } else {
-                current.push_str(word);
-                current_len = word_len;
-            }
-        } else if current_len + 1 + word_len <= max_width {
-            current.push(' ');
-            current.push_str(word);
-            current_len += 1 + word_len;
-        } else {
-            lines.push(current.clone());
-            current.clear();
-            current_len = 0;
-            if word_len > max_width {
-                let mut chars = word.chars();
-                let mut chunk = String::new();
-                let mut chunk_len = 0;
-                for ch in chars.by_ref() {
-                    chunk.push(ch);
-                    chunk_len += 1;
-                    if chunk_len == max_width {
-                        lines.push(chunk.clone());
-                        chunk.clear();
-                        chunk_len = 0;
-                    }
-                }
-                if !chunk.is_empty() {
-                    current = chunk;
-                    current_len = chunk_len;
-                }
-            } else {
-                current.push_str(word);
-                current_len = word_len;
-            }
-        }
-    }
-
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
 }
 
 fn fits_in(outer: Rect, inner: Rect) -> bool {
