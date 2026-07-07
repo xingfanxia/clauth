@@ -71,14 +71,24 @@ fn run_with_deadline(
         .with_context(|| format!("failed to spawn {SECURITY_BIN}"))?;
     if let Some(payload) = stdin_payload {
         use std::io::Write;
-        let mut stdin = child
+        // Write the payload, then close the pipe (drop of `stdin`) so the child
+        // sees EOF and runs. On any write failure (e.g. EPIPE if it died early)
+        // kill/wait the child before returning: a bare `?` would leak it as a
+        // zombie, unlike the timeout and normal-exit paths below.
+        let write_result: Result<()> = child
             .stdin
             .take()
-            .context("child stdin unexpectedly absent")?;
-        stdin
-            .write_all(payload.as_bytes())
-            .with_context(|| format!("failed to write {SECURITY_BIN} stdin"))?;
-        // Dropping the handle closes the pipe — the child sees EOF and runs.
+            .context("child stdin unexpectedly absent")
+            .and_then(|mut stdin| {
+                stdin
+                    .write_all(payload.as_bytes())
+                    .with_context(|| format!("failed to write {SECURITY_BIN} stdin"))
+            });
+        if let Err(e) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
     }
     let deadline = Instant::now() + timeout;
     loop {
