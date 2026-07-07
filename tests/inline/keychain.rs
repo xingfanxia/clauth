@@ -9,7 +9,7 @@
 //! (`keychain::enabled()` is false under `cfg(test)`), so `cargo test` never
 //! touches the Keychain.
 
-use super::{delete_at, read_at, run_with_deadline, write_at};
+use super::{delete_at, read_at, run_with_deadline, security_quote, write_at};
 use crate::profile::{ClaudeCredentials, OAuthToken};
 
 fn sample_creds(access: &str, refresh: &str) -> ClaudeCredentials {
@@ -65,6 +65,19 @@ fn keychain_round_trip_on_temp_service() {
         .expect("oauth");
     assert_eq!(rotated.access_token, "sk-ant-oat01-ROTATED");
 
+    // Hostile-content write via `security -i`: spaces, double quotes, and
+    // backslashes in the secret must round-trip byte-identical through the
+    // security_quote escaping (no real token looks like this; the point is
+    // that the -i tokenizer can never mangle one that does).
+    let hostile = sample_creds(r#"sk with spaces "quoted" back\slash"#, "rt-plain");
+    write_at(&service, account, &hostile).expect("hostile write");
+    let echoed = read_at(&service, account)
+        .expect("read hostile")
+        .expect("some")
+        .claude_ai_oauth
+        .expect("oauth");
+    assert_eq!(echoed.access_token, r#"sk with spaces "quoted" back\slash"#);
+
     // Delete → absent; delete again is still Ok (idempotent).
     delete_at(&service, account).expect("delete");
     assert!(
@@ -89,7 +102,7 @@ fn keychain_timeout_kills_a_hung_command() {
     let mut cmd = Command::new("/bin/sleep");
     cmd.arg("30");
     let start = Instant::now();
-    let result = run_with_deadline(cmd, Duration::from_millis(300));
+    let result = run_with_deadline(cmd, Duration::from_millis(300), None);
     let elapsed = start.elapsed();
 
     assert!(
@@ -112,6 +125,43 @@ fn keychain_deadline_returns_output_for_a_fast_command() {
     use std::time::Duration;
 
     let cmd = Command::new("/usr/bin/true");
-    let out = run_with_deadline(cmd, Duration::from_secs(5)).expect("fast command succeeds");
+    let out = run_with_deadline(cmd, Duration::from_secs(5), None).expect("fast command succeeds");
     assert!(out.status.success(), "`true` exits 0 within the deadline");
+}
+
+// ── `security -i` plumbing: stdin transport + line quoting (no Keychain) ──────
+
+#[test]
+fn deadline_feeds_stdin_payload_and_closes_the_pipe() {
+    use std::process::Command;
+    use std::time::Duration;
+
+    // `cat` exits only when stdin reaches EOF — proves the payload is written
+    // AND the pipe is closed (a leaked handle would hang until the deadline).
+    let cmd = Command::new("/bin/cat");
+    let out = run_with_deadline(cmd, Duration::from_secs(5), Some("payload {\"a b\"}\n"))
+        .expect("cat echoes stdin and exits on EOF");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "payload {\"a b\"}\n");
+}
+
+#[test]
+fn security_quote_escapes_quotes_backslashes_and_wraps() {
+    assert_eq!(security_quote("plain").expect("quote"), "\"plain\"");
+    assert_eq!(
+        security_quote(r#"{"k": "a b"}"#).expect("quote"),
+        r#""{\"k\": \"a b\"}""#
+    );
+    assert_eq!(
+        security_quote(r"back\slash").expect("quote"),
+        r#""back\\slash""#
+    );
+}
+
+#[test]
+fn security_quote_refuses_embedded_newlines() {
+    // `-i` is a line protocol — a newline inside a value would parse as a
+    // second command. Refusal must be loud, never a silent truncation.
+    assert!(security_quote("a\nb").is_err());
+    assert!(security_quote("a\rb").is_err());
 }
