@@ -5,7 +5,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write  # softprops/action-gh-release creates the release
+  contents: write  # gh release upload attaches assets to the release
 
 # Force HTTP/1.1 for registry downloads: curl's HTTP/2 multiplexing against the
 # crates.io CDN intermittently dies with "[16] Error in the HTTP2 framing layer"
@@ -14,18 +14,16 @@ env:
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
 
-jobs:
-  create-release:
-    name: Create release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: softprops/action-gh-release@v3
-        with:
-          generate_release_notes: false
+# The release itself is created by release.sh right after the tag push, with the
+# full changelog already in the body so the notes ride along in GitHub's release
+# email. This workflow never creates the release or touches its notes -- it only
+# builds the per-OS binaries and uploads them (plus sums + signature) to the
+# release the script already published. One upload point (the publish job), so no
+# concurrent softprops find-or-create can duplicate the release and orphan the notes.
 
+jobs:
   build:
     name: Build ${{ matrix.asset_name }}
-    needs: create-release
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -60,22 +58,18 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
       - name: Prepare asset
         run: cp "target/${{ matrix.target }}/release/clauth${{ matrix.ext }}" "${{ matrix.asset_name }}${{ matrix.ext }}"
-      - name: Upload to release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: ${{ matrix.asset_name }}${{ matrix.ext }}
-      - name: Upload artifact for checksum job
+      - name: Upload artifact for the publish job
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}${{ matrix.ext }}
           path: ${{ matrix.asset_name }}${{ matrix.ext }}
           if-no-files-found: error
 
-  checksums:
-    name: Checksums + signature
+  publish:
+    name: Publish assets
     needs: [build]
-    # Run even when a build leg fails so the binaries that DID ship always have
-    # a matching sums file covering exactly what was published.
+    # Run even when a build leg fails so the binaries that DID ship still get
+    # attached with a matching sums file covering exactly what was published.
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -84,25 +78,17 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-      - name: Generate sha256sums.txt
-        # Glob whatever was actually built so a partial release still produces
-        # a sums file matching exactly what shipped.
-        run: |
-          cd artifacts
-          sha256sum clauth-* > ../sha256sums.txt
-      - name: Upload sha256sums.txt to release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: sha256sums.txt
-      - name: Sign sha256sums.txt with minisign
+      - name: Generate + sign sha256sums.txt
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-        # Signing the sums file transitively authenticates every asset hash it
-        # lists. Gated on the secret so forks / pre-key releases still ship a
-        # valid sha256-only release; update.rs verifies this signature when (and
-        # only when) MINISIGN_PUBLIC_KEY is pinned. A passwordless key signs
-        # non-interactively in the default (prehashed) format.
+        # Glob whatever was actually built so a partial release still produces a sums
+        # file matching exactly what shipped. Signing the sums file transitively
+        # authenticates every asset hash it lists; gated on the secret so a fork /
+        # pre-key release still ships a valid sha256-only release. update.rs verifies
+        # this signature when (and only when) MINISIGN_PUBLIC_KEY is pinned.
         run: |
+          cd artifacts
+          sha256sum clauth-* > sha256sums.txt
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
             echo "MINISIGN_SECRET_KEY not set — shipping sha256-only (no signature)."
             exit 0
@@ -114,8 +100,17 @@ jobs:
           printf '%s\n' "${MINISIGN_SECRET_KEY}" > minisign.key
           minisign -S -s minisign.key -m sha256sums.txt -t "clauth ${GITHUB_REF_NAME} checksums"
           echo "Signed → sha256sums.txt.minisig"
-      - name: Upload signature to release
-        if: hashFiles('sha256sums.txt.minisig') != ''
-        uses: softprops/action-gh-release@v3
-        with:
-          files: sha256sums.txt.minisig
+      - name: Upload assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # release.sh normally creates the release (with the full notes) moments after
+        # the tag push; fall back to a bare release so a hand-pushed tag still gets
+        # its binaries. Never generate notes here -- the script owns them. --clobber
+        # keeps re-runs idempotent.
+        run: |
+          cd artifacts
+          gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --notes "" --verify-tag
+          files=(clauth-* sha256sums.txt)
+          [ -f sha256sums.txt.minisig ] && files+=(sha256sums.txt.minisig)
+          gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
