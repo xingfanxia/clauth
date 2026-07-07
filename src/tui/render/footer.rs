@@ -289,7 +289,7 @@ fn draw_login(
         Span::styled(format!("{} ", spinner_frame(tick)), theme::accent()),
         Span::styled(
             format!(
-                "logging in '{}' — complete it in your browser",
+                "logging in '{}' (complete it in your browser)",
                 session.name
             ),
             theme::dim(),
