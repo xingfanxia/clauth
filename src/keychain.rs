@@ -47,15 +47,39 @@ const SECURITY_TIMEOUT: Duration = Duration::from_secs(20);
 /// error on spawn failure / timeout. Extracted so the deadline is unit-testable
 /// with a benign hanging command (`sleep`) — no real Keychain is touched.
 ///
+/// `stdin_payload`, when given, is written to the child's stdin which is then
+/// closed (EOF) — the transport for `security -i`'s command line, keeping the
+/// secret out of argv. The payload is a few KB and the write happens before the
+/// poll loop; a macOS pipe buffer is 64 KB, so the single write cannot block.
+///
 /// `security` produces only a few bytes of output, so buffering it in the pipe
 /// while we poll cannot deadlock on a full pipe buffer.
-fn run_with_deadline(mut cmd: Command, timeout: Duration) -> Result<Output> {
+fn run_with_deadline(
+    mut cmd: Command,
+    timeout: Duration,
+    stdin_payload: Option<&str>,
+) -> Result<Output> {
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(if stdin_payload.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn {SECURITY_BIN}"))?;
+    if let Some(payload) = stdin_payload {
+        use std::io::Write;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("child stdin unexpectedly absent")?;
+        stdin
+            .write_all(payload.as_bytes())
+            .with_context(|| format!("failed to write {SECURITY_BIN} stdin"))?;
+        // Dropping the handle closes the pipe — the child sees EOF and runs.
+    }
     let deadline = Instant::now() + timeout;
     loop {
         match child
@@ -125,7 +149,7 @@ fn account() -> Result<String> {
 fn read_at(service: &str, account: &str) -> Result<Option<ClaudeCredentials>> {
     let mut cmd = Command::new(SECURITY_BIN);
     cmd.args(["find-generic-password", "-s", service, "-a", account, "-w"]);
-    let output = run_with_deadline(cmd, SECURITY_TIMEOUT)
+    let output = run_with_deadline(cmd, SECURITY_TIMEOUT, None)
         .with_context(|| format!("failed to run {SECURITY_BIN} find-generic-password"))?;
     if output.status.success() {
         // `-w` prints only the password (our JSON) followed by a trailing newline.
@@ -140,36 +164,52 @@ fn read_at(service: &str, account: &str) -> Result<Option<ClaudeCredentials>> {
     }
 }
 
+/// Quote `s` for `security -i`'s line tokenizer: wrap in `"…"` with `\` → `\\`
+/// and `"` → `\"`. Verified empirically (macOS 15 / Darwin 25): an escaped
+/// quoted string round-trips byte-identical through `add-generic-password -w`,
+/// including embedded spaces, double quotes, and backslashes; an UNquoted value
+/// containing whitespace is split into separate argv words (usage error).
+/// Embedded newlines are refused — `-i` is a line protocol, and a `\n` inside a
+/// value would be parsed as a second command.
+fn security_quote(s: &str) -> Result<String> {
+    if s.contains('\n') || s.contains('\r') {
+        anyhow::bail!("refusing to pass a value with an embedded newline to `security -i`");
+    }
+    Ok(format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
 /// Add-or-update the item at `(service, account)` with `creds` serialized as the
 /// `{"claudeAiOauth":{…}}` JSON Claude Code expects, via
 /// `security add-generic-password -U`. `-U` updates the item in place when it
 /// already exists (created by Claude Code) and adds it otherwise.
 ///
-/// The secret is passed as the `-w` argument, so it is briefly visible in this
-/// user's own process list. Accepted tradeoff (TECH-9 #17): `argv` is readable
-/// only by the SAME UID (or root) on macOS — there is no other-user `ps`
-/// disclosure — and it is the operator's own token on their own machine. A
-/// same-UID process already owns the 0o600 credential files, so racing `ps` to
-/// catch this argv is strictly harder than reading the file. The one residual
-/// sink argv adds over a file read is process-exec logging (Endpoint Security
-/// `es_event_exec_t`, i.e. most EDR agents), which captures full command lines; on
-/// a machine running EDR the token may reach that log store. `security` does have a
-/// no-value `-w` form, but it prompts on the controlling *tty* (`readpassphrase`),
-/// not stdin — a pipe can't feed it — so it is not a usable non-argv path here.
+/// The command line is fed to `security -i` over **stdin**, not argv, so the
+/// token never appears in this process's own argv — keeping it out of
+/// process-exec logging (Endpoint Security `es_event_exec_t`, i.e. most EDR
+/// agents), which captures full command lines at exec time but not pipe
+/// contents. (Plain same-UID `ps` exposure was already an accepted tradeoff —
+/// TECH-9 #17: argv is readable only by the same UID or root on macOS, and a
+/// same-UID process already owns the 0o600 credential files — but the EDR log
+/// store was the one residual argv-only sink, and `-i` closes it.) `-i`'s
+/// tokenizer needs the [`security_quote`] escaping for values with whitespace;
+/// the inner command's exit code propagates as `security -i`'s own exit code
+/// (verified: 0 on success, 44 for `errSecItemNotFound`, 2 on usage error).
+/// The no-value `-w` prompt form is still unusable here — it reads from the
+/// controlling *tty* (`readpassphrase`), not stdin, so a pipe can't feed it.
 fn write_at(service: &str, account: &str, creds: &ClaudeCredentials) -> Result<()> {
     let json = serde_json::to_string(creds).context("failed to serialize Claude credentials")?;
+    let line = format!(
+        "add-generic-password -U -s {} -a {} -w {}\n",
+        security_quote(service)?,
+        security_quote(account)?,
+        security_quote(&json)?,
+    );
     let mut cmd = Command::new(SECURITY_BIN);
-    cmd.args([
-        "add-generic-password",
-        "-U",
-        "-s",
-        service,
-        "-a",
-        account,
-        "-w",
-        &json,
-    ]);
-    let output = run_with_deadline(cmd, SECURITY_TIMEOUT)
+    cmd.arg("-i");
+    let output = run_with_deadline(cmd, SECURITY_TIMEOUT, Some(&line))
         .with_context(|| format!("failed to run {SECURITY_BIN} add-generic-password"))?;
     if output.status.success() {
         Ok(())
@@ -183,7 +223,7 @@ fn write_at(service: &str, account: &str, creds: &ClaudeCredentials) -> Result<(
 fn delete_at(service: &str, account: &str) -> Result<()> {
     let mut cmd = Command::new(SECURITY_BIN);
     cmd.args(["delete-generic-password", "-s", service, "-a", account]);
-    let output = run_with_deadline(cmd, SECURITY_TIMEOUT)
+    let output = run_with_deadline(cmd, SECURITY_TIMEOUT, None)
         .with_context(|| format!("failed to run {SECURITY_BIN} delete-generic-password"))?;
     if output.status.success() || output.status.code() == Some(EXIT_ITEM_NOT_FOUND) {
         Ok(())
@@ -193,7 +233,8 @@ fn delete_at(service: &str, account: &str) -> Result<()> {
 }
 
 /// Build an error from a failed `security` invocation, including its stderr and
-/// exit code (never the password, which is only ever on stdin/argv, not stderr).
+/// exit code (never the password, which travels only on the child's stdin —
+/// `write_at` via `security -i` — and is never echoed to stderr).
 fn security_error(op: &str, output: &std::process::Output) -> anyhow::Error {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let code = output
