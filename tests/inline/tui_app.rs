@@ -358,6 +358,35 @@ fn login_creds(refresh: &str) -> crate::profile::ClaudeCredentials {
     }
 }
 
+/// Like [`login_creds`] but with a caller-chosen access token, so a test can
+/// change the live login's fingerprint without changing its account.
+fn creds_ra(refresh: &str, access: &str) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    }
+}
+
+/// Write a plain (diverged) `~/.claude/.credentials.json` carrying `creds`.
+fn write_live_creds(creds: &crate::profile::ClaudeCredentials) {
+    let path = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(&path, serde_json::to_vec(creds).expect("ser live")).expect("write live");
+}
+
+/// Force the 1Hz divergence poll to run now, bypassing its interval throttle.
+fn force_poll(app: &mut App) {
+    app.last_divergence_check = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    super::poll_credentials_divergence(app);
+}
+
 /// An in-flight login session fixture at the waiting stage.
 fn login_session(name: &str, is_new: bool, generation: u64) -> super::LoginSession {
     super::LoginSession {
@@ -704,6 +733,132 @@ fn relogin_gate_maps_divergence_defaults() {
         app.config().find("work").and_then(|p| p.refresh_token()),
         Some("new"),
         "the first login adopts silently"
+    );
+}
+
+// Issue #20: dismissing the divergence prompt must stop the 1Hz poll from
+// re-pushing it every second. The snooze releases only when the live login
+// itself changes (a fresh /login or refresh), so a stale account isn't nagged
+// forever yet a genuinely new one still surfaces.
+#[test]
+fn divergence_dismiss_snoozes_until_the_live_login_changes() {
+    use super::{Modal, handle_key};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    force_poll(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Divergence(_))),
+        "a diverged active profile prompts"
+    );
+
+    handle_key(&mut app, key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "esc dismisses the prompt");
+    assert!(app.divergence_snooze.is_some(), "esc records a snooze");
+
+    force_poll(&mut app);
+    assert!(
+        app.modals.is_empty(),
+        "the same dismissed login must not re-prompt"
+    );
+
+    // A fresh login (new access token, same or different account) re-prompts.
+    write_live_creds(&creds_ra("rt-live", "at-2"));
+    force_poll(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Divergence(_))),
+        "a changed live login re-prompts once"
+    );
+}
+
+// Issue #20: "save elsewhere" must let the user route the live login into a
+// profile OTHER than the active one, so re-logging a second account while the
+// wrong profile is active no longer forces two profiles onto one account.
+#[test]
+fn divergence_picker_saves_the_login_into_a_chosen_profile() {
+    use super::{ConfirmAction, Modal, handle_key, run_confirm_action, run_divergence_choice};
+    use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut spare = Profile::new("spare".to_string(), None, None);
+    spare.credentials = Some(login_creds("rt-spare"));
+    save_profile(&spare).expect("save spare");
+    // CC re-logged an account; the live file carries a fresh token that matches
+    // no stored profile (a re-login mints a new refresh token).
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles: vec![work, spare],
+    });
+
+    // "save elsewhere" opens the picker listing only the non-active profile.
+    run_divergence_choice(&mut app, "work", DivergenceChoice::NewProfile);
+    let Some(Modal::DivergenceTarget(form)) = app.modals.last() else {
+        panic!("expected the target picker, got {:?}", app.modals.last());
+    };
+    assert_eq!(
+        form.targets,
+        vec!["spare".to_string()],
+        "the active profile is never an overwrite target"
+    );
+
+    // Move to "spare" (row 1) and pick it.
+    handle_key(&mut app, key(KeyCode::Down));
+    handle_key(&mut app, key(KeyCode::Enter));
+    let Some(Modal::Confirm(state)) = app.modals.last() else {
+        panic!(
+            "expected the overwrite confirm, got {:?}",
+            app.modals.last()
+        );
+    };
+    assert!(
+        matches!(&state.on_confirm, ConfirmAction::AdoptDivergence(_, name) if name == "spare"),
+        "the confirm adopts the live login into the chosen profile"
+    );
+
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        unreachable!("asserted above");
+    };
+    run_confirm_action(&mut app, state.on_confirm);
+
+    assert_eq!(
+        app.config().find("spare").and_then(|p| p.refresh_token()),
+        Some("rt-fresh"),
+        "the live login landed in the chosen profile"
+    );
+    assert_eq!(
+        app.config().find("work").and_then(|p| p.refresh_token()),
+        Some("rt-work"),
+        "the previously active profile is untouched"
+    );
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("spare"),
+        "the chosen profile becomes active so the divergence is resolved"
     );
 }
 

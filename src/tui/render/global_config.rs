@@ -101,7 +101,7 @@ fn row_hint(
                 "fold a new login into the active account, replacing its credentials"
             }
             Some(DivergenceChoice::NewProfile) => {
-                "save a new login as its own account and keep the current one"
+                "pick which account to save a new login into, keeping the current one"
             }
             Some(DivergenceChoice::Discard) => {
                 "restore the previous credentials and drop the new login"

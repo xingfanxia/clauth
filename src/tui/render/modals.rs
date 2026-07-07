@@ -10,8 +10,8 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use crate::profile::DivergenceChoice;
 
 use super::super::app::{
-    ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceForm, EnvCollisionChoice,
-    EnvCollisionForm, InputState, LoginStage, Modal, Tab,
+    ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceForm, DivergenceTargetForm,
+    EnvCollisionChoice, EnvCollisionForm, InputState, LoginStage, Modal, Tab,
 };
 use super::super::theme;
 use super::format::spinner_frame;
@@ -22,6 +22,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::Confirm(state) => draw_confirm(frame, area, state),
         Modal::Divergence(form) => draw_divergence(frame, area, form),
         Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input),
+        Modal::DivergenceTarget(form) => draw_divergence_target(frame, area, form),
         Modal::Help => draw_help(frame, area, app),
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
         Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
@@ -133,6 +134,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let title = match state.on_confirm {
         ConfirmAction::CaptureConflict(..) => "CONFIRM",
         ConfirmAction::CaptureOverwrite(..) => "CONFIRM",
+        ConfirmAction::AdoptDivergence(..) => "CONFIRM",
         ConfirmAction::Switch(_) => "CONFIRM",
         ConfirmAction::DiscardDivergence(_) => "CONFIRM",
         ConfirmAction::RotateAll => "CONFIRM",
@@ -151,6 +153,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::RotateAll
             | ConfirmAction::RotateOne(_)
             | ConfirmAction::CaptureOverwrite(..)
+            | ConfirmAction::AdoptDivergence(..)
             | ConfirmAction::BlankCredentials(_)
     );
 
@@ -209,59 +212,64 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
 
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(vec![
-            Span::styled("~/.claude/.credentials.json", theme::body()),
-            Span::styled(" no longer points to ", theme::dim()),
+            Span::styled("the live login no longer matches ", theme::dim()),
             Span::styled(
                 format!("'{}'", form.active),
                 Style::default().fg(theme::accent_color()),
             ),
             Span::styled(".", theme::dim()),
         ]),
-        Line::from(Span::styled(
-            "Claude Code re-logged or refreshed via unlink+write.",
-            theme::dim(),
-        )),
         Line::from(""),
     ];
 
     for (i, option) in options.iter().enumerate() {
         let selected = i == cursor;
-        let arrow = if selected {
-            Span::styled("\u{276f} ", theme::accent())
-        } else {
-            Span::raw("  ")
-        };
-        let (label, detail) = divergence_option_text(*option, &form.active);
-        let label_style = if selected {
-            theme::accent()
-        } else {
-            theme::dim()
-        };
-        lines.push(Line::from(vec![arrow, Span::styled(label, label_style)]));
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(detail, theme::dim()),
-        ]));
+        lines.push(option_line(
+            selected,
+            divergence_option_text(*option, &form.active),
+        ));
     }
 
     draw_modal(frame, area, "DIVERGENCE", lines);
 }
 
-fn divergence_option_text(option: DivergenceChoice, active: &str) -> (String, String) {
+fn divergence_option_text(option: DivergenceChoice, active: &str) -> String {
     match option {
-        DivergenceChoice::Overwrite => (
-            format!("overwrite '{active}' with new credentials"),
-            "save the live tokens into the active profile and re-link".to_string(),
-        ),
-        DivergenceChoice::NewProfile => (
-            "save new credentials as a new profile".to_string(),
-            format!("preserve '{active}' as-is and capture the live tokens elsewhere"),
-        ),
-        DivergenceChoice::Discard => (
-            format!("discard new credentials, restore '{active}'"),
-            "overwrites the live file with the profile's stored tokens".to_string(),
-        ),
+        DivergenceChoice::Overwrite => format!("overwrite '{active}' with this login"),
+        DivergenceChoice::NewProfile => "save this login to another profile…".to_string(),
+        DivergenceChoice::Discard => format!("discard this login, restore '{active}'"),
     }
+}
+
+/// Arrow-selected menu row shared by the Divergence and target-picker modals:
+/// `❯ ` accent when selected, two-space indent + dim otherwise.
+fn option_line(selected: bool, label: String) -> Line<'static> {
+    let arrow = if selected {
+        Span::styled("\u{276f} ", theme::accent())
+    } else {
+        Span::raw("  ")
+    };
+    let style = if selected {
+        theme::accent()
+    } else {
+        theme::dim()
+    };
+    Line::from(vec![arrow, Span::styled(label, style)])
+}
+
+fn draw_divergence_target(frame: &mut Frame<'_>, area: Rect, form: &DivergenceTargetForm) {
+    let cursor = form.cursor.min(form.targets.len());
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled("where to save the login?", theme::dim())),
+        Line::from(""),
+        option_line(cursor == 0, "+ new profile".to_string()),
+    ];
+    for (i, name) in form.targets.iter().enumerate() {
+        lines.push(option_line(cursor == i + 1, format!("overwrite '{name}'")));
+    }
+
+    draw_modal(frame, area, "SAVE LOGIN", lines);
 }
 
 fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm) {

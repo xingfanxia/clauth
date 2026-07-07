@@ -351,6 +351,11 @@ pub(crate) enum ConfirmAction {
     /// `overwrite_captured_profile` the same way `CaptureConflict` carries them
     /// to `capture_into_profile`.
     CaptureOverwrite(Box<CaptureSnapshot>, String, bool),
+    /// Divergence "save elsewhere" → a chosen (non-active) profile. `String` =
+    /// that profile. Saves the live login into it and force-links it active —
+    /// the guarded relink can't resolve a CC-written divergence (the on-disk
+    /// byte formats differ), so this path forces the live link onto the target.
+    AdoptDivergence(Box<CaptureSnapshot>, String),
     Switch(String),
     /// Confirm before discarding CC's freshly-written credentials and relinking.
     DiscardDivergence(String),
@@ -396,6 +401,16 @@ impl DivergenceForm {
             DivergenceChoice::Discard,
         ]
     }
+}
+
+/// "Save the live login to another profile" picker, opened from the Divergence
+/// modal's second action. Row 0 is `+ new profile`; rows 1.. are existing
+/// profiles (the active/diverged one excluded). A refresh-token match is
+/// pre-selected so re-logging an account you already hold is one keypress.
+#[derive(Debug, Clone)]
+pub(crate) struct DivergenceTargetForm {
+    pub(crate) targets: Vec<String>,
+    pub(crate) cursor: usize,
 }
 
 /// A choice on the env-key collision prompt (3 vertical options).
@@ -585,6 +600,8 @@ pub(crate) enum Modal {
     /// Credential divergence prompt.
     Divergence(DivergenceForm),
     CaptureName(CaptureNameForm),
+    /// Divergence "save elsewhere": pick which profile the live login lands in.
+    DivergenceTarget(DivergenceTargetForm),
     Help,
     /// Context-sensitive action menu opened by `a`.
     ActionMenu(ActionMenuState),
@@ -1137,6 +1154,11 @@ pub(crate) struct App {
     pub(crate) banner: Option<Banner>,
     /// Last time the 1Hz divergence poll ran.
     pub(crate) last_divergence_check: Instant,
+    /// Fingerprint of a divergence the user dismissed with esc (siphash of the
+    /// live access token). The poll stays quiet while the live login still
+    /// hashes to this; a fresh `/login` or refresh changes it and re-prompts
+    /// once. In-memory only — a restart re-evaluates.
+    pub(crate) divergence_snooze: Option<u64>,
     /// Throttle for the Plugin tab's per-tick live refresh (session counts + link
     /// state); recompute fires at most once per `PLUGIN_REFRESH_INTERVAL`.
     pub(crate) last_plugin_refresh: Instant,
@@ -1374,6 +1396,7 @@ impl App {
             footer_alert: None,
             banner: None,
             last_divergence_check: Instant::now(),
+            divergence_snooze: None,
             last_plugin_refresh: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
@@ -3008,17 +3031,18 @@ fn perform_switch_off(app: &mut App) {
     }
 }
 
-fn begin_capture(app: &mut App, from_divergence: bool) {
+/// Read the live login into a snapshot, or toast + `None` when there's nothing
+/// to capture. An all-empty snapshot would persist a credential-less profile
+/// behind a success toast (issue #1 — on macOS CC keeps its login in the
+/// Keychain, so the credentials file is absent).
+fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
     let snapshot = match capture_snapshot() {
         Ok(s) => s,
         Err(e) => {
             app.toast(ToastKind::Danger, format!("capture failed: {e}"));
-            return;
+            return None;
         }
     };
-    // Refuse an all-empty snapshot: persisting it would create a
-    // credential-less profile behind a success toast (issue #1 — on macOS CC
-    // keeps its login in the Keychain, so the credentials file is absent).
     let has_oauth = snapshot
         .credentials
         .as_ref()
@@ -3028,8 +3052,15 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
             ToastKind::Danger,
             "no live login found — nothing to capture (macOS keychain isn't supported yet)",
         );
-        return;
+        return None;
     }
+    Some(snapshot)
+}
+
+fn begin_capture(app: &mut App, from_divergence: bool) {
+    let Some(snapshot) = capture_live_or_toast(app) else {
+        return;
+    };
     let existing_match = {
         let cfg = app.config();
         find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref()).map(str::to_string)
@@ -3770,6 +3801,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::Confirm(_) => handle_confirm_key(app, key),
         Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
+        Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
         Modal::Login => {
@@ -5246,6 +5278,31 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Err(e) => app.toast(ToastKind::Danger, format!("overwrite failed: {e}")),
             }
         }
+        ConfirmAction::AdoptDivergence(snapshot, name) => {
+            // `name` is never the active profile (the picker lists only others),
+            // so `overwrite_captured_profile` just rewrites its stored creds and
+            // skips its own guarded relink. Then force the live link onto it and
+            // make it active — the divergence is resolved onto the target.
+            let result = {
+                let mut cfg = app.config();
+                overwrite_captured_profile(&mut cfg, &name, *snapshot).and_then(|()| {
+                    cfg.state.active_profile = Some(name.as_str().into());
+                    save_app_state(&cfg.state)
+                })
+            };
+            let result = result.and_then(|()| force_link_profile_credentials(&name));
+            match result {
+                Ok(()) => {
+                    app.refresh_tokens();
+                    app.last_state_mtime = app_state_mtime();
+                    app.toast(
+                        ToastKind::Success,
+                        format!("saved the login into '{name}', now active"),
+                    );
+                }
+                Err(e) => app.toast(ToastKind::Danger, format!("save failed: {e}")),
+            }
+        }
         ConfirmAction::Switch(name) => {
             if !is_idle(&app.activity, &name) {
                 app.toast(
@@ -5369,7 +5426,9 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            // Esc / q dismiss; the 1Hz poll re-pushes if divergence persists.
+            // Snooze this exact live login so the 1Hz poll stops re-pushing; a
+            // fresh login or refresh changes the fingerprint and re-prompts.
+            app.divergence_snooze = live_creds_fingerprint();
             app.modals.pop();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
@@ -5403,11 +5462,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 format!("saved live credentials into '{active}'"),
             );
         }
-        DivergenceChoice::NewProfile => {
-            // Defer detach+deactivate to the capture's success arm so cancel
-            // (Esc on the name modal) leaves the prior profile intact.
-            begin_capture(app, true);
-        }
+        DivergenceChoice::NewProfile => open_divergence_target_picker(app),
         DivergenceChoice::Discard => {
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: format!("Discard the new login and restore '{active}'?"),
@@ -5430,6 +5485,92 @@ fn run_discard_divergence(app: &mut App, active: &str) {
         ToastKind::Warning,
         format!("discarded new login; restored '{active}'"),
     );
+}
+
+/// Open the "save elsewhere" picker from the Divergence modal. Lists every
+/// profile except the active (diverged) one; a refresh-token match is
+/// pre-selected. With no other profile to pick, drops straight into a
+/// new-profile capture.
+fn open_divergence_target_picker(app: &mut App) {
+    let (targets, preselect) = {
+        let cfg = app.config();
+        let active = cfg.state.active_profile.as_deref();
+        let targets: Vec<String> = cfg
+            .profiles
+            .iter()
+            .map(|p| p.name.as_str().to_string())
+            .filter(|n| Some(n.as_str()) != active)
+            .collect();
+        let live = read_claude_credentials().ok().flatten();
+        let preselect = find_matching_oauth_profile(&cfg, live.as_ref())
+            .and_then(|m| targets.iter().position(|n| n == m))
+            .map_or(0, |i| i + 1);
+        (targets, preselect)
+    };
+    if targets.is_empty() {
+        begin_capture(app, true);
+        return;
+    }
+    app.modals
+        .push(Modal::DivergenceTarget(DivergenceTargetForm {
+            targets,
+            cursor: preselect,
+        }));
+}
+
+/// Rows: 0 = `+ new profile` (→ capture-name), 1.. = existing profiles
+/// (→ overwrite-confirm on that profile). Both routes carry `from_divergence`,
+/// so the prior active is detached only once the action is confirmed and a
+/// cancel leaves everything as-is.
+fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::DivergenceTarget(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let last = form.targets.len(); // row 0 is "+ new"; rows 1..=len are profiles
+    match key.code {
+        KeyCode::Up => {
+            form.cursor = if form.cursor == 0 {
+                last
+            } else {
+                form.cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            form.cursor = if form.cursor >= last {
+                0
+            } else {
+                form.cursor + 1
+            };
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let cursor = form.cursor;
+            let Some(Modal::DivergenceTarget(form)) = app.modals.pop() else {
+                return;
+            };
+            if cursor == 0 {
+                begin_capture(app, true);
+                return;
+            }
+            let Some(target) = form.targets.get(cursor - 1).cloned() else {
+                return;
+            };
+            let Some(snapshot) = capture_live_or_toast(app) else {
+                return;
+            };
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: format!("Save the live login into '{target}'?"),
+                detail: Some(format!(
+                    "'{target}' becomes the active account; its old credentials are replaced. Usage history, env, and model settings are kept."
+                )),
+                choice: false,
+                on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), target),
+            }));
+        }
+        _ => {}
+    }
 }
 
 fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
@@ -6008,6 +6149,7 @@ fn poll_credentials_divergence(app: &mut App) {
         classify_credentials_link(&active).ok(),
         Some(LinkState::Diverged)
     ) {
+        app.divergence_snooze = None; // resolved; a later divergence re-prompts
         return;
     }
     // First login on a credential-less profile: adopt silently, don't prompt.
@@ -6031,8 +6173,27 @@ fn poll_credentials_divergence(app: &mut App) {
         run_divergence_choice(app, &active, choice);
         return;
     }
+    // Dismissed already and the live login hasn't changed since — stay quiet.
+    let fingerprint = live_creds_fingerprint();
+    if fingerprint.is_some() && fingerprint == app.divergence_snooze {
+        return;
+    }
+    app.divergence_snooze = None;
     app.modals
         .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+}
+
+/// SipHash of the live access token — a cheap identity for "which login sits in
+/// `~/.claude/.credentials.json` right now". It changes on every re-login and
+/// every refresh, so a snooze keyed to it releases exactly when the creds
+/// change. `None` when no readable OAuth login is present.
+fn live_creds_fingerprint() -> Option<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let creds = read_claude_credentials().ok().flatten()?;
+    let token = creds.access_token().filter(|t| !t.is_empty())?;
+    let mut hasher = DefaultHasher::new();
+    token.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 /// Clears `bootstrap_active` and posts `BootstrapDone` when dropped — success
