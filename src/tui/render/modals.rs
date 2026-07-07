@@ -32,8 +32,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
 
 /// In-flight login progress. Renders live from `App::login` (the URL and the
 /// stage land async), so the modal variant carries no state of its own. The
-/// authorize URL must stay copyable as the paste fallback, so it wraps into
-/// fixed-width chunks instead of truncating.
+/// browser opens on its own; the modal offers an `r` retry instead of a
+/// pasteable URL, since a wrapped ~440-char authorize link isn't clickable and
+/// clips in compact mode. A headless host uses `clauth login` (CLI) instead.
 fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(session) = app.login.as_ref() else {
         return; // login ended this frame; the modal pops on the next drain
@@ -58,20 +59,18 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]),
         Line::from(""),
     ];
-    match &session.url {
-        Some(url) => {
+    match session.url {
+        // The URL is known once the worker announced it, so the retry is live.
+        Some(_) => {
             lines.push(Line::from(Span::styled(
-                "if no browser opened, use this url:",
+                "complete the sign-in in your browser",
                 theme::dim(),
             )));
-            const URL_CHUNK: usize = 64;
-            let chars: Vec<char> = url.chars().collect();
-            for chunk in chars.chunks(URL_CHUNK) {
-                lines.push(Line::from(Span::styled(
-                    chunk.iter().collect::<String>(),
-                    theme::dim(),
-                )));
-            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("r", theme::accent().add_modifier(Modifier::BOLD)),
+                Span::styled("  open the browser again", theme::dim()),
+            ]));
         }
         None => lines.push(Line::from(Span::styled(
             "opening your browser…",
@@ -142,6 +141,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::WireMcpServers => "CONFIRM",
         ConfirmAction::RelinkCredentials(_) => "CONFIRM",
         ConfirmAction::BlankCredentials(_) => "CONFIRM",
+        ConfirmAction::RestartLogin(..) => "CONFIRM",
     };
 
     // Destructive/global ops carry a DANGER cue on their confirm button.

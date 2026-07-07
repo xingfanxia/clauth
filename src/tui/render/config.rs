@@ -407,8 +407,8 @@ fn detail_row(
             Line::from(vec![arrow, Span::styled("create account", theme::accent())])
         }
         ConfigRow::Login => {
-            // A draft-held mint renders the done state; ⏎ still re-runs the
-            // login and replaces the stash.
+            // A draft-held mint renders the done state; ⏎ re-runs the login but
+            // confirms first before replacing the stash.
             if snap.captured {
                 Line::from(vec![arrow, Span::styled("✓ logged in", theme::success())])
             } else {

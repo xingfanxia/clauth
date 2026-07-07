@@ -112,6 +112,34 @@ fn dump(app: &App, w: u16, h: u16) -> String {
 }
 
 #[test]
+fn login_modal_drops_the_url_and_offers_a_retry() {
+    use crate::tui::app::{LoginSession, LoginStage, Modal, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    app.login = Some(LoginSession {
+        name: "fresh".to_string(),
+        is_new: true,
+        generation: 1,
+        url: Some("https://claude.com/cai/oauth/authorize?client_id=redacted".to_string()),
+        stage: LoginStage::WaitingBrowser,
+    });
+    app.modals.push(Modal::Login);
+
+    let out = dump(&app, 80, 24);
+    assert!(
+        out.contains("open the browser again"),
+        "the login modal offers a browser retry:\n{out}",
+    );
+    assert!(
+        !out.contains("oauth/authorize"),
+        "the wrapped authorize URL is no longer rendered inline:\n{out}",
+    );
+}
+
+#[test]
 fn all_tabs_render() {
     let profiles = vec![
         oauth("uwuclxdy", 42.0, 18.0, true),

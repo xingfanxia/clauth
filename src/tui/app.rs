@@ -373,6 +373,10 @@ pub(crate) enum ConfirmAction {
     RelinkCredentials(String),
     /// Setup tab: drop a profile's stored OAuth credentials, keeping the shell.
     BlankCredentials(String),
+    /// Setup `+ new` draft: a login already stashed a mint (the `✓ logged in`
+    /// row), so re-running would silently replace it. Confirm first, then
+    /// re-dispatch `start_login`. `bool` = `is_new`, carried to the restart.
+    RestartLogin(String, bool),
 }
 
 #[derive(Debug, Clone)]
@@ -3802,14 +3806,25 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
-        Modal::Login => {
+        Modal::Login => match key.code {
+            // Re-fire the browser open. The URL exists once the worker announced
+            // it; before that there is nothing to open, so `r` is a no-op.
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if let Some(url) = app.login.as_ref().and_then(|s| s.url.clone()) {
+                    match crate::platform::open_url(&url) {
+                        Ok(()) => app.toast(ToastKind::Info, "opening your browser…"),
+                        Err(_) => app.toast(ToastKind::Danger, "couldn't open the browser"),
+                    }
+                }
+            }
             // Collapse to the footer indicator; the login keeps running (the
             // generation is untouched). A real cancel is the top-level esc
             // once collapsed; ⏎ on the login row re-expands.
-            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                 app.modals.pop();
             }
-        }
+            _ => {}
+        },
     }
 }
 
@@ -4387,8 +4402,8 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 .config_draft
                 .as_ref()
                 .and_then(|d| d.editing_name.clone());
-            match editing {
-                Some(name) => start_login(app, name, false),
+            let target = match editing {
+                Some(name) => Some((name, false)),
                 None => {
                     let typed = app
                         .config_draft
@@ -4400,9 +4415,34 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                         validate_profile_name(&typed, &cfg.names(), None)
                     };
                     match validation {
-                        Ok(()) => start_login(app, typed, true),
-                        Err(e) => app.toast(ToastKind::Danger, format!("{e}")),
+                        Ok(()) => Some((typed, true)),
+                        Err(e) => {
+                            app.toast(ToastKind::Danger, format!("{e}"));
+                            None
+                        }
                     }
+                }
+            };
+            if let Some((name, is_new)) = target {
+                // A stashed mint (the `✓ logged in` done-state) makes ⏎ a
+                // stash-replacing re-login; gate it so it can't drop the capture
+                // silently. Only the `+ new` draft ever holds a stash.
+                let has_stash = app
+                    .config_draft
+                    .as_ref()
+                    .is_some_and(|d| d.captured_creds.is_some());
+                if has_stash {
+                    app.modals.push(Modal::Confirm(ConfirmState {
+                        message: "Replace the captured login?".to_string(),
+                        detail: Some(
+                            "A fresh browser login replaces the one already captured for this account. The stashed tokens are dropped."
+                                .to_string(),
+                        ),
+                        choice: false,
+                        on_confirm: ConfirmAction::RestartLogin(name, is_new),
+                    }));
+                } else {
+                    start_login(app, name, is_new);
                 }
             }
         }
@@ -5399,6 +5439,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Err(e) => app.toast(ToastKind::Danger, format!("clear credentials failed: {e}")),
             }
         }
+        ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
     }
 }
 

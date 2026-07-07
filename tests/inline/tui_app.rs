@@ -476,6 +476,39 @@ fn login_result_on_the_new_form_stashes_into_the_draft() {
 }
 
 #[test]
+fn relogin_on_a_stashed_new_form_confirms_before_replacing_the_stash() {
+    use super::{ConfigFocus, ConfigRow, ConfirmAction, Modal, build_draft_new, run_config_row};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.profile_cursor = 0; // the `+ new` form
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("fresh");
+    // A mint already captured → the `✓ logged in` done-state row.
+    draft.captured_creds = Some(Box::new(login_creds("stashed")));
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::Login);
+
+    assert!(
+        matches!(
+            app.modals.last(),
+            Some(Modal::Confirm(s)) if matches!(s.on_confirm, ConfirmAction::RestartLogin(_, true))
+        ),
+        "⏎ on a stashed new-form login must confirm before dropping the capture",
+    );
+    assert!(
+        app.login.is_none(),
+        "no login worker starts until the confirm is accepted",
+    );
+}
+
+#[test]
 fn login_result_with_the_form_closed_is_dropped_with_a_warning() {
     use super::{ToastKind, drain_login_events};
     use crate::profile::{AppConfig, AppState};
