@@ -179,8 +179,20 @@ fn login_route(config: &AppConfig, raw: &str) -> LoginRoute {
         // so `clauth login ACME` for stored `acme` refreshes the same profile
         // instead of bailing on the case-insensitive collision check.
         Some(existing) => LoginRoute::Reauth(existing),
-        None => LoginRoute::New(raw.to_string()),
+        // Store the TRIMMED name. Every later lookup (`canonical_name`,
+        // `resolve_or_bail`, `switch`) matches without trimming, so a padded
+        // `"  new  "` would be unreachable afterwards and a later `login "new"`
+        // wouldn't detect the collision, silently making a near-duplicate.
+        None => LoginRoute::New(raw.trim().to_string()),
     }
+}
+
+/// Parse a reauth-overwrite confirmation with a default-NO policy — the op
+/// replaces a profile's stored credentials, so silence must not proceed. Only
+/// `y`/`yes` (case-insensitive) confirms.
+fn reauth_confirmed(input: &str) -> bool {
+    let a = input.trim();
+    a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes")
 }
 
 /// `clauth login <name>` — add a new OAuth account by real browser login, with
@@ -216,6 +228,23 @@ fn cmd_login(name: &str, model: Option<&str>) -> Result<()> {
     let reauth = matches!(route, LoginRoute::Reauth(_));
 
     if reauth {
+        // A reauth overwrites the profile's stored credentials, so guard the
+        // typo case (a new account was meant, an existing name was typed) with
+        // a confirm. Only when BOTH ends are a TTY: a piped/non-interactive
+        // stdin can't be prompted and proceeds, so scripted reauth still works.
+        use std::io::{IsTerminal as _, Write as _};
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            print!(
+                "clauth: profile '{target}' already exists. Re-authenticating replaces its stored credentials. Continue? [y/N] "
+            );
+            let _ = std::io::stdout().flush();
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !reauth_confirmed(&answer) {
+                println!("clauth: aborted. '{target}' left unchanged.");
+                return Ok(());
+            }
+        }
         println!("clauth: re-authenticating existing profile '{target}' — opening a browser…");
     } else {
         println!("clauth: opening a browser to log in to a new account for '{target}'…");

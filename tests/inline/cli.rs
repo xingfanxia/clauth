@@ -136,3 +136,25 @@ fn login_route_case_variant_reauths_canonical_spelling() {
         "surrounding whitespace is trimmed before matching"
     );
 }
+
+// The New arm must trim too, symmetric with Reauth: a stored `"  new  "` would
+// be unreachable by the no-trim lookups every later command uses.
+#[test]
+fn login_route_new_name_trims_surrounding_whitespace() {
+    let config = config_with(&["acme"]);
+    assert_eq!(
+        login_route(&config, "  fresh  "),
+        LoginRoute::New("fresh".to_string())
+    );
+}
+
+// Reauth overwrite confirm is default-NO: only an explicit y/yes proceeds.
+#[test]
+fn reauth_confirmed_only_on_explicit_yes() {
+    for yes in ["y", "Y", "yes", "YES", "  y  ", "Yes\n"] {
+        assert!(reauth_confirmed(yes), "{yes:?} should confirm");
+    }
+    for no in ["", "  ", "n", "no", "nope", "\n", "yeah", "ok"] {
+        assert!(!reauth_confirmed(no), "{no:?} should decline");
+    }
+}
