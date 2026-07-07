@@ -158,23 +158,68 @@ fn parse_login_args(rest: &[String]) -> Option<(&str, Option<&str>)> {
     }
 }
 
+/// Where `clauth login <name>` lands. An EXISTING profile (matched
+/// case-insensitively, carrying its stored canonical spelling) is
+/// re-authenticated in place through the issue-#7 overwrite path; any other
+/// name creates a fresh profile. Pure, so the routing is unit-testable without
+/// `cmd_login`, which opens a real browser.
+#[derive(Debug, PartialEq)]
+enum LoginRoute {
+    /// No profile has this name — mint tokens into a brand-new profile.
+    New(String),
+    /// A profile already exists under this (canonical) name — mint fresh
+    /// tokens and overwrite its credential set in place, keeping its chain
+    /// slot, env, and model settings.
+    Reauth(String),
+}
+
+fn login_route(config: &AppConfig, raw: &str) -> LoginRoute {
+    match config.canonical_name(raw.trim()) {
+        // Route to the stored canonical spelling, not the typed case variant,
+        // so `clauth login ACME` for stored `acme` refreshes the same profile
+        // instead of bailing on the case-insensitive collision check.
+        Some(existing) => LoginRoute::Reauth(existing),
+        None => LoginRoute::New(raw.to_string()),
+    }
+}
+
 /// `clauth login <name>` — add a new OAuth account by real browser login, with
-/// visible progress. clauth reproduces Claude Code's own PKCE + loopback flow
-/// (see `oauth_login`) and writes the minted tokens straight into a fresh
-/// profile's `.credentials.json`, so it works identically on every platform —
-/// unlike running CC's own `/login`, which on macOS lands only in a per-config-
-/// dir hashed Keychain item and leaves the profile file empty (#1/#3).
-/// Captures into the profile; does not switch to it (`clauth <name>` does that).
-/// `--model` (any preset alias or a full custom id, same values the Setup tab's
-/// model row accepts) is persisted onto the new profile after capture, so its
-/// sessions route to that model from the first launch. Tokens are never printed
-/// — only a sha256 prefix.
+/// visible progress, or RE-AUTHENTICATE an existing profile in place (#7).
+/// clauth reproduces Claude Code's own PKCE + loopback flow (see `oauth_login`)
+/// and writes the minted tokens straight into the profile's
+/// `.credentials.json`, so it works identically on every platform — unlike
+/// running CC's own `/login`, which on macOS lands only in a per-config-dir
+/// hashed Keychain item and leaves the profile file empty (#1/#3).
+///
+/// A NEW name captures into a fresh profile; an EXISTING name routes through
+/// [`actions::overwrite_captured_profile`] — fresh tokens replace the
+/// credential set in place (chain slot, env, and model settings survive; stale
+/// per-account fetch caches are dropped; when it is the ACTIVE profile the
+/// live link is re-run so a running `claude` picks the new login up). Neither
+/// path switches to the profile (`clauth <name>` does that). `--model` (any
+/// preset alias or a full custom id, same values the Setup tab's model row
+/// accepts) is persisted onto the profile after capture, so its sessions route
+/// to that model from the first launch. Tokens are never printed — only a
+/// sha256 prefix.
 fn cmd_login(name: &str, model: Option<&str>) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
-    actions::validate_profile_name(name, &config.names(), None)?;
+    let route = login_route(&config, name);
+    let target = match &route {
+        LoginRoute::Reauth(existing) => existing.clone(),
+        LoginRoute::New(fresh) => {
+            actions::validate_profile_name(fresh, &config.names(), None)?;
+            fresh.clone()
+        }
+    };
 
-    println!("clauth: opening a browser to log in to a new account for '{name}'…");
+    let reauth = matches!(route, LoginRoute::Reauth(_));
+
+    if reauth {
+        println!("clauth: re-authenticating existing profile '{target}' — opening a browser…");
+    } else {
+        println!("clauth: opening a browser to log in to a new account for '{target}'…");
+    }
     let credentials = oauth_login::login_with(|progress| {
         // The CLI surfaces only the paste-fallback URL; the later milestones
         // are TUI-modal fodder and would just be noise between the prints here.
@@ -192,13 +237,22 @@ fn cmd_login(name: &str, model: Option<&str>) -> Result<()> {
         base_url: None,
         api_key: None,
     };
-    actions::capture_into_profile(&mut config, name.to_string(), snapshot)?;
-    // Preserve upstream's `--model` support: apply the requested default model to
-    // the freshly-captured profile so its sessions route there from the first launch.
-    if let Some(model) = model {
-        actions::set_profile_default_model(&mut config, name, model)?;
+    if reauth {
+        actions::overwrite_captured_profile(&mut config, &target, snapshot)?;
+    } else {
+        actions::capture_into_profile(&mut config, target.clone(), snapshot)?;
     }
-    println!("clauth: captured into profile '{name}'. Switch to it with:  clauth {name}");
+    // Apply the requested default model to the captured profile so its
+    // sessions route there from the first launch. On a reauth this is an
+    // explicit override — without `--model` the profile's settings survive.
+    if let Some(model) = model {
+        actions::set_profile_default_model(&mut config, &target, model)?;
+    }
+    if reauth {
+        println!("clauth: re-authenticated '{target}'. Fresh tokens are in place.");
+    } else {
+        println!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
+    }
     Ok(())
 }
 
@@ -236,10 +290,10 @@ fn print_help() {
          memory/plugins/hooks (run in a clean cwd for a blind session);\n                                  \
          extra args go to claude\n  \
            clauth login <profile> [--model <id>]\n                                  \
-         sign in via claude's own /login inside the profile's runtime;\n                                  \
-         creates the profile when missing and saves the completed login\n                                  \
-         into it; --model sets its default model first (opus/sonnet/haiku/\n                                  \
-         opusplan or a full model id)\n  \
+         add a new account via browser OAuth sign-in and capture it into a\n                                  \
+         new profile, or re-authenticate an existing one in place (neither\n                                  \
+         switches to it); --model sets its default model (opus/sonnet/\n                                  \
+         haiku/opusplan or a full model id)\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
          credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \

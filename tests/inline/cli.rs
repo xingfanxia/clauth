@@ -88,3 +88,51 @@ fn dispatch_login_model_flag_without_value_errors_with_usage() {
         "error must be a usage message, got: {err}"
     );
 }
+
+// ── login_route: `clauth login <existing>` re-authenticates instead of bailing ──
+
+fn config_with(names: &[&str]) -> crate::profile::AppConfig {
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    for n in names {
+        config.add(crate::profile::Profile::new((*n).to_string(), None, None));
+    }
+    config
+}
+
+#[test]
+fn login_route_new_name_creates() {
+    let config = config_with(&["acme"]);
+    assert_eq!(
+        login_route(&config, "fresh"),
+        LoginRoute::New("fresh".to_string())
+    );
+}
+
+#[test]
+fn login_route_existing_name_reauths() {
+    let config = config_with(&["acme"]);
+    assert_eq!(
+        login_route(&config, "acme"),
+        LoginRoute::Reauth("acme".to_string())
+    );
+}
+
+// A case variant must land on the STORED canonical spelling — otherwise the
+// collision validator would bail "already exists" and the reauth path is
+// unreachable for anyone who types `ACME` for stored `acme` (the #7 report).
+#[test]
+fn login_route_case_variant_reauths_canonical_spelling() {
+    let config = config_with(&["acme"]);
+    assert_eq!(
+        login_route(&config, "ACME"),
+        LoginRoute::Reauth("acme".to_string())
+    );
+    assert_eq!(
+        login_route(&config, "  acme  "),
+        LoginRoute::Reauth("acme".to_string()),
+        "surrounding whitespace is trimmed before matching"
+    );
+}
