@@ -1908,12 +1908,10 @@ impl App {
             .collect()
     }
 
-    /// Number of profiles.
     pub(crate) fn profile_count(&self) -> usize {
         self.config().profiles.len()
     }
 
-    /// Profile name at `idx`, if any.
     pub(crate) fn profile_name_at(&self, idx: usize) -> Option<String> {
         self.config().profiles.get(idx).map(|p| p.name.to_string())
     }

@@ -434,8 +434,10 @@ struct ProfileConfig {
 #[cfg(test)]
 static HOME_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Every test redirecting `home_dir()` (via `HOME_OVERRIDE` or `$HOME`) must hold
-/// this lock for its whole duration — both paths feed the same resolution.
+/// Serializes tests that redirect `home_dir()`: `HOME_OVERRIDE` and `$HOME` feed
+/// the same resolution, so overlapping redirects bleed between parallel tests.
+/// `testutil::HomeSandbox` and runtime's `with_fake_home` acquire it as RAII
+/// guards.
 #[cfg(test)]
 pub(crate) static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -446,7 +448,6 @@ pub(crate) fn set_home_override(path: PathBuf) {
     }
 }
 
-/// Clear the test home override. Must be called on teardown to avoid shadowing `$HOME`.
 #[cfg(test)]
 pub(crate) fn clear_home_override() {
     if let Ok(mut guard) = HOME_OVERRIDE.lock() {

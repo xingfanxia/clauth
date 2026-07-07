@@ -264,11 +264,6 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
 /// Returns a [`FetchOutcome`]: the rotated pair for the caller's `TokenList`
 /// sync, the `from_fetch` provenance flag, and the 429 `retry-after` hint that
 /// [`apply_outcome`] turns into a deferred next-fetch slot.
-///
-/// Flips `activity[name]` to `Refreshing` during `oauth::refresh`, then back to
-/// `Fetching` for the retry. The caller marks the initial `Queued`; the flip to
-/// `Fetching` happens in `get_json` once the request clears the throttle. The
-/// caller owns the final `Idle` clear.
 fn fetch_with_rotation(
     config: &crate::profile::ConfigHandle,
     name: &str,

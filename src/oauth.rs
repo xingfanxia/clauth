@@ -184,9 +184,9 @@ fn kick(access_token: &str) -> std::result::Result<(), KickError> {
 /// Outcome of an [`auto_start_kick`]. `opened` is whether the 5h window opened
 /// (a 2xx from the messages endpoint, first try or post-rotation retry).
 /// `rotated` carries a freshly minted `(access, refresh)` pair whenever a
-/// rotation happened — the caller MUST propagate it into the live token snapshot
-/// even when `opened` is false, because the single-use refresh token was already
-/// spent.
+/// rotation happened; the pair is live even when `opened` is false, because the
+/// previous single-use refresh token is already spent and dropping it would
+/// strand the profile.
 #[must_use]
 pub(crate) struct KickResult {
     pub(crate) opened: bool,

@@ -688,20 +688,25 @@ fn detect_link_mode_returns_real_on_unix() {
 }
 
 // ── HOME-mutating tests ────────────────────────────────────────────────────────
-//
-// These override $HOME so all path helpers resolve under a tempdir. HOME_MUTEX
-// must be held for the entire test to avoid races on the env var.
-use crate::profile::HOME_TEST_LOCK as HOME_MUTEX;
 
-/// Redirect `home_dir()` into `root` for the duration of `f`. Caller must hold
-/// `HOME_MUTEX`. Uses the process-global `HOME_OVERRIDE` rather than `$HOME` so
-/// resolution matches on Windows too, where `dirs::home_dir()` reads
-/// `USERPROFILE`, not `HOME`.
+/// Redirect `home_dir()` into `root` for the duration of `f`, serialized on
+/// `profile::HOME_TEST_LOCK`. Uses the process-global `HOME_OVERRIDE` rather
+/// than `$HOME` so resolution matches on Windows too, where `dirs::home_dir()`
+/// reads `USERPROFILE`, not `HOME`. The override is cleared on drop so a
+/// panicking test can't leak it into the next test.
 fn with_fake_home<T>(root: &Path, f: impl FnOnce() -> T) -> T {
+    let _lock = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            crate::profile::clear_home_override();
+        }
+    }
     crate::profile::set_home_override(root.to_path_buf());
-    let result = f();
-    crate::profile::clear_home_override();
-    result
+    let _clear = ClearOnDrop;
+    f()
 }
 
 /// Build `~/.claude/` (required by `acquire`).
@@ -718,7 +723,6 @@ fn make_profile(name: &str) -> crate::profile::Profile {
 #[test]
 fn build_runtime_dir_writes_settings_not_symlink() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         fs::write(
@@ -759,7 +763,6 @@ fn build_runtime_dir_writes_settings_not_symlink() {
 #[test]
 fn build_runtime_dir_credentials_not_from_claude_home() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         // ~/.claude/.credentials.json must NOT appear in runtime
@@ -790,7 +793,6 @@ fn build_runtime_dir_credentials_not_from_claude_home() {
 #[test]
 fn build_runtime_dir_fake_preserves_live_runtime_credentials() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         let runtime = tmp.path().join("runtime");
@@ -824,7 +826,6 @@ fn build_runtime_dir_fake_preserves_live_runtime_credentials() {
 #[test]
 fn build_runtime_dir_real_preserves_live_runtime_credentials() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         let runtime = tmp.path().join("runtime");
@@ -860,7 +861,6 @@ fn build_runtime_dir_real_preserves_live_runtime_credentials() {
 #[test]
 fn build_runtime_dir_real_keeps_invalid_runtime_credentials_for_retry() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         let runtime = tmp.path().join("runtime");
@@ -892,7 +892,6 @@ fn build_runtime_dir_real_keeps_invalid_runtime_credentials_for_retry() {
 #[test]
 fn build_runtime_dir_other_entries_materialized() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         // A few ordinary entries that should be mirrored.
@@ -925,7 +924,6 @@ fn build_runtime_dir_other_entries_materialized() {
 #[test]
 fn build_runtime_dir_other_entries_symlinked_on_unix() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         fs::write(claude_home.join("todos.json"), b"[]").expect("write todos");
@@ -958,7 +956,6 @@ fn build_runtime_dir_other_entries_symlinked_on_unix() {
 #[test]
 fn build_runtime_dir_links_claude_json_from_parent() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         // ~/.claude.json sits next to ~/.claude/, not inside it
@@ -996,7 +993,6 @@ fn build_runtime_dir_links_claude_json_from_parent() {
 #[test]
 fn seed_claude_json_strips_oauth_account_from_fresh_member() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         fs::write(
@@ -1026,7 +1022,6 @@ fn seed_claude_json_strips_oauth_account_from_fresh_member() {
 #[test]
 fn seed_claude_json_leaves_existing_real_copy_untouched() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         fs::write(
@@ -1053,7 +1048,6 @@ fn seed_claude_json_leaves_existing_real_copy_untouched() {
 #[test]
 fn has_live_session_false_when_no_sessions_dir() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         assert!(!has_live_session("ghost")); // no sessions dir → false, not error
     });
@@ -1062,7 +1056,6 @@ fn has_live_session_false_when_no_sessions_dir() {
 #[test]
 fn has_live_session_false_when_sessions_dir_empty() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
@@ -1078,7 +1071,6 @@ fn has_live_session_false_when_sessions_dir_empty() {
 #[test]
 fn has_live_session_false_when_all_sessions_dead() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
@@ -1095,7 +1087,6 @@ fn has_live_session_false_when_all_sessions_dead() {
 #[test]
 fn has_live_session_true_when_any_session_alive() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
@@ -1116,7 +1107,6 @@ fn has_live_session_true_when_any_session_alive() {
 #[test]
 fn has_live_session_true_with_mixed_alive_and_dead() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
@@ -1137,7 +1127,6 @@ fn has_live_session_true_with_mixed_alive_and_dead() {
 #[test]
 fn live_session_count_counts_only_alive() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
@@ -1161,7 +1150,6 @@ fn live_session_count_counts_only_alive() {
 #[test]
 fn acquire_creates_runtime_and_pid_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         fake_claude_home(tmp.path());
         let profile = make_profile("lifecycle");
@@ -1231,7 +1219,6 @@ fn acquire_creates_runtime_and_pid_file() {
 #[test]
 fn acquire_isolates_credentials_from_real_home() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         // The real `~/.claude/.credentials.json` belongs to a DIFFERENT account
@@ -1301,7 +1288,6 @@ fn acquire_isolates_credentials_from_real_home() {
 #[test]
 fn acquire_twice_same_process_counts_two_sessions() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         fake_claude_home(tmp.path());
         let profile = make_profile("concurrent");
@@ -1344,7 +1330,6 @@ fn acquire_twice_same_process_counts_two_sessions() {
 #[test]
 fn build_runtime_dir_rewalk_picks_up_late_entries() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         fs::write(claude_home.join("existing.txt"), b"v1").expect("write existing");
@@ -1490,7 +1475,6 @@ fn sync_credentials_unlocked_concurrent_same_link_consistent_end_state() {
 #[test]
 fn build_runtime_dir_isolated_omits_operator_extensions() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         fs::write(claude_home.join("CLAUDE.md"), b"# operator memory").expect("write memory");
@@ -1534,7 +1518,6 @@ fn build_runtime_dir_isolated_omits_operator_extensions() {
 #[test]
 fn build_runtime_dir_shared_keeps_operator_extensions() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         fs::write(claude_home.join("CLAUDE.md"), b"# operator memory").expect("write memory");
@@ -1563,7 +1546,6 @@ fn build_runtime_dir_shared_keeps_operator_extensions() {
 #[test]
 fn build_runtime_dir_isolated_settings_drop_operator_config() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         fs::write(
@@ -1603,7 +1585,6 @@ fn build_runtime_dir_isolated_settings_drop_operator_config() {
 #[test]
 fn build_runtime_dir_prunes_dangling_symlink() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let claude_home = fake_claude_home(tmp.path());
         let runtime = tmp.path().join("runtime");
@@ -1643,7 +1624,6 @@ fn build_runtime_dir_prunes_dangling_symlink() {
 #[test]
 fn has_live_session_sees_isolated_session() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let sessions = tmp
             .path()
@@ -1667,7 +1647,6 @@ fn has_live_session_sees_isolated_session() {
 #[test]
 fn gc_removes_stale_runtime_but_spares_live() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _guard = HOME_MUTEX.lock().expect("home mutex");
     with_fake_home(tmp.path(), || {
         let profiles = tmp.path().join(".clauth").join("profiles");
 

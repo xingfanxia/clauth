@@ -230,8 +230,10 @@ pub(crate) fn switch_profile_noninteractive(
 
 /// Snapshot active creds then clear them so Claude Code can't spend any account.
 /// Used by wrap-off mode when the whole chain is exhausted. No-op when no profile
-/// is active. Caller must gate on divergence first — snapshot no-ops on a diverged
-/// file, so clearing without checking would drop a fresh `/login`.
+/// is active. A diverged live file is cleared WITHOUT being snapshotted
+/// (`snapshot_active_credentials` skips it, keeping the stored identity), so a
+/// fresh `/login` is dropped: the TUI gates that on the divergence prompt, while
+/// the automatic wrap-off leg accepts the drop, unattended by design.
 pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
     with_state_lock(|| {
         if config.state.active_profile.is_none() {

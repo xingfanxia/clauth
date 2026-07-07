@@ -693,3 +693,62 @@ fn switch_off_also_deletes_stale_oauth_account_block() {
     );
     assert_eq!(after["numStartups"], serde_json::json!(7));
 }
+
+/// `switch_off` on a DIVERGED live file: the foreign `/login` is dropped, never
+/// absorbed. `snapshot_active_credentials` skips a diverged file so the profile
+/// keeps its stored identity while the live creds are cleared; the divergence
+/// flow's consent prompt is what stands between the user and this drop.
+#[test]
+fn switch_off_on_diverged_file_keeps_profile_snapshot_and_drops_login() {
+    let _home = HomeSandbox::new();
+
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_creds("stored-token"));
+    save_profile(&profile).expect("save profile");
+
+    // A plain file with a different token where the symlink should sit = Diverged.
+    let live = _home.home().join(".claude").join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&oauth_creds("fresh-login")).expect("serialize"),
+    )
+    .expect("write diverged live file");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["acct".into()],
+            active_profile: Some("acct".into()),
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+
+    switch_off(&mut config).expect("switch_off");
+
+    assert!(config.state.active_profile.is_none());
+    assert!(
+        !live.exists(),
+        "live creds cleared: the fresh login is gone"
+    );
+    assert_eq!(
+        config.profiles[0]
+            .credentials
+            .as_ref()
+            .and_then(|c| c.access_token()),
+        Some("stored-token"),
+        "a foreign login must never be absorbed into the profile snapshot"
+    );
+}
+
+fn oauth_creds(access: &str) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    }
+}

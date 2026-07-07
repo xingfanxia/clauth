@@ -7,9 +7,7 @@
 
 use super::*;
 
-// ---------------------------------------------------------------------------
-// verify_sha256
-// ---------------------------------------------------------------------------
+// ── verify_sha256 ──────────────────────────────────────────────────────────
 
 /// Compute the SHA-256 of `bytes` as a lowercase hex string — used by tests
 /// to generate a ground-truth expected value without duplicating the
@@ -70,9 +68,7 @@ fn verify_sha256_uppercase_hex_also_accepted() {
     assert!(verify_sha256(bytes, &hex), "uppercase hex must verify too");
 }
 
-// ---------------------------------------------------------------------------
-// parse_sums_line
-// ---------------------------------------------------------------------------
+// ── parse_sums_line ────────────────────────────────────────────────────────
 
 #[test]
 fn parse_sums_line_valid() {
@@ -100,9 +96,7 @@ fn parse_sums_line_rejects_short_hex() {
     assert!(parse_sums_line(line).is_none());
 }
 
-// ---------------------------------------------------------------------------
-// find_expected_sha
-// ---------------------------------------------------------------------------
+// ── find_expected_sha ──────────────────────────────────────────────────────
 
 const SUMS_TEXT: &str = "\
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  clauth-linux-x86_64\n\
@@ -128,9 +122,7 @@ fn find_expected_sha_empty_sums_file() {
     assert!(find_expected_sha("", "clauth-linux-x86_64").is_none());
 }
 
-// ---------------------------------------------------------------------------
-// updates_enabled (env opt-out) + spawn suppression
-// ---------------------------------------------------------------------------
+// ── updates_enabled (env opt-out) + spawn suppression ──────────────────────
 
 /// Set/restore `CLAUTH_NO_UPDATE` around a closure.
 ///
@@ -212,9 +204,7 @@ fn spawn_sends_nothing_when_update_disabled() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// derive_sums_url
-// ---------------------------------------------------------------------------
+// ── derive_sums_url ────────────────────────────────────────────────────────
 
 #[test]
 fn derive_sums_url_replaces_asset_name() {
@@ -227,9 +217,7 @@ fn derive_sums_url_replaces_asset_name() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// verify_minisign (detached-signature authenticity)
-// ---------------------------------------------------------------------------
+// ── verify_minisign (detached-signature authenticity) ──────────────────────
 
 /// Official `minisign-verify` test vector: this key + signature authenticate the
 /// exact bytes `b"test"`.
