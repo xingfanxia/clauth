@@ -1010,3 +1010,48 @@ fn bootstrap_third_party_seeds_any_cache() {
         "the seeded third-party profile stamps last_fetched at the cache mtime"
     );
 }
+
+// `proactive_rotation_due` decides whether the ACTIVE Keychain-installed profile
+// rotates AHEAD of expiry (rotation coherence, #1) instead of waiting for a
+// 401 — reactive rotation loses the refresh race to the running `claude`, and
+// whoever loses gets its single-use chain revoked.
+
+#[test]
+fn proactive_rotation_fires_only_inside_the_lead_window() {
+    let lead = super::ACTIVE_ROTATE_LEAD_MS;
+    // At or inside the lead window → rotate now, ahead of the running claude.
+    assert!(super::proactive_rotation_due(
+        true,
+        true,
+        Some(10_000 + lead),
+        10_000
+    ));
+    assert!(super::proactive_rotation_due(
+        true,
+        true,
+        Some(10_000),
+        10_000
+    ));
+    // Beyond the lead window → plain poll; nothing to win yet.
+    assert!(!super::proactive_rotation_due(
+        true,
+        true,
+        Some(10_000 + lead + 1),
+        10_000
+    ));
+}
+
+#[test]
+fn proactive_rotation_requires_active_and_keychain() {
+    // Inactive profile: its chain is not the live login — reactive only.
+    assert!(!super::proactive_rotation_due(false, true, Some(0), 10_000));
+    // No Keychain mirror (other OSes / disabled): the symlinked profile file IS
+    // the live credential — there is no second chain to race.
+    assert!(!super::proactive_rotation_due(true, false, Some(0), 10_000));
+}
+
+#[test]
+fn proactive_rotation_never_fires_on_unknown_expiry() {
+    // Never spend a single-use refresh on a token whose expiry we can't prove.
+    assert!(!super::proactive_rotation_due(true, true, None, 10_000));
+}

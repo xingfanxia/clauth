@@ -70,7 +70,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 
 ### Automate & stay safe
 
-- **Automatic token refresh**: OAuth refresh tokens are single-use, so rotation stays lazy. A stale access token rotates the moment a usage query 401s, never ahead of time. <kbd>t</kbd> force-rotates every account.
+- **Automatic token refresh**: OAuth refresh tokens are single-use, so rotation stays lazy for every account except one. A stale access token rotates the moment a usage query 401s; the **active** account on macOS instead rotates ~30 min *ahead* of expiry and mirrors the fresh pair straight into the Keychain — the running `claude` shares that single-use chain, and whoever refreshes first revokes the other side, so clauth deliberately wins the race and keeps the live login permanently fresh (rotation coherence, #1). <kbd>t</kbd> force-rotates every account.
 - **Auto-switch on exhaustion**: opt accounts into an ordered fallback chain. When the active one crosses its 5h threshold (95% default), clauth hops to the next member with headroom. An opt-in burn-aware mode (Config tab) switches on projected usage instead: heavy burn hops early, light burn rides closer to 100% before moving. Needs clauth open.
 - **Multi-instance safe**: state writes serialize through a file lock, each instance reloads on external changes, HTTP runs off the UI thread.
 - **In-app help**: <kbd>?</kbd> opens a keybinding reference scoped to the current tab.

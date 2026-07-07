@@ -630,6 +630,11 @@ pub(crate) fn apply_rotated_tokens_locked(
         let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         };
+        // Pre-rotation access token, kept for the Keychain-mirror gate below:
+        // it tells "the live file is a stale mirror of OUR OWN chain" apart
+        // from a genuinely foreign CC re-login.
+        #[cfg(target_os = "macos")]
+        let old_access = oauth.access_token.clone();
         write_token_fields(oauth, tok);
         // Stage the rotated pair durably before the structured save (see
         // `stage_rotated_credentials`): a failed save or crash is recovered on
@@ -642,10 +647,60 @@ pub(crate) fn apply_rotated_tokens_locked(
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         }
         clear_staged_credentials(name);
+        // Rotation coherence (#1): a rotation of the ACTIVE profile revokes
+        // the single-use refresh token the macOS Keychain copy carries — the
+        // running `claude` (which re-reads the Keychain per request) would
+        // sign out at that stale token's expiry while every clauth copy stays
+        // green (observed on-device 2026-07-07). Mirror the fresh pair into
+        // the Keychain inside the same locked section as the persist, so a
+        // concurrent switch cannot re-point the item in between. A mirror
+        // failure is loud but non-fatal: the rotation itself is durable, and
+        // the next rotation or switch retries the write.
+        #[cfg(target_os = "macos")]
+        if crate::keychain::enabled() && cfg.is_active(name) {
+            if live_login_is_foreign(name, &old_access) {
+                eprintln!(
+                    "clauth: rotated '{name}' but the live login diverged (a re-login clauth \
+                     doesn't own) — Keychain left untouched; resolve the divergence in the TUI"
+                );
+            } else if let Some(creds) = cfg.find(name).and_then(|p| p.credentials.as_ref())
+                && let Err(e) = crate::keychain::keychain_write(creds)
+            {
+                eprintln!(
+                    "clauth: rotated '{name}' but the Keychain mirror failed: {e:#} — a \
+                     running claude signs out when its old token expires; run `clauth {name}` \
+                     to reinstall"
+                );
+            }
+        }
         Ok(())
     })
     // A failed state flock surfaces as the `Err` from `with_state_lock`, so a
     // poisoned/unavailable lock never looks like a successful rotation.
+}
+
+/// Whether the live `.credentials.json` holds a login clauth does NOT own —
+/// i.e. genuinely [`crate::claude::LinkState::Diverged`] and not merely a
+/// stale regular-file mirror of this profile's own pre-rotation pair. On
+/// macOS Claude Code rewrites the live file as a regular-file copy of the
+/// Keychain, so the moment a rotation lands, `classify_credentials_link`
+/// reports Diverged against the NEW stored token even though the live login
+/// is still our own chain one step behind — that stale-mirror case must still
+/// be mirrored, or the coherence write would skip exactly when it matters.
+/// Only a live token matching NEITHER the new nor the pre-rotation pair is
+/// foreign (a real CC re-login); an unreadable/unclassifiable state is
+/// treated as foreign so a state we cannot understand is never overwritten.
+#[cfg(target_os = "macos")]
+fn live_login_is_foreign(name: &str, old_access: &str) -> bool {
+    match crate::claude::classify_credentials_link(name) {
+        Ok(crate::claude::LinkState::LinkedTo) | Ok(crate::claude::LinkState::Missing) => false,
+        Ok(crate::claude::LinkState::Diverged) => {
+            let live = crate::claude::read_claude_credentials().ok().flatten();
+            let live_token = live.as_ref().and_then(|c| c.access_token());
+            !live_token.is_some_and(|t| !t.is_empty() && t == old_access)
+        }
+        Err(_) => true,
+    }
 }
 
 /// True when an active profile is set and its live .credentials.json no longer

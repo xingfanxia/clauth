@@ -309,3 +309,75 @@ fn rotation_guard_is_independent_across_profiles() {
 // gate that decides whether to kick is unit-tested in `scheduler.rs`
 // (`window_lapsed`), and the opt-in gate is `Profile::auto_start` threaded into
 // `TokenEntry`.
+
+// `live_login_is_foreign` gates the rotation→Keychain mirror (rotation
+// coherence, #1): the mirror must still fire when the live `.credentials.json`
+// is merely a stale regular-file copy of OUR OWN pre-rotation pair (Claude
+// Code's Keychain mirror, one step behind), and must NOT fire over a login
+// clauth doesn't own (a real CC re-login into some other account).
+#[cfg(target_os = "macos")]
+mod keychain_mirror_gate {
+    use crate::testutil::HomeSandbox;
+
+    fn creds(access: &str) -> crate::profile::ClaudeCredentials {
+        crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some(format!("{access}-refresh")),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }
+    }
+
+    fn save_profile_with(name: &str, access: &str) {
+        let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds(access));
+        crate::profile::save_profile(&p).expect("save profile");
+    }
+
+    fn write_live_file(access: &str) {
+        let live = crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(&live, serde_json::to_vec(&creds(access)).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn missing_live_file_is_not_foreign() {
+        let _home = HomeSandbox::new();
+        save_profile_with("alpha", "new-token");
+        assert!(!super::live_login_is_foreign("alpha", "old-token"));
+    }
+
+    #[test]
+    fn live_file_matching_stored_pair_is_not_foreign() {
+        let _home = HomeSandbox::new();
+        save_profile_with("alpha", "new-token");
+        write_live_file("new-token");
+        assert!(!super::live_login_is_foreign("alpha", "old-token"));
+    }
+
+    #[test]
+    fn stale_mirror_of_own_pre_rotation_pair_is_not_foreign() {
+        // The case the gate exists FOR: CC's regular-file mirror still holds the
+        // pair this rotation just superseded. Diverged by classification, but it
+        // is our own chain one step behind — the Keychain mirror must proceed.
+        let _home = HomeSandbox::new();
+        save_profile_with("alpha", "new-token");
+        write_live_file("old-token");
+        assert!(!super::live_login_is_foreign("alpha", "old-token"));
+    }
+
+    #[test]
+    fn unrelated_live_login_is_foreign() {
+        // A real CC re-login into some other account: matches neither the new
+        // nor the pre-rotation pair — never overwrite it.
+        let _home = HomeSandbox::new();
+        save_profile_with("alpha", "new-token");
+        write_live_file("someone-elses-token");
+        assert!(super::live_login_is_foreign("alpha", "old-token"));
+    }
+}
