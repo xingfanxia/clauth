@@ -291,8 +291,7 @@ configured active profile, with no creds on disk to match). Appends a live usage
         &self,
         Parameters(SwitchArgs { name }): Parameters<SwitchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let mut config =
-            load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         // Resolve the raw tool argument to a stored profile (case-insensitive)
         // BEFORE any mutation — the same guard the CLI applies. Skipping it lets an
@@ -309,7 +308,19 @@ configured active profile, with no creds on disk to match). Appends a live usage
         };
         let on_divergence = config.state.default_divergence;
 
-        match crate::actions::switch_profile_noninteractive(&mut config, &name, on_divergence) {
+        // `switch_profile_noninteractive` can block on the macOS keychain deadline
+        // (up to 20s); keep it off the async worker so a slow keychain never stalls
+        // the runtime. Mirrors `delegate`'s `spawn_blocking`.
+        let (config, outcome) = tokio::task::spawn_blocking(move || {
+            let mut config = config;
+            let outcome =
+                crate::actions::switch_profile_noninteractive(&mut config, &name, on_divergence);
+            (config, outcome)
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("switch task failed: {e}"), None))?;
+
+        match outcome {
             Ok((previous, active)) => {
                 let payload = serde_json::json!({
                     "ok": true,
