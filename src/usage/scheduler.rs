@@ -390,14 +390,17 @@ fn fetch_with_rotation(
     // cache serves this tick.
     if is_active
         && keychain_live()
-        && crate::oauth::try_adopt_live_rotation(config, name, &|tok| {
+        && let Some(adopted) = crate::oauth::try_adopt_live_rotation(config, name, &|tok| {
             crate::usage::fetch_account_uuid(tok)
         })
     {
         if let Ok(mut q) = refetch.lock() {
             q.insert(name.to_string());
         }
-        return FetchOutcome::cached(name, FetchStatus::Cached, None, None);
+        // Carry the adopted pair as `rotated` so the caller syncs the
+        // in-memory TokenList — otherwise the queued refetch would run on the
+        // superseded entry and spend the revoked refresh token.
+        return FetchOutcome::cached(name, FetchStatus::Cached, Some(adopted), None);
     }
 
     let Some(rt) = refresh_token else {
@@ -431,14 +434,16 @@ fn fetch_with_rotation(
             // (at latest CC's next launch).
             if is_active
                 && keychain_live()
-                && crate::oauth::try_adopt_live_rotation(config, name, &|tok| {
+                && let Some(adopted) = crate::oauth::try_adopt_live_rotation(config, name, &|tok| {
                     crate::usage::fetch_account_uuid(tok)
                 })
             {
                 if let Ok(mut q) = refetch.lock() {
                     q.insert(name.to_string());
                 }
-                return FetchOutcome::cached(name, FetchStatus::Cached, None, None);
+                // Sync the adopted pair into the TokenList (see the
+                // rotation-leg adopt above).
+                return FetchOutcome::cached(name, FetchStatus::Cached, Some(adopted), None);
             }
             return bail_unrotated();
         }

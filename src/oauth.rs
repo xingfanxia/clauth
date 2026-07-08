@@ -708,23 +708,26 @@ pub(crate) fn apply_rotated_tokens_locked(
 /// adopts can verify identity even when the stored token is already dead.
 /// The Keychain is NOT written here — in this state CC minted the pair, so
 /// the Keychain and mirror are already the fresh truth; only our store lags.
+///
+/// Returns the adopted `(access, refresh)` pair so the caller can sync its
+/// in-memory `TokenList` exactly like every other rotation site — without it,
+/// the next poll would run on the superseded entry, spend the revoked refresh
+/// token, and fail on the very account the adopt just saved.
 pub(crate) fn try_adopt_live_rotation(
     config: &crate::profile::ConfigHandle,
     name: &str,
     identity: &dyn Fn(&str) -> Option<String>,
-) -> bool {
+) -> Option<(String, Option<String>)> {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache, write_profile_cache};
 
     // Snapshot the store side under the config lock, then drop it — the
     // identity fetches below are HTTP and must never hold the mutex.
     let (stored_access, stored_expires) = {
-        let Ok(cfg) = config.lock() else { return false };
+        let Ok(cfg) = config.lock() else { return None };
         if !cfg.is_active(name) {
-            return false;
+            return None;
         }
-        let Some(p) = cfg.find(name) else {
-            return false;
-        };
+        let p = cfg.find(name)?;
         (
             p.access_token().map(str::to_string),
             p.access_token_expires_at(),
@@ -735,22 +738,18 @@ pub(crate) fn try_adopt_live_rotation(
         crate::claude::classify_credentials_link(name),
         Ok(crate::claude::LinkState::Diverged)
     ) {
-        return false;
+        return None;
     }
     let Ok(Some(live)) = crate::claude::read_claude_credentials() else {
-        return false;
+        return None;
     };
-    let Some(live_oauth) = live.claude_ai_oauth.as_ref() else {
-        return false;
-    };
-    if live_oauth.refresh_token.is_none() {
-        return false;
-    }
+    let live_oauth = live.claude_ai_oauth.as_ref()?;
+    live_oauth.refresh_token.as_ref()?;
     let (Some(live_expires), Some(stored_expires)) = (live_oauth.expires_at, stored_expires) else {
-        return false;
+        return None;
     };
     if live_expires <= stored_expires {
-        return false;
+        return None;
     }
 
     // Identity anchor: cached uuid, else the stored token's own uuid while it
@@ -769,17 +768,20 @@ pub(crate) fn try_adopt_live_rotation(
              (no cached account id and the stored token is dead) — not adopting; \
              resolve in the TUI or re-run clauth login {name}"
         );
-        return false;
+        return None;
     };
-    let Some(live_id) = identity(&live_oauth.access_token) else {
-        return false;
-    };
+    let live_id = identity(&live_oauth.access_token)?;
+    // A blank uuid is shape drift, not an identity — two blanks matching each
+    // other must never prove two tokens are the same account.
+    if live_id.trim().is_empty() || expected.trim().is_empty() {
+        return None;
+    }
     if live_id != expected {
         eprintln!(
             "clauth: live login for '{name}' belongs to a DIFFERENT account — not adopting; \
              capture it via the TUI divergence flow if that was intentional"
         );
-        return false;
+        return None;
     }
 
     // Persist under config mutex + state flock, re-checking the gates that
@@ -805,14 +807,18 @@ pub(crate) fn try_adopt_live_rotation(
         Ok::<bool, anyhow::Error>(true)
     })
     .unwrap_or(false);
-    if adopted {
-        write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &live_id);
-        eprintln!(
-            "clauth: adopted the live session's rotated login for '{name}' \
-             (the running claude refreshed first — no token spent)"
-        );
+    if !adopted {
+        return None;
     }
-    adopted
+    write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &live_id);
+    eprintln!(
+        "clauth: adopted the live session's rotated login for '{name}' \
+         (the running claude refreshed first — no token spent)"
+    );
+    Some((
+        live_oauth.access_token.clone(),
+        live_oauth.refresh_token.clone(),
+    ))
 }
 
 /// Whether the live `.credentials.json` holds a login clauth does NOT own —

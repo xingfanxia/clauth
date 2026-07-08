@@ -924,6 +924,10 @@ pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<String> {
         .ok()?
         .account?
         .uuid
+        // A present-but-blank uuid is shape drift, not an identity — two
+        // blanks comparing equal must never prove two tokens are the same
+        // account (the None contract above).
+        .filter(|u| !u.trim().is_empty())
 }
 
 pub(crate) fn now_ms() -> u64 {

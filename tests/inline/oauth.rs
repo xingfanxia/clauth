@@ -455,7 +455,12 @@ mod adopt_live_rotation {
         let name = "adopt-ok";
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
         let adopted = try_adopt_live_rotation(&handle, name, &|_| Some("uuid-1".into()));
-        assert!(adopted);
+        // The adopted pair is returned so the caller syncs its TokenList —
+        // without it, the next poll runs on the superseded entry.
+        assert_eq!(
+            adopted,
+            Some(("at-mirror".into(), Some("at-mirror-refresh".into())))
+        );
         assert_eq!(stored_access(&handle, name), "at-mirror");
         // The identity anchor is cached for future dead-store adopts.
         assert_eq!(
@@ -485,7 +490,7 @@ mod adopt_live_rotation {
                 .into(),
             )
         });
-        assert!(!adopted);
+        assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
 
@@ -499,7 +504,7 @@ mod adopt_live_rotation {
         let adopted = try_adopt_live_rotation(&handle, name, &|tok| {
             (tok == "at-mirror").then(|| "uuid-1".into())
         });
-        assert!(!adopted);
+        assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
 
@@ -516,7 +521,7 @@ mod adopt_live_rotation {
         let adopted = try_adopt_live_rotation(&handle, name, &|tok| {
             (tok == "at-mirror").then(|| "uuid-1".into())
         });
-        assert!(adopted);
+        assert!(adopted.is_some());
         assert_eq!(stored_access(&handle, name), "at-mirror");
     }
 
@@ -528,7 +533,7 @@ mod adopt_live_rotation {
         let expiry = future_expiry();
         let handle = setup(name, expiry, expiry);
         let adopted = try_adopt_live_rotation(&handle, name, &|_| Some("uuid-1".into()));
-        assert!(!adopted);
+        assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
 
@@ -539,7 +544,20 @@ mod adopt_live_rotation {
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
         handle.lock().unwrap().state.active_profile = None;
         let adopted = try_adopt_live_rotation(&handle, name, &|_| Some("uuid-1".into()));
-        assert!(!adopted);
+        assert_eq!(adopted, None);
+        assert_eq!(stored_access(&handle, name), "at-old");
+    }
+
+    #[test]
+    fn refuses_a_blank_identity() {
+        // A present-but-blank uuid is shape drift, not an identity — two
+        // blanks matching each other must never prove the tokens are the same
+        // account.
+        let _home = HomeSandbox::new();
+        let name = "adopt-blank-id";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let adopted = try_adopt_live_rotation(&handle, name, &|_| Some("  ".into()));
+        assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
 }
