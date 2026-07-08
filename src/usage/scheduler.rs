@@ -254,24 +254,27 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
     }
 }
 
-/// How early (ms) the daemon rotates the ACTIVE, Keychain-installed profile
-/// ahead of its clock expiry (rotation coherence, #1).
+/// Floor (ms) for [`active_rotate_lead_ms`] — even on a very short refresh
+/// interval, leave a couple of minutes of margin.
+const ACTIVE_ROTATE_LEAD_FLOOR_MS: i64 = 180_000;
+
+/// How early the poller rotates the ACTIVE, Keychain-installed profile ahead
+/// of its clock expiry (rotation coherence, #1).
 ///
-/// On macOS the running `claude` reads the SAME OAuth family out of the
-/// Keychain, and the refresh token is single-use: whoever refreshes first
-/// revokes the other side's chain. Reactive rotation (401) always loses that
-/// race to an actively-used session — CC refreshes lazily within minutes of
-/// expiry, the poller then finds a revoked refresh token. Worse, when the
-/// POLLER wins (an idle session), the stale Keychain copy dies at expiry and
-/// every running `claude` signs out while clauth's own copies stay green
-/// (observed on-device 2026-07-07).
-///
-/// Rotating a comfortable lead ahead of expiry — and mirroring the fresh pair
-/// into the Keychain via `apply_rotated_tokens_locked` — means CC never sees
-/// an expiring token, never refreshes, and clauth owns the single chain. A
-/// bigger lead costs an EARLIER rotation, not an extra one (each refresh
-/// mints a full-lifetime token), so this is deliberately generous.
-const ACTIVE_ROTATE_LEAD_MS: i64 = 30 * 60 * 1000;
+/// The invariant this maintains is NOT "beat Claude Code's refresh schedule"
+/// (any fixed margin would silently lose to a future CC that refreshes
+/// earlier): it is **"the Keychain never holds an expired token while the
+/// poller is alive."** CC re-reads the Keychain per request and refreshes
+/// only when the token it just read looks spent; keep the item fresh and CC
+/// has no reason to refresh at all. Three poll intervals (with a floor)
+/// guarantees multiple rotation opportunities before expiry, whatever the
+/// configured cadence. And correctness never depends on winning: if CC does
+/// refresh first — schedule change, clauth downtime, lost race — the poller
+/// ADOPTS CC's fresher pair from the live file mirror instead of fighting
+/// for the chain (`oauth::try_adopt_live_rotation`).
+fn active_rotate_lead_ms(interval_ms: u64) -> i64 {
+    ((interval_ms as i64).saturating_mul(3)).max(ACTIVE_ROTATE_LEAD_FLOOR_MS)
+}
 
 /// Whether this poll should rotate ahead of expiry instead of waiting for a
 /// 401: only for the ACTIVE profile, only while the Keychain mirror is live
@@ -284,10 +287,11 @@ fn proactive_rotation_due(
     keychain_live: bool,
     access_expires_at: Option<i64>,
     now_ms: i64,
+    interval_ms: u64,
 ) -> bool {
     active
         && keychain_live
-        && access_expires_at.is_some_and(|exp| now_ms + ACTIVE_ROTATE_LEAD_MS >= exp)
+        && access_expires_at.is_some_and(|exp| now_ms + active_rotate_lead_ms(interval_ms) >= exp)
 }
 
 /// Whether the macOS Keychain mirror is live — `false` under `cfg(test)` and
@@ -327,20 +331,22 @@ fn fetch_with_rotation(
 ) -> FetchOutcome {
     // Rotation coherence (#1): read the active flag and stored expiry in one
     // short config-lock window; the poll itself must never hold the lock.
-    let (is_active, access_expires_at) = config
+    let (is_active, access_expires_at, interval_ms) = config
         .lock()
         .map(|c| {
             (
                 c.is_active(name),
                 c.find(name).and_then(|p| p.access_token_expires_at()),
+                c.state.refresh_interval_ms,
             )
         })
-        .unwrap_or((false, None));
+        .unwrap_or((false, None, 90_000));
     let proactive = proactive_rotation_due(
         is_active,
         keychain_live(),
         access_expires_at,
         now_ms() as i64,
+        interval_ms,
     );
     if !proactive {
         match fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity)) {
@@ -376,6 +382,24 @@ fn fetch_with_rotation(
         }
     };
 
+    // Adopt before spending: when the ACTIVE Keychain profile's live file
+    // mirror already holds a FRESHER same-account pair, the running claude
+    // rotated first — adopt its pair (identity-guarded) instead of burning
+    // OUR single-use refresh token against a family it just superseded.
+    // Queue a refetch so the next tick polls with the adopted token; disk
+    // cache serves this tick.
+    if is_active
+        && keychain_live()
+        && crate::oauth::try_adopt_live_rotation(config, name, &|tok| {
+            crate::usage::fetch_account_uuid(tok)
+        })
+    {
+        if let Ok(mut q) = refetch.lock() {
+            q.insert(name.to_string());
+        }
+        return FetchOutcome::cached(name, FetchStatus::Cached, None, None);
+    }
+
     let Some(rt) = refresh_token else {
         return bail_unrotated();
     };
@@ -398,10 +422,26 @@ fn fetch_with_rotation(
     mark_activity(activity, name, ProfileActivity::Fetching);
     let tok = match refresh_result {
         Ok(t) => t,
-        // Proactive + failed = the chain may have moved under us (a live
-        // claude already rotated it); the still-valid access token keeps the
-        // numbers live while the next tick retries.
-        Err(_) => return bail_unrotated(),
+        Err(_) => {
+            // A failed refresh on the ACTIVE Keychain profile usually means
+            // the live claude rotated first and revoked our copy — one more
+            // adopt attempt (its mirror may have JUST surfaced the fresh
+            // pair) before falling back. This same path re-runs every poll,
+            // so a lagging store self-heals as soon as the mirror catches up
+            // (at latest CC's next launch).
+            if is_active
+                && keychain_live()
+                && crate::oauth::try_adopt_live_rotation(config, name, &|tok| {
+                    crate::usage::fetch_account_uuid(tok)
+                })
+            {
+                if let Ok(mut q) = refetch.lock() {
+                    q.insert(name.to_string());
+                }
+                return FetchOutcome::cached(name, FetchStatus::Cached, None, None);
+            }
+            return bail_unrotated();
+        }
     };
     // Persist under the AppConfig mutex + state lock — matches every other rotation site
     // so a concurrent `rotate_one_inner` can't interleave, and keeps in-memory AppConfig in sync.

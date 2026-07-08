@@ -381,3 +381,165 @@ mod keychain_mirror_gate {
         assert!(super::live_login_is_foreign("alpha", "old-token"));
     }
 }
+
+// ── try_adopt_live_rotation (rotation coherence, the adopt-don't-race half) ──
+//
+// The running claude and clauth hold ONE single-use refresh family; when CC
+// rotates first, its file mirror (~/.claude/.credentials.json) carries the
+// fresher pair. Adopting it — identity-guarded — replaces racing for the
+// chain. All offline: identity is injected, the "mirror" is a sandboxed file.
+#[cfg(target_os = "macos")]
+mod adopt_live_rotation {
+    use super::*;
+    use crate::lockorder::RankedMutex;
+    use crate::testutil::HomeSandbox;
+    use std::sync::Arc;
+
+    fn creds_with(access: &str, expires_at: Option<i64>) -> crate::profile::ClaudeCredentials {
+        crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some(format!("{access}-refresh")),
+                expires_at,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }
+    }
+
+    fn past_expiry() -> i64 {
+        crate::usage::now_ms() as i64 - 60_000
+    }
+
+    fn future_expiry() -> i64 {
+        crate::usage::now_ms() as i64 + 3_600_000
+    }
+
+    /// Active profile persisted to disk (classify reads the file layer) with a
+    /// stored pair ("at-old"), plus a DIVERGED live regular file holding the
+    /// mirror pair ("at-mirror").
+    fn setup(name: &str, stored_expiry: i64, mirror_expiry: i64) -> crate::profile::ConfigHandle {
+        let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds_with("at-old", Some(stored_expiry)));
+        crate::profile::save_profile(&p).expect("save profile");
+        let mut config = crate::profile::AppConfig {
+            state: crate::profile::AppState::default(),
+            profiles: vec![p],
+        };
+        config.state.profiles = vec![name.into()];
+        config.state.active_profile = Some(name.into());
+        let live = crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(
+            &live,
+            serde_json::to_vec(&creds_with("at-mirror", Some(mirror_expiry))).unwrap(),
+        )
+        .unwrap();
+        Arc::new(RankedMutex::new(config))
+    }
+
+    fn stored_access(handle: &crate::profile::ConfigHandle, name: &str) -> String {
+        handle
+            .lock()
+            .unwrap()
+            .find(name)
+            .and_then(|p| p.access_token().map(str::to_string))
+            .expect("stored access token")
+    }
+
+    #[test]
+    fn adopts_a_fresher_same_account_pair() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-ok";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let adopted = try_adopt_live_rotation(&handle, name, &|_| Some("uuid-1".into()));
+        assert!(adopted);
+        assert_eq!(stored_access(&handle, name), "at-mirror");
+        // The identity anchor is cached for future dead-store adopts.
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                name,
+                crate::profile_cache::ACCOUNT_ID_CACHE_FILE
+            )
+            .as_deref(),
+            Some("uuid-1")
+        );
+    }
+
+    #[test]
+    fn refuses_a_live_login_from_a_different_account() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-foreign";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        // Stored token answers uuid-1; the mirror token answers uuid-2 — a
+        // manual CC /login into another account must never be captured.
+        let adopted = try_adopt_live_rotation(&handle, name, &|tok| {
+            Some(
+                if tok == "at-mirror" {
+                    "uuid-2"
+                } else {
+                    "uuid-1"
+                }
+                .into(),
+            )
+        });
+        assert!(!adopted);
+        assert_eq!(stored_access(&handle, name), "at-old");
+    }
+
+    #[test]
+    fn refuses_without_an_identity_anchor() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-anchorless";
+        // Stored token already expired → its own uuid can't be fetched, and no
+        // cached anchor exists. Identity unprovable ⇒ refuse.
+        let handle = setup(name, past_expiry(), future_expiry());
+        let adopted = try_adopt_live_rotation(&handle, name, &|tok| {
+            (tok == "at-mirror").then(|| "uuid-1".into())
+        });
+        assert!(!adopted);
+        assert_eq!(stored_access(&handle, name), "at-old");
+    }
+
+    #[test]
+    fn cached_anchor_allows_adopt_even_with_a_dead_stored_token() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-cached-anchor";
+        let handle = setup(name, past_expiry(), future_expiry());
+        crate::profile_cache::write_profile_cache(
+            name,
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            &"uuid-1".to_string(),
+        );
+        let adopted = try_adopt_live_rotation(&handle, name, &|tok| {
+            (tok == "at-mirror").then(|| "uuid-1".into())
+        });
+        assert!(adopted);
+        assert_eq!(stored_access(&handle, name), "at-mirror");
+    }
+
+    #[test]
+    fn refuses_a_stale_or_equal_mirror() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-stale";
+        // Mirror expiry equals the store's — nothing fresher to adopt.
+        let expiry = future_expiry();
+        let handle = setup(name, expiry, expiry);
+        let adopted = try_adopt_live_rotation(&handle, name, &|_| Some("uuid-1".into()));
+        assert!(!adopted);
+        assert_eq!(stored_access(&handle, name), "at-old");
+    }
+
+    #[test]
+    fn refuses_when_not_the_active_profile() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-inactive";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        handle.lock().unwrap().state.active_profile = None;
+        let adopted = try_adopt_live_rotation(&handle, name, &|_| Some("uuid-1".into()));
+        assert!(!adopted);
+        assert_eq!(stored_access(&handle, name), "at-old");
+    }
+}

@@ -679,6 +679,142 @@ pub(crate) fn apply_rotated_tokens_locked(
     // poisoned/unavailable lock never looks like a successful rotation.
 }
 
+/// Adopt the live session's OWN token rotation instead of fighting it
+/// (rotation coherence — the future-proof half). The running `claude` and
+/// clauth hold ONE single-use refresh family; whoever refreshes first revokes
+/// the other. Rather than racing, concede: CC maintains
+/// `~/.claude/.credentials.json` as a regular-file mirror of its Keychain
+/// login (rewritten at least on every CC launch), a prompt-free read path to
+/// CC's current pair. When that mirror holds a FRESHER pair for the SAME
+/// account, adopt it into the profile store — no refresh spent — so clauth
+/// stays correct whatever refresh schedule a future Claude Code ships.
+///
+/// Gates, in order — every one must pass:
+///   * `name` is the ACTIVE profile (only its chain is shared with a live CC);
+///   * the live path classifies [`crate::claude::LinkState::Diverged`]
+///     (`LinkedTo` = mirror equals the store, nothing to adopt);
+///   * the mirror pair carries a refresh token and a STRICTLY LATER expiry
+///     than the store (never adopt sideways or backwards);
+///   * identity: the mirror token's account uuid (via `identity`, injected so
+///     the gate is testable offline; prod passes `usage::fetch_account_uuid`)
+///     matches the profile's cached uuid — or, when no uuid is cached yet, the
+///     STORED token's own uuid fetched now (only possible while it still
+///     works). Unprovable identity refuses the adopt: a live login belonging
+///     to a different account (a manual CC `/login`) must never be captured
+///     into this profile unattended — that stays the TUI divergence flow's
+///     job.
+///
+/// On success the mirror uuid is cached (`ACCOUNT_ID_CACHE_FILE`), so later
+/// adopts can verify identity even when the stored token is already dead.
+/// The Keychain is NOT written here — in this state CC minted the pair, so
+/// the Keychain and mirror are already the fresh truth; only our store lags.
+pub(crate) fn try_adopt_live_rotation(
+    config: &crate::profile::ConfigHandle,
+    name: &str,
+    identity: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache, write_profile_cache};
+
+    // Snapshot the store side under the config lock, then drop it — the
+    // identity fetches below are HTTP and must never hold the mutex.
+    let (stored_access, stored_expires) = {
+        let Ok(cfg) = config.lock() else { return false };
+        if !cfg.is_active(name) {
+            return false;
+        }
+        let Some(p) = cfg.find(name) else {
+            return false;
+        };
+        (
+            p.access_token().map(str::to_string),
+            p.access_token_expires_at(),
+        )
+    };
+
+    if !matches!(
+        crate::claude::classify_credentials_link(name),
+        Ok(crate::claude::LinkState::Diverged)
+    ) {
+        return false;
+    }
+    let Ok(Some(live)) = crate::claude::read_claude_credentials() else {
+        return false;
+    };
+    let Some(live_oauth) = live.claude_ai_oauth.as_ref() else {
+        return false;
+    };
+    if live_oauth.refresh_token.is_none() {
+        return false;
+    }
+    let (Some(live_expires), Some(stored_expires)) = (live_oauth.expires_at, stored_expires) else {
+        return false;
+    };
+    if live_expires <= stored_expires {
+        return false;
+    }
+
+    // Identity anchor: cached uuid, else the stored token's own uuid while it
+    // still authenticates. No anchor → refuse (identity unprovable).
+    let expected: Option<String> = load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE)
+        .or_else(|| {
+            let alive = (now_ms() as i64) < stored_expires;
+            match (&stored_access, alive) {
+                (Some(tok), true) => identity(tok),
+                _ => None,
+            }
+        });
+    let Some(expected) = expected else {
+        eprintln!(
+            "clauth: live login for '{name}' is newer but its identity can't be proven \
+             (no cached account id and the stored token is dead) — not adopting; \
+             resolve in the TUI or re-run clauth login {name}"
+        );
+        return false;
+    };
+    let Some(live_id) = identity(&live_oauth.access_token) else {
+        return false;
+    };
+    if live_id != expected {
+        eprintln!(
+            "clauth: live login for '{name}' belongs to a DIFFERENT account — not adopting; \
+             capture it via the TUI divergence flow if that was intentional"
+        );
+        return false;
+    }
+
+    // Persist under config mutex + state flock, re-checking the gates that
+    // could have moved during the HTTP window (an interleaved switch or a
+    // rotation that already advanced the store past the mirror).
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    let mut cfg = config.lock().expect("config mutex poisoned");
+    let adopted = with_state_lock(|| {
+        if !cfg.is_active(name) {
+            return Ok(false);
+        }
+        let Some(profile) = cfg.find_mut(name) else {
+            return Ok(false);
+        };
+        if profile
+            .access_token_expires_at()
+            .is_none_or(|cur| live_expires <= cur)
+        {
+            return Ok(false);
+        }
+        profile.credentials = Some(live.clone());
+        save_profile(profile)?;
+        Ok::<bool, anyhow::Error>(true)
+    })
+    .unwrap_or(false);
+    if adopted {
+        write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &live_id);
+        eprintln!(
+            "clauth: adopted the live session's rotated login for '{name}' \
+             (the running claude refreshed first — no token spent)"
+        );
+    }
+    adopted
+}
+
 /// Whether the live `.credentials.json` holds a login clauth does NOT own —
 /// i.e. genuinely [`crate::claude::LinkState::Diverged`] and not merely a
 /// stale regular-file mirror of this profile's own pre-rotation pair. On

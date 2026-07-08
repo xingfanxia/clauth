@@ -643,6 +643,8 @@ struct RawProfile {
 #[derive(Deserialize)]
 struct RawProfileAccount {
     #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
     has_claude_max: bool,
     #[serde(default)]
     has_claude_pro: bool,
@@ -909,6 +911,19 @@ pub(crate) fn probe_subscription_type(access_token: &str) -> anyhow::Result<Opti
         PlanTier::Free => Some("free".to_string()),
         PlanTier::Unknown => None,
     })
+}
+
+/// The account uuid `access_token` authenticates as, via `/api/oauth/profile`
+/// — the identity anchor for adopting a live-session rotation
+/// (`oauth::try_adopt_live_rotation`): two tokens belong to the same account
+/// iff their uuids match. Best-effort `None` on any failure (network, 401,
+/// shape drift) — callers must treat that as "identity unproven" and refuse.
+pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<String> {
+    let text = get_json(PROFILE_ENDPOINT, access_token, None, "identity").ok()?;
+    serde_json::from_str::<RawProfile>(&text)
+        .ok()?
+        .account?
+        .uuid
 }
 
 pub(crate) fn now_ms() -> u64 {

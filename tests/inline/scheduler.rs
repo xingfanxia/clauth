@@ -1018,40 +1018,71 @@ fn bootstrap_third_party_seeds_any_cache() {
 
 #[test]
 fn proactive_rotation_fires_only_inside_the_lead_window() {
-    let lead = super::ACTIVE_ROTATE_LEAD_MS;
-    // At or inside the lead window → rotate now, ahead of the running claude.
+    let interval = 90_000u64;
+    let lead = super::active_rotate_lead_ms(interval);
+    // At or inside the lead window → rotate now, keeping the Keychain token
+    // from ever expiring under the running claude.
     assert!(super::proactive_rotation_due(
         true,
         true,
         Some(10_000 + lead),
-        10_000
+        10_000,
+        interval
     ));
     assert!(super::proactive_rotation_due(
         true,
         true,
         Some(10_000),
-        10_000
+        10_000,
+        interval
     ));
-    // Beyond the lead window → plain poll; nothing to win yet.
+    // Beyond the lead window → plain poll; nothing at stake yet.
     assert!(!super::proactive_rotation_due(
         true,
         true,
         Some(10_000 + lead + 1),
-        10_000
+        10_000,
+        interval
     ));
+}
+
+#[test]
+fn proactive_lead_scales_with_the_poll_interval_with_a_floor() {
+    // The lead is derived from the cadence (3 polls' worth of rotation
+    // opportunities before expiry), not a magic race margin — and it never
+    // drops below the floor even on an aggressive interval.
+    assert_eq!(super::active_rotate_lead_ms(90_000), 270_000);
+    assert_eq!(
+        super::active_rotate_lead_ms(10_000),
+        super::ACTIVE_ROTATE_LEAD_FLOOR_MS
+    );
 }
 
 #[test]
 fn proactive_rotation_requires_active_and_keychain() {
     // Inactive profile: its chain is not the live login — reactive only.
-    assert!(!super::proactive_rotation_due(false, true, Some(0), 10_000));
+    assert!(!super::proactive_rotation_due(
+        false,
+        true,
+        Some(0),
+        10_000,
+        90_000
+    ));
     // No Keychain mirror (other OSes / disabled): the symlinked profile file IS
     // the live credential — there is no second chain to race.
-    assert!(!super::proactive_rotation_due(true, false, Some(0), 10_000));
+    assert!(!super::proactive_rotation_due(
+        true,
+        false,
+        Some(0),
+        10_000,
+        90_000
+    ));
 }
 
 #[test]
 fn proactive_rotation_never_fires_on_unknown_expiry() {
     // Never spend a single-use refresh on a token whose expiry we can't prove.
-    assert!(!super::proactive_rotation_due(true, true, None, 10_000));
+    assert!(!super::proactive_rotation_due(
+        true, true, None, 10_000, 90_000
+    ));
 }
