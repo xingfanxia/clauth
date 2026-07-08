@@ -130,10 +130,10 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
 
     let config = Arc::new(RankedMutex::new(config));
 
-    // AUTH-1 (Incident C): never install a stale/dead token. Refresh an expiring
-    // target — or refuse loudly with the login hint — before the switch writes
-    // its credentials into the Keychain (which re-authenticates every running
-    // `claude` on this machine).
+    // AUTH-1 (Incident C): gate the target before its credentials land in the
+    // Keychain (which re-authenticates every running `claude` on this machine).
+    // Refusal + `clauth login` hint pinned by
+    // `switch_cli_refuses_dead_target_with_login_hint`.
     match oauth::ensure_installable(&config, canonical, oauth::refresh_result) {
         oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
         oauth::AuthGate::Broken => bail!(
@@ -640,8 +640,8 @@ pub(crate) fn overwrite_captured_profile(
             apply_profile_to_claude_settings(profile, &prev_env_keys)?;
         }
         // AUTH-1: re-authenticating an existing profile (`clauth login <name>`) is
-        // the documented recovery for a revoked login — clear its quarantine so the
-        // fresh tokens rejoin the fallback chain and are accepted as a switch target.
+        // the documented recovery for a revoked login — clear its quarantine.
+        // Pinned by `reauth_overwrite_clears_broken_flag`.
         config.set_auth_broken(name, false);
         save_app_state(&config.state)
     })

@@ -255,41 +255,33 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
     }
 }
 
-/// Whether a poll-time refresh *failure* means the account's OAuth login has
-/// dropped for good (a dead/revoked refresh token → HTTP 4xx from the token
-/// endpoint) versus a transient blip (network, 5xx, parse). `true` → the poller
-/// quarantines the account NOW so "needs reauth" surfaces on this tick, instead of
-/// the account silently serving stale cached usage until the next switch trips
-/// `ensure_installable`. Pure so the classification is unit-tested without a
-/// network or config — the wiring below just applies it via `mark_auth_broken`.
+/// A poll-time refresh failure is terminal (the OAuth login dropped for good)
+/// only for a revoked/invalid refresh token, not a transient network/5xx/parse
+/// blip. Quarantining on a terminal failure surfaces "needs reauth" on this tick
+/// instead of serving stale cached usage until the next switch trips
+/// `ensure_installable`. Truth table pinned by the scheduler `*_terminal` tests.
 fn refresh_failure_is_terminal(err: &RefreshError) -> bool {
     matches!(err, RefreshError::Invalid(_))
 }
 
 /// Whether a 429 on the usage fetch is worth rotating for. Mirrors
-/// `auth::auto_start_kick`'s 429 gate: only a CLOCK-EXPIRED access token warrants
-/// spending the single-use refresh token. A 429 on a still-valid token is a pure
-/// endpoint rate limit a refresh can't fix (and would re-spend every tick); but a
-/// clock-expired token would 401 the moment the limit clears anyway, so a 429 there
-/// is masking a token that MUST be refreshed — and if the refresh token is also dead,
-/// that refresh is exactly what surfaces `auth_broken` (AUTH-1) instead of the account
-/// hiding behind `RateLimited` forever. Unknown expiry (`None`) → NOT rotated
-/// (conservative: never spend a refresh on a token we can't prove is expired).
+/// `auth::auto_start_kick`'s 429 gate: a 429 on a still-valid token is a pure
+/// endpoint rate limit a refresh can't fix, but a clock-expired token would 401
+/// the moment the limit clears — so its 429 masks a token that MUST be refreshed,
+/// and that refresh is exactly what surfaces `auth_broken` (AUTH-1) instead of the
+/// account hiding behind `RateLimited` forever. Unknown expiry stays conservative
+/// (never rotate). Truth table pinned by the scheduler `rate_limited_*` tests.
 fn token_clock_expired(access_expires_at: Option<i64>, now_ms: i64) -> bool {
     access_expires_at.is_some_and(|exp| now_ms >= exp)
 }
 
-/// Fetch + rotate + retry for one profile. On 401: refresh the OAuth pair,
-/// persist, retry once. A 429 on a still-VALID token never rotates — it's an
-/// endpoint-level rate limit (`retry-after: 0`, token-independent), so a
-/// refresh can't fix it and would spend the single-use refresh token every
-/// tick under a persistent storm; it falls back to disk cache as `RateLimited`
-/// and the fixed cadence retries. A 429 on a CLOCK-EXPIRED token DOES reach
-/// the rotation leg (see [`token_clock_expired`]) — the AUTH-1 dead-login
-/// unmasking. Other errors fall back to disk cache as `Cached`. Pushes `name`
-/// onto `refetch` when rotation succeeded but the follow-up fetch failed.
-/// Returns a [`FetchOutcome`]: the rotated pair for the caller's `TokenList`
-/// sync, the `from_fetch` provenance flag, and the 429 `retry-after` hint that
+/// Fetch + rotate + retry for one profile. On 401 — or a 429 on a clock-expired
+/// token (the AUTH-1 dead-login unmasking, see [`token_clock_expired`]) — refresh
+/// the OAuth pair, persist, retry once. A 429 on a still-valid token bails to disk
+/// cache as `RateLimited`; other errors bail as `Cached`. Pushes `name` onto
+/// `refetch` when rotation succeeded but the follow-up fetch failed. Returns a
+/// [`FetchOutcome`]: the rotated pair for the caller's `TokenList` sync, the
+/// `from_fetch` provenance flag, and the 429 `retry-after` hint that
 /// [`apply_outcome`] turns into a deferred next-fetch slot.
 fn fetch_with_rotation(
     config: &crate::profile::ConfigHandle,
@@ -304,18 +296,16 @@ fn fetch_with_rotation(
     let access_expires_at = entry.access_expires_at;
     match fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity)) {
         Ok(info) => return FetchOutcome::live(name, info, None),
-        // Rate-limited on a still-VALID token: bail to cache, never rotate — a refresh
-        // can't unstick an endpoint rate limit and would re-spend the single-use token
-        // every tick (see `token_clock_expired`).
+        // 429 on a still-valid token: an endpoint rate limit, not a token problem —
+        // bail to cache (see `token_clock_expired`).
         Err(FetchError::RateLimited { retry_after })
             if !token_clock_expired(access_expires_at, now_ms() as i64) =>
         {
             return FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after);
         }
-        // Expired access token (401), OR a 429 on a CLOCK-EXPIRED token: fall through
-        // into the rotation leg. The latter is the AUTH-1 fix — a dead login that 429s
-        // must reach the refresh so a dead refresh token surfaces as `auth_broken`
-        // instead of being masked as `RateLimited` indefinitely.
+        // 401, or a 429 on a clock-expired token (AUTH-1): fall through to the
+        // rotation leg so a dead refresh token surfaces as `auth_broken` rather
+        // than staying masked as `RateLimited`.
         Err(FetchError::Status(401)) | Err(FetchError::RateLimited { .. }) => {}
         Err(_) => return FetchOutcome::cached(name, FetchStatus::Cached, None, None),
     }
@@ -349,11 +339,9 @@ fn fetch_with_rotation(
     let tok = match rotation {
         Ok(t) => t,
         Err(e) => {
-            // Auth-health (AUTH-1): a dead refresh token means the OAuth login
-            // dropped — flag it on this tick so the account surfaces "needs reauth"
-            // immediately, rather than silently caching stale usage until a switch
-            // trips `ensure_installable`. Transient failures leave the flag
-            // untouched and retry on the next cadence.
+            // A terminal failure (dead refresh token) quarantines the account on
+            // this tick; a transient one leaves the flag and retries. See
+            // `refresh_failure_is_terminal`.
             if refresh_failure_is_terminal(&e) {
                 crate::oauth::mark_auth_broken(config, name, true);
             }

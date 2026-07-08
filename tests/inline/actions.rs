@@ -798,3 +798,40 @@ fn reauth_overwrite_clears_broken_flag() {
         "auth-broken quarantine cleared by re-auth",
     );
 }
+
+/// AUTH-1 switch gate (Incident C): a CLI switch to a target whose OAuth login
+/// is dead — expired access token, no refresh token, so unrecoverable without a
+/// re-login — is refused with the exact `clauth login <name>` recovery hint
+/// instead of installing the dead token into the Keychain. The no-refresh-token
+/// path reaches `AuthGate::Broken` with no network call, so the assertion stays
+/// hermetic.
+#[test]
+fn switch_cli_refuses_dead_target_with_login_hint() {
+    let _home = HomeSandbox::new();
+
+    let mut dead = Profile::new("dead-acct".to_string(), None, None);
+    dead.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "expired".to_string(),
+            refresh_token: None,
+            expires_at: Some(1), // epoch-ms 1 → long expired
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["dead-acct".into()],
+            active_profile: None, // no outgoing profile → no link reconcile before the gate
+            ..AppState::default()
+        },
+        profiles: vec![dead],
+    };
+
+    let err = switch_profile_cli(config, "dead-acct").expect_err("a dead target must be refused");
+    assert!(
+        err.to_string().contains("clauth login dead-acct"),
+        "the refusal must name the recovery command, got: {err}",
+    );
+}

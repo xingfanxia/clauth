@@ -55,17 +55,13 @@ pub(crate) struct TokenResponse {
     pub(crate) scope: Option<String>,
 }
 
-/// Build a safe error for a **2xx** token-endpoint body that failed to
-/// deserialize into [`TokenResponse`]. Such a body still contains the live
-/// access+refresh tokens, so it must NEVER be interpolated into an error that
-/// surfaces on `clauth login` or a TUI rotate toast — a token pasted into a
-/// public issue is account takeover.
-///
-/// The serde `Display` is deliberately NOT used: an `invalid type`/`invalid value`
-/// error echoes the offending scalar, which for an unexpected body shape could be a
-/// token substring. Instead report only the error *category* + line/column, the HTTP
-/// status, and the body length — a value-free channel that still pinpoints the
-/// failure. The raw body is withheld entirely.
+/// Build a safe error for a **2xx** token-endpoint body that failed to parse
+/// into [`TokenResponse`]. The body still holds the live access+refresh tokens,
+/// so neither it nor serde's `Display` (which echoes the offending scalar — a
+/// possible token substring) may reach an error surfaced on `clauth login` or a
+/// TUI toast; a leaked token is account takeover. The value-free channel
+/// (category + position + status + length) is pinned by
+/// `token_parse_error_redacts_the_2xx_body`.
 fn token_parse_error(e: serde_json::Error, status: u16, body_len: usize) -> anyhow::Error {
     let kind = match e.classify() {
         serde_json::error::Category::Io => "io",
@@ -750,21 +746,17 @@ pub(crate) enum AuthGate {
     Transient(anyhow::Error),
 }
 
-/// Pre-install auth gate (AUTH-1 / Incident C). Before a switch installs `name`'s
-/// stored credentials into the macOS Keychain — which instantly re-authenticates
-/// every running `claude` on this machine — make sure the token is live:
-///   * third-party (api-key) profiles bypass the gate;
-///   * an OAuth access token with more than [`AUTH_GATE_GRACE_MS`] of life
-///     installs as-is;
-///   * an expiring/expired token is refreshed through `refresher` and the rotated
-///     pair persisted before install;
-///   * a revoked/invalid refresh token quarantines the profile (`auth_broken`,
-///     [`AuthGate::Broken`]) and refuses the switch.
+/// Pre-install auth gate (AUTH-1 / Incident C). Installing `name`'s stored
+/// credentials into the macOS Keychain instantly re-authenticates every running
+/// `claude` on this machine, so a dead token must never be installed: this
+/// refreshes an expiring OAuth token before install, quarantines a revoked one
+/// ([`AuthGate::Broken`]), and passes healthy or third-party targets through.
+/// Every branch is pinned by the `gate_*` tests in this module's test file.
 ///
-/// `refresher` is injected so the gate is unit-testable offline (real callers
-/// pass [`refresh_result`]; tests pass a fixture). The config mutex is never held
-/// across the HTTP refresh, and the per-profile `RotationGuard` wraps the refresh
-/// so a live session or sibling worker cannot double-spend the single-use token.
+/// `refresher` is injected so the gate is testable offline (real callers pass
+/// [`refresh_result`]). The config mutex is never held across the HTTP refresh,
+/// and the per-profile `RotationGuard` wraps the refresh so a live session or
+/// sibling worker cannot double-spend the single-use token.
 pub(crate) fn ensure_installable(
     config: &crate::profile::ConfigHandle,
     name: &str,
@@ -847,9 +839,9 @@ pub(crate) fn mark_auth_broken(config: &crate::profile::ConfigHandle, name: &str
     if let Ok(mut cfg) = config.lock()
         && cfg.set_auth_broken(name, broken)
     {
-        // Log the TRANSITION only (`set_auth_broken` returns false on a no-op), so a
-        // dropped login leaves one line on stderr — the "why did it break?" answer
-        // — instead of silently flipping a flag or spamming every tick.
+        // Log the transition only — guarded by `set_auth_broken`'s changed-return
+        // (pinned by `set_auth_broken_reports_transitions_and_is_idempotent`) so a
+        // dropped login leaves one stderr line, never a per-tick repeat.
         if broken {
             eprintln!(
                 "clauth: login for '{name}' expired — refresh token dead; \

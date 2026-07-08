@@ -834,6 +834,32 @@ fn next_target_broken_sink_wrap_off_switches_off() {
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
+// The last-resort pass excludes a broken member too (not just the headroom
+// pass): a `last_resort` sink whose token is dead must not be migrated to. The
+// base case migrates a→b; quarantining b makes the last-resort walk find
+// nothing.
+#[test]
+fn next_target_skips_broken_last_resort_member() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted, not last_resort
+            mark_last_resort(profile_with_util("b", Some(80.0), Some(100.0))), // last_resort sink
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".into())),
+        "base case: the last-resort pass migrates to the sink"
+    );
+    config.set_auth_broken("b", true);
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "a broken last_resort sink is excluded from the last-resort pass"
+    );
+}
+
 // ── issue #8 follow-up b: burn-aware auto-switch (opt-in, default off) ─────
 //
 // `is_exhausted_projected`/`is_exhausted_active`/`is_exhausted_active_from_store`

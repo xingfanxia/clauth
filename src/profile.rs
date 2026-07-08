@@ -226,13 +226,11 @@ pub(crate) struct AppState {
     /// credentials and unsets the active profile instead of staying put.
     #[serde(default)]
     pub(crate) wrap_off: bool,
-    /// Profiles whose last OAuth refresh was rejected as revoked/invalid
-    /// (AUTH-1 / Incident C). A member listed here is excluded from every
-    /// fallback chain walk and refused as a switch target, so a dead token is
+    /// Profiles quarantined after a *permanent* OAuth refresh rejection (AUTH-1 /
+    /// Incident C) — a transient network/5xx blip never lands here. Excluded from
+    /// the fallback chain walk and refused as a switch target so a dead token is
     /// never installed into the Keychain (which would log out every running
-    /// `claude`). Cleared on a successful refresh or `clauth login`. Only
-    /// *permanent* refresh failures land here — a transient network/5xx blip
-    /// refuses the one switch attempt without quarantining the account.
+    /// `claude`); cleared on a successful refresh or `clauth login`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) auth_broken: Vec<ProfileName>,
     /// When true, the fallback-chain auto-switch decision for the ACTIVE
