@@ -1140,9 +1140,23 @@ fn live_session_count_counts_only_alive() {
         a.lock().expect("lock a");
         let b = open_pid_file(&sessions.join("33333")).expect("open b");
         b.lock().expect("lock b");
-        assert_eq!(live_session_count("counted"), 2);
+        // The probe is deliberately fail-alive (any try_lock I/O error reads
+        // as "alive" — see `is_session_alive`), so one transient error under a
+        // parallel suite run can inflate a single reading. Poll briefly: only
+        // a PERSISTENT wrong count is a regression.
+        let settled = |expect: usize| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let n = live_session_count("counted");
+                if n == expect || std::time::Instant::now() >= deadline {
+                    return n;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        assert_eq!(settled(2), 2);
         drop(a);
-        assert_eq!(live_session_count("counted"), 1);
+        assert_eq!(settled(1), 1);
         assert_eq!(live_session_count("ghost"), 0); // no sessions dir → zero
     });
 }
