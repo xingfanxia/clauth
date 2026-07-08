@@ -752,3 +752,49 @@ fn oauth_creds(access: &str) -> crate::profile::ClaudeCredentials {
         }),
     }
 }
+
+/// AUTH-1 reauth: `clauth login <existing>` overwrites a quarantined profile's
+/// stored tokens through `overwrite_captured_profile` — the documented recovery
+/// for a revoked login — and must clear its auth-broken flag so the recovered
+/// account rejoins the fallback chain and is a valid switch target again. The
+/// active-but-dead account here is the Incident C scenario.
+#[test]
+fn reauth_overwrite_clears_broken_flag() {
+    let _home = HomeSandbox::new();
+
+    let mut stale = Profile::new("xfx".to_string(), None, None);
+    stale.credentials = Some(oauth_creds("stale-access"));
+    save_profile(&stale).expect("save profile");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["xfx".into()],
+            active_profile: Some("xfx".into()),
+            ..AppState::default()
+        },
+        profiles: vec![stale],
+    };
+    config.set_auth_broken("xfx", true);
+    assert!(config.is_auth_broken("xfx"), "precondition: quarantined");
+
+    overwrite_captured_profile(
+        &mut config,
+        "xfx",
+        CaptureSnapshot {
+            credentials: Some(oauth_creds("fresh-access")),
+            base_url: None,
+            api_key: None,
+        },
+    )
+    .expect("re-auth overwrite");
+
+    assert_eq!(
+        config.find("xfx").and_then(|p| p.access_token()),
+        Some("fresh-access"),
+        "credentials overwritten by re-auth",
+    );
+    assert!(
+        !config.is_auth_broken("xfx"),
+        "auth-broken quarantine cleared by re-auth",
+    );
+}

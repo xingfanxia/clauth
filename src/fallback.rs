@@ -190,6 +190,10 @@ pub(crate) struct ChainSnapshot {
     pub(crate) chain: Vec<ChainMember>,
     /// Snapshot of `AppState::wrap_off` — drives the switch-off-all decision.
     pub(crate) wrap_off: bool,
+    /// Snapshot of `AppState::auth_broken` — members whose OAuth refresh is
+    /// revoked/invalid (AUTH-1). Excluded from every walk pass so a dead token
+    /// is never installed unattended.
+    pub(crate) broken: Vec<String>,
     /// Snapshot of `AppState::burn_aware_switching` (issue #8 follow-up b) —
     /// gates whether the ACTIVE-side check in `next_auto_switch_target`
     /// projects ahead of the next poll instead of using the static threshold.
@@ -227,6 +231,12 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
         active,
         chain,
         wrap_off: config.state.wrap_off,
+        broken: config
+            .state
+            .auth_broken
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect(),
         burn_aware: config.state.burn_aware_switching,
         interval_ms: config.state.refresh_interval_ms,
     })
@@ -332,7 +342,9 @@ pub(crate) fn next_target(
     let active_idx = chain.iter().position(|n| n == active)?;
     let len = chain.len();
 
-    let skip = |i: usize| chain[i] == active || config.find(&chain[i]).is_none();
+    let skip = |i: usize| {
+        chain[i] == active || config.find(&chain[i]).is_none() || config.is_auth_broken(&chain[i])
+    };
     let walk = |accept: &dyn Fn(&Profile) -> bool| -> Option<String> {
         let pick = walk_chain(active_idx, len, &skip, &|i| {
             config.find(&chain[i]).is_some_and(&accept)
@@ -406,7 +418,10 @@ pub(crate) fn next_auto_switch_target(
         return None;
     }
 
-    let skip = |i: usize| snapshot.chain[i].name == active.name;
+    let skip = |i: usize| {
+        snapshot.chain[i].name == active.name
+            || snapshot.broken.iter().any(|b| b == &snapshot.chain[i].name)
+    };
     let walk = |accept: &dyn Fn(&ChainMember) -> bool| -> Option<String> {
         let pick = walk_chain(active_idx, len, &skip, &|i| accept(&snapshot.chain[i]));
         pick.map(|i| snapshot.chain[i].name.clone())

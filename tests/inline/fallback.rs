@@ -755,6 +755,85 @@ fn auto_switch_wrap_off_disabled_stays_put() {
     assert_eq!(next_auto_switch_target(&snap, &store), None);
 }
 
+// ── AUTH-1: auth-broken members excluded from the chain walk ──────────────────
+//
+// A member whose OAuth refresh is revoked/invalid (`AppState::auth_broken`) must
+// never be picked as a switch target — installing its dead token would log out
+// every running claude (Incident C). Excluded in the headroom pass AND the sink
+// pass, on both the config-side (`next_target`) and scheduler-side
+// (`next_auto_switch_target`) walks.
+
+// next_target: broken member with headroom is skipped; the next viable one wins.
+#[test]
+fn next_target_skips_broken_member_picks_next() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
+            profile_with_util("b", Some(95.0), Some(20.0)),  // headroom but broken
+            profile_with_util("c", Some(95.0), Some(20.0)),  // headroom, viable
+        ],
+        "a",
+    );
+    config.set_auth_broken("b", true);
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".into()))
+    );
+}
+
+// next_target: the only non-active member is broken → nothing viable → None.
+#[test]
+fn next_target_returns_none_when_only_alternative_is_broken() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
+            profile_with_util("b", Some(95.0), Some(20.0)),  // headroom but broken
+        ],
+        "a",
+    );
+    config.set_auth_broken("b", true);
+    assert_eq!(next_target(&config, None), None);
+}
+
+// next_auto_switch_target: the scheduler-side walk skips broken members too
+// (snapshot_chain carries `auth_broken` into ChainSnapshot.broken).
+#[test]
+fn auto_switch_skips_broken_member_picks_next() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.set_auth_broken("b", true);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert!(snap.broken.iter().any(|n| n == "b"));
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".into())),
+    );
+}
+
+// A broken 100%-sink is excluded from the sink pass: with wrap-off on and no
+// other viable member, the chain switches OFF rather than installing the dead
+// sink's token.
+#[test]
+fn next_target_broken_sink_wrap_off_switches_off() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted, not a sink
+            profile_with_util("b", Some(100.0), Some(100.0)), // sink — but broken
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    config.set_auth_broken("b", true);
+    assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
+}
+
 // ── issue #8 follow-up b: burn-aware auto-switch (opt-in, default off) ─────
 //
 // `is_exhausted_projected`/`is_exhausted_active`/`is_exhausted_active_from_store`

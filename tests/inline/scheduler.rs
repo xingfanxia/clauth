@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::lockorder::RankedMutex;
+use crate::oauth::RefreshError;
 
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
@@ -1009,4 +1010,52 @@ fn bootstrap_third_party_seeds_any_cache() {
         stamp <= now && stamp >= now.saturating_sub(5_000),
         "the seeded third-party profile stamps last_fetched at the cache mtime"
     );
+}
+
+// ── AUTH-1: proactive auth-health during the usage poll ──────────────────────
+// `refresh_failure_is_terminal` decides whether a poll-time refresh failure means
+// the OAuth login DROPPED (quarantine the account now) or is a transient blip
+// (leave the flag, retry). This is the classification behind the account surfacing
+// "needs reauth" on the tick the drop is detected, not only on the next switch.
+
+#[test]
+fn dead_refresh_token_is_terminal() {
+    // A 4xx from the token endpoint (revoked / expired refresh token) → the login
+    // is gone; quarantine so the UI surfaces reauth immediately.
+    let err = RefreshError::Invalid("HTTP 400: invalid_grant".to_string());
+    assert!(super::refresh_failure_is_terminal(&err));
+}
+
+#[test]
+fn transient_refresh_failure_is_not_terminal() {
+    // A network / 5xx / parse blip must NOT quarantine — the token may be fine; the
+    // fixed cadence retries next tick.
+    let err = RefreshError::Transient(anyhow::anyhow!("connection reset by peer"));
+    assert!(!super::refresh_failure_is_terminal(&err));
+}
+
+// `token_clock_expired` gates whether a 429 on the usage fetch falls through to the
+// refresh leg (the AUTH-1 fix so a dead login that 429s surfaces as auth_broken
+// instead of being masked as RateLimited forever) vs bails to cache. Only a
+// clock-EXPIRED token is worth spending the single-use refresh on.
+
+#[test]
+fn rate_limited_expired_token_rotates_so_a_dead_login_surfaces() {
+    // 429 + access token expired 1s ago → rotate (a dead refresh token then flags
+    // auth_broken; a live one just re-fetches). now=10_000ms, exp=9_000ms.
+    assert!(super::token_clock_expired(Some(9_000), 10_000));
+}
+
+#[test]
+fn rate_limited_valid_token_does_not_rotate() {
+    // 429 on a still-valid token is a pure endpoint rate limit — refusing to refresh
+    // protects the single-use token from being re-spent every tick. exp in the future.
+    assert!(!super::token_clock_expired(Some(20_000), 10_000));
+}
+
+#[test]
+fn rate_limited_unknown_expiry_does_not_rotate() {
+    // No expiry known → conservative: never spend a refresh on a token we can't prove
+    // is expired (matches auto_start_kick's `is_some_and` gate).
+    assert!(!super::token_clock_expired(None, 10_000));
 }

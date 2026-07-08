@@ -5,6 +5,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use crate::lockorder::{RankedMutex, rank};
+use crate::oauth::RefreshError;
 use crate::providers::ThirdPartyStats;
 
 use super::fetch::{
@@ -254,33 +255,68 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
     }
 }
 
+/// Whether a poll-time refresh *failure* means the account's OAuth login has
+/// dropped for good (a dead/revoked refresh token → HTTP 4xx from the token
+/// endpoint) versus a transient blip (network, 5xx, parse). `true` → the poller
+/// quarantines the account NOW so "needs reauth" surfaces on this tick, instead of
+/// the account silently serving stale cached usage until the next switch trips
+/// `ensure_installable`. Pure so the classification is unit-tested without a
+/// network or config — the wiring below just applies it via `mark_auth_broken`.
+fn refresh_failure_is_terminal(err: &RefreshError) -> bool {
+    matches!(err, RefreshError::Invalid(_))
+}
+
+/// Whether a 429 on the usage fetch is worth rotating for. Mirrors
+/// `auth::auto_start_kick`'s 429 gate: only a CLOCK-EXPIRED access token warrants
+/// spending the single-use refresh token. A 429 on a still-valid token is a pure
+/// endpoint rate limit a refresh can't fix (and would re-spend every tick); but a
+/// clock-expired token would 401 the moment the limit clears anyway, so a 429 there
+/// is masking a token that MUST be refreshed — and if the refresh token is also dead,
+/// that refresh is exactly what surfaces `auth_broken` (AUTH-1) instead of the account
+/// hiding behind `RateLimited` forever. Unknown expiry (`None`) → NOT rotated
+/// (conservative: never spend a refresh on a token we can't prove is expired).
+fn token_clock_expired(access_expires_at: Option<i64>, now_ms: i64) -> bool {
+    access_expires_at.is_some_and(|exp| now_ms >= exp)
+}
+
 /// Fetch + rotate + retry for one profile. On 401: refresh the OAuth pair,
-/// persist, retry once. A 429 never rotates — it's an endpoint-level rate
-/// limit (`retry-after: 0`, token-independent), so a refresh can't fix it and
-/// would spend the single-use refresh token every tick under a persistent
-/// storm; it falls back to disk cache as `RateLimited` and the fixed cadence
-/// retries. Other errors fall back to disk cache as `Cached`. Pushes `name`
+/// persist, retry once. A 429 on a still-VALID token never rotates — it's an
+/// endpoint-level rate limit (`retry-after: 0`, token-independent), so a
+/// refresh can't fix it and would spend the single-use refresh token every
+/// tick under a persistent storm; it falls back to disk cache as `RateLimited`
+/// and the fixed cadence retries. A 429 on a CLOCK-EXPIRED token DOES reach
+/// the rotation leg (see [`token_clock_expired`]) — the AUTH-1 dead-login
+/// unmasking. Other errors fall back to disk cache as `Cached`. Pushes `name`
 /// onto `refetch` when rotation succeeded but the follow-up fetch failed.
 /// Returns a [`FetchOutcome`]: the rotated pair for the caller's `TokenList`
 /// sync, the `from_fetch` provenance flag, and the 429 `retry-after` hint that
 /// [`apply_outcome`] turns into a deferred next-fetch slot.
 fn fetch_with_rotation(
     config: &crate::profile::ConfigHandle,
-    name: &str,
-    access_token: &str,
-    refresh_token: Option<&str>,
+    entry: &TokenEntry,
     prev_plan: Option<PlanInfo>,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
 ) -> FetchOutcome {
+    let name = entry.name.as_str();
+    let access_token = entry.access_token.as_str();
+    let refresh_token = entry.refresh_token.as_deref();
+    let access_expires_at = entry.access_expires_at;
     match fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity)) {
         Ok(info) => return FetchOutcome::live(name, info, None),
-        // Rate-limited: bail to cache, never rotate (see the doc comment).
-        Err(FetchError::RateLimited { retry_after }) => {
+        // Rate-limited on a still-VALID token: bail to cache, never rotate — a refresh
+        // can't unstick an endpoint rate limit and would re-spend the single-use token
+        // every tick (see `token_clock_expired`).
+        Err(FetchError::RateLimited { retry_after })
+            if !token_clock_expired(access_expires_at, now_ms() as i64) =>
+        {
             return FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after);
         }
-        // Expired access token: fall through into the rotation leg.
-        Err(FetchError::Status(401)) => {}
+        // Expired access token (401), OR a 429 on a CLOCK-EXPIRED token: fall through
+        // into the rotation leg. The latter is the AUTH-1 fix — a dead login that 429s
+        // must reach the refresh so a dead refresh token surfaces as `auth_broken`
+        // instead of being masked as `RateLimited` indefinitely.
+        Err(FetchError::Status(401)) | Err(FetchError::RateLimited { .. }) => {}
         Err(_) => return FetchOutcome::cached(name, FetchStatus::Cached, None, None),
     }
 
@@ -306,11 +342,23 @@ fn fetch_with_rotation(
         return bail_to_cache(None);
     }
     mark_activity(activity, name, ProfileActivity::Refreshing);
-    let refresh_result = crate::oauth::refresh(rt);
+    // `refresh_result` (not `refresh`) so the RefreshError variant survives — the
+    // poll needs to tell a dead token (quarantine) from a transient blip (retry).
+    let rotation = crate::oauth::refresh_result(rt);
     mark_activity(activity, name, ProfileActivity::Fetching);
-    let tok = match refresh_result {
+    let tok = match rotation {
         Ok(t) => t,
-        Err(_) => return bail_to_cache(None),
+        Err(e) => {
+            // Auth-health (AUTH-1): a dead refresh token means the OAuth login
+            // dropped — flag it on this tick so the account surfaces "needs reauth"
+            // immediately, rather than silently caching stale usage until a switch
+            // trips `ensure_installable`. Transient failures leave the flag
+            // untouched and retry on the next cadence.
+            if refresh_failure_is_terminal(&e) {
+                crate::oauth::mark_auth_broken(config, name, true);
+            }
+            return bail_to_cache(None);
+        }
     };
     // Persist under the AppConfig mutex + state lock — matches every other rotation site
     // so a concurrent `rotate_one_inner` can't interleave, and keeps in-memory AppConfig in sync.
@@ -319,6 +367,9 @@ fn fetch_with_rotation(
     if crate::oauth::apply_rotated_tokens_locked(config, name, tok).is_err() {
         return bail_to_cache(None);
     }
+    // A successful refresh + persist clears any prior auth-broken quarantine
+    // (mirrors `ensure_installable`); a no-op when the flag was already clear.
+    crate::oauth::mark_auth_broken(config, name, false);
     let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
     // Post-rotation retry forces a `/profile` pull: the token just changed, so
     // refresh the plan alongside it (the 401 profile-fetch trigger).
@@ -495,15 +546,7 @@ fn run_fetch(
         .ok()
         .and_then(|m| m.get(&entry.name).and_then(|i| i.plan.clone()));
 
-    let mut outcome = fetch_with_rotation(
-        config,
-        &entry.name,
-        &entry.access_token,
-        entry.refresh_token.as_deref(),
-        prev_plan,
-        refetch,
-        activity,
-    );
+    let mut outcome = fetch_with_rotation(config, &entry, prev_plan, refetch, activity);
     // The fetch's own rotation (if any) supersedes the kick's; otherwise carry
     // the kick's rotated pair back so the tick still syncs the spent chain.
     if outcome.rotated.is_none() {

@@ -130,6 +130,22 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
 
     let config = Arc::new(RankedMutex::new(config));
 
+    // AUTH-1 (Incident C): never install a stale/dead token. Refresh an expiring
+    // target — or refuse loudly with the login hint — before the switch writes
+    // its credentials into the Keychain (which re-authenticates every running
+    // `claude` on this machine).
+    match oauth::ensure_installable(&config, canonical, oauth::refresh_result) {
+        oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
+        oauth::AuthGate::Broken => bail!(
+            "login for '{canonical}' has expired (refresh token revoked or invalid). \
+             run: clauth login {canonical}"
+        ),
+        oauth::AuthGate::Transient(e) => bail!(
+            "could not refresh '{canonical}' before switching ({e}); check your \
+             connection and retry"
+        ),
+    }
+
     if reconciled {
         let active = {
             #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
@@ -519,6 +535,9 @@ pub(crate) fn capture_into_profile(
         profile.credentials = credentials;
         save_profile(&profile)?;
         config.add(profile);
+        // AUTH-1: a fresh login/capture clears any stale auth-broken quarantine
+        // for this name (e.g. a delete-then-relogin of a revoked account).
+        config.set_auth_broken(&name, false);
 
         if config.state.active_profile.is_none() {
             link_profile_credentials(&name)?;
@@ -620,6 +639,10 @@ pub(crate) fn overwrite_captured_profile(
             let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
             apply_profile_to_claude_settings(profile, &prev_env_keys)?;
         }
+        // AUTH-1: re-authenticating an existing profile (`clauth login <name>`) is
+        // the documented recovery for a revoked login — clear its quarantine so the
+        // fresh tokens rejoin the fallback chain and are accepted as a switch target.
+        config.set_auth_broken(name, false);
         save_app_state(&config.state)
     })
 }
