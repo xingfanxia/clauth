@@ -500,6 +500,10 @@ pub(crate) enum ActionMenuAction {
     ToggleEstimates,
     TogglePace,
     // Tokens
+    TokensPeriodLifetime,
+    TokensPeriodDaily,
+    TokensPeriodWeekly,
+    TokensPeriodMonthly,
     TokensShowAll,
     TokensShowClaude,
     TokensShowOthers,
@@ -561,6 +565,12 @@ impl ActionMenuAction {
             // Mirror the Tokens tab's page keys so the menu teaches them.
             Self::ToggleCountCache => Some('c'),
             Self::ReloadTokenStats => Some('r'),
+            // Period rows all start with "period: ", so pin each to its
+            // distinguishing word instead of the label scan.
+            Self::TokensPeriodLifetime => Some('l'),
+            Self::TokensPeriodDaily => Some('d'),
+            Self::TokensPeriodWeekly => Some('w'),
+            Self::TokensPeriodMonthly => Some('m'),
             _ => None,
         }
     }
@@ -589,6 +599,10 @@ impl ActionMenuAction {
             Self::OpenIncidentLink => "open in browser",
             Self::ToggleEstimates => "toggle estimates",
             Self::TogglePace => "toggle pace marker",
+            Self::TokensPeriodLifetime => "period: lifetime",
+            Self::TokensPeriodDaily => "period: daily",
+            Self::TokensPeriodWeekly => "period: weekly",
+            Self::TokensPeriodMonthly => "period: monthly",
             Self::TokensShowAll => "show all models",
             Self::TokensShowClaude => "show claude models",
             Self::TokensShowOthers => "show other models",
@@ -738,6 +752,50 @@ impl TokenFilter {
             TokenFilter::All => None,
             TokenFilter::Claude => Some("claude only"),
             TokenFilter::Others => Some("others only"),
+        }
+    }
+}
+
+/// Time-window lens over the Tokens tab, cycled with `t` or set from the
+/// action menu. Session-only — a lens, not a setting, like [`TokenFilter`].
+/// `Lifetime` (the default) is the untouched all-time dashboard; the other
+/// three scope the cards to today / this calendar week / this calendar month.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TokenPeriod {
+    #[default]
+    Lifetime,
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl TokenPeriod {
+    /// Cycle order for the `t` key, wrapping.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            TokenPeriod::Lifetime => TokenPeriod::Daily,
+            TokenPeriod::Daily => TokenPeriod::Weekly,
+            TokenPeriod::Weekly => TokenPeriod::Monthly,
+            TokenPeriod::Monthly => TokenPeriod::Lifetime,
+        }
+    }
+
+    /// Title-right meta badge naming the scoped window; `None` when lifetime.
+    pub(crate) fn badge(self) -> Option<&'static str> {
+        match self {
+            TokenPeriod::Lifetime => None,
+            TokenPeriod::Daily => Some("today"),
+            TokenPeriod::Weekly => Some("this week"),
+            TokenPeriod::Monthly => Some("this month"),
+        }
+    }
+
+    /// Calendar bucket for the trend cards; `None` = per-day rows.
+    pub(crate) fn bucket(self) -> Option<crate::tokens::Bucket> {
+        match self {
+            TokenPeriod::Weekly => Some(crate::tokens::Bucket::Week),
+            TokenPeriod::Monthly => Some(crate::tokens::Bucket::Month),
+            TokenPeriod::Lifetime | TokenPeriod::Daily => None,
         }
     }
 }
@@ -1130,6 +1188,7 @@ pub(crate) struct App {
     pub(crate) token_model_cursor: usize,
     /// Model filter over the Tokens tab's model surfaces (action-menu driven).
     pub(crate) token_filter: TokenFilter,
+    pub(crate) token_period: TokenPeriod,
     /// Token-stats load results from the background loader; drained in `on_tick`.
     pub(crate) tokens_events: std::sync::mpsc::Receiver<crate::tokens::TokensEvent>,
     /// Manual-refresh signal to the token loader; a `()` triggers a reload.
@@ -1387,6 +1446,7 @@ impl App {
             token_view: TokenView::Dashboard,
             token_model_cursor: 0,
             token_filter: TokenFilter::default(),
+            token_period: TokenPeriod::default(),
             tokens_events,
             tokens_refresh,
             price_table: None,
@@ -2129,6 +2189,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('t') => {
             app.disarm_quit();
+            // Tokens claims `t` for its period lens (as `r` reloads there);
+            // rotate-all stays reachable from every other tab.
+            if app.tab == Tab::Tokens {
+                set_token_period(app, app.token_period.next());
+                return;
+            }
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: ROTATE_ALL_MSG.to_string(),
                 detail: Some(ROTATE_ALL_DETAIL.to_string()),
@@ -2215,18 +2281,40 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Number of rows in the Tokens `Models` master list (grouped models, after
-/// the active display filter).
+/// The Tokens model rows for the active period lens — filtered and ranked
+/// exactly as rendered, the single source for both the render and the cursor
+/// math. Lifetime keeps the grouped ("others"-folded) rows; scoped periods
+/// list raw per-model aggregates (a period's list is short, no tail fold).
+pub(crate) fn token_period_models(app: &App) -> Vec<crate::tokens::PeriodModel> {
+    use crate::tokens::PeriodModel;
+    let Some(stats) = app.token_stats.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<PeriodModel> = if let Some(bucket) = app.token_period.bucket() {
+        let (from, to) = crate::tokens::current_bucket_bounds(&crate::tokens::today_date(), bucket);
+        crate::tokens::period_models(&stats.daily_models, &from, &to)
+    } else if app.token_period == TokenPeriod::Daily {
+        stats
+            .today
+            .as_ref()
+            .map(|t| t.models.iter().map(PeriodModel::from_full).collect())
+            .unwrap_or_default()
+    } else {
+        crate::tokens::group_models(&stats.models)
+            .iter()
+            .map(PeriodModel::from_full)
+            .collect()
+    };
+    rows.retain(|m| app.token_filter.matches(&m.model));
+    let basis = crate::tokens::effective_cache_basis(&rows, app.config().state.count_cache);
+    rows.sort_unstable_by_key(|m| std::cmp::Reverse(m.metric(basis)));
+    rows
+}
+
+/// Number of rows in the Tokens `Models` master list under the active
+/// period + filter lenses.
 fn token_model_count(app: &App) -> usize {
-    app.token_stats
-        .as_ref()
-        .map(|s| {
-            crate::tokens::group_models(&s.models)
-                .iter()
-                .filter(|m| app.token_filter.matches(&m.model))
-                .count()
-        })
-        .unwrap_or(0)
+    token_period_models(app).len()
 }
 
 /// Tokens `r` / action-menu reload: re-read the on-disk stats + recent
@@ -2237,9 +2325,10 @@ fn reload_token_stats(app: &mut App) {
     app.toast(ToastKind::Info, "reloading token usage");
 }
 
-/// Tokens tab: `c` toggles cache-counting (persisted) on either view; Dashboard
-/// descends to Models on ⏎; Models moves the model cursor with ↑↓ (ascend handled
-/// by the global esc/q).
+/// Tokens tab: `c` toggles cache-counting (persisted) on either view (`t`'s
+/// period cycle is claimed by the global key arm); Dashboard descends to
+/// Models on ⏎; Models moves the model cursor with ↑↓ (ascend handled by the
+/// global esc/q).
 fn handle_tokens_key(app: &mut App, key: KeyEvent) {
     if key.code == KeyCode::Char('c') {
         toggle_count_cache(app);
@@ -3853,9 +3942,20 @@ fn build_action_menu(app: &App) -> ActionMenuState {
             actions.push(ToggleEstimates);
             actions.push(TogglePace);
         }
-        // Tokens: the model-filter lenses (minus the one already active) plus
-        // the page keys (`c` cache basis, `r` reload) for discoverability.
+        // Tokens: the period + model-filter lenses (minus the ones already
+        // active) plus the page keys (`c` cache basis, `r` reload) for
+        // discoverability.
         Tab::Tokens => {
+            for (period, action) in [
+                (TokenPeriod::Lifetime, TokensPeriodLifetime),
+                (TokenPeriod::Daily, TokensPeriodDaily),
+                (TokenPeriod::Weekly, TokensPeriodWeekly),
+                (TokenPeriod::Monthly, TokensPeriodMonthly),
+            ] {
+                if app.token_period != period {
+                    actions.push(action);
+                }
+            }
             if app.token_filter != TokenFilter::All {
                 actions.push(TokensShowAll);
             }
@@ -4083,6 +4183,10 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
         ActionMenuAction::TogglePace => toggle_show_pace(app),
+        ActionMenuAction::TokensPeriodLifetime => set_token_period(app, TokenPeriod::Lifetime),
+        ActionMenuAction::TokensPeriodDaily => set_token_period(app, TokenPeriod::Daily),
+        ActionMenuAction::TokensPeriodWeekly => set_token_period(app, TokenPeriod::Weekly),
+        ActionMenuAction::TokensPeriodMonthly => set_token_period(app, TokenPeriod::Monthly),
         ActionMenuAction::TokensShowAll => set_token_filter(app, TokenFilter::All),
         ActionMenuAction::TokensShowClaude => set_token_filter(app, TokenFilter::Claude),
         ActionMenuAction::TokensShowOthers => set_token_filter(app, TokenFilter::Others),
@@ -4095,6 +4199,16 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
 /// list can be shorter than where the cursor sat.
 fn set_token_filter(app: &mut App, filter: TokenFilter) {
     app.token_filter = filter;
+    let len = token_model_count(app);
+    if app.token_model_cursor >= len {
+        app.token_model_cursor = len.saturating_sub(1);
+    }
+}
+
+/// Swap the Tokens period lens and re-clamp the Models cursor — the scoped
+/// list can be shorter than where the cursor sat.
+fn set_token_period(app: &mut App, period: TokenPeriod) {
+    app.token_period = period;
     let len = token_model_count(app);
     if app.token_model_cursor >= len {
         app.token_model_cursor = len.saturating_sub(1);

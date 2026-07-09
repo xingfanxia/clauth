@@ -268,6 +268,7 @@ fn cache_hit_ratio_math() {
     let stats = TokenStats {
         models: vec![],
         daily: vec![],
+        daily_models: vec![],
         activity: vec![],
         hour_counts: [0; 24],
         total_input: 1000,
@@ -291,6 +292,7 @@ fn cache_hit_ratio_zero_denominator() {
     let stats = TokenStats {
         models: vec![],
         daily: vec![],
+        daily_models: vec![],
         activity: vec![],
         hour_counts: [0; 24],
         total_input: 0,
@@ -719,4 +721,275 @@ fn top_up_reconstructs_messages_sessions_hours_after_cutoff() {
         .expect("2026-06-11 activity");
     assert_eq!(day.messages, 3);
     assert_eq!(day.sessions, 2);
+}
+
+// ── 6. period bucketing + per-day models ─────────────────────────────────────
+
+#[test]
+fn bucket_start_week_and_month() {
+    // 2026-07-09 is a thursday; its week starts monday 2026-07-06.
+    assert_eq!(bucket_start("2026-07-09", Bucket::Week), "2026-07-06");
+    // A monday is its own week start; a sunday belongs to the preceding monday.
+    assert_eq!(bucket_start("2026-07-06", Bucket::Week), "2026-07-06");
+    assert_eq!(bucket_start("2026-07-12", Bucket::Week), "2026-07-06");
+    // Year boundary: 2026-01-01 (thursday) → monday 2025-12-29.
+    assert_eq!(bucket_start("2026-01-01", Bucket::Week), "2025-12-29");
+    assert_eq!(bucket_start("2026-07-09", Bucket::Month), "2026-07-01");
+    // Unparseable input degrades to itself instead of panicking.
+    assert_eq!(bucket_start("garbage-date", Bucket::Week), "garbage-date");
+    assert_eq!(bucket_start("abc", Bucket::Month), "abc");
+}
+
+#[test]
+fn current_bucket_bounds_are_inclusive_start_to_today() {
+    assert_eq!(
+        current_bucket_bounds("2026-07-09", Bucket::Week),
+        ("2026-07-06".to_owned(), "2026-07-09".to_owned())
+    );
+    assert_eq!(
+        current_bucket_bounds("2026-07-09", Bucket::Month),
+        ("2026-07-01".to_owned(), "2026-07-09".to_owned())
+    );
+}
+
+#[test]
+fn bucket_tokens_folds_days_into_calendar_buckets() {
+    let days = vec![
+        DayTokens {
+            date: "2026-06-30".into(),
+            tokens: 1,
+        }, // week of 06-29
+        DayTokens {
+            date: "2026-07-01".into(),
+            tokens: 2,
+        }, // week of 06-29
+        DayTokens {
+            date: "2026-07-06".into(),
+            tokens: 4,
+        }, // week of 07-06
+        DayTokens {
+            date: "2026-07-07".into(),
+            tokens: 8,
+        }, // week of 07-06
+    ];
+    let weeks = bucket_tokens(&days, Bucket::Week);
+    assert_eq!(weeks.len(), 2);
+    assert_eq!(weeks[0].date, "2026-06-29");
+    assert_eq!(weeks[0].tokens, 3);
+    assert_eq!(weeks[1].date, "2026-07-06");
+    assert_eq!(weeks[1].tokens, 12);
+
+    let months = bucket_tokens(&days, Bucket::Month);
+    assert_eq!(months.len(), 2);
+    assert_eq!(months[0].date, "2026-06-01");
+    assert_eq!(months[0].tokens, 1);
+    assert_eq!(months[1].date, "2026-07-01");
+    assert_eq!(months[1].tokens, 14);
+}
+
+#[test]
+fn bucket_activity_sums_counts_under_the_bucket_key() {
+    let days = vec![
+        DayActivity {
+            date: "2026-07-06".into(),
+            messages: 10,
+            sessions: 1,
+            tool_calls: 5,
+        },
+        DayActivity {
+            date: "2026-07-07".into(),
+            messages: 20,
+            sessions: 2,
+            tool_calls: 7,
+        },
+    ];
+    let weeks = bucket_activity(&days, Bucket::Week);
+    assert_eq!(weeks.len(), 1);
+    assert_eq!(weeks[0].date, "2026-07-06");
+    assert_eq!(weeks[0].messages, 30);
+    assert_eq!(weeks[0].sessions, 3);
+    assert_eq!(weeks[0].tool_calls, 12);
+}
+
+fn day_model(date: &str, model: &str, in_out: u64, split: Option<ModelTokens>) -> DayModelTokens {
+    DayModelTokens {
+        date: date.into(),
+        model: model.into(),
+        in_out,
+        split,
+    }
+}
+
+#[test]
+fn period_models_aggregates_range_and_split_flags() {
+    let split = ModelTokens {
+        model: "claude-opus-4".into(),
+        input: 30,
+        output: 20,
+        cache_read: 500,
+        cache_create: 5,
+    };
+    let days = vec![
+        // Outside the range — must not count.
+        day_model("2026-06-30", "claude-opus-4", 999, None),
+        // stats-cache day: in+out only.
+        day_model("2026-07-01", "claude-opus-4", 100, None),
+        // transcript day: full split.
+        day_model("2026-07-07", "claude-opus-4", 50, Some(split.clone())),
+        day_model(
+            "2026-07-07",
+            "gpt-5",
+            10,
+            Some(ModelTokens {
+                model: "gpt-5".into(),
+                input: 6,
+                output: 4,
+                ..Default::default()
+            }),
+        ),
+    ];
+    let rows = period_models(&days, "2026-07-01", "2026-07-09");
+    assert_eq!(rows.len(), 2);
+    // Ranked DESC by in+out.
+    assert_eq!(rows[0].model, "claude-opus-4");
+    assert_eq!(rows[0].in_out, 150);
+    // The split sums only the split-bearing day and is flagged incomplete.
+    assert!(!rows[0].split_complete);
+    assert_eq!(rows[0].split.input, 30);
+    assert_eq!(rows[0].split.cache_read, 500);
+    assert_eq!(rows[1].model, "gpt-5");
+    assert!(rows[1].split_complete);
+    assert_eq!(rows[1].in_out, 10);
+
+    // One incomplete row pins the whole list to the in+out basis.
+    assert!(!effective_cache_basis(&rows, true));
+    assert!(effective_cache_basis(&rows[1..], true));
+    assert!(!effective_cache_basis(&rows[1..], false));
+}
+
+#[test]
+fn period_model_metric_honors_split_completeness() {
+    let m = ModelTokens {
+        model: "claude-opus-4".into(),
+        input: 10,
+        output: 5,
+        cache_read: 100,
+        cache_create: 1,
+    };
+    let full = PeriodModel::from_full(&m);
+    assert_eq!(full.metric(false), 15);
+    assert_eq!(full.metric(true), 116);
+    let partial = PeriodModel {
+        split_complete: false,
+        ..full
+    };
+    assert_eq!(partial.metric(true), 15);
+}
+
+#[test]
+fn load_populates_daily_models_from_stats_cache_and_topup() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+
+    write_stats_cache(
+        &claude_dir,
+        r#"{
+            "lastComputedDate": "2026-06-10",
+            "totalSessions": 0, "totalMessages": 0,
+            "dailyActivity": [],
+            "dailyModelTokens": [
+                {"date": "2026-06-09", "tokensByModel": {"claude-opus-4": 500}}
+            ],
+            "modelUsage": {}, "hourCounts": {}
+        }"#,
+    );
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let p = proj_dir.join("sess.jsonl");
+    let line = jsonl_line(
+        "2026-06-11T10:30:00+00:00",
+        "claude-opus-4",
+        300,
+        100,
+        20,
+        10,
+    );
+    std::fs::write(&p, format!("{line}\n")).expect("write");
+    set_mtime(&p, SystemTime::now());
+
+    let stats = load(&claude_dir).expect("load");
+    // The stats-cache day carries no split; the transcript day carries a full one.
+    let cached = stats
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-09")
+        .expect("stats-cache day");
+    assert_eq!(cached.model, "claude-opus-4");
+    assert_eq!(cached.in_out, 500);
+    assert!(cached.split.is_none());
+    let live = stats
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-11")
+        .expect("top-up day");
+    assert_eq!(live.in_out, 400);
+    let split = live.split.as_ref().expect("split");
+    assert_eq!(split.input, 300);
+    assert_eq!(split.output, 100);
+    assert_eq!(split.cache_read, 20);
+    assert_eq!(split.cache_create, 10);
+}
+
+#[test]
+fn today_hours_track_todays_messages() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{
+            "lastComputedDate": "2026-06-10",
+            "totalSessions": 0, "totalMessages": 0,
+            "dailyActivity": [], "dailyModelTokens": [],
+            "modelUsage": {}, "hourCounts": {}
+        }"#,
+    );
+
+    let today = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs());
+    let today_date = today[..10].to_owned();
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let p = proj_dir.join("sess.jsonl");
+    let l1 = jsonl_line(
+        &format!("{today_date}T12:00:00+00:00"),
+        "claude-opus-4",
+        1,
+        1,
+        0,
+        0,
+    );
+    let l2 = jsonl_line(
+        &format!("{today_date}T12:30:00+00:00"),
+        "claude-opus-4",
+        2,
+        2,
+        0,
+        0,
+    );
+    let l3 = jsonl_line(
+        &format!("{today_date}T03:00:00+00:00"),
+        "claude-opus-4",
+        3,
+        3,
+        0,
+        0,
+    );
+    std::fs::write(&p, format!("{l1}\n{l2}\n{l3}\n")).expect("write");
+    set_mtime(&p, SystemTime::now());
+
+    let stats = load(&claude_dir).expect("load");
+    let t = stats.today.expect("today");
+    assert_eq!(t.hours[12], 2);
+    assert_eq!(t.hours[3], 1);
+    assert_eq!(t.hours.iter().sum::<u64>(), 3);
 }

@@ -402,6 +402,10 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("\u{23ce}", "open per-model breakdown"),
                 ("\u{2191}\u{2193}", "pick model (in breakdown)"),
                 ("c", "count cache in token figures"),
+                (
+                    "t",
+                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
+                ),
                 ("r", "reload on-disk stats"),
                 ("esc", "back to dashboard"),
             ][..],
@@ -475,7 +479,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "previous / next tab (shift tab: previous)",
     )];
 
-    let global: &[(&str, &str)] = &[
+    let global_all: &[(&str, &str)] = &[
         ("n", "new account"),
         ("r", "refresh usage now"),
         ("t", "rotate all tokens"),
@@ -486,13 +490,25 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("esc", "back within a sub-view (no-op at the top level)"),
         ("\u{2303}c", "quit from anywhere"),
     ];
+    // A key the current tab redefines is documented in its own section above;
+    // keeping the global sense too would contradict it (`t` cycles the period
+    // and `r` reloads stats on Tokens, `r` refreshes one account on Usage).
+    let shadowed: Vec<&str> = tab_specific
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|(k, _)| *k))
+        .collect();
+    let global: Vec<(&str, &str)> = global_all
+        .iter()
+        .copied()
+        .filter(|(k, _)| !shadowed.contains(k))
+        .collect();
 
     let mut lines: Vec<Line<'_>> = Vec::new();
     lines.extend(key_section("tabs", nav));
     for (section, entries) in &tab_specific {
         lines.extend(key_section(section, entries));
     }
-    lines.extend(key_section("global", global));
+    lines.extend(key_section("global", &global));
     lines.pop(); // trim trailing blank from last section
     draw_modal(frame, area, title, lines);
 }

@@ -8,6 +8,12 @@
 //! a single model. All figures are global across every model/provider Claude
 //! Code has run — the on-disk pool is shared across clauth profiles, not
 //! per-account.
+//!
+//! Both views obey the [`TokenPeriod`] lens (`t` / action menu): `lifetime`
+//! is the untouched all-time dashboard; `daily`/`weekly`/`monthly` scope the
+//! cards to the current calendar bucket and re-bucket the trend rows. Where
+//! the data can't follow — pre-cutoff days publish no cache/in-out split —
+//! cards fall back to lifetime (badged) and costs render as `+`-marked floors.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -15,14 +21,17 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, TokenFilter, TokenView};
+use super::super::app::{App, TokenFilter, TokenPeriod, TokenView, token_period_models};
 use super::super::theme;
 use super::format::fixed;
 use super::panes::{
     draw_selector_list, picker_row, section_box, section_box_verbatim, selector_width,
 };
 use crate::pricing::PriceTable;
-use crate::tokens::{ModelTokens, TokenStats, group_models, is_anthropic, model_display_name};
+use crate::tokens::{
+    ModelTokens, PeriodModel, TokenStats, bucket_activity, bucket_tokens, current_bucket_bounds,
+    effective_cache_basis, is_anthropic, model_display_name, today_date,
+};
 
 /// Key column width for label:value rows.
 const KEY_W: usize = 8;
@@ -117,14 +126,20 @@ fn money_style() -> Style {
 }
 
 /// A `label  $cost` row summing API-equivalent cost over `models`. Shows `—` when
-/// no price table has loaded yet, and a trailing `+` when some models carry
-/// tokens but no matching rate (so the figure is a floor, not a total).
-fn cost_line(label: &str, prices: Option<&PriceTable>, models: &[ModelTokens]) -> Line<'static> {
+/// no price table has loaded yet, and a trailing `+` when the figure is a floor
+/// rather than a total — some models carry tokens but no matching rate, or the
+/// caller knows the token set itself is incomplete (`floor`).
+fn cost_line(
+    label: &str,
+    prices: Option<&PriceTable>,
+    models: &[ModelTokens],
+    floor: bool,
+) -> Line<'static> {
     let value = match prices {
         Some(p) => {
             let (total, unpriced) = p.total_cost(models);
             let mut s = fmt_money(total);
-            if unpriced > 0 {
+            if unpriced > 0 || floor {
                 s.push('+');
             }
             s
@@ -134,11 +149,12 @@ fn cost_line(label: &str, prices: Option<&PriceTable>, models: &[ModelTokens]) -
     Line::from(vec![key(label), Span::styled(value, money_style())])
 }
 
+const MONTHS: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+
 /// `2026-01-18[...]` → `jan 18`. Degrades to the raw string when too short.
 fn short_date(ymd: &str) -> String {
-    const MONTHS: [&str; 12] = [
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-    ];
     if ymd.len() < 10 {
         return ymd.to_string();
     }
@@ -146,6 +162,19 @@ fn short_date(ymd: &str) -> String {
     let day: u32 = ymd[8..10].parse().unwrap_or(0);
     let mon = MONTHS.get(month.saturating_sub(1)).copied().unwrap_or("?");
     format!("{mon} {day}")
+}
+
+/// `2026-06[-..]` → `jun`. Degrades to the raw string when too short.
+fn month_label(ymd: &str) -> String {
+    if ymd.len() < 7 {
+        return ymd.to_string();
+    }
+    let month: usize = ymd[5..7].parse().unwrap_or(1);
+    MONTHS
+        .get(month.saturating_sub(1))
+        .copied()
+        .unwrap_or("?")
+        .to_string()
 }
 
 /// Block-glyph sparkline over `vals`, scaled to the slice's own max.
@@ -224,20 +253,6 @@ fn busiest_hour(hours: &[u64; 24]) -> Option<usize> {
     (count > 0).then_some(hour)
 }
 
-/// A model's token count on the active basis: in+out, or +cache when `count_cache`.
-fn model_metric(m: &ModelTokens, count_cache: bool) -> u64 {
-    if count_cache { m.total() } else { m.in_out() }
-}
-
-/// Grouped models after the display filter, ranked DESC by the active basis
-/// (so the bars descend by the value actually shown).
-fn ranked_models(stats: &TokenStats, count_cache: bool, filter: TokenFilter) -> Vec<ModelTokens> {
-    let mut g = group_models(&stats.models);
-    g.retain(|m| filter.matches(&m.model));
-    g.sort_unstable_by_key(|m| std::cmp::Reverse(model_metric(m, count_cache)));
-    g
-}
-
 // ── dashboard view ─────────────────────────────────────────────────────────
 
 fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -259,28 +274,45 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let count_cache = app.config().state.count_cache;
     let prices = app.price_table.as_ref();
+    let period = app.token_period;
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6), // today · total (incl. cost row)
-            Constraint::Length(4), // daily
+            Constraint::Length(6), // today/this week/this month · total (incl. cost row)
+            Constraint::Length(4), // daily/weekly/monthly trend
             Constraint::Length(7), // top models · composition
             Constraint::Min(4),    // hour · activity
         ])
         .split(area);
 
     let top = halves(rows[0], 42);
-    // Today's date → the today card's title-right meta badge.
-    let today_meta = stats.today.as_ref().map(|t| short_date(&t.date));
-    card(
-        frame,
-        top[0],
-        "today",
-        today_meta.as_deref(),
-        true,
-        today_lines(stats, inner_w(top[0]), count_cache, prices),
-    );
+    if let Some(bucket) = period.bucket() {
+        // Scoped first card: the current calendar bucket, meta = its start day.
+        let (from, to) = current_bucket_bounds(&today_date(), bucket);
+        let meta = format!("{}+", short_date(&from));
+        card(
+            frame,
+            top[0],
+            period.badge().unwrap_or("period"),
+            Some(&meta),
+            true,
+            period_lines(stats, inner_w(top[0]), count_cache, prices, &from, &to),
+        );
+    } else {
+        // Today's date → the today card's title-right meta badge.
+        let today_meta = stats.today.as_ref().map(|t| short_date(&t.date));
+        card(
+            frame,
+            top[0],
+            "today",
+            today_meta.as_deref(),
+            true,
+            today_lines(stats, inner_w(top[0]), count_cache, prices),
+        );
+    }
+    // Total stays the lifetime anchor in every period — the scoped window
+    // already owns the first card.
     card(
         frame,
         top[1],
@@ -290,45 +322,54 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         total_lines(stats, inner_w(top[1]), count_cache, prices),
     );
 
-    // Freshness badge → the daily card's title-right meta slot.
+    // Freshness badge → the trend card's title-right meta slot.
     let fresh = stats
         .topped_up_through
         .as_deref()
         .map(|d| format!("live thru {}", short_date(d)));
+    let trend_title = match period {
+        TokenPeriod::Weekly => "weekly",
+        TokenPeriod::Monthly => "monthly",
+        TokenPeriod::Lifetime | TokenPeriod::Daily => "daily",
+    };
     card(
         frame,
         rows[1],
-        "daily",
+        trend_title,
         fresh.as_deref(),
         false,
-        daily_lines(stats, inner_w(rows[1])),
+        trend_lines(stats, inner_w(rows[1]), period),
     );
 
     let mid = halves(rows[2], 55);
-    // The active model filter shows as the card's title-right meta badge.
+    // Filter + period lenses both show as the card's title-right meta badge.
+    let model_rows = token_period_models(app);
+    let models_meta = join_badges(app.token_filter.badge(), period.badge());
     card(
         frame,
         mid[0],
         "top models",
-        app.token_filter.badge(),
+        models_meta.as_deref(),
         false,
         model_lines(
-            stats,
+            &model_rows,
             inner_w(mid[0]),
             5,
-            count_cache,
+            effective_cache_basis(&model_rows, count_cache),
             prices,
-            app.token_filter,
+            empty_models_msg(app.token_filter),
         ),
     );
-    card(
-        frame,
-        mid[1],
-        "composition",
-        None,
-        false,
-        comp_lines(stats, inner_w(mid[1])),
-    );
+    // Composition can scope honestly only to today (transcript-derived split);
+    // weekly/monthly fall back to lifetime, badged as such.
+    let (comp_meta, comp) = match period {
+        TokenPeriod::Daily => (Some("today"), today_comp_lines(stats, inner_w(mid[1]))),
+        TokenPeriod::Weekly | TokenPeriod::Monthly => {
+            (Some("lifetime"), comp_lines(stats, inner_w(mid[1])))
+        }
+        TokenPeriod::Lifetime => (None, comp_lines(stats, inner_w(mid[1]))),
+    };
+    card(frame, mid[1], "composition", comp_meta, false, comp);
 
     // Hour graph is a fixed 24-bucket sparkline (one cell/hour). Pin its box to
     // 24 + 4 (border + 1-col padding each side) so the graph fills it with no
@@ -337,22 +378,56 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(HOUR_BOX_W), Constraint::Min(0)])
         .split(rows[3]);
+    // Same fallback shape as composition: per-day hours exist only for today.
+    let (hour_meta, hours) = match period {
+        TokenPeriod::Daily => (
+            Some("today"),
+            stats.today.as_ref().map(|t| t.hours).unwrap_or([0; 24]),
+        ),
+        TokenPeriod::Weekly | TokenPeriod::Monthly => (Some("lifetime"), stats.hour_counts),
+        TokenPeriod::Lifetime => (None, stats.hour_counts),
+    };
     card(
         frame,
         bot[0],
         "hour of day",
-        None,
+        hour_meta,
         false,
-        hour_lines(stats, inner_w(bot[0])),
+        hour_lines(&hours, inner_w(bot[0])),
     );
+    let act_meta = match period {
+        TokenPeriod::Weekly => Some("weekly"),
+        TokenPeriod::Monthly => Some("monthly"),
+        TokenPeriod::Lifetime | TokenPeriod::Daily => None,
+    };
     card(
         frame,
         bot[1],
         "activity",
-        None,
+        act_meta,
         false,
-        activity_lines(stats, inner_w(bot[1])),
+        activity_lines(stats, inner_w(bot[1]), period),
     );
+}
+
+/// Compose the filter + period meta badges into one title-right string.
+fn join_badges(filter: Option<&'static str>, period: Option<&'static str>) -> Option<String> {
+    match (filter, period) {
+        (Some(f), Some(p)) => Some(format!("{f}  {p}")),
+        (Some(f), None) => Some(f.to_string()),
+        (None, Some(p)) => Some(p.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Empty-state copy for a model list: name the filter when one is narrowing,
+/// else the window simply has no usage.
+fn empty_models_msg(filter: TokenFilter) -> &'static str {
+    if filter == TokenFilter::All {
+        "no model usage yet"
+    } else {
+        "no models match the filter"
+    }
 }
 
 /// Split a row into two columns, the left taking `left_pct` percent.
@@ -402,7 +477,7 @@ fn today_lines(
     let tokens = if count_cache { t.total() } else { t.in_out() };
     vec![
         kv_accent("tokens", fmt_count(tokens)),
-        cost_line("cost", prices, &t.models),
+        cost_line("cost", prices, &t.models, false),
         Line::from(vec![
             key("msgs"),
             Span::styled(t.messages.to_string(), theme::body()),
@@ -452,7 +527,7 @@ fn total_lines(
             )],
             w,
         ),
-        cost_line("cost", prices, &stats.models),
+        cost_line("cost", prices, &stats.models, false),
         lr(
             vec![Span::styled(
                 format!("{} sess", stats.total_sessions),
@@ -475,70 +550,128 @@ fn total_lines(
     lines
 }
 
-fn daily_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
-    let vals: Vec<u64> = trail(&stats.daily, w).iter().map(|d| d.tokens).collect();
-    if vals.is_empty() {
-        return vec![Line::from(Span::styled("no daily data", theme::faint()))];
-    }
-    let (peak_v, peak_d) = stats
+/// The this-week / this-month headline card. Tokens and msgs sum the calendar
+/// bucket's days; cost sums the priceable (split-bearing) days and renders as
+/// a `+` floor when stats-cache days hide part of the window.
+fn period_lines(
+    stats: &TokenStats,
+    w: usize,
+    count_cache: bool,
+    prices: Option<&PriceTable>,
+    from: &str,
+    to: &str,
+) -> Vec<Line<'static>> {
+    let in_range = |date: &str| date >= from && date <= to;
+    let rows = crate::tokens::period_models(&stats.daily_models, from, to);
+    let complete = rows.iter().all(|m| m.split_complete);
+    let splits: Vec<ModelTokens> = rows.iter().map(|m| m.split.clone()).collect();
+    let in_out: u64 = stats
         .daily
         .iter()
-        .max_by_key(|d| d.tokens)
-        .map(|d| (d.tokens, d.date.clone()))
-        .unwrap_or((0, String::new()));
+        .filter(|d| in_range(&d.date))
+        .map(|d| d.tokens)
+        .sum();
+    if in_out == 0 && rows.is_empty() {
+        return vec![Line::from(Span::styled("idle so far", theme::faint()))];
+    }
+    // The cache-counting basis holds only when the whole window carries splits.
+    let tokens = if count_cache && complete {
+        splits.iter().map(ModelTokens::total).sum()
+    } else {
+        in_out
+    };
+    let msgs: u64 = stats
+        .activity
+        .iter()
+        .filter(|a| in_range(&a.date))
+        .map(|a| a.messages)
+        .sum();
     vec![
-        center(vec![Span::styled(sparkline(&vals), theme::accent())], w),
-        center(
-            vec![Span::styled(
-                format!("peak {} {}", fmt_count(peak_v), short_date(&peak_d)),
-                theme::faint(),
-            )],
+        kv_accent("tokens", fmt_count(tokens)),
+        cost_line("cost", prices, &splits, !complete),
+        Line::from(vec![
+            key("msgs"),
+            Span::styled(fmt_count(msgs), theme::body()),
+        ]),
+        lr(
+            vec![Span::styled(short_date(from), theme::dim())],
+            vec![Span::styled(short_date(to), theme::dim())],
             w,
         ),
     ]
 }
 
+/// The trend sparkline — per-day rows, or calendar buckets under the weekly /
+/// monthly lens (peak caption names the bucket).
+fn trend_lines(stats: &TokenStats, w: usize, period: TokenPeriod) -> Vec<Line<'static>> {
+    let series = match period.bucket() {
+        Some(b) => bucket_tokens(&stats.daily, b),
+        None => stats.daily.clone(),
+    };
+    let vals: Vec<u64> = trail(&series, w).iter().map(|d| d.tokens).collect();
+    if vals.is_empty() {
+        return vec![Line::from(Span::styled("no daily data", theme::faint()))];
+    }
+    let (peak_v, peak_d) = series
+        .iter()
+        .max_by_key(|d| d.tokens)
+        .map(|d| (d.tokens, d.date.clone()))
+        .unwrap_or((0, String::new()));
+    let peak = match period {
+        TokenPeriod::Weekly => {
+            format!("peak {} wk of {}", fmt_count(peak_v), short_date(&peak_d))
+        }
+        TokenPeriod::Monthly => format!("peak {} {}", fmt_count(peak_v), month_label(&peak_d)),
+        TokenPeriod::Lifetime | TokenPeriod::Daily => {
+            format!("peak {} {}", fmt_count(peak_v), short_date(&peak_d))
+        }
+    };
+    vec![
+        center(vec![Span::styled(sparkline(&vals), theme::accent())], w),
+        center(vec![Span::styled(peak, theme::faint())], w),
+    ]
+}
+
 fn model_lines(
-    stats: &TokenStats,
+    rows: &[PeriodModel],
     w: usize,
     n: usize,
-    count_cache: bool,
+    basis: bool,
     prices: Option<&PriceTable>,
-    filter: TokenFilter,
+    empty_msg: &'static str,
 ) -> Vec<Line<'static>> {
-    let grouped = ranked_models(stats, count_cache, filter);
-    if grouped.is_empty() {
-        return vec![Line::from(Span::styled(
-            "no models match the filter",
-            theme::faint(),
-        ))];
+    if rows.is_empty() {
+        return vec![Line::from(Span::styled(empty_msg, theme::faint()))];
     }
-    let max = grouped
-        .first()
-        .map(|m| model_metric(m, count_cache))
-        .unwrap_or(0);
-    let names: Vec<String> = grouped
+    let max = rows.first().map(|m| m.metric(basis)).unwrap_or(0);
+    let names: Vec<String> = rows
         .iter()
         .take(n)
         .map(|m| model_display_name(&m.model))
         .collect();
     // Token-count strings, right-aligned to a shared column so the counts (and
     // the cost suffix after them) form clean vertical columns across rows.
-    let counts: Vec<String> = grouped
+    let counts: Vec<String> = rows
         .iter()
         .take(n)
-        .map(|m| fmt_count(model_metric(m, count_cache)))
+        .map(|m| fmt_count(m.metric(basis)))
         .collect();
     let count_w = counts.iter().map(|s| s.chars().count()).max().unwrap_or(3);
     // Per-model API-equivalent cost suffix (empty when unpriced / not loaded),
-    // right-aligned to its own shared column.
-    let costs: Vec<String> = grouped
+    // right-aligned to its own shared column; a partial split reads as a floor.
+    let costs: Vec<String> = rows
         .iter()
         .take(n)
         .map(|m| {
             prices
-                .and_then(|p| p.cost(m))
-                .map(fmt_money)
+                .and_then(|p| p.cost(&m.split))
+                .map(|c| {
+                    let mut s = fmt_money(c);
+                    if !m.split_complete {
+                        s.push('+');
+                    }
+                    s
+                })
                 .unwrap_or_default()
         })
         .collect();
@@ -560,8 +693,7 @@ fn model_lines(
         .saturating_sub(label_w)
         .saturating_sub(count_w + 2 + cost_col)
         .clamp(4, 30);
-    grouped
-        .iter()
+    rows.iter()
         .take(n)
         .zip(names.iter())
         .zip(counts.iter())
@@ -572,7 +704,7 @@ fn model_lines(
             } else {
                 theme::dim()
             };
-            let val = model_metric(m, count_cache);
+            let val = m.metric(basis);
             let mut spans = vec![
                 Span::styled(fixed(name, label_w), theme::body()),
                 Span::raw(" "),
@@ -588,13 +720,44 @@ fn model_lines(
 }
 
 fn comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
-    let grand = stats.total_tokens();
+    comp_rows(
+        stats.total_input,
+        stats.total_output,
+        stats.total_cache_create,
+        stats.total_cache_read,
+        w,
+    )
+}
+
+/// Today's transcript-derived split — the one window besides lifetime whose
+/// composition is fully known.
+fn today_comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
+    match stats.today.as_ref() {
+        Some(t) => comp_rows(t.input, t.output, t.cache_create, t.cache_read, w),
+        None => vec![Line::from(Span::styled(
+            "idle so far today",
+            theme::faint(),
+        ))],
+    }
+}
+
+fn comp_rows(
+    input: u64,
+    output: u64,
+    cache_write: u64,
+    cache_read: u64,
+    w: usize,
+) -> Vec<Line<'static>> {
+    let grand = input
+        .saturating_add(output)
+        .saturating_add(cache_write)
+        .saturating_add(cache_read);
     let bar_w = w.saturating_sub(WIDE_KEY_W).saturating_sub(6).clamp(4, 28);
     [
-        ("input", stats.total_input, theme::accent()),
-        ("output", stats.total_output, theme::success()),
-        ("cache write", stats.total_cache_create, theme::warning()),
-        ("cache read", stats.total_cache_read, theme::info()),
+        ("input", input, theme::accent()),
+        ("output", output, theme::success()),
+        ("cache write", cache_write, theme::warning()),
+        ("cache read", cache_read, theme::info()),
     ]
     .into_iter()
     .map(|(label, value, fill)| {
@@ -614,31 +777,29 @@ fn comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
     .collect()
 }
 
-fn hour_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
+fn hour_lines(hours: &[u64; 24], w: usize) -> Vec<Line<'static>> {
     // Centered 24-bucket sparkline with the busiest hour centered below it.
-    let peak = busiest_hour(&stats.hour_counts)
+    let peak = busiest_hour(hours)
         .map(|h| format!("peak {h:02}:00"))
         .unwrap_or_default();
     vec![
-        center(
-            vec![Span::styled(sparkline(&stats.hour_counts), theme::accent())],
-            w,
-        ),
+        center(vec![Span::styled(sparkline(hours), theme::accent())], w),
         center(vec![Span::styled(peak, theme::faint())], w),
     ]
 }
 
-fn activity_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
-    let msgs: Vec<u64> = trail(&stats.activity, w)
-        .iter()
-        .map(|a| a.messages)
-        .collect();
+fn activity_lines(stats: &TokenStats, w: usize, period: TokenPeriod) -> Vec<Line<'static>> {
+    let series = match period.bucket() {
+        Some(b) => bucket_activity(&stats.activity, b),
+        None => stats.activity.clone(),
+    };
+    let msgs: Vec<u64> = trail(&series, w).iter().map(|a| a.messages).collect();
     if msgs.is_empty() {
         return vec![Line::from(Span::styled("no activity data", theme::faint()))];
     }
-    let peak_msgs = stats.activity.iter().map(|a| a.messages).max().unwrap_or(0);
-    let peak_sess = stats.activity.iter().map(|a| a.sessions).max().unwrap_or(0);
-    let tools: u64 = stats.activity.iter().map(|a| a.tool_calls).sum();
+    let peak_msgs = series.iter().map(|a| a.messages).max().unwrap_or(0);
+    let peak_sess = series.iter().map(|a| a.sessions).max().unwrap_or(0);
+    let tools: u64 = series.iter().map(|a| a.tool_calls).sum();
     vec![
         center(vec![Span::styled(sparkline(&msgs), theme::accent())], w),
         center(
@@ -674,35 +835,38 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ])
         .split(area);
 
-    let count_cache = app.config().state.count_cache;
-    let grouped = app
-        .token_stats
-        .as_ref()
-        .map(|s| ranked_models(s, count_cache, app.token_filter))
-        .unwrap_or_default();
+    let grouped = token_period_models(app);
     let sel = app.token_model_cursor.min(grouped.len().saturating_sub(1));
 
-    // The selector title carries the filter so the narrowed list reads as such.
-    let title = match app.token_filter.badge() {
+    // The selector title carries the active lenses so the narrowed list reads
+    // as such.
+    let title = match join_badges(app.token_filter.badge(), app.token_period.badge()) {
         Some(badge) => format!("models  {badge}"),
         None => "models".to_string(),
     };
-    // A filter can empty the list mid-view (menu on the Models view) —
+    // A lens can empty the list mid-view (menu on the Models view) —
     // `draw_selector_list`'s shared empty state talks about accounts, so
-    // render the filter-specific message instead.
+    // render the lens-specific message instead.
     if grouped.is_empty() {
         let block = section_box(&title, true, true);
         let inner = block.inner(cols[0]);
         frame.render_widget(block, cols[0]);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "no models match the filter",
+                empty_models_msg(app.token_filter),
                 theme::faint(),
             )))
             .style(theme::base()),
             inner,
         );
-        draw_model_detail(frame, cols[1], None, 0, app.price_table.as_ref());
+        draw_model_detail(
+            frame,
+            cols[1],
+            None,
+            0,
+            app.price_table.as_ref(),
+            app.token_period,
+        );
         return;
     }
     draw_selector_list(frame, cols[0], &title, true, sel, |w| {
@@ -720,26 +884,45 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .collect()
     });
 
-    let grand = app
-        .token_stats
-        .as_ref()
-        .map(TokenStats::total_tokens)
-        .unwrap_or(0);
     draw_model_detail(
         frame,
         cols[1],
         grouped.get(sel),
-        grand,
+        period_grand(app),
         app.price_table.as_ref(),
+        app.token_period,
     );
+}
+
+/// Share-of-window denominator for the detail card, on the same basis as its
+/// numerator per mode: full throughput for lifetime/today, in+out for scoped
+/// weeks/months (the only figure every day in range carries).
+fn period_grand(app: &App) -> u64 {
+    let Some(stats) = app.token_stats.as_ref() else {
+        return 0;
+    };
+    if let Some(bucket) = app.token_period.bucket() {
+        let (from, to) = current_bucket_bounds(&today_date(), bucket);
+        stats
+            .daily
+            .iter()
+            .filter(|d| d.date >= from && d.date <= to)
+            .map(|d| d.tokens)
+            .sum()
+    } else if app.token_period == TokenPeriod::Daily {
+        stats.today.as_ref().map(|t| t.total()).unwrap_or(0)
+    } else {
+        stats.total_tokens()
+    }
 }
 
 fn draw_model_detail(
     frame: &mut Frame<'_>,
     area: Rect,
-    model: Option<&ModelTokens>,
+    model: Option<&PeriodModel>,
     grand: u64,
     prices: Option<&PriceTable>,
+    period: TokenPeriod,
 ) {
     let title = model
         .map(|m| model_display_name(&m.model))
@@ -765,21 +948,40 @@ fn draw_model_detail(
             Span::styled(value, theme::body()),
         ])
     };
-    let mut lines = vec![
-        kv("input", fmt_count(m.input)),
-        kv("output", fmt_count(m.output)),
-        kv("cache read", fmt_count(m.cache_read)),
-        kv("cache write", fmt_count(m.cache_create)),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(format!("{:<WIDE_KEY_W$}", "total"), theme::label()),
-            Span::styled(
-                fmt_count(m.total()),
-                theme::accent().add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        kv("io", fmt_count(m.in_out())),
-    ];
+    let s = &m.split;
+    let mut lines = if m.split_complete {
+        vec![
+            kv("input", fmt_count(s.input)),
+            kv("output", fmt_count(s.output)),
+            kv("cache read", fmt_count(s.cache_read)),
+            kv("cache write", fmt_count(s.cache_create)),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(format!("{:<WIDE_KEY_W$}", "total"), theme::label()),
+                Span::styled(
+                    fmt_count(s.total()),
+                    theme::accent().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            kv("io", fmt_count(s.in_out())),
+        ]
+    } else {
+        // Part of the window predates the transcript cutoff, where only the
+        // combined in+out per model exists — no split rows, no cache lens.
+        vec![
+            Line::from(vec![
+                Span::styled(format!("{:<WIDE_KEY_W$}", "tokens"), theme::label()),
+                Span::styled(
+                    fmt_count(m.in_out),
+                    theme::accent().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "in+out only (older days carry no split)",
+                theme::faint(),
+            )),
+        ]
+    };
 
     // API-equivalent cost, split by token bucket (rates differ per bucket).
     lines.push(Line::from(""));
@@ -787,6 +989,11 @@ fn draw_model_detail(
         "COST · API-EQUIVALENT",
         theme::label(),
     )));
+    // Cost values share the `money_style` identity (vs the body-styled
+    // token counts above).
+    let cost_kv = |label: &str, value: String| {
+        Line::from(vec![key(label), Span::styled(value, money_style())])
+    };
     match prices {
         None => lines.push(Line::from(Span::styled("rates loading", theme::faint()))),
         Some(p) => match p.rate(&m.model) {
@@ -794,16 +1001,11 @@ fn draw_model_detail(
                 "no rate for this model",
                 theme::faint(),
             ))),
-            Some(r) => {
-                let c_in = m.input as f64 * r.input;
-                let c_out = m.output as f64 * r.output;
+            Some(r) if m.split_complete => {
+                let c_in = s.input as f64 * r.input;
+                let c_out = s.output as f64 * r.output;
                 let c_cache =
-                    m.cache_read as f64 * r.cache_read + m.cache_create as f64 * r.cache_write;
-                // Cost values share the `money_style` identity (vs the body-styled
-                // token counts above).
-                let cost_kv = |label: &str, value: String| {
-                    Line::from(vec![key(label), Span::styled(value, money_style())])
-                };
+                    s.cache_read as f64 * r.cache_read + s.cache_create as f64 * r.cache_write;
                 lines.push(cost_kv("input", fmt_money(c_in)));
                 lines.push(cost_kv("output", fmt_money(c_out)));
                 lines.push(cost_kv("cache", fmt_money(c_cache)));
@@ -815,44 +1017,65 @@ fn draw_model_detail(
                     ),
                 ]));
             }
+            Some(_) => {
+                // Floor over the split-bearing days only.
+                let floor = p.cost(s).unwrap_or(0.0);
+                lines.push(Line::from(vec![
+                    key("total"),
+                    Span::styled(
+                        format!("{}+", fmt_money(floor)),
+                        money_style().add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
         },
     }
 
     let bar_w = (inner.width as usize).saturating_sub(14).clamp(6, 36);
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "SHARE OF ALL TOKENS",
-        theme::label(),
-    )));
+    let share_title = match period.badge() {
+        Some(b) => format!("SHARE OF {}", b.to_uppercase()),
+        None => "SHARE OF ALL TOKENS".to_string(),
+    };
+    lines.push(Line::from(Span::styled(share_title, theme::label())));
+    // Numerator on the denominator's basis (see `period_grand`): in+out under
+    // a weekly/monthly bucket, full throughput otherwise.
+    let share_val = if period.bucket().is_some() {
+        m.in_out
+    } else {
+        s.total()
+    };
     let share = if grand == 0 {
         0.0
     } else {
-        m.total() as f64 / grand as f64 * 100.0
+        share_val as f64 / grand as f64 * 100.0
     };
-    let mut share_line = hbar(m.total(), grand, bar_w, theme::accent());
+    let mut share_line = hbar(share_val, grand, bar_w, theme::accent());
     share_line.push(Span::styled(format!(" {share:>4.1}%"), theme::dim()));
     lines.push(Line::from(share_line));
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("CACHE HIT", theme::label())));
-    let denom = m.cache_read + m.cache_create + m.input;
-    let hit = if denom == 0 {
-        0.0
-    } else {
-        m.cache_read as f64 / denom as f64
-    };
-    let mut hit_line = hbar(
-        (hit * 100.0) as u64,
-        100,
-        bar_w,
-        Style::default().fg(theme::info_color()),
-    );
-    hit_line.push(Span::styled(
-        format!(" {:>3.0}%", hit * 100.0),
-        theme::dim(),
-    ));
-    lines.push(Line::from(hit_line));
+    if m.split_complete {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("CACHE HIT", theme::label())));
+        let denom = s.cache_read + s.cache_create + s.input;
+        let hit = if denom == 0 {
+            0.0
+        } else {
+            s.cache_read as f64 / denom as f64
+        };
+        let mut hit_line = hbar(
+            (hit * 100.0) as u64,
+            100,
+            bar_w,
+            Style::default().fg(theme::info_color()),
+        );
+        hit_line.push(Span::styled(
+            format!(" {:>3.0}%", hit * 100.0),
+            theme::dim(),
+        ));
+        lines.push(Line::from(hit_line));
+    }
 
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }

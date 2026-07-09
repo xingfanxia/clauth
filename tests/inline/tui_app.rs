@@ -1685,6 +1685,9 @@ fn tokens_action_menu_sets_and_swaps_the_model_filter() {
     assert_eq!(
         labels,
         vec![
+            "period: daily",
+            "period: weekly",
+            "period: monthly",
             "show claude models",
             "show other models",
             "toggle cache counting",
@@ -1965,4 +1968,53 @@ mod new_account_model_row {
             "default stays unset on purpose, matching default claude code behaviour"
         );
     }
+}
+
+#[test]
+fn tokens_period_key_cycles_and_clamps_cursor() {
+    use super::{KeyCode, Tab, TokenPeriod, TokenView, handle_key};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Tokens;
+    // Two lifetime rows; the daily/scoped lists are empty (no `today`, no
+    // per-day models), so cycling must clamp the Models cursor.
+    app.token_stats = Some(crate::tokens::TokenStats {
+        models: vec![
+            crate::tokens::ModelTokens {
+                model: "claude-opus-4".into(),
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_create: 0,
+            },
+            crate::tokens::ModelTokens {
+                model: "claude-sonnet-4".into(),
+                input: 8,
+                output: 4,
+                cache_read: 0,
+                cache_create: 0,
+            },
+        ],
+        ..Default::default()
+    });
+    app.token_view = TokenView::Models;
+    app.token_model_cursor = 1;
+
+    for expected in [
+        TokenPeriod::Daily,
+        TokenPeriod::Weekly,
+        TokenPeriod::Monthly,
+        TokenPeriod::Lifetime,
+    ] {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char('t')));
+        assert_eq!(app.token_period, expected, "t cycles in declared order");
+    }
+    // The first hop landed on the empty daily list, so the cursor was clamped
+    // to 0 and stays there through the full cycle.
+    assert_eq!(app.token_model_cursor, 0, "cursor clamps on an empty lens");
 }
