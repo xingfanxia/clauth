@@ -277,8 +277,8 @@ fn placeholder_shows_the_full_width_bouncing_bar() {
     // token_stats stays None, tokens_failed false → the indeterminate spinner.
     let out = render_dashboard(&app, 100, 10);
     assert!(
-        out.contains("reading ~/.claude"),
-        "the loading label renders"
+        out.contains("parsing stats-cache.json"),
+        "the stage-1 loading label renders"
     );
     assert!(out.contains('['), "the bracketed spinner frame renders");
     assert!(out.contains('█'), "the bouncing block renders");
