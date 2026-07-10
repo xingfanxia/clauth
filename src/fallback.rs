@@ -171,8 +171,9 @@ pub(crate) fn is_exhausted_active(
 /// WHOLE chain is currently exhausted, covering both wrap-off's
 /// switch-off-all (active cleared) and wrap mode's stalled-active equivalent
 /// (`next_target` returns `None` with every member maxed). Reuses
-/// [`is_exhausted`]'s `five_hour_live` gate: a single member with no live
-/// window or a past reset already has headroom — `find_recovered_member` /
+/// [`is_exhausted`]'s wall-clock gates (`five_hour_live` and the weekly
+/// `seven_day_live` hard-block): a member exhausted in neither window
+/// already has headroom — `find_recovered_member` /
 /// `scan_recovery` would relink it on the very next tick — so that member's
 /// presence bails the WHOLE result to `None` rather than being skipped around;
 /// the caption's premise is that NOTHING in the chain is currently usable.
