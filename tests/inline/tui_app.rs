@@ -2018,3 +2018,60 @@ fn tokens_period_key_cycles_and_clamps_cursor() {
     // to 0 and stays there through the full cycle.
     assert_eq!(app.token_model_cursor, 0, "cursor clamps on an empty lens");
 }
+
+// ── tokens tab: loading-spinner busy flag ─────────────────────────────────────
+
+/// `tokens_topping_up` drives the tab's loading spinners. Only a seeding `Base`
+/// (first paint) or a manual reload lights it; `Loaded`/`Failed` clear it, and a
+/// silent periodic `Base` (stats already present) must stay dark.
+#[test]
+fn tokens_topping_up_tracks_the_load_lifecycle() {
+    use super::{drain_tokens_events, reload_token_stats};
+    use crate::profile::{AppConfig, AppState};
+    use crate::tokens::{TokenStats, TokensEvent};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    // App::new drops the loader's sender under cfg(test); rewire a live channel
+    // so the test can feed the loader's events.
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tokens_events = rx;
+
+    assert!(app.token_stats.is_none());
+    assert!(!app.tokens_topping_up);
+
+    // First (seeding) Base: paints the cache and marks the top-up in flight.
+    tx.send(TokensEvent::Base(Box::<TokenStats>::default()))
+        .unwrap();
+    drain_tokens_events(&mut app);
+    assert!(app.token_stats.is_some(), "seeding Base paints the tab");
+    assert!(
+        app.tokens_topping_up,
+        "a seeding Base lights the loading flag"
+    );
+
+    // Loaded clears it.
+    tx.send(TokensEvent::Loaded(Box::<TokenStats>::default()))
+        .unwrap();
+    drain_tokens_events(&mut app);
+    assert!(!app.tokens_topping_up, "Loaded clears the loading flag");
+
+    // A silent periodic Base (stats already present) must NOT relight it.
+    tx.send(TokensEvent::Base(Box::<TokenStats>::default()))
+        .unwrap();
+    drain_tokens_events(&mut app);
+    assert!(
+        !app.tokens_topping_up,
+        "a non-seeding periodic Base stays silent"
+    );
+
+    // Manual reload lights it; a subsequent Failed clears it.
+    reload_token_stats(&mut app);
+    assert!(app.tokens_topping_up, "manual reload lights the flag");
+    tx.send(TokensEvent::Failed).unwrap();
+    drain_tokens_events(&mut app);
+    assert!(!app.tokens_topping_up, "Failed clears the loading flag");
+}

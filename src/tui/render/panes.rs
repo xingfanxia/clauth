@@ -296,16 +296,36 @@ pub(super) fn label_style(focused: bool) -> Style {
 /// Title: always italic, always UPPERCASE; bold added only when focused.
 /// Color: `ACCENT_2` for the first bordered panel on the screen body, `TEXT_DIM` for the rest.
 pub(super) fn section_box(title: &str, focused: bool, first: bool) -> Block<'static> {
-    section_box_impl(title, focused, first, true)
+    section_box_impl(title, focused, first, true, Vec::new())
 }
 
 /// Like [`section_box`] but preserves the title's original case — use only when
 /// the title is a profile/account name, not a structural label.
 pub(super) fn section_box_verbatim(title: &str, focused: bool, first: bool) -> Block<'static> {
-    section_box_impl(title, focused, first, false)
+    section_box_impl(title, focused, first, false, Vec::new())
 }
 
-fn section_box_impl(title: &str, focused: bool, first: bool, uppercase: bool) -> Block<'static> {
+/// [`section_box`] with a live braille spinner `frame` appended inside the title
+/// inset (` TITLE ⠋ `), for a card whose data is still loading. The spinner is
+/// its own `ACCENT` span; the border dashes keep the border token (chrome owns
+/// the dashes).
+pub(super) fn section_box_loading(
+    title: &str,
+    focused: bool,
+    first: bool,
+    frame: &str,
+) -> Block<'static> {
+    let suffix = vec![Span::styled(format!("{frame} "), theme::accent())];
+    section_box_impl(title, focused, first, true, suffix)
+}
+
+fn section_box_impl(
+    title: &str,
+    focused: bool,
+    first: bool,
+    uppercase: bool,
+    suffix: Vec<Span<'static>>,
+) -> Block<'static> {
     let border_style = if focused {
         Style::default().fg(theme::line_strong_color())
     } else {
@@ -331,11 +351,13 @@ fn section_box_impl(title: &str, focused: bool, first: bool, uppercase: bool) ->
     } else {
         format!(" {} ", title)
     };
+    let mut title_spans = vec![Span::styled(label, title_style)];
+    title_spans.extend(suffix);
     Block::default()
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
         .border_style(border_style)
-        .title(Line::from(Span::styled(label, title_style)))
+        .title(Line::from(title_spans))
         .padding(Padding::horizontal(1))
 }
 

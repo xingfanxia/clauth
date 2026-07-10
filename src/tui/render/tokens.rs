@@ -23,9 +23,10 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{App, TokenFilter, TokenPeriod, TokenView, token_period_models};
 use super::super::theme;
-use super::format::fixed;
+use super::format::{fixed, spinner_frame};
 use super::panes::{
-    draw_selector_list, picker_row, section_box, section_box_verbatim, selector_width,
+    draw_selector_list, picker_row, section_box, section_box_loading, section_box_verbatim,
+    selector_width,
 };
 use crate::pricing::PriceTable;
 use crate::tokens::{
@@ -39,10 +40,10 @@ const KEY_W: usize = 8;
 /// (composition card + per-model detail): `cache write` (11) + 1 trailing space,
 /// so every label keeps a gap before its bar/value and the columns stay aligned.
 const WIDE_KEY_W: usize = 12;
-/// Block-glyph ramp for sparklines, low → high.
+/// Block-glyph ramp for the vertical bar charts, low → high (top partial cell).
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Hour-of-day card outer width: 24 hour buckets + 4 (border + 1-col padding
-/// each side), so the fixed-width sparkline fills the box exactly.
+/// each side), so the fixed-width chart fills the box exactly.
 const HOUR_BOX_W: u16 = 28;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -177,18 +178,76 @@ fn month_label(ymd: &str) -> String {
         .to_string()
 }
 
-/// Block-glyph sparkline over `vals`, scaled to the slice's own max.
-fn sparkline(vals: &[u64]) -> String {
-    let max = vals.iter().copied().max().unwrap_or(0);
-    if max == 0 {
-        return SPARK[0].to_string().repeat(vals.len());
+/// Four-cell bouncing block for the full-width indeterminate spinner.
+const INDET_BLOCK: usize = 4;
+
+/// Height-aware vertical block-bar chart: one 1-cell column per value, `height`
+/// rows tall, linear-scaled to the slice max, `fill`-colored. Full `█` blocks
+/// stack from the bottom; a bar's top cell is a partial `▁`..`▇` glyph when the
+/// value doesn't land on an exact 8th of a row.
+/// An all-zero slice renders a flat `▁` baseline. Bars are centered within
+/// `width` (matching the old sparkline placement). Rows are top→bottom.
+fn bar_chart(vals: &[u64], width: usize, height: usize, fill: Style) -> Vec<Line<'static>> {
+    if height == 0 || vals.is_empty() {
+        return Vec::new();
     }
-    vals.iter()
-        .map(|&v| {
-            let idx = ((v as f64 / max as f64) * 7.0).round() as usize;
-            SPARK[idx.min(7)]
+    let max = vals.iter().copied().max().unwrap_or(0);
+    // Height of each bar in eighth-cells (0..=height*8). No data → a flat 1/8
+    // baseline so an idle window still shows a floor rather than blank space.
+    let cap = (height * 8) as f64;
+    let eighths: Vec<usize> = if max == 0 {
+        vec![1; vals.len()]
+    } else {
+        vals.iter()
+            .map(|&v| ((v as f64 / max as f64) * cap).round() as usize)
+            .collect()
+    };
+    let pad = width.saturating_sub(vals.len()) / 2;
+    (0..height)
+        .map(|row| {
+            // Row 0 is the top; count each bar's filled cells up from the bottom.
+            let from_bottom = height - row; // 1..=height
+            let s: String = eighths
+                .iter()
+                .map(|&e| {
+                    let full = e / 8;
+                    let rem = e % 8;
+                    if from_bottom <= full {
+                        '█'
+                    } else if from_bottom == full + 1 && rem > 0 {
+                        SPARK[rem - 1]
+                    } else {
+                        ' '
+                    }
+                })
+                .collect();
+            Line::from(vec![Span::raw(" ".repeat(pad)), Span::styled(s, fill)])
         })
         .collect()
+}
+
+/// Full-width indeterminate spinner (cloudy-tui): a 4-cell `ACCENT` `█` block
+/// bouncing across a `░` `LINE` track inside a `[ ]` `LINE` frame, `label`
+/// trailing in `TEXT_DIM`. Position is a triangle wave over `tick` so it rides
+/// the app's one 80ms tick clock (no second timer).
+fn indeterminate_bar(tick: u64, track: usize, label: &str) -> Line<'static> {
+    let max = track.saturating_sub(INDET_BLOCK);
+    let pos = if max == 0 {
+        0
+    } else {
+        let period = 2 * max;
+        let phase = (tick as usize) % period;
+        if phase <= max { phase } else { period - phase }
+    };
+    let after = track.saturating_sub(pos + INDET_BLOCK);
+    Line::from(vec![
+        Span::styled("[", theme::line()),
+        Span::styled("░".repeat(pos), theme::line()),
+        Span::styled("█".repeat(INDET_BLOCK.min(track)), theme::accent()),
+        Span::styled("░".repeat(after), theme::line()),
+        Span::styled("]", theme::line()),
+        Span::styled(format!("  {label}"), theme::dim()),
+    ])
 }
 
 /// `█`×filled + `░`×rest, `value` scaled against `max`, in `fill`.
@@ -216,6 +275,11 @@ fn key(label: &str) -> Span<'static> {
 /// Inner content width of a card (`section_box` border + 1-col horizontal padding).
 fn inner_w(area: Rect) -> usize {
     (area.width as usize).saturating_sub(4)
+}
+
+/// Inner content height of a card (top + bottom border rows).
+fn inner_h(area: Rect) -> usize {
+    (area.height as usize).saturating_sub(2)
 }
 
 /// Last `width`-bounded tail of a chronological slice (the recent days).
@@ -260,29 +324,42 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let block = section_box("tokens", false, true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let (msg, style) = if app.tokens_failed {
-            ("~/.claude/stats-cache.json unreadable", theme::danger())
+        let line = if app.tokens_failed {
+            Line::from(Span::styled(
+                "~/.claude/stats-cache.json unreadable",
+                theme::danger(),
+            ))
         } else {
-            ("reading ~/.claude", theme::faint())
+            // Pre-first-paint: no total to show yet → the full-width indeterminate
+            // spinner. Reserve the `[ ]`, its gap, and the label from the track.
+            const LABEL: &str = "reading ~/.claude…";
+            let track = inner_w(area)
+                .saturating_sub(2 + 2 + LABEL.chars().count())
+                .clamp(INDET_BLOCK, 40);
+            indeterminate_bar(app.tick_count, track, LABEL)
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, style))).style(theme::base()),
-            inner,
-        );
+        frame.render_widget(Paragraph::new(line).style(theme::base()), inner);
         return;
     };
 
     let count_cache = app.config().state.count_cache;
     let prices = app.price_table.as_ref();
     let period = app.token_period;
+    // While the transcript top-up is in flight, the first card's title carries a
+    // braille spinner (one clock — the app's tick frame).
+    let card_spin = app.tokens_topping_up.then(|| spinner_frame(app.tick_count));
 
+    // Grow the trend card toward a ~10-row cap so its chart breathes, leaving the
+    // bottom row (hour + activity) its 4-row floor plus the rest of the height.
+    // Falls back to the old 4-row trend on short terminals.
+    let trend_h = area.height.saturating_sub(6 + 7 + 4).clamp(4, 10);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6), // today/this week/this month · total (incl. cost row)
-            Constraint::Length(4), // daily/weekly/monthly trend
+            Constraint::Length(trend_h), // daily/weekly/monthly trend (growable)
             Constraint::Length(7), // top models · composition
-            Constraint::Min(4),    // hour · activity
+            Constraint::Min(4),    // hour · activity (takes the rest)
         ])
         .split(area);
 
@@ -297,6 +374,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             period.badge().unwrap_or("period"),
             Some(&meta),
             true,
+            card_spin,
             period_lines(stats, inner_w(top[0]), count_cache, prices, &from, &to),
         );
     } else {
@@ -308,6 +386,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "today",
             today_meta.as_deref(),
             true,
+            card_spin,
             today_lines(stats, inner_w(top[0]), count_cache, prices),
         );
     }
@@ -319,26 +398,32 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "total",
         None,
         false,
+        None,
         total_lines(stats, inner_w(top[1]), count_cache, prices),
     );
 
-    // Freshness badge → the trend card's title-right meta slot.
-    let fresh = stats
-        .topped_up_through
-        .as_deref()
-        .map(|d| format!("live thru {}", short_date(d)));
+    // Freshness badge → the trend card's title-right meta slot. Before the first
+    // top-up lands there is no `live thru` date, so a topping-up spinner stands in.
+    let trend_meta = if let Some(d) = stats.topped_up_through.as_deref() {
+        Some(format!("live thru {}", short_date(d)))
+    } else if app.tokens_topping_up {
+        Some(format!("{} topping up", spinner_frame(app.tick_count)))
+    } else {
+        None
+    };
     let trend_title = match period {
-        TokenPeriod::Weekly => "weekly",
-        TokenPeriod::Monthly => "monthly",
+        TokenPeriod::Weekly => "by week",
+        TokenPeriod::Monthly => "by month",
         TokenPeriod::Lifetime | TokenPeriod::Daily => "daily",
     };
     card(
         frame,
         rows[1],
         trend_title,
-        fresh.as_deref(),
+        trend_meta.as_deref(),
         false,
-        trend_lines(stats, inner_w(rows[1]), period),
+        None,
+        trend_lines(stats, inner_w(rows[1]), inner_h(rows[1]), period),
     );
 
     let mid = halves(rows[2], 55);
@@ -351,6 +436,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "top models",
         models_meta.as_deref(),
         false,
+        None,
         model_lines(
             &model_rows,
             inner_w(mid[0]),
@@ -369,11 +455,12 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         TokenPeriod::Lifetime => (None, comp_lines(stats, inner_w(mid[1]))),
     };
-    card(frame, mid[1], "composition", comp_meta, false, comp);
+    card(frame, mid[1], "composition", comp_meta, false, None, comp);
 
-    // Hour graph is a fixed 24-bucket sparkline (one cell/hour). Pin its box to
-    // 24 + 4 (border + 1-col padding each side) so the graph fills it with no
-    // gap; activity takes the rest and shows more history on wide terminals.
+    // Hour graph is a fixed 24-bucket chart (one cell/hour), grown vertically by
+    // the bottom row's height. Pin its box width to 24 + 4 (border + 1-col
+    // padding each side) so the graph fills it with no gap; activity takes the
+    // rest and shows more history on wide terminals.
     let bot = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(HOUR_BOX_W), Constraint::Min(0)])
@@ -393,11 +480,12 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "hour of day",
         hour_meta,
         false,
-        hour_lines(&hours, inner_w(bot[0])),
+        None,
+        hour_lines(&hours, inner_w(bot[0]), inner_h(bot[0])),
     );
     let act_meta = match period {
-        TokenPeriod::Weekly => Some("weekly"),
-        TokenPeriod::Monthly => Some("monthly"),
+        TokenPeriod::Weekly => Some("by week"),
+        TokenPeriod::Monthly => Some("by month"),
         TokenPeriod::Lifetime | TokenPeriod::Daily => None,
     };
     card(
@@ -406,7 +494,8 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "activity",
         act_meta,
         false,
-        activity_lines(stats, inner_w(bot[1]), period),
+        None,
+        activity_lines(stats, inner_w(bot[1]), inner_h(bot[1]), period),
     );
 }
 
@@ -442,16 +531,21 @@ fn halves(area: Rect, left_pct: u16) -> std::rc::Rc<[Rect]> {
 }
 
 /// Draw one bordered card with its lines. `meta` (if any) renders as a
-/// right-aligned title badge (the cloudy-tui title-right meta slot).
+/// right-aligned title badge (the cloudy-tui title-right meta slot); `spinner`
+/// (if any) appends a braille loading frame into the title's left inset.
 fn card(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
     meta: Option<&str>,
     first: bool,
+    spinner: Option<&str>,
     lines: Vec<Line<'static>>,
 ) {
-    let mut block = section_box(title, false, first);
+    let mut block = match spinner {
+        Some(f) => section_box_loading(title, false, first, f),
+        None => section_box(title, false, first),
+    };
     if let Some(m) = meta {
         block = block.title(
             Line::from(Span::styled(format!(" {m} "), theme::dim())).alignment(Alignment::Right),
@@ -480,7 +574,7 @@ fn today_lines(
         cost_line("cost", prices, &t.models, false),
         Line::from(vec![
             key("msgs"),
-            Span::styled(t.messages.to_string(), theme::body()),
+            Span::styled(group_thousands(t.messages as f64, 0), theme::body()),
         ]),
         lr(
             vec![Span::styled(
@@ -522,7 +616,7 @@ fn total_lines(
                 ),
             ],
             vec![Span::styled(
-                format!("{:.0}% cached", stats.cache_hit_ratio() * 100.0),
+                format!("{:.0}% cache hit", stats.cache_hit_ratio() * 100.0),
                 Style::default().fg(theme::info_color()),
             )],
             w,
@@ -591,7 +685,7 @@ fn period_lines(
         cost_line("cost", prices, &splits, !complete),
         Line::from(vec![
             key("msgs"),
-            Span::styled(fmt_count(msgs), theme::body()),
+            Span::styled(group_thousands(msgs as f64, 0), theme::body()),
         ]),
         lr(
             vec![Span::styled(short_date(from), theme::dim())],
@@ -601,9 +695,10 @@ fn period_lines(
     ]
 }
 
-/// The trend sparkline — per-day rows, or calendar buckets under the weekly /
-/// monthly lens (peak caption names the bucket).
-fn trend_lines(stats: &TokenStats, w: usize, period: TokenPeriod) -> Vec<Line<'static>> {
+/// The trend chart — per-day columns, or calendar buckets under the weekly /
+/// monthly lens (peak caption names the bucket). The bars grow to fill `h` rows,
+/// caption pinned to the bottom.
+fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> Vec<Line<'static>> {
     let series = match period.bucket() {
         Some(b) => bucket_tokens(&stats.daily, b),
         None => stats.daily.clone(),
@@ -626,10 +721,9 @@ fn trend_lines(stats: &TokenStats, w: usize, period: TokenPeriod) -> Vec<Line<'s
             format!("peak {} {}", fmt_count(peak_v), short_date(&peak_d))
         }
     };
-    vec![
-        center(vec![Span::styled(sparkline(&vals), theme::accent())], w),
-        center(vec![Span::styled(peak, theme::faint())], w),
-    ]
+    let mut lines = bar_chart(&vals, w, h.saturating_sub(1), theme::accent());
+    lines.push(center(vec![Span::styled(peak, theme::faint())], w));
+    lines
 }
 
 fn model_lines(
@@ -777,18 +871,22 @@ fn comp_rows(
     .collect()
 }
 
-fn hour_lines(hours: &[u64; 24], w: usize) -> Vec<Line<'static>> {
-    // Centered 24-bucket sparkline with the busiest hour centered below it.
+fn hour_lines(hours: &[u64; 24], w: usize, h: usize) -> Vec<Line<'static>> {
+    // 24-bucket chart grown vertically, busiest hour named below it.
     let peak = busiest_hour(hours)
         .map(|h| format!("peak {h:02}:00"))
         .unwrap_or_default();
-    vec![
-        center(vec![Span::styled(sparkline(hours), theme::accent())], w),
-        center(vec![Span::styled(peak, theme::faint())], w),
-    ]
+    let mut lines = bar_chart(hours, w, h.saturating_sub(1), theme::accent());
+    lines.push(center(vec![Span::styled(peak, theme::faint())], w));
+    lines
 }
 
-fn activity_lines(stats: &TokenStats, w: usize, period: TokenPeriod) -> Vec<Line<'static>> {
+fn activity_lines(
+    stats: &TokenStats,
+    w: usize,
+    h: usize,
+    period: TokenPeriod,
+) -> Vec<Line<'static>> {
     let series = match period.bucket() {
         Some(b) => bucket_activity(&stats.activity, b),
         None => stats.activity.clone(),
@@ -797,23 +895,29 @@ fn activity_lines(stats: &TokenStats, w: usize, period: TokenPeriod) -> Vec<Line
     if msgs.is_empty() {
         return vec![Line::from(Span::styled("no activity data", theme::faint()))];
     }
-    let peak_msgs = series.iter().map(|a| a.messages).max().unwrap_or(0);
-    let peak_sess = series.iter().map(|a| a.sessions).max().unwrap_or(0);
-    let tools: u64 = series.iter().map(|a| a.tool_calls).sum();
-    vec![
-        center(vec![Span::styled(sparkline(&msgs), theme::accent())], w),
-        center(
-            vec![Span::styled(
-                format!(
-                    "peak {} msgs   {peak_sess} sess   {} tools",
-                    fmt_count(peak_msgs),
-                    fmt_count(tools),
-                ),
-                theme::faint(),
-            )],
-            w,
-        ),
-    ]
+    // Caption reports the single busiest-by-messages bucket's own three real
+    // figures — not maxima mixed across buckets plus a lifetime tool sum (which
+    // read the same in every lens). Granularity word distinguishes day/wk/mo.
+    let gran = match period {
+        TokenPeriod::Weekly => "wk",
+        TokenPeriod::Monthly => "mo",
+        TokenPeriod::Lifetime | TokenPeriod::Daily => "day",
+    };
+    let caption = series
+        .iter()
+        .max_by_key(|a| a.messages)
+        .map(|a| {
+            format!(
+                "peak {gran}: {} msgs   {} sess   {} tools",
+                fmt_count(a.messages),
+                a.sessions,
+                fmt_count(a.tool_calls),
+            )
+        })
+        .unwrap_or_default();
+    let mut lines = bar_chart(&msgs, w, h.saturating_sub(1), theme::accent());
+    lines.push(center(vec![Span::styled(caption, theme::faint())], w));
+    lines
 }
 
 /// `key:value` line whose value is the accent-bold headline number.
@@ -1079,3 +1183,7 @@ fn draw_model_detail(
 
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_tokens.rs"]
+mod tests;
