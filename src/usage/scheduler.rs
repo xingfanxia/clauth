@@ -1382,7 +1382,12 @@ fn scan_auto_switch(
 
     // Only act on a confirmed-live read of the active profile — a stale or
     // synthetic store entry would drive a false switch (see `decision_fresh`).
-    if !decision_fresh(status, &snapshot.active) {
+    // EXCEPT an auth-broken active (AUTH-4): its fetches can never come back
+    // Fresh again (the login is dead), so requiring one froze this scan
+    // forever and wedged the daemon on the dead account (observed
+    // 2026-07-09); the walk never consults the broken active's own usage.
+    let active_broken = snapshot.broken.iter().any(|b| b == &snapshot.active);
+    if !active_broken && !decision_fresh(status, &snapshot.active) {
         return;
     }
 

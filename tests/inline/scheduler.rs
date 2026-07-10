@@ -407,6 +407,101 @@ fn only_a_fresh_read_drives_a_switch_decision() {
     );
 }
 
+/// AUTH-4: `scan_auto_switch` bypasses the freshness gate for an auth-broken
+/// active — its reads can never be `Fresh` again (the login is dead), so
+/// requiring one froze the scan forever and wedged the daemon on the dead
+/// account while a viable sibling idled (observed live 2026-07-09). A healthy
+/// active keeps the gate: the same frozen store state must NOT drive a switch
+/// when the account is merely stale, only when it is confirmed dead.
+#[test]
+fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
+    use super::{FetchStatus, PendingSwitch, PendingSwitchOff, StatusStore, scan_auto_switch};
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let frozen_state = || {
+        // The wedge's exact shape: the active's last-ever read is maxed on a
+        // window that has since lapsed (reads as idle headroom), status stuck
+        // on RateLimited; the sibling is genuinely viable and Fresh.
+        let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+            (
+                "a".to_string(),
+                UsageInfo {
+                    five_hour: Some(UsageWindow {
+                        utilization: 100.0,
+                        resets_at: Some(epoch_secs_to_iso(now_epoch_secs() - 3600)),
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                "b".to_string(),
+                UsageInfo {
+                    five_hour: Some(UsageWindow {
+                        utilization: 10.0,
+                        resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ])));
+        let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+            ("a".to_string(), FetchStatus::RateLimited),
+            ("b".to_string(), FetchStatus::Fresh),
+        ])));
+        let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+        let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+        (store, status, activity, pending, pending_off)
+    };
+    let config_handle = |broken: bool| -> crate::profile::ConfigHandle {
+        let mut cfg = AppConfig {
+            state: AppState {
+                active_profile: Some("a".into()),
+                profiles: vec!["a".into(), "b".into()],
+                fallback_chain: vec!["a".into(), "b".into()],
+                ..AppState::default()
+            },
+            profiles: vec![
+                Profile::new("a".to_string(), None, None),
+                Profile::new("b".to_string(), None, None),
+            ],
+        };
+        cfg.set_auth_broken("a", broken);
+        Arc::new(RankedMutex::new(cfg))
+    };
+
+    // Broken active → the gate is bypassed and the walk queues the sibling.
+    let (store, status, activity, pending, pending_off) = frozen_state();
+    scan_auto_switch(
+        &config_handle(true),
+        &store,
+        &status,
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    assert!(
+        pending.lock().unwrap().contains("b"),
+        "a dead active must be walked away from without waiting for a Fresh read"
+    );
+
+    // Healthy active, identical frozen stores → the freshness gate holds.
+    let (store, status, activity, pending, pending_off) = frozen_state();
+    scan_auto_switch(
+        &config_handle(false),
+        &store,
+        &status,
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a merely-stale healthy active must still not drive a switch"
+    );
+}
+
 /// A Fresh `/usage` body fetched in the same tick as a kick can lag the
 /// just-opened window and still report it closed; `preserve_live_window` keeps
 /// the live window we already hold so it can't re-lapse and re-fire the kick.

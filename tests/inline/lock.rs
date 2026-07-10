@@ -7,6 +7,12 @@ use std::time::Instant;
 /// closures — no two intervals may overlap.
 #[test]
 fn cross_thread_with_state_lock_serializes() {
+    // Sandbox-pinned: the lock path resolves through the process-global home
+    // override, and without holding the sandbox lock a concurrently-running
+    // sandboxed test can swap that override mid-test — two of the threads
+    // below would then flock DIFFERENT files and legitimately overlap
+    // (observed as a rare parallel-run flake, 2026-07-09).
+    let _home = crate::testutil::HomeSandbox::new();
     const THREADS: usize = 4;
     let barrier = Arc::new(Barrier::new(THREADS));
     let intervals = Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));

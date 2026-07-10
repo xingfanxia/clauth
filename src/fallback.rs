@@ -408,13 +408,22 @@ pub(crate) fn next_auto_switch_target(
     let len = snapshot.chain.len();
 
     let active = &snapshot.chain[active_idx];
-    if !is_exhausted_active_from_store(
+    // AUTH-4: an auth-broken active bypasses the exhaustion gate. Its fetches
+    // can never succeed again, so its store entry is frozen at the last read —
+    // usually a lapsed 5h window that reads as idle headroom — and requiring
+    // exhaustion here wedged the daemon on the dead account while a viable
+    // sibling idled (observed 2026-07-09). The flag is terminal-confirmed (set
+    // only after a rejected refresh AND a failed live-mirror adopt), and the
+    // walk below never consults the broken active's own usage.
+    let active_broken = snapshot.broken.iter().any(|b| b == &active.name);
+    let active_exhausted = is_exhausted_active_from_store(
         &active.name,
         active.threshold,
         snapshot.burn_aware,
         snapshot.interval_ms,
         store,
-    ) {
+    );
+    if !active_broken && !active_exhausted {
         return None;
     }
 
@@ -439,10 +448,12 @@ pub(crate) fn next_auto_switch_target(
         return Some(SwitchAction::To(name));
     }
 
-    // No headroom, no `last_resort` member anywhere, and the active profile is
-    // already exhausted (gated above). In wrap-off mode, halt all usage
-    // instead of staying on the spent profile.
-    if snapshot.wrap_off {
+    // No headroom, no `last_resort` member anywhere. In wrap-off mode, halt
+    // all usage instead of staying on the spent profile — keyed on REAL
+    // exhaustion only: a broken-but-unspent active stays put (AUTH-4), since
+    // the live session's own Keychain chain may still be healthy and switching
+    // off would log it out over a flag, not over spent quota.
+    if snapshot.wrap_off && active_exhausted {
         return Some(SwitchAction::Off);
     }
     None
@@ -495,12 +506,17 @@ pub(crate) fn auto_switch_if_needed(
         let Some(active) = config.find(active_name) else {
             return Ok(None);
         };
-        if !is_exhausted_active(
-            active,
-            config.state.burn_aware_switching,
-            config.state.refresh_interval_ms,
-            active_burn_pct_per_hour,
-        ) {
+        // AUTH-4 parity with the scheduler-side walk: an auth-broken active's
+        // usage is frozen-stale (its fetches can't succeed), so exhaustion
+        // cannot be a precondition for leaving it.
+        if !config.is_auth_broken(active_name)
+            && !is_exhausted_active(
+                active,
+                config.state.burn_aware_switching,
+                config.state.refresh_interval_ms,
+                active_burn_pct_per_hour,
+            )
+        {
             return Ok(None);
         }
 
