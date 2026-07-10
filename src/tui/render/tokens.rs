@@ -371,9 +371,99 @@ fn clamp_width(area: Rect, max_w: u16) -> Rect {
     }
 }
 
-fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
+/// Card rectangles for the dashboard grid, resolved per layout mode.
+struct DashRects {
+    first: Rect,
+    total: Rect,
+    trend: Rect,
+    models: Rect,
+    comp: Rect,
+    hour: Rect,
+    activity: Rect,
+}
+
+/// Two-column reflow gates: enough width for a card column plus a chart column
+/// that still beats the single-column band, enough height for the full card
+/// stack (6+6+7+6 rows) with a usable hour chart below it.
+const TWO_COL_MIN_W: u16 = 140;
+const TWO_COL_MIN_H: u16 = 30;
+/// Card (left) column width in the two-column layout.
+const CARD_COL_W: u16 = 56;
+
+/// On a big terminal the dashboard reflows to two columns — cards stacked on
+/// the left, the trend + activity charts taking the whole right column, so
+/// extra width buys visible history and extra height buys chart resolution
+/// instead of dead margins. Otherwise the single-column grid, centered in the
+/// `DASH_MAX_W` band (past it the percentage-split cards stretch their
+/// edge-anchored figures into scattered fragments).
+fn dash_rects(area: Rect) -> DashRects {
+    if area.width >= TWO_COL_MIN_W && area.height >= TWO_COL_MIN_H {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(CARD_COL_W), Constraint::Min(0)])
+            .split(area);
+        let left = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(6), // today / this week / this month
+                Constraint::Length(6), // total
+                Constraint::Length(7), // top models
+                Constraint::Length(6), // composition
+                Constraint::Min(5),    // hour of day (grows)
+            ])
+            .split(cols[0]);
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(cols[1]);
+        return DashRects {
+            first: left[0],
+            total: left[1],
+            models: left[2],
+            comp: left[3],
+            hour: left[4],
+            trend: right[0],
+            activity: right[1],
+        };
+    }
+
     let area = clamp_width(area, DASH_MAX_W);
+    // Grow the trend card toward a ~10-row cap so its chart breathes, leaving the
+    // bottom row (hour + activity) its 4-row floor plus the rest of the height.
+    // Falls back to the old 4-row trend on short terminals.
+    let trend_h = area.height.saturating_sub(6 + 7 + 4).clamp(4, 10);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6), // today/this week/this month · total (incl. cost row)
+            Constraint::Length(trend_h), // daily/weekly/monthly trend (growable)
+            Constraint::Length(7), // top models · composition
+            Constraint::Min(4),    // hour · activity (takes the rest)
+        ])
+        .split(area);
+    let top = halves(rows[0], 42);
+    let mid = halves(rows[2], 55);
+    // Hour graph is a fixed 24-bucket chart (one cell/hour). Pin its box width
+    // to 24 + 4 (border + 1-col padding each side) so the graph fills it with
+    // no gap; activity takes the rest and shows more history on wide terminals.
+    let bot = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(HOUR_BOX_W), Constraint::Min(0)])
+        .split(rows[3]);
+    DashRects {
+        first: top[0],
+        total: top[1],
+        trend: rows[1],
+        models: mid[0],
+        comp: mid[1],
+        hour: bot[0],
+        activity: bot[1],
+    }
+}
+
+fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(stats) = app.token_stats.as_ref() else {
+        let area = clamp_width(area, DASH_MAX_W);
         let block = section_box("tokens", false, true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -403,21 +493,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // braille spinner (one clock — the app's tick frame).
     let card_spin = app.tokens_topping_up.then(|| spinner_frame(app.tick_count));
 
-    // Grow the trend card toward a ~10-row cap so its chart breathes, leaving the
-    // bottom row (hour + activity) its 4-row floor plus the rest of the height.
-    // Falls back to the old 4-row trend on short terminals.
-    let trend_h = area.height.saturating_sub(6 + 7 + 4).clamp(4, 10);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(6), // today/this week/this month · total (incl. cost row)
-            Constraint::Length(trend_h), // daily/weekly/monthly trend (growable)
-            Constraint::Length(7), // top models · composition
-            Constraint::Min(4),    // hour · activity (takes the rest)
-        ])
-        .split(area);
-
-    let top = halves(rows[0], 42);
+    let r = dash_rects(area);
     if let Some(bucket) = period.bucket() {
         // Scoped first card: the current calendar bucket, meta = its start day.
         let (from, to) = current_bucket_bounds(&today_date(), bucket);
@@ -426,32 +502,32 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let meta = format!("{} →", short_date(&from));
         card(
             frame,
-            top[0],
+            r.first,
             period.badge().unwrap_or("period"),
             Some(&meta),
             true,
             card_spin,
-            period_lines(stats, inner_w(top[0]), count_cache, prices, &from, &to),
+            period_lines(stats, inner_w(r.first), count_cache, prices, &from, &to),
         );
     } else {
         // Today's date → the today card's title-right meta badge.
         let today_meta = stats.today.as_ref().map(|t| short_date(&t.date));
         card(
             frame,
-            top[0],
+            r.first,
             "today",
             today_meta.as_deref(),
             true,
             card_spin,
-            today_lines(stats, inner_w(top[0]), count_cache, prices),
+            today_lines(stats, inner_w(r.first), count_cache, prices),
         );
     }
     // Total stays the lifetime anchor in every period — the scoped window
     // already owns the first card.
-    let (total_body, total_meta) = total_lines(stats, inner_w(top[1]), count_cache, prices);
+    let (total_body, total_meta) = total_lines(stats, inner_w(r.total), count_cache, prices);
     card(
         frame,
-        top[1],
+        r.total,
         "total",
         total_meta.as_deref(),
         false,
@@ -486,7 +562,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Some((d, t)) => format!("scanning session logs {d}/{t}"),
             None => "scanning session logs".to_string(),
         };
-        let track = inner_w(rows[1])
+        let track = inner_w(r.trend)
             .saturating_sub(2 + 2 + label.chars().count())
             .clamp(INDET_BLOCK, 40);
         vec![match app.tokens_progress {
@@ -494,11 +570,11 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             None => indeterminate_bar(app.tick_count, track, &label),
         }]
     } else {
-        trend_lines(stats, inner_w(rows[1]), inner_h(rows[1]), period)
+        trend_lines(stats, inner_w(r.trend), inner_h(r.trend), period)
     };
     card(
         frame,
-        rows[1],
+        r.trend,
         trend_title,
         trend_meta.as_deref(),
         false,
@@ -506,20 +582,19 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         trend_body,
     );
 
-    let mid = halves(rows[2], 55);
     // Filter + period lenses both show as the card's title-right meta badge.
     let model_rows = token_period_models(app);
     let models_meta = join_badges(app.token_filter.badge(), Some(period.lens_badge()));
     card(
         frame,
-        mid[0],
+        r.models,
         "top models",
         models_meta.as_deref(),
         false,
         None,
         model_lines(
             &model_rows,
-            inner_w(mid[0]),
+            inner_w(r.models),
             5,
             effective_cache_basis(&model_rows, count_cache),
             prices,
@@ -529,22 +604,14 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Composition can scope honestly only to today (transcript-derived split);
     // weekly/monthly fall back to lifetime, badged as such.
     let (comp_meta, comp) = match period {
-        TokenPeriod::Daily => (Some("today"), today_comp_lines(stats, inner_w(mid[1]))),
+        TokenPeriod::Daily => (Some("today"), today_comp_lines(stats, inner_w(r.comp))),
         TokenPeriod::Weekly | TokenPeriod::Monthly => {
-            (Some("lifetime"), comp_lines(stats, inner_w(mid[1])))
+            (Some("lifetime"), comp_lines(stats, inner_w(r.comp)))
         }
-        TokenPeriod::Lifetime => (Some("lifetime"), comp_lines(stats, inner_w(mid[1]))),
+        TokenPeriod::Lifetime => (Some("lifetime"), comp_lines(stats, inner_w(r.comp))),
     };
-    card(frame, mid[1], "composition", comp_meta, false, None, comp);
+    card(frame, r.comp, "composition", comp_meta, false, None, comp);
 
-    // Hour graph is a fixed 24-bucket chart (one cell/hour), grown vertically by
-    // the bottom row's height. Pin its box width to 24 + 4 (border + 1-col
-    // padding each side) so the graph fills it with no gap; activity takes the
-    // rest and shows more history on wide terminals.
-    let bot = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(HOUR_BOX_W), Constraint::Min(0)])
-        .split(rows[3]);
     // Same fallback shape as composition: per-day hours exist only for today.
     let (hour_meta, hours) = match period {
         TokenPeriod::Daily => (
@@ -557,12 +624,12 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     card(
         frame,
-        bot[0],
+        r.hour,
         "hour of day",
         hour_meta,
         false,
         None,
-        hour_lines(&hours, inner_w(bot[0]), inner_h(bot[0])),
+        hour_lines(&hours, inner_w(r.hour), inner_h(r.hour)),
     );
     let act_meta = match period {
         TokenPeriod::Weekly => Some("by week"),
@@ -571,12 +638,12 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     card(
         frame,
-        bot[1],
+        r.activity,
         "activity",
         act_meta,
         false,
         None,
-        activity_lines(stats, inner_w(bot[1]), inner_h(bot[1]), period),
+        activity_lines(stats, inner_w(r.activity), inner_h(r.activity), period),
     );
 }
 

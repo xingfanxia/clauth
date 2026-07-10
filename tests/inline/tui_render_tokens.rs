@@ -163,7 +163,37 @@ fn bar_chart_capped_scales_to_the_cap() {
 // ── dashboard width clamp + TOTAL card ────────────────────────────────────────
 
 #[test]
-fn dashboard_clamps_to_a_centered_band_on_wide_terminals() {
+fn dashboard_reflows_to_two_columns_on_big_terminals() {
+    let app = app_with_stats(TokenPeriod::Lifetime);
+    let out = render_dashboard(&app, 160, 40);
+    let row = |y: usize| -> String { out.chars().skip(y * 160).take(160).collect() };
+    assert_eq!(
+        row(0).chars().next(),
+        Some('╭'),
+        "the card column starts at the left edge (no centering margin)"
+    );
+    assert!(
+        row(0).contains(" DAILY "),
+        "the trend card shares the top row"
+    );
+    assert!(
+        !row(0).contains(" TOTAL "),
+        "total stacks under the first card instead of sitting beside it"
+    );
+    assert!(
+        row(6).contains(" TOTAL "),
+        "total is the second left-column card"
+    );
+    let act_row = (0..40).find(|&y| row(y).contains(" ACTIVITY "));
+    assert!(
+        act_row.is_some_and(|y| y >= 20),
+        "activity sits in the lower right half, got row {act_row:?}"
+    );
+}
+
+#[test]
+fn dashboard_clamps_to_a_centered_band_on_wide_short_terminals() {
+    // Wide but under the 30-row reflow gate → the single-column centered band.
     let app = app_with_stats(TokenPeriod::Lifetime);
     let out = render_dashboard(&app, 160, 24);
     let row0: String = out.chars().take(160).collect();
