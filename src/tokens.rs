@@ -515,7 +515,7 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
     let today = today_date();
     let lcd = base.last_computed_date.clone();
     let mut cache = TopUpCache::default();
-    refresh_topup_cache(claude_dir, lcd.as_deref(), &mut cache);
+    refresh_topup_cache(claude_dir, lcd.as_deref(), &mut cache, |_, _| {});
     merge_topup(&mut base, &cache, lcd.as_deref(), &today);
     Some(base)
 }
@@ -719,6 +719,7 @@ fn refresh_topup_cache(
     claude_dir: &Path,
     last_computed_date: Option<&str>,
     cache: &mut TopUpCache,
+    mut progress: impl FnMut(usize, usize),
 ) {
     let Some(cutoff_date) = last_computed_date else {
         cache.files.clear();
@@ -735,7 +736,9 @@ fn refresh_topup_cache(
     let present: HashSet<&PathBuf> = paths.iter().collect();
     cache.files.retain(|p, _| present.contains(p));
 
-    for path in paths {
+    let total = paths.len();
+    for (done, path) in paths.into_iter().enumerate() {
+        progress(done + 1, total);
         let mtime = match std::fs::metadata(&path)
             .ok()
             .and_then(|m| m.modified().ok())
@@ -1089,6 +1092,9 @@ pub(crate) enum TokensEvent {
     /// Phase 1: stats-cache parsed, transcript sweep not yet run. Lets the tab
     /// paint lifetime/model data instantly instead of blocking on the sweep.
     Base(Box<TokenStats>),
+    /// Mid-sweep: `done` of `total` transcript files visited. Throttled at the
+    /// send site so a multi-hundred-file sweep doesn't flood the channel.
+    Progress { done: usize, total: usize },
     /// Phase 2: the live transcript top-up merged in (today card, recent days,
     /// reconstructed lifetime counts). Supersedes the matching `Base`.
     Loaded(Box<TokenStats>),
@@ -1122,7 +1128,14 @@ pub(crate) fn spawn(tx: Sender<TokensEvent>, refresh_rx: Receiver<()>, claude_di
             // Phase 2 — refresh the per-file cache (changed files only) and merge.
             let today = today_date();
             let lcd = base.last_computed_date.clone();
-            refresh_topup_cache(&claude_dir, lcd.as_deref(), cache);
+            // Throttled progress: every 25th file plus the final one, so a
+            // several-hundred-file cold sweep paints a moving count without
+            // flooding the channel on warm (all-cached) cycles.
+            refresh_topup_cache(&claude_dir, lcd.as_deref(), cache, |done, total| {
+                if done % 25 == 0 || done == total {
+                    let _ = tx.send(TokensEvent::Progress { done, total });
+                }
+            });
             merge_topup(&mut base, cache, lcd.as_deref(), &today);
             let _ = tx.send(TokensEvent::Loaded(Box::new(base)));
         };

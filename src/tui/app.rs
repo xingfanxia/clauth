@@ -1180,13 +1180,17 @@ pub(crate) struct App {
     /// transcript top-up); `None` until the loader posts its first result.
     pub(crate) token_stats: Option<crate::tokens::TokenStats>,
     /// Set when the loader reported a failure and no stats are cached — the tab
-    /// shows an error instead of a perpetual "reading ~/.claude".
+    /// shows an error instead of a perpetual "parsing stats-cache.json".
     pub(crate) tokens_failed: bool,
     /// True while the JSONL transcript top-up is known to be in flight: set when
     /// a `Base` first seeds the tab or on a manual reload, cleared on the next
     /// `Loaded`/`Failed`. Silent periodic refreshes never light it (their `Base`
     /// hits an already-populated tab). Drives the loading spinners on the tab.
     pub(crate) tokens_topping_up: bool,
+    /// Latest `(done, total)` transcript-sweep count from the loader; rendered
+    /// only while `tokens_topping_up` (silent periodic sweeps also emit it),
+    /// cleared on `Loaded`/`Failed` and on a manual reload.
+    pub(crate) tokens_progress: Option<(usize, usize)>,
     /// Which view the Tokens tab is showing (Dashboard landing vs Models detail).
     pub(crate) token_view: TokenView,
     /// Cursor into the grouped model list on the Tokens `Models` view.
@@ -1449,6 +1453,7 @@ impl App {
             token_stats: None,
             tokens_failed: false,
             tokens_topping_up: false,
+            tokens_progress: None,
             token_view: TokenView::Dashboard,
             token_model_cursor: 0,
             token_filter: TokenFilter::default(),
@@ -2331,6 +2336,7 @@ fn reload_token_stats(app: &mut App) {
     // A user-triggered reload is a foreground refresh — light the loading
     // spinners until the loader's next `Loaded`/`Failed` clears them.
     app.tokens_topping_up = true;
+    app.tokens_progress = None;
     app.toast(ToastKind::Info, "reloading token usage");
 }
 
@@ -5937,9 +5943,13 @@ fn drain_tokens_events(app: &mut App) {
                     app.tokens_topping_up = true;
                 }
             }
+            crate::tokens::TokensEvent::Progress { done, total } => {
+                app.tokens_progress = Some((done, total));
+            }
             crate::tokens::TokensEvent::Loaded(stats) => {
                 app.tokens_failed = false;
                 app.tokens_topping_up = false;
+                app.tokens_progress = None;
                 app.token_stats = Some(*stats);
                 // Re-clamp the model cursor in case the grouped list shrank.
                 let len = token_model_count(app);
@@ -5951,6 +5961,7 @@ fn drain_tokens_events(app: &mut App) {
             // read error mid-session keeps the last good snapshot.
             crate::tokens::TokensEvent::Failed => {
                 app.tokens_topping_up = false;
+                app.tokens_progress = None;
                 if app.token_stats.is_none() {
                     app.tokens_failed = true;
                 }

@@ -250,6 +250,21 @@ fn indeterminate_bar(tick: u64, track: usize, label: &str) -> Line<'static> {
     ])
 }
 
+/// Full-width determinate progress run — bare `█`/`░` per the contract (the
+/// `[ ]` frame is the indeterminate variant's tell), label trailing in dim.
+fn determinate_bar(done: usize, total: usize, track: usize, label: &str) -> Line<'static> {
+    let filled = if total == 0 {
+        0
+    } else {
+        ((done * track) / total).min(track)
+    };
+    Line::from(vec![
+        Span::styled("█".repeat(filled), theme::accent()),
+        Span::styled("░".repeat(track.saturating_sub(filled)), theme::line()),
+        Span::styled(format!("  {label}"), theme::dim()),
+    ])
+}
+
 /// `█`×filled + `░`×rest, `value` scaled against `max`, in `fill`.
 fn hbar(value: u64, max: u64, width: usize, fill: Style) -> Vec<Span<'static>> {
     let filled = if max == 0 {
@@ -330,9 +345,10 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 theme::danger(),
             ))
         } else {
-            // Pre-first-paint: no total to show yet → the full-width indeterminate
-            // spinner. Reserve the `[ ]`, its gap, and the label from the track.
-            const LABEL: &str = "reading ~/.claude…";
+            // Pre-first-paint: only the stats-cache parse runs before `Base`
+            // seeds the tab, so the label names that stage. Reserve the `[ ]`,
+            // its gap, and the label from the track.
+            const LABEL: &str = "parsing stats-cache.json…";
             let track = inner_w(area)
                 .saturating_sub(2 + 2 + LABEL.chars().count())
                 .clamp(INDET_BLOCK, 40);
@@ -407,7 +423,12 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let trend_meta = if let Some(d) = stats.topped_up_through.as_deref() {
         Some(format!("live thru {}", short_date(d)))
     } else if app.tokens_topping_up {
-        Some(format!("{} topping up", spinner_frame(app.tick_count)))
+        // Sweep counts (when the loader has reported any) ride the spinner.
+        let count = app
+            .tokens_progress
+            .map(|(d, t)| format!(" {d}/{t}"))
+            .unwrap_or_default();
+        Some(format!("{} scanning{count}", spinner_frame(app.tick_count)))
     } else {
         None
     };
@@ -416,6 +437,24 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         TokenPeriod::Monthly => "by month",
         TokenPeriod::Lifetime | TokenPeriod::Daily => "daily",
     };
+    // A fresh install has no daily history to chart while the first sweep runs;
+    // the trend interior carries the full-width scanning bar instead of the
+    // bare "no daily data" empty state (determinate once counts arrive).
+    let trend_body = if stats.daily.is_empty() && app.tokens_topping_up {
+        let label = match app.tokens_progress {
+            Some((d, t)) => format!("scanning session logs {d}/{t}"),
+            None => "scanning session logs".to_string(),
+        };
+        let track = inner_w(rows[1])
+            .saturating_sub(2 + 2 + label.chars().count())
+            .clamp(INDET_BLOCK, 40);
+        vec![match app.tokens_progress {
+            Some((d, t)) => determinate_bar(d, t, track, &label),
+            None => indeterminate_bar(app.tick_count, track, &label),
+        }]
+    } else {
+        trend_lines(stats, inner_w(rows[1]), inner_h(rows[1]), period)
+    };
     card(
         frame,
         rows[1],
@@ -423,7 +462,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         trend_meta.as_deref(),
         false,
         None,
-        trend_lines(stats, inner_w(rows[1]), inner_h(rows[1]), period),
+        trend_body,
     );
 
     let mid = halves(rows[2], 55);

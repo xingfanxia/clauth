@@ -2053,11 +2053,25 @@ fn tokens_topping_up_tracks_the_load_lifecycle() {
         "a seeding Base lights the loading flag"
     );
 
-    // Loaded clears it.
+    // Sweep progress lands in `tokens_progress` while the top-up runs.
+    tx.send(TokensEvent::Progress {
+        done: 25,
+        total: 380,
+    })
+    .unwrap();
+    drain_tokens_events(&mut app);
+    assert_eq!(
+        app.tokens_progress,
+        Some((25, 380)),
+        "Progress stores the sweep counts"
+    );
+
+    // Loaded clears both the flag and the counts.
     tx.send(TokensEvent::Loaded(Box::<TokenStats>::default()))
         .unwrap();
     drain_tokens_events(&mut app);
     assert!(!app.tokens_topping_up, "Loaded clears the loading flag");
+    assert_eq!(app.tokens_progress, None, "Loaded clears the sweep counts");
 
     // A silent periodic Base (stats already present) must NOT relight it.
     tx.send(TokensEvent::Base(Box::<TokenStats>::default()))
@@ -2068,10 +2082,17 @@ fn tokens_topping_up_tracks_the_load_lifecycle() {
         "a non-seeding periodic Base stays silent"
     );
 
-    // Manual reload lights it; a subsequent Failed clears it.
+    // Manual reload lights it (and drops any stale counts); a subsequent
+    // Failed clears both.
+    app.tokens_progress = Some((1, 2));
     reload_token_stats(&mut app);
     assert!(app.tokens_topping_up, "manual reload lights the flag");
+    assert_eq!(
+        app.tokens_progress, None,
+        "manual reload drops stale sweep counts"
+    );
     tx.send(TokensEvent::Failed).unwrap();
     drain_tokens_events(&mut app);
     assert!(!app.tokens_topping_up, "Failed clears the loading flag");
+    assert_eq!(app.tokens_progress, None, "Failed clears the sweep counts");
 }
