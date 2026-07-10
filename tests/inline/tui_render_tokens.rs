@@ -140,27 +140,19 @@ fn p95_cap_fires_only_on_outliers() {
 }
 
 #[test]
-fn bar_chart_capped_crowns_clipped_bars() {
-    // 19 equal columns + one outlier, capped at the quiet level: the quiet
-    // columns fill the full height and the outlier is crowned with `▲`.
+fn bar_chart_capped_scales_to_the_cap() {
+    // 19 equal columns + one outlier, capped at the quiet level: every column
+    // reaches full height (the outlier renders as a plain max bar, no marker).
     let mut vals = vec![1_u64; 19];
     vals.push(100);
-    let (lines, clipped) = bar_chart_capped(&vals, 20, 3, Style::default(), Some(1));
-    assert!(clipped, "the outlier reports as clipped");
-    let top = line_text(&lines[0]);
+    let lines = bar_chart_capped(&vals, 20, 3, Style::default(), Some(1));
     assert_eq!(
-        top.chars().nth(19).unwrap(),
-        '▲',
-        "the clipped bar's top cell is the clip marker, got {top:?}"
-    );
-    assert_eq!(
-        top.chars().next().unwrap(),
-        '█',
-        "capped quiet columns reach the full height"
+        line_text(&lines[0]),
+        "█".repeat(20),
+        "capped columns all reach the full height"
     );
     // Uncapped, the same series flattens the quiet days into the baseline.
-    let (linear, linear_clipped) = bar_chart_capped(&vals, 20, 3, Style::default(), None);
-    assert!(!linear_clipped, "no cap → nothing reports as clipped");
+    let linear = bar_chart_capped(&vals, 20, 3, Style::default(), None);
     assert_ne!(
         line_text(&linear[0]).chars().next().unwrap(),
         '█',
