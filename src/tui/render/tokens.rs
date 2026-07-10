@@ -188,47 +188,48 @@ const INDET_BLOCK: usize = 4;
 /// Height-aware vertical block-bar chart: one 1-cell column per value, `height`
 /// rows tall, linear-scaled to the slice max, `fill`-colored. Full `█` blocks
 /// stack from the bottom; a bar's top cell is a partial `▁`..`▇` glyph when the
-/// value doesn't land on an exact 8th of a row.
+/// value doesn't land on an exact 8th of a row. A nonzero value always keeps
+/// the `▁` floor cell, so a real day never renders blank.
 /// An all-zero slice renders a flat `▁` baseline. Bars are centered within
 /// `width` (matching the old sparkline placement). Rows are top→bottom.
 fn bar_chart(vals: &[u64], width: usize, height: usize, fill: Style) -> Vec<Line<'static>> {
-    bar_chart_capped(vals, width, height, fill, None)
+    bar_chart_scaled(vals, width, height, fill, false)
 }
 
-/// The p95 of a series' nonzero values — the scale ceiling for outlier-heavy
-/// time series (one 982M day flattening months of normal use to 1-cell noise).
-/// `None` when nothing would clip (cap == max, or no data), so callers can skip
-/// the clip legend.
-fn p95_cap(vals: &[u64]) -> Option<u64> {
-    let mut nz: Vec<u64> = vals.iter().copied().filter(|&v| v > 0).collect();
-    nz.sort_unstable();
-    let cap = *nz.get((nz.len().checked_sub(1)?) * 95 / 100)?;
-    let max = *nz.last()?;
-    (cap < max && cap > 0).then_some(cap)
+/// `bar_chart` on a square-root scale, for outlier-heavy time series: linear
+/// let one 982M day flatten months of normal use to sub-cell noise, and the
+/// p95 hard-clip that replaced it rendered every above-cap day as an identical
+/// full-height wall. sqrt keeps ordering and the peak cluster's shape while
+/// quiet days stay readable; heights aren't proportional to values, so the
+/// peak caption names the true max.
+fn bar_chart_sqrt(vals: &[u64], width: usize, height: usize, fill: Style) -> Vec<Line<'static>> {
+    bar_chart_scaled(vals, width, height, fill, true)
 }
 
-/// `bar_chart` core with an optional scale ceiling: values above `cap` render
-/// as plain full-height columns (the peak caption still names the true max).
-fn bar_chart_capped(
+fn bar_chart_scaled(
     vals: &[u64],
     width: usize,
     height: usize,
     fill: Style,
-    cap: Option<u64>,
+    sqrt: bool,
 ) -> Vec<Line<'static>> {
     if height == 0 || vals.is_empty() {
         return Vec::new();
     }
     let max = vals.iter().copied().max().unwrap_or(0);
-    let scale_max = cap.unwrap_or(max).min(max);
     // Height of each bar in eighth-cells (0..=height*8). No data → a flat 1/8
     // baseline so an idle window still shows a floor rather than blank space.
     let row_cap = (height * 8) as f64;
-    let eighths: Vec<usize> = if scale_max == 0 {
+    let eighths: Vec<usize> = if max == 0 {
         vec![1; vals.len()]
     } else {
         vals.iter()
-            .map(|&v| ((v.min(scale_max) as f64 / scale_max as f64) * row_cap).round() as usize)
+            .map(|&v| {
+                let ratio = v as f64 / max as f64;
+                let scaled = if sqrt { ratio.sqrt() } else { ratio };
+                let e = (scaled * row_cap).round() as usize;
+                if v > 0 { e.max(1) } else { e }
+            })
             .collect()
     };
     let pad = width.saturating_sub(vals.len()) / 2;
@@ -871,15 +872,7 @@ fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> V
             format!("peak {} {}", fmt_count(peak_v), short_date(&peak_d))
         }
     };
-    // Outlier days would flatten the rest of the series to 1-cell noise on a
-    // linear scale; clamp to the p95 (the caption names the true peak).
-    let mut lines = bar_chart_capped(
-        &vals,
-        w,
-        h.saturating_sub(1),
-        theme::accent(),
-        p95_cap(&vals),
-    );
+    let mut lines = bar_chart_sqrt(&vals, w, h.saturating_sub(1), theme::accent());
     lines.push(center(vec![Span::styled(peak, theme::faint())], w));
     lines
 }
@@ -1103,14 +1096,8 @@ fn activity_lines(
             )
         })
         .unwrap_or_default();
-    // Same p95 clamp as the trend chart — activity has the same outlier shape.
-    let mut lines = bar_chart_capped(
-        &msgs,
-        w,
-        h.saturating_sub(1),
-        theme::accent(),
-        p95_cap(&msgs),
-    );
+    // Same sqrt scale as the trend chart — activity has the same outlier shape.
+    let mut lines = bar_chart_sqrt(&msgs, w, h.saturating_sub(1), theme::accent());
     lines.push(center(vec![Span::styled(caption, theme::faint())], w));
     lines
 }

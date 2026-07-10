@@ -2,8 +2,8 @@
 //! loading spinner, the honest activity caption, and the granularity badges.
 
 use super::{
-    HOUR_TICKS, INDET_BLOCK, activity_lines, bar_chart, bar_chart_capped, determinate_bar,
-    hour_lines, indeterminate_bar, model_lines, p95_cap,
+    HOUR_TICKS, INDET_BLOCK, activity_lines, bar_chart, bar_chart_sqrt, determinate_bar,
+    hour_lines, indeterminate_bar, model_lines,
 };
 use crate::pricing::{ModelRate, PriceTable};
 use crate::profile::{AppConfig, AppState};
@@ -126,37 +126,59 @@ fn bar_chart_short_series_is_left_padded() {
     );
 }
 
-// ── p95 clamp ─────────────────────────────────────────────────────────────────
+// ── sqrt scale ────────────────────────────────────────────────────────────────
 
-#[test]
-fn p95_cap_fires_only_on_outliers() {
-    assert_eq!(p95_cap(&[]), None, "empty series has no cap");
-    assert_eq!(p95_cap(&[0, 0, 0]), None, "all-zero series has no cap");
-    assert_eq!(p95_cap(&[5, 5, 5, 5]), None, "uniform series never clips");
-    // 19 quiet days + one spike: the p95 sits at the quiet level.
-    let mut vals = vec![1_u64; 19];
-    vals.push(100);
-    assert_eq!(p95_cap(&vals), Some(1), "outlier series caps at the p95");
+/// Rows of a column occupied by any glyph (full or partial), bottom-up.
+fn col_cells(lines: &[Line<'_>], col: usize) -> usize {
+    lines
+        .iter()
+        .filter(|l| line_text(l).chars().nth(col) != Some(' '))
+        .count()
 }
 
 #[test]
-fn bar_chart_capped_scales_to_the_cap() {
-    // 19 equal columns + one outlier, capped at the quiet level: every column
-    // reaches full height (the outlier renders as a plain max bar, no marker).
-    let mut vals = vec![1_u64; 19];
+fn bar_chart_sqrt_peak_alone_fills_the_full_height() {
+    // One 100× outlier next to quiet days: only the peak column reaches the
+    // top row — no p95-style wall of identical full-height columns.
+    let mut vals = vec![9_u64; 19];
     vals.push(100);
-    let lines = bar_chart_capped(&vals, 20, 3, Style::default(), Some(1));
+    let lines = bar_chart_sqrt(&vals, 20, 8, Style::default());
     assert_eq!(
-        line_text(&lines[0]),
-        "█".repeat(20),
-        "capped columns all reach the full height"
-    );
-    // Uncapped, the same series flattens the quiet days into the baseline.
-    let linear = bar_chart_capped(&vals, 20, 3, Style::default(), None);
-    assert_ne!(
-        line_text(&linear[0]).chars().next().unwrap(),
+        line_text(&lines[0]).chars().nth(19).unwrap(),
         '█',
-        "linear scale flattens the quiet columns"
+        "the peak column reaches the top row"
+    );
+    assert_eq!(
+        line_text(&lines[0]).chars().filter(|&c| c != ' ').count(),
+        1,
+        "no other column joins the peak at the top"
+    );
+}
+
+#[test]
+fn bar_chart_sqrt_lifts_quiet_days_above_linear() {
+    // 9% of the peak: linear leaves it inside the bottom cell; sqrt gives it
+    // ~30% of the height so months of normal use stay readable.
+    let vals = [9_u64, 100];
+    let linear = bar_chart(&vals, 2, 8, Style::default());
+    let sqrt = bar_chart_sqrt(&vals, 2, 8, Style::default());
+    assert_eq!(col_cells(&linear, 0), 1, "linear flattens the quiet column");
+    assert!(
+        col_cells(&sqrt, 0) >= 2,
+        "sqrt keeps the quiet column readable, got {} cells",
+        col_cells(&sqrt, 0)
+    );
+}
+
+#[test]
+fn bar_chart_nonzero_keeps_the_floor_cell() {
+    // 1/10_000 of the peak rounds to zero cells; a real day still shows the
+    // ▁ floor instead of vanishing, while a true zero day stays blank.
+    let lines = bar_chart(&[1, 0, 10_000], 3, 2, Style::default());
+    assert_eq!(
+        line_text(&lines[1]),
+        "▁ █",
+        "nonzero floors at ▁, zero stays blank"
     );
 }
 
