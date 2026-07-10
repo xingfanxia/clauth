@@ -2,11 +2,12 @@
 //! loading spinner, the honest activity caption, and the granularity badges.
 
 use super::{
-    INDET_BLOCK, activity_lines, bar_chart, bar_chart_capped, determinate_bar, indeterminate_bar,
-    p95_cap,
+    HOUR_TICKS, INDET_BLOCK, activity_lines, bar_chart, bar_chart_capped, determinate_bar,
+    hour_lines, indeterminate_bar, model_lines, p95_cap,
 };
+use crate::pricing::{ModelRate, PriceTable};
 use crate::profile::{AppConfig, AppState};
-use crate::tokens::{DayActivity, DayTokens, ModelTokens, TokenStats};
+use crate::tokens::{DayActivity, DayTokens, ModelTokens, PeriodModel, TokenStats};
 use crate::tui::app::{App, Tab, TokenPeriod};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -164,6 +165,79 @@ fn bar_chart_capped_crowns_clipped_bars() {
         line_text(&linear[0]).chars().next().unwrap(),
         '█',
         "linear scale flattens the quiet columns"
+    );
+}
+
+// ── model rows: unpriced cost dash ────────────────────────────────────────────
+
+#[test]
+fn model_lines_dash_unpriced_models_when_a_table_is_loaded() {
+    let rows: Vec<PeriodModel> = [("claude-opus-4-8", 900_u64), ("glm-5.2", 800)]
+        .iter()
+        .map(|&(id, tokens)| {
+            PeriodModel::from_full(&ModelTokens {
+                model: id.into(),
+                input: tokens,
+                output: 0,
+                cache_read: 0,
+                cache_create: 0,
+            })
+        })
+        .collect();
+    let mut prices = PriceTable {
+        rates: std::collections::HashMap::new(),
+        fetched_at_ms: 0,
+    };
+    prices.rates.insert(
+        "claude-opus-4-8".into(),
+        ModelRate {
+            input: 5e-6,
+            output: 25e-6,
+            cache_read: 5e-7,
+            cache_write: 6e-6,
+        },
+    );
+
+    let lines = model_lines(&rows, 60, 5, true, Some(&prices), "no model usage yet");
+    let texts: Vec<String> = lines.iter().map(line_text).collect();
+    assert!(
+        texts[0].contains('$'),
+        "the priced model shows a cost, got {:?}",
+        texts[0]
+    );
+    assert!(
+        texts[1].trim_end().ends_with('—'),
+        "the unpriced model shows the no-value dash, got {:?}",
+        texts[1]
+    );
+
+    // No price table at all → the whole cost column stays hidden.
+    let bare = model_lines(&rows, 60, 5, true, None, "no model usage yet");
+    assert!(
+        bare.iter().map(line_text).all(|t| !t.contains('—')),
+        "no table → no dash column"
+    );
+}
+
+// ── hour-of-day ticks ─────────────────────────────────────────────────────────
+
+#[test]
+fn hour_lines_carry_baseline_ticks_only_when_tall_enough() {
+    let mut hours = [0u64; 24];
+    hours[12] = 10;
+    let tall: Vec<String> = hour_lines(&hours, 30, 5).iter().map(line_text).collect();
+    assert!(
+        tall.iter().any(|t| t.contains(HOUR_TICKS)),
+        "a tall chart carries the 0/6/12/18 tick row"
+    );
+    // Ticks sit directly above the caption row.
+    assert!(tall[tall.len() - 2].contains(HOUR_TICKS));
+    assert!(tall[tall.len() - 1].contains("peak 12:00"));
+
+    let short: Vec<String> = hour_lines(&hours, 30, 2).iter().map(line_text).collect();
+    assert!(
+        !short.iter().any(|t| t.contains(HOUR_TICKS)),
+        "the 2-row floor drops the ticks, not the chart"
     );
 }
 

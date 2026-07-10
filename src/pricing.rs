@@ -77,7 +77,7 @@ pub(crate) struct ModelRate {
 /// it was fetched (for a freshness badge).
 #[derive(Debug, Clone)]
 pub(crate) struct PriceTable {
-    rates: HashMap<String, ModelRate>,
+    pub(crate) rates: HashMap<String, ModelRate>,
     pub(crate) fetched_at_ms: u64,
 }
 

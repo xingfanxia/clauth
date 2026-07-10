@@ -415,7 +415,9 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(bucket) = period.bucket() {
         // Scoped first card: the current calendar bucket, meta = its start day.
         let (from, to) = current_bucket_bounds(&today_date(), bucket);
-        let meta = format!("{}+", short_date(&from));
+        // `→` = "from this day"; a `+` here would collide with the cost floor's
+        // `$X+` suffix inches below it.
+        let meta = format!("{} →", short_date(&from));
         card(
             frame,
             top[0],
@@ -834,9 +836,12 @@ fn model_lines(
     let costs: Vec<String> = rows
         .iter()
         .take(n)
-        .map(|m| {
-            prices
-                .and_then(|p| p.cost(&m.split))
+        .map(|m| match prices {
+            // No price table at all → no column; a loaded table with an
+            // unpriced model (unknown third-party id) shows the no-value dash.
+            None => String::new(),
+            Some(p) => p
+                .cost(&m.split)
                 .map(|c| {
                     let mut s = fmt_money(c);
                     if !m.split_complete {
@@ -844,7 +849,7 @@ fn model_lines(
                     }
                     s
                 })
-                .unwrap_or_default()
+                .unwrap_or_else(|| "—".to_string()),
         })
         .collect();
     let cost_w = costs.iter().map(|s| s.chars().count()).max().unwrap_or(0);
@@ -884,7 +889,13 @@ fn model_lines(
             spans.extend(hbar(val, max, bar_w, fill));
             spans.push(Span::styled(format!(" {count:>count_w$}"), theme::dim()));
             if show_cost {
-                spans.push(Span::styled(format!(" {cost:>cost_w$}"), money_style()));
+                // The no-value dash stays faint — orange is the money identity.
+                let style = if cost == "—" {
+                    theme::faint()
+                } else {
+                    money_style()
+                };
+                spans.push(Span::styled(format!(" {cost:>cost_w$}"), style));
             }
             Line::from(spans)
         })
@@ -949,12 +960,27 @@ fn comp_rows(
     .collect()
 }
 
+/// Baseline tick labels under the 24-column hour chart, one digit run per
+/// quarter of the day (columns 0 / 6 / 12 / 18).
+const HOUR_TICKS: &str = "0     6     12    18";
+
 fn hour_lines(hours: &[u64; 24], w: usize, h: usize) -> Vec<Line<'static>> {
-    // 24-bucket chart grown vertically, busiest hour named below it.
+    // 24-bucket chart grown vertically, busiest hour named below it. Tick
+    // labels squeeze in only when the chart keeps ≥ 2 rows of its own.
     let peak = busiest_hour(hours)
         .map(|h| format!("peak {h:02}:00"))
         .unwrap_or_default();
-    let mut lines = bar_chart(hours, w, h.saturating_sub(1), theme::accent());
+    let ticks = h >= 4;
+    let chart_h = h.saturating_sub(1 + usize::from(ticks));
+    let mut lines = bar_chart(hours, w, chart_h, theme::accent());
+    if ticks {
+        // Same centering as `bar_chart`'s 24 columns so ticks sit under bars.
+        let pad = w.saturating_sub(24) / 2;
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(pad)),
+            Span::styled(HOUR_TICKS, theme::faint()),
+        ]));
+    }
     lines.push(center(vec![Span::styled(peak, theme::faint())], w));
     lines
 }
