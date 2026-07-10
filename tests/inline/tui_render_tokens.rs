@@ -168,6 +168,40 @@ fn bar_chart_capped_crowns_clipped_bars() {
     );
 }
 
+// ── dashboard width clamp + TOTAL card ────────────────────────────────────────
+
+#[test]
+fn dashboard_clamps_to_a_centered_band_on_wide_terminals() {
+    let app = app_with_stats(TokenPeriod::Lifetime);
+    let out = render_dashboard(&app, 160, 24);
+    let row0: String = out.chars().take(160).collect();
+    assert!(
+        row0.starts_with(&" ".repeat(20)),
+        "the left margin outside the 120-col band stays blank"
+    );
+    assert_eq!(
+        row0.chars().nth(20),
+        Some('╭'),
+        "the first card's border opens at the band edge"
+    );
+    assert!(
+        row0.trim_end().chars().count() <= 140,
+        "the right margin outside the band stays blank"
+    );
+}
+
+#[test]
+fn total_card_groups_kv_rows_and_carries_the_range_meta() {
+    let app = app_with_stats(TokenPeriod::Lifetime);
+    let out = render_dashboard(&app, 120, 24);
+    assert!(
+        out.contains("jan 18 → jun 21"),
+        "lifetime date range rides the title-right meta"
+    );
+    assert!(out.contains("sessions"), "sessions is a spelled-out kv key");
+    assert!(out.contains("1,000"), "session count is comma-grouped");
+}
+
 // ── model rows: unpriced cost dash ────────────────────────────────────────────
 
 #[test]

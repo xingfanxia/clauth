@@ -34,8 +34,12 @@ use crate::tokens::{
     effective_cache_basis, is_anthropic, model_display_name, today_date,
 };
 
-/// Key column width for label:value rows.
-const KEY_W: usize = 8;
+/// Key column width for label:value rows (`sessions` (8) + a 2-cell gap).
+const KEY_W: usize = 10;
+/// Dashboard content-width ceiling: past this the percentage-split cards
+/// stretch their edge-anchored figures into scattered fragments with a dead
+/// middle, so the spare columns split evenly around a centered dashboard.
+const DASH_MAX_W: u16 = 120;
 /// Wider key column for the spelled-out `cache read`/`cache write` rows
 /// (composition card + per-model detail): `cache write` (11) + 1 trailing space,
 /// so every label keeps a gap before its bar/value and the columns stay aligned.
@@ -366,7 +370,20 @@ fn busiest_hour(hours: &[u64; 24]) -> Option<usize> {
 
 // ── dashboard view ─────────────────────────────────────────────────────────
 
+/// Center `area` within itself at `max_w` columns when it's wider.
+fn clamp_width(area: Rect, max_w: u16) -> Rect {
+    if area.width <= max_w {
+        return area;
+    }
+    Rect {
+        x: area.x + (area.width - max_w) / 2,
+        width: max_w,
+        ..area
+    }
+}
+
 fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let area = clamp_width(area, DASH_MAX_W);
     let Some(stats) = app.token_stats.as_ref() else {
         let block = section_box("tokens", false, true);
         let inner = block.inner(area);
@@ -442,14 +459,15 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     // Total stays the lifetime anchor in every period — the scoped window
     // already owns the first card.
+    let (total_body, total_meta) = total_lines(stats, inner_w(top[1]), count_cache, prices);
     card(
         frame,
         top[1],
         "total",
-        None,
+        total_meta.as_deref(),
         false,
         None,
-        total_lines(stats, inner_w(top[1]), count_cache, prices),
+        total_body,
     );
 
     // Freshness badge → the trend card's title-right meta slot. Before the first
@@ -664,12 +682,15 @@ fn today_lines(
     ]
 }
 
+/// The lifetime TOTAL card: kv rows grouped on the left (the old right-edge
+/// `msgs`/date scatter read as fragments on wide cards), lifetime date range
+/// as the returned title-right meta.
 fn total_lines(
     stats: &TokenStats,
     w: usize,
     count_cache: bool,
     prices: Option<&PriceTable>,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Option<String>) {
     let last = stats
         .topped_up_through
         .as_deref()
@@ -680,7 +701,7 @@ fn total_lines(
     } else {
         stats.total_in_out()
     };
-    let mut lines = vec![
+    let lines = vec![
         lr(
             vec![
                 key("tokens"),
@@ -696,26 +717,25 @@ fn total_lines(
             w,
         ),
         cost_line("cost", prices, &stats.models, false),
-        lr(
-            vec![Span::styled(
-                format!("{} sess", stats.total_sessions),
+        Line::from(vec![
+            key("sessions"),
+            Span::styled(
+                group_thousands(stats.total_sessions as f64, 0),
                 theme::body(),
-            )],
-            vec![Span::styled(
-                format!("{} msgs", fmt_count(stats.total_messages)),
-                theme::body(),
-            )],
-            w,
-        ),
+            ),
+        ]),
+        Line::from(vec![
+            key("msgs"),
+            Span::styled(fmt_count(stats.total_messages), theme::body()),
+        ]),
     ];
-    if let (Some(first), Some(latest)) = (stats.first_session_date.as_deref(), last) {
-        lines.push(lr(
-            vec![Span::styled(short_date(first), theme::dim())],
-            vec![Span::styled(short_date(latest), theme::dim())],
-            w,
-        ));
-    }
-    lines
+    let meta = match (stats.first_session_date.as_deref(), last) {
+        (Some(first), Some(latest)) => {
+            Some(format!("{} → {}", short_date(first), short_date(latest)))
+        }
+        _ => None,
+    };
+    (lines, meta)
 }
 
 /// The this-week / this-month headline card. Tokens and msgs sum the calendar
@@ -895,7 +915,13 @@ fn model_lines(
                 } else {
                     money_style()
                 };
-                spans.push(Span::styled(format!(" {cost:>cost_w$}"), style));
+                // Cost column anchored to the card's right edge — the bar cap
+                // (30) otherwise leaves the row's tail dangling mid-card.
+                let gap = w
+                    .saturating_sub(label_w + 1 + bar_w + 1 + count_w + cost_w)
+                    .max(1);
+                spans.push(Span::raw(" ".repeat(gap)));
+                spans.push(Span::styled(format!("{cost:>cost_w$}"), style));
             }
             Line::from(spans)
         })
