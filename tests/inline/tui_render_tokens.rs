@@ -1,7 +1,10 @@
 //! Tokens-dashboard render tests: the height-aware bar charts, the full-width
 //! loading spinner, the honest activity caption, and the granularity badges.
 
-use super::{INDET_BLOCK, activity_lines, bar_chart, indeterminate_bar};
+use super::{
+    INDET_BLOCK, activity_lines, bar_chart, bar_chart_capped, determinate_bar, indeterminate_bar,
+    p95_cap,
+};
 use crate::profile::{AppConfig, AppState};
 use crate::tokens::{DayActivity, DayTokens, ModelTokens, TokenStats};
 use crate::tui::app::{App, Tab, TokenPeriod};
@@ -120,6 +123,62 @@ fn bar_chart_short_series_is_left_padded() {
         "a short series left-pads the bars, got {:?}",
         line_text(&lines[0])
     );
+}
+
+// ── p95 clamp ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn p95_cap_fires_only_on_outliers() {
+    assert_eq!(p95_cap(&[]), None, "empty series has no cap");
+    assert_eq!(p95_cap(&[0, 0, 0]), None, "all-zero series has no cap");
+    assert_eq!(p95_cap(&[5, 5, 5, 5]), None, "uniform series never clips");
+    // 19 quiet days + one spike: the p95 sits at the quiet level.
+    let mut vals = vec![1_u64; 19];
+    vals.push(100);
+    assert_eq!(p95_cap(&vals), Some(1), "outlier series caps at the p95");
+}
+
+#[test]
+fn bar_chart_capped_crowns_clipped_bars() {
+    // 19 equal columns + one outlier, capped at the quiet level: the quiet
+    // columns fill the full height and the outlier is crowned with `▲`.
+    let mut vals = vec![1_u64; 19];
+    vals.push(100);
+    let (lines, clipped) = bar_chart_capped(&vals, 20, 3, Style::default(), Some(1));
+    assert!(clipped, "the outlier reports as clipped");
+    let top = line_text(&lines[0]);
+    assert_eq!(
+        top.chars().nth(19).unwrap(),
+        '▲',
+        "the clipped bar's top cell is the clip marker, got {top:?}"
+    );
+    assert_eq!(
+        top.chars().next().unwrap(),
+        '█',
+        "capped quiet columns reach the full height"
+    );
+    // Uncapped, the same series flattens the quiet days into the baseline.
+    let (linear, linear_clipped) = bar_chart_capped(&vals, 20, 3, Style::default(), None);
+    assert!(!linear_clipped, "no cap → nothing reports as clipped");
+    assert_ne!(
+        line_text(&linear[0]).chars().next().unwrap(),
+        '█',
+        "linear scale flattens the quiet columns"
+    );
+}
+
+// ── determinate_bar ───────────────────────────────────────────────────────────
+
+#[test]
+fn determinate_bar_is_bare_with_a_trailing_label() {
+    let t = line_text(&determinate_bar(1, 2, 10, "scanning session logs 1/2"));
+    assert!(
+        !t.contains('[') && !t.contains(']'),
+        "determinate bars are bare — the [ ] frame is the indeterminate tell"
+    );
+    assert_eq!(t.matches('█').count(), 5, "half done fills half the track");
+    assert_eq!(t.matches('░').count(), 5, "the rest stays track");
+    assert!(t.ends_with("scanning session logs 1/2"));
 }
 
 // ── indeterminate_bar ─────────────────────────────────────────────────────────

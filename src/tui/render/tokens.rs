@@ -188,31 +188,62 @@ const INDET_BLOCK: usize = 4;
 /// An all-zero slice renders a flat `▁` baseline. Bars are centered within
 /// `width` (matching the old sparkline placement). Rows are top→bottom.
 fn bar_chart(vals: &[u64], width: usize, height: usize, fill: Style) -> Vec<Line<'static>> {
+    bar_chart_capped(vals, width, height, fill, None).0
+}
+
+/// The p95 of a series' nonzero values — the scale ceiling for outlier-heavy
+/// time series (one 982M day flattening months of normal use to 1-cell noise).
+/// `None` when nothing would clip (cap == max, or no data), so callers can skip
+/// the clip legend.
+fn p95_cap(vals: &[u64]) -> Option<u64> {
+    let mut nz: Vec<u64> = vals.iter().copied().filter(|&v| v > 0).collect();
+    nz.sort_unstable();
+    let cap = *nz.get((nz.len().checked_sub(1)?) * 95 / 100)?;
+    let max = *nz.last()?;
+    (cap < max && cap > 0).then_some(cap)
+}
+
+/// `bar_chart` core with an optional scale ceiling: values above `cap` render
+/// as a full column crowned with a `▲` clip marker. Returns the rows plus
+/// whether any bar clipped (drives the caption legend).
+fn bar_chart_capped(
+    vals: &[u64],
+    width: usize,
+    height: usize,
+    fill: Style,
+    cap: Option<u64>,
+) -> (Vec<Line<'static>>, bool) {
     if height == 0 || vals.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let max = vals.iter().copied().max().unwrap_or(0);
+    let scale_max = cap.unwrap_or(max).min(max);
+    let clipped: Vec<bool> = vals.iter().map(|&v| v > scale_max).collect();
+    let any_clipped = clipped.iter().any(|&c| c);
     // Height of each bar in eighth-cells (0..=height*8). No data → a flat 1/8
     // baseline so an idle window still shows a floor rather than blank space.
-    let cap = (height * 8) as f64;
-    let eighths: Vec<usize> = if max == 0 {
+    let row_cap = (height * 8) as f64;
+    let eighths: Vec<usize> = if scale_max == 0 {
         vec![1; vals.len()]
     } else {
         vals.iter()
-            .map(|&v| ((v as f64 / max as f64) * cap).round() as usize)
+            .map(|&v| ((v.min(scale_max) as f64 / scale_max as f64) * row_cap).round() as usize)
             .collect()
     };
     let pad = width.saturating_sub(vals.len()) / 2;
-    (0..height)
+    let lines = (0..height)
         .map(|row| {
             // Row 0 is the top; count each bar's filled cells up from the bottom.
             let from_bottom = height - row; // 1..=height
             let s: String = eighths
                 .iter()
-                .map(|&e| {
+                .zip(&clipped)
+                .map(|(&e, &clip)| {
                     let full = e / 8;
                     let rem = e % 8;
-                    if from_bottom <= full {
+                    if clip && from_bottom == height {
+                        '▲'
+                    } else if from_bottom <= full {
                         '█'
                     } else if from_bottom == full + 1 && rem > 0 {
                         SPARK[rem - 1]
@@ -223,7 +254,8 @@ fn bar_chart(vals: &[u64], width: usize, height: usize, fill: Style) -> Vec<Line
                 .collect();
             Line::from(vec![Span::raw(" ".repeat(pad)), Span::styled(s, fill)])
         })
-        .collect()
+        .collect();
+    (lines, any_clipped)
 }
 
 /// Full-width indeterminate spinner (cloudy-tui): a 4-cell `ACCENT` `█` block
@@ -751,7 +783,7 @@ fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> V
         .max_by_key(|d| d.tokens)
         .map(|d| (d.tokens, d.date.clone()))
         .unwrap_or((0, String::new()));
-    let peak = match period {
+    let mut peak = match period {
         TokenPeriod::Weekly => {
             format!("peak {} wk of {}", fmt_count(peak_v), short_date(&peak_d))
         }
@@ -760,7 +792,13 @@ fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> V
             format!("peak {} {}", fmt_count(peak_v), short_date(&peak_d))
         }
     };
-    let mut lines = bar_chart(&vals, w, h.saturating_sub(1), theme::accent());
+    // Outlier days would flatten the rest of the series to 1-cell noise on a
+    // linear scale; clamp to the p95 and crown clipped bars instead.
+    let (mut lines, clipped) =
+        bar_chart_capped(&vals, w, h.saturating_sub(1), theme::accent(), p95_cap(&vals));
+    if clipped {
+        peak.push_str("   ▲ clipped");
+    }
     lines.push(center(vec![Span::styled(peak, theme::faint())], w));
     lines
 }
@@ -942,7 +980,7 @@ fn activity_lines(
         TokenPeriod::Monthly => "mo",
         TokenPeriod::Lifetime | TokenPeriod::Daily => "day",
     };
-    let caption = series
+    let mut caption = series
         .iter()
         .max_by_key(|a| a.messages)
         .map(|a| {
@@ -954,7 +992,12 @@ fn activity_lines(
             )
         })
         .unwrap_or_default();
-    let mut lines = bar_chart(&msgs, w, h.saturating_sub(1), theme::accent());
+    // Same p95 clamp as the trend chart — activity has the same outlier shape.
+    let (mut lines, clipped) =
+        bar_chart_capped(&msgs, w, h.saturating_sub(1), theme::accent(), p95_cap(&msgs));
+    if clipped {
+        caption.push_str("   ▲ clipped");
+    }
     lines.push(center(vec![Span::styled(caption, theme::faint())], w));
     lines
 }
