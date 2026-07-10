@@ -289,11 +289,7 @@ fn indeterminate_bar(tick: u64, track: usize, label: &str) -> Line<'static> {
 /// Full-width determinate progress run — bare `█`/`░` per the contract (the
 /// `[ ]` frame is the indeterminate variant's tell), label trailing in dim.
 fn determinate_bar(done: usize, total: usize, track: usize, label: &str) -> Line<'static> {
-    let filled = if total == 0 {
-        0
-    } else {
-        ((done * track) / total).min(track)
-    };
+    let filled = (done * track).checked_div(total).unwrap_or(0).min(track);
     Line::from(vec![
         Span::styled("█".repeat(filled), theme::accent()),
         Span::styled("░".repeat(track.saturating_sub(filled)), theme::line()),
@@ -817,8 +813,13 @@ fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> V
     };
     // Outlier days would flatten the rest of the series to 1-cell noise on a
     // linear scale; clamp to the p95 and crown clipped bars instead.
-    let (mut lines, clipped) =
-        bar_chart_capped(&vals, w, h.saturating_sub(1), theme::accent(), p95_cap(&vals));
+    let (mut lines, clipped) = bar_chart_capped(
+        &vals,
+        w,
+        h.saturating_sub(1),
+        theme::accent(),
+        p95_cap(&vals),
+    );
     if clipped {
         peak.push_str("   ▲ clipped");
     }
@@ -1046,8 +1047,13 @@ fn activity_lines(
         })
         .unwrap_or_default();
     // Same p95 clamp as the trend chart — activity has the same outlier shape.
-    let (mut lines, clipped) =
-        bar_chart_capped(&msgs, w, h.saturating_sub(1), theme::accent(), p95_cap(&msgs));
+    let (mut lines, clipped) = bar_chart_capped(
+        &msgs,
+        w,
+        h.saturating_sub(1),
+        theme::accent(),
+        p95_cap(&msgs),
+    );
     if clipped {
         caption.push_str("   ▲ clipped");
     }
@@ -1079,7 +1085,10 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // The selector title carries the active lenses so the narrowed list reads
     // as such.
-    let title = match join_badges(app.token_filter.badge(), Some(app.token_period.lens_badge())) {
+    let title = match join_badges(
+        app.token_filter.badge(),
+        Some(app.token_period.lens_badge()),
+    ) {
         Some(badge) => format!("models  {badge}"),
         None => "models".to_string(),
     };
