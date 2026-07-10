@@ -3,6 +3,58 @@ use super::*;
 // 2026-05-17T14:20:00 UTC == 1779027600 epoch seconds.
 const BASE_UTC: i64 = 1_779_027_600;
 
+// ── identity-anchor backfill (rides the hourly /profile tier fetch) ──────────
+//
+// A profile that predates login-time anchor seeding has no `account_id.json`;
+// once its stored pair is fully dead, `oauth::try_adopt_live_rotation` cannot
+// prove a diverged live login is the same account and the profile wedges in
+// `auth_broken` (observed 2026-07-09). The backfill closes that hole while the
+// stored token is still alive, at zero extra HTTP.
+
+fn raw_profile(uuid: Option<&str>) -> RawProfile {
+    let text = match uuid {
+        Some(u) => format!(r#"{{"account":{{"uuid":"{u}"}}}}"#),
+        None => r#"{"account":{}}"#.to_string(),
+    };
+    serde_json::from_str(&text).expect("fixture profile parses")
+}
+
+#[test]
+fn identity_anchor_backfills_only_when_missing() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    seed_identity_anchor("acme", &raw_profile(Some("uuid-live")));
+    assert_eq!(
+        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE).as_deref(),
+        Some("uuid-live"),
+        "missing anchor is seeded from the parsed /profile response"
+    );
+
+    // An existing anchor is authoritative (login re-seeds it; the ride-along
+    // must never churn it).
+    seed_identity_anchor("acme", &raw_profile(Some("uuid-later")));
+    assert_eq!(
+        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE).as_deref(),
+        Some("uuid-live"),
+        "a present anchor is never overwritten by the ride-along"
+    );
+}
+
+#[test]
+fn identity_anchor_refuses_blank_or_absent_uuid() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    seed_identity_anchor("acme", &raw_profile(None));
+    seed_identity_anchor("acme", &raw_profile(Some("  ")));
+    assert_eq!(
+        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE),
+        None,
+        "no anchor may be minted from an absent or blank uuid"
+    );
+}
+
 #[test]
 fn short_label_drops_claude_prefix_and_keeps_max_multiplier() {
     assert_eq!(

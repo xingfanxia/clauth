@@ -848,6 +848,7 @@ pub(super) fn fetch_raw(
             .ok()
             .and_then(|text| serde_json::from_str::<RawProfile>(&text).ok())
             .map(|p| {
+                seed_identity_anchor(name, &p);
                 let org = p.organization.as_ref();
                 PlanInfo {
                     tier: PlanTier::from_profile(
@@ -877,6 +878,37 @@ pub(super) fn fetch_raw(
         extra_usage: raw.extra_usage,
         spend,
     })
+}
+
+/// Backfill the profile's identity anchor (`account_id.json`) from an already-
+/// parsed `/profile` response, riding the hourly tier fetch — zero extra HTTP.
+/// A profile that predates login-time anchor seeding has none, and without one
+/// `oauth::try_adopt_live_rotation` cannot prove a diverged live login is the
+/// same account once the stored pair is fully dead — the profile wedges in
+/// `auth_broken` even when the live session holds a healthy fresher pair
+/// (observed 2026-07-09). Write-if-missing only: `clauth login` remains the
+/// authoritative (re)seeder, and a blank uuid is shape drift, never an
+/// identity (same contract as [`fetch_account_uuid`]).
+///
+/// The missing-check → write pair is deliberately not atomic: the only bad
+/// interleave (a concurrent re-login to a DIFFERENT account landing its
+/// anchor in that microsecond gap, then being overwritten by this ride-along)
+/// fails SAFE — a wrong anchor only makes adoption refuse and self-heals on
+/// the next login/adopt, so a cross-process lock isn't worth its weight here.
+fn seed_identity_anchor(name: &str, profile: &RawProfile) {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache, write_profile_cache};
+    let Some(uuid) = profile
+        .account
+        .as_ref()
+        .and_then(|a| a.uuid.as_deref())
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    else {
+        return;
+    };
+    if load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE).is_none() {
+        write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &uuid.to_string());
+    }
 }
 
 /// Fetch `/profile` with a freshly minted OAuth access token and derive the
