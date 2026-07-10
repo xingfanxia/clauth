@@ -218,12 +218,9 @@ fn model_lines_dash_unpriced_models_when_a_table_is_loaded() {
             })
         })
         .collect();
-    let mut prices = PriceTable {
-        rates: std::collections::HashMap::new(),
-        fetched_at_ms: 0,
-    };
-    prices.rates.insert(
-        "claude-opus-4-8".into(),
+    let mut rates = std::collections::HashMap::new();
+    rates.insert(
+        "claude-opus-4-8".to_string(),
         ModelRate {
             input: 5e-6,
             output: 25e-6,
@@ -231,6 +228,7 @@ fn model_lines_dash_unpriced_models_when_a_table_is_loaded() {
             cache_write: 6e-6,
         },
     );
+    let prices = PriceTable::from_rates(rates);
 
     let lines = model_lines(&rows, 60, 5, true, Some(&prices), "no model usage yet");
     let texts: Vec<String> = lines.iter().map(line_text).collect();

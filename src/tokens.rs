@@ -1094,7 +1094,10 @@ pub(crate) enum TokensEvent {
     Base(Box<TokenStats>),
     /// Mid-sweep: `done` of `total` transcript files visited. Throttled at the
     /// send site so a multi-hundred-file sweep doesn't flood the channel.
-    Progress { done: usize, total: usize },
+    Progress {
+        done: usize,
+        total: usize,
+    },
     /// Phase 2: the live transcript top-up merged in (today card, recent days,
     /// reconstructed lifetime counts). Supersedes the matching `Base`.
     Loaded(Box<TokenStats>),
@@ -1129,8 +1132,9 @@ pub(crate) fn spawn(tx: Sender<TokensEvent>, refresh_rx: Receiver<()>, claude_di
             let today = today_date();
             let lcd = base.last_computed_date.clone();
             // Throttled progress: every 25th file plus the final one, so a
-            // several-hundred-file cold sweep paints a moving count without
-            // flooding the channel on warm (all-cached) cycles.
+            // several-hundred-file sweep paints a moving count at ~1/25 the
+            // per-file send volume (warm cycles still emit; render ignores
+            // them — see `App::tokens_progress`).
             refresh_topup_cache(&claude_dir, lcd.as_deref(), cache, |done, total| {
                 if done % 25 == 0 || done == total {
                     let _ = tx.send(TokensEvent::Progress { done, total });
