@@ -2,8 +2,8 @@
 //! loading spinner, the honest activity caption, and the granularity badges.
 
 use super::{
-    HOUR_TICKS, INDET_BLOCK, activity_lines, bar_chart, bar_chart_sqrt, determinate_bar,
-    hour_lines, indeterminate_bar, model_lines,
+    INDET_BLOCK, activity_lines, bar_chart, bar_chart_sqrt, bucket_layout, comp_rows,
+    determinate_bar, hour_lines, indeterminate_bar, model_lines, trend_lines,
 };
 use crate::pricing::{ModelRate, PriceTable};
 use crate::profile::{AppConfig, AppState};
@@ -85,7 +85,7 @@ fn app_with_stats(period: TokenPeriod) -> App {
 #[test]
 fn bar_chart_peak_fills_the_full_height() {
     // Three columns, the max value (10) in column 0, at 4 rows tall.
-    let lines = bar_chart(&[10, 0, 5], 3, 4, Style::default());
+    let lines = bar_chart(&[10, 0, 5], 3, 4, Style::default(), 1, 0);
     assert_eq!(lines.len(), 4, "one line per chart row");
     for l in &lines {
         assert_eq!(
@@ -101,7 +101,7 @@ fn bar_chart_peak_fills_the_full_height() {
 
 #[test]
 fn bar_chart_zero_series_renders_a_baseline() {
-    let lines = bar_chart(&[0, 0, 0], 3, 3, Style::default());
+    let lines = bar_chart(&[0, 0, 0], 3, 3, Style::default(), 1, 0);
     assert_eq!(lines.len(), 3);
     assert_eq!(
         line_text(&lines[2]),
@@ -118,7 +118,7 @@ fn bar_chart_zero_series_renders_a_baseline() {
 #[test]
 fn bar_chart_short_series_is_left_padded() {
     // Two full-height columns in a 6-wide chart → centered by a 2-cell left pad.
-    let lines = bar_chart(&[5, 5], 6, 2, Style::default());
+    let lines = bar_chart(&[5, 5], 6, 2, Style::default(), 1, 0);
     assert!(
         line_text(&lines[0]).starts_with("  ██"),
         "a short series left-pads the bars, got {:?}",
@@ -142,7 +142,7 @@ fn bar_chart_sqrt_peak_alone_fills_the_full_height() {
     // top row — no p95-style wall of identical full-height columns.
     let mut vals = vec![9_u64; 19];
     vals.push(100);
-    let lines = bar_chart_sqrt(&vals, 20, 8, Style::default());
+    let lines = bar_chart_sqrt(&vals, 20, 8, Style::default(), 1, 0);
     assert_eq!(
         line_text(&lines[0]).chars().nth(19).unwrap(),
         '█',
@@ -160,8 +160,8 @@ fn bar_chart_sqrt_lifts_quiet_days_above_linear() {
     // 9% of the peak: linear leaves it inside the bottom cell; sqrt gives it
     // ~30% of the height so months of normal use stay readable.
     let vals = [9_u64, 100];
-    let linear = bar_chart(&vals, 2, 8, Style::default());
-    let sqrt = bar_chart_sqrt(&vals, 2, 8, Style::default());
+    let linear = bar_chart(&vals, 2, 8, Style::default(), 1, 0);
+    let sqrt = bar_chart_sqrt(&vals, 2, 8, Style::default(), 1, 0);
     assert_eq!(col_cells(&linear, 0), 1, "linear flattens the quiet column");
     assert!(
         col_cells(&sqrt, 0) >= 2,
@@ -174,7 +174,7 @@ fn bar_chart_sqrt_lifts_quiet_days_above_linear() {
 fn bar_chart_nonzero_keeps_the_floor_cell() {
     // 1/10_000 of the peak rounds to zero cells; a real day still shows the
     // ▁ floor instead of vanishing, while a true zero day stays blank.
-    let lines = bar_chart(&[1, 0, 10_000], 3, 2, Style::default());
+    let lines = bar_chart(&[1, 0, 10_000], 3, 2, Style::default(), 1, 0);
     assert_eq!(
         line_text(&lines[1]),
         "▁ █",
@@ -299,22 +299,113 @@ fn model_lines_dash_unpriced_models_when_a_table_is_loaded() {
 
 #[test]
 fn hour_lines_carry_baseline_ticks_only_when_tall_enough() {
+    // The single-cell tick row generated at cell width 1 (w = 30 < 48).
+    const TICKS: &str = "0     6     12    18";
     let mut hours = [0u64; 24];
     hours[12] = 10;
     let tall: Vec<String> = hour_lines(&hours, 30, 5).iter().map(line_text).collect();
     assert!(
-        tall.iter().any(|t| t.contains(HOUR_TICKS)),
+        tall.iter().any(|t| t.contains(TICKS)),
         "a tall chart carries the 0/6/12/18 tick row"
     );
     // Ticks sit directly above the caption row.
-    assert!(tall[tall.len() - 2].contains(HOUR_TICKS));
+    assert!(tall[tall.len() - 2].contains(TICKS));
     assert!(tall[tall.len() - 1].contains("peak 12:00"));
 
     let short: Vec<String> = hour_lines(&hours, 30, 2).iter().map(line_text).collect();
     assert!(
-        !short.iter().any(|t| t.contains(HOUR_TICKS)),
+        !short.iter().any(|t| t.contains(TICKS)),
         "the 2-row floor drops the ticks, not the chart"
     );
+}
+
+#[test]
+fn hour_bars_and_ticks_widen_on_wide_cards() {
+    let mut hours = [0u64; 24];
+    hours[12] = 10;
+    // 52 cols → 2-cell hour columns (48 wide, pad 2); ticks track the bars.
+    let lines: Vec<String> = hour_lines(&hours, 52, 5).iter().map(line_text).collect();
+    assert_eq!(
+        lines[0].matches('█').count(),
+        2,
+        "the peak column is 2 cells wide"
+    );
+    let ticks = &lines[lines.len() - 2];
+    assert_eq!(ticks.find('0'), Some(2), "hour 0 tick at the padded origin");
+    assert_eq!(ticks.find("12"), Some(2 + 24), "hour 12 tick under its bar");
+}
+
+// ── bucket layout + month ticks ───────────────────────────────────────────────
+
+#[test]
+fn bucket_layout_widens_only_when_there_is_room() {
+    assert_eq!(
+        bucket_layout(116, 116),
+        (1, 0),
+        "dense daily series stays 1-cell contiguous"
+    );
+    assert_eq!(
+        bucket_layout(25, 110),
+        (3, 1),
+        "weekly buckets widen with a 1-cell gap"
+    );
+    assert_eq!(bucket_layout(4, 48), (8, 1), "bar width caps at 8");
+    assert_eq!(bucket_layout(0, 40), (1, 0));
+}
+
+#[test]
+fn trend_bars_widen_with_gaps_and_carry_month_ticks() {
+    // 10 days straddling jun → jul, in a 48-wide card: layout (3, 1), pad 4.
+    let daily: Vec<DayTokens> = (0..10)
+        .map(|i| DayTokens {
+            date: if i < 5 {
+                format!("2026-06-{:02}", 20 + i)
+            } else {
+                format!("2026-07-{:02}", i - 4)
+            },
+            tokens: 1_000_000 * (i as u64 + 1),
+        })
+        .collect();
+    let stats = TokenStats {
+        daily,
+        ..Default::default()
+    };
+    let lines: Vec<String> = trend_lines(&stats, 48, 6, TokenPeriod::Lifetime)
+        .iter()
+        .map(line_text)
+        .collect();
+    // h = 6 → 4 chart rows + tick row + peak caption.
+    assert_eq!(lines.len(), 6);
+    let bars = lines[3].trim().split(' ').filter(|s| !s.is_empty()).count();
+    assert_eq!(bars, 10, "each bucket is a discrete gapped bar");
+    assert_eq!(
+        lines[4].find("jun"),
+        Some(4),
+        "first bucket names its month"
+    );
+    assert_eq!(
+        lines[4].find("jul"),
+        Some(4 + 5 * 4),
+        "the month change is labeled at its bucket's column"
+    );
+    assert!(lines[5].contains("peak"));
+
+    // Below the 4-row gate the tick row is dropped, never the chart.
+    let short = trend_lines(&stats, 48, 3, TokenPeriod::Lifetime);
+    assert!(!line_text(&short[short.len() - 2]).contains("jun"));
+}
+
+// ── composition rows ──────────────────────────────────────────────────────────
+
+#[test]
+fn composition_pcts_anchor_to_the_card_edge() {
+    let lines = comp_rows(10, 20, 30, 40, 60);
+    for l in &lines {
+        let t = line_text(l);
+        assert_eq!(t.chars().count(), 60, "the row spans the full card width");
+        assert!(t.ends_with('%'), "pct anchors to the right edge, got {t:?}");
+    }
+    assert!(line_text(&lines[3]).ends_with(" 40%"));
 }
 
 // ── determinate_bar ───────────────────────────────────────────────────────────

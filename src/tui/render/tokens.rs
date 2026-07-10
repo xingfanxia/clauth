@@ -185,15 +185,22 @@ fn month_label(ymd: &str) -> String {
 /// Four-cell bouncing block for the full-width indeterminate spinner.
 const INDET_BLOCK: usize = 4;
 
-/// Height-aware vertical block-bar chart: one 1-cell column per value, `height`
-/// rows tall, linear-scaled to the slice max, `fill`-colored. Full `█` blocks
-/// stack from the bottom; a bar's top cell is a partial `▁`..`▇` glyph when the
-/// value doesn't land on an exact 8th of a row. A nonzero value always keeps
-/// the `▁` floor cell, so a real day never renders blank.
-/// An all-zero slice renders a flat `▁` baseline. Bars are centered within
-/// `width` (matching the old sparkline placement). Rows are top→bottom.
-fn bar_chart(vals: &[u64], width: usize, height: usize, fill: Style) -> Vec<Line<'static>> {
-    bar_chart_scaled(vals, width, height, fill, false)
+/// Height-aware vertical block-bar chart: one `cell_w`-wide column per value
+/// (`gap` blank cells between columns), `height` rows tall, linear-scaled to
+/// the slice max, `fill`-colored. Full `█` blocks stack from the bottom; a
+/// bar's top cell is a partial `▁`..`▇` glyph when the value doesn't land on
+/// an exact 8th of a row. A nonzero value always keeps the `▁` floor cell, so
+/// a real day never renders blank. An all-zero slice renders a flat `▁`
+/// baseline. Bars are centered within `width`. Rows are top→bottom.
+fn bar_chart(
+    vals: &[u64],
+    width: usize,
+    height: usize,
+    fill: Style,
+    cell_w: usize,
+    gap: usize,
+) -> Vec<Line<'static>> {
+    bar_chart_scaled(vals, width, height, fill, false, cell_w, gap)
 }
 
 /// `bar_chart` on a square-root scale, for outlier-heavy time series: linear
@@ -202,8 +209,15 @@ fn bar_chart(vals: &[u64], width: usize, height: usize, fill: Style) -> Vec<Line
 /// full-height wall. sqrt keeps ordering and the peak cluster's shape while
 /// quiet days stay readable; heights aren't proportional to values, so the
 /// peak caption names the true max.
-fn bar_chart_sqrt(vals: &[u64], width: usize, height: usize, fill: Style) -> Vec<Line<'static>> {
-    bar_chart_scaled(vals, width, height, fill, true)
+fn bar_chart_sqrt(
+    vals: &[u64],
+    width: usize,
+    height: usize,
+    fill: Style,
+    cell_w: usize,
+    gap: usize,
+) -> Vec<Line<'static>> {
+    bar_chart_scaled(vals, width, height, fill, true, cell_w, gap)
 }
 
 fn bar_chart_scaled(
@@ -212,6 +226,8 @@ fn bar_chart_scaled(
     height: usize,
     fill: Style,
     sqrt: bool,
+    cell_w: usize,
+    gap: usize,
 ) -> Vec<Line<'static>> {
     if height == 0 || vals.is_empty() {
         return Vec::new();
@@ -232,28 +248,72 @@ fn bar_chart_scaled(
             })
             .collect()
     };
-    let pad = width.saturating_sub(vals.len()) / 2;
+    let chart_w = vals.len() * cell_w + vals.len().saturating_sub(1) * gap;
+    let pad = width.saturating_sub(chart_w) / 2;
     (0..height)
         .map(|row| {
             // Row 0 is the top; count each bar's filled cells up from the bottom.
             let from_bottom = height - row; // 1..=height
-            let s: String = eighths
-                .iter()
-                .map(|&e| {
-                    let full = e / 8;
-                    let rem = e % 8;
-                    if from_bottom <= full {
-                        '█'
-                    } else if from_bottom == full + 1 && rem > 0 {
-                        SPARK[rem - 1]
-                    } else {
-                        ' '
-                    }
-                })
-                .collect();
+            let mut s = String::with_capacity(chart_w * 3);
+            for (i, &e) in eighths.iter().enumerate() {
+                if i > 0 {
+                    s.extend(std::iter::repeat_n(' ', gap));
+                }
+                let full = e / 8;
+                let rem = e % 8;
+                let ch = if from_bottom <= full {
+                    '█'
+                } else if from_bottom == full + 1 && rem > 0 {
+                    SPARK[rem - 1]
+                } else {
+                    ' '
+                };
+                s.extend(std::iter::repeat_n(ch, cell_w));
+            }
             Line::from(vec![Span::raw(" ".repeat(pad)), Span::styled(s, fill)])
         })
         .collect()
+}
+
+/// Column layout for `n` buckets across `width` cells: `(cell_w, gap)`.
+/// Buckets widen to multi-cell bars with a 1-cell gap once every one can hold
+/// ≥ 2 cells — discrete, countable bars instead of a thin centered blob —
+/// capped at 8 wide so a handful of monthly buckets doesn't render as walls.
+/// Falls back to dense 1-cell contiguous columns when the buckets outnumber
+/// the space.
+fn bucket_layout(n: usize, width: usize) -> (usize, usize) {
+    // Widest cell satisfying n*cell + (n-1) gaps <= width; empty series → thin.
+    let cell = (width + 1)
+        .checked_div(n)
+        .map_or(0, |c| c.saturating_sub(1))
+        .min(8);
+    if cell >= 2 { (cell, 1) } else { (1, 0) }
+}
+
+/// Month labels under a dated bucket axis: one at the first visible bucket,
+/// then at each bucket opening a new month. A label that would run into the
+/// previous one is skipped (dense daily axes keep them ~a month apart anyway).
+fn month_ticks(dates: &[&str], width: usize, cell_w: usize, gap: usize) -> Line<'static> {
+    let chart_w = dates.len() * cell_w + dates.len().saturating_sub(1) * gap;
+    let pad = width.saturating_sub(chart_w) / 2;
+    let mut out = String::new();
+    let mut prev_month = "";
+    for (i, date) in dates.iter().enumerate() {
+        if date.len() < 7 || date[5..7] == *prev_month {
+            continue;
+        }
+        prev_month = &date[5..7];
+        let col = i * (cell_w + gap);
+        if !out.is_empty() && col < out.chars().count() + 1 {
+            continue;
+        }
+        out.push_str(&" ".repeat(col - out.chars().count()));
+        out.push_str(&month_label(date));
+    }
+    Line::from(vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(out, theme::faint()),
+    ])
 }
 
 /// Full-width indeterminate spinner (cloudy-tui): a 4-cell `ACCENT` `█` block
@@ -854,10 +914,12 @@ fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> V
         Some(b) => bucket_tokens(&stats.daily, b),
         None => stats.daily.clone(),
     };
-    let vals: Vec<u64> = trail(&series, w).iter().map(|d| d.tokens).collect();
+    let tail = trail(&series, w);
+    let vals: Vec<u64> = tail.iter().map(|d| d.tokens).collect();
     if vals.is_empty() {
         return vec![Line::from(Span::styled("no daily data", theme::faint()))];
     }
+    let dates: Vec<&str> = tail.iter().map(|d| d.date.as_str()).collect();
     let (peak_v, peak_d) = series
         .iter()
         .max_by_key(|d| d.tokens)
@@ -872,7 +934,21 @@ fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> V
             format!("peak {} {}", fmt_count(peak_v), short_date(&peak_d))
         }
     };
-    let mut lines = bar_chart_sqrt(&vals, w, h.saturating_sub(1), theme::accent());
+    // Bars widen to fill the card; a month tick row squeezes in under the axis
+    // only when the chart keeps ≥ 2 rows of its own (same gate as hour-of-day).
+    let (cell, gap) = bucket_layout(vals.len(), w);
+    let ticks = h >= 4;
+    let mut lines = bar_chart_sqrt(
+        &vals,
+        w,
+        h.saturating_sub(1 + usize::from(ticks)),
+        theme::accent(),
+        cell,
+        gap,
+    );
+    if ticks {
+        lines.push(month_ticks(&dates, w, cell, gap));
+    }
     lines.push(center(vec![Span::styled(peak, theme::faint())], w));
     lines
 }
@@ -1026,36 +1102,46 @@ fn comp_rows(
         } else {
             value as f64 / grand as f64 * 100.0
         };
-        let mut spans = vec![Span::styled(
+        let mut left = vec![Span::styled(
             format!("{label:<WIDE_KEY_W$}"),
             theme::label(),
         )];
-        spans.extend(hbar(value, grand, bar_w, fill));
-        spans.push(Span::styled(format!(" {pct:>3.0}%"), theme::dim()));
-        Line::from(spans)
+        left.extend(hbar(value, grand, bar_w, fill));
+        // Percentage anchored to the card's right edge (not the bar's end), so
+        // the column reads as one rail however wide the card gets.
+        lr(
+            left,
+            vec![Span::styled(format!("{pct:>3.0}%"), theme::dim())],
+            w,
+        )
     })
     .collect()
 }
 
-/// Baseline tick labels under the 24-column hour chart, one digit run per
-/// quarter of the day (columns 0 / 6 / 12 / 18).
-const HOUR_TICKS: &str = "0     6     12    18";
-
 fn hour_lines(hours: &[u64; 24], w: usize, h: usize) -> Vec<Line<'static>> {
-    // 24-bucket chart grown vertically, busiest hour named below it. Tick
-    // labels squeeze in only when the chart keeps ≥ 2 rows of its own.
+    // 24-bucket chart grown vertically — hour columns widen up to 3 cells when
+    // the card has the room (contiguous: this one is a distribution, not
+    // discrete buckets) — busiest hour named below it. Tick labels squeeze in
+    // only when the chart keeps ≥ 2 rows of its own.
     let peak = busiest_hour(hours)
         .map(|h| format!("peak {h:02}:00"))
         .unwrap_or_default();
+    let cell = (w / 24).clamp(1, 3);
     let ticks = h >= 4;
     let chart_h = h.saturating_sub(1 + usize::from(ticks));
-    let mut lines = bar_chart(hours, w, chart_h, theme::accent());
+    let mut lines = bar_chart(hours, w, chart_h, theme::accent(), cell, 0);
     if ticks {
-        // Same centering as `bar_chart`'s 24 columns so ticks sit under bars.
-        let pad = w.saturating_sub(24) / 2;
+        // 0/6/12/18 labels at their hour's column, matching `bar_chart`'s
+        // centering so ticks sit under bars at any cell width.
+        let pad = w.saturating_sub(24 * cell) / 2;
+        let mut row = String::new();
+        for hour in [0usize, 6, 12, 18] {
+            row.push_str(&" ".repeat(hour * cell - row.chars().count()));
+            row.push_str(&hour.to_string());
+        }
         lines.push(Line::from(vec![
             Span::raw(" ".repeat(pad)),
-            Span::styled(HOUR_TICKS, theme::faint()),
+            Span::styled(row, theme::faint()),
         ]));
     }
     lines.push(center(vec![Span::styled(peak, theme::faint())], w));
@@ -1072,10 +1158,12 @@ fn activity_lines(
         Some(b) => bucket_activity(&stats.activity, b),
         None => stats.activity.clone(),
     };
-    let msgs: Vec<u64> = trail(&series, w).iter().map(|a| a.messages).collect();
+    let tail = trail(&series, w);
+    let msgs: Vec<u64> = tail.iter().map(|a| a.messages).collect();
     if msgs.is_empty() {
         return vec![Line::from(Span::styled("no activity data", theme::faint()))];
     }
+    let dates: Vec<&str> = tail.iter().map(|a| a.date.as_str()).collect();
     // Caption reports the single busiest-by-messages bucket's own three real
     // figures — not maxima mixed across buckets plus a lifetime tool sum (which
     // read the same in every lens). Granularity word distinguishes day/wk/mo.
@@ -1096,8 +1184,21 @@ fn activity_lines(
             )
         })
         .unwrap_or_default();
-    // Same sqrt scale as the trend chart — activity has the same outlier shape.
-    let mut lines = bar_chart_sqrt(&msgs, w, h.saturating_sub(1), theme::accent());
+    // Same sqrt scale, bar widening, and tick gate as the trend chart —
+    // activity has the same outlier shape and the same axis question.
+    let (cell, gap) = bucket_layout(msgs.len(), w);
+    let ticks = h >= 4;
+    let mut lines = bar_chart_sqrt(
+        &msgs,
+        w,
+        h.saturating_sub(1 + usize::from(ticks)),
+        theme::accent(),
+        cell,
+        gap,
+    );
+    if ticks {
+        lines.push(month_ticks(&dates, w, cell, gap));
+    }
     lines.push(center(vec![Span::styled(caption, theme::faint())], w));
     lines
 }
