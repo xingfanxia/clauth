@@ -790,6 +790,13 @@ impl TokenPeriod {
         }
     }
 
+    /// Like [`Self::badge`] but always names the lens — `lifetime` included —
+    /// so the lens-bearing surfaces never render an empty badge slot (a badge
+    /// that only sometimes appears reads as an anomaly, not a lens).
+    pub(crate) fn lens_badge(self) -> &'static str {
+        self.badge().unwrap_or("lifetime")
+    }
+
     /// Calendar bucket for the trend cards; `None` = per-day rows.
     pub(crate) fn bucket(self) -> Option<crate::tokens::Bucket> {
         match self {

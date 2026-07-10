@@ -500,7 +500,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mid = halves(rows[2], 55);
     // Filter + period lenses both show as the card's title-right meta badge.
     let model_rows = token_period_models(app);
-    let models_meta = join_badges(app.token_filter.badge(), period.badge());
+    let models_meta = join_badges(app.token_filter.badge(), Some(period.lens_badge()));
     card(
         frame,
         mid[0],
@@ -524,7 +524,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
         TokenPeriod::Weekly | TokenPeriod::Monthly => {
             (Some("lifetime"), comp_lines(stats, inner_w(mid[1])))
         }
-        TokenPeriod::Lifetime => (None, comp_lines(stats, inner_w(mid[1]))),
+        TokenPeriod::Lifetime => (Some("lifetime"), comp_lines(stats, inner_w(mid[1]))),
     };
     card(frame, mid[1], "composition", comp_meta, false, None, comp);
 
@@ -542,8 +542,9 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Some("today"),
             stats.today.as_ref().map(|t| t.hours).unwrap_or([0; 24]),
         ),
-        TokenPeriod::Weekly | TokenPeriod::Monthly => (Some("lifetime"), stats.hour_counts),
-        TokenPeriod::Lifetime => (None, stats.hour_counts),
+        TokenPeriod::Weekly | TokenPeriod::Monthly | TokenPeriod::Lifetime => {
+            (Some("lifetime"), stats.hour_counts)
+        }
     };
     card(
         frame,
@@ -557,7 +558,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let act_meta = match period {
         TokenPeriod::Weekly => Some("by week"),
         TokenPeriod::Monthly => Some("by month"),
-        TokenPeriod::Lifetime | TokenPeriod::Daily => None,
+        TokenPeriod::Lifetime | TokenPeriod::Daily => Some("by day"),
     };
     card(
         frame,
@@ -1026,7 +1027,7 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // The selector title carries the active lenses so the narrowed list reads
     // as such.
-    let title = match join_badges(app.token_filter.badge(), app.token_period.badge()) {
+    let title = match join_badges(app.token_filter.badge(), Some(app.token_period.lens_badge())) {
         Some(badge) => format!("models  {badge}"),
         None => "models".to_string(),
     };
