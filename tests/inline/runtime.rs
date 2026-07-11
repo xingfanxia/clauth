@@ -1100,7 +1100,23 @@ fn has_live_session_true_when_any_session_alive() {
         file.lock().expect("lock pid");
         assert!(has_live_session("alive"));
         drop(file);
-        assert!(!has_live_session("alive"));
+        // The probe is deliberately fail-alive (any try_lock I/O error reads
+        // as "alive" — see `is_session_alive`), so one transient error under a
+        // parallel suite run can inflate a single reading. Poll briefly: only
+        // a PERSISTENTLY-alive reading is a regression. Same hardening as
+        // `live_session_count_counts_only_alive`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let settled_dead = loop {
+            let alive = has_live_session("alive");
+            if !alive {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(settled_dead, "a dropped session lock must read as dead");
     });
 }
 
