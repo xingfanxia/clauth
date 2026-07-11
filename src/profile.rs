@@ -722,7 +722,7 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
     })
 }
 
-fn load_profile(name: &str) -> Result<Profile> {
+pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,

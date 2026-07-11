@@ -2971,6 +2971,20 @@ fn prompt_divergence(app: &mut App, active: String, verb: &str) {
 /// Synchronous UI-thread switch. No HTTP; clears the Switching marker, runs
 /// `switch_profile`, refreshes token snapshot on success.
 fn finalize_switch(app: &mut App, name: &str) {
+    // AUTH-1 (Incident C) parity with the CLI/noninteractive gates: a
+    // quarantined target's dead token must never land in the Keychain (it
+    // would log out every running `claude`). Flag-only — no HTTP on the UI
+    // thread; the flag is set/cleared by the poller and every refresh site,
+    // so it is current within one tick. A flagged-but-actually-healthy
+    // account clears itself on its next successful refresh.
+    if app.config().is_auth_broken(name) {
+        clear_activity(&app.activity, name);
+        app.toast(
+            ToastKind::Danger,
+            format!("login for '{name}' has expired — run: clauth login {name}"),
+        );
+        return;
+    }
     // Guard a diverged outgoing active: `switch_profile` would no-op the
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so

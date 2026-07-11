@@ -264,6 +264,24 @@ fn refresh_failure_is_terminal(err: &RefreshError) -> bool {
     matches!(err, RefreshError::Invalid(_))
 }
 
+/// The benign face of a terminal 400: "refresh token not found or invalid" is
+/// also the exact response after a single-use double-spend — Claude Code
+/// refreshing the active profile's symlinked credentials mid-poll, or another
+/// refresher that completed before this tick's guard was acquired (the
+/// in-memory `TokenEntry` snapshot predates the guard). Re-read the profile's
+/// on-disk credentials (call while STILL holding the rotation guard, so the
+/// read is stable): a stored pair that moved past the token we just spent
+/// means the chain is alive and someone else advanced it — return that fresh
+/// pair for the caller's `TokenList` sync instead of quarantining a healthy
+/// account. `None` (unchanged, unreadable, or tokenless) means the 400 was a
+/// real revocation.
+fn fresher_disk_pair(name: &str, spent_refresh: &str) -> Option<RotatedTokens> {
+    let profile = crate::profile::load_profile(name).ok()?;
+    let access = profile.access_token()?.to_string();
+    let refresh = profile.refresh_token()?.to_string();
+    (refresh != spent_refresh).then_some((access, Some(refresh)))
+}
+
 /// Whether a 429 on the usage fetch is worth rotating for. Mirrors
 /// `auth::auto_start_kick`'s 429 gate: a 429 on a still-valid token is a pure
 /// endpoint rate limit a refresh can't fix, but a clock-expired token would 401
@@ -339,10 +357,22 @@ fn fetch_with_rotation(
     let tok = match rotation {
         Ok(t) => t,
         Err(e) => {
-            // A terminal failure (dead refresh token) quarantines the account on
-            // this tick; a transient one leaves the flag and retries. See
-            // `refresh_failure_is_terminal`.
             if refresh_failure_is_terminal(&e) {
+                // Double-spend guard before quarantining: if the on-disk pair
+                // moved past the token we just spent, another refresher
+                // already rotated the chain — carry the fresh pair into the
+                // TokenList and retry next tick (disk cache serves this one).
+                // Only an unchanged-credentials 400 is a real revocation. See
+                // `fresher_disk_pair`.
+                if let Some(fresh) = fresher_disk_pair(name, rt) {
+                    if let Ok(mut q) = refetch.lock() {
+                        q.insert(name.to_string());
+                    }
+                    return FetchOutcome::cached(name, FetchStatus::Cached, Some(fresh), None);
+                }
+                // A terminal failure (dead refresh token) quarantines the
+                // account on this tick; a transient one leaves the flag and
+                // retries. See `refresh_failure_is_terminal`.
                 crate::oauth::mark_auth_broken(config, name, true);
             }
             return bail_to_cache(None);

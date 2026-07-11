@@ -1129,6 +1129,51 @@ fn transient_refresh_failure_is_not_terminal() {
     assert!(!super::refresh_failure_is_terminal(&err));
 }
 
+// `fresher_disk_pair` is the double-spend guard in front of the quarantine: a
+// terminal 400 is also what a benign single-use double-spend returns (Claude
+// Code refreshing the active profile's symlinked credentials mid-poll, or a
+// refresher that completed before this tick's guard was acquired). Only an
+// UNCHANGED on-disk pair proves a real revocation.
+
+#[test]
+fn a_disk_pair_that_moved_past_the_spent_token_is_returned_not_quarantined() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "double-spend-benign";
+    let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+    p.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-new".into(),
+            refresh_token: Some("rt-new".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&p).expect("save profile");
+
+    // We spent "rt-old"; the store moved to "rt-new" — someone else rotated.
+    assert_eq!(
+        super::fresher_disk_pair(name, "rt-old"),
+        Some(("at-new".to_string(), Some("rt-new".to_string())))
+    );
+    // We spent "rt-new" itself and it 400d — a real revocation, quarantine.
+    assert_eq!(super::fresher_disk_pair(name, "rt-new"), None);
+}
+
+#[test]
+fn a_missing_or_tokenless_profile_never_reads_as_a_benign_double_spend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // No profile on disk at all.
+    assert_eq!(
+        super::fresher_disk_pair("double-spend-missing", "rt-x"),
+        None
+    );
+    // Profile exists but has no stored credentials.
+    let p = crate::profile::Profile::new("double-spend-bare".to_string(), None, None);
+    crate::profile::save_profile(&p).expect("save profile");
+    assert_eq!(super::fresher_disk_pair("double-spend-bare", "rt-x"), None);
+}
+
 // `token_clock_expired` gates whether a 429 on the usage fetch falls through to the
 // refresh leg (the AUTH-1 fix so a dead login that 429s surfaces as auth_broken
 // instead of being masked as RateLimited forever) vs bails to cache. Only a

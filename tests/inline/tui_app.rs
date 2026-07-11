@@ -1966,3 +1966,33 @@ mod new_account_model_row {
         );
     }
 }
+
+// ── AUTH-1 gate on the TUI switch (Incident C, every entry point) ───────────
+
+/// The UI-thread switch shares the quarantine refusal: a flagged target's
+/// dead token must never land in the Keychain. Flag-only — no HTTP on the UI
+/// thread — so it keys on `is_auth_broken`, which the poller and every
+/// refresh site keep current.
+#[test]
+fn tui_switch_refuses_a_quarantined_target_with_login_hint() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile("healthy"),
+        crate::testutil::blank_profile("broken"),
+    ]);
+    app.config().set_auth_broken("broken", true);
+
+    super::perform_switch(&mut app, "broken");
+
+    assert!(
+        !app.config().is_active("broken"),
+        "a quarantined target must never become active"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("clauth login broken")),
+        "the refusal names the recovery"
+    );
+}

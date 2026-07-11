@@ -562,3 +562,30 @@ fn token_parse_error_redacts_the_2xx_body() {
         "the parse position (not the serde value) is reported: {msg}"
     );
 }
+
+// ── refresh_rejection_is_terminal (the 400/401/403 truth table) ─────────────
+
+/// 400/401 are terminal regardless of body (OAuth2 reports a dead refresh
+/// token as 400 `invalid_grant`; some proxies answer 401). 403 is terminal
+/// ONLY with a confirming `invalid_grant` body — WAF/geo/challenge blocks
+/// answer 403 too, and quarantining on one would take a healthy account out
+/// of rotation until its next successful refresh.
+#[test]
+fn refresh_rejection_terminal_truth_table() {
+    assert!(refresh_rejection_is_terminal(400, "invalid_grant"));
+    assert!(refresh_rejection_is_terminal(
+        400,
+        "refresh token not found or invalid"
+    ));
+    assert!(refresh_rejection_is_terminal(401, "unauthorized"));
+    assert!(refresh_rejection_is_terminal(
+        403,
+        r#"{"error":"invalid_grant"}"#
+    ));
+    assert!(!refresh_rejection_is_terminal(
+        403,
+        "<html>Access denied by security policy</html>"
+    ));
+    assert!(!refresh_rejection_is_terminal(429, "rate limited"));
+    assert!(!refresh_rejection_is_terminal(500, "internal error"));
+}

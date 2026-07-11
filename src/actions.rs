@@ -208,12 +208,38 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
 ///
 /// Accepted TOCTOU: the divergence classify runs before the locked relink (same
 /// shape as the CLI path); a live change in that gap self-heals on the next switch.
+///
+/// Takes the shared [`crate::profile::ConfigHandle`] (not `&mut AppConfig`)
+/// because the AUTH-1 gate below may refresh over HTTP, which must never run
+/// under the config mutex. `refresher` is injected so the gate is testable
+/// offline (production callers pass [`oauth::refresh_result`]).
 pub(crate) fn switch_profile_noninteractive(
-    config: &mut AppConfig,
+    config: &crate::profile::ConfigHandle,
     target: &str,
     on_divergence: Option<DivergenceChoice>,
+    refresher: impl Fn(&str) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
 ) -> Result<(Option<String>, String)> {
-    let previous = config.state.active_profile.as_deref().map(str::to_string);
+    // AUTH-1 (Incident C): gate the target before its credentials land in the
+    // Keychain — the same gate as the CLI switch, so "a quarantined account is
+    // refused as a switch target" holds for EVERY noninteractive entry point
+    // (MCP today; any future headless caller inherits it).
+    match oauth::ensure_installable(config, target, refresher) {
+        oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
+        oauth::AuthGate::Broken => bail!(
+            "login for '{target}' has expired (refresh token revoked or invalid). \
+             run: clauth login {target}"
+        ),
+        oauth::AuthGate::Transient(e) => bail!(
+            "could not refresh '{target}' before switching ({e}); check your \
+             connection and retry"
+        ),
+    }
+
+    let previous = {
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        let cfg = config.lock().expect("config mutex poisoned");
+        cfg.state.active_profile.as_deref().map(str::to_string)
+    };
 
     let diverged = match previous.as_deref() {
         Some(active) => {
@@ -223,6 +249,8 @@ pub(crate) fn switch_profile_noninteractive(
         None => false,
     };
 
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    let config = &mut *config.lock().expect("config mutex poisoned");
     if diverged {
         match on_divergence {
             Some(DivergenceChoice::Overwrite) => switch_profile_reconciled(config, target)?,

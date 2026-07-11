@@ -97,10 +97,11 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
 /// only fix) from a *transient* network/429/5xx blip (refuse this one switch,
 /// retry next tick — never quarantine a healthy account on a hiccup).
 pub(crate) enum RefreshError {
-    /// The token endpoint rejected the refresh token (HTTP 400/401/403) — it is
-    /// revoked or invalid.
+    /// The token endpoint rejected the refresh token — it is revoked or
+    /// invalid. HTTP 400/401, or a 403 whose body confirms `invalid_grant`.
     Invalid(String),
-    /// Transport failure, 429, or 5xx — the refresh token may still be good.
+    /// Transport failure, 429, 5xx, or an unconfirmed 403 (WAF/geo/challenge
+    /// blocks answer 403 too) — the refresh token may still be good.
     Transient(anyhow::Error),
 }
 
@@ -114,9 +115,12 @@ impl From<RefreshError> for anyhow::Error {
 }
 
 /// [`refresh`] preserving the permanent-vs-transient distinction the AUTH-1 gate
-/// needs. A 400/401/403 from the token endpoint means the refresh token is
-/// revoked/invalid (quarantine); a transport error, 429, or 5xx is transient
-/// (retry, never quarantine).
+/// needs. A 400/401 from the token endpoint means the refresh token is
+/// revoked/invalid (quarantine — OAuth2 reports a dead refresh token as a 400
+/// `invalid_grant`; some proxies answer 401). A 403 is terminal only when the
+/// body actually confirms `invalid_grant`: WAF/geo/challenge blocks answer 403
+/// too, and quarantining on one would take a healthy account out of rotation.
+/// A transport error, 429, or 5xx is transient (retry, never quarantine).
 pub(crate) fn refresh_result(
     refresh_token: &str,
 ) -> std::result::Result<TokenResponse, RefreshError> {
@@ -137,7 +141,7 @@ pub(crate) fn refresh_result(
         .body_mut()
         .read_to_string()
         .map_err(|e| RefreshError::Transient(anyhow::Error::from(e)))?;
-    if matches!(status, 400 | 401 | 403) {
+    if refresh_rejection_is_terminal(status, &text) {
         return Err(RefreshError::Invalid(format!("HTTP {status}: {text}")));
     }
     if status >= 400 {
@@ -148,6 +152,14 @@ pub(crate) fn refresh_result(
 
     serde_json::from_str(&text)
         .map_err(|e| RefreshError::Transient(token_parse_error(e, status, text.len())))
+}
+
+/// Whether a token-endpoint rejection means the refresh token itself is dead
+/// (quarantine) rather than the request being blocked (retry). Extracted pure
+/// so the truth table is pinned offline
+/// (`refresh_rejection_terminal_truth_table`).
+fn refresh_rejection_is_terminal(status: u16, body: &str) -> bool {
+    matches!(status, 400 | 401) || (status == 403 && body.contains("invalid_grant"))
 }
 
 pub(crate) fn refresh(refresh_token: &str) -> Result<TokenResponse> {

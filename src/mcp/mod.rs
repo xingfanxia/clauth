@@ -309,16 +309,24 @@ configured active profile, with no creds on disk to match). Appends a live usage
         let on_divergence = config.state.default_divergence;
 
         // `switch_profile_noninteractive` can block on the macOS keychain deadline
-        // (up to 20s); keep it off the async worker so a slow keychain never stalls
-        // the runtime. Mirrors `delegate`'s `spawn_blocking`.
+        // (up to 20s) and may refresh the target over HTTP (its AUTH-1 gate);
+        // keep it off the async worker so neither stalls the runtime. Mirrors
+        // `delegate`'s `spawn_blocking`. The shared-handle wrap is what the
+        // gate's refresh path requires (it must lock/unlock around HTTP).
         let (config, outcome) = tokio::task::spawn_blocking(move || {
-            let mut config = config;
-            let outcome =
-                crate::actions::switch_profile_noninteractive(&mut config, &name, on_divergence);
+            let config = std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+            let outcome = crate::actions::switch_profile_noninteractive(
+                &config,
+                &name,
+                on_divergence,
+                crate::oauth::refresh_result,
+            );
             (config, outcome)
         })
         .await
         .map_err(|e| ErrorData::internal_error(format!("switch task failed: {e}"), None))?;
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        let config = config.lock().expect("config mutex poisoned");
 
         match outcome {
             Ok((previous, active)) => {

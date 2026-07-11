@@ -31,6 +31,35 @@ fn creds(access: &str, refresh: &str) -> ClaudeCredentials {
     }
 }
 
+/// Like [`creds`] but already past expiry, so `ensure_installable` classifies
+/// the profile as expiring and exercises the injected refresher.
+fn creds_expired(access: &str, refresh: &str) -> ClaudeCredentials {
+    ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 - 60_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    }
+}
+
+/// Gate fixture: every test profile carries `expires_at: None` (never
+/// "expiring"), so `ensure_installable` answers Ready without touching this —
+/// it exists only to satisfy the injected-refresher parameter offline.
+fn no_network(
+    _rt: &str,
+) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
+    Err(crate::oauth::RefreshError::Transient(anyhow::anyhow!(
+        "no network in tests"
+    )))
+}
+
+fn handle(config: AppConfig) -> crate::profile::ConfigHandle {
+    std::sync::Arc::new(crate::lockorder::RankedMutex::new(config))
+}
+
 fn stored_profile(name: &str, c: Option<ClaudeCredentials>) -> Profile {
     let mut p = Profile::new(name.to_string(), None, None);
     p.credentials = c;
@@ -70,15 +99,15 @@ fn seed_diverged(
 fn divergence_without_default_errors() {
     let _home = HomeSandbox::new();
     let live = creds("relogin-a", "relogin-r");
-    let mut config = seed_diverged(
+    let config = handle(seed_diverged(
         "active",
         creds("stored-a", "stored-r"),
         &live,
         "target",
         Some(creds("target-a", "target-r")),
-    );
+    ));
 
-    let err = switch_profile_noninteractive(&mut config, "target", None);
+    let err = switch_profile_noninteractive(&config, "target", None, no_network);
     assert!(
         err.is_err(),
         "diverged active with no default must error, never prompt"
@@ -89,16 +118,20 @@ fn divergence_without_default_errors() {
 fn divergence_new_profile_default_errors() {
     let _home = HomeSandbox::new();
     let live = creds("relogin-a", "relogin-r");
-    let mut config = seed_diverged(
+    let config = handle(seed_diverged(
         "active",
         creds("stored-a", "stored-r"),
         &live,
         "target",
         Some(creds("target-a", "target-r")),
-    );
+    ));
 
-    let err =
-        switch_profile_noninteractive(&mut config, "target", Some(DivergenceChoice::NewProfile));
+    let err = switch_profile_noninteractive(
+        &config,
+        "target",
+        Some(DivergenceChoice::NewProfile),
+        no_network,
+    );
     assert!(
         err.is_err(),
         "'save as new profile' needs an interactive name prompt; headless must error",
@@ -109,17 +142,21 @@ fn divergence_new_profile_default_errors() {
 fn divergence_overwrite_captures_relogin_into_outgoing() {
     let _home = HomeSandbox::new();
     let live = creds("relogin-a", "relogin-r");
-    let mut config = seed_diverged(
+    let config = handle(seed_diverged(
         "active",
         creds("stored-a", "stored-r"),
         &live,
         "target",
         Some(creds("target-a", "target-r")),
-    );
+    ));
 
-    let (previous, active) =
-        switch_profile_noninteractive(&mut config, "target", Some(DivergenceChoice::Overwrite))
-            .expect("overwrite switch");
+    let (previous, active) = switch_profile_noninteractive(
+        &config,
+        "target",
+        Some(DivergenceChoice::Overwrite),
+        no_network,
+    )
+    .expect("overwrite switch");
     assert_eq!(previous.as_deref(), Some("active"));
     assert_eq!(active, "target");
 
@@ -151,17 +188,21 @@ fn divergence_overwrite_captures_relogin_into_outgoing() {
 fn divergence_discard_drops_relogin_and_relinks_target() {
     let _home = HomeSandbox::new();
     let live = creds("relogin-a", "relogin-r");
-    let mut config = seed_diverged(
+    let config = handle(seed_diverged(
         "active",
         creds("stored-a", "stored-r"),
         &live,
         "target",
         Some(creds("target-a", "target-r")),
-    );
+    ));
 
-    let (previous, active) =
-        switch_profile_noninteractive(&mut config, "target", Some(DivergenceChoice::Discard))
-            .expect("discard switch succeeds — it force-relinks past the divergence guard");
+    let (previous, active) = switch_profile_noninteractive(
+        &config,
+        "target",
+        Some(DivergenceChoice::Discard),
+        no_network,
+    )
+    .expect("discard switch succeeds — it force-relinks past the divergence guard");
     assert_eq!(previous.as_deref(), Some("active"));
     assert_eq!(active, "target");
 
@@ -203,14 +244,14 @@ fn non_diverged_switch_takes_plain_path() {
     // Link the live path to the active profile so it classifies as LinkedTo.
     crate::claude::force_link_profile_credentials("active").expect("link active");
 
-    let mut config = AppConfig {
+    let config = handle(AppConfig {
         state: AppState {
             active_profile: Some("active".into()),
             profiles: vec!["active".into(), "target".into()],
             ..Default::default()
         },
         profiles: vec![active_profile, target_profile],
-    };
+    });
 
     assert_eq!(
         classify_credentials_link("active").expect("classify"),
@@ -219,7 +260,87 @@ fn non_diverged_switch_takes_plain_path() {
     );
 
     let (previous, active) =
-        switch_profile_noninteractive(&mut config, "target", None).expect("plain switch");
+        switch_profile_noninteractive(&config, "target", None, no_network).expect("plain switch");
     assert_eq!(previous.as_deref(), Some("active"));
     assert_eq!(active, "target");
+}
+
+// ── AUTH-1 gate on the noninteractive path (Incident C, every entry point) ──
+
+/// A dead target must be refused BEFORE any relink — the MCP `switch` (and any
+/// future headless caller) shares the CLI's `ensure_installable` gate, so a
+/// quarantined token can never land in the Keychain through this path either.
+#[test]
+fn noninteractive_switch_refuses_a_dead_target_with_login_hint() {
+    let _home = HomeSandbox::new();
+    let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
+    let target_profile = stored_profile("target", Some(creds_expired("dead-a", "dead-r")));
+    crate::claude::force_link_profile_credentials("active").expect("link active");
+
+    let config = handle(AppConfig {
+        state: AppState {
+            active_profile: Some("active".into()),
+            profiles: vec!["active".into(), "target".into()],
+            ..Default::default()
+        },
+        profiles: vec![active_profile, target_profile],
+    });
+
+    let revoked = |_: &str| {
+        Err(crate::oauth::RefreshError::Invalid(
+            "HTTP 400: refresh token not found or invalid".into(),
+        ))
+    };
+    let err = switch_profile_noninteractive(&config, "target", None, revoked)
+        .expect_err("a revoked target must refuse the switch");
+    assert!(
+        err.to_string().contains("clauth login target"),
+        "the refusal names the recovery, got: {err}"
+    );
+
+    // The refusal quarantined the target and left the active link untouched.
+    assert!(config.lock().unwrap().is_auth_broken("target"));
+    assert!(config.lock().unwrap().is_active("active"));
+    let live_now: ClaudeCredentials = read_json_file(
+        &crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json"),
+    )
+    .expect("read live creds");
+    assert_eq!(
+        live_now.refresh_token(),
+        Some("stored-r"),
+        "the dead target's credentials must never reach the live link",
+    );
+}
+
+/// A transient refresh failure refuses THIS switch but never quarantines —
+/// mirrors the CLI gate's Transient arm.
+#[test]
+fn noninteractive_switch_transient_failure_refuses_without_quarantine() {
+    let _home = HomeSandbox::new();
+    let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
+    let target_profile = stored_profile("target", Some(creds_expired("t-a", "t-r")));
+    crate::claude::force_link_profile_credentials("active").expect("link active");
+
+    let config = handle(AppConfig {
+        state: AppState {
+            active_profile: Some("active".into()),
+            profiles: vec!["active".into(), "target".into()],
+            ..Default::default()
+        },
+        profiles: vec![active_profile, target_profile],
+    });
+
+    let err = switch_profile_noninteractive(&config, "target", None, no_network)
+        .expect_err("a transient refresh failure must refuse the switch");
+    assert!(
+        err.to_string().contains("could not refresh"),
+        "the refusal explains the transient cause, got: {err}"
+    );
+    assert!(
+        !config.lock().unwrap().is_auth_broken("target"),
+        "a transient blip must never quarantine"
+    );
+    assert!(config.lock().unwrap().is_active("active"));
 }
