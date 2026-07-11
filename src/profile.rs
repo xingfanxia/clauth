@@ -499,7 +499,7 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
     if let Some(path) = HOME_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
         return Ok(path);
     }
-    dirs::home_dir().context("Cannot determine home directory")
+    dirs::home_dir().context("cannot determine home directory")
 }
 
 pub(crate) fn clauth_dir() -> Result<PathBuf> {
@@ -694,14 +694,14 @@ fn mkdir_700(path: &Path) -> std::io::Result<()> {
 
 pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    serde_json::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 pub(crate) fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn load_app_state() -> Result<AppState> {
@@ -718,7 +718,7 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
     with_state_lock(|| {
         std::fs::create_dir_all(clauth_dir()?)?;
         atomic_write_600(&app_state_path()?, toml::to_string_pretty(state)?)
-            .context("Failed to write profiles.toml")
+            .context("failed to write profiles.toml")
     })
 }
 
@@ -727,13 +727,13 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     let raw_config = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("Failed to read {name}/config.toml")),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {name}/config.toml")),
     };
     let config: ProfileConfig = if raw_config.trim().is_empty() {
         ProfileConfig::default()
     } else {
         toml::from_str(&raw_config)
-            .with_context(|| format!("Failed to parse {name}/config.toml"))?
+            .with_context(|| format!("failed to parse {name}/config.toml"))?
     };
 
     let cred_path = profile_credentials_path(name)?;
@@ -820,9 +820,9 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
         let cred_path = profile_credentials_path(&profile.name)?;
         match &profile.credentials {
             Some(creds) => atomic_write_600(&cred_path, serde_json::to_string_pretty(creds)?)
-                .context("Failed to write credentials.json")?,
+                .context("failed to write credentials.json")?,
             None if cred_path.exists() => {
-                std::fs::remove_file(&cred_path).context("Failed to remove credentials.json")?
+                std::fs::remove_file(&cred_path).context("failed to remove credentials.json")?
             }
             None => {}
         }
@@ -831,7 +831,7 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
             &profile_config_path(&profile.name)?,
             render_config_toml(profile),
         )
-        .context("Failed to write config.toml")?;
+        .context("failed to write config.toml")?;
 
         Ok(())
     })
@@ -847,7 +847,7 @@ pub(crate) fn stage_rotated_credentials(name: &str, creds: &ClaudeCredentials) -
             &profile_credentials_pending_path(name)?,
             serde_json::to_string_pretty(creds)?,
         )
-        .context("Failed to stage rotated credentials")
+        .context("failed to stage rotated credentials")
     })
 }
 
@@ -950,7 +950,7 @@ fn render_config_toml(profile: &Profile) -> String {
     out.push_str("# Marks this profile as the fallback chain's last resort. Once the\n");
     out.push_str("# auto-switch walk lands here with no other member having headroom, it\n");
     out.push_str("# parks instead of turning off all accounts. Independent of\n");
-    out.push_str("# fallback_threshold — this profile still switches away at its own\n");
+    out.push_str("# fallback_threshold, this profile still switches away at its own\n");
     out.push_str("# threshold whenever another chain member has headroom.\n");
     if profile.last_resort {
         out.push_str("last_resort = true\n");

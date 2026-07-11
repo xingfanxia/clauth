@@ -42,7 +42,7 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     };
 
     match (&s.plan, body.is_empty()) {
-        (Some(plan), false) => format!("{plan} — {body}"),
+        (Some(plan), false) => format!("{plan}: {body}"),
         (Some(plan), true) => plan.clone(),
         (None, _) => body,
     }
@@ -78,17 +78,17 @@ pub(crate) fn switch_effect(auth: &SessionAuth) -> String {
     match auth {
         SessionAuth::Global => "`switch` repoints the global `~/.claude` credentials THIS \
 session reads; Claude Code reloads them on its next token refresh, so this session would \
-start acting as the switched profile — disruptive mid-session. To use another account \
+start acting as the switched profile, disruptive mid-session. To use another account \
 without disturbing this one, use the `delegate` tool."
             .to_string(),
         SessionAuth::IsolatedRuntime(name) => format!(
             "`switch` repoints the global `~/.claude` credentials, but THIS session runs in an \
-isolated `clauth start` runtime pinned to `{name}` and is unaffected — only a later session on \
+isolated `clauth start` runtime pinned to `{name}` and is unaffected. Only a later session on \
 the global credentials adopts the change."
         ),
         SessionAuth::IsolatedCustom => "`switch` repoints the global `~/.claude` credentials, but \
 THIS session uses a custom `CLAUDE_CONFIG_DIR` and reads its own credentials, so it is \
-unaffected — only a later session on the global credentials adopts the change."
+unaffected. Only a later session on the global credentials adopts the change."
             .to_string(),
     }
 }
@@ -101,7 +101,7 @@ unaffected — only a later session on the global credentials adopts the change.
 pub(crate) fn instructions_block(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
     let mut out = String::new();
     out.push_str(
-        "clauth manages multiple Claude Code accounts (\"profiles\") — each an isolated \
+        "clauth manages multiple Claude Code accounts (\"profiles\"): each an isolated \
 credential set / subscription. Use these tools to compare usage headroom across accounts, \
 relink the active account, or delegate a task to another account without spending this \
 session's window.\n\n\
@@ -109,7 +109,7 @@ Tools: `list_profiles` (cached usage + filesystem, zero quota), \
 `which` (the profile that owns this session's credentials), \
 `switch` (relink the global active profile), \
 `delegate` (delegate a headless prompt to a profile; this BURNS a real account usage window, \
-hard-capped at depth 1 — a delegate cannot itself delegate; pass `background:true` for a `job_id` \
+hard-capped at depth 1 (a delegate cannot itself delegate); pass `background:true` for a `job_id` \
 now and the result later), \
 `delegate_result` (fetch a backgrounded delegate's result by `job_id`).\n\nswitch & this session: ",
     );
@@ -118,9 +118,9 @@ now and the result later), \
         "\n\nCost: `delegate` to a subscription profile burns a rate-limited window (no per-token \
 charge); to an API-key profile (DeepSeek, Z.ai) it bills real USD; a local endpoint is free. To \
 pick the cheapest target, call `list_profiles` for live windows + third-party balances.\n\n\
-A delegate sees nothing but the prompt you pass it — frame the task in that prompt; it has no view \
+A delegate sees nothing but the prompt you pass it. Frame the task in that prompt; it has no view \
 of this conversation.\n\n\
-Profiles (at session start — call `list_profiles` for the live roster and usage):\n",
+Profiles (at session start, call `list_profiles` for the live roster and usage):\n",
     );
 
     for p in profiles {

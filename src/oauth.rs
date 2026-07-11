@@ -92,6 +92,24 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .into()
 });
 
+/// Cap a raw HTTP error body to its first line, max 200 chars, before it
+/// reaches a user-facing toast — an upstream error page must not flood a
+/// one-line surface.
+fn http_error(status: u16, body: &str) -> anyhow::Error {
+    let detail: String = body
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect();
+    if detail.is_empty() {
+        anyhow::anyhow!("HTTP {status}")
+    } else {
+        anyhow::anyhow!("HTTP {status}: {detail}")
+    }
+}
+
 /// A token-refresh failure, split so the AUTH-1 gate can tell a *permanently*
 /// revoked/invalid refresh token (quarantine the account — `clauth login` is the
 /// only fix) from a *transient* network/429/5xx blip (refuse this one switch,
@@ -142,12 +160,10 @@ pub(crate) fn refresh_result(
         .read_to_string()
         .map_err(|e| RefreshError::Transient(anyhow::Error::from(e)))?;
     if refresh_rejection_is_terminal(status, &text) {
-        return Err(RefreshError::Invalid(format!("HTTP {status}: {text}")));
+        return Err(RefreshError::Invalid(http_error(status, &text).to_string()));
     }
     if status >= 400 {
-        return Err(RefreshError::Transient(anyhow::anyhow!(
-            "HTTP {status}: {text}"
-        )));
+        return Err(RefreshError::Transient(http_error(status, &text)));
     }
 
     serde_json::from_str(&text)
@@ -198,7 +214,7 @@ pub(crate) fn exchange_code(
         .read_to_string()
         .map_err(anyhow::Error::from)?;
     if status >= 400 {
-        anyhow::bail!("HTTP {status}: {text}");
+        return Err(http_error(status, &text));
     }
 
     serde_json::from_str(&text).map_err(|e| token_parse_error(e, status, text.len()))

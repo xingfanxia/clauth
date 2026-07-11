@@ -81,6 +81,18 @@ pub(crate) struct PriceTable {
     pub(crate) fetched_at_ms: u64,
 }
 
+#[cfg(test)]
+impl PriceTable {
+    /// Literal table for tests outside this module — keeps `rates` private
+    /// (lookups stay funneled through `rate`/`cost`/`total_cost`).
+    pub(crate) fn from_rates(rates: HashMap<String, ModelRate>) -> Self {
+        Self {
+            rates,
+            fetched_at_ms: 0,
+        }
+    }
+}
+
 impl PriceTable {
     /// Rate for a model id, with suffix fallback. Tries an exact match, then
     /// progressively strips trailing `-<segment>` groups — so a date stamp

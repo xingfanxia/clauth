@@ -171,7 +171,8 @@ pub(crate) struct DelegateArgs {
     /// are always set by clauth and cannot be overridden here.
     env: Option<HashMap<String, String>>,
     /// Extra arguments appended to the `claude` invocation (after clauth's own
-    /// `-p`/`--output-format json`, and the isolated-only `--strict-mcp-config`).
+    /// `-p`/`--output-format json`, the isolated-only `--strict-mcp-config`, and
+    /// `--model <model>` when `model` is set).
     args: Option<Vec<String>>,
     /// Per-call timeout in seconds (1..=3600). Defaults to 300.
     timeout_secs: Option<u64>,
@@ -208,6 +209,10 @@ impl ClauthServer {
 
     #[tool(
         description = "List all clauth profiles from disk cache (zero quota). Per profile: \
+`name`, `active` (is this the currently active profile), `provider` (`anthropic` or a recognised \
+third-party name), and `base_url` (endpoint URL, null for a default OAuth profile) identify it; \
+`tier` is the account plan label (e.g. `Max 5x`), null for a third-party/API-key profile or when \
+no plan data is cached yet; \
 `windows[]` carries the 5h, 7d, and per-model weekly (`7d <model>`) `{label, utilization_pct, \
 resets_at}` where `utilization_pct` is the percent of that window already USED (higher = less \
 headroom) and `resets_at` is ISO-8601; \
@@ -254,9 +259,9 @@ past `delegate` calls; \
 
     #[tool(
         description = "Report which profile owns the credentials this session loaded. `source` \
-explains how it resolved: `refresh_match` (a profile's stored token matches the live creds), \
+explains how it resolved: `refresh_match` (a profile's stored token matches the live credentials), \
 `session_dir` (this session's runtime dir pins the profile), `credential_less_active` (the \
-configured active profile, with no creds on disk to match). Appends a live usage footer (% used)"
+configured active profile, with no credentials on disk to match). Appends a live usage footer (% used)"
     )]
     async fn which(&self) -> Result<CallToolResult, ErrorData> {
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -354,16 +359,16 @@ configured active profile, with no creds on disk to match). Appends a live usage
         description = "Delegate a headless task to a profile; SPENDS that account's real usage \
 window. The depth-1 cap blocks only a nested clauth `delegate` (a delegate cannot delegate again); \
 in-delegate subagents run, but under the SAME delegated profile, not other accounts. For a \
-one-shot task PREFER `isolated: true` — a clean blind session that skips the operator persona \
-(the runtime's `CLAUDE.md`, plugins, hooks, skills) and loads NO MCP servers, so it is cheaper \
-(and on an api-key profile, fewer billed tokens). A SHARED delegate (the default) instead inherits \
+one-shot task, prefer `isolated: true`: a clean blind session that skips the operator persona \
+(the runtime's `CLAUDE.md`, plugins, hooks, skills) and loads no MCP servers, so it is cheaper \
+(and on an API-key profile, fewer billed tokens). A shared delegate (the default) instead inherits \
 that persona plus the runtime config-dir's MCP servers; use it only when the task needs repo tools \
 / codebase nav. Scope a shared delegate with `args:[\"--mcp-config\",\"<json|path>\",\"--strict-mcp-config\"]`. \
-SEPARATELY, a delegate loads the project `CLAUDE.md` of its `cwd` (defaults to this server's cwd) \
+Separately, a delegate loads the project `CLAUDE.md` of its `cwd` (defaults to this server's cwd) \
 regardless of `isolated`, so set `cwd` to a clean dir for a one-shot to avoid an unrelated \
 project's house-style. Optional cwd/env/args/timeout_secs/isolated shape the spawned `claude`. \
 Returns the delegate envelope (`result`, \
-`is_error`, `total_cost_usd`, token usage) — read `total_cost_usd`/usage to self-throttle; the \
+`is_error`, `total_cost_usd`, token usage): read `total_cost_usd`/usage to self-throttle; the \
 `result` is the delegate's own self-report, so spot-verify it like any subagent. Set \
 `background: true` to get a `{job_id}` back at once instead of blocking; the result auto-arrives \
 via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so a \
@@ -520,8 +525,9 @@ via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so
         description = "Fetch the result of a `delegate` call made with `background: true`, by \
 `job_id`. `wait_secs` (0..=60, default 0) long-polls for completion. Returns the delegate \
 envelope when done (same shape as a blocking `delegate`, with the live usage footer), \
-`{status:\"running\"}` if it hasn't finished, or an error for an unknown `job_id`. Normally the \
-result auto-arrives via a hook — use this only when delegate hooks are disabled"
+`{job_id, status:\"running\", elapsed_secs, quota?}` if it hasn't finished (`quota` present only \
+when the job's `delegate` call set `monitor: true`), or an error for an unknown `job_id`. Normally \
+the result auto-arrives via a hook. Use this only when delegate hooks are disabled"
     )]
     async fn delegate_result(
         &self,

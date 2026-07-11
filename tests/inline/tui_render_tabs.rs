@@ -81,6 +81,7 @@ fn tokens_dashboard_uses_alignment_not_middot() {
             cache_create: 543_000_000,
         }],
         daily,
+        daily_models: vec![],
         activity,
         hour_counts,
         total_input: 2_735_000_000,
@@ -99,6 +100,7 @@ fn tokens_dashboard_uses_alignment_not_middot() {
             cache_read: 88_000_000,
             cache_create: 5_200_000,
             messages: 342,
+            hours: [0; 24],
             models: vec![],
         }),
     });
@@ -139,6 +141,7 @@ fn count_cache_toggle_switches_token_basis() {
     app.token_stats = Some(TokenStats {
         models: vec![],
         daily: vec![],
+        daily_models: vec![],
         activity: vec![],
         hour_counts: [0; 24],
         total_input: 10_000_000,
@@ -157,6 +160,7 @@ fn count_cache_toggle_switches_token_basis() {
             cache_read: 90_000_000,
             cache_create: 0,
             messages: 1,
+            hours: [0; 24],
             models: vec![],
         }),
     });

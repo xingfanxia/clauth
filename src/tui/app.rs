@@ -361,8 +361,8 @@ pub(crate) enum ConfirmAction {
     DiscardDivergence(String),
     /// Force-rotate all refresh tokens; active sessions may be logged out.
     RotateAll,
-    /// Force-rotate one account's refresh token (action-menu "rotate tokens" on
-    /// the focused account).
+    /// Force-rotate one account's refresh token (action-menu "rotate access
+    /// token" on the focused account).
     RotateOne(String),
     /// Plugin tab: write the `mcpServers.clauth` entry into `~/.claude.json`.
     /// Reversible local write — non-destructive, so it keeps the plain button.
@@ -500,6 +500,10 @@ pub(crate) enum ActionMenuAction {
     ToggleEstimates,
     TogglePace,
     // Tokens
+    TokensPeriodLifetime,
+    TokensPeriodDaily,
+    TokensPeriodWeekly,
+    TokensPeriodMonthly,
     TokensShowAll,
     TokensShowClaude,
     TokensShowOthers,
@@ -561,6 +565,12 @@ impl ActionMenuAction {
             // Mirror the Tokens tab's page keys so the menu teaches them.
             Self::ToggleCountCache => Some('c'),
             Self::ReloadTokenStats => Some('r'),
+            // Period rows all start with "period: ", so pin each to its
+            // distinguishing word instead of the label scan.
+            Self::TokensPeriodLifetime => Some('l'),
+            Self::TokensPeriodDaily => Some('d'),
+            Self::TokensPeriodWeekly => Some('w'),
+            Self::TokensPeriodMonthly => Some('m'),
             _ => None,
         }
     }
@@ -569,7 +579,7 @@ impl ActionMenuAction {
         match self {
             Self::NewAccount => "new account",
             Self::RefreshUsage => "refresh usage",
-            Self::RotateTokens => "rotate tokens",
+            Self::RotateTokens => "rotate access token",
             Self::SwitchToSelected => "switch to selected",
             Self::ConfigureSelected => "configure",
             Self::OpenChainMember => "open",
@@ -582,13 +592,17 @@ impl ActionMenuAction {
             Self::DeleteProfile => "delete profile",
             Self::CreateProfile => "create profile",
             Self::LoginAccount => "log in",
-            Self::ClearCredentials => "delete credentials",
+            Self::ClearCredentials => "log out",
             Self::EditField => "edit field",
             Self::RemoveEnvField => "remove field",
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
             Self::ToggleEstimates => "toggle estimates",
             Self::TogglePace => "toggle pace marker",
+            Self::TokensPeriodLifetime => "period: lifetime",
+            Self::TokensPeriodDaily => "period: daily",
+            Self::TokensPeriodWeekly => "period: weekly",
+            Self::TokensPeriodMonthly => "period: monthly",
             Self::TokensShowAll => "show all models",
             Self::TokensShowClaude => "show claude models",
             Self::TokensShowOthers => "show other models",
@@ -633,7 +647,7 @@ pub(crate) struct Toast {
     pub(crate) born: Instant,
 }
 
-const ROTATE_ALL_MSG: &str = "rotate tokens for all accounts?";
+const ROTATE_ALL_MSG: &str = "Rotate all access tokens?";
 const ROTATE_ALL_DETAIL: &str = "accounts with a live session might be logged out.";
 const ROTATE_ONE_DETAIL: &str = "a live session on this account might be logged out.";
 const TOAST_CAPACITY: usize = 3;
@@ -738,6 +752,57 @@ impl TokenFilter {
             TokenFilter::All => None,
             TokenFilter::Claude => Some("claude only"),
             TokenFilter::Others => Some("others only"),
+        }
+    }
+}
+
+/// Time-window lens over the Tokens tab, cycled with `t` or set from the
+/// action menu. Session-only — a lens, not a setting, like [`TokenFilter`].
+/// `Lifetime` (the default) is the untouched all-time dashboard; the other
+/// three scope the cards to today / this calendar week / this calendar month.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TokenPeriod {
+    #[default]
+    Lifetime,
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl TokenPeriod {
+    /// Cycle order for the `t` key, wrapping.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            TokenPeriod::Lifetime => TokenPeriod::Daily,
+            TokenPeriod::Daily => TokenPeriod::Weekly,
+            TokenPeriod::Weekly => TokenPeriod::Monthly,
+            TokenPeriod::Monthly => TokenPeriod::Lifetime,
+        }
+    }
+
+    /// Title-right meta badge naming the scoped window; `None` when lifetime.
+    pub(crate) fn badge(self) -> Option<&'static str> {
+        match self {
+            TokenPeriod::Lifetime => None,
+            TokenPeriod::Daily => Some("today"),
+            TokenPeriod::Weekly => Some("this week"),
+            TokenPeriod::Monthly => Some("this month"),
+        }
+    }
+
+    /// Like [`Self::badge`] but always names the lens — `lifetime` included —
+    /// so the lens-bearing surfaces never render an empty badge slot (a badge
+    /// that only sometimes appears reads as an anomaly, not a lens).
+    pub(crate) fn lens_badge(self) -> &'static str {
+        self.badge().unwrap_or("lifetime")
+    }
+
+    /// Calendar bucket for the trend cards; `None` = per-day rows.
+    pub(crate) fn bucket(self) -> Option<crate::tokens::Bucket> {
+        match self {
+            TokenPeriod::Weekly => Some(crate::tokens::Bucket::Week),
+            TokenPeriod::Monthly => Some(crate::tokens::Bucket::Month),
+            TokenPeriod::Lifetime | TokenPeriod::Daily => None,
         }
     }
 }
@@ -1122,14 +1187,24 @@ pub(crate) struct App {
     /// transcript top-up); `None` until the loader posts its first result.
     pub(crate) token_stats: Option<crate::tokens::TokenStats>,
     /// Set when the loader reported a failure and no stats are cached — the tab
-    /// shows an error instead of a perpetual "reading ~/.claude".
+    /// shows an error instead of a perpetual "parsing stats-cache.json".
     pub(crate) tokens_failed: bool,
+    /// True while the JSONL transcript top-up is known to be in flight: set when
+    /// a `Base` first seeds the tab or on a manual reload, cleared on the next
+    /// `Loaded`/`Failed`. Silent periodic refreshes never light it (their `Base`
+    /// hits an already-populated tab). Drives the loading spinners on the tab.
+    pub(crate) tokens_topping_up: bool,
+    /// Latest `(done, total)` transcript-sweep count from the loader; rendered
+    /// only while `tokens_topping_up` (silent periodic sweeps also emit it),
+    /// cleared on `Loaded`/`Failed` and on a manual reload.
+    pub(crate) tokens_progress: Option<(usize, usize)>,
     /// Which view the Tokens tab is showing (Dashboard landing vs Models detail).
     pub(crate) token_view: TokenView,
     /// Cursor into the grouped model list on the Tokens `Models` view.
     pub(crate) token_model_cursor: usize,
     /// Model filter over the Tokens tab's model surfaces (action-menu driven).
     pub(crate) token_filter: TokenFilter,
+    pub(crate) token_period: TokenPeriod,
     /// Token-stats load results from the background loader; drained in `on_tick`.
     pub(crate) tokens_events: std::sync::mpsc::Receiver<crate::tokens::TokensEvent>,
     /// Manual-refresh signal to the token loader; a `()` triggers a reload.
@@ -1384,9 +1459,12 @@ impl App {
             plugin: PluginState::default(),
             token_stats: None,
             tokens_failed: false,
+            tokens_topping_up: false,
+            tokens_progress: None,
             token_view: TokenView::Dashboard,
             token_model_cursor: 0,
             token_filter: TokenFilter::default(),
+            token_period: TokenPeriod::default(),
             tokens_events,
             tokens_refresh,
             price_table: None,
@@ -1580,7 +1658,7 @@ impl App {
                 self.refresh_tokens();
                 self.toast(
                     ToastKind::Warning,
-                    "all accounts spent — switched off to halt usage".to_string(),
+                    "all accounts spent; switched off to halt usage".to_string(),
                 );
             }
             None => {}
@@ -2129,6 +2207,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('t') => {
             app.disarm_quit();
+            // Tokens claims `t` for its period lens (as `r` reloads there);
+            // rotate-all stays reachable from every other tab.
+            if app.tab == Tab::Tokens {
+                set_token_period(app, app.token_period.next());
+                return;
+            }
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: ROTATE_ALL_MSG.to_string(),
                 detail: Some(ROTATE_ALL_DETAIL.to_string()),
@@ -2215,18 +2299,40 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Number of rows in the Tokens `Models` master list (grouped models, after
-/// the active display filter).
+/// The Tokens model rows for the active period lens — filtered and ranked
+/// exactly as rendered, the single source for both the render and the cursor
+/// math. Lifetime keeps the grouped ("others"-folded) rows; scoped periods
+/// list raw per-model aggregates (a period's list is short, no tail fold).
+pub(crate) fn token_period_models(app: &App) -> Vec<crate::tokens::PeriodModel> {
+    use crate::tokens::PeriodModel;
+    let Some(stats) = app.token_stats.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<PeriodModel> = if let Some(bucket) = app.token_period.bucket() {
+        let (from, to) = crate::tokens::current_bucket_bounds(&crate::tokens::today_date(), bucket);
+        crate::tokens::period_models(&stats.daily_models, &from, &to)
+    } else if app.token_period == TokenPeriod::Daily {
+        stats
+            .today
+            .as_ref()
+            .map(|t| t.models.iter().map(PeriodModel::from_full).collect())
+            .unwrap_or_default()
+    } else {
+        crate::tokens::group_models(&stats.models)
+            .iter()
+            .map(PeriodModel::from_full)
+            .collect()
+    };
+    rows.retain(|m| app.token_filter.matches(&m.model));
+    let basis = crate::tokens::effective_cache_basis(&rows, app.config().state.count_cache);
+    rows.sort_unstable_by_key(|m| std::cmp::Reverse(m.metric(basis)));
+    rows
+}
+
+/// Number of rows in the Tokens `Models` master list under the active
+/// period + filter lenses.
 fn token_model_count(app: &App) -> usize {
-    app.token_stats
-        .as_ref()
-        .map(|s| {
-            crate::tokens::group_models(&s.models)
-                .iter()
-                .filter(|m| app.token_filter.matches(&m.model))
-                .count()
-        })
-        .unwrap_or(0)
+    token_period_models(app).len()
 }
 
 /// Tokens `r` / action-menu reload: re-read the on-disk stats + recent
@@ -2234,12 +2340,17 @@ fn token_model_count(app: &App) -> usize {
 fn reload_token_stats(app: &mut App) {
     let _ = app.tokens_refresh.send(());
     let _ = app.pricing_refresh.send(());
+    // A user-triggered reload is a foreground refresh — light the loading
+    // spinners until the loader's next `Loaded`/`Failed` clears them.
+    app.tokens_topping_up = true;
+    app.tokens_progress = None;
     app.toast(ToastKind::Info, "reloading token usage");
 }
 
-/// Tokens tab: `c` toggles cache-counting (persisted) on either view; Dashboard
-/// descends to Models on ⏎; Models moves the model cursor with ↑↓ (ascend handled
-/// by the global esc/q).
+/// Tokens tab: `c` toggles cache-counting (persisted) on either view (`t`'s
+/// period cycle is claimed by the global key arm); Dashboard descends to
+/// Models on ⏎; Models moves the model cursor with ↑↓ (ascend handled by the
+/// global esc/q).
 fn handle_tokens_key(app: &mut App, key: KeyEvent) {
     if key.code == KeyCode::Char('c') {
         toggle_count_cache(app);
@@ -2962,7 +3073,7 @@ fn active_diverged_unsaved(active: &str) -> bool {
 fn prompt_divergence(app: &mut App, active: String, verb: &str) {
     app.toast(
         ToastKind::Warning,
-        format!("'{active}' has unsaved Claude Code credentials — resolve before {verb}"),
+        format!("'{active}' has unsaved Claude Code credentials; resolve before {verb}"),
     );
     app.modals
         .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
@@ -3034,7 +3145,7 @@ fn perform_switch_off(app: &mut App) {
             app.last_state_mtime = app_state_mtime();
             app.toast(
                 ToastKind::Warning,
-                "all accounts spent — switched off to halt usage".to_string(),
+                "all accounts spent; switched off to halt usage".to_string(),
             );
         }
         Err(e) => app.toast(ToastKind::Danger, format!("switch-off failed: {e}")),
@@ -3060,7 +3171,7 @@ fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
     if !has_oauth && snapshot.base_url.is_none() && snapshot.api_key.is_none() {
         app.toast(
             ToastKind::Danger,
-            "no live login found — nothing to capture (macOS keychain isn't supported yet)",
+            "no live login found; nothing to capture (macOS keychain isn't supported yet)",
         );
         return None;
     }
@@ -3867,9 +3978,20 @@ fn build_action_menu(app: &App) -> ActionMenuState {
             actions.push(ToggleEstimates);
             actions.push(TogglePace);
         }
-        // Tokens: the model-filter lenses (minus the one already active) plus
-        // the page keys (`c` cache basis, `r` reload) for discoverability.
+        // Tokens: the period + model-filter lenses (minus the ones already
+        // active) plus the page keys (`c` cache basis, `r` reload) for
+        // discoverability.
         Tab::Tokens => {
+            for (period, action) in [
+                (TokenPeriod::Lifetime, TokensPeriodLifetime),
+                (TokenPeriod::Daily, TokensPeriodDaily),
+                (TokenPeriod::Weekly, TokensPeriodWeekly),
+                (TokenPeriod::Monthly, TokensPeriodMonthly),
+            ] {
+                if app.token_period != period {
+                    actions.push(action);
+                }
+            }
             if app.token_filter != TokenFilter::All {
                 actions.push(TokensShowAll);
             }
@@ -4031,7 +4153,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::RotateTokens => match focused_account(app) {
             Some((name, true, _)) => {
                 app.modals.push(Modal::Confirm(ConfirmState {
-                    message: format!("rotate tokens for '{name}'?"),
+                    message: format!("Rotate access token for '{name}'?"),
                     detail: Some(ROTATE_ONE_DETAIL.to_string()),
                     choice: false,
                     on_confirm: ConfirmAction::RotateOne(name),
@@ -4097,6 +4219,10 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
         ActionMenuAction::TogglePace => toggle_show_pace(app),
+        ActionMenuAction::TokensPeriodLifetime => set_token_period(app, TokenPeriod::Lifetime),
+        ActionMenuAction::TokensPeriodDaily => set_token_period(app, TokenPeriod::Daily),
+        ActionMenuAction::TokensPeriodWeekly => set_token_period(app, TokenPeriod::Weekly),
+        ActionMenuAction::TokensPeriodMonthly => set_token_period(app, TokenPeriod::Monthly),
         ActionMenuAction::TokensShowAll => set_token_filter(app, TokenFilter::All),
         ActionMenuAction::TokensShowClaude => set_token_filter(app, TokenFilter::Claude),
         ActionMenuAction::TokensShowOthers => set_token_filter(app, TokenFilter::Others),
@@ -4109,6 +4235,16 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
 /// list can be shorter than where the cursor sat.
 fn set_token_filter(app: &mut App, filter: TokenFilter) {
     app.token_filter = filter;
+    let len = token_model_count(app);
+    if app.token_model_cursor >= len {
+        app.token_model_cursor = len.saturating_sub(1);
+    }
+}
+
+/// Swap the Tokens period lens and re-clamp the Models cursor — the scoped
+/// list can be shorter than where the cursor sat.
+fn set_token_period(app: &mut App, period: TokenPeriod) {
+    app.token_period = period;
     let len = token_model_count(app);
     if app.token_model_cursor >= len {
         app.token_model_cursor = len.saturating_sub(1);
@@ -4457,7 +4593,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         ConfigRow::DeleteCreds => {
             if let Some(name) = name {
                 app.modals.push(Modal::Confirm(ConfirmState {
-                    message: format!("Delete stored OAuth credentials for '{name}'?"),
+                    message: format!("Log out of '{name}'?"),
                     detail: Some(
                         "Blanks the login; keeps the profile, model, env, and chain slot. Re-login any time."
                             .to_string(),
@@ -5353,7 +5489,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             if !is_idle(&app.activity, &name) {
                 app.toast(
                     ToastKind::Warning,
-                    format!("'{name}' is already busy — try again in a moment"),
+                    format!("'{name}' is already busy; try again in a moment"),
                 );
                 return;
             }
@@ -5367,7 +5503,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             if app.bootstrap_active.load(Ordering::SeqCst) || any_busy(&app.activity) {
                 app.toast(
                     ToastKind::Warning,
-                    "rotate-all skipped — another op is still in flight",
+                    "rotate-all skipped; another op is still in flight",
                 );
                 return;
             }
@@ -5391,7 +5527,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 app.toast(
                     ToastKind::Warning,
                     format!(
-                        "'{name}' is in use by a running session — its tokens are managed there"
+                        "'{name}' is in use by a running session; its tokens are managed there"
                     ),
                 );
                 return;
@@ -5439,12 +5575,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_state_mtime = app_state_mtime();
-                    app.toast(
-                        ToastKind::Success,
-                        format!("cleared credentials for '{name}'"),
-                    );
+                    app.toast(ToastKind::Success, format!("logged out of '{name}'"));
                 }
-                Err(e) => app.toast(ToastKind::Danger, format!("clear credentials failed: {e}")),
+                Err(e) => app.toast(ToastKind::Danger, format!("log out failed: {e}")),
             }
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
@@ -5733,7 +5866,7 @@ fn drain_status_events(app: &mut App) {
                 apply_status_incidents(app, incidents, fetched_at_ms, true, false);
                 if was_manual {
                     app.status.fetching = false;
-                    app.toast(ToastKind::Danger, "status refresh failed — showing cached");
+                    app.toast(ToastKind::Danger, "status refresh failed; showing cached");
                 }
             }
             StatusEvent::Failed(msg) => {
@@ -5823,10 +5956,18 @@ fn drain_tokens_events(app: &mut App) {
                 app.tokens_failed = false;
                 if app.token_stats.is_none() {
                     app.token_stats = Some(*stats);
+                    // First paint from the cache: the transcript top-up is now in
+                    // flight, so light the loading spinners until `Loaded` lands.
+                    app.tokens_topping_up = true;
                 }
+            }
+            crate::tokens::TokensEvent::Progress { done, total } => {
+                app.tokens_progress = Some((done, total));
             }
             crate::tokens::TokensEvent::Loaded(stats) => {
                 app.tokens_failed = false;
+                app.tokens_topping_up = false;
+                app.tokens_progress = None;
                 app.token_stats = Some(*stats);
                 // Re-clamp the model cursor in case the grouped list shrank.
                 let len = token_model_count(app);
@@ -5837,6 +5978,8 @@ fn drain_tokens_events(app: &mut App) {
             // Surface failure only when there is nothing to show — a transient
             // read error mid-session keeps the last good snapshot.
             crate::tokens::TokensEvent::Failed => {
+                app.tokens_topping_up = false;
+                app.tokens_progress = None;
                 if app.token_stats.is_none() {
                     app.tokens_failed = true;
                 }
@@ -5987,13 +6130,13 @@ pub(crate) fn on_tick(app: &mut App) {
             UpdateEvent::Installed(v) => {
                 app.toast(
                     ToastKind::Success,
-                    format!("updated to v{v} — restart to apply"),
+                    format!("updated to v{v}; restart to apply"),
                 );
             }
             UpdateEvent::Available(v) => {
                 app.toast(
                     ToastKind::Info,
-                    format!("update available: v{v} — run `cargo install clauth`"),
+                    format!("update available: v{v}; run `cargo install clauth`"),
                 );
             }
         }

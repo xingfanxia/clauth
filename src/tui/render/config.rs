@@ -323,7 +323,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
 fn row_hint(row: ConfigRow) -> Option<&'static str> {
     match row {
         ConfigRow::BaseUrl => {
-            Some("api endpoint for this account; leave empty for claude.ai oauth")
+            Some("api endpoint for this account; leave empty for claude.ai OAuth")
         }
         ConfigRow::ApiKey => Some("x-api-key sent to the custom endpoint"),
         // The value grammar (`space cycle · ↵ custom`) already lives in the footer.
@@ -338,9 +338,14 @@ fn row_hint(row: ConfigRow) -> Option<&'static str> {
         ConfigRow::ModelOverrideAdd => {
             Some("pin what an alias resolves to, or force the subagent model")
         }
-        ConfigRow::Login => Some("browser oauth login; mints fresh tokens for this account"),
-        ConfigRow::DeleteCreds => Some("drop the stored oauth tokens; keeps the profile shell"),
-        ConfigRow::Name | ConfigRow::Delete | ConfigRow::Create => None,
+        ConfigRow::Login => Some("browser OAuth login; mints fresh tokens for this account"),
+        ConfigRow::DeleteCreds => {
+            Some("clears the stored OAuth login; keeps the account and its settings")
+        }
+        ConfigRow::Delete => {
+            Some("deletes the account and everything stored for it, usage history included")
+        }
+        ConfigRow::Name | ConfigRow::Create => None,
     }
 }
 
@@ -422,10 +427,7 @@ fn detail_row(
         }
         ConfigRow::DeleteCreds => Line::from(vec![
             arrow,
-            Span::styled(
-                "delete credentials",
-                theme::danger().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("log out", theme::danger().add_modifier(Modifier::BOLD)),
         ]),
     }
 }

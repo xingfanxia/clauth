@@ -66,7 +66,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let Some(profile) = profile else {
         let hint = Paragraph::new(Line::from(Span::styled(
-            "no accounts yet — press n to create one",
+            "no accounts yet, press n to create one",
             theme::dim(),
         )))
         .style(theme::base());
@@ -743,7 +743,7 @@ fn oauth_empty_msg(profile: &Profile) -> &'static str {
         .as_ref()
         .is_some_and(|c| c.claude_ai_oauth.is_some());
     if !has_oauth {
-        "no credentials — capture or sign in"
+        "no credentials, capture or log in"
     } else if profile.fetch_status == Some(FetchStatus::Failed) {
         "no usage available"
     } else {
@@ -768,7 +768,7 @@ fn build_tp_rows(
         // nothing cached — never spin on "loading" forever (the original z.ai bug).
         let msg = match profile.fetch_status {
             Some(FetchStatus::Failed) => "no usage available",
-            Some(FetchStatus::RateLimited) => "rate limited — retrying",
+            Some(FetchStatus::RateLimited) => "rate limited, retrying",
             _ => "loading",
         };
         lines.push(Line::from(Span::styled(msg, theme::faint())));

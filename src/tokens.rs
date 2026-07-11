@@ -78,6 +78,60 @@ pub(crate) struct DayTokens {
     pub(crate) tokens: u64,
 }
 
+/// One model's tokens on one day. stats-cache days publish only the combined
+/// in+out per model, so `split` is `None` for them; transcript-derived
+/// (post-cutoff) days carry the full in/out/cache split.
+#[derive(Debug, Clone)]
+pub(crate) struct DayModelTokens {
+    pub(crate) date: String, // "YYYY-MM-DD"
+    pub(crate) model: String,
+    pub(crate) in_out: u64,
+    /// Full split when known; `split.model` mirrors `model`.
+    pub(crate) split: Option<ModelTokens>,
+}
+
+/// One model's aggregate over a date range ([`period_models`]). `split` sums
+/// only the split-bearing days, so it is a floor unless `split_complete` —
+/// cache figures and cost are exact only when every day in range carried one.
+#[derive(Debug, Clone)]
+pub(crate) struct PeriodModel {
+    pub(crate) model: String,
+    pub(crate) in_out: u64,
+    pub(crate) split: ModelTokens,
+    pub(crate) split_complete: bool,
+}
+
+impl PeriodModel {
+    /// Wrap a fully-known aggregate (lifetime / today rows) so every Tokens
+    /// view ranks and renders through one row type.
+    pub(crate) fn from_full(m: &ModelTokens) -> Self {
+        Self {
+            model: m.model.clone(),
+            in_out: m.in_out(),
+            split: m.clone(),
+            split_complete: true,
+        }
+    }
+
+    /// Display/ranking metric. Cache joins the count only when the split is
+    /// fully known — callers pass `count_cache && all rows complete` so a
+    /// partial split never mixes bases across rows of one list.
+    pub(crate) fn metric(&self, count_cache: bool) -> u64 {
+        if count_cache && self.split_complete {
+            self.split.total()
+        } else {
+            self.in_out
+        }
+    }
+}
+
+/// The `count_cache` basis actually usable for a row list: cache joins the
+/// counts only when every row's split is fully known, so one list never mixes
+/// bases across rows.
+pub(crate) fn effective_cache_basis(rows: &[PeriodModel], count_cache: bool) -> bool {
+    count_cache && rows.iter().all(|m| m.split_complete)
+}
+
 /// Per-day activity counts (from stats-cache `dailyActivity`).
 #[derive(Debug, Clone)]
 pub(crate) struct DayActivity {
@@ -98,6 +152,9 @@ pub(crate) struct DaySummary {
     pub(crate) cache_create: u64,
     /// User/assistant messages seen for the day (transcript-derived).
     pub(crate) messages: u64,
+    /// Message count per hour of day for the day, index = hour 0..23 — the
+    /// daily-period twin of `TokenStats::hour_counts`.
+    pub(crate) hours: [u64; 24],
     /// Per-model breakdown of the day's tokens. Carried so cost can be priced
     /// per model (rates differ by family) — the day's lifetime totals can't be
     /// isolated from `TokenStats::models`. Empty until the top-up populates it.
@@ -122,8 +179,12 @@ pub(crate) struct TokenStats {
     /// All models individually, sorted DESC by total(). Grouping is a render concern.
     pub(crate) models: Vec<ModelTokens>,
     pub(crate) daily: Vec<DayTokens>, // chronological ASC by date
+    /// Per-day per-model tokens, ASC by (date, model) — feeds the weekly /
+    /// monthly period lens. Pre-cutoff entries are in+out only (see
+    /// [`DayModelTokens::split`]).
+    pub(crate) daily_models: Vec<DayModelTokens>,
     pub(crate) activity: Vec<DayActivity>, // chronological ASC by date
-    pub(crate) hour_counts: [u64; 24], // index = hour of day 0..23
+    pub(crate) hour_counts: [u64; 24],     // index = hour of day 0..23
     pub(crate) total_input: u64,
     pub(crate) total_output: u64,
     pub(crate) total_cache_read: u64,
@@ -372,6 +433,24 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
         .collect();
     daily.sort_unstable_by_key(|d| d.date.clone());
 
+    let mut daily_models: Vec<DayModelTokens> = wire
+        .daily_model_tokens
+        .iter()
+        .flat_map(|d| {
+            d.tokens_by_model
+                .iter()
+                .map(|(model, &in_out)| DayModelTokens {
+                    date: d.date.clone(),
+                    model: model.clone(),
+                    in_out,
+                    split: None,
+                })
+        })
+        .collect();
+    daily_models.sort_unstable_by(|a, b| {
+        (a.date.as_str(), a.model.as_str()).cmp(&(b.date.as_str(), b.model.as_str()))
+    });
+
     let mut activity: Vec<DayActivity> = wire
         .daily_activity
         .iter()
@@ -409,6 +488,7 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
     let stats = TokenStats {
         models,
         daily,
+        daily_models,
         activity,
         hour_counts,
         total_input,
@@ -435,15 +515,123 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
     let today = today_date();
     let lcd = base.last_computed_date.clone();
     let mut cache = TopUpCache::default();
-    refresh_topup_cache(claude_dir, lcd.as_deref(), &mut cache);
+    refresh_topup_cache(claude_dir, lcd.as_deref(), &mut cache, |_, _| {});
     merge_topup(&mut base, &cache, lcd.as_deref(), &today);
     Some(base)
 }
 
 /// Current UTC calendar date as "YYYY-MM-DD".
-fn today_date() -> String {
+pub(crate) fn today_date() -> String {
     let iso = epoch_secs_to_iso(now_epoch_secs());
     iso.get(..10).map(str::to_owned).unwrap_or(iso)
+}
+
+// ── Period bucketing ─────────────────────────────────────────────────────────
+
+/// Calendar bucket granularity for the weekly / monthly period lens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bucket {
+    Week,
+    Month,
+}
+
+/// First day of `date`'s bucket — monday for weeks, the 1st for months.
+/// Degrades to `date` itself on an unparseable input.
+pub(crate) fn bucket_start(date: &str, bucket: Bucket) -> String {
+    match bucket {
+        Bucket::Month if date.len() >= 7 => format!("{}-01", &date[..7]),
+        Bucket::Month => date.to_owned(),
+        Bucket::Week => {
+            let Some(secs) = iso_to_epoch_secs(&format!("{date}T00:00:00+00:00")) else {
+                return date.to_owned();
+            };
+            let days = secs.div_euclid(86_400);
+            // 1970-01-01 was a thursday; monday-indexed weekday.
+            let weekday = (days + 3).rem_euclid(7);
+            let iso = epoch_secs_to_iso((days - weekday) * 86_400);
+            iso.get(..10).map(str::to_owned).unwrap_or(iso)
+        }
+    }
+}
+
+/// Inclusive (from, to) date range of the current bucket containing `today`.
+pub(crate) fn current_bucket_bounds(today: &str, bucket: Bucket) -> (String, String) {
+    (bucket_start(today, bucket), today.to_owned())
+}
+
+/// Fold chronological-ASC daily totals into bucket totals, one row per bucket
+/// keyed (and dated) by the bucket's first day. Adjacent-fold, so the input
+/// order invariant of [`TokenStats::daily`] is load-bearing.
+pub(crate) fn bucket_tokens(days: &[DayTokens], bucket: Bucket) -> Vec<DayTokens> {
+    let mut out: Vec<DayTokens> = Vec::new();
+    for d in days {
+        let key = bucket_start(&d.date, bucket);
+        match out.last_mut() {
+            Some(last) if last.date == key => {
+                last.tokens = last.tokens.saturating_add(d.tokens);
+            }
+            _ => out.push(DayTokens {
+                date: key,
+                tokens: d.tokens,
+            }),
+        }
+    }
+    out
+}
+
+/// [`bucket_tokens`]'s activity twin. Bucket sessions are sums of daily counts,
+/// so a session spanning days counts once per day it touched — a known ceiling,
+/// matching how the per-day rows already report it.
+pub(crate) fn bucket_activity(days: &[DayActivity], bucket: Bucket) -> Vec<DayActivity> {
+    let mut out: Vec<DayActivity> = Vec::new();
+    for d in days {
+        let key = bucket_start(&d.date, bucket);
+        match out.last_mut() {
+            Some(last) if last.date == key => {
+                last.messages = last.messages.saturating_add(d.messages);
+                last.sessions = last.sessions.saturating_add(d.sessions);
+                last.tool_calls = last.tool_calls.saturating_add(d.tool_calls);
+            }
+            _ => out.push(DayActivity {
+                date: key,
+                ..d.clone()
+            }),
+        }
+    }
+    out
+}
+
+/// Aggregate per-day per-model rows over the inclusive `from..=to` date range,
+/// ranked DESC by in+out. See [`PeriodModel`] for the split-floor semantics.
+pub(crate) fn period_models(days: &[DayModelTokens], from: &str, to: &str) -> Vec<PeriodModel> {
+    let mut map: HashMap<&str, PeriodModel> = HashMap::new();
+    for d in days {
+        if d.date.as_str() < from || d.date.as_str() > to {
+            continue;
+        }
+        let e = map.entry(d.model.as_str()).or_insert_with(|| PeriodModel {
+            model: d.model.clone(),
+            in_out: 0,
+            split: ModelTokens {
+                model: d.model.clone(),
+                ..Default::default()
+            },
+            split_complete: true,
+        });
+        e.in_out = e.in_out.saturating_add(d.in_out);
+        match &d.split {
+            Some(s) => {
+                e.split.input = e.split.input.saturating_add(s.input);
+                e.split.output = e.split.output.saturating_add(s.output);
+                e.split.cache_read = e.split.cache_read.saturating_add(s.cache_read);
+                e.split.cache_create = e.split.cache_create.saturating_add(s.cache_create);
+            }
+            None => e.split_complete = false,
+        }
+    }
+    let mut out: Vec<PeriodModel> = map.into_values().collect();
+    out.sort_unstable_by_key(|m| std::cmp::Reverse(m.in_out));
+    out
 }
 
 // ── Recent transcript top-up ─────────────────────────────────────────────────
@@ -531,6 +719,7 @@ fn refresh_topup_cache(
     claude_dir: &Path,
     last_computed_date: Option<&str>,
     cache: &mut TopUpCache,
+    mut progress: impl FnMut(usize, usize),
 ) {
     let Some(cutoff_date) = last_computed_date else {
         cache.files.clear();
@@ -547,7 +736,9 @@ fn refresh_topup_cache(
     let present: HashSet<&PathBuf> = paths.iter().collect();
     cache.files.retain(|p, _| present.contains(p));
 
-    for path in paths {
+    let total = paths.len();
+    for (done, path) in paths.into_iter().enumerate() {
+        progress(done + 1, total);
         let mtime = match std::fs::metadata(&path)
             .ok()
             .and_then(|m| m.modified().ok())
@@ -607,6 +798,8 @@ fn merge_topup(
         .map(|m| (m.model.clone(), m))
         .collect();
 
+    // Per-day per-model splits for post-cutoff days (weekly/monthly lens).
+    let mut day_models: HashMap<(String, String), ModelTokens> = HashMap::new();
     // Per-day activity for post-cutoff days + lifetime deltas.
     let mut day_msgs: HashMap<String, u64> = HashMap::new();
     let mut day_sessions: HashMap<String, HashSet<String>> = HashMap::new();
@@ -631,6 +824,10 @@ fn merge_topup(
             if r.is_message && (r.uuid.is_empty() || seen_uuid.insert(r.uuid.as_str())) {
                 if r.date == today_date {
                     today_acc.messages = today_acc.messages.saturating_add(1);
+                    if (r.hour as usize) < 24 {
+                        today_acc.hours[r.hour as usize] =
+                            today_acc.hours[r.hour as usize].saturating_add(1);
+                    }
                 }
                 if r.date.as_str() > cutoff_date {
                     *day_msgs.entry(r.date.clone()).or_insert(0) += 1;
@@ -669,6 +866,16 @@ fn merge_topup(
                 if r.date.as_str() > cutoff_date {
                     *daily_map.entry(r.date.clone()).or_insert(0) +=
                         r.input.saturating_add(r.output);
+                    let dm = day_models
+                        .entry((r.date.clone(), r.model.clone()))
+                        .or_insert_with(|| ModelTokens {
+                            model: r.model.clone(),
+                            ..Default::default()
+                        });
+                    dm.input = dm.input.saturating_add(r.input);
+                    dm.output = dm.output.saturating_add(r.output);
+                    dm.cache_read = dm.cache_read.saturating_add(r.cache_read);
+                    dm.cache_create = dm.cache_create.saturating_add(r.cache_create);
                     let e = model_map
                         .entry(r.model.clone())
                         .or_insert_with(|| ModelTokens {
@@ -716,6 +923,22 @@ fn merge_topup(
         }
     }
     base.daily.sort_unstable_by_key(|d| d.date.clone());
+
+    // Post-cutoff per-day per-model rows are transcript-authoritative: drop any
+    // base rows past the cutoff (normally none — stats-cache stops there) and
+    // append the reconstructed split-bearing ones.
+    base.daily_models.retain(|d| d.date.as_str() <= cutoff_date);
+    for ((date, _), tokens) in day_models {
+        base.daily_models.push(DayModelTokens {
+            date,
+            model: tokens.model.clone(),
+            in_out: tokens.in_out(),
+            split: Some(tokens),
+        });
+    }
+    base.daily_models.sort_unstable_by(|a, b| {
+        (a.date.as_str(), a.model.as_str()).cmp(&(b.date.as_str(), b.model.as_str()))
+    });
 
     base.models = model_map.into_values().collect();
     base.models
@@ -869,6 +1092,12 @@ pub(crate) enum TokensEvent {
     /// Phase 1: stats-cache parsed, transcript sweep not yet run. Lets the tab
     /// paint lifetime/model data instantly instead of blocking on the sweep.
     Base(Box<TokenStats>),
+    /// Mid-sweep: `done` of `total` transcript files visited. Throttled at the
+    /// send site so a multi-hundred-file sweep doesn't flood the channel.
+    Progress {
+        done: usize,
+        total: usize,
+    },
     /// Phase 2: the live transcript top-up merged in (today card, recent days,
     /// reconstructed lifetime counts). Supersedes the matching `Base`.
     Loaded(Box<TokenStats>),
@@ -902,7 +1131,15 @@ pub(crate) fn spawn(tx: Sender<TokensEvent>, refresh_rx: Receiver<()>, claude_di
             // Phase 2 — refresh the per-file cache (changed files only) and merge.
             let today = today_date();
             let lcd = base.last_computed_date.clone();
-            refresh_topup_cache(&claude_dir, lcd.as_deref(), cache);
+            // Throttled progress: every 25th file plus the final one, so a
+            // several-hundred-file sweep paints a moving count at ~1/25 the
+            // per-file send volume (warm cycles still emit; render ignores
+            // them — see `App::tokens_progress`).
+            refresh_topup_cache(&claude_dir, lcd.as_deref(), cache, |done, total| {
+                if done % 25 == 0 || done == total {
+                    let _ = tx.send(TokensEvent::Progress { done, total });
+                }
+            });
             merge_topup(&mut base, cache, lcd.as_deref(), &today);
             let _ = tx.send(TokensEvent::Loaded(Box::new(base)));
         };

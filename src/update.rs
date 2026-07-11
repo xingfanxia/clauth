@@ -175,7 +175,7 @@ fn verify_minisign(
         .map_err(|e| anyhow::anyhow!("malformed minisign signature: {e}"))?;
     public_key
         .verify(signed_bytes, &signature, false)
-        .map_err(|e| anyhow::anyhow!("minisign signature did not verify — refusing update: {e}"))
+        .map_err(|e| anyhow::anyhow!("minisign signature did not verify; refusing update: {e}"))
 }
 
 /// Fetch `sha256sums.txt.minisig` and verify it against `MINISIGN_PUBLIC_KEY`.
@@ -241,7 +241,7 @@ fn download_and_replace(url: &str, sums_url: &str, asset: &str) -> anyhow::Resul
     verify_sums_signature(&agent, sums_url, &sums_text)?;
 
     let expected_hex = find_expected_sha(&sums_text, asset)
-        .ok_or_else(|| anyhow::anyhow!("asset {asset} not listed in sha256sums.txt — aborting"))?;
+        .ok_or_else(|| anyhow::anyhow!("asset {asset} not listed in sha256sums.txt; aborting"))?;
 
     let bytes = agent
         .get(url)
@@ -254,7 +254,7 @@ fn download_and_replace(url: &str, sums_url: &str, asset: &str) -> anyhow::Resul
 
     if !verify_sha256(&bytes, &expected_hex) {
         anyhow::bail!(
-            "SHA-256 mismatch for {asset}: download corrupted or tampered — aborting update"
+            "SHA-256 mismatch for {asset}: download corrupted or tampered; aborting update"
         );
     }
 

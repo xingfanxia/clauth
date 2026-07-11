@@ -266,7 +266,7 @@ fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
 /// when the current buffer parses out of range (or non-numeric), else faint.
 fn refresh_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
     let range = format!(
-        "{}–{} s",
+        "{}-{} s",
         MIN_REFRESH_INTERVAL_MS / 1000,
         MAX_REFRESH_INTERVAL_MS / 1000
     );

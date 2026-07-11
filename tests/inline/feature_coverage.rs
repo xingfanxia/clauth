@@ -20,7 +20,7 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         &["auto_switch", "snapshot_chain", "resolves_started_profile"],
     ),
     (
-        "Sign in an account",
+        "Log in an account",
         &[
             "authorize_url",
             "pkce_challenge",

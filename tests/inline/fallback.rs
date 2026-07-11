@@ -1136,3 +1136,158 @@ fn burn_aware_heavy_burn_flips_wrap_off_decision_on_both_walks() {
         "scheduler-side walk agrees with next_target under burn-aware mode"
     );
 }
+
+// ── weekly hard block (7d at 100%) ────────────────────────────────────────────
+//
+// A weekly-dead account's 5h window drains and then LAPSES (no live reset), so
+// the 5h-only predicates read it as the freshest member in the chain — the
+// observed 2026-07-08 bug: auto-fallback switched INTO a 7d=100 account, and
+// recovery kept relinking it every time its 5h window rolled over.
+
+/// UsageInfo with both windows populated explicitly.
+fn usage_both(five_hour: Option<UsageWindow>, seven_day: Option<UsageWindow>) -> UsageInfo {
+    UsageInfo {
+        five_hour,
+        seven_day,
+        ..UsageInfo::default()
+    }
+}
+
+/// A profile whose weekly window is spent to the cap and whose 5h window has
+/// lapsed entirely — the live specimen's exact shape (5h resets_at: null).
+fn weekly_dead_profile(name: &str) -> Profile {
+    profile_with_usage(
+        name,
+        Some(95.0),
+        Some(usage_both(None, Some(window(100.0, Some(live_reset()))))),
+    )
+}
+
+#[test]
+fn weekly_dead_member_is_never_a_fallback_target() {
+    // a (active, 5h exhausted) → b (7d=100, 5h lapsed) → c (fresh): the walk
+    // must land on c. Before the weekly gate, b's lapsed 5h read as headroom.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(97.0)),
+            weekly_dead_profile("b"),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".into()))
+    );
+}
+
+#[test]
+fn weekly_dead_active_is_exhausted_despite_idle_5h() {
+    // The mirror direction: an ACTIVE account whose week is spent must count
+    // exhausted — its 5h window never grows again (requests are refused), so
+    // the 5h trigger alone would leave the daemon parked on a dead account.
+    let p = weekly_dead_profile("a");
+    assert!(is_exhausted(&p));
+    // Hard block trumps both burn-aware modes (nothing left to project).
+    assert!(is_exhausted_active(&p, false, 90_000, None));
+    assert!(is_exhausted_active(&p, true, 90_000, Some(5.0)));
+}
+
+#[test]
+fn weekly_below_cap_or_lapsed_does_not_block() {
+    // 99.9% still serves requests — only the cap blocks. The 5h side has
+    // threshold semantics; the weekly side is a hard-block check by design.
+    let almost = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_both(None, Some(window(99.9, Some(live_reset()))))),
+    );
+    assert!(!is_exhausted(&almost));
+    // A 7d=100 whose reset has PASSED is a renewed quota, not a block.
+    let renewed = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_both(None, Some(window(100.0, Some(expired_reset()))))),
+    );
+    assert!(!is_exhausted(&renewed));
+}
+
+#[test]
+fn weekly_dead_member_is_skipped_by_the_store_walk_too() {
+    // Scheduler-side twin: next_auto_switch_target reads the UsageStore.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snapshot = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(97.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_both(None, Some(window(100.0, Some(live_reset())))),
+        ),
+        ("c", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snapshot, &store),
+        Some(SwitchAction::To("c".into()))
+    );
+}
+
+#[test]
+fn weekly_dead_member_never_recovers() {
+    // Recovery's "5h lapsed = idle headroom" rule is exactly how a weekly-dead
+    // member kept getting relinked every 5h rollover. It must stay out until
+    // the WEEKLY reset passes.
+    let members = vec![ChainMember {
+        name: "b".into(),
+        threshold: 95.0,
+        last_resort: false,
+    }];
+    let dead = store_with_infos(vec![(
+        "b",
+        usage_both(None, Some(window(100.0, Some(live_reset())))),
+    )]);
+    assert_eq!(find_recovered_member(&members, &dead), None);
+    // Same member with the weekly reset in the past HAS recovered.
+    let renewed = store_with_infos(vec![(
+        "b",
+        usage_both(None, Some(window(100.0, Some(expired_reset())))),
+    )]);
+    assert_eq!(
+        find_recovered_member(&members, &renewed),
+        Some("b".to_string())
+    );
+}
+
+#[test]
+fn soonest_resume_uses_the_weekly_reset_for_a_weekly_dead_member() {
+    // The all-exhausted caption must not promise a 5h comeback for an account
+    // that is blocked until its WEEKLY reset (nor bail to no caption at all
+    // because the 5h window is absent).
+    let weekly_reset = epoch_secs_to_iso(now_epoch_secs() + 48 * 3600);
+    let five_hour_reset = epoch_secs_to_iso(now_epoch_secs() + 600);
+    let config = config_with_chain(
+        vec![
+            profile_with_usage(
+                "a",
+                Some(95.0),
+                Some(usage_both(Some(window(97.0, Some(five_hour_reset))), None)),
+            ),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_both(None, Some(window(100.0, Some(weekly_reset))))),
+            ),
+        ],
+        "a",
+    );
+    let (name, secs) = soonest_resume(&config).expect("caption data");
+    // a's 10-minute 5h reset beats b's 48h weekly reset.
+    assert_eq!(name, "a");
+    assert!((500..700).contains(&secs), "got {secs}");
+}
