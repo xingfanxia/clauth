@@ -1013,8 +1013,24 @@ fn bootstrap_third_party_seeds_any_cache() {
 
 // `proactive_rotation_due` decides whether the ACTIVE Keychain-installed profile
 // rotates AHEAD of expiry (rotation coherence, #1) instead of waiting for a
-// 401 — reactive rotation loses the refresh race to the running `claude`, and
-// whoever loses gets its single-use chain revoked.
+// 401. Opt-in via `AppState.preemptive_rotation` — adoption plus
+// mirror-on-rotate carry the correctness; the early rotate is an optimization.
+
+#[test]
+fn preemptive_rotation_is_opt_in_and_off_by_default() {
+    // Stock clauth stays strictly lazy: with the toggle off, even a token
+    // deep inside the lead window (active + Keychain live) never rotates
+    // ahead of expiry.
+    assert!(!crate::profile::AppState::default().preemptive_rotation);
+    assert!(!super::proactive_rotation_due(
+        false,
+        true,
+        true,
+        Some(10_000),
+        10_000,
+        90_000
+    ));
+}
 
 #[test]
 fn proactive_rotation_fires_only_inside_the_lead_window() {
@@ -1025,11 +1041,13 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     assert!(super::proactive_rotation_due(
         true,
         true,
+        true,
         Some(10_000 + lead),
         10_000,
         interval
     ));
     assert!(super::proactive_rotation_due(
+        true,
         true,
         true,
         Some(10_000),
@@ -1038,6 +1056,7 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     ));
     // Beyond the lead window → plain poll; nothing at stake yet.
     assert!(!super::proactive_rotation_due(
+        true,
         true,
         true,
         Some(10_000 + lead + 1),
@@ -1062,6 +1081,7 @@ fn proactive_lead_scales_with_the_poll_interval_with_a_floor() {
 fn proactive_rotation_requires_active_and_keychain() {
     // Inactive profile: its chain is not the live login — reactive only.
     assert!(!super::proactive_rotation_due(
+        true,
         false,
         true,
         Some(0),
@@ -1071,6 +1091,7 @@ fn proactive_rotation_requires_active_and_keychain() {
     // No Keychain mirror (other OSes / disabled): the symlinked profile file IS
     // the live credential — there is no second chain to race.
     assert!(!super::proactive_rotation_due(
+        true,
         true,
         false,
         Some(0),
@@ -1083,6 +1104,6 @@ fn proactive_rotation_requires_active_and_keychain() {
 fn proactive_rotation_never_fires_on_unknown_expiry() {
     // Never spend a single-use refresh on a token whose expiry we can't prove.
     assert!(!super::proactive_rotation_due(
-        true, true, None, 10_000, 90_000
+        true, true, true, None, 10_000, 90_000
     ));
 }

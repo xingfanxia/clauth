@@ -237,6 +237,14 @@ pub(crate) struct AppState {
     /// either way — see `fallback::is_exhausted_active`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) burn_aware_switching: bool,
+    /// Opt-in: rotate the ACTIVE, Keychain-installed profile ahead of its
+    /// access-token expiry instead of waiting for a 401 (rotation coherence,
+    /// #1). Off by default — stock clauth stays strictly lazy. Adoption plus
+    /// mirror-on-rotate already provide the correctness; the early refresh is
+    /// an optimization (fewer live-mirror adopt events) some setups may want.
+    /// See `usage::scheduler::proactive_rotation_due`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) preemptive_rotation: bool,
     /// Config-file theme override. CLI `--theme` flag takes priority; auto-
     /// detect applies when this is `None` and no flag was passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -298,6 +306,7 @@ impl Default for AppState {
             fallback_chain: Vec::new(),
             wrap_off: false,
             burn_aware_switching: false,
+            preemptive_rotation: false,
             theme: None,
             show_estimates: true,
             show_pace: false,

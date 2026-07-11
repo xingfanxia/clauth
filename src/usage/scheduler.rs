@@ -259,7 +259,8 @@ fn load_cached_with_status(name: &str, status: FetchStatus) -> (Option<UsageInfo
 const ACTIVE_ROTATE_LEAD_FLOOR_MS: i64 = 180_000;
 
 /// How early the poller rotates the ACTIVE, Keychain-installed profile ahead
-/// of its clock expiry (rotation coherence, #1).
+/// of its clock expiry — only with the opt-in `preemptive_rotation` toggle
+/// (rotation coherence, #1).
 ///
 /// The invariant this maintains is NOT "beat Claude Code's refresh schedule"
 /// (any fixed margin would silently lose to a future CC that refreshes
@@ -277,19 +278,24 @@ fn active_rotate_lead_ms(interval_ms: u64) -> i64 {
 }
 
 /// Whether this poll should rotate ahead of expiry instead of waiting for a
-/// 401: only for the ACTIVE profile, only while the Keychain mirror is live
-/// (elsewhere the live credential IS the profile file via the symlink, so
-/// there is no second chain to race), and only inside the lead window. An
-/// unknown expiry never rotates proactively (never spend a single-use refresh
-/// on a token whose expiry we can't prove).
+/// 401: only with the opt-in `preemptive_rotation` toggle (`enabled`, off by
+/// default — stock behavior stays strictly lazy; adoption + mirror-on-rotate
+/// carry the correctness, this is an optimization), only for the ACTIVE
+/// profile, only while the Keychain mirror is live (elsewhere the live
+/// credential IS the profile file via the symlink, so there is no second
+/// chain to race), and only inside the lead window. An unknown expiry never
+/// rotates proactively (never spend a single-use refresh on a token whose
+/// expiry we can't prove).
 fn proactive_rotation_due(
+    enabled: bool,
     active: bool,
     keychain_live: bool,
     access_expires_at: Option<i64>,
     now_ms: i64,
     interval_ms: u64,
 ) -> bool {
-    active
+    enabled
+        && active
         && keychain_live
         && access_expires_at.is_some_and(|exp| now_ms + active_rotate_lead_ms(interval_ms) >= exp)
 }
@@ -317,9 +323,10 @@ fn keychain_live() -> bool {
 /// sync, the `from_fetch` provenance flag, and the 429 `retry-after` hint that
 /// [`apply_outcome`] turns into a deferred next-fetch slot.
 ///
-/// One exception to "rotate only on 401": the ACTIVE, Keychain-installed
-/// profile rotates ahead of expiry (see [`ACTIVE_ROTATE_LEAD_MS`]) so the
-/// running `claude` never spends the single-use chain.
+/// One exception to "rotate only on 401": with the opt-in
+/// `preemptive_rotation` toggle, the ACTIVE, Keychain-installed profile
+/// rotates ahead of expiry (see [`active_rotate_lead_ms`]) so the running
+/// `claude` never spends the single-use chain.
 fn fetch_with_rotation(
     config: &crate::profile::ConfigHandle,
     name: &str,
@@ -331,17 +338,19 @@ fn fetch_with_rotation(
 ) -> FetchOutcome {
     // Rotation coherence (#1): read the active flag and stored expiry in one
     // short config-lock window; the poll itself must never hold the lock.
-    let (is_active, access_expires_at, interval_ms) = config
+    let (is_active, access_expires_at, interval_ms, preemptive) = config
         .lock()
         .map(|c| {
             (
                 c.is_active(name),
                 c.find(name).and_then(|p| p.access_token_expires_at()),
                 c.state.refresh_interval_ms,
+                c.state.preemptive_rotation,
             )
         })
-        .unwrap_or((false, None, 90_000));
+        .unwrap_or((false, None, 90_000, false));
     let proactive = proactive_rotation_due(
+        preemptive,
         is_active,
         keychain_live(),
         access_expires_at,
@@ -382,6 +391,16 @@ fn fetch_with_rotation(
         }
     };
 
+    // Per-profile rotation lock across the ENTIRE rotation leg — the adopt
+    // below mutates the same stored credential fields as a refresh persist,
+    // so both hold the same guard as `rotate_one_inner` (guard OUTERMOST,
+    // then config mutex + state flock inside). Blocking acquire is safe: the
+    // tick body holds no lock, so no deadlock risk. On acquire failure, fall
+    // back rather than touching the credentials unguarded.
+    let Ok(rotation_guard) = crate::runtime::RotationGuard::acquire(name) else {
+        return bail_unrotated();
+    };
+
     // Adopt before spending: when the ACTIVE Keychain profile's live file
     // mirror already holds a FRESHER same-account pair, the running claude
     // rotated first — adopt its pair (identity-guarded) instead of burning
@@ -390,9 +409,10 @@ fn fetch_with_rotation(
     // cache serves this tick.
     if is_active
         && keychain_live()
-        && let Some(adopted) = crate::oauth::try_adopt_live_rotation(config, name, &|tok| {
-            crate::usage::fetch_account_uuid(tok)
-        })
+        && let Some(adopted) =
+            crate::oauth::try_adopt_live_rotation(config, name, &rotation_guard, &|tok| {
+                crate::usage::fetch_account_uuid(tok)
+            })
     {
         if let Ok(mut q) = refetch.lock() {
             q.insert(name.to_string());
@@ -404,13 +424,6 @@ fn fetch_with_rotation(
     }
 
     let Some(rt) = refresh_token else {
-        return bail_unrotated();
-    };
-    // Per-profile rotation lock across the refresh HTTP window — prevents a
-    // concurrent `clauth start <name>` from double-spending this single-use token.
-    // Blocking acquire is safe: the tick body holds no lock, so no deadlock risk.
-    // On acquire failure, fall back rather than refreshing unguarded.
-    let Ok(_rotation_guard) = crate::runtime::RotationGuard::acquire(name) else {
         return bail_unrotated();
     };
     // Re-check liveness under the guard: a live session owns the chain and will
@@ -434,9 +447,10 @@ fn fetch_with_rotation(
             // (at latest CC's next launch).
             if is_active
                 && keychain_live()
-                && let Some(adopted) = crate::oauth::try_adopt_live_rotation(config, name, &|tok| {
-                    crate::usage::fetch_account_uuid(tok)
-                })
+                && let Some(adopted) =
+                    crate::oauth::try_adopt_live_rotation(config, name, &rotation_guard, &|tok| {
+                        crate::usage::fetch_account_uuid(tok)
+                    })
             {
                 if let Ok(mut q) = refetch.lock() {
                     q.insert(name.to_string());

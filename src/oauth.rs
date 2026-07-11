@@ -620,6 +620,20 @@ pub(crate) fn apply_rotated_tokens_locked(
 ) -> Result<()> {
     #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     let mut cfg = config.lock().expect("config mutex poisoned");
+    // Rotation coherence (#1): a rotation of the ACTIVE profile revokes the
+    // single-use refresh token the macOS Keychain copy carries — the running
+    // `claude` (which re-reads the Keychain per request) would sign out at
+    // that stale token's expiry while every clauth copy stays green (observed
+    // on-device 2026-07-07). The mirror DECISION and the creds snapshot are
+    // made under the locked section below, so the written pair is exactly the
+    // persisted one; the `/usr/bin/security` shell-out itself runs after the
+    // flock is released (it can hang up to its 20 s kill deadline, and the
+    // global state flock must never be held across a subprocess — before this
+    // function the locked section contained only fast disk writes). In-process
+    // switches stay excluded for the whole window by the config mutex held
+    // across this function.
+    #[cfg(target_os = "macos")]
+    let mut mirror: Option<crate::profile::ClaudeCredentials> = None;
     with_state_lock(|| {
         let Some(profile) = cfg.find_mut(name) else {
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
@@ -647,15 +661,6 @@ pub(crate) fn apply_rotated_tokens_locked(
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         }
         clear_staged_credentials(name);
-        // Rotation coherence (#1): a rotation of the ACTIVE profile revokes
-        // the single-use refresh token the macOS Keychain copy carries — the
-        // running `claude` (which re-reads the Keychain per request) would
-        // sign out at that stale token's expiry while every clauth copy stays
-        // green (observed on-device 2026-07-07). Mirror the fresh pair into
-        // the Keychain inside the same locked section as the persist, so a
-        // concurrent switch cannot re-point the item in between. A mirror
-        // failure is loud but non-fatal: the rotation itself is durable, and
-        // the next rotation or switch retries the write.
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() && cfg.is_active(name) {
             if live_login_is_foreign(name, &old_access) {
@@ -663,20 +668,27 @@ pub(crate) fn apply_rotated_tokens_locked(
                     "clauth: rotated '{name}' but the live login diverged (a re-login clauth \
                      doesn't own) — Keychain left untouched; resolve the divergence in the TUI"
                 );
-            } else if let Some(creds) = cfg.find(name).and_then(|p| p.credentials.as_ref())
-                && let Err(e) = crate::keychain::keychain_write(creds)
-            {
-                eprintln!(
-                    "clauth: rotated '{name}' but the Keychain mirror failed: {e:#} — a \
-                     running claude signs out when its old token expires; run `clauth {name}` \
-                     to reinstall"
-                );
+            } else {
+                mirror = cfg.find(name).and_then(|p| p.credentials.as_ref()).cloned();
             }
         }
         Ok(())
-    })
-    // A failed state flock surfaces as the `Err` from `with_state_lock`, so a
-    // poisoned/unavailable lock never looks like a successful rotation.
+    })?;
+    // A failed state flock surfaces as the `Err` from `with_state_lock` above,
+    // so a poisoned/unavailable lock never looks like a successful rotation.
+    // A mirror failure is loud but non-fatal: the rotation itself is durable,
+    // and the next rotation or switch retries the write.
+    #[cfg(target_os = "macos")]
+    if let Some(creds) = mirror
+        && let Err(e) = crate::keychain::keychain_write(&creds)
+    {
+        eprintln!(
+            "clauth: rotated '{name}' but the Keychain mirror failed: {e:#} — a \
+             running claude signs out when its old token expires; run `clauth {name}` \
+             to reinstall"
+        );
+    }
+    Ok(())
 }
 
 /// Adopt the live session's OWN token rotation instead of fighting it
@@ -713,9 +725,17 @@ pub(crate) fn apply_rotated_tokens_locked(
 /// in-memory `TokenList` exactly like every other rotation site — without it,
 /// the next poll would run on the superseded entry, spend the revoked refresh
 /// token, and fail on the very account the adopt just saved.
+///
+/// `_rotation_guard` is proof the caller holds this profile's per-profile
+/// rotation lock: the adopt mutates the same stored credential fields as a
+/// refresh persist (`rotate_one_inner`), so both writers must serialize on
+/// the same [`crate::runtime::RotationGuard`], not just the state flock.
+/// Taken by reference because the flock is not reentrant — the refresh-failure
+/// call site already holds the guard when it retries the adopt.
 pub(crate) fn try_adopt_live_rotation(
     config: &crate::profile::ConfigHandle,
     name: &str,
+    _rotation_guard: &crate::runtime::RotationGuard,
     identity: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(String, Option<String>)> {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache, write_profile_cache};

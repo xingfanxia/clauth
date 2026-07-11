@@ -388,12 +388,20 @@ mod keychain_mirror_gate {
 // rotates first, its file mirror (~/.claude/.credentials.json) carries the
 // fresher pair. Adopting it — identity-guarded — replaces racing for the
 // chain. All offline: identity is injected, the "mirror" is a sandboxed file.
-#[cfg(target_os = "macos")]
+// NOT macOS-gated: only the production call site's `keychain_live()` gate is
+// platform-specific — the identity gate and the expiry-monotonicity re-check
+// must hold (and run in CI) on every OS.
 mod adopt_live_rotation {
     use super::*;
     use crate::lockorder::RankedMutex;
     use crate::testutil::HomeSandbox;
     use std::sync::Arc;
+
+    /// The per-profile rotation lock `try_adopt_live_rotation` demands proof
+    /// of (production callers hold it across the whole rotation leg).
+    fn guard(name: &str) -> crate::runtime::RotationGuard {
+        crate::runtime::RotationGuard::acquire(name).expect("rotation guard")
+    }
 
     fn creds_with(access: &str, expires_at: Option<i64>) -> crate::profile::ClaudeCredentials {
         crate::profile::ClaudeCredentials {
@@ -454,7 +462,8 @@ mod adopt_live_rotation {
         let _home = HomeSandbox::new();
         let name = "adopt-ok";
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
-        let adopted = try_adopt_live_rotation(&handle, name, &|_| Some("uuid-1".into()));
+        let adopted =
+            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
         // The adopted pair is returned so the caller syncs its TokenList —
         // without it, the next poll runs on the superseded entry.
         assert_eq!(
@@ -480,7 +489,7 @@ mod adopt_live_rotation {
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
         // Stored token answers uuid-1; the mirror token answers uuid-2 — a
         // manual CC /login into another account must never be captured.
-        let adopted = try_adopt_live_rotation(&handle, name, &|tok| {
+        let adopted = try_adopt_live_rotation(&handle, name, &guard(name), &|tok| {
             Some(
                 if tok == "at-mirror" {
                     "uuid-2"
@@ -501,7 +510,7 @@ mod adopt_live_rotation {
         // Stored token already expired → its own uuid can't be fetched, and no
         // cached anchor exists. Identity unprovable ⇒ refuse.
         let handle = setup(name, past_expiry(), future_expiry());
-        let adopted = try_adopt_live_rotation(&handle, name, &|tok| {
+        let adopted = try_adopt_live_rotation(&handle, name, &guard(name), &|tok| {
             (tok == "at-mirror").then(|| "uuid-1".into())
         });
         assert_eq!(adopted, None);
@@ -518,7 +527,7 @@ mod adopt_live_rotation {
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
             &"uuid-1".to_string(),
         );
-        let adopted = try_adopt_live_rotation(&handle, name, &|tok| {
+        let adopted = try_adopt_live_rotation(&handle, name, &guard(name), &|tok| {
             (tok == "at-mirror").then(|| "uuid-1".into())
         });
         assert!(adopted.is_some());
@@ -532,7 +541,8 @@ mod adopt_live_rotation {
         // Mirror expiry equals the store's — nothing fresher to adopt.
         let expiry = future_expiry();
         let handle = setup(name, expiry, expiry);
-        let adopted = try_adopt_live_rotation(&handle, name, &|_| Some("uuid-1".into()));
+        let adopted =
+            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
         assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
@@ -543,7 +553,8 @@ mod adopt_live_rotation {
         let name = "adopt-inactive";
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
         handle.lock().unwrap().state.active_profile = None;
-        let adopted = try_adopt_live_rotation(&handle, name, &|_| Some("uuid-1".into()));
+        let adopted =
+            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
         assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
@@ -556,7 +567,7 @@ mod adopt_live_rotation {
         let _home = HomeSandbox::new();
         let name = "adopt-blank-id";
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
-        let adopted = try_adopt_live_rotation(&handle, name, &|_| Some("  ".into()));
+        let adopted = try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("  ".into()));
         assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }

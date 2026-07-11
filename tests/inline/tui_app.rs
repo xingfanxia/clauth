@@ -1077,6 +1077,44 @@ fn burn_aware_space_toggles_and_persists() {
     );
 }
 
+// ── preemptive rotation (rotation coherence #1) ─────────────────────────────
+
+#[test]
+fn preemptive_rotation_space_toggles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::PreemptiveRotation)
+        .unwrap();
+    assert!(
+        !app.config().state.preemptive_rotation,
+        "off by default — stock stays strictly lazy"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        app.config().state.preemptive_rotation,
+        "space toggles the mode on"
+    );
+
+    // Persisted to profiles.toml — the scheduler reads the flag off the
+    // shared config, but a relaunch must pick it up from disk too.
+    let reloaded: crate::profile::AppState = toml::from_str(
+        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+            .expect("read profiles.toml"),
+    )
+    .expect("parse profiles.toml");
+    assert!(reloaded.preemptive_rotation, "toggle persists to disk");
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.preemptive_rotation,
+        "space toggles the mode back off"
+    );
+}
+
 // ── refresh interval custom value ──────────────────────────────────────────
 
 use super::parse_refresh_secs;

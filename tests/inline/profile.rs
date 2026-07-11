@@ -96,6 +96,33 @@ fn burn_aware_switching_round_trips_and_is_omitted_when_off() {
     );
 }
 
+// `preemptive_rotation` (rotation coherence #1) shares `burn_aware_switching`'s
+// serde contract exactly: absent from old state files → false (stock stays
+// strictly lazy), on renders explicitly, off is omitted.
+#[test]
+fn preemptive_rotation_defaults_false_and_round_trips() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(!state.preemptive_rotation);
+
+    let on = AppState {
+        preemptive_rotation: true,
+        ..AppState::default()
+    };
+    let rendered_on = toml::to_string_pretty(&on).expect("render on state");
+    assert!(
+        rendered_on.contains("preemptive_rotation = true"),
+        "on must render explicitly, got:\n{rendered_on}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_on).expect("reparse on state");
+    assert!(reparsed.preemptive_rotation);
+
+    let rendered_off = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_off.contains("preemptive_rotation"),
+        "off (default) must be omitted, got:\n{rendered_off}"
+    );
+}
+
 #[test]
 fn profile_name_is_serde_transparent() {
     // `ProfileName` must serialize as a bare string so profiles.toml stays
