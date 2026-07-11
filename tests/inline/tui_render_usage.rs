@@ -173,7 +173,7 @@ fn empty_msg_credless_profile_is_terminal() {
     let profile = crate::testutil::blank_profile("a");
     assert_eq!(
         oauth_empty_msg(&profile),
-        "no credentials — capture or sign in"
+        "no credentials, capture or log in"
     );
 }
 

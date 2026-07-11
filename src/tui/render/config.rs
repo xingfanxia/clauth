@@ -323,7 +323,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
 fn row_hint(row: ConfigRow) -> Option<&'static str> {
     match row {
         ConfigRow::BaseUrl => {
-            Some("api endpoint for this account; leave empty for claude.ai oauth")
+            Some("api endpoint for this account; leave empty for claude.ai OAuth")
         }
         ConfigRow::ApiKey => Some("x-api-key sent to the custom endpoint"),
         // The value grammar (`space cycle · ↵ custom`) already lives in the footer.
@@ -338,8 +338,8 @@ fn row_hint(row: ConfigRow) -> Option<&'static str> {
         ConfigRow::ModelOverrideAdd => {
             Some("pin what an alias resolves to, or force the subagent model")
         }
-        ConfigRow::Login => Some("browser oauth login; mints fresh tokens for this account"),
-        ConfigRow::DeleteCreds => Some("drop the stored oauth tokens; keeps the profile shell"),
+        ConfigRow::Login => Some("browser OAuth login; mints fresh tokens for this account"),
+        ConfigRow::DeleteCreds => Some("drop the stored OAuth tokens; keeps the profile shell"),
         ConfigRow::Name | ConfigRow::Delete | ConfigRow::Create => None,
     }
 }

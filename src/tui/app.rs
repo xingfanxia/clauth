@@ -361,8 +361,8 @@ pub(crate) enum ConfirmAction {
     DiscardDivergence(String),
     /// Force-rotate all refresh tokens; active sessions may be logged out.
     RotateAll,
-    /// Force-rotate one account's refresh token (action-menu "rotate tokens" on
-    /// the focused account).
+    /// Force-rotate one account's refresh token (action-menu "rotate access
+    /// token" on the focused account).
     RotateOne(String),
     /// Plugin tab: write the `mcpServers.clauth` entry into `~/.claude.json`.
     /// Reversible local write — non-destructive, so it keeps the plain button.
@@ -579,7 +579,7 @@ impl ActionMenuAction {
         match self {
             Self::NewAccount => "new account",
             Self::RefreshUsage => "refresh usage",
-            Self::RotateTokens => "rotate tokens",
+            Self::RotateTokens => "rotate access token",
             Self::SwitchToSelected => "switch to selected",
             Self::ConfigureSelected => "configure",
             Self::OpenChainMember => "open",
@@ -647,7 +647,7 @@ pub(crate) struct Toast {
     pub(crate) born: Instant,
 }
 
-const ROTATE_ALL_MSG: &str = "rotate tokens for all accounts?";
+const ROTATE_ALL_MSG: &str = "Rotate all access tokens?";
 const ROTATE_ALL_DETAIL: &str = "accounts with a live session might be logged out.";
 const ROTATE_ONE_DETAIL: &str = "a live session on this account might be logged out.";
 const TOAST_CAPACITY: usize = 3;
@@ -1658,7 +1658,7 @@ impl App {
                 self.refresh_tokens();
                 self.toast(
                     ToastKind::Warning,
-                    "all accounts spent — switched off to halt usage".to_string(),
+                    "all accounts spent; switched off to halt usage".to_string(),
                 );
             }
             None => {}
@@ -3073,7 +3073,7 @@ fn active_diverged_unsaved(active: &str) -> bool {
 fn prompt_divergence(app: &mut App, active: String, verb: &str) {
     app.toast(
         ToastKind::Warning,
-        format!("'{active}' has unsaved Claude Code credentials — resolve before {verb}"),
+        format!("'{active}' has unsaved Claude Code credentials; resolve before {verb}"),
     );
     app.modals
         .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
@@ -3131,7 +3131,7 @@ fn perform_switch_off(app: &mut App) {
             app.last_state_mtime = app_state_mtime();
             app.toast(
                 ToastKind::Warning,
-                "all accounts spent — switched off to halt usage".to_string(),
+                "all accounts spent; switched off to halt usage".to_string(),
             );
         }
         Err(e) => app.toast(ToastKind::Danger, format!("switch-off failed: {e}")),
@@ -3157,7 +3157,7 @@ fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
     if !has_oauth && snapshot.base_url.is_none() && snapshot.api_key.is_none() {
         app.toast(
             ToastKind::Danger,
-            "no live login found — nothing to capture (macOS keychain isn't supported yet)",
+            "no live login found; nothing to capture (macOS keychain isn't supported yet)",
         );
         return None;
     }
@@ -4139,7 +4139,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::RotateTokens => match focused_account(app) {
             Some((name, true, _)) => {
                 app.modals.push(Modal::Confirm(ConfirmState {
-                    message: format!("rotate tokens for '{name}'?"),
+                    message: format!("Rotate access token for '{name}'?"),
                     detail: Some(ROTATE_ONE_DETAIL.to_string()),
                     choice: false,
                     on_confirm: ConfirmAction::RotateOne(name),
@@ -5475,7 +5475,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             if !is_idle(&app.activity, &name) {
                 app.toast(
                     ToastKind::Warning,
-                    format!("'{name}' is already busy — try again in a moment"),
+                    format!("'{name}' is already busy; try again in a moment"),
                 );
                 return;
             }
@@ -5489,7 +5489,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             if app.bootstrap_active.load(Ordering::SeqCst) || any_busy(&app.activity) {
                 app.toast(
                     ToastKind::Warning,
-                    "rotate-all skipped — another op is still in flight",
+                    "rotate-all skipped; another op is still in flight",
                 );
                 return;
             }
@@ -5513,7 +5513,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 app.toast(
                     ToastKind::Warning,
                     format!(
-                        "'{name}' is in use by a running session — its tokens are managed there"
+                        "'{name}' is in use by a running session; its tokens are managed there"
                     ),
                 );
                 return;
@@ -5855,7 +5855,7 @@ fn drain_status_events(app: &mut App) {
                 apply_status_incidents(app, incidents, fetched_at_ms, true, false);
                 if was_manual {
                     app.status.fetching = false;
-                    app.toast(ToastKind::Danger, "status refresh failed — showing cached");
+                    app.toast(ToastKind::Danger, "status refresh failed; showing cached");
                 }
             }
             StatusEvent::Failed(msg) => {
@@ -6119,13 +6119,13 @@ pub(crate) fn on_tick(app: &mut App) {
             UpdateEvent::Installed(v) => {
                 app.toast(
                     ToastKind::Success,
-                    format!("updated to v{v} — restart to apply"),
+                    format!("updated to v{v}; restart to apply"),
                 );
             }
             UpdateEvent::Available(v) => {
                 app.toast(
                     ToastKind::Info,
-                    format!("update available: v{v} — run `cargo install clauth`"),
+                    format!("update available: v{v}; run `cargo install clauth`"),
                 );
             }
         }

@@ -35,21 +35,21 @@ pub(crate) fn validate_profile_name(
 ) -> Result<()> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        bail!("Name cannot be empty.");
+        bail!("name cannot be empty");
     }
     let valid_chars = trimmed
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '+'));
     if !valid_chars || trimmed.starts_with('.') {
         bail!(
-            "Name must contain only letters, digits, '-', '_', '.', '@', or '+', and cannot start with '.'."
+            "name must contain only letters, digits, '-', '_', '.', '@', or '+', and cannot start with '.'"
         );
     }
     if existing
         .iter()
         .any(|&n| n.eq_ignore_ascii_case(trimmed) && Some(n) != exclude)
     {
-        bail!("A profile named '{trimmed}' already exists.");
+        bail!("a profile named '{trimmed}' already exists");
     }
     Ok(())
 }
@@ -141,7 +141,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
                 .to_string()
         };
         print!(
-            "active profile '{active}' has uncaptured credentials in ~/.claude \
+            "clauth: active profile '{active}' has uncaptured credentials in ~/.claude \
              (a re-login or token rotation). capture them into '{active}' and \
              switch to '{canonical}'? [Y/n] "
         );
@@ -155,7 +155,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
             let mut cfg = config.lock().expect("config mutex poisoned");
             switch_profile_reconciled(&mut cfg, canonical)?;
         } else {
-            println!("aborted — no changes made");
+            println!("clauth: aborted, no changes made");
             return Ok(());
         }
     } else {
@@ -171,7 +171,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
         let _spinner = Spinner::start("clauth: priming usage window");
         let _ = oauth::prime_window(&config, canonical);
     }
-    println!("switched to '{canonical}'");
+    println!("clauth: switched to '{canonical}'");
     Ok(())
 }
 
@@ -258,7 +258,7 @@ fn finish_switch(config: &mut AppConfig, name: &str) -> Result<()> {
         .and_then(|n| config.find(n))
         .map(|p| p.env.keys().cloned().collect())
         .unwrap_or_default();
-    let profile = config.find(name).context("Profile not found")?;
+    let profile = config.find(name).context("profile not found")?;
     apply_profile_to_claude_settings(profile, &prev_env_keys)?;
     // issue #17: drop the outgoing account's cached identity so Claude Code
     // re-derives it from the just-relinked credentials instead of showing
@@ -275,7 +275,7 @@ pub(crate) fn edit_profile_endpoint(
     api_key: Option<String>,
 ) -> Result<()> {
     with_state_lock(|| {
-        let profile = config.find_mut(name).context("Profile not found")?;
+        let profile = config.find_mut(name).context("profile not found")?;
         let old_api_key = profile.api_key.clone();
         profile.base_url = base_url;
         profile.api_key = api_key;
@@ -294,7 +294,7 @@ pub(crate) fn edit_profile_endpoint(
         save_profile(profile)?;
 
         if config.is_active(name) {
-            let profile = config.find(name).context("Profile not found")?;
+            let profile = config.find(name).context("profile not found")?;
             let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
             apply_profile_to_claude_settings(profile, &prev_env_keys)?;
         }
@@ -311,7 +311,7 @@ pub(crate) fn edit_profile_model(
     models: ModelSettings,
 ) -> Result<()> {
     with_state_lock(|| {
-        let profile = config.find_mut(name).context("Profile not found")?;
+        let profile = config.find_mut(name).context("profile not found")?;
         profile.models = models;
         save_profile(profile)?;
 
@@ -321,7 +321,7 @@ pub(crate) fn edit_profile_model(
             // keeps every key the profile still carries). The model env keys
             // (`ANTHROPIC_DEFAULT_*`/`CLAUDE_CODE_SUBAGENT_MODEL`) are set or
             // cleared unconditionally inside `build_claude_settings_json`.
-            let profile = config.find(name).context("Profile not found")?;
+            let profile = config.find(name).context("profile not found")?;
             let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
             apply_profile_to_claude_settings(profile, &prev_env_keys)?;
         }
@@ -339,7 +339,7 @@ pub(crate) fn edit_profile_env(
     env: BTreeMap<String, String>,
 ) -> Result<()> {
     with_state_lock(|| {
-        let profile = config.find_mut(name).context("Profile not found")?;
+        let profile = config.find_mut(name).context("profile not found")?;
         // Snapshot before overwrite — a removed key is only stripped from live
         // settings when it appears in `prev` but not in the new `profile.env`.
         let old_env_keys: Vec<String> = profile.env.keys().cloned().collect();
@@ -347,7 +347,7 @@ pub(crate) fn edit_profile_env(
         save_profile(profile)?;
 
         if config.is_active(name) {
-            let profile = config.find(name).context("Profile not found")?;
+            let profile = config.find(name).context("profile not found")?;
             apply_profile_to_claude_settings(profile, &old_env_keys)?;
         }
         Ok(())
@@ -393,7 +393,7 @@ pub(crate) fn rename_profile(config: &mut AppConfig, old: &str, new: &str) -> Re
         let old_dir = profile_dir(old)?;
         if old_dir.exists() {
             std::fs::rename(&old_dir, profile_dir(new)?)
-                .with_context(|| format!("Failed to rename profile directory to '{new}'"))?;
+                .with_context(|| format!("failed to rename profile directory to '{new}'"))?;
         }
 
         let was_active = config.is_active(old);
@@ -417,7 +417,7 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         // the user can retry; persisting state first would leave an orphan dir.
         if dir.exists() {
             std::fs::remove_dir_all(&dir)
-                .with_context(|| format!("Failed to delete profile directory for '{name}'"))?;
+                .with_context(|| format!("failed to delete profile directory for '{name}'"))?;
         }
         config.remove(name);
         save_app_state(&config.state)?;
@@ -616,7 +616,7 @@ pub(crate) fn overwrite_captured_profile(
             // way `edit_profile_endpoint` does, so a running `claude` doesn't
             // keep reading the OLD endpoint/token until the next switch.
             link_profile_credentials(name)?;
-            let profile = config.find(name).context("Profile not found")?;
+            let profile = config.find(name).context("profile not found")?;
             let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
             apply_profile_to_claude_settings(profile, &prev_env_keys)?;
         }

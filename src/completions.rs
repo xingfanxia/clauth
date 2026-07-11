@@ -11,7 +11,7 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login which" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login which completions" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ]; }; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
@@ -33,9 +33,10 @@ _clauth() {
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
         _values 'subcommand' \
-            'start[launch claude with an isolated profile]' \
-            'login[sign an account in via claude /login]' \
-            'which[print profile owning the loaded credentials]'
+            'start[launch claude with that profile]' \
+            'login[log in via browser OAuth]' \
+            'which[print profile owning the loaded credentials]' \
+            'completions[emit shell completion script]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login) ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
@@ -54,9 +55,10 @@ const FISH: &str = r#"function __clauth_profiles
 end
 complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
-complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with an isolated profile"
-complete -c clauth -f -n __fish_is_first_token -a login -d "Sign an account in via claude /login"
+complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
+complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
+complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --model -d "Set default model before signing in"
@@ -217,8 +219,8 @@ pub(crate) fn auto_install_once() {
     if matches!(consent, Consent::Yes)
         && let Err(e) = install(Some(&shell))
     {
-        eprintln!("[clauth] could not install completions: {e}");
-        eprintln!("[clauth] run `clauth completions install` later to retry");
+        eprintln!("clauth: could not install completions: {e}");
+        eprintln!("clauth: run `clauth completions install` later to retry");
     }
 }
 

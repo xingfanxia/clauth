@@ -61,7 +61,7 @@ fn third_party_headline_joins_bars_with_plan_prefix() {
         vec![],
         Some("pro"),
     );
-    assert_eq!(third_party_headline(&s), "pro — prompts 50%, tokens 12%");
+    assert_eq!(third_party_headline(&s), "pro: prompts 50%, tokens 12%");
 }
 
 #[test]

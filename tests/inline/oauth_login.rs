@@ -171,7 +171,7 @@ fn callback_ignores_unrelated_requests_and_keeps_waiting() {
 fn callback_pages_are_distinct_and_never_reflect_query_values() {
     // Success: styled page that attempts a tab auto-close.
     let (_, ok) = callback_roundtrip("GET /callback?code=c&state=STATE HTTP/1.1\r\n", "STATE");
-    assert!(ok.contains("You're signed in"), "got: {ok}");
+    assert!(ok.contains("You're logged in"), "got: {ok}");
     assert!(
         ok.contains("window.close"),
         "the success page attempts a tab auto-close"
@@ -183,7 +183,7 @@ fn callback_pages_are_distinct_and_never_reflect_query_values() {
         "GET /callback?error=access_denied&error_description=evil-marker HTTP/1.1\r\n",
         "STATE",
     );
-    assert!(denied.contains("Sign-in canceled"), "got: {denied}");
+    assert!(denied.contains("Login canceled"), "got: {denied}");
     assert!(
         !denied.contains("evil-marker"),
         "untrusted query values must never be reflected into the page"
@@ -191,7 +191,7 @@ fn callback_pages_are_distinct_and_never_reflect_query_values() {
 
     // Any other OAuth error keeps the generic failure page, with no auto-close.
     let (_, failed) = callback_roundtrip("GET /callback?error=server_error HTTP/1.1\r\n", "STATE");
-    assert!(failed.contains("Sign-in failed"), "got: {failed}");
+    assert!(failed.contains("Login failed"), "got: {failed}");
     assert!(
         !failed.contains("window.close"),
         "only the success page auto-closes"

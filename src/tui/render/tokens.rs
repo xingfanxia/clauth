@@ -1353,7 +1353,7 @@ fn draw_model_detail(
                     theme::accent().add_modifier(Modifier::BOLD),
                 ),
             ]),
-            kv("io", fmt_count(s.in_out())),
+            kv("in+out", fmt_count(s.in_out())),
         ]
     } else {
         // Part of the window predates the transcript cutoff, where only the
