@@ -282,6 +282,34 @@ fn fresher_disk_pair(name: &str, spent_refresh: &str) -> Option<RotatedTokens> {
     (refresh != spent_refresh).then_some((access, Some(refresh)))
 }
 
+/// The carry half of the double-spend guard: when [`fresher_disk_pair`] proves
+/// someone else advanced the chain, clear any pre-existing quarantine (the
+/// chain is alive, so a standing `auth_broken` is stale — without this, an
+/// account recovered by an external re-login would stay excluded from the
+/// fallback walk and refused by every switch gate forever), queue a refetch so
+/// the next tick polls with the carried pair, and hand back the cached outcome
+/// whose `rotated` syncs the caller's `TokenList`. A wrong clear self-corrects:
+/// if the carried pair is itself dead, its refresh 400s next tick with the
+/// store unchanged and the account re-quarantines.
+fn carry_external_rotation(
+    config: &crate::profile::ConfigHandle,
+    name: &str,
+    spent_refresh: &str,
+    refetch: &RefetchQueue,
+) -> Option<FetchOutcome> {
+    let fresh = fresher_disk_pair(name, spent_refresh)?;
+    crate::oauth::mark_auth_broken(config, name, false);
+    if let Ok(mut q) = refetch.lock() {
+        q.insert(name.to_string());
+    }
+    Some(FetchOutcome::cached(
+        name,
+        FetchStatus::Cached,
+        Some(fresh),
+        None,
+    ))
+}
+
 /// Whether a 429 on the usage fetch is worth rotating for. Mirrors
 /// `auth::auto_start_kick`'s 429 gate: a 429 on a still-valid token is a pure
 /// endpoint rate limit a refresh can't fix, but a clock-expired token would 401
@@ -361,14 +389,12 @@ fn fetch_with_rotation(
                 // Double-spend guard before quarantining: if the on-disk pair
                 // moved past the token we just spent, another refresher
                 // already rotated the chain — carry the fresh pair into the
-                // TokenList and retry next tick (disk cache serves this one).
-                // Only an unchanged-credentials 400 is a real revocation. See
-                // `fresher_disk_pair`.
-                if let Some(fresh) = fresher_disk_pair(name, rt) {
-                    if let Ok(mut q) = refetch.lock() {
-                        q.insert(name.to_string());
-                    }
-                    return FetchOutcome::cached(name, FetchStatus::Cached, Some(fresh), None);
+                // TokenList (clearing any stale quarantine) and retry next
+                // tick (disk cache serves this one). Only an
+                // unchanged-credentials 400 is a real revocation. See
+                // `carry_external_rotation`.
+                if let Some(outcome) = carry_external_rotation(config, name, rt, refetch) {
+                    return outcome;
                 }
                 // A terminal failure (dead refresh token) quarantines the
                 // account on this tick; a transient one leaves the flag and

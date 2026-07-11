@@ -1160,6 +1160,60 @@ fn a_disk_pair_that_moved_past_the_spent_token_is_returned_not_quarantined() {
     assert_eq!(super::fresher_disk_pair(name, "rt-new"), None);
 }
 
+/// The carry path must also LIFT a stale quarantine: the moved pair proves the
+/// chain is alive, and without the clear, an account recovered by an external
+/// re-login stays excluded from the fallback walk and refused by every switch
+/// gate forever (its own refresh never succeeds — the carry preempts it).
+#[test]
+fn carrying_an_external_rotation_clears_a_stale_quarantine() {
+    use crate::lockorder::RankedMutex;
+    use std::sync::Arc;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "double-spend-quarantined";
+    let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+    p.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-new".into(),
+            refresh_token: Some("rt-new".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&p).expect("save profile");
+
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![p],
+    };
+    config.state.profiles = vec![name.into()];
+    config.set_auth_broken(name, true);
+    let handle: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(config));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(Default::default()));
+
+    // Spent "rt-old"; store holds "rt-new" → carry fires and lifts the flag.
+    let outcome = super::carry_external_rotation(&handle, name, "rt-old", &refetch);
+    assert!(outcome.is_some(), "a moved pair must carry");
+    assert!(
+        !handle.lock().unwrap().is_auth_broken(name),
+        "the carried (alive) chain must lift a stale quarantine"
+    );
+    assert!(
+        refetch.lock().unwrap().contains(name),
+        "the carried pair is refetched next tick"
+    );
+
+    // Spent the store's own pair → no carry, and the flag is left alone.
+    handle.lock().unwrap().set_auth_broken(name, true);
+    let outcome = super::carry_external_rotation(&handle, name, "rt-new", &refetch);
+    assert!(outcome.is_none(), "an unchanged pair is a real revocation");
+    assert!(
+        handle.lock().unwrap().is_auth_broken(name),
+        "a real revocation keeps the quarantine"
+    );
+}
+
 #[test]
 fn a_missing_or_tokenless_profile_never_reads_as_a_benign_double_spend() {
     let _home = crate::testutil::HomeSandbox::new();
