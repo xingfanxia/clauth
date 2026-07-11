@@ -521,25 +521,28 @@ fn rate_limit_backoff_ms(streak: u32) -> u64 {
 }
 
 /// Deferral added to a profile's `last_fetched` stamp so `partition_due`'s fixed
-/// `stamp + interval` math lands the next slot correctly. A server `retry-after`
-/// defers to `now + retry_after` (capped) — an explicit `0` / elapsed date
-/// (parsed as `ZERO`) means "retry now", so it lands the normal cadence rather
-/// than the no-hint ladder. A 429 with no header at all defers one interval +
-/// [`rate_limit_backoff_ms`] (which grows with the consecutive-429 `streak`),
-/// capped at [`MAX_RETRY_AFTER_MS`]. Everything else: no defer.
+/// `stamp + interval` math lands the next slot correctly. On a 429 the slot is
+/// `max(server retry-after, one interval + `[`rate_limit_backoff_ms`]`)` —
+/// a REAL long hint is honored verbatim, but a `0` / sub-cadence hint can
+/// never suppress the streak ladder. The usage endpoint answers EVERY 429
+/// with `retry-after: 0` while its sliding window counts the rejected
+/// requests too; taking that "retry now" at face value re-polls at cadence,
+/// keeps the window pinned full, and the profile never leaves `RateLimited`
+/// (observed 2026-07-11: hours of uninterrupted per-account 429s that only a
+/// growing back-off can drain). Capped at [`MAX_RETRY_AFTER_MS`]. Non-429
+/// outcomes: no defer.
 fn next_slot_deferral(
     rate_limited: bool,
     retry_after: Option<Duration>,
     streak: u32,
     interval_ms: u64,
 ) -> IntervalMs {
-    let target_ms = match retry_after.map(|ra| ra.as_millis() as u64) {
-        // Honor any server hint verbatim, including an explicit `0`: the server
-        // said "retry now", so cadence — never escalate it into the no-hint
-        // exponential backoff below (that ladder is only for a missing header).
-        Some(ms) => ms,
-        None if rate_limited => interval_ms.saturating_add(rate_limit_backoff_ms(streak)),
-        None => 0,
+    let hint = retry_after.map(|ra| ra.as_millis() as u64);
+    let target_ms = if rate_limited {
+        let ladder = interval_ms.saturating_add(rate_limit_backoff_ms(streak));
+        hint.unwrap_or(0).max(ladder)
+    } else {
+        hint.unwrap_or(0)
     };
     IntervalMs::from_millis(
         target_ms
