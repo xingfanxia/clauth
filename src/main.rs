@@ -95,7 +95,7 @@ fn dispatch(args: &[String]) -> Result<()> {
             None => anyhow::bail!("usage: clauth login <profile> [--model <id>]"),
         },
         [cmd, ..] if cmd == "run" => anyhow::bail!(
-            "`clauth run` isn't a command — for a headless delegate use \
+            "`clauth run` isn't a command; for a headless delegate use \
              `clauth start <profile> -p \"<prompt>\"` (or the MCP `delegate` tool)"
         ),
         [cmd] if cmd == "mcp" => mcp::serve(),
@@ -105,7 +105,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
         _ => anyhow::bail!(
-            "usage: clauth [profile] | clauth start <profile> [claude args...] | clauth login <profile> [--model <id>] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
+            "usage: clauth [profile] | clauth start [--isolated] <profile> [args] | clauth login <profile> [--model <id>] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
         ),
     }
 }
@@ -245,7 +245,7 @@ fn cmd_login(name: &str, model: Option<&str>) -> Result<()> {
                 return Ok(());
             }
         }
-        println!("clauth: re-authenticating existing profile '{target}' — opening a browser…");
+        println!("clauth: re-authenticating existing profile '{target}', opening a browser…");
     } else {
         println!("clauth: opening a browser to log in to a new account for '{target}'…");
     }
@@ -326,7 +326,7 @@ fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
 
 fn print_help() {
     println!(
-        "clauth {ver} — Claude Code account switcher\n\n\
+        "clauth {ver}: Claude Code account switcher\n\n\
          Usage:\n  \
            clauth [--theme=full|compatible] launch the TUI\n  \
            clauth <profile>                switch to profile by name and exit\n  \
@@ -336,7 +336,7 @@ fn print_help() {
          memory/plugins/hooks (run in a clean cwd for a blind session);\n                                  \
          extra args go to claude\n  \
            clauth login <profile> [--model <id>]\n                                  \
-         add a new account via browser OAuth sign-in and capture it into a\n                                  \
+         add a new account via browser OAuth login and capture it into a\n                                  \
          new profile, or re-authenticate an existing one in place (neither\n                                  \
          switches to it); --model sets its default model (opus/sonnet/\n                                  \
          haiku/opusplan or a full model id)\n  \

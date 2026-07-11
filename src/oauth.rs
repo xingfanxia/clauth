@@ -69,6 +69,24 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .into()
 });
 
+/// Cap a raw HTTP error body to its first line, max 200 chars, before it
+/// reaches a user-facing toast — an upstream error page must not flood a
+/// one-line surface.
+fn http_error(status: u16, body: &str) -> anyhow::Error {
+    let detail: String = body
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect();
+    if detail.is_empty() {
+        anyhow::anyhow!("HTTP {status}")
+    } else {
+        anyhow::anyhow!("HTTP {status}: {detail}")
+    }
+}
+
 pub(crate) fn refresh(refresh_token: &str) -> Result<TokenResponse> {
     let body = serde_json::to_string(&serde_json::json!({
         "grant_type": "refresh_token",
@@ -87,7 +105,7 @@ pub(crate) fn refresh(refresh_token: &str) -> Result<TokenResponse> {
         .read_to_string()
         .map_err(anyhow::Error::from)?;
     if status >= 400 {
-        anyhow::bail!("HTTP {status}: {text}");
+        return Err(http_error(status, &text));
     }
 
     serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))
@@ -125,7 +143,7 @@ pub(crate) fn exchange_code(
         .read_to_string()
         .map_err(anyhow::Error::from)?;
     if status >= 400 {
-        anyhow::bail!("HTTP {status}: {text}");
+        return Err(http_error(status, &text));
     }
 
     serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))

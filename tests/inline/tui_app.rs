@@ -1723,6 +1723,9 @@ fn tokens_action_menu_sets_and_swaps_the_model_filter() {
     assert_eq!(
         labels,
         vec![
+            "period: daily",
+            "period: weekly",
+            "period: monthly",
             "show claude models",
             "show other models",
             "toggle cache counting",
@@ -2003,4 +2006,131 @@ mod new_account_model_row {
             "default stays unset on purpose, matching default claude code behaviour"
         );
     }
+}
+
+#[test]
+fn tokens_period_key_cycles_and_clamps_cursor() {
+    use super::{KeyCode, Tab, TokenPeriod, TokenView, handle_key};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Tokens;
+    // Two lifetime rows; the daily/scoped lists are empty (no `today`, no
+    // per-day models), so cycling must clamp the Models cursor.
+    app.token_stats = Some(crate::tokens::TokenStats {
+        models: vec![
+            crate::tokens::ModelTokens {
+                model: "claude-opus-4".into(),
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_create: 0,
+            },
+            crate::tokens::ModelTokens {
+                model: "claude-sonnet-4".into(),
+                input: 8,
+                output: 4,
+                cache_read: 0,
+                cache_create: 0,
+            },
+        ],
+        ..Default::default()
+    });
+    app.token_view = TokenView::Models;
+    app.token_model_cursor = 1;
+
+    for expected in [
+        TokenPeriod::Daily,
+        TokenPeriod::Weekly,
+        TokenPeriod::Monthly,
+        TokenPeriod::Lifetime,
+    ] {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char('t')));
+        assert_eq!(app.token_period, expected, "t cycles in declared order");
+    }
+    // The first hop landed on the empty daily list, so the cursor was clamped
+    // to 0 and stays there through the full cycle.
+    assert_eq!(app.token_model_cursor, 0, "cursor clamps on an empty lens");
+}
+
+// ── tokens tab: loading-spinner busy flag ─────────────────────────────────────
+
+/// `tokens_topping_up` drives the tab's loading spinners. Only a seeding `Base`
+/// (first paint) or a manual reload lights it; `Loaded`/`Failed` clear it, and a
+/// silent periodic `Base` (stats already present) must stay dark.
+#[test]
+fn tokens_topping_up_tracks_the_load_lifecycle() {
+    use super::{drain_tokens_events, reload_token_stats};
+    use crate::profile::{AppConfig, AppState};
+    use crate::tokens::{TokenStats, TokensEvent};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    // App::new drops the loader's sender under cfg(test); rewire a live channel
+    // so the test can feed the loader's events.
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tokens_events = rx;
+
+    assert!(app.token_stats.is_none());
+    assert!(!app.tokens_topping_up);
+
+    // First (seeding) Base: paints the cache and marks the top-up in flight.
+    tx.send(TokensEvent::Base(Box::<TokenStats>::default()))
+        .unwrap();
+    drain_tokens_events(&mut app);
+    assert!(app.token_stats.is_some(), "seeding Base paints the tab");
+    assert!(
+        app.tokens_topping_up,
+        "a seeding Base lights the loading flag"
+    );
+
+    // Sweep progress lands in `tokens_progress` while the top-up runs.
+    tx.send(TokensEvent::Progress {
+        done: 25,
+        total: 380,
+    })
+    .unwrap();
+    drain_tokens_events(&mut app);
+    assert_eq!(
+        app.tokens_progress,
+        Some((25, 380)),
+        "Progress stores the sweep counts"
+    );
+
+    // Loaded clears both the flag and the counts.
+    tx.send(TokensEvent::Loaded(Box::<TokenStats>::default()))
+        .unwrap();
+    drain_tokens_events(&mut app);
+    assert!(!app.tokens_topping_up, "Loaded clears the loading flag");
+    assert_eq!(app.tokens_progress, None, "Loaded clears the sweep counts");
+
+    // A silent periodic Base (stats already present) must NOT relight it.
+    tx.send(TokensEvent::Base(Box::<TokenStats>::default()))
+        .unwrap();
+    drain_tokens_events(&mut app);
+    assert!(
+        !app.tokens_topping_up,
+        "a non-seeding periodic Base stays silent"
+    );
+
+    // Manual reload lights it (and drops any stale counts); a subsequent
+    // Failed clears both.
+    app.tokens_progress = Some((1, 2));
+    reload_token_stats(&mut app);
+    assert!(app.tokens_topping_up, "manual reload lights the flag");
+    assert_eq!(
+        app.tokens_progress, None,
+        "manual reload drops stale sweep counts"
+    );
+    tx.send(TokensEvent::Failed).unwrap();
+    drain_tokens_events(&mut app);
+    assert!(!app.tokens_topping_up, "Failed clears the loading flag");
+    assert_eq!(app.tokens_progress, None, "Failed clears the sweep counts");
 }

@@ -12,7 +12,7 @@ pub(crate) use fetch::{
     ScopedWindow, SpendInfo, UsageInfo, UsageWindow, WindowDollars, await_request_slot,
     epoch_secs_to_iso, expire_profile_ttl, fetch_account_uuid, five_hour_live, http_agent,
     humanize_duration, ideal_pace_pct, iso_to_epoch_secs, now_epoch_secs, now_ms,
-    parse_retry_after, probe_subscription_type, window_avg_pace_per_day,
+    parse_retry_after, probe_subscription_type, seven_day_live, window_avg_pace_per_day,
 };
 pub(crate) use scheduler::{
     ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,

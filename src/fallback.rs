@@ -3,7 +3,9 @@ use anyhow::Result;
 use crate::actions::{switch_off, switch_profile};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile};
-use crate::usage::{UsageStore, UsageWindow, five_hour_live, iso_to_epoch_secs, now_epoch_secs};
+use crate::usage::{
+    UsageStore, UsageWindow, five_hour_live, iso_to_epoch_secs, now_epoch_secs, seven_day_live,
+};
 
 /// What the auto-switch evaluator decided when the active profile crossed its
 /// threshold.
@@ -42,6 +44,36 @@ fn live_five_hour(profile: &Profile) -> Option<&UsageWindow> {
     usage.five_hour.as_ref()
 }
 
+/// Cap at which the OVERALL weekly window hard-blocks an account. Not a
+/// configurable headroom threshold like the 5h one: at 100% the API refuses
+/// requests until the weekly reset, and the idle account's 5h window drains
+/// and then LAPSES — which made a weekly-dead member look like the freshest
+/// target in the chain (observed live 2026-07-08: two members at exactly
+/// 100.0 with no live 5h window, and auto-fallback switched into one). Only
+/// `seven_day` gates here — a per-model `weekly_scoped` limit at 100 (e.g.
+/// "7d fable" spent while 7d has room) blocks just that model, and the walk
+/// cannot know which model the next session will drive.
+const WEEKLY_BLOCK_PCT: f64 = 100.0;
+
+/// Whether `info`'s live weekly window is spent to the cap — unusable until
+/// the weekly reset regardless of anything the 5h window says. Store-side
+/// twin logic inlines this same shape (see `is_exhausted_from_store`).
+fn weekly_blocked_info(info: &crate::usage::UsageInfo, now_secs: i64) -> bool {
+    seven_day_live(info, now_secs)
+        && info
+            .seven_day
+            .as_ref()
+            .is_some_and(|w| w.utilization >= WEEKLY_BLOCK_PCT)
+}
+
+/// [`weekly_blocked_info`] over a profile's own usage snapshot.
+fn weekly_blocked(profile: &Profile) -> bool {
+    profile
+        .usage
+        .as_ref()
+        .is_some_and(|u| weekly_blocked_info(u, now_epoch_secs()))
+}
+
 /// True when the profile's 5h utilization has crossed its own threshold. Also
 /// drives the TUI's all-spent banner wording. Static regardless of burn-aware
 /// mode (issue #8 follow-up b) — the target walk's candidates and
@@ -49,7 +81,8 @@ fn live_five_hour(profile: &Profile) -> Option<&UsageWindow> {
 /// profile's own decision becomes projection-aware (see
 /// [`is_exhausted_active`]).
 pub(crate) fn is_exhausted(profile: &Profile) -> bool {
-    live_five_hour(profile).is_some_and(|w| w.utilization >= threshold_for(profile))
+    weekly_blocked(profile)
+        || live_five_hour(profile).is_some_and(|w| w.utilization >= threshold_for(profile))
 }
 
 /// Recent burn rate (%/h) for `name`'s 5h window: durable per-profile history
@@ -111,6 +144,12 @@ pub(crate) fn is_exhausted_active(
     interval_ms: u64,
     active_burn_pct_per_hour: Option<f64>,
 ) -> bool {
+    // Weekly hard block first: a 7d window at the cap is dead until its
+    // weekly reset whatever the 5h window (often lapsed/idle by then) says,
+    // and no burn projection applies — there is nothing left to project.
+    if weekly_blocked(profile) {
+        return true;
+    }
     let Some(window) = live_five_hour(profile) else {
         return false;
     };
@@ -132,8 +171,9 @@ pub(crate) fn is_exhausted_active(
 /// WHOLE chain is currently exhausted, covering both wrap-off's
 /// switch-off-all (active cleared) and wrap mode's stalled-active equivalent
 /// (`next_target` returns `None` with every member maxed). Reuses
-/// [`is_exhausted`]'s `five_hour_live` gate: a single member with no live
-/// window or a past reset already has headroom — `find_recovered_member` /
+/// [`is_exhausted`]'s wall-clock gates (`five_hour_live` and the weekly
+/// `seven_day_live` hard-block): a member exhausted in neither window
+/// already has headroom — `find_recovered_member` /
 /// `scan_recovery` would relink it on the very next tick — so that member's
 /// presence bails the WHOLE result to `None` rather than being skipped around;
 /// the caption's premise is that NOTHING in the chain is currently usable.
@@ -150,14 +190,15 @@ pub(crate) fn soonest_resume(config: &AppConfig) -> Option<(String, i64)> {
         if !is_exhausted(profile) {
             return None;
         }
-        let resets_at = profile
-            .usage
-            .as_ref()?
-            .five_hour
-            .as_ref()?
-            .resets_at
-            .as_deref()
-            .and_then(iso_to_epoch_secs)?;
+        // A weekly-dead member resumes at its 7d reset (its 5h window may be
+        // lapsed or absent entirely); anyone else at their next 5h reset.
+        let usage = profile.usage.as_ref()?;
+        let window = if weekly_blocked(profile) {
+            usage.seven_day.as_ref()?
+        } else {
+            usage.five_hour.as_ref()?
+        };
+        let resets_at = window.resets_at.as_deref().and_then(iso_to_epoch_secs)?;
         if best.is_none_or(|(_, cur)| resets_at < cur) {
             best = Some((name.as_str(), resets_at));
         }
@@ -240,11 +281,12 @@ fn is_exhausted_from_store(name: &str, threshold: f64, store: &UsageStore) -> bo
     let now = now_epoch_secs();
     match store.lock() {
         Ok(s) => s.get(name).is_some_and(|info| {
-            five_hour_live(info, now)
-                && info
-                    .five_hour
-                    .as_ref()
-                    .is_some_and(|w| w.utilization >= threshold)
+            weekly_blocked_info(info, now)
+                || (five_hour_live(info, now)
+                    && info
+                        .five_hour
+                        .as_ref()
+                        .is_some_and(|w| w.utilization >= threshold))
         }),
         Err(_) => false,
     }
@@ -264,16 +306,25 @@ fn is_exhausted_active_from_store(
     store: &UsageStore,
 ) -> bool {
     let now = now_epoch_secs();
-    let window: Option<UsageWindow> = match store.lock() {
-        Ok(s) => s.get(name).and_then(|info| {
-            if five_hour_live(info, now) {
-                info.five_hour.clone()
-            } else {
-                None
-            }
-        }),
-        Err(_) => None,
+    // One lock window for both reads; weekly hard block trumps projection
+    // (mirrors `is_exhausted_active`).
+    let (blocked, window): (bool, Option<UsageWindow>) = match store.lock() {
+        Ok(s) => match s.get(name) {
+            Some(info) => (
+                weekly_blocked_info(info, now),
+                if five_hour_live(info, now) {
+                    info.five_hour.clone()
+                } else {
+                    None
+                },
+            ),
+            None => (false, None),
+        },
+        Err(_) => (false, None),
     };
+    if blocked {
+        return true;
+    }
     let Some(window) = window else {
         return false;
     };
@@ -441,14 +492,17 @@ pub(crate) fn find_recovered_member(chain: &[ChainMember], store: &UsageStore) -
     for member in chain {
         // A fetched entry whose 5h window is absent or past its reset is idle
         // headroom; a live window recovers only below the member's threshold.
-        // An absent entry (never fetched) stays undecidable.
+        // An absent entry (never fetched) stays undecidable. A weekly-dead
+        // member NEVER recovers — its 5h window lapsing every few hours is
+        // exactly what made it look reborn while the 7d cap still blocks it.
         let recovered = match store.lock() {
             Ok(s) => s.get(&member.name).map(|info| {
-                !five_hour_live(info, now)
-                    || info
-                        .five_hour
-                        .as_ref()
-                        .is_none_or(|w| w.utilization < member.threshold)
+                !weekly_blocked_info(info, now)
+                    && (!five_hour_live(info, now)
+                        || info
+                            .five_hour
+                            .as_ref()
+                            .is_none_or(|w| w.utilization < member.threshold))
             }),
             Err(_) => None,
         };

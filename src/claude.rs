@@ -42,7 +42,7 @@ pub(crate) fn classify_link_at(link: &Path, expected: &Path) -> Result<LinkState
     let meta = match link.symlink_metadata() {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(LinkState::Missing),
-        Err(e) => return Err(e).context("Failed to stat .credentials.json"),
+        Err(e) => return Err(e).context("failed to stat .credentials.json"),
     };
     if !meta.file_type().is_symlink() {
         // Not our symlink. On macOS, Claude Code rewrites ~/.claude/.credentials.json
@@ -66,7 +66,7 @@ pub(crate) fn classify_link_at(link: &Path, expected: &Path) -> Result<LinkState
             },
         );
     }
-    let target = std::fs::read_link(link).context("Failed to read .credentials.json link")?;
+    let target = std::fs::read_link(link).context("failed to read .credentials.json link")?;
     if paths_equivalent(&target, expected) {
         Ok(LinkState::LinkedTo)
     } else {
@@ -137,7 +137,7 @@ fn keychain_write_profile(name: &str) -> Result<()> {
 
 #[cfg(unix)]
 pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(target, link).context("Failed to create credential symlink")
+    std::os::unix::fs::symlink(target, link).context("failed to create credential symlink")
 }
 
 #[cfg(windows)]
@@ -146,7 +146,7 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(_) => std::fs::copy(target, link)
             .map(|_| ())
-            .context("Failed to copy credentials"),
+            .context("failed to copy credentials"),
     }
 }
 
@@ -154,7 +154,7 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
 pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     std::fs::copy(target, link)
         .map(|_| ())
-        .context("Failed to copy credentials")
+        .context("failed to copy credentials")
 }
 
 /// Symlink `~/.claude/.credentials.json` → profile's `credentials.json` (copy on
@@ -171,11 +171,11 @@ pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
                 let target_bytes = std::fs::read(&target).ok();
                 if live_bytes != target_bytes {
                     anyhow::bail!(
-                        "refusing to replace .credentials.json — live file differs from profile '{name}'; resolve divergence first"
+                        "refusing to replace .credentials.json: live file differs from profile '{name}'; resolve the divergence in the clauth TUI first"
                     );
                 }
             }
-            std::fs::remove_file(&link).context("Failed to remove old .credentials.json")?;
+            std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
         }
 
         if target.exists() {
@@ -198,7 +198,7 @@ pub(crate) fn clear_claude_credentials() -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
         if link.symlink_metadata().is_ok() {
-            std::fs::remove_file(&link).context("Failed to remove .credentials.json")?;
+            std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
         // macOS: also drop the live Keychain login so Claude Code can't spend the
         // account (parity with removing the credential file). This deletes
@@ -298,7 +298,7 @@ fn apply_profile_to_claude_settings_inner(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    atomic_write(&path, content).context("Failed to write settings.json")
+    atomic_write(&path, content).context("failed to write settings.json")
 }
 
 /// Build the merged settings.json content. `prev_env_keys` are stripped before
@@ -390,7 +390,7 @@ pub(crate) fn build_claude_settings_json(
         }
     }
 
-    serde_json::to_string_pretty(&settings).context("Failed to serialize settings.json")
+    serde_json::to_string_pretty(&settings).context("failed to serialize settings.json")
 }
 
 /// Save live `.credentials.json` into the active profile. No-op on divergence
@@ -445,7 +445,7 @@ pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
         if link.symlink_metadata().is_ok() {
-            std::fs::remove_file(&link).context("Failed to remove .credentials.json")?;
+            std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
         let target = profile_dir(name)?.join("credentials.json");
         if target.exists() {
@@ -491,9 +491,9 @@ pub(crate) fn detach_credentials_link() -> Result<()> {
             return Ok(());
         }
         let content =
-            std::fs::read(&path).context("Failed to read .credentials.json before detach")?;
-        std::fs::remove_file(&path).context("Failed to remove .credentials.json symlink")?;
-        atomic_write_600(&path, content).context("Failed to write detached .credentials.json")?;
+            std::fs::read(&path).context("failed to read .credentials.json before detach")?;
+        std::fs::remove_file(&path).context("failed to remove .credentials.json symlink")?;
+        atomic_write_600(&path, content).context("failed to write detached .credentials.json")?;
         Ok(())
     })
 }

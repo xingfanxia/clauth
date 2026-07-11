@@ -202,13 +202,13 @@ fn config_refresh_interval_custom_editor_renders() {
     let valid = dump(&app, 90, 20);
     assert!(valid.contains("refresh"), "refresh row label renders");
     assert!(valid.contains("45"), "typed seconds render in the field");
-    assert!(valid.contains("10–3600 s"), "valid-range tooltip renders");
+    assert!(valid.contains("10-3600 s"), "valid-range tooltip renders");
 
     // An out-of-range buffer still renders (DANGER value) without panicking.
     app.refresh_interval_draft = Some(InputState::new("99999"));
     let invalid = dump(&app, 90, 20);
     assert!(invalid.contains("99999"));
-    assert!(invalid.contains("10–3600 s"));
+    assert!(invalid.contains("10-3600 s"));
 
     // At rest, a custom (non-preset) interval shows the real value rather than
     // mis-bracketing the nearest preset chip.
@@ -249,13 +249,42 @@ fn fallback_threshold_editor_shows_range_tooltip() {
         valid.contains("70 %"),
         "typed value renders with the unit after the caret cell"
     );
-    assert!(valid.contains("0–100 %"), "valid-range tooltip renders");
+    assert!(valid.contains("0-100 %"), "valid-range tooltip renders");
 
     // An out-of-range buffer still renders (DANGER) with the same range tooltip.
     app.fallback_threshold_draft = Some(InputState::new("150"));
     let invalid = dump(&app, 90, 20);
     assert!(invalid.contains("150"));
-    assert!(invalid.contains("0–100 %"));
+    assert!(invalid.contains("0-100 %"));
+}
+
+#[test]
+fn setup_delete_row_hint_names_usage_history() {
+    use crate::tui::app::{ConfigRow, Tab, config_rows};
+    let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles,
+    };
+    let mut app = App::new(config);
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::Delete)
+        .unwrap();
+
+    // Delete removes the whole profile dir, usage_history.jsonl included, so the
+    // hint must not read as if history survives (unlike delete-credentials).
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("usage history included"),
+        "delete-row hint names usage history:\n{out}",
+    );
 }
 
 #[test]

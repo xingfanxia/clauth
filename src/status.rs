@@ -594,7 +594,7 @@ fn fetch_feed() -> anyhow::Result<Vec<Incident>> {
         .read_to_end(&mut bytes)
         .map_err(anyhow::Error::from)?;
     if bytes.len() as u64 > MAX_BODY_BYTES {
-        anyhow::bail!("status feed exceeded {MAX_BODY_BYTES} byte cap");
+        anyhow::bail!("status feed too large");
     }
     let json = String::from_utf8(bytes).map_err(anyhow::Error::from)?;
 

@@ -76,15 +76,15 @@ impl StateLock {
 
         if guard.is_none() {
             let dir = clauth_dir()?;
-            std::fs::create_dir_all(&dir).context("Failed to create ~/.clauth")?;
+            std::fs::create_dir_all(&dir).context("failed to create ~/.clauth")?;
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
                 .open(dir.join(LOCK_FILENAME))
-                .context("Failed to open clauth state lock file")?;
-            file.lock().context("Failed to acquire clauth state lock")?;
+                .context("failed to open clauth state lock file")?;
+            file.lock().context("failed to acquire clauth state lock")?;
             *guard = Some(file);
         }
 

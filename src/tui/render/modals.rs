@@ -40,7 +40,7 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return; // login ended this frame; the modal pops on the next drain
     };
     let stage = match session.stage {
-        LoginStage::WaitingBrowser => "waiting for the browser sign-in",
+        LoginStage::WaitingBrowser => "waiting for the browser login",
         LoginStage::ExchangingCode => "exchanging the code for tokens",
         LoginStage::Verifying => "verifying the minted token",
     };
@@ -63,7 +63,7 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // The URL is known once the worker announced it, so the retry is live.
         Some(_) => {
             lines.push(Line::from(Span::styled(
-                "complete the sign-in in your browser",
+                "complete the login in your browser",
                 theme::dim(),
             )));
             lines.push(Line::from(""));
@@ -237,7 +237,7 @@ fn divergence_option_text(option: DivergenceChoice, active: &str) -> String {
     match option {
         DivergenceChoice::Overwrite => format!("overwrite '{active}' with this login"),
         DivergenceChoice::NewProfile => "save this login to another profile…".to_string(),
-        DivergenceChoice::Discard => format!("discard this login, restore '{active}'"),
+        DivergenceChoice::Discard => format!("discard this login and restore '{active}'"),
     }
 }
 
@@ -383,7 +383,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
             "accounts",
             &[
                 ("\u{2191}\u{2193}", "move cursor"),
-                ("\u{23ce}", "switch to selected account (confirm)"),
+                ("\u{21b5}", "switch to selected account (confirm)"),
                 ("shift \u{2191}\u{2193}", "reorder account up / down"),
             ][..],
         )],
@@ -399,9 +399,13 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
         Tab::Tokens => vec![(
             "tokens",
             &[
-                ("\u{23ce}", "open per-model breakdown"),
+                ("\u{21b5}", "open per-model breakdown"),
                 ("\u{2191}\u{2193}", "pick model (in breakdown)"),
                 ("c", "count cache in token figures"),
+                (
+                    "t",
+                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
+                ),
                 ("r", "reload on-disk stats"),
                 ("esc", "back to dashboard"),
             ][..],
@@ -410,11 +414,11 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
             "setup",
             &[
                 ("\u{2191}\u{2193}", "pick account / + new, then a row"),
-                ("\u{23ce}", "open settings · edit field · flip toggle"),
-                ("\u{23ce} on a field", "edit inline; \u{23ce} again saves"),
+                ("\u{21b5}", "open settings · edit field · flip toggle"),
+                ("\u{21b5} on a field", "edit inline; \u{21b5} again saves"),
                 ("space", "cycle the model preset (model row)"),
-                ("env", "+ add env · \u{23ce} edits a value · a removes"),
-                ("delete", "\u{23ce} once to arm, again to confirm"),
+                ("env", "+ add env · \u{21b5} edits a value · a removes"),
+                ("delete", "\u{21b5} once to arm, again to confirm"),
                 ("esc", "stop editing / back to account list"),
             ][..],
         )],
@@ -424,7 +428,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("\u{2191}\u{2193}", "move between settings"),
                 ("space", "cycle the focused setting"),
                 (
-                    "\u{23ce}",
+                    "\u{21b5}",
                     "same as space · custom value on refresh interval",
                 ),
             ][..],
@@ -433,7 +437,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
             "status",
             &[
                 ("\u{2191}\u{2193}", "pick incident / scroll detail"),
-                ("\u{23ce}", "open incident timeline"),
+                ("\u{21b5}", "open incident timeline"),
                 ("r", "refresh the feed"),
                 ("esc", "back to the list"),
             ][..],
@@ -442,7 +446,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
             "plugin",
             &[
                 ("\u{2191}\u{2193}", "pick check · scroll detail"),
-                ("\u{23ce}", "open the selected row's detail"),
+                ("\u{21b5}", "open the selected row's detail"),
                 ("f", "apply the selected row's fix"),
                 ("r", "re-run all checks"),
                 ("esc", "back to the list"),
@@ -454,11 +458,11 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("\u{2191}\u{2193}", "move cursor / detail row"),
                 ("shift \u{2191}\u{2193}", "reorder member = priority"),
                 (
-                    "\u{23ce}",
+                    "\u{21b5}",
                     "open \u{00b7} edit threshold \u{00b7} toggle last resort \u{00b7} remove \u{00b7} add",
                 ),
                 ("+ / -", "step threshold by 5"),
-                ("\u{23ce}", "type a threshold, \u{23ce} saves"),
+                ("\u{21b5}", "type a threshold, \u{21b5} saves"),
                 ("esc", "back / cancel edit"),
             ][..],
         )],
@@ -475,7 +479,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "previous / next tab (shift tab: previous)",
     )];
 
-    let global: &[(&str, &str)] = &[
+    let global_all: &[(&str, &str)] = &[
         ("n", "new account"),
         ("r", "refresh usage now"),
         ("t", "rotate all tokens"),
@@ -486,13 +490,25 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("esc", "back within a sub-view (no-op at the top level)"),
         ("\u{2303}c", "quit from anywhere"),
     ];
+    // A key the current tab redefines is documented in its own section above;
+    // keeping the global sense too would contradict it (`t` cycles the period
+    // and `r` reloads stats on Tokens, `r` refreshes one account on Usage).
+    let shadowed: Vec<&str> = tab_specific
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|(k, _)| *k))
+        .collect();
+    let global: Vec<(&str, &str)> = global_all
+        .iter()
+        .copied()
+        .filter(|(k, _)| !shadowed.contains(k))
+        .collect();
 
     let mut lines: Vec<Line<'_>> = Vec::new();
     lines.extend(key_section("tabs", nav));
     for (section, entries) in &tab_specific {
         lines.extend(key_section(section, entries));
     }
-    lines.extend(key_section("global", global));
+    lines.extend(key_section("global", &global));
     lines.pop(); // trim trailing blank from last section
     draw_modal(frame, area, title, lines);
 }

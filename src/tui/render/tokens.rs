@@ -8,6 +8,12 @@
 //! a single model. All figures are global across every model/provider Claude
 //! Code has run — the on-disk pool is shared across clauth profiles, not
 //! per-account.
+//!
+//! Both views obey the [`TokenPeriod`] lens (`t` / action menu): `lifetime`
+//! is the untouched all-time dashboard; `daily`/`weekly`/`monthly` scope the
+//! cards to the current calendar bucket and re-bucket the trend rows. Where
+//! the data can't follow — pre-cutoff days publish no cache/in-out split —
+//! cards fall back to lifetime (badged) and costs render as `+`-marked floors.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -15,25 +21,33 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, TokenFilter, TokenView};
+use super::super::app::{App, TokenFilter, TokenPeriod, TokenView, token_period_models};
 use super::super::theme;
-use super::format::fixed;
+use super::format::{fixed, spinner_frame};
 use super::panes::{
-    draw_selector_list, picker_row, section_box, section_box_verbatim, selector_width,
+    draw_selector_list, picker_row, section_box, section_box_loading, section_box_verbatim,
+    selector_width,
 };
 use crate::pricing::PriceTable;
-use crate::tokens::{ModelTokens, TokenStats, group_models, is_anthropic, model_display_name};
+use crate::tokens::{
+    ModelTokens, PeriodModel, TokenStats, bucket_activity, bucket_tokens, current_bucket_bounds,
+    effective_cache_basis, is_anthropic, model_display_name, today_date,
+};
 
-/// Key column width for label:value rows.
-const KEY_W: usize = 8;
+/// Key column width for label:value rows (`sessions` (8) + a 2-cell gap).
+const KEY_W: usize = 10;
+/// Dashboard content-width ceiling: past this the percentage-split cards
+/// stretch their edge-anchored figures into scattered fragments with a dead
+/// middle, so the spare columns split evenly around a centered dashboard.
+const DASH_MAX_W: u16 = 120;
 /// Wider key column for the spelled-out `cache read`/`cache write` rows
 /// (composition card + per-model detail): `cache write` (11) + 1 trailing space,
 /// so every label keeps a gap before its bar/value and the columns stay aligned.
 const WIDE_KEY_W: usize = 12;
-/// Block-glyph ramp for sparklines, low → high.
+/// Block-glyph ramp for the vertical bar charts, low → high (top partial cell).
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Hour-of-day card outer width: 24 hour buckets + 4 (border + 1-col padding
-/// each side), so the fixed-width sparkline fills the box exactly.
+/// each side), so the fixed-width chart fills the box exactly.
 const HOUR_BOX_W: u16 = 28;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -117,14 +131,20 @@ fn money_style() -> Style {
 }
 
 /// A `label  $cost` row summing API-equivalent cost over `models`. Shows `—` when
-/// no price table has loaded yet, and a trailing `+` when some models carry
-/// tokens but no matching rate (so the figure is a floor, not a total).
-fn cost_line(label: &str, prices: Option<&PriceTable>, models: &[ModelTokens]) -> Line<'static> {
+/// no price table has loaded yet, and a trailing `+` when the figure is a floor
+/// rather than a total — some models carry tokens but no matching rate, or the
+/// caller knows the token set itself is incomplete (`floor`).
+fn cost_line(
+    label: &str,
+    prices: Option<&PriceTable>,
+    models: &[ModelTokens],
+    floor: bool,
+) -> Line<'static> {
     let value = match prices {
         Some(p) => {
             let (total, unpriced) = p.total_cost(models);
             let mut s = fmt_money(total);
-            if unpriced > 0 {
+            if unpriced > 0 || floor {
                 s.push('+');
             }
             s
@@ -134,11 +154,12 @@ fn cost_line(label: &str, prices: Option<&PriceTable>, models: &[ModelTokens]) -
     Line::from(vec![key(label), Span::styled(value, money_style())])
 }
 
+const MONTHS: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+
 /// `2026-01-18[...]` → `jan 18`. Degrades to the raw string when too short.
 fn short_date(ymd: &str) -> String {
-    const MONTHS: [&str; 12] = [
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-    ];
     if ymd.len() < 10 {
         return ymd.to_string();
     }
@@ -148,18 +169,186 @@ fn short_date(ymd: &str) -> String {
     format!("{mon} {day}")
 }
 
-/// Block-glyph sparkline over `vals`, scaled to the slice's own max.
-fn sparkline(vals: &[u64]) -> String {
-    let max = vals.iter().copied().max().unwrap_or(0);
-    if max == 0 {
-        return SPARK[0].to_string().repeat(vals.len());
+/// `2026-06[-..]` → `jun`. Degrades to the raw string when too short.
+fn month_label(ymd: &str) -> String {
+    if ymd.len() < 7 {
+        return ymd.to_string();
     }
-    vals.iter()
-        .map(|&v| {
-            let idx = ((v as f64 / max as f64) * 7.0).round() as usize;
-            SPARK[idx.min(7)]
+    let month: usize = ymd[5..7].parse().unwrap_or(1);
+    MONTHS
+        .get(month.saturating_sub(1))
+        .copied()
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// Four-cell bouncing block for the full-width indeterminate spinner.
+const INDET_BLOCK: usize = 4;
+
+/// Height-aware vertical block-bar chart: one `cell_w`-wide column per value
+/// (`gap` blank cells between columns), `height` rows tall, linear-scaled to
+/// the slice max, `fill`-colored. Full `█` blocks stack from the bottom; a
+/// bar's top cell is a partial `▁`..`▇` glyph when the value doesn't land on
+/// an exact 8th of a row. A nonzero value always keeps the `▁` floor cell, so
+/// a real day never renders blank. An all-zero slice renders a flat `▁`
+/// baseline. Bars are centered within `width`. Rows are top→bottom.
+fn bar_chart(
+    vals: &[u64],
+    width: usize,
+    height: usize,
+    fill: Style,
+    cell_w: usize,
+    gap: usize,
+) -> Vec<Line<'static>> {
+    bar_chart_scaled(vals, width, height, fill, false, cell_w, gap)
+}
+
+/// `bar_chart` on a square-root scale, for outlier-heavy time series: linear
+/// let one 982M day flatten months of normal use to sub-cell noise, and the
+/// p95 hard-clip that replaced it rendered every above-cap day as an identical
+/// full-height wall. sqrt keeps ordering and the peak cluster's shape while
+/// quiet days stay readable; heights aren't proportional to values, so the
+/// peak caption names the true max.
+fn bar_chart_sqrt(
+    vals: &[u64],
+    width: usize,
+    height: usize,
+    fill: Style,
+    cell_w: usize,
+    gap: usize,
+) -> Vec<Line<'static>> {
+    bar_chart_scaled(vals, width, height, fill, true, cell_w, gap)
+}
+
+fn bar_chart_scaled(
+    vals: &[u64],
+    width: usize,
+    height: usize,
+    fill: Style,
+    sqrt: bool,
+    cell_w: usize,
+    gap: usize,
+) -> Vec<Line<'static>> {
+    if height == 0 || vals.is_empty() {
+        return Vec::new();
+    }
+    let max = vals.iter().copied().max().unwrap_or(0);
+    // Height of each bar in eighth-cells (0..=height*8). No data → a flat 1/8
+    // baseline so an idle window still shows a floor rather than blank space.
+    let row_cap = (height * 8) as f64;
+    let eighths: Vec<usize> = if max == 0 {
+        vec![1; vals.len()]
+    } else {
+        vals.iter()
+            .map(|&v| {
+                let ratio = v as f64 / max as f64;
+                let scaled = if sqrt { ratio.sqrt() } else { ratio };
+                let e = (scaled * row_cap).round() as usize;
+                if v > 0 { e.max(1) } else { e }
+            })
+            .collect()
+    };
+    let chart_w = vals.len() * cell_w + vals.len().saturating_sub(1) * gap;
+    let pad = width.saturating_sub(chart_w) / 2;
+    (0..height)
+        .map(|row| {
+            // Row 0 is the top; count each bar's filled cells up from the bottom.
+            let from_bottom = height - row; // 1..=height
+            let mut s = String::with_capacity(chart_w * 3);
+            for (i, &e) in eighths.iter().enumerate() {
+                if i > 0 {
+                    s.extend(std::iter::repeat_n(' ', gap));
+                }
+                let full = e / 8;
+                let rem = e % 8;
+                let ch = if from_bottom <= full {
+                    '█'
+                } else if from_bottom == full + 1 && rem > 0 {
+                    SPARK[rem - 1]
+                } else {
+                    ' '
+                };
+                s.extend(std::iter::repeat_n(ch, cell_w));
+            }
+            Line::from(vec![Span::raw(" ".repeat(pad)), Span::styled(s, fill)])
         })
         .collect()
+}
+
+/// Column layout for `n` buckets across `width` cells: `(cell_w, gap)`.
+/// Buckets widen to multi-cell bars with a 1-cell gap once every one can hold
+/// ≥ 2 cells — discrete, countable bars instead of a thin centered blob —
+/// capped at 8 wide so a handful of monthly buckets doesn't render as walls.
+/// Falls back to dense 1-cell contiguous columns when the buckets outnumber
+/// the space.
+fn bucket_layout(n: usize, width: usize) -> (usize, usize) {
+    // Widest cell satisfying n*cell + (n-1) gaps <= width; empty series → thin.
+    let cell = (width + 1)
+        .checked_div(n)
+        .map_or(0, |c| c.saturating_sub(1))
+        .min(8);
+    if cell >= 2 { (cell, 1) } else { (1, 0) }
+}
+
+/// Month labels under a dated bucket axis: one at the first visible bucket,
+/// then at each bucket opening a new month. A label that would run into the
+/// previous one is skipped (dense daily axes keep them ~a month apart anyway).
+fn month_ticks(dates: &[&str], width: usize, cell_w: usize, gap: usize) -> Line<'static> {
+    let chart_w = dates.len() * cell_w + dates.len().saturating_sub(1) * gap;
+    let pad = width.saturating_sub(chart_w) / 2;
+    let mut out = String::new();
+    let mut prev_month = "";
+    for (i, date) in dates.iter().enumerate() {
+        if date.len() < 7 || date[5..7] == *prev_month {
+            continue;
+        }
+        prev_month = &date[5..7];
+        let col = i * (cell_w + gap);
+        if !out.is_empty() && col < out.chars().count() + 1 {
+            continue;
+        }
+        out.push_str(&" ".repeat(col - out.chars().count()));
+        out.push_str(&month_label(date));
+    }
+    Line::from(vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(out, theme::faint()),
+    ])
+}
+
+/// Full-width indeterminate spinner (cloudy-tui): a 4-cell `ACCENT` `█` block
+/// bouncing across a `░` `LINE` track inside a `[ ]` `LINE` frame, `label`
+/// trailing in `TEXT_DIM`. Position is a triangle wave over `tick` so it rides
+/// the app's one 80ms tick clock (no second timer).
+fn indeterminate_bar(tick: u64, track: usize, label: &str) -> Line<'static> {
+    let max = track.saturating_sub(INDET_BLOCK);
+    let pos = if max == 0 {
+        0
+    } else {
+        let period = 2 * max;
+        let phase = (tick as usize) % period;
+        if phase <= max { phase } else { period - phase }
+    };
+    let after = track.saturating_sub(pos + INDET_BLOCK);
+    Line::from(vec![
+        Span::styled("[", theme::line()),
+        Span::styled("░".repeat(pos), theme::line()),
+        Span::styled("█".repeat(INDET_BLOCK.min(track)), theme::accent()),
+        Span::styled("░".repeat(after), theme::line()),
+        Span::styled("]", theme::line()),
+        Span::styled(format!("  {label}"), theme::dim()),
+    ])
+}
+
+/// Full-width determinate progress run — bare `█`/`░` per the contract (the
+/// `[ ]` frame is the indeterminate variant's tell), label trailing in dim.
+fn determinate_bar(done: usize, total: usize, track: usize, label: &str) -> Line<'static> {
+    let filled = (done * track).checked_div(total).unwrap_or(0).min(track);
+    Line::from(vec![
+        Span::styled("█".repeat(filled), theme::accent()),
+        Span::styled("░".repeat(track.saturating_sub(filled)), theme::line()),
+        Span::styled(format!("  {label}"), theme::dim()),
+    ])
 }
 
 /// `█`×filled + `░`×rest, `value` scaled against `max`, in `fill`.
@@ -187,6 +376,11 @@ fn key(label: &str) -> Span<'static> {
 /// Inner content width of a card (`section_box` border + 1-col horizontal padding).
 fn inner_w(area: Rect) -> usize {
     (area.width as usize).saturating_sub(4)
+}
+
+/// Inner content height of a card (top + bottom border rows).
+fn inner_h(area: Rect) -> usize {
+    (area.height as usize).saturating_sub(2)
 }
 
 /// Last `width`-bounded tail of a chronological slice (the recent days).
@@ -224,135 +418,314 @@ fn busiest_hour(hours: &[u64; 24]) -> Option<usize> {
     (count > 0).then_some(hour)
 }
 
-/// A model's token count on the active basis: in+out, or +cache when `count_cache`.
-fn model_metric(m: &ModelTokens, count_cache: bool) -> u64 {
-    if count_cache { m.total() } else { m.in_out() }
-}
-
-/// Grouped models after the display filter, ranked DESC by the active basis
-/// (so the bars descend by the value actually shown).
-fn ranked_models(stats: &TokenStats, count_cache: bool, filter: TokenFilter) -> Vec<ModelTokens> {
-    let mut g = group_models(&stats.models);
-    g.retain(|m| filter.matches(&m.model));
-    g.sort_unstable_by_key(|m| std::cmp::Reverse(model_metric(m, count_cache)));
-    g
-}
-
 // ── dashboard view ─────────────────────────────────────────────────────────
+
+/// Center `area` within itself at `max_w` columns when it's wider.
+fn clamp_width(area: Rect, max_w: u16) -> Rect {
+    if area.width <= max_w {
+        return area;
+    }
+    Rect {
+        x: area.x + (area.width - max_w) / 2,
+        width: max_w,
+        ..area
+    }
+}
+
+/// Card rectangles for the dashboard grid, resolved per layout mode.
+struct DashRects {
+    first: Rect,
+    total: Rect,
+    trend: Rect,
+    models: Rect,
+    comp: Rect,
+    hour: Rect,
+    activity: Rect,
+}
+
+/// Two-column reflow gates: enough width for a card column plus a chart column
+/// that still beats the single-column band, enough height for the full card
+/// stack (6+6+7+6 rows) with a usable hour chart below it.
+const TWO_COL_MIN_W: u16 = 140;
+const TWO_COL_MIN_H: u16 = 30;
+/// Card (left) column width in the two-column layout.
+const CARD_COL_W: u16 = 56;
+
+/// On a big terminal the dashboard reflows to two columns — cards stacked on
+/// the left, the trend + activity charts taking the whole right column, so
+/// extra width buys visible history and extra height buys chart resolution
+/// instead of dead margins. Otherwise the single-column grid, centered in the
+/// `DASH_MAX_W` band (past it the percentage-split cards stretch their
+/// edge-anchored figures into scattered fragments).
+fn dash_rects(area: Rect) -> DashRects {
+    if area.width >= TWO_COL_MIN_W && area.height >= TWO_COL_MIN_H {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(CARD_COL_W), Constraint::Min(0)])
+            .split(area);
+        let left = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(6), // today / this week / this month
+                Constraint::Length(6), // total
+                Constraint::Length(7), // top models
+                Constraint::Length(6), // composition
+                Constraint::Min(5),    // hour of day (grows)
+            ])
+            .split(cols[0]);
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(cols[1]);
+        return DashRects {
+            first: left[0],
+            total: left[1],
+            models: left[2],
+            comp: left[3],
+            hour: left[4],
+            trend: right[0],
+            activity: right[1],
+        };
+    }
+
+    let area = clamp_width(area, DASH_MAX_W);
+    // Grow the trend card toward a ~10-row cap so its chart breathes, leaving the
+    // bottom row (hour + activity) its 4-row floor plus the rest of the height.
+    // Falls back to the old 4-row trend on short terminals.
+    let trend_h = area.height.saturating_sub(6 + 7 + 4).clamp(4, 10);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6), // today/this week/this month · total (incl. cost row)
+            Constraint::Length(trend_h), // daily/weekly/monthly trend (growable)
+            Constraint::Length(7), // top models · composition
+            Constraint::Min(4),    // hour · activity (takes the rest)
+        ])
+        .split(area);
+    let top = halves(rows[0], 42);
+    let mid = halves(rows[2], 55);
+    // Hour graph is a fixed 24-bucket chart (one cell/hour). Pin its box width
+    // to 24 + 4 (border + 1-col padding each side) so the graph fills it with
+    // no gap; activity takes the rest and shows more history on wide terminals.
+    let bot = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(HOUR_BOX_W), Constraint::Min(0)])
+        .split(rows[3]);
+    DashRects {
+        first: top[0],
+        total: top[1],
+        trend: rows[1],
+        models: mid[0],
+        comp: mid[1],
+        hour: bot[0],
+        activity: bot[1],
+    }
+}
 
 fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(stats) = app.token_stats.as_ref() else {
+        let area = clamp_width(area, DASH_MAX_W);
         let block = section_box("tokens", false, true);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let (msg, style) = if app.tokens_failed {
-            ("~/.claude/stats-cache.json unreadable", theme::danger())
+        let line = if app.tokens_failed {
+            Line::from(Span::styled(
+                "~/.claude/stats-cache.json unreadable",
+                theme::danger(),
+            ))
         } else {
-            ("reading ~/.claude", theme::faint())
+            // Pre-first-paint: only the stats-cache parse runs before `Base`
+            // seeds the tab, so the label names that stage. Reserve the `[ ]`,
+            // its gap, and the label from the track.
+            const LABEL: &str = "parsing stats-cache.json…";
+            let track = inner_w(area)
+                .saturating_sub(2 + 2 + LABEL.chars().count())
+                .clamp(INDET_BLOCK, 40);
+            indeterminate_bar(app.tick_count, track, LABEL)
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, style))).style(theme::base()),
-            inner,
-        );
+        frame.render_widget(Paragraph::new(line).style(theme::base()), inner);
         return;
     };
 
     let count_cache = app.config().state.count_cache;
     let prices = app.price_table.as_ref();
+    let period = app.token_period;
+    // While the transcript top-up is in flight, the first card's title carries a
+    // braille spinner (one clock — the app's tick frame).
+    let card_spin = app.tokens_topping_up.then(|| spinner_frame(app.tick_count));
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(6), // today · total (incl. cost row)
-            Constraint::Length(4), // daily
-            Constraint::Length(7), // top models · composition
-            Constraint::Min(4),    // hour · activity
-        ])
-        .split(area);
-
-    let top = halves(rows[0], 42);
-    // Today's date → the today card's title-right meta badge.
-    let today_meta = stats.today.as_ref().map(|t| short_date(&t.date));
+    let r = dash_rects(area);
+    if let Some(bucket) = period.bucket() {
+        // Scoped first card: the current calendar bucket, meta = its start day.
+        let (from, to) = current_bucket_bounds(&today_date(), bucket);
+        // `→` = "from this day"; a `+` here would collide with the cost floor's
+        // `$X+` suffix inches below it.
+        let meta = format!("{} →", short_date(&from));
+        card(
+            frame,
+            r.first,
+            period.badge().unwrap_or("period"),
+            Some(&meta),
+            true,
+            card_spin,
+            period_lines(stats, inner_w(r.first), count_cache, prices, &from, &to),
+        );
+    } else {
+        // Today's date → the today card's title-right meta badge.
+        let today_meta = stats.today.as_ref().map(|t| short_date(&t.date));
+        card(
+            frame,
+            r.first,
+            "today",
+            today_meta.as_deref(),
+            true,
+            card_spin,
+            today_lines(stats, inner_w(r.first), count_cache, prices),
+        );
+    }
+    // Total stays the lifetime anchor in every period — the scoped window
+    // already owns the first card.
+    let (total_body, total_meta) = total_lines(stats, inner_w(r.total), count_cache, prices);
     card(
         frame,
-        top[0],
-        "today",
-        today_meta.as_deref(),
-        true,
-        today_lines(stats, inner_w(top[0]), count_cache, prices),
-    );
-    card(
-        frame,
-        top[1],
+        r.total,
         "total",
+        total_meta.as_deref(),
+        false,
         None,
-        false,
-        total_lines(stats, inner_w(top[1]), count_cache, prices),
+        total_body,
     );
 
-    // Freshness badge → the daily card's title-right meta slot.
-    let fresh = stats
-        .topped_up_through
-        .as_deref()
-        .map(|d| format!("live thru {}", short_date(d)));
+    // Freshness badge → the trend card's title-right meta slot. Before the first
+    // top-up lands there is no `live thru` date, so a topping-up spinner stands in.
+    let trend_meta = if let Some(d) = stats.topped_up_through.as_deref() {
+        Some(format!("live thru {}", short_date(d)))
+    } else if app.tokens_topping_up {
+        // Sweep counts (when the loader has reported any) ride the spinner.
+        let count = app
+            .tokens_progress
+            .map(|(d, t)| format!(" {d}/{t}"))
+            .unwrap_or_default();
+        Some(format!("{} scanning{count}", spinner_frame(app.tick_count)))
+    } else {
+        None
+    };
+    let trend_title = match period {
+        TokenPeriod::Weekly => "by week",
+        TokenPeriod::Monthly => "by month",
+        TokenPeriod::Lifetime | TokenPeriod::Daily => "daily",
+    };
+    // A fresh install has no daily history to chart while the first sweep runs;
+    // the trend interior carries the full-width scanning bar instead of the
+    // bare "no daily data" empty state (determinate once counts arrive).
+    let trend_body = if stats.daily.is_empty() && app.tokens_topping_up {
+        let label = match app.tokens_progress {
+            Some((d, t)) => format!("scanning session logs {d}/{t}"),
+            None => "scanning session logs".to_string(),
+        };
+        let track = inner_w(r.trend)
+            .saturating_sub(2 + 2 + label.chars().count())
+            .clamp(INDET_BLOCK, 40);
+        vec![match app.tokens_progress {
+            Some((d, t)) => determinate_bar(d, t, track, &label),
+            None => indeterminate_bar(app.tick_count, track, &label),
+        }]
+    } else {
+        trend_lines(stats, inner_w(r.trend), inner_h(r.trend), period)
+    };
     card(
         frame,
-        rows[1],
-        "daily",
-        fresh.as_deref(),
+        r.trend,
+        trend_title,
+        trend_meta.as_deref(),
         false,
-        daily_lines(stats, inner_w(rows[1])),
+        None,
+        trend_body,
     );
 
-    let mid = halves(rows[2], 55);
-    // The active model filter shows as the card's title-right meta badge.
+    // Filter + period lenses both show as the card's title-right meta badge.
+    let model_rows = token_period_models(app);
+    let models_meta = join_badges(app.token_filter.badge(), Some(period.lens_badge()));
     card(
         frame,
-        mid[0],
+        r.models,
         "top models",
-        app.token_filter.badge(),
+        models_meta.as_deref(),
         false,
+        None,
         model_lines(
-            stats,
-            inner_w(mid[0]),
+            &model_rows,
+            inner_w(r.models),
             5,
-            count_cache,
+            effective_cache_basis(&model_rows, count_cache),
             prices,
-            app.token_filter,
+            empty_models_msg(app.token_filter),
         ),
     );
-    card(
-        frame,
-        mid[1],
-        "composition",
-        None,
-        false,
-        comp_lines(stats, inner_w(mid[1])),
-    );
+    // Composition can scope honestly only to today (transcript-derived split);
+    // weekly/monthly fall back to lifetime, badged as such.
+    let (comp_meta, comp) = match period {
+        TokenPeriod::Daily => (Some("today"), today_comp_lines(stats, inner_w(r.comp))),
+        TokenPeriod::Weekly | TokenPeriod::Monthly => {
+            (Some("lifetime"), comp_lines(stats, inner_w(r.comp)))
+        }
+        TokenPeriod::Lifetime => (Some("lifetime"), comp_lines(stats, inner_w(r.comp))),
+    };
+    card(frame, r.comp, "composition", comp_meta, false, None, comp);
 
-    // Hour graph is a fixed 24-bucket sparkline (one cell/hour). Pin its box to
-    // 24 + 4 (border + 1-col padding each side) so the graph fills it with no
-    // gap; activity takes the rest and shows more history on wide terminals.
-    let bot = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(HOUR_BOX_W), Constraint::Min(0)])
-        .split(rows[3]);
+    // Same fallback shape as composition: per-day hours exist only for today.
+    let (hour_meta, hours) = match period {
+        TokenPeriod::Daily => (
+            Some("today"),
+            stats.today.as_ref().map(|t| t.hours).unwrap_or([0; 24]),
+        ),
+        TokenPeriod::Weekly | TokenPeriod::Monthly | TokenPeriod::Lifetime => {
+            (Some("lifetime"), stats.hour_counts)
+        }
+    };
     card(
         frame,
-        bot[0],
+        r.hour,
         "hour of day",
-        None,
+        hour_meta,
         false,
-        hour_lines(stats, inner_w(bot[0])),
+        None,
+        hour_lines(&hours, inner_w(r.hour), inner_h(r.hour)),
     );
+    let act_meta = match period {
+        TokenPeriod::Weekly => Some("by week"),
+        TokenPeriod::Monthly => Some("by month"),
+        TokenPeriod::Lifetime | TokenPeriod::Daily => Some("by day"),
+    };
     card(
         frame,
-        bot[1],
+        r.activity,
         "activity",
-        None,
+        act_meta,
         false,
-        activity_lines(stats, inner_w(bot[1])),
+        None,
+        activity_lines(stats, inner_w(r.activity), inner_h(r.activity), period),
     );
+}
+
+/// Compose the filter + period meta badges into one title-right string.
+fn join_badges(filter: Option<&'static str>, period: Option<&'static str>) -> Option<String> {
+    match (filter, period) {
+        (Some(f), Some(p)) => Some(format!("{f}  {p}")),
+        (Some(f), None) => Some(f.to_string()),
+        (None, Some(p)) => Some(p.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Empty-state copy for a model list: name the filter when one is narrowing,
+/// else the window simply has no usage.
+fn empty_models_msg(filter: TokenFilter) -> &'static str {
+    if filter == TokenFilter::All {
+        "no model usage yet"
+    } else {
+        "no models match the filter"
+    }
 }
 
 /// Split a row into two columns, the left taking `left_pct` percent.
@@ -367,16 +740,21 @@ fn halves(area: Rect, left_pct: u16) -> std::rc::Rc<[Rect]> {
 }
 
 /// Draw one bordered card with its lines. `meta` (if any) renders as a
-/// right-aligned title badge (the cloudy-tui title-right meta slot).
+/// right-aligned title badge (the cloudy-tui title-right meta slot); `spinner`
+/// (if any) appends a braille loading frame into the title's left inset.
 fn card(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
     meta: Option<&str>,
     first: bool,
+    spinner: Option<&str>,
     lines: Vec<Line<'static>>,
 ) {
-    let mut block = section_box(title, false, first);
+    let mut block = match spinner {
+        Some(f) => section_box_loading(title, false, first, f),
+        None => section_box(title, false, first),
+    };
     if let Some(m) = meta {
         block = block.title(
             Line::from(Span::styled(format!(" {m} "), theme::dim())).alignment(Alignment::Right),
@@ -402,10 +780,10 @@ fn today_lines(
     let tokens = if count_cache { t.total() } else { t.in_out() };
     vec![
         kv_accent("tokens", fmt_count(tokens)),
-        cost_line("cost", prices, &t.models),
+        cost_line("cost", prices, &t.models, false),
         Line::from(vec![
             key("msgs"),
-            Span::styled(t.messages.to_string(), theme::body()),
+            Span::styled(group_thousands(t.messages as f64, 0), theme::body()),
         ]),
         lr(
             vec![Span::styled(
@@ -421,12 +799,15 @@ fn today_lines(
     ]
 }
 
+/// The lifetime TOTAL card: kv rows grouped on the left (the old right-edge
+/// `msgs`/date scatter read as fragments on wide cards), lifetime date range
+/// as the returned title-right meta.
 fn total_lines(
     stats: &TokenStats,
     w: usize,
     count_cache: bool,
     prices: Option<&PriceTable>,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Option<String>) {
     let last = stats
         .topped_up_through
         .as_deref()
@@ -437,7 +818,7 @@ fn total_lines(
     } else {
         stats.total_in_out()
     };
-    let mut lines = vec![
+    let lines = vec![
         lr(
             vec![
                 key("tokens"),
@@ -447,99 +828,175 @@ fn total_lines(
                 ),
             ],
             vec![Span::styled(
-                format!("{:.0}% cached", stats.cache_hit_ratio() * 100.0),
+                format!("{:.0}% cache hit", stats.cache_hit_ratio() * 100.0),
                 Style::default().fg(theme::info_color()),
             )],
             w,
         ),
-        cost_line("cost", prices, &stats.models),
-        lr(
-            vec![Span::styled(
-                format!("{} sess", stats.total_sessions),
+        cost_line("cost", prices, &stats.models, false),
+        Line::from(vec![
+            key("sessions"),
+            Span::styled(
+                group_thousands(stats.total_sessions as f64, 0),
                 theme::body(),
-            )],
-            vec![Span::styled(
-                format!("{} msgs", fmt_count(stats.total_messages)),
-                theme::body(),
-            )],
-            w,
-        ),
+            ),
+        ]),
+        Line::from(vec![
+            key("msgs"),
+            Span::styled(fmt_count(stats.total_messages), theme::body()),
+        ]),
     ];
-    if let (Some(first), Some(latest)) = (stats.first_session_date.as_deref(), last) {
-        lines.push(lr(
-            vec![Span::styled(short_date(first), theme::dim())],
-            vec![Span::styled(short_date(latest), theme::dim())],
-            w,
-        ));
-    }
-    lines
+    let meta = match (stats.first_session_date.as_deref(), last) {
+        (Some(first), Some(latest)) => {
+            Some(format!("{} → {}", short_date(first), short_date(latest)))
+        }
+        _ => None,
+    };
+    (lines, meta)
 }
 
-fn daily_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
-    let vals: Vec<u64> = trail(&stats.daily, w).iter().map(|d| d.tokens).collect();
-    if vals.is_empty() {
-        return vec![Line::from(Span::styled("no daily data", theme::faint()))];
-    }
-    let (peak_v, peak_d) = stats
+/// The this-week / this-month headline card. Tokens and msgs sum the calendar
+/// bucket's days; cost sums the priceable (split-bearing) days and renders as
+/// a `+` floor when stats-cache days hide part of the window.
+fn period_lines(
+    stats: &TokenStats,
+    w: usize,
+    count_cache: bool,
+    prices: Option<&PriceTable>,
+    from: &str,
+    to: &str,
+) -> Vec<Line<'static>> {
+    let in_range = |date: &str| date >= from && date <= to;
+    let rows = crate::tokens::period_models(&stats.daily_models, from, to);
+    let complete = rows.iter().all(|m| m.split_complete);
+    let splits: Vec<ModelTokens> = rows.iter().map(|m| m.split.clone()).collect();
+    let in_out: u64 = stats
         .daily
         .iter()
-        .max_by_key(|d| d.tokens)
-        .map(|d| (d.tokens, d.date.clone()))
-        .unwrap_or((0, String::new()));
+        .filter(|d| in_range(&d.date))
+        .map(|d| d.tokens)
+        .sum();
+    if in_out == 0 && rows.is_empty() {
+        return vec![Line::from(Span::styled("idle so far", theme::faint()))];
+    }
+    // The cache-counting basis holds only when the whole window carries splits.
+    let tokens = if count_cache && complete {
+        splits.iter().map(ModelTokens::total).sum()
+    } else {
+        in_out
+    };
+    let msgs: u64 = stats
+        .activity
+        .iter()
+        .filter(|a| in_range(&a.date))
+        .map(|a| a.messages)
+        .sum();
     vec![
-        center(vec![Span::styled(sparkline(&vals), theme::accent())], w),
-        center(
-            vec![Span::styled(
-                format!("peak {} {}", fmt_count(peak_v), short_date(&peak_d)),
-                theme::faint(),
-            )],
+        kv_accent("tokens", fmt_count(tokens)),
+        cost_line("cost", prices, &splits, !complete),
+        Line::from(vec![
+            key("msgs"),
+            Span::styled(group_thousands(msgs as f64, 0), theme::body()),
+        ]),
+        lr(
+            vec![Span::styled(short_date(from), theme::dim())],
+            vec![Span::styled(short_date(to), theme::dim())],
             w,
         ),
     ]
 }
 
+/// The trend chart — per-day columns, or calendar buckets under the weekly /
+/// monthly lens (peak caption names the bucket). The bars grow to fill `h` rows,
+/// caption pinned to the bottom.
+fn trend_lines(stats: &TokenStats, w: usize, h: usize, period: TokenPeriod) -> Vec<Line<'static>> {
+    let series = match period.bucket() {
+        Some(b) => bucket_tokens(&stats.daily, b),
+        None => stats.daily.clone(),
+    };
+    let tail = trail(&series, w);
+    let vals: Vec<u64> = tail.iter().map(|d| d.tokens).collect();
+    if vals.is_empty() {
+        return vec![Line::from(Span::styled("no daily data", theme::faint()))];
+    }
+    let dates: Vec<&str> = tail.iter().map(|d| d.date.as_str()).collect();
+    let (peak_v, peak_d) = series
+        .iter()
+        .max_by_key(|d| d.tokens)
+        .map(|d| (d.tokens, d.date.clone()))
+        .unwrap_or((0, String::new()));
+    let peak = match period {
+        TokenPeriod::Weekly => {
+            format!("peak {} wk of {}", fmt_count(peak_v), short_date(&peak_d))
+        }
+        TokenPeriod::Monthly => format!("peak {} {}", fmt_count(peak_v), month_label(&peak_d)),
+        TokenPeriod::Lifetime | TokenPeriod::Daily => {
+            format!("peak {} {}", fmt_count(peak_v), short_date(&peak_d))
+        }
+    };
+    // Bars widen to fill the card; a month tick row squeezes in under the axis
+    // only when the chart keeps ≥ 2 rows of its own (same gate as hour-of-day).
+    let (cell, gap) = bucket_layout(vals.len(), w);
+    let ticks = h >= 4;
+    let mut lines = bar_chart_sqrt(
+        &vals,
+        w,
+        h.saturating_sub(1 + usize::from(ticks)),
+        theme::accent(),
+        cell,
+        gap,
+    );
+    if ticks {
+        lines.push(month_ticks(&dates, w, cell, gap));
+    }
+    lines.push(center(vec![Span::styled(peak, theme::faint())], w));
+    lines
+}
+
 fn model_lines(
-    stats: &TokenStats,
+    rows: &[PeriodModel],
     w: usize,
     n: usize,
-    count_cache: bool,
+    basis: bool,
     prices: Option<&PriceTable>,
-    filter: TokenFilter,
+    empty_msg: &'static str,
 ) -> Vec<Line<'static>> {
-    let grouped = ranked_models(stats, count_cache, filter);
-    if grouped.is_empty() {
-        return vec![Line::from(Span::styled(
-            "no models match the filter",
-            theme::faint(),
-        ))];
+    if rows.is_empty() {
+        return vec![Line::from(Span::styled(empty_msg, theme::faint()))];
     }
-    let max = grouped
-        .first()
-        .map(|m| model_metric(m, count_cache))
-        .unwrap_or(0);
-    let names: Vec<String> = grouped
+    let max = rows.first().map(|m| m.metric(basis)).unwrap_or(0);
+    let names: Vec<String> = rows
         .iter()
         .take(n)
         .map(|m| model_display_name(&m.model))
         .collect();
     // Token-count strings, right-aligned to a shared column so the counts (and
     // the cost suffix after them) form clean vertical columns across rows.
-    let counts: Vec<String> = grouped
+    let counts: Vec<String> = rows
         .iter()
         .take(n)
-        .map(|m| fmt_count(model_metric(m, count_cache)))
+        .map(|m| fmt_count(m.metric(basis)))
         .collect();
     let count_w = counts.iter().map(|s| s.chars().count()).max().unwrap_or(3);
     // Per-model API-equivalent cost suffix (empty when unpriced / not loaded),
-    // right-aligned to its own shared column.
-    let costs: Vec<String> = grouped
+    // right-aligned to its own shared column; a partial split reads as a floor.
+    let costs: Vec<String> = rows
         .iter()
         .take(n)
-        .map(|m| {
-            prices
-                .and_then(|p| p.cost(m))
-                .map(fmt_money)
-                .unwrap_or_default()
+        .map(|m| match prices {
+            // No price table at all → no column; a loaded table with an
+            // unpriced model (unknown third-party id) shows the no-value dash.
+            None => String::new(),
+            Some(p) => p
+                .cost(&m.split)
+                .map(|c| {
+                    let mut s = fmt_money(c);
+                    if !m.split_complete {
+                        s.push('+');
+                    }
+                    s
+                })
+                .unwrap_or_else(|| "—".to_string()),
         })
         .collect();
     let cost_w = costs.iter().map(|s| s.chars().count()).max().unwrap_or(0);
@@ -560,8 +1017,7 @@ fn model_lines(
         .saturating_sub(label_w)
         .saturating_sub(count_w + 2 + cost_col)
         .clamp(4, 30);
-    grouped
-        .iter()
+    rows.iter()
         .take(n)
         .zip(names.iter())
         .zip(counts.iter())
@@ -572,7 +1028,7 @@ fn model_lines(
             } else {
                 theme::dim()
             };
-            let val = model_metric(m, count_cache);
+            let val = m.metric(basis);
             let mut spans = vec![
                 Span::styled(fixed(name, label_w), theme::body()),
                 Span::raw(" "),
@@ -580,7 +1036,19 @@ fn model_lines(
             spans.extend(hbar(val, max, bar_w, fill));
             spans.push(Span::styled(format!(" {count:>count_w$}"), theme::dim()));
             if show_cost {
-                spans.push(Span::styled(format!(" {cost:>cost_w$}"), money_style()));
+                // The no-value dash stays faint — orange is the money identity.
+                let style = if cost == "—" {
+                    theme::faint()
+                } else {
+                    money_style()
+                };
+                // Cost column anchored to the card's right edge — the bar cap
+                // (30) otherwise leaves the row's tail dangling mid-card.
+                let gap = w
+                    .saturating_sub(label_w + 1 + bar_w + 1 + count_w + cost_w)
+                    .max(1);
+                spans.push(Span::raw(" ".repeat(gap)));
+                spans.push(Span::styled(format!("{cost:>cost_w$}"), style));
             }
             Line::from(spans)
         })
@@ -588,13 +1056,44 @@ fn model_lines(
 }
 
 fn comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
-    let grand = stats.total_tokens();
+    comp_rows(
+        stats.total_input,
+        stats.total_output,
+        stats.total_cache_create,
+        stats.total_cache_read,
+        w,
+    )
+}
+
+/// Today's transcript-derived split — the one window besides lifetime whose
+/// composition is fully known.
+fn today_comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
+    match stats.today.as_ref() {
+        Some(t) => comp_rows(t.input, t.output, t.cache_create, t.cache_read, w),
+        None => vec![Line::from(Span::styled(
+            "idle so far today",
+            theme::faint(),
+        ))],
+    }
+}
+
+fn comp_rows(
+    input: u64,
+    output: u64,
+    cache_write: u64,
+    cache_read: u64,
+    w: usize,
+) -> Vec<Line<'static>> {
+    let grand = input
+        .saturating_add(output)
+        .saturating_add(cache_write)
+        .saturating_add(cache_read);
     let bar_w = w.saturating_sub(WIDE_KEY_W).saturating_sub(6).clamp(4, 28);
     [
-        ("input", stats.total_input, theme::accent()),
-        ("output", stats.total_output, theme::success()),
-        ("cache write", stats.total_cache_create, theme::warning()),
-        ("cache read", stats.total_cache_read, theme::info()),
+        ("input", input, theme::accent()),
+        ("output", output, theme::success()),
+        ("cache write", cache_write, theme::warning()),
+        ("cache read", cache_read, theme::info()),
     ]
     .into_iter()
     .map(|(label, value, fill)| {
@@ -603,56 +1102,105 @@ fn comp_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
         } else {
             value as f64 / grand as f64 * 100.0
         };
-        let mut spans = vec![Span::styled(
+        let mut left = vec![Span::styled(
             format!("{label:<WIDE_KEY_W$}"),
             theme::label(),
         )];
-        spans.extend(hbar(value, grand, bar_w, fill));
-        spans.push(Span::styled(format!(" {pct:>3.0}%"), theme::dim()));
-        Line::from(spans)
+        left.extend(hbar(value, grand, bar_w, fill));
+        // Percentage anchored to the card's right edge (not the bar's end), so
+        // the column reads as one rail however wide the card gets.
+        lr(
+            left,
+            vec![Span::styled(format!("{pct:>3.0}%"), theme::dim())],
+            w,
+        )
     })
     .collect()
 }
 
-fn hour_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
-    // Centered 24-bucket sparkline with the busiest hour centered below it.
-    let peak = busiest_hour(&stats.hour_counts)
+fn hour_lines(hours: &[u64; 24], w: usize, h: usize) -> Vec<Line<'static>> {
+    // 24-bucket chart grown vertically — hour columns widen up to 3 cells when
+    // the card has the room (contiguous: this one is a distribution, not
+    // discrete buckets) — busiest hour named below it. Tick labels squeeze in
+    // only when the chart keeps ≥ 2 rows of its own.
+    let peak = busiest_hour(hours)
         .map(|h| format!("peak {h:02}:00"))
         .unwrap_or_default();
-    vec![
-        center(
-            vec![Span::styled(sparkline(&stats.hour_counts), theme::accent())],
-            w,
-        ),
-        center(vec![Span::styled(peak, theme::faint())], w),
-    ]
+    let cell = (w / 24).clamp(1, 3);
+    let ticks = h >= 4;
+    let chart_h = h.saturating_sub(1 + usize::from(ticks));
+    let mut lines = bar_chart(hours, w, chart_h, theme::accent(), cell, 0);
+    if ticks {
+        // 0/6/12/18 labels at their hour's column, matching `bar_chart`'s
+        // centering so ticks sit under bars at any cell width.
+        let pad = w.saturating_sub(24 * cell) / 2;
+        let mut row = String::new();
+        for hour in [0usize, 6, 12, 18] {
+            row.push_str(&" ".repeat(hour * cell - row.chars().count()));
+            row.push_str(&hour.to_string());
+        }
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(pad)),
+            Span::styled(row, theme::faint()),
+        ]));
+    }
+    lines.push(center(vec![Span::styled(peak, theme::faint())], w));
+    lines
 }
 
-fn activity_lines(stats: &TokenStats, w: usize) -> Vec<Line<'static>> {
-    let msgs: Vec<u64> = trail(&stats.activity, w)
-        .iter()
-        .map(|a| a.messages)
-        .collect();
+fn activity_lines(
+    stats: &TokenStats,
+    w: usize,
+    h: usize,
+    period: TokenPeriod,
+) -> Vec<Line<'static>> {
+    let series = match period.bucket() {
+        Some(b) => bucket_activity(&stats.activity, b),
+        None => stats.activity.clone(),
+    };
+    let tail = trail(&series, w);
+    let msgs: Vec<u64> = tail.iter().map(|a| a.messages).collect();
     if msgs.is_empty() {
         return vec![Line::from(Span::styled("no activity data", theme::faint()))];
     }
-    let peak_msgs = stats.activity.iter().map(|a| a.messages).max().unwrap_or(0);
-    let peak_sess = stats.activity.iter().map(|a| a.sessions).max().unwrap_or(0);
-    let tools: u64 = stats.activity.iter().map(|a| a.tool_calls).sum();
-    vec![
-        center(vec![Span::styled(sparkline(&msgs), theme::accent())], w),
-        center(
-            vec![Span::styled(
-                format!(
-                    "peak {} msgs   {peak_sess} sess   {} tools",
-                    fmt_count(peak_msgs),
-                    fmt_count(tools),
-                ),
-                theme::faint(),
-            )],
-            w,
-        ),
-    ]
+    let dates: Vec<&str> = tail.iter().map(|a| a.date.as_str()).collect();
+    // Caption reports the single busiest-by-messages bucket's own three real
+    // figures — not maxima mixed across buckets plus a lifetime tool sum (which
+    // read the same in every lens). Granularity word distinguishes day/wk/mo.
+    let gran = match period {
+        TokenPeriod::Weekly => "wk",
+        TokenPeriod::Monthly => "mo",
+        TokenPeriod::Lifetime | TokenPeriod::Daily => "day",
+    };
+    let caption = series
+        .iter()
+        .max_by_key(|a| a.messages)
+        .map(|a| {
+            format!(
+                "peak {gran}: {} msgs   {} sess   {} tools",
+                fmt_count(a.messages),
+                a.sessions,
+                fmt_count(a.tool_calls),
+            )
+        })
+        .unwrap_or_default();
+    // Same sqrt scale, bar widening, and tick gate as the trend chart —
+    // activity has the same outlier shape and the same axis question.
+    let (cell, gap) = bucket_layout(msgs.len(), w);
+    let ticks = h >= 4;
+    let mut lines = bar_chart_sqrt(
+        &msgs,
+        w,
+        h.saturating_sub(1 + usize::from(ticks)),
+        theme::accent(),
+        cell,
+        gap,
+    );
+    if ticks {
+        lines.push(month_ticks(&dates, w, cell, gap));
+    }
+    lines.push(center(vec![Span::styled(caption, theme::faint())], w));
+    lines
 }
 
 /// `key:value` line whose value is the accent-bold headline number.
@@ -674,35 +1222,41 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ])
         .split(area);
 
-    let count_cache = app.config().state.count_cache;
-    let grouped = app
-        .token_stats
-        .as_ref()
-        .map(|s| ranked_models(s, count_cache, app.token_filter))
-        .unwrap_or_default();
+    let grouped = token_period_models(app);
     let sel = app.token_model_cursor.min(grouped.len().saturating_sub(1));
 
-    // The selector title carries the filter so the narrowed list reads as such.
-    let title = match app.token_filter.badge() {
+    // The selector title carries the active lenses so the narrowed list reads
+    // as such.
+    let title = match join_badges(
+        app.token_filter.badge(),
+        Some(app.token_period.lens_badge()),
+    ) {
         Some(badge) => format!("models  {badge}"),
         None => "models".to_string(),
     };
-    // A filter can empty the list mid-view (menu on the Models view) —
+    // A lens can empty the list mid-view (menu on the Models view) —
     // `draw_selector_list`'s shared empty state talks about accounts, so
-    // render the filter-specific message instead.
+    // render the lens-specific message instead.
     if grouped.is_empty() {
         let block = section_box(&title, true, true);
         let inner = block.inner(cols[0]);
         frame.render_widget(block, cols[0]);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "no models match the filter",
+                empty_models_msg(app.token_filter),
                 theme::faint(),
             )))
             .style(theme::base()),
             inner,
         );
-        draw_model_detail(frame, cols[1], None, 0, app.price_table.as_ref());
+        draw_model_detail(
+            frame,
+            cols[1],
+            None,
+            0,
+            app.price_table.as_ref(),
+            app.token_period,
+        );
         return;
     }
     draw_selector_list(frame, cols[0], &title, true, sel, |w| {
@@ -720,26 +1274,45 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .collect()
     });
 
-    let grand = app
-        .token_stats
-        .as_ref()
-        .map(TokenStats::total_tokens)
-        .unwrap_or(0);
     draw_model_detail(
         frame,
         cols[1],
         grouped.get(sel),
-        grand,
+        period_grand(app),
         app.price_table.as_ref(),
+        app.token_period,
     );
+}
+
+/// Share-of-window denominator for the detail card, on the same basis as its
+/// numerator per mode: full throughput for lifetime/today, in+out for scoped
+/// weeks/months (the only figure every day in range carries).
+fn period_grand(app: &App) -> u64 {
+    let Some(stats) = app.token_stats.as_ref() else {
+        return 0;
+    };
+    if let Some(bucket) = app.token_period.bucket() {
+        let (from, to) = current_bucket_bounds(&today_date(), bucket);
+        stats
+            .daily
+            .iter()
+            .filter(|d| d.date >= from && d.date <= to)
+            .map(|d| d.tokens)
+            .sum()
+    } else if app.token_period == TokenPeriod::Daily {
+        stats.today.as_ref().map(|t| t.total()).unwrap_or(0)
+    } else {
+        stats.total_tokens()
+    }
 }
 
 fn draw_model_detail(
     frame: &mut Frame<'_>,
     area: Rect,
-    model: Option<&ModelTokens>,
+    model: Option<&PeriodModel>,
     grand: u64,
     prices: Option<&PriceTable>,
+    period: TokenPeriod,
 ) {
     let title = model
         .map(|m| model_display_name(&m.model))
@@ -765,21 +1338,40 @@ fn draw_model_detail(
             Span::styled(value, theme::body()),
         ])
     };
-    let mut lines = vec![
-        kv("input", fmt_count(m.input)),
-        kv("output", fmt_count(m.output)),
-        kv("cache read", fmt_count(m.cache_read)),
-        kv("cache write", fmt_count(m.cache_create)),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(format!("{:<WIDE_KEY_W$}", "total"), theme::label()),
-            Span::styled(
-                fmt_count(m.total()),
-                theme::accent().add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        kv("io", fmt_count(m.in_out())),
-    ];
+    let s = &m.split;
+    let mut lines = if m.split_complete {
+        vec![
+            kv("input", fmt_count(s.input)),
+            kv("output", fmt_count(s.output)),
+            kv("cache read", fmt_count(s.cache_read)),
+            kv("cache write", fmt_count(s.cache_create)),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(format!("{:<WIDE_KEY_W$}", "total"), theme::label()),
+                Span::styled(
+                    fmt_count(s.total()),
+                    theme::accent().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            kv("in+out", fmt_count(s.in_out())),
+        ]
+    } else {
+        // Part of the window predates the transcript cutoff, where only the
+        // combined in+out per model exists — no split rows, no cache lens.
+        vec![
+            Line::from(vec![
+                Span::styled(format!("{:<WIDE_KEY_W$}", "tokens"), theme::label()),
+                Span::styled(
+                    fmt_count(m.in_out),
+                    theme::accent().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "in+out only (older days carry no split)",
+                theme::faint(),
+            )),
+        ]
+    };
 
     // API-equivalent cost, split by token bucket (rates differ per bucket).
     lines.push(Line::from(""));
@@ -787,6 +1379,11 @@ fn draw_model_detail(
         "COST · API-EQUIVALENT",
         theme::label(),
     )));
+    // Cost values share the `money_style` identity (vs the body-styled
+    // token counts above).
+    let cost_kv = |label: &str, value: String| {
+        Line::from(vec![key(label), Span::styled(value, money_style())])
+    };
     match prices {
         None => lines.push(Line::from(Span::styled("rates loading", theme::faint()))),
         Some(p) => match p.rate(&m.model) {
@@ -794,16 +1391,11 @@ fn draw_model_detail(
                 "no rate for this model",
                 theme::faint(),
             ))),
-            Some(r) => {
-                let c_in = m.input as f64 * r.input;
-                let c_out = m.output as f64 * r.output;
+            Some(r) if m.split_complete => {
+                let c_in = s.input as f64 * r.input;
+                let c_out = s.output as f64 * r.output;
                 let c_cache =
-                    m.cache_read as f64 * r.cache_read + m.cache_create as f64 * r.cache_write;
-                // Cost values share the `money_style` identity (vs the body-styled
-                // token counts above).
-                let cost_kv = |label: &str, value: String| {
-                    Line::from(vec![key(label), Span::styled(value, money_style())])
-                };
+                    s.cache_read as f64 * r.cache_read + s.cache_create as f64 * r.cache_write;
                 lines.push(cost_kv("input", fmt_money(c_in)));
                 lines.push(cost_kv("output", fmt_money(c_out)));
                 lines.push(cost_kv("cache", fmt_money(c_cache)));
@@ -815,44 +1407,69 @@ fn draw_model_detail(
                     ),
                 ]));
             }
+            Some(_) => {
+                // Floor over the split-bearing days only.
+                let floor = p.cost(s).unwrap_or(0.0);
+                lines.push(Line::from(vec![
+                    key("total"),
+                    Span::styled(
+                        format!("{}+", fmt_money(floor)),
+                        money_style().add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
         },
     }
 
     let bar_w = (inner.width as usize).saturating_sub(14).clamp(6, 36);
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "SHARE OF ALL TOKENS",
-        theme::label(),
-    )));
+    let share_title = match period.badge() {
+        Some(b) => format!("SHARE OF {}", b.to_uppercase()),
+        None => "SHARE OF ALL TOKENS".to_string(),
+    };
+    lines.push(Line::from(Span::styled(share_title, theme::label())));
+    // Numerator on the denominator's basis (see `period_grand`): in+out under
+    // a weekly/monthly bucket, full throughput otherwise.
+    let share_val = if period.bucket().is_some() {
+        m.in_out
+    } else {
+        s.total()
+    };
     let share = if grand == 0 {
         0.0
     } else {
-        m.total() as f64 / grand as f64 * 100.0
+        share_val as f64 / grand as f64 * 100.0
     };
-    let mut share_line = hbar(m.total(), grand, bar_w, theme::accent());
+    let mut share_line = hbar(share_val, grand, bar_w, theme::accent());
     share_line.push(Span::styled(format!(" {share:>4.1}%"), theme::dim()));
     lines.push(Line::from(share_line));
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("CACHE HIT", theme::label())));
-    let denom = m.cache_read + m.cache_create + m.input;
-    let hit = if denom == 0 {
-        0.0
-    } else {
-        m.cache_read as f64 / denom as f64
-    };
-    let mut hit_line = hbar(
-        (hit * 100.0) as u64,
-        100,
-        bar_w,
-        Style::default().fg(theme::info_color()),
-    );
-    hit_line.push(Span::styled(
-        format!(" {:>3.0}%", hit * 100.0),
-        theme::dim(),
-    ));
-    lines.push(Line::from(hit_line));
+    if m.split_complete {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("CACHE HIT", theme::label())));
+        let denom = s.cache_read + s.cache_create + s.input;
+        let hit = if denom == 0 {
+            0.0
+        } else {
+            s.cache_read as f64 / denom as f64
+        };
+        let mut hit_line = hbar(
+            (hit * 100.0) as u64,
+            100,
+            bar_w,
+            Style::default().fg(theme::info_color()),
+        );
+        hit_line.push(Span::styled(
+            format!(" {:>3.0}%", hit * 100.0),
+            theme::dim(),
+        ));
+        lines.push(Line::from(hit_line));
+    }
 
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_tokens.rs"]
+mod tests;

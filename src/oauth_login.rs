@@ -261,8 +261,8 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
             Page {
                 tone: Tone::Danger,
                 title: "That request didn't parse",
-                detail: "clauth expected an OAuth callback here. Close this tab and retry \
-                         the login from clauth.",
+                detail: "clauth expected an OAuth callback here. clauth is still waiting \
+                         for the real callback; you can close this tab.",
                 auto_close: false,
             },
         );
@@ -276,7 +276,7 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
             Page {
                 tone: Tone::Warning,
                 title: "Nothing at this address",
-                detail: "The sign-in callback arrives at /callback on its own. \
+                detail: "The login callback arrives at /callback on its own. \
                          You can close this tab.",
                 auto_close: false,
             },
@@ -289,7 +289,7 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
         let page = if err == "access_denied" {
             Page {
                 tone: Tone::Warning,
-                title: "Sign-in canceled",
+                title: "Login canceled",
                 detail: "You declined the authorization request, so no login was \
                          captured. Close this tab; you can retry from clauth any time.",
                 auto_close: false,
@@ -297,7 +297,7 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
         } else {
             Page {
                 tone: Tone::Danger,
-                title: "Sign-in failed",
+                title: "Login failed",
                 detail: "Claude reported an error during authorization. Close this \
                          tab and retry the login from clauth.",
                 auto_close: false,
@@ -326,20 +326,20 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
             "400 Bad Request",
             Page {
                 tone: Tone::Danger,
-                title: "Sign-in blocked",
+                title: "Login blocked",
                 detail: "This callback didn't match the login clauth started, so it \
                          was rejected for safety. Retry the login from clauth.",
                 auto_close: false,
             },
         );
-        anyhow::bail!("OAuth state mismatch — possible CSRF; login aborted");
+        anyhow::bail!("OAuth state mismatch (possible CSRF); login aborted");
     }
     write_response(
         &stream,
         "200 OK",
         Page {
             tone: Tone::Success,
-            title: "You're signed in",
+            title: "You're logged in",
             detail: "clauth captured the login. This tab will try to close itself; \
                      if it sticks around, close it and head back to the terminal.",
             auto_close: true,
