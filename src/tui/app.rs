@@ -592,7 +592,7 @@ impl ActionMenuAction {
             Self::DeleteProfile => "delete profile",
             Self::CreateProfile => "create profile",
             Self::LoginAccount => "log in",
-            Self::ClearCredentials => "delete credentials",
+            Self::ClearCredentials => "log out",
             Self::EditField => "edit field",
             Self::RemoveEnvField => "remove field",
             Self::RefreshStatus => "refresh status",
@@ -4579,7 +4579,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         ConfigRow::DeleteCreds => {
             if let Some(name) = name {
                 app.modals.push(Modal::Confirm(ConfirmState {
-                    message: format!("Delete stored OAuth credentials for '{name}'?"),
+                    message: format!("Log out of '{name}'?"),
                     detail: Some(
                         "Blanks the login; keeps the profile, model, env, and chain slot. Re-login any time."
                             .to_string(),
@@ -5561,12 +5561,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_state_mtime = app_state_mtime();
-                    app.toast(
-                        ToastKind::Success,
-                        format!("cleared credentials for '{name}'"),
-                    );
+                    app.toast(ToastKind::Success, format!("logged out of '{name}'"));
                 }
-                Err(e) => app.toast(ToastKind::Danger, format!("clear credentials failed: {e}")),
+                Err(e) => app.toast(ToastKind::Danger, format!("log out failed: {e}")),
             }
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),

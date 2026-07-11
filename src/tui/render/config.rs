@@ -339,7 +339,9 @@ fn row_hint(row: ConfigRow) -> Option<&'static str> {
             Some("pin what an alias resolves to, or force the subagent model")
         }
         ConfigRow::Login => Some("browser OAuth login; mints fresh tokens for this account"),
-        ConfigRow::DeleteCreds => Some("drop the stored OAuth tokens; keeps the account shell"),
+        ConfigRow::DeleteCreds => {
+            Some("clears the stored OAuth login; keeps the account and its settings")
+        }
         ConfigRow::Delete => {
             Some("deletes the account and everything stored for it, usage history included")
         }
@@ -425,10 +427,7 @@ fn detail_row(
         }
         ConfigRow::DeleteCreds => Line::from(vec![
             arrow,
-            Span::styled(
-                "delete credentials",
-                theme::danger().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("log out", theme::danger().add_modifier(Modifier::BOLD)),
         ]),
     }
 }
