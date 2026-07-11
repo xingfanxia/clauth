@@ -769,12 +769,13 @@ fn relogin_gate_maps_divergence_defaults() {
     );
 }
 
-// Issue #20: dismissing the divergence prompt must stop the 1Hz poll from
-// re-pushing it every second. The snooze releases only when the live login
-// itself changes (a fresh /login or refresh), so a stale account isn't nagged
-// forever yet a genuinely new one still surfaces.
+// A divergence must never lock the TUI: the 1Hz poll raises the non-blocking
+// BANNER (`divergence_pending`), never the modal — browsing usage stays fully
+// available. <kbd>d</kbd> opens the resolver on demand; Esc closes it and, with
+// no auto-push left, nothing re-raises it. (Supersedes the issue #20 snooze:
+// with no auto-push there is nothing to snooze.)
 #[test]
-fn divergence_dismiss_snoozes_until_the_live_login_changes() {
+fn divergence_flags_the_banner_and_never_blocks_the_tui() {
     use super::{Modal, handle_key};
     use crate::profile::{AppConfig, AppState, Profile, save_profile};
     use crate::testutil::key;
@@ -796,26 +797,89 @@ fn divergence_dismiss_snoozes_until_the_live_login_changes() {
 
     force_poll(&mut app);
     assert!(
-        matches!(app.modals.last(), Some(Modal::Divergence(_))),
-        "a diverged active profile prompts"
-    );
-
-    handle_key(&mut app, key(KeyCode::Esc));
-    assert!(app.modals.is_empty(), "esc dismisses the prompt");
-    assert!(app.divergence_snooze.is_some(), "esc records a snooze");
-
-    force_poll(&mut app);
-    assert!(
         app.modals.is_empty(),
-        "the same dismissed login must not re-prompt"
+        "the poll must NOT raise the modal — a divergence can't lock the TUI"
+    );
+    let notice = app
+        .divergence_pending
+        .clone()
+        .expect("the poll flags the banner instead");
+    assert_eq!(notice.active, "work");
+    assert_eq!(
+        notice.sibling, None,
+        "an unknown login has no owner to offer"
     );
 
-    // A fresh login (new access token, same or different account) re-prompts.
-    write_live_creds(&creds_ra("rt-live", "at-2"));
-    force_poll(&mut app);
+    // `d` opens the resolver on demand; Esc closes it and nothing re-raises.
+    handle_key(&mut app, key(KeyCode::Char('d')));
     assert!(
         matches!(app.modals.last(), Some(Modal::Divergence(_))),
-        "a changed live login re-prompts once"
+        "d opens the resolver from the banner"
+    );
+    handle_key(&mut app, key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "esc dismisses the resolver");
+    force_poll(&mut app);
+    assert!(app.modals.is_empty(), "no auto-re-raise after dismissal");
+
+    // The link healing clears the banner (and `d` becomes a no-op).
+    crate::claude::force_link_profile_credentials("work").expect("relink");
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_none(),
+        "a clean link clears the banner"
+    );
+    handle_key(&mut app, key(KeyCode::Char('d')));
+    assert!(app.modals.is_empty(), "d is a no-op with no divergence");
+}
+
+/// The banner and the resolver both identify the live login's OWNER when it is
+/// a stored sibling — by exact token match here (the half-landed-switch shape)
+/// — and the resolver leads with the "switch to it" action.
+#[test]
+fn divergence_identifies_a_sibling_owner_and_leads_with_switch_to_it() {
+    use super::{DivergenceAction, Modal, handle_key};
+    use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile, save_profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut play = Profile::new("play".to_string(), None, None);
+    play.credentials = Some(creds_ra("rt-play", "at-play"));
+    save_profile(&play).expect("save play");
+    // The live file carries play's EXACT stored pair while work is active.
+    write_live_creds(&creds_ra("rt-play", "at-play"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into(), "play".into()],
+            ..AppState::default()
+        },
+        profiles: vec![work, play],
+    });
+
+    force_poll(&mut app);
+    let notice = app.divergence_pending.clone().expect("banner flagged");
+    assert_eq!(notice.sibling.as_deref(), Some("play"));
+
+    handle_key(&mut app, key(KeyCode::Char('d')));
+    let Some(Modal::Divergence(form)) = app.modals.last() else {
+        panic!("d opens the resolver");
+    };
+    assert_eq!(form.sibling.as_deref(), Some("play"));
+    let actions = form.actions();
+    assert_eq!(
+        actions.first(),
+        Some(&DivergenceAction::SwitchToOwner("play".to_string())),
+        "the owner switch leads the menu"
+    );
+    assert_eq!(actions.len(), 4, "the three generic choices follow");
+    assert_eq!(
+        actions[1],
+        DivergenceAction::Choice(DivergenceChoice::Overwrite)
     );
 }
 

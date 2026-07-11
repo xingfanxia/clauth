@@ -472,6 +472,35 @@ pub(crate) fn set_profile_default_model(
     edit_profile_model(config, name, models)
 }
 
+/// Which profile the CURRENT live login (`~/.claude/.credentials.json`)
+/// belongs to, by exact token match — no network:
+///
+/// **Exact token match** (refresh or access token equal to a profile's stored
+/// pair): the live file IS that profile's credential — a stale mirror, or a
+/// half-landed switch that moved the link but not the state.
+///
+/// Returns the owning profile's name — possibly the ACTIVE profile itself (a
+/// same-account divergence, which the adopt path self-heals). Callers wanting a
+/// SIBLING must compare against the active name. `None` when the login matches
+/// no stored token — either a genuinely foreign account (a human decision) or a
+/// CC re-login where every token is new. An account-uuid tier (CC's own
+/// `~/.claude.json` identity record matched against a profile's cached identity
+/// anchor) can layer on once per-profile identity anchors exist (PR #24); until
+/// then this is token-equality only.
+pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<String> {
+    let live = read_claude_credentials().ok().flatten()?;
+    let live_access = live.access_token().filter(|t| !t.is_empty());
+    let live_refresh = live.refresh_token().filter(|t| !t.is_empty());
+    config
+        .profiles
+        .iter()
+        .find(|p| {
+            (live_refresh.is_some() && p.refresh_token() == live_refresh)
+                || (live_access.is_some() && p.access_token() == live_access)
+        })
+        .map(|p| p.name.as_str().to_string())
+}
+
 /// Returns a profile whose `refresh_token` matches `live`. Matches on refresh
 /// token only (stable identity); access tokens rotate and would produce false
 /// misses and duplicate profiles.

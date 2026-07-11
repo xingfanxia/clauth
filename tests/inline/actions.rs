@@ -752,3 +752,79 @@ fn oauth_creds(access: &str) -> crate::profile::ClaudeCredentials {
         }),
     }
 }
+
+// ── identify_live_login_owner: whose login sits in ~/.claude right now ──────
+//
+// Token-equality tier only. An account-uuid tier (CC's `~/.claude.json`
+// identity record matched against a profile's cached anchor) layers on once
+// per-profile identity anchors exist (PR #24) — no anchors upstream yet.
+
+#[cfg(unix)]
+mod identify_live_login_owner {
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
+    use crate::testutil::HomeSandbox;
+
+    fn creds(access: &str, refresh: &str) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some(refresh.to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }
+    }
+
+    fn config_with(profiles: Vec<(&str, ClaudeCredentials)>) -> AppConfig {
+        let profiles: Vec<Profile> = profiles
+            .into_iter()
+            .map(|(name, c)| {
+                let mut p = Profile::new(name.to_string(), None, None);
+                p.credentials = Some(c);
+                p
+            })
+            .collect();
+        AppConfig {
+            state: AppState {
+                profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+                ..AppState::default()
+            },
+            profiles,
+        }
+    }
+
+    fn write_live(c: &ClaudeCredentials) {
+        let live = crate::profile::claude_dir()
+            .expect("claude dir")
+            .join(".credentials.json");
+        std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&live, serde_json::to_vec(c).expect("ser")).expect("write");
+    }
+
+    /// Exact token equality — the live file IS a profile's stored credential
+    /// (stale mirror / half-landed switch).
+    #[test]
+    fn exact_token_match_identifies_the_owner() {
+        let _home = HomeSandbox::new();
+        let cfg = config_with(vec![
+            ("a", creds("at-a", "rt-a")),
+            ("b", creds("at-b", "rt-b")),
+        ]);
+        write_live(&creds("at-b", "rt-b"));
+        assert_eq!(
+            crate::actions::identify_live_login_owner(&cfg).as_deref(),
+            Some("b")
+        );
+    }
+
+    /// No token match → unknown; a CC re-login where every token is new (no
+    /// anchors yet) and a genuinely foreign account both identify nobody.
+    #[test]
+    fn a_foreign_login_identifies_nobody() {
+        let _home = HomeSandbox::new();
+        let cfg = config_with(vec![("a", creds("at-a", "rt-a"))]);
+        write_live(&creds("at-foreign", "rt-foreign"));
+        assert_eq!(crate::actions::identify_live_login_owner(&cfg), None);
+    }
+}

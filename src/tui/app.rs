@@ -388,22 +388,60 @@ pub(crate) struct CaptureNameForm {
     pub(crate) from_divergence: bool,
 }
 
-/// Credential-divergence prompt. Shown at startup and on the 1Hz poll when
-/// `.credentials.json` no longer matches the active profile's stored creds.
-/// Three actions: Overwrite, NewProfile, or Discard.
+/// Credential-divergence prompt. Raised on demand (the <kbd>d</kbd> key from
+/// the non-blocking banner) and when an action that REQUIRES resolution is
+/// attempted (switch / switch-off / plugin fix) — never auto-pushed at startup
+/// or from the 1Hz poll, so a divergence can't lock the whole TUI
+/// (`divergence_pending` + the banner carry the signal instead).
 #[derive(Debug, Clone)]
 pub(crate) struct DivergenceForm {
     pub(crate) active: String,
+    /// The profile the live login was identified as belonging to
+    /// ([`crate::actions::identify_live_login_owner`], local evidence), when
+    /// that profile is NOT the active one. Surfaces a first-class "switch to
+    /// it" action — the near-always-right resolution for a CC re-login into a
+    /// known account, which the generic three options all get wrong.
+    pub(crate) sibling: Option<String>,
     pub(crate) cursor: usize,
 }
 
+/// The non-blocking divergence signal behind the accounts-pane banner: set by
+/// the 1Hz poll / startup reconcile, cleared the moment the live link matches
+/// again. <kbd>d</kbd> opens the resolver from it.
+#[derive(Debug, Clone)]
+pub(crate) struct DivergenceNotice {
+    pub(crate) active: String,
+    /// Locally identified owner of the live login when it is a NON-active
+    /// profile (see [`DivergenceForm::sibling`]); drives the banner wording.
+    pub(crate) sibling: Option<String>,
+    /// SipHash of the live access token at identification time — the memo that
+    /// keeps the 1Hz poll from re-running the owner lookup while the live login
+    /// is unchanged.
+    pub(crate) fingerprint: Option<u64>,
+}
+
+/// One row on the Divergence prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DivergenceAction {
+    /// The live login belongs to this (non-active) profile: capture it there
+    /// and make that profile active — the [`ConfirmAction::AdoptDivergence`]
+    /// path the "save elsewhere" picker already uses, promoted to the top.
+    SwitchToOwner(String),
+    Choice(DivergenceChoice),
+}
+
 impl DivergenceForm {
-    pub(crate) fn options() -> [DivergenceChoice; 3] {
-        [
-            DivergenceChoice::Overwrite,
-            DivergenceChoice::NewProfile,
-            DivergenceChoice::Discard,
-        ]
+    pub(crate) fn actions(&self) -> Vec<DivergenceAction> {
+        let mut v = Vec::with_capacity(4);
+        if let Some(owner) = &self.sibling {
+            v.push(DivergenceAction::SwitchToOwner(owner.clone()));
+        }
+        v.extend([
+            DivergenceAction::Choice(DivergenceChoice::Overwrite),
+            DivergenceAction::Choice(DivergenceChoice::NewProfile),
+            DivergenceAction::Choice(DivergenceChoice::Discard),
+        ]);
+        v
     }
 }
 
@@ -1233,11 +1271,12 @@ pub(crate) struct App {
     pub(crate) banner: Option<Banner>,
     /// Last time the 1Hz divergence poll ran.
     pub(crate) last_divergence_check: Instant,
-    /// Fingerprint of a divergence the user dismissed with esc (siphash of the
-    /// live access token). The poll stays quiet while the live login still
-    /// hashes to this; a fresh `/login` or refresh changes it and re-prompts
-    /// once. In-memory only — a restart re-evaluates.
-    pub(crate) divergence_snooze: Option<u64>,
+    /// The non-blocking divergence banner's backing signal: `Some` while the
+    /// live login no longer matches the active profile, `None` the moment the
+    /// link is clean again. Set/refreshed by the 1Hz poll and startup
+    /// reconcile; <kbd>d</kbd> opens the resolver from it. In-memory only — a
+    /// restart re-evaluates.
+    pub(crate) divergence_pending: Option<DivergenceNotice>,
     /// Throttle for the Plugin tab's per-tick live refresh (session counts + link
     /// state); recompute fires at most once per `PLUGIN_REFRESH_INTERVAL`.
     pub(crate) last_plugin_refresh: Instant,
@@ -1478,7 +1517,7 @@ impl App {
             footer_alert: None,
             banner: None,
             last_divergence_check: Instant::now(),
-            divergence_snooze: None,
+            divergence_pending: None,
             last_plugin_refresh: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
@@ -2158,6 +2197,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             app.modals.push(Modal::Help);
             return;
         }
+        KeyCode::Char('d') => {
+            // Open the divergence resolver from the banner (no-op when the
+            // live link is clean).
+            if let Some(notice) = app.divergence_pending.clone() {
+                app.disarm_quit();
+                open_divergence_modal(app, &notice.active);
+            }
+            return;
+        }
         KeyCode::Char('a') => {
             app.disarm_quit();
             let state = build_action_menu(app);
@@ -2559,10 +2607,7 @@ fn apply_plugin_fix(app: &mut App) {
         }
         PluginFix::RepairDivergence(name) => {
             app.disarm_quit();
-            app.modals.push(Modal::Divergence(DivergenceForm {
-                active: name,
-                cursor: 0,
-            }));
+            open_divergence_modal(app, &name);
         }
         PluginFix::RelinkCredentials(name) => {
             app.disarm_quit();
@@ -3075,8 +3120,23 @@ fn prompt_divergence(app: &mut App, active: String, verb: &str) {
         ToastKind::Warning,
         format!("'{active}' has unsaved Claude Code credentials; resolve before {verb}"),
     );
-    app.modals
-        .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+    open_divergence_modal(app, &active);
+}
+
+/// Push the Divergence prompt, first identifying (locally) which profile the
+/// live login belongs to so the near-always-right "switch to it" action can
+/// lead the menu. The active profile owning its own newer login is NOT a
+/// sibling (that is the adopt path's self-healing domain).
+fn open_divergence_modal(app: &mut App, active: &str) {
+    let sibling = {
+        let cfg = app.config();
+        crate::actions::identify_live_login_owner(&cfg).filter(|owner| owner != active)
+    };
+    app.modals.push(Modal::Divergence(DivergenceForm {
+        active: active.to_string(),
+        sibling,
+        cursor: 0,
+    }));
 }
 
 /// Synchronous UI-thread switch. No HTTP; clears the Switching marker, runs
@@ -5574,8 +5634,8 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
     let Some(Modal::Divergence(state)) = app.modals.last_mut() else {
         return;
     };
-    let options = DivergenceForm::options();
-    let last = options.len() - 1;
+    let actions = state.actions();
+    let last = actions.len() - 1;
     match key.code {
         KeyCode::Up => {
             state.cursor = if state.cursor == 0 {
@@ -5592,16 +5652,34 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            // Snooze this exact live login so the 1Hz poll stops re-pushing; a
-            // fresh login or refresh changes the fingerprint and re-prompts.
-            app.divergence_snooze = live_creds_fingerprint();
+            // Just close — the prompt is on-demand now; the non-blocking
+            // banner keeps carrying the signal until the divergence resolves.
             app.modals.pop();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            let choice = options[state.cursor];
+            let action = actions[state.cursor.min(last)].clone();
             let active = state.active.clone();
             app.modals.pop();
-            run_divergence_choice(app, &active, choice);
+            match action {
+                DivergenceAction::SwitchToOwner(owner) => {
+                    // Same confirmed path as the "save elsewhere" picker: the
+                    // live login is captured into its own profile, which then
+                    // becomes active. Nothing is lost, nothing else rewritten.
+                    let Some(snapshot) = capture_live_or_toast(app) else {
+                        return;
+                    };
+                    app.modals.push(Modal::Confirm(ConfirmState {
+                        message: format!("Switch to '{owner}' — the live login is its account?"),
+                        detail: Some(format!(
+                            "The login is saved into '{owner}' and '{owner}' becomes the active \
+                             account. The running claude is untouched."
+                        )),
+                        choice: false,
+                        on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), owner),
+                    }));
+                }
+                DivergenceAction::Choice(choice) => run_divergence_choice(app, &active, choice),
+            }
         }
         _ => {}
     }
@@ -6278,8 +6356,11 @@ fn drain_startup_signals(app: &mut App) {
                 if let Some(choice) = default {
                     run_divergence_choice(app, &active, choice);
                 } else {
-                    app.modals
-                        .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+                    // Non-blocking: flag the banner; the user opens the
+                    // resolver with <kbd>d</kbd> when they want it, and any
+                    // switch-shaped action raises it itself. Startup must never
+                    // lock the TUI behind a modal.
+                    note_divergence(app, &active);
                 }
             }
             StartupSignal::BootstrapDone => {
@@ -6299,8 +6380,13 @@ fn maybe_spawn_bootstrap(app: &mut App) {
     app.spawn_bootstrap();
 }
 
-/// 1Hz check: push Divergence modal if `.credentials.json` no longer matches
-/// the active profile's stored creds. Skips when a modal is already open.
+/// 1Hz check: keep [`App::divergence_pending`] (the non-blocking banner) in
+/// sync with whether `.credentials.json` matches the active profile's stored
+/// creds. Never pushes the modal — a divergence must not lock the whole TUI out
+/// of browsing usage; <kbd>d</kbd> opens the resolver on demand, and
+/// switch-shaped actions raise it themselves when resolution is actually
+/// required. First-login adoption and a configured `default_divergence` still
+/// resolve automatically here.
 fn poll_credentials_divergence(app: &mut App) {
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -6319,13 +6405,14 @@ fn poll_credentials_divergence(app: &mut App) {
         .as_deref()
         .map(str::to_string)
     else {
+        app.divergence_pending = None;
         return;
     };
     if !matches!(
         classify_credentials_link(&active).ok(),
         Some(LinkState::Diverged)
     ) {
-        app.divergence_snooze = None; // resolved; a later divergence re-prompts
+        app.divergence_pending = None; // resolved; a later divergence re-flags
         return;
     }
     // First login on a credential-less profile: adopt silently, don't prompt.
@@ -6349,19 +6436,34 @@ fn poll_credentials_divergence(app: &mut App) {
         run_divergence_choice(app, &active, choice);
         return;
     }
-    // Dismissed already and the live login hasn't changed since — stay quiet.
+    note_divergence(app, &active);
+}
+
+/// Set/refresh the non-blocking divergence banner. The (local) owner lookup
+/// runs only when the live login actually changed — the fingerprint memo keeps
+/// the 1Hz poll to a single file read in the steady state.
+fn note_divergence(app: &mut App, active: &str) {
     let fingerprint = live_creds_fingerprint();
-    if fingerprint.is_some() && fingerprint == app.divergence_snooze {
+    if let Some(p) = &app.divergence_pending
+        && p.active == active
+        && p.fingerprint == fingerprint
+    {
         return;
     }
-    app.divergence_snooze = None;
-    app.modals
-        .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
+    let sibling = {
+        let cfg = app.config();
+        crate::actions::identify_live_login_owner(&cfg).filter(|owner| owner != active)
+    };
+    app.divergence_pending = Some(DivergenceNotice {
+        active: active.to_string(),
+        sibling,
+        fingerprint,
+    });
 }
 
 /// SipHash of the live access token — a cheap identity for "which login sits in
 /// `~/.claude/.credentials.json` right now". It changes on every re-login and
-/// every refresh, so a snooze keyed to it releases exactly when the creds
+/// every refresh, so the banner's owner lookup re-runs exactly when the creds
 /// change. `None` when no readable OAuth login is present.
 fn live_creds_fingerprint() -> Option<u64> {
     use std::hash::{DefaultHasher, Hash, Hasher};
