@@ -317,7 +317,7 @@ fn last_resort_hint(cfg: &AppConfig, name: &str, on: bool) -> String {
 /// when the current buffer parses out of range (or non-numeric), else faint —
 /// the threshold twin of the Config-tab refresh editor's `refresh_range_tooltip`.
 fn threshold_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
-    let range = "0–100 %";
+    let range = "0-100 %";
     if parse_threshold(input.trimmed()).is_none() {
         invalid_tooltip_lines(range, width)
     } else {

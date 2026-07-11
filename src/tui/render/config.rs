@@ -339,8 +339,11 @@ fn row_hint(row: ConfigRow) -> Option<&'static str> {
             Some("pin what an alias resolves to, or force the subagent model")
         }
         ConfigRow::Login => Some("browser OAuth login; mints fresh tokens for this account"),
-        ConfigRow::DeleteCreds => Some("drop the stored OAuth tokens; keeps the profile shell"),
-        ConfigRow::Name | ConfigRow::Delete | ConfigRow::Create => None,
+        ConfigRow::DeleteCreds => Some("drop the stored OAuth tokens; keeps the account shell"),
+        ConfigRow::Delete => {
+            Some("deletes the account and everything stored for it, usage history included")
+        }
+        ConfigRow::Name | ConfigRow::Create => None,
     }
 }
 
