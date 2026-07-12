@@ -862,7 +862,7 @@ fn retry_after_defers_next_fetch_slot() {
         "a 429 with no retry-after defers a flat 10s past now"
     );
 
-    // Hint shorter than the interval → no extra deferral.
+    // Hint shorter than the ladder → the ladder wins (max, never suppressed).
     let before = now_ms();
     apply_outcome(
         outcome("c", Some(Duration::from_secs(5))),
@@ -873,7 +873,10 @@ fn retry_after_defers_next_fetch_slot() {
         REFRESH_INTERVAL_MS,
     );
     let after = now_ms();
-    assert!((before..=after).contains(&stamp("c")));
+    assert!(
+        (before + floor..=after + floor).contains(&stamp("c")),
+        "a sub-cadence hint cannot undercut the streak ladder"
+    );
 
     // Absurd hint → clamped to the ceiling.
     let before = now_ms();
@@ -892,9 +895,11 @@ fn retry_after_defers_next_fetch_slot() {
         "huge retry-after clamps to MAX_RETRY_AFTER_MS"
     );
 
-    // Explicit `retry-after: 0` (server says "retry now", same as an elapsed
-    // HTTP-date) keeps the cadence — it must NOT fall into the no-hint
-    // exponential backoff that a missing header gets.
+    // Explicit `retry-after: 0` rides the SAME ladder as a missing header.
+    // The usage endpoint answers every 429 with `retry-after: 0` while its
+    // sliding window counts the rejected requests too — honoring the "retry
+    // now" verbatim re-polls at cadence and pins the window full forever
+    // (observed 2026-07-11: hours of uninterrupted per-account 429s).
     let before = now_ms();
     apply_outcome(
         outcome("e", Some(Duration::ZERO)),
@@ -906,8 +911,8 @@ fn retry_after_defers_next_fetch_slot() {
     );
     let after = now_ms();
     assert!(
-        (before..=after).contains(&stamp("e")),
-        "a zero retry-after keeps the cadence, never escalates to backoff"
+        (before + floor..=after + floor).contains(&stamp("e")),
+        "a zero retry-after must not suppress the backoff ladder"
     );
 }
 
