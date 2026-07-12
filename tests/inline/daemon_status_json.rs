@@ -203,3 +203,61 @@ fn build_status_pending_switch_reflects_live_signal() {
         "pending_switch is part of schema 1 — no bump"
     );
 }
+
+/// An api-key profile's freshness derives from ITS cache
+/// (`THIRD_PARTY_CACHE_FILE`), and a name the live stores don't carry falls
+/// back to the same derivation — pre-fix both keyed on the OAuth
+/// `USAGE_CACHE_FILE`/status store, so a healthy hourly-refreshed api-key
+/// account rendered permanently as never-fetched (`fetch_status: null`).
+#[test]
+fn build_status_third_party_freshness_from_its_own_cache() {
+    let _home = HomeSandbox::new();
+    let mut api = Profile::new("zai".to_string(), None, None);
+    api.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    api.api_key = Some("k".to_string());
+    api.provider = crate::providers::Provider::from_base_url(api.base_url.as_deref().unwrap());
+    assert!(api.is_third_party(), "fixture must be an api-key profile");
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![api],
+    };
+
+    // Warm third-party cache, no OAuth cache: the profile is fetched.
+    crate::profile_cache::write_profile_cache(
+        "zai",
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    // Single-shot: freshness from the third-party cache mtime (just written).
+    let v = build_status(&config, 300_000, None);
+    let p = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(p["fetch_status"], "Fresh");
+    assert!(!p["fetched_at"].is_null());
+    assert!(!p["next_refresh_at"].is_null());
+    assert_eq!(p["third_party"]["available"], true);
+
+    // Live daemon whose stores don't carry the name (the OAuth-leg stores
+    // never do for api-key profiles): same derivation, not null.
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let live = LiveSignals {
+        status: &empty_status,
+        next_refresh: &empty_next,
+        pending_switch: None,
+    };
+    let v = build_status(&config, 300_000, Some(&live));
+    let p = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(
+        p["fetch_status"], "Fresh",
+        "a live daemon must not blank an api-key profile's freshness"
+    );
+    assert!(!p["next_refresh_at"].is_null());
+}

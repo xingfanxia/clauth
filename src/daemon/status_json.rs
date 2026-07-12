@@ -1,6 +1,6 @@
 //! `~/.clauth/status.json` serializer — the daemon's published feed, and the
 //! shape `clauth status --json` prints (one code path builds both, so they
-//! cannot drift). Contract: docs/daemon.md.
+//! cannot drift). Contract: wiki/daemon.md.
 //!
 //! Usage windows/tier come from the on-disk `usage_cache.json` (written by the
 //! scheduler), so this is process-independent: it returns the last-persisted
@@ -101,26 +101,47 @@ pub(crate) fn build_status(
         .iter()
         .map(|p| {
             let name = p.name.as_str();
-            let mtime_ms = profile_cache_mtime_ms(name, USAGE_CACHE_FILE);
+            // Freshness reads each profile's OWN cache: the third-party leg
+            // never touches USAGE_CACHE_FILE, so keying api-key profiles on it
+            // rendered a healthy hourly-refreshed account as never-fetched.
+            let cache_file = if p.is_third_party() {
+                THIRD_PARTY_CACHE_FILE
+            } else {
+                USAGE_CACHE_FILE
+            };
+            let mtime_ms = profile_cache_mtime_ms(name, cache_file);
 
-            // fetch_status: the live store when a daemon is running, else derive
-            // from cache freshness (Fresh within one interval, else Cached; a
-            // profile with no cache at all reports null — never fetched).
-            let fetch_status: Option<&'static str> = match live {
-                Some(sig) => sig.status.get(name).copied().map(fetch_status_str),
-                None => mtime_ms.map(|mt| {
+            // fetch_status: the live store when a daemon is running, else
+            // derive from cache freshness (Fresh within one interval, else
+            // Cached). The live store only carries the OAuth leg's outcomes,
+            // so a name missing from it (api-key profiles, a just-started
+            // daemon) falls back to the same derivation rather than reading
+            // as never-fetched; null = no cache at all.
+            let derived_status = || {
+                mtime_ms.map(|mt| {
                     if now.saturating_sub(mt) < interval_ms {
                         "Fresh"
                     } else {
                         "Cached"
                     }
-                }),
+                })
+            };
+            let fetch_status: Option<&'static str> = match live {
+                Some(sig) => sig
+                    .status
+                    .get(name)
+                    .copied()
+                    .map(fetch_status_str)
+                    .or_else(derived_status),
+                None => derived_status(),
             };
 
-            // next_refresh_at: the live countdown store, else mtime + interval.
+            // next_refresh_at: the live countdown store, else mtime + interval
+            // (also the fallback for names the live store doesn't carry).
+            let derived_next = || mtime_ms.map(|mt| mt.saturating_add(interval_ms));
             let next_refresh_ms: Option<u64> = match live {
-                Some(sig) => sig.next_refresh.get(name).copied(),
-                None => mtime_ms.map(|mt| mt.saturating_add(interval_ms)),
+                Some(sig) => sig.next_refresh.get(name).copied().or_else(derived_next),
+                None => derived_next(),
             };
 
             // Structured third-party balance isn't carried by ThirdPartyStats
