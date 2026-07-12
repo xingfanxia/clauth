@@ -1332,7 +1332,7 @@ impl App {
     pub(crate) fn new(config: AppConfig) -> Self {
         let usage_store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
         let usage_status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
-        let usage_tokens: TokenList = Arc::new(RankedMutex::new(collect_tokens(&config.profiles)));
+        let usage_tokens: TokenList = Arc::new(RankedMutex::new(collect_tokens(&config)));
         let next_refresh_per_profile: NextRefreshPerProfile =
             Arc::new(RankedMutex::new(HashMap::new()));
         let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -1559,7 +1559,7 @@ impl App {
                 #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
                 let cfg = config.lock().expect("config mutex poisoned");
                 (
-                    collect_tokens(&cfg.profiles),
+                    collect_tokens(&cfg),
                     collect_third_party_entries(&cfg.profiles),
                 )
             };
@@ -1856,18 +1856,18 @@ impl App {
         if let Ok(fresh) = load_config() {
             *self.config() = fresh;
             self.last_state_mtime = current;
-            let profiles = &self.config().profiles;
+            let cfg = self.config();
             #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             {
                 *self
                     .usage_tokens
                     .lock()
-                    .expect("usage_tokens mutex poisoned") = collect_tokens(profiles);
+                    .expect("usage_tokens mutex poisoned") = collect_tokens(&cfg);
                 *self
                     .third_party_tokens
                     .lock()
                     .expect("third_party_tokens mutex poisoned") =
-                    collect_third_party_entries(profiles);
+                    collect_third_party_entries(&cfg.profiles);
             }
             true
         } else {
@@ -1878,7 +1878,7 @@ impl App {
     pub(crate) fn refresh_tokens(&self) {
         // Drop `config` lock before taking `usage_tokens` — folding them would
         // invert lock order (TOKENS is outer of CONFIG).
-        let tokens = collect_tokens(&self.config().profiles);
+        let tokens = collect_tokens(&self.config());
         let third_party = collect_third_party_entries(&self.config().profiles);
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         {
@@ -2026,8 +2026,9 @@ impl App {
 
 // ── Token snapshot ────────────────────────────────────────────────────────────
 
-fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
-    profiles
+fn collect_tokens(config: &AppConfig) -> Vec<TokenEntry> {
+    config
+        .profiles
         .iter()
         .filter_map(|p| {
             let oauth = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
@@ -2037,6 +2038,7 @@ fn collect_tokens(profiles: &[Profile]) -> Vec<TokenEntry> {
                 refresh_token: oauth.refresh_token.clone(),
                 auto_start: p.auto_start,
                 access_expires_at: oauth.expires_at,
+                auth_broken: config.is_auth_broken(&p.name),
             })
         })
         .collect()

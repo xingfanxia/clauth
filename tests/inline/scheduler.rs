@@ -19,6 +19,7 @@ fn token(name: &str) -> TokenEntry {
         refresh_token: Some("refresh".to_string()),
         auto_start: false,
         access_expires_at: None,
+        auth_broken: false,
     }
 }
 
@@ -118,6 +119,73 @@ fn partition_due_excludes_switching() {
         next.contains_key("a"),
         "countdown still publishes for excluded profiles"
     );
+}
+
+/// A quarantined (`auth_broken`) profile's poll spends a guaranteed-dead
+/// 401 → refresh → 400 pair against the token endpoint, so partition widens
+/// its cadence by `AUTH_BROKEN_BACKOFF_MS` — computed from the live flag,
+/// never baked into the `last_fetched` stamp, so any flag lift (login, adopt,
+/// carry) snaps the cadence back on the very next tick.
+#[test]
+fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), EpochMs::from_millis(base));
+
+    let mut flagged = token("a");
+    flagged.auth_broken = true;
+    let snapshot = vec![flagged];
+
+    // One interval elapsed: an unflagged profile would be due here.
+    let at_interval = base + REFRESH_INTERVAL_MS + 1;
+    let (due, next) = partition_due(
+        &snapshot,
+        at_interval,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+    );
+    assert!(due.is_empty(), "flagged profile skips the plain cadence");
+    assert_eq!(
+        next["a"],
+        base + REFRESH_INTERVAL_MS + super::AUTH_BROKEN_BACKOFF_MS,
+        "published countdown shows the widened deadline"
+    );
+
+    // Past the widened deadline it still polls — the poll's own refresh
+    // attempt stays a (slow) recovery path.
+    let (due, _) = partition_due(
+        &snapshot,
+        base + REFRESH_INTERVAL_MS + super::AUTH_BROKEN_BACKOFF_MS,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+    );
+    assert_eq!(
+        due.len(),
+        1,
+        "a flagged profile still polls after the backoff"
+    );
+
+    // Same stamp, flag lifted: due immediately on the plain cadence.
+    let unflagged = vec![token("a")];
+    let (due, next) = partition_due(
+        &unflagged,
+        at_interval,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+    );
+    assert_eq!(
+        due.len(),
+        1,
+        "an unflagged profile snaps back to the cadence"
+    );
+    assert_eq!(next["a"], base + REFRESH_INTERVAL_MS);
 }
 
 /// Forced (manual `r`) refetches skip a mid-switch profile for the same

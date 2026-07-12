@@ -2037,6 +2037,37 @@ fn already_expired() -> i64 {
     crate::usage::now_ms() as i64 - 60_000
 }
 
+/// `collect_tokens` snapshots the persisted quarantine flag so the scheduler's
+/// partition can widen a flagged profile's cadence without a config lock.
+#[test]
+fn collect_tokens_carries_the_auth_broken_flag() {
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken};
+    let creds = |name: &str| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let mut flagged = crate::testutil::blank_profile("flagged");
+    flagged.credentials = Some(creds("flagged"));
+    let mut clean = crate::testutil::blank_profile("clean");
+    clean.credentials = Some(creds("clean"));
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![flagged, clean],
+    };
+    config.set_auth_broken("flagged", true);
+
+    let entries = super::collect_tokens(&config);
+    let get = |n: &str| entries.iter().find(|e| e.name == n).expect("entry");
+    assert!(get("flagged").auth_broken, "flag rides the snapshot");
+    assert!(!get("clean").auth_broken, "unflagged stays clear");
+}
+
 /// A dead login whose flag hasn't been set yet must still be refused: the
 /// switch runs the full `ensure_installable` gate (off the UI thread in
 /// production), not the flag-only check that let an unflagged dead token

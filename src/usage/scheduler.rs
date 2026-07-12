@@ -24,6 +24,15 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// can't starve a profile's refresh slot.
 const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
 
+/// Widen-only poll deferral for an `auth_broken` profile. Each quarantined
+/// poll spends a guaranteed-dead 401 → refresh → 400 pair against the token
+/// endpoint, so the cadence stretches to the same ceiling the 429 ladder
+/// converges to; the poll stays a (slow) recovery path rather than being
+/// excluded outright. Applied at partition time from the live flag — never
+/// baked into the `last_fetched` stamp — so a login/adopt/carry lifting the
+/// flag snaps the cadence back on the very next tick.
+const AUTH_BROKEN_BACKOFF_MS: u64 = MAX_RETRY_AFTER_MS;
+
 /// Base extra backoff applied after a 429 that carries no usable `retry-after`:
 /// the first such 429 lands the next slot one interval + this far out. Successive
 /// 429s multiply it by [`RATE_LIMIT_BACKOFF_FACTOR`]; a server-provided
@@ -104,6 +113,9 @@ pub(crate) struct TokenEntry {
     /// Epoch-ms the access token expires at, when known. Gates the kick's
     /// rotate-on-429 to clock-expired tokens only.
     pub(crate) access_expires_at: Option<i64>,
+    /// Persisted `auth_broken` quarantine at snapshot time; widens the poll
+    /// cadence by [`AUTH_BROKEN_BACKOFF_MS`] while set.
+    pub(crate) auth_broken: bool,
 }
 
 /// Snapshot of one third-party profile identity used by the refresher.
@@ -118,11 +130,24 @@ pub(crate) struct ThirdPartyEntry {
 /// `partition_due` / `merge_forced` run identically over both.
 trait NamedEntry {
     fn name(&self) -> &str;
+    /// Widen-only extra deferral added to the fixed cadence at partition time.
+    /// Zero for everything but a quarantined OAuth profile.
+    fn poll_backoff_ms(&self) -> u64 {
+        0
+    }
 }
 
 impl NamedEntry for TokenEntry {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn poll_backoff_ms(&self) -> u64 {
+        if self.auth_broken {
+            AUTH_BROKEN_BACKOFF_MS
+        } else {
+            0
+        }
     }
 }
 
@@ -1704,6 +1729,8 @@ fn scan_recovery(
 /// all profiles due — fetch storm). Profiles currently `Switching` or `Refreshing`
 /// are excluded to avoid racing the switch worker on `TokenList` or `rotate_one_inner`
 /// on the single-use refresh token. Poisoned activity mutex fails safe to excluded.
+/// A quarantined entry's deadline widens by its `poll_backoff_ms` — read from the
+/// snapshot each partition, so the widening vanishes the tick the flag lifts.
 fn partition_due<T: NamedEntry + Clone>(
     snapshot: &[T],
     now: u64,
@@ -1725,7 +1752,9 @@ fn partition_due<T: NamedEntry + Clone>(
             .get(entry.name())
             .copied()
             .unwrap_or(EpochMs::from_millis(0));
-        let next = last.saturating_add(interval);
+        let next = last
+            .saturating_add(interval)
+            .saturating_add(IntervalMs::from_millis(entry.poll_backoff_ms()));
         per_profile.insert(entry.name().to_string(), next.as_millis());
         let excluded = match act.as_ref() {
             Ok(a) => matches!(
