@@ -95,6 +95,53 @@ fn partition_due_excludes_refreshing() {
     );
 }
 
+/// A profile whose switch gate is in flight (`Switching`) is excluded like a
+/// `Refreshing` one: a fetch worker would re-mark it `Queued`/`Fetching`,
+/// overwriting the pending-switch mark that `switch_gate_in_flight` keys on.
+#[test]
+fn partition_due_excludes_switching() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let snapshot = vec![token("a")];
+
+    mark_activity(&activity, "a", ProfileActivity::Switching);
+
+    let (due, next) = partition_due(
+        &snapshot,
+        REFRESH_INTERVAL_MS + 1,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+    );
+    assert!(due.is_empty(), "mid-switch profiles are excluded from due");
+    assert!(
+        next.contains_key("a"),
+        "countdown still publishes for excluded profiles"
+    );
+}
+
+/// Forced (manual `r`) refetches skip a mid-switch profile for the same
+/// reason: scheduling it would overwrite the `Switching` mark and drop the
+/// in-flight switch pending state.
+#[test]
+fn merge_forced_skips_switching() {
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    mark_activity(&activity, "switching", ProfileActivity::Switching);
+
+    let snapshot = vec![token("switching"), token("plain")];
+    let forced: HashSet<String> = ["switching", "plain"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut due: Vec<TokenEntry> = Vec::new();
+    let mut next: HashMap<String, u64> = HashMap::new();
+
+    super::merge_forced(&snapshot, &forced, &mut due, &mut next, &activity, 1);
+
+    assert_eq!(due.len(), 1, "only the unowned profile is scheduled");
+    assert_eq!(due[0].name, "plain");
+}
+
 /// A forced refetch marks `Queued`; if no leg schedules that name this tick (its
 /// profile vanished from both snapshots), the orphan sweep clears it so the
 /// spinner can't freeze — but a name that IS scheduled, and one mid-`Refreshing`,

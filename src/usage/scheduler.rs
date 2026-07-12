@@ -1728,7 +1728,10 @@ fn partition_due<T: NamedEntry + Clone>(
         let next = last.saturating_add(interval);
         per_profile.insert(entry.name().to_string(), next.as_millis());
         let excluded = match act.as_ref() {
-            Ok(a) => matches!(a.get(entry.name()), Some(ProfileActivity::Refreshing)),
+            Ok(a) => matches!(
+                a.get(entry.name()),
+                Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
+            ),
             Err(_) => true, // Poisoned: fail safe to excluded.
         };
         if excluded {
@@ -1742,7 +1745,8 @@ fn partition_due<T: NamedEntry + Clone>(
 }
 
 /// Merge forced (cadence-bypassing) entries into `due`. Skips profiles that are
-/// `Refreshing` — `rotate_one_inner` owns the refresh token — and entries already due.
+/// `Refreshing`/`Switching` — `rotate_one_inner` or the switch gate owns the
+/// activity slot — and entries already due.
 fn merge_forced<T: NamedEntry + Clone>(
     snapshot: &[T],
     forced: &HashSet<String>,
@@ -1757,7 +1761,7 @@ fn merge_forced<T: NamedEntry + Clone>(
     let switching: HashSet<String> = match activity.lock() {
         Ok(a) => a
             .iter()
-            .filter(|(_, v)| matches!(v, ProfileActivity::Refreshing))
+            .filter(|(_, v)| matches!(v, ProfileActivity::Refreshing | ProfileActivity::Switching))
             .map(|(n, _)| n.clone())
             .collect(),
         Err(_) => snapshot.iter().map(|e| e.name().to_string()).collect(),
