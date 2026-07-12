@@ -56,6 +56,15 @@ pub(crate) fn validate_profile_name(
 
 pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
+        // Existence FIRST: everything below has side effects (the live
+        // credentials link is torn down before `finish_switch` would notice a
+        // ghost), and a caller holding a stale name — a daemon's queued switch
+        // target deleted out-of-process — must bounce off cleanly instead
+        // (2026-07-12 review: the too-late check let a retry misread the
+        // half-torn link as "logged out" and null the ACTIVE profile's creds).
+        if config.find(name).is_none() {
+            bail!("profile '{name}' not found");
+        }
         if config.is_active(name) {
             return Ok(());
         }

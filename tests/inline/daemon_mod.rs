@@ -211,6 +211,56 @@ fn drain_pending_switch_skips_on_active_divergence() {
     );
 }
 
+/// A queued switch whose target no longer resolves (deleted out-of-process
+/// after the enqueue — `clauth delete` can't purge this daemon's in-memory
+/// queue) is DROPPED with a last_error, never attempted. Pre-fix, the drain
+/// ran `switch_profile` on the ghost: `force_link` removed the live
+/// credentials file BEFORE the existence check fired, the entry re-queued,
+/// and the next tick's snapshot read the missing live file as "logged out" —
+/// nulling the ACTIVE profile's stored credentials (2026-07-12 review).
+#[test]
+fn drain_pending_switch_drops_a_vanished_target() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "ghost");
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "the active profile must be untouched"
+    );
+    assert!(
+        queued_targets(&daemon).is_empty(),
+        "a vanished target is dropped, not re-queued — retrying can't resurrect it"
+    );
+    // The live credentials link must still resolve to alpha — the pre-fix bug
+    // tore it down on the way to the too-late existence check.
+    assert!(
+        crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json")
+            .exists(),
+        "the live credentials file survives"
+    );
+    // Alpha's stored credentials survive on disk (the pre-fix second tick
+    // nulled them via the logged-out misread).
+    let stored = crate::profile::profile_dir("alpha")
+        .unwrap()
+        .join("credentials.json");
+    assert!(stored.exists(), "alpha's stored credentials survive");
+}
+
 /// A switch to a target that is still mid-fetch can't execute this tick, but the
 /// request is RE-QUEUED (not dropped after one attempt) and lands once the target
 /// goes idle — the deferred-not-dropped contract (a switch during a fetch window

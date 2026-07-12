@@ -125,6 +125,58 @@ fn switch_replaces_active_account_mirror_without_refusing() {
     );
 }
 
+/// `switch_profile` to a name with no profile must bail BEFORE any side
+/// effect. Pre-fix the existence check lived in `finish_switch` — LAST in the
+/// sequence — so `force_link_profile_credentials` had already torn down the
+/// live `.credentials.json` for a ghost target (a deleted profile still queued
+/// in a daemon's pending-switch), and a retry then misread the missing live
+/// file as "logged out", nulling the ACTIVE profile's stored credentials
+/// (2026-07-12 review, HIGH).
+#[test]
+fn switch_to_a_missing_profile_bails_before_touching_the_live_link() {
+    let _home = HomeSandbox::new();
+
+    let mut p = Profile::new("keeper".to_string(), None, None);
+    p.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "keeper-access".to_string(),
+            refresh_token: Some("keeper-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&p).expect("save profile");
+
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(p.credentials.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![p],
+    };
+    config.state.active_profile = Some("keeper".into());
+
+    let err = switch_profile(&mut config, "ghost").expect_err("ghost must bail");
+    assert!(
+        err.to_string().contains("not found"),
+        "bail names the cause, got: {err}"
+    );
+    assert!(config.is_active("keeper"), "active unchanged");
+    assert!(live_path.exists(), "the live credentials file survives");
+    let stored = crate::profile::profile_dir("keeper")
+        .unwrap()
+        .join("credentials.json");
+    assert!(stored.exists(), "keeper's stored credentials survive");
+}
+
 /// AUTH-4 parity, TUI side: `auto_switch_if_needed` must leave an auth-broken
 /// active even when its (frozen-stale) usage still reads as headroom — the
 /// same wedge `scan_auto_switch` had on the daemon side. Pre-fix, the

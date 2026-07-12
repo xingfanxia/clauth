@@ -98,6 +98,30 @@ impl super::Daemon {
         };
         let now = now_ms();
 
+        // A vanished target (deleted out-of-process after the enqueue — the
+        // queue holds a raw name this process alone owns) is DROPPED, not
+        // retried: no re-login can resurrect a profile that no longer exists,
+        // and attempting it would run `switch_profile`'s side effects against
+        // a ghost. The logline keeps the drop observable.
+        let target_exists = self
+            .config
+            .lock()
+            .map(|c| c.find(&target).is_some())
+            .unwrap_or(false);
+        if !target_exists {
+            logline!(
+                "clauth daemon: dropping queued switch to '{target}': profile no longer exists (deleted?)"
+            );
+            if self
+                .switch_backoff
+                .as_ref()
+                .is_some_and(|b| b.target == target)
+            {
+                self.switch_backoff = None;
+            }
+            return;
+        }
+
         // Backoff gate: if this target is inside its backoff window from a prior
         // failure, re-queue without attempting or logging — this is what turns a
         // stuck switch's 1/tick retry+log storm into a spaced, deduped one. The
