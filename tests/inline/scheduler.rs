@@ -1823,3 +1823,61 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         "the countdown tracks the cache stamp + one interval"
     );
 }
+
+/// The bootstrap pre-marks cache-due profiles `Queued` for first paint,
+/// expecting a fetch worker to take over — standing down, no worker exists, so
+/// the tick must sweep EVERY Queued mark (not only forced ones) or the row
+/// spins forever where the daemon-fed countdown belongs. In-flight kinds stay.
+#[test]
+fn standdown_sweeps_bootstrap_queued_marks() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::UsageInfo;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    }));
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![token("kitty"), token("stale")])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        rate_limit_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        standdown_probe: true,
+        standdown_active: AtomicBool::new(true),
+    };
+
+    // Bootstrap pre-marked a cache-due profile; a rotate worker from the last
+    // armed tick is still in flight on another.
+    mark_activity(&state.activity, "stale", ProfileActivity::Queued);
+    mark_activity(&state.activity, "kitty", ProfileActivity::Refreshing);
+
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+
+    let a = state.activity.lock().unwrap();
+    assert!(
+        a.get("stale").is_none(),
+        "an un-owned Queued mark is swept — no frozen spinner"
+    );
+    assert!(
+        matches!(a.get("kitty"), Some(ProfileActivity::Refreshing)),
+        "an in-flight worker's mark survives (it clears itself on landing)"
+    );
+}

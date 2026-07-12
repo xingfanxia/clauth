@@ -1670,6 +1670,16 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
     clear_orphaned_forced(&state.activity, &forced, &HashSet::new());
+    // With no worker running, EVERY Queued mark is an orphan — not only forced
+    // ones. The bootstrap pre-marks cache-due profiles Queued so the first
+    // paint shows a spinner instead of a stale countdown, expecting the first
+    // tick's worker to take over and clear it; standing down, nothing ever
+    // does, and the row would spin forever where the daemon-fed countdown
+    // belongs. Fetching/Refreshing/Switching stay — a worker from the last
+    // armed tick may genuinely still be in flight and clears itself.
+    if let Ok(mut a) = state.activity.lock() {
+        a.retain(|_, act| !matches!(act, ProfileActivity::Queued));
+    }
 }
 
 /// The store-refresh half of [`standdown_tick`], extracted store-narrow so the
