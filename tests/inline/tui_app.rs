@@ -837,7 +837,7 @@ fn divergence_flags_the_banner_and_never_blocks_the_tui() {
 /// — and the resolver leads with the "switch to it" action.
 #[test]
 fn divergence_identifies_a_sibling_owner_and_leads_with_switch_to_it() {
-    use super::{DivergenceAction, Modal, handle_key};
+    use super::{ConfirmAction, DivergenceAction, Modal, handle_key};
     use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile, save_profile};
     use crate::testutil::key;
     use ratatui::crossterm::event::KeyCode;
@@ -881,6 +881,18 @@ fn divergence_identifies_a_sibling_owner_and_leads_with_switch_to_it() {
         actions[1],
         DivergenceAction::Choice(DivergenceChoice::Overwrite)
     );
+
+    // Enter on the leading SwitchToOwner action raises the AdoptDivergence
+    // confirm for the owner — the near-always-right resolution, one keypress.
+    handle_key(&mut app, key(KeyCode::Enter));
+    let Some(Modal::Confirm(confirm)) = app.modals.last() else {
+        panic!("enter on switch-to-owner raises the adopt confirm");
+    };
+    assert!(
+        matches!(&confirm.on_confirm, ConfirmAction::AdoptDivergence(_, owner) if owner == "play"),
+        "the confirm adopts the live login into its owner 'play'",
+    );
+    assert!(!confirm.choice, "the adopt confirm defaults to cancel");
 }
 
 /// A flagged divergence renders through the ONE system banner (`update_banner`),
