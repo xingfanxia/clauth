@@ -1018,46 +1018,22 @@ pub(crate) fn ensure_installable(
     name: &str,
     refresher: impl Fn(&str) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> AuthGate {
-    // Read the target's auth shape under the config lock, then release it — the
-    // HTTP refresh below must never hold the config mutex (a slow refresh would
-    // otherwise wedge the daemon's single-threaded run loop).
-    let (expires_at, refresh_token, flagged) = {
-        let Ok(cfg) = config.lock() else {
-            return AuthGate::Transient(anyhow::anyhow!("config mutex poisoned"));
-        };
-        let Some(profile) = cfg.find(name) else {
-            // Unknown profile: nothing to gate — the switch itself surfaces
-            // "Profile not found".
-            return AuthGate::Ready;
-        };
-        if !profile.is_oauth() {
-            // Third-party (api-key) profiles carry no OAuth token to expire.
+    // Cheap pre-check WITHOUT the rotation guard: non-OAuth and
+    // comfortably-live tokens install as-is. Token data read here is
+    // discarded — only the post-guard re-read may feed the refresher (a
+    // pre-guard snapshot can go stale the moment a sibling rotation runs).
+    match oauth_shape(config, name) {
+        Err(gate) => return gate,
+        Ok((expires_at, _, flagged)) if !expiring(expires_at, flagged) => {
             return AuthGate::Ready;
         }
-        (
-            profile.access_token_expires_at(),
-            profile.refresh_token().map(str::to_string),
-            cfg.is_auth_broken(name),
-        )
-    };
-
-    // Unknown expiry → treat as not-expiring (mirrors `auto_start_kick`): install
-    // as-is and let the lazy 401→rotate path handle a surprise expiry. A standing
-    // `auth_broken` flag overrides the clock: the chain's last refresh terminally
-    // failed, so a still-future `expires_at` proves nothing (server-side
-    // revocation outlives the stored clock). Route it through the refresher —
-    // a recovered chain comes back `Refreshed` and lifts the flag, a dead one
-    // confirms `Broken`.
-    let expiring =
-        flagged || expires_at.is_some_and(|exp| (now_ms() as i64) + AUTH_GATE_GRACE_MS >= exp);
-    if !expiring {
-        return AuthGate::Ready;
+        Ok(_) => {}
     }
 
     // RotationGuard across the HTTP window (single-use double-spend guard),
     // acquired with no config lock held. A busy guard means a live session or
     // sibling worker is already on this chain — refuse this switch and retry.
-    let Ok(_guard) = RotationGuard::acquire(name) else {
+    let Ok(guard) = RotationGuard::acquire(name) else {
         return AuthGate::Transient(anyhow::anyhow!(
             "'{name}' rotation lock busy; retry after the in-flight refresh"
         ));
@@ -1066,6 +1042,112 @@ pub(crate) fn ensure_installable(
     // advances this profile's single-use chain and keeps the Keychain fresh, so
     // refreshing here would 400 the session — install as-is.
     if has_live_session(name) {
+        return AuthGate::Ready;
+    }
+    gate_under_guard(config, name, refresher, &guard)
+}
+
+/// The target's auth shape — `(access-token expiry, refresh token, standing
+/// auth_broken flag)` — read under the config lock and released before
+/// returning, so no caller ever holds the mutex across an HTTP refresh. `Err`
+/// carries the gate verdict for the non-OAuth / unknown-profile / poisoned
+/// cases.
+#[allow(
+    clippy::type_complexity,
+    reason = "one-shot triple, named at both call sites"
+)]
+fn oauth_shape(
+    config: &crate::profile::ConfigHandle,
+    name: &str,
+) -> std::result::Result<(Option<i64>, Option<String>, bool), AuthGate> {
+    let Ok(cfg) = config.lock() else {
+        return Err(AuthGate::Transient(anyhow::anyhow!(
+            "config mutex poisoned"
+        )));
+    };
+    let Some(profile) = cfg.find(name) else {
+        // Unknown profile: nothing to gate — the switch itself surfaces
+        // "Profile not found".
+        return Err(AuthGate::Ready);
+    };
+    if !profile.is_oauth() {
+        // Third-party (api-key) profiles carry no OAuth token to expire.
+        return Err(AuthGate::Ready);
+    }
+    Ok((
+        profile.access_token_expires_at(),
+        profile.refresh_token().map(str::to_string),
+        cfg.is_auth_broken(name),
+    ))
+}
+
+/// Unknown expiry → treated as not-expiring (mirrors `auto_start_kick`):
+/// install as-is and let the lazy 401→rotate path handle a surprise expiry.
+/// A standing `auth_broken` flag overrides the clock: the chain's last refresh
+/// terminally failed, so a still-future `expires_at` proves nothing
+/// (server-side revocation outlives the stored clock). Route it through the
+/// refresher — a recovered chain comes back `Refreshed` and lifts the flag, a
+/// dead one confirms `Broken`.
+fn expiring(expires_at: Option<i64>, flagged: bool) -> bool {
+    flagged || expires_at.is_some_and(|exp| (now_ms() as i64) + AUTH_GATE_GRACE_MS >= exp)
+}
+
+/// Reconcile the in-memory profile with the on-disk store; the `_guard`
+/// witness proves the [`RotationGuard`] is held, which makes the disk read
+/// stable. A cross-process peer (the daemon, a second clauth) rotates and
+/// persists under this same flock, and a caller that loaded config from disk
+/// once (CLI, MCP) can hold a snapshot predating that write. Tokens are opaque
+/// and no writer rewinds the store (see the scheduler's `fresher_disk_pair`),
+/// so a stored refresh token that DIFFERS from the in-memory one proves
+/// someone advanced the single-use chain: adopt the disk pair, and lift a
+/// stale quarantine — the chain is alive under someone else's advance
+/// (mirrors `carry_external_rotation`; a wrong lift self-corrects when the
+/// carried pair's own refresh 400s). Unreadable or tokenless disk state is a
+/// no-op: the in-memory shape stays the best available truth.
+fn adopt_disk_rotation(config: &crate::profile::ConfigHandle, name: &str, _guard: &RotationGuard) {
+    let Ok(disk) = crate::profile::load_profile(name) else {
+        return;
+    };
+    if disk.refresh_token().is_none() {
+        return;
+    }
+    {
+        let Ok(mut cfg) = config.lock() else {
+            return;
+        };
+        let Some(profile) = cfg.find_mut(name) else {
+            return;
+        };
+        if profile.refresh_token() == disk.refresh_token() {
+            return;
+        }
+        profile.credentials = disk.credentials;
+    }
+    mark_auth_broken(config, name, false);
+}
+
+/// The refresh leg; the `guard` witness proves the [`RotationGuard`] is held.
+/// First adopts a cross-process rotation from disk ([`adopt_disk_rotation`]),
+/// then re-reads the auth shape UNDER the guard — between the pre-check and
+/// guard acquisition a sibling rotation (in-process or peer) may have spent
+/// the single-use refresh token and persisted a new pair, and refreshing from
+/// that stale snapshot would 400 and wrongly quarantine a healthy login. This
+/// function takes no token arguments, so post-guard decisions structurally
+/// cannot reuse pre-guard data.
+fn gate_under_guard(
+    config: &crate::profile::ConfigHandle,
+    name: &str,
+    refresher: impl Fn(&str) -> std::result::Result<TokenResponse, RefreshError>,
+    guard: &RotationGuard,
+) -> AuthGate {
+    adopt_disk_rotation(config, name, guard);
+    let (expires_at, refresh_token, flagged) = match oauth_shape(config, name) {
+        Err(gate) => return gate,
+        Ok(shape) => shape,
+    };
+    if !expiring(expires_at, flagged) {
+        // A sibling refreshed while we acquired the guard — the stored pair is
+        // fresh; install it as-is instead of double-spending the old chain.
         return AuthGate::Ready;
     }
     let Some(rt) = refresh_token else {

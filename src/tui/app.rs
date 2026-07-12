@@ -23,10 +23,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{
     CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
-    clear_profile_credentials, create_blank_profile, create_profile_from_login, delete_profile,
-    edit_profile_endpoint, edit_profile_env, edit_profile_model, find_matching_oauth_profile,
-    overwrite_captured_profile, rename_profile, reorder_profile, switch_off, switch_profile,
-    validate_profile_name,
+    clear_profile_api_key, clear_profile_credentials, create_blank_profile,
+    create_profile_from_login, delete_profile, edit_profile_endpoint, edit_profile_env,
+    edit_profile_model, find_matching_oauth_profile, overwrite_captured_profile, rename_profile,
+    reorder_profile, switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -39,8 +39,9 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTERVAL_MS,
-    ModelSettings, Profile, ThemeName, app_state_mtime, load_config, save_app_state, save_profile,
+    AppConfig, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
+    MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings, Profile, ThemeName,
+    app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
@@ -229,6 +230,11 @@ impl ConfigRow {
 /// (no `model` key); a custom id set via ⏎ is outside this list.
 pub(crate) const MODEL_PRESETS: [&str; 4] = ["opus", "sonnet", "haiku", "opusplan"];
 
+/// The weekly-line preset ladder: one source for the Config row's segmented
+/// control AND `step_weekly_threshold`'s cycle. 100 reproduces the old
+/// hard-cap behavior (switch only once the API already refuses).
+pub(crate) const WEEKLY_PRESETS: [f64; 4] = [90.0, 95.0, 98.0, 100.0];
+
 /// One row on the program-wide Config tab. These back real persisted globals in
 /// [`AppState`] — no decorative toggles. ⏎/space cycles or flips in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +245,10 @@ pub(crate) enum GlobalConfigRow {
     /// Chain-wide "when spent" behavior (`AppState.wrap_off`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.
     WrapOff,
+    /// Chain-wide weekly (7d) exhaustion line
+    /// (`AppState.weekly_switch_threshold`, default 98) — space steps presets,
+    /// ⏎ opens the custom-value editor (50–100, decimals allowed).
+    WeeklyThreshold,
     /// Global refresh interval; `+`/`-` steps through presets in-place.
     RefreshInterval,
     /// Default action when CC overwrites the credentials symlink. ⏎/space cycles.
@@ -279,6 +289,10 @@ pub(crate) struct ConfigDraft {
     pub(crate) active: Option<ConfigRow>,
     /// First ⏎ on delete arms it; second confirms. Any cursor move disarms.
     pub(crate) armed_delete: bool,
+    /// API-account re-login is in flight: committing the base-url field advances
+    /// to the api-key field (re-enter both, mirroring `login --base-url --api-key`)
+    /// instead of ending the edit. Cleared on the api-key commit or any ⎋.
+    pub(crate) relogin_chain: bool,
     /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
     /// collapsed (set overrides still render; unset ones hide behind the chip).
     pub(crate) overrides_expanded: bool,
@@ -1215,6 +1229,9 @@ pub(crate) struct App {
     /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
     /// owns keyboard). Space/`+`/`-` still cycle the presets when `None`.
     pub(crate) refresh_interval_draft: Option<InputState>,
+    /// In-flight custom value for the Config tab's weekly-threshold editor
+    /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
+    pub(crate) weekly_threshold_draft: Option<InputState>,
 
     pub(crate) toasts: VecDeque<Toast>,
     /// Whether the terminal is currently too short for the normal layout (< 14 rows).
@@ -1513,6 +1530,7 @@ impl App {
             fallback_threshold_draft: None,
             global_config_cursor: 0,
             refresh_interval_draft: None,
+            weekly_threshold_draft: None,
             config_draft: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
@@ -2195,6 +2213,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // And the Config-tab weekly-threshold custom-value editor.
+    if app.tab == Tab::Config && app.weekly_threshold_draft.is_some() {
+        handle_weekly_threshold_edit_key(app, key);
+        return;
+    }
+
     // Esc/q abandon an in-flight login (the detached worker's result is
     // discarded by the generation guard). Catching q here keeps it symmetric
     // with esc — otherwise q would ascend out of the Setup form (orphaning the
@@ -2482,6 +2506,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
         Tab::Config => {
             app.global_config_cursor = 0;
             app.refresh_interval_draft = None;
+            app.weekly_threshold_draft = None;
         }
         Tab::Status => {
             // Keep the incident cursor; reset focus to the list per the contract.
@@ -3352,11 +3377,12 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
 ];
 
 /// Rows on the program-wide Config tab, in display order.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 6] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 7] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::WrapOff,
+    GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
     GlobalConfigRow::PreemptiveRotation,
 ];
@@ -3392,6 +3418,8 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
             let row = GLOBAL_CONFIG_ROWS[app.global_config_cursor];
             if row == GlobalConfigRow::RefreshInterval {
                 begin_refresh_interval_edit(app);
+            } else if row == GlobalConfigRow::WeeklyThreshold {
+                begin_weekly_threshold_edit(app);
             } else {
                 run_global_config_row(app, row);
             }
@@ -3408,6 +3436,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::Theme => cycle_theme(app),
         GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
         GlobalConfigRow::WrapOff => toggle_wrap_off(app),
+        GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
@@ -3700,6 +3729,82 @@ pub(crate) fn parse_refresh_secs(raw: &str) -> Option<u64> {
     (MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS)
         .contains(&ms)
         .then_some(ms)
+}
+
+/// Step the weekly exhaustion line forward through the preset ladder (space on
+/// the Config row), wrapping past the top back to the first — the same
+/// segmented-control grammar as the refresh row. Presets mirror
+/// `WEEKLY_PRESETS` in `render/global_config.rs`.
+fn step_weekly_threshold(app: &mut App) {
+    let current = app.config().state.weekly_switch_threshold_pct();
+    let next = WEEKLY_PRESETS
+        .iter()
+        .copied()
+        .find(|&p| p > current)
+        .unwrap_or(WEEKLY_PRESETS[0]);
+    {
+        let mut cfg = app.config();
+        cfg.state.weekly_switch_threshold = Some(next);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+}
+
+/// Open the inline custom-value editor for the weekly line, seeded with the
+/// current value. ⏎ commits, ⎋ discards.
+fn begin_weekly_threshold_edit(app: &mut App) {
+    let current = app.config().state.weekly_switch_threshold_pct();
+    app.weekly_threshold_draft = Some(InputState::new(&format_weekly_pct(current)));
+}
+
+/// Keystrokes while the weekly-threshold field is open: ⏎ saves, ⎋ discards.
+fn handle_weekly_threshold_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.weekly_threshold_draft = None,
+        KeyCode::Enter => commit_weekly_threshold_edit(app),
+        _ => {
+            if let Some(input) = app.weekly_threshold_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// Parse and persist the typed custom weekly line. Invalid input keeps the
+/// draft open with the inline Invalid-input treatment, same as the refresh
+/// editor — no toast.
+fn commit_weekly_threshold_edit(app: &mut App) {
+    let Some(raw) = app.weekly_threshold_draft.as_ref().map(|i| i.trimmed()) else {
+        return;
+    };
+    let Some(pct) = parse_weekly_pct(raw) else {
+        return;
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.weekly_switch_threshold = Some(pct);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+    app.weekly_threshold_draft = None;
+}
+
+/// A typed custom weekly line is valid as a finite percent (decimals allowed)
+/// within `MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT`. Shared by the
+/// commit path and the Config card's inline check.
+pub(crate) fn parse_weekly_pct(raw: &str) -> Option<f64> {
+    let pct = raw.parse::<f64>().ok()?;
+    (pct.is_finite() && (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(&pct))
+        .then_some(pct)
+}
+
+/// Render a percent without a trailing `.0` on whole numbers — `98`, `97.5`.
+pub(crate) fn format_weekly_pct(pct: f64) -> String {
+    if pct.fract() == 0.0 {
+        format!("{pct:.0}")
+    } else {
+        format!("{pct}")
+    }
 }
 
 /// Right-pane keymap for a member: ↑↓ walks rows, `+`/`-` steps the threshold,
@@ -4514,13 +4619,19 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     let env_count = profile.map(|p| p.env.len()).unwrap_or(0);
     rows.extend((0..env_count).map(ConfigRow::EnvEntry));
     rows.push(ConfigRow::EnvAdd);
-    if !is_api {
-        // OAuth account: log in (or re-login), and drop creds only when some exist.
-        rows.push(ConfigRow::Login);
-        let has_creds = profile.and_then(|p| p.credentials.as_ref()).is_some();
-        if has_creds {
-            rows.push(ConfigRow::DeleteCreds);
-        }
+    // Log in / re-login, then log out once a credential exists — for both OAuth
+    // (browser mint) and API (base url + api key) accounts. "Has a credential"
+    // reads the OAuth token or the api key depending on the account type.
+    rows.push(ConfigRow::Login);
+    let has_creds = if is_api {
+        profile
+            .and_then(|p| p.api_key.as_deref())
+            .is_some_and(|k| !k.trim().is_empty())
+    } else {
+        profile.and_then(|p| p.credentials.as_ref()).is_some()
+    };
+    if has_creds {
+        rows.push(ConfigRow::DeleteCreds);
     }
     rows.push(ConfigRow::Delete);
     rows
@@ -4563,6 +4674,7 @@ fn build_draft_new() -> ConfigDraft {
         env_new_key: InputState::new(""),
         active: None,
         armed_delete: false,
+        relogin_chain: false,
         overrides_expanded: false,
         captured_creds: None,
     }
@@ -4586,6 +4698,7 @@ fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
         env_new_key: InputState::new(""),
         active: None,
         armed_delete: false,
+        relogin_chain: false,
         overrides_expanded: false,
         captured_creds: None,
     }
@@ -4676,6 +4789,16 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 .config_draft
                 .as_ref()
                 .and_then(|d| d.editing_name.clone());
+            // An existing API account re-enters its base url + api key inline (no
+            // browser); only OAuth accounts run the token-minting flow below.
+            let is_api_account = editing.as_deref().is_some_and(|n| {
+                let cfg = app.config();
+                cfg.find(n).map(|p| !p.is_oauth()).unwrap_or(false)
+            });
+            if is_api_account {
+                start_api_relogin(app);
+                return;
+            }
             let target = match editing {
                 Some(name) => Some((name, false)),
                 None => {
@@ -4722,18 +4845,50 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         ConfigRow::DeleteCreds => {
             if let Some(name) = name {
+                let is_api = {
+                    let cfg = app.config();
+                    cfg.find(&name).map(|p| !p.is_oauth()).unwrap_or(false)
+                };
+                let detail = if is_api {
+                    "Blanks the api key; keeps the base url, model, and env. Re-login any time."
+                } else {
+                    "Blanks the login; keeps the profile, model, env, and chain slot. Re-login any time."
+                };
                 app.modals.push(Modal::Confirm(ConfirmState {
                     message: format!("Log out of '{name}'?"),
-                    detail: Some(
-                        "Blanks the login; keeps the profile, model, env, and chain slot. Re-login any time."
-                            .to_string(),
-                    ),
+                    detail: Some(detail.to_string()),
                     choice: false,
                     on_confirm: ConfirmAction::BlankCredentials(name),
                 }));
             }
         }
         _ => {}
+    }
+}
+
+/// API-account "re-login": re-enter the base url + api key inline, mirroring the
+/// CLI's `login --base-url --api-key`. Seeds both buffers from the stored values
+/// and opens the base-url editor; committing it advances to the api-key editor
+/// (the `relogin_chain`), and committing that persists both via `commit_endpoint`.
+fn start_api_relogin(app: &mut App) {
+    let name = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone());
+    let (base, key) = {
+        let cfg = app.config();
+        let p = name.as_deref().and_then(|n| cfg.find(n));
+        (
+            p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+            p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
+        )
+    };
+    if let Some(d) = app.config_draft.as_mut() {
+        d.base_url = InputState::new(&base);
+        d.api_key = InputState::new(&key);
+        d.base_url.end();
+        d.relogin_chain = true;
+        d.active = Some(ConfigRow::BaseUrl);
     }
 }
 
@@ -4836,6 +4991,9 @@ fn cancel_config_edit(app: &mut App, field: ConfigRow) {
         }
     }
     if let Some(d) = app.config_draft.as_mut() {
+        // ⎋ mid re-login abandons the whole base-url → api-key chain, not just the
+        // current field.
+        d.relogin_chain = false;
         d.active = None;
     }
 }
@@ -5374,6 +5532,7 @@ fn commit_endpoint(app: &mut App) {
     let Some(name) = d.editing_name.clone() else {
         return;
     };
+    let active_field = d.active;
     let base_url = d.base_url.trimmed_some();
     // An API key only makes sense with a base URL; drop it for OAuth.
     let api_key = if base_url.is_some() {
@@ -5399,7 +5558,16 @@ fn commit_endpoint(app: &mut App) {
             if let Some(d) = app.config_draft.as_mut() {
                 d.base_url = InputState::new(&base);
                 d.api_key = InputState::new(&key);
-                d.active = None;
+                // Re-login chain: after the base-url step, advance into the
+                // api-key editor instead of ending (only while it's still an API
+                // account — an emptied base url flipped it to OAuth, key dropped).
+                if d.relogin_chain && active_field == Some(ConfigRow::BaseUrl) && !base.is_empty() {
+                    d.api_key.end();
+                    d.active = Some(ConfigRow::ApiKey);
+                } else {
+                    d.relogin_chain = false;
+                    d.active = None;
+                }
             }
         }
         Err(e) => app.toast(ToastKind::Danger, format!("edit failed: {e}")),
@@ -5706,7 +5874,14 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         ConfirmAction::BlankCredentials(name) => {
             let result = {
                 let mut cfg = app.config();
-                clear_profile_credentials(&mut cfg, &name)
+                // OAuth accounts drop the token via the shared clearer; API
+                // accounts drop only the api key, keeping the base-url shell.
+                let is_oauth = cfg.find(&name).map(|p| p.is_oauth()).unwrap_or(true);
+                if is_oauth {
+                    clear_profile_credentials(&mut cfg, &name)
+                } else {
+                    clear_profile_api_key(&mut cfg, &name)
+                }
             };
             match result {
                 Ok(()) => {
@@ -6364,7 +6539,12 @@ fn update_banner(app: &mut App) {
     // "no active profile" (issue #2 read the generic banner as a stuck limit).
     let cfg = app.config();
     let no_active = !cfg.profiles.is_empty() && cfg.state.active_profile.is_none();
-    let any_spent = no_active && cfg.profiles.iter().any(crate::fallback::is_exhausted);
+    let weekly_pct = cfg.state.weekly_switch_threshold_pct();
+    let any_spent = no_active
+        && cfg
+            .profiles
+            .iter()
+            .any(|p| crate::fallback::is_exhausted(p, weekly_pct));
     drop(cfg);
 
     // Divergence outranks the compact-size nudge (both WARNING): a live-login

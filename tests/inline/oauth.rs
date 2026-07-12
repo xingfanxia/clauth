@@ -930,3 +930,160 @@ mod adopt_live_rotation {
         );
     }
 }
+
+// ── post-guard re-read (the pre-RotationGuard token-snapshot race) ────────────
+//
+// Between the guard-less pre-check and RotationGuard acquisition a sibling
+// rotation can spend the single-use refresh token and persist a new pair;
+// refreshing from a pre-guard snapshot would 400 and wrongly quarantine a
+// healthy login. `gate_under_guard` therefore takes NO token arguments — its
+// decisions can only come from state read under the guard. These pin that
+// boundary directly.
+
+/// The rotation lock the guard leg demands proof of (production callers hold
+/// it across the whole refresh window).
+fn gate_guard(name: &str) -> crate::runtime::RotationGuard {
+    crate::runtime::RotationGuard::acquire(name).expect("rotation guard")
+}
+
+/// Persist a peer's rotation to the on-disk profile store — the state a
+/// cross-process rotation leaves behind for `adopt_disk_rotation` to find.
+fn save_disk_profile(name: &str, refresh: &str, expires_at: Option<i64>) {
+    let mut p = Profile::new(name.to_string(), None, None);
+    p.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-disk".to_string(),
+            refresh_token: Some(refresh.to_string()),
+            expires_at,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&p).expect("save disk profile");
+}
+
+/// Stored pair already fresh when the guard leg runs (the sibling-refreshed
+/// interleave) → Ready, and the old chain is NOT double-spent (the refresher
+/// panics if called).
+#[test]
+fn gate_under_guard_installs_a_sibling_refreshed_pair_as_is() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-sibling-refreshed";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-fresh"),
+        Some(future_expiry()),
+    )));
+    assert!(matches!(
+        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        AuthGate::Ready
+    ));
+}
+
+/// Still expiring under the guard → the refresher is fed the CURRENTLY stored
+/// refresh token, never a caller-supplied snapshot.
+#[test]
+fn gate_under_guard_spends_the_currently_stored_refresh_token() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-current-rt";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-current"),
+        Some(past_expiry()),
+    )));
+    let refresher = |rt: &str| {
+        assert_eq!(
+            rt, "rt-current",
+            "must spend the token read under the guard"
+        );
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-next".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        gate_under_guard(&handle, name, refresher, &gate_guard(name)),
+        AuthGate::Refreshed
+    ));
+}
+
+/// A cross-process peer rotated and persisted while this process held a stale
+/// in-memory config snapshot (the CLI and MCP load config from disk once and
+/// never reload): under the guard the DISK pair is authoritative. A live disk
+/// pair installs as-is — the stale in-memory token is never spent (the
+/// refresher panics if called) — and the handle carries the adopted pair.
+#[test]
+fn gate_under_guard_adopts_a_cross_process_rotation_from_disk() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-disk-adopt";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-stale"),
+        Some(past_expiry()),
+    )));
+    save_disk_profile(name, "rt-peer", Some(future_expiry()));
+    assert!(matches!(
+        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        AuthGate::Ready
+    ));
+    assert_eq!(
+        handle.lock().unwrap().find(name).unwrap().refresh_token(),
+        Some("rt-peer"),
+        "the adopted disk pair must replace the stale in-memory snapshot"
+    );
+}
+
+/// Peer-rotated pair that is ITSELF already expiring again: the refresher must
+/// be fed the disk refresh token — spending the stale in-memory one would 400
+/// (already spent by the peer) and wrongly quarantine a healthy login.
+#[test]
+fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-disk-spend";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-stale"),
+        Some(past_expiry()),
+    )));
+    save_disk_profile(name, "rt-peer", Some(past_expiry()));
+    let refresher = |rt: &str| {
+        assert_eq!(rt, "rt-peer", "must spend the disk pair, not the snapshot");
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-next".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        gate_under_guard(&handle, name, refresher, &gate_guard(name)),
+        AuthGate::Refreshed
+    ));
+}
+
+/// A differing disk pair proves the chain is alive, so a standing in-memory
+/// quarantine is stale and lifts (same rationale as the scheduler's
+/// `carry_external_rotation`): the gate proceeds from the adopted pair
+/// instead of refusing a recovered login.
+#[test]
+fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-disk-quarantine";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-stale"),
+        Some(future_expiry()),
+    )));
+    handle.lock().unwrap().set_auth_broken(name, true);
+    save_disk_profile(name, "rt-peer", Some(future_expiry()));
+    assert!(matches!(
+        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        AuthGate::Ready
+    ));
+    assert!(
+        !handle.lock().unwrap().is_auth_broken(name),
+        "an adopted (alive) chain lifts a stale quarantine"
+    );
+}

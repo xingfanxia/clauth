@@ -128,10 +128,10 @@ fn switch_replaces_active_account_mirror_without_refusing() {
 /// `switch_profile` to a name with no profile must bail BEFORE any side
 /// effect. Pre-fix the existence check lived in `finish_switch` — LAST in the
 /// sequence — so `force_link_profile_credentials` had already torn down the
-/// live `.credentials.json` for a ghost target (a deleted profile still queued
-/// in a daemon's pending-switch), and a retry then misread the missing live
-/// file as "logged out", nulling the ACTIVE profile's stored credentials
-/// (2026-07-12 review, HIGH).
+/// live `.credentials.json` for a ghost target (a profile deleted by
+/// `clauth delete` while a queued auto-switch — e.g. a daemon's pending
+/// switch — MCP switch, or CLI switch still held its name), destroying the
+/// live login even though the switch itself failed.
 #[test]
 fn switch_to_a_missing_profile_bails_before_touching_the_live_link() {
     let _home = HomeSandbox::new();
@@ -681,6 +681,66 @@ fn delete_active_api_profile_unwires_settings_endpoint() {
         after.api_key, None,
         "deleted api key must not linger in settings.json"
     );
+}
+
+/// Setup-tab "log out" on an ACTIVE API account drops only the api key: the base
+/// url stays wired (account keeps its API shell + active status), the live
+/// `settings.json` loses `ANTHROPIC_AUTH_TOKEN` but keeps `ANTHROPIC_BASE_URL`,
+/// and the stale third-party stats cache is removed.
+#[test]
+fn clear_profile_api_key_keeps_base_url_and_active_status() {
+    let _home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "api-acct".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret".to_string()),
+        None,
+    )
+    .expect("create api profile");
+    config.state.active_profile = Some("api-acct".into());
+    let profile = config.find("api-acct").expect("profile present").clone();
+    crate::claude::apply_profile_to_claude_settings(&profile, &[]).expect("seed settings.json");
+    crate::profile_cache::write_profile_cache(
+        "api-acct",
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &"stale",
+    );
+
+    clear_profile_api_key(&mut config, "api-acct").expect("clear api key");
+
+    let profile = config.find("api-acct").expect("profile still present");
+    assert_eq!(profile.api_key, None, "api key dropped");
+    assert_eq!(
+        profile.base_url.as_deref(),
+        Some("https://api.example.com"),
+        "base-url shell preserved"
+    );
+    assert_eq!(
+        config.state.active_profile.as_deref(),
+        Some("api-acct"),
+        "account stays active (only the key is gone)"
+    );
+
+    let after = crate::claude::read_claude_endpoint_config().expect("read endpoint");
+    assert_eq!(
+        after.base_url.as_deref(),
+        Some("https://api.example.com"),
+        "live base url kept so the account stays an API shell"
+    );
+    assert_eq!(after.api_key, None, "live auth token stripped on log out");
+
+    let cache = crate::profile_cache::profile_cache_path(
+        "api-acct",
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
+    assert!(!cache.exists(), "stale third-party stats cache dropped");
 }
 
 /// Blanking an active profile drops its credentials + per-account fetch caches

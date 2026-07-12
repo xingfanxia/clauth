@@ -54,17 +54,22 @@ pub(crate) fn validate_profile_name(
     Ok(())
 }
 
+/// Every switch primitive tears the live credentials link down before
+/// `finish_switch` would notice a ghost, and the discard path takes no prior
+/// snapshot — an uncaptured re-login would be gone for good. So existence
+/// FIRST: a caller holding a stale name (a queued auto-switch target, the MCP
+/// switch tool with a divergence default) bounces off before any side effect
+/// instead of stranding the machine half-switched with the live link destroyed.
+fn ensure_profile_exists(config: &AppConfig, name: &str) -> Result<()> {
+    if config.find(name).is_none() {
+        bail!("profile '{name}' not found");
+    }
+    Ok(())
+}
+
 pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
-        // Existence FIRST: everything below has side effects (the live
-        // credentials link is torn down before `finish_switch` would notice a
-        // ghost), and a caller holding a stale name — a daemon's queued switch
-        // target deleted out-of-process — must bounce off cleanly instead
-        // (2026-07-12 review: the too-late check let a retry misread the
-        // half-torn link as "logged out" and null the ACTIVE profile's creds).
-        if config.find(name).is_none() {
-            bail!("profile '{name}' not found");
-        }
+        ensure_profile_exists(config, name)?;
         if config.is_active(name) {
             return Ok(());
         }
@@ -102,6 +107,7 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
 /// un-captured re-login) precisely because the caller chose to drop it.
 pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &str) -> Result<()> {
     with_state_lock(|| {
+        ensure_profile_exists(config, target)?;
         if config.is_active(target) {
             return Ok(());
         }
@@ -113,6 +119,7 @@ pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &str) -> Re
 /// Force-snapshot the outgoing creds then force the symlink. CLI prompt path only.
 pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
+        ensure_profile_exists(config, name)?;
         if config.is_active(name) {
             return Ok(());
         }
@@ -775,6 +782,30 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &str) -> R
             clear_claude_credentials()?;
             config.state.active_profile = None;
             save_app_state(&config.state)?;
+        }
+        Ok(())
+    })
+}
+
+/// Setup-tab "log out" for an API account: drop the stored api key while keeping
+/// the base-url shell so it stays an API account you can re-login. The OAuth arm
+/// is [`clear_profile_credentials`]; this one reuses [`edit_profile_endpoint`],
+/// which re-derives the provider, drops stale third-party stats, and re-applies
+/// the live `settings.json` (removing `ANTHROPIC_AUTH_TOKEN`) when the account is
+/// active — so a running `claude` loses the token too. The account stays active:
+/// its base url is still wired, only the key is gone.
+pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &str) -> Result<()> {
+    with_state_lock(|| {
+        let base_url = config.find(name).and_then(|p| p.base_url.clone());
+        edit_profile_endpoint(config, name, base_url, None)?;
+        // The endpoint editor clears the in-memory stats; also drop the on-disk
+        // third-party cache so a stale copy can't resurface on reload (no key left
+        // to refresh it).
+        if let Some(path) = crate::profile_cache::profile_cache_path(
+            name,
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        ) {
+            let _ = std::fs::remove_file(path);
         }
         Ok(())
     })

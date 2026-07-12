@@ -587,7 +587,7 @@ fn find_recovered_returns_first_member_below_threshold() {
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
     assert_eq!(
-        find_recovered_member(&members, &store),
+        find_recovered_member(&members, &store, 98.0),
         Some("b".to_string()),
     );
 }
@@ -607,7 +607,7 @@ fn find_recovered_skips_exhausted_members() {
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
-    assert_eq!(find_recovered_member(&members, &store), None);
+    assert_eq!(find_recovered_member(&members, &store, 98.0), None);
 }
 
 #[test]
@@ -625,7 +625,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
-    assert_eq!(find_recovered_member(&members, &store), None);
+    assert_eq!(find_recovered_member(&members, &store, 98.0), None);
 }
 
 #[test]
@@ -644,7 +644,7 @@ fn find_recovered_uses_threshold_per_member() {
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
     assert_eq!(
-        find_recovered_member(&members, &store),
+        find_recovered_member(&members, &store, 98.0),
         Some("b".to_string()),
     );
 }
@@ -664,7 +664,7 @@ fn find_recovered_recovers_when_window_expired() {
         usage_info(Some(window(100.0, Some(expired_reset())))),
     )]);
     assert_eq!(
-        find_recovered_member(&members, &store),
+        find_recovered_member(&members, &store, 98.0),
         Some("a".to_string()),
     );
 }
@@ -680,7 +680,7 @@ fn find_recovered_recovers_when_windowless() {
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
-        find_recovered_member(&members, &store),
+        find_recovered_member(&members, &store, 98.0),
         Some("a".to_string()),
     );
 }
@@ -696,7 +696,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
-        find_recovered_member(&members, &store),
+        find_recovered_member(&members, &store, 98.0),
         Some("a".to_string()),
     );
 }
@@ -985,15 +985,15 @@ fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
     let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
     let headroom = profile_with_util("a", Some(95.0), Some(50.0));
     assert_eq!(
-        is_exhausted_active(&exhausted, false, 90_000, None),
-        is_exhausted(&exhausted)
+        is_exhausted_active(&exhausted, false, 90_000, None, 98.0),
+        is_exhausted(&exhausted, 98.0)
     );
     assert_eq!(
-        is_exhausted_active(&headroom, false, 90_000, None),
-        is_exhausted(&headroom)
+        is_exhausted_active(&headroom, false, 90_000, None, 98.0),
+        is_exhausted(&headroom, 98.0)
     );
-    assert!(is_exhausted_active(&exhausted, false, 90_000, None));
-    assert!(!is_exhausted_active(&headroom, false, 90_000, None));
+    assert!(is_exhausted_active(&exhausted, false, 90_000, None, 98.0));
+    assert!(!is_exhausted_active(&headroom, false, 90_000, None, 98.0));
 }
 
 // Burn-aware ON but no rate available (fresh profile / first tick, or the
@@ -1007,8 +1007,8 @@ fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
 fn is_exhausted_active_burn_aware_falls_back_without_rate() {
     let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
     let headroom = profile_with_util("a", Some(95.0), Some(50.0));
-    assert!(is_exhausted_active(&exhausted, true, 90_000, None));
-    assert!(!is_exhausted_active(&headroom, true, 90_000, None));
+    assert!(is_exhausted_active(&exhausted, true, 90_000, None, 98.0));
+    assert!(!is_exhausted_active(&headroom, true, 90_000, None, 98.0));
 }
 
 // Same fallback, exercised through the full `next_target` entry point (wrap-off
@@ -1137,12 +1137,14 @@ fn burn_aware_heavy_burn_flips_wrap_off_decision_on_both_walks() {
     );
 }
 
-// ── weekly hard block (7d at 100%) ────────────────────────────────────────────
+// ── weekly exhaustion (7d soft line, 98%) ─────────────────────────────────────
 //
 // A weekly-dead account's 5h window drains and then LAPSES (no live reset), so
 // the 5h-only predicates read it as the freshest member in the chain — the
 // observed 2026-07-08 bug: auto-fallback switched INTO a 7d=100 account, and
-// recovery kept relinking it every time its 5h window rolled over.
+// recovery kept relinking it every time its 5h window rolled over. 2026-07-12
+// lowered the line from the 100% hard cap to a 98% soft line: EITHER window
+// crossing its line triggers the hop, while there is still room to land it.
 
 /// UsageInfo with both windows populated explicitly.
 fn usage_both(five_hour: Option<UsageWindow>, seven_day: Option<UsageWindow>) -> UsageInfo {
@@ -1187,29 +1189,95 @@ fn weekly_dead_active_is_exhausted_despite_idle_5h() {
     // exhausted — its 5h window never grows again (requests are refused), so
     // the 5h trigger alone would leave the daemon parked on a dead account.
     let p = weekly_dead_profile("a");
-    assert!(is_exhausted(&p));
+    assert!(is_exhausted(&p, 98.0));
     // Hard block trumps both burn-aware modes (nothing left to project).
-    assert!(is_exhausted_active(&p, false, 90_000, None));
-    assert!(is_exhausted_active(&p, true, 90_000, Some(5.0)));
+    assert!(is_exhausted_active(&p, false, 90_000, None, 98.0));
+    assert!(is_exhausted_active(&p, true, 90_000, Some(5.0), 98.0));
 }
 
 #[test]
-fn weekly_below_cap_or_lapsed_does_not_block() {
-    // 99.9% still serves requests — only the cap blocks. The 5h side has
-    // threshold semantics; the weekly side is a hard-block check by design.
-    let almost = profile_with_usage(
+fn weekly_soft_line_gates_below_it_and_lapsed_resets_renew() {
+    // The weekly side is a soft line at 98%, not a 100% hard cap (2026-07-12):
+    // an account riding 98%+ of its week bricks for DAYS the moment it tops
+    // out, so the switch must happen while there is still room to land it —
+    // waiting for the API to start refusing means dying mid-session.
+    let below = profile_with_usage(
         "a",
         Some(95.0),
-        Some(usage_both(None, Some(window(99.9, Some(live_reset()))))),
+        Some(usage_both(None, Some(window(97.9, Some(live_reset()))))),
     );
-    assert!(!is_exhausted(&almost));
-    // A 7d=100 whose reset has PASSED is a renewed quota, not a block.
+    assert!(
+        !is_exhausted(&below, 98.0),
+        "97.9% weekly still has headroom"
+    );
+    let at_line = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_both(None, Some(window(98.0, Some(live_reset()))))),
+    );
+    assert!(
+        is_exhausted(&at_line, 98.0),
+        "98% weekly counts as exhausted"
+    );
+    // A 7d window whose reset has PASSED is a renewed quota, not a block.
     let renewed = profile_with_usage(
         "a",
         Some(95.0),
         Some(usage_both(None, Some(window(100.0, Some(expired_reset()))))),
     );
-    assert!(!is_exhausted(&renewed));
+    assert!(!is_exhausted(&renewed, 98.0));
+}
+
+#[test]
+fn weekly_soft_exhausted_active_triggers_a_switch_despite_5h_headroom() {
+    // The user-reported gap (2026-07-12): active at 5h 40% / 7d 98.5% sat
+    // unswitched until the weekly cap bricked it. EITHER window crossing its
+    // line must trigger the hop.
+    let active = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_both(
+            Some(window(40.0, Some(live_reset()))),
+            Some(window(98.5, Some(live_reset()))),
+        )),
+    );
+    assert!(
+        is_exhausted(&active, 98.0),
+        "7d 98.5% triggers despite 5h 40%"
+    );
+    assert!(is_exhausted_active(&active, false, 90_000, None, 98.0));
+    let config = config_with_chain(
+        vec![active, profile_with_util("b", Some(95.0), Some(10.0))],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".into()))
+    );
+}
+
+#[test]
+fn weekly_soft_member_is_not_a_target() {
+    // Symmetric: hopping INTO a 98%+ weekly member just re-triggers next tick.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(97.0)),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_both(
+                    Some(window(10.0, Some(live_reset()))),
+                    Some(window(98.5, Some(live_reset()))),
+                )),
+            ),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".into()))
+    );
 }
 
 #[test]
@@ -1252,14 +1320,14 @@ fn weekly_dead_member_never_recovers() {
         "b",
         usage_both(None, Some(window(100.0, Some(live_reset())))),
     )]);
-    assert_eq!(find_recovered_member(&members, &dead), None);
+    assert_eq!(find_recovered_member(&members, &dead, 98.0), None);
     // Same member with the weekly reset in the past HAS recovered.
     let renewed = store_with_infos(vec![(
         "b",
         usage_both(None, Some(window(100.0, Some(expired_reset())))),
     )]);
     assert_eq!(
-        find_recovered_member(&members, &renewed),
+        find_recovered_member(&members, &renewed, 98.0),
         Some("b".to_string())
     );
 }
@@ -1290,4 +1358,146 @@ fn soonest_resume_uses_the_weekly_reset_for_a_weekly_dead_member() {
     // a's 10-minute 5h reset beats b's 48h weekly reset.
     assert_eq!(name, "a");
     assert!((500..700).contains(&secs), "got {secs}");
+}
+
+#[test]
+fn weekly_line_is_configurable_chain_wide() {
+    // Same roster, two configured lines: at 90 a member riding 7d 92% is
+    // exhausted (excluded as a target, triggers as active); back at the 98
+    // default it has headroom again. The accessor also rejects out-of-band
+    // hand-edits rather than silently disabling the weekly gate.
+    let mk = || {
+        vec![
+            profile_with_util("a", Some(95.0), Some(97.0)),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_both(
+                    Some(window(10.0, Some(live_reset()))),
+                    Some(window(92.0, Some(live_reset()))),
+                )),
+            ),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ]
+    };
+    let mut config = config_with_chain(mk(), "a");
+    config.state.weekly_switch_threshold = Some(90.0);
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".into())),
+        "at a 90 line, b's 7d 92% is exhausted — walk lands on c"
+    );
+    let default_line = config_with_chain(mk(), "a");
+    assert_eq!(
+        next_target(&default_line, None),
+        Some(SwitchAction::To("b".into())),
+        "at the 98 default, b's 7d 92% is headroom"
+    );
+    let mut garbage = config_with_chain(mk(), "a");
+    garbage.state.weekly_switch_threshold = Some(120.0);
+    assert_eq!(garbage.state.weekly_switch_threshold_pct(), 98.0);
+    assert_eq!(
+        next_target(&garbage, None),
+        Some(SwitchAction::To("b".into())),
+        "an out-of-band hand-edit falls back to the default line"
+    );
+}
+
+/// A soft-blocked (7d >= line, < 100) profile with fresh 5h headroom.
+fn weekly_soft_profile(name: &str) -> Profile {
+    profile_with_usage(
+        name,
+        Some(95.0),
+        Some(usage_both(
+            Some(window(40.0, Some(live_reset()))),
+            Some(window(98.5, Some(live_reset()))),
+        )),
+    )
+}
+
+#[test]
+fn wrap_off_keys_on_the_weekly_hard_cap_not_the_soft_line() {
+    // Whole chain soft-blocked with fresh 5h headroom: switching is correctly
+    // refused everywhere (the soft line's job), but wrap-off must NOT sign
+    // everything out — the active still has real weekly room up to the API's
+    // own cap, and Off would forfeit that tail for no gain.
+    let mut config = config_with_chain(
+        vec![weekly_soft_profile("a"), weekly_soft_profile("b")],
+        "a",
+    );
+    config.state.wrap_off = true;
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "a soft-blocked active with weekly room left must stay put"
+    );
+
+    // Same chain with the ACTIVE at the hard cap: Off fires.
+    let dead = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_both(
+            Some(window(40.0, Some(live_reset()))),
+            Some(window(100.0, Some(live_reset()))),
+        )),
+    );
+    let mut config = config_with_chain(vec![dead, weekly_soft_profile("b")], "a");
+    config.state.wrap_off = true;
+    assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
+}
+
+#[test]
+fn wrap_off_keys_on_the_hard_cap_in_the_store_walk_too() {
+    // Scheduler-side twin of the test above.
+    let mk = || {
+        config_with_chain(
+            vec![
+                profile_with_util("a", Some(95.0), None),
+                profile_with_util("b", Some(95.0), None),
+            ],
+            "a",
+        )
+    };
+    let soft = || {
+        usage_both(
+            Some(window(40.0, Some(live_reset()))),
+            Some(window(98.5, Some(live_reset()))),
+        )
+    };
+    let mut config = mk();
+    config.state.wrap_off = true;
+    let snapshot = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![("a", soft()), ("b", soft())]);
+    assert_eq!(
+        next_auto_switch_target(&snapshot, &store),
+        None,
+        "the soft-line trigger walks, finds nothing, and must NOT fall to Off"
+    );
+
+    let hard = usage_both(
+        Some(window(40.0, Some(live_reset()))),
+        Some(window(100.0, Some(live_reset()))),
+    );
+    let store = store_with_infos(vec![("a", hard), ("b", soft())]);
+    assert_eq!(
+        next_auto_switch_target(&snapshot, &store),
+        Some(SwitchAction::Off),
+        "the hard-capped active turns the chain off"
+    );
+}
+
+#[test]
+fn weekly_accessor_pins_the_band_and_resets_garbage_to_default() {
+    let mut s = crate::profile::AppState {
+        weekly_switch_threshold: Some(50.0),
+        ..Default::default()
+    };
+    assert_eq!(s.weekly_switch_threshold_pct(), 50.0, "50.0 is in-band");
+    s.weekly_switch_threshold = Some(100.0);
+    assert_eq!(s.weekly_switch_threshold_pct(), 100.0, "100.0 is in-band");
+    // Out-of-band RESETS to the default — never a clamp to the nearest bound.
+    s.weekly_switch_threshold = Some(49.99);
+    assert_eq!(s.weekly_switch_threshold_pct(), 98.0);
+    s.weekly_switch_threshold = Some(f64::NAN);
+    assert_eq!(s.weekly_switch_threshold_pct(), 98.0);
 }

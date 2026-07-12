@@ -270,6 +270,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
+        false,
     );
     let after = now_ms();
 
@@ -414,6 +415,7 @@ fn cached_fallback_does_not_clobber_store() {
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
+        false,
     );
     assert!(
         store.lock().unwrap().get("a").unwrap().five_hour.is_some(),
@@ -440,6 +442,7 @@ fn cached_fallback_does_not_clobber_store() {
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
+        false,
     );
     assert!(
         store.lock().unwrap().contains_key("b"),
@@ -812,6 +815,7 @@ fn retry_after_defers_next_fetch_slot() {
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
+        false,
     );
     let after = now_ms();
     let extra = 300_000 - REFRESH_INTERVAL_MS;
@@ -854,6 +858,7 @@ fn retry_after_defers_next_fetch_slot() {
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
+        false,
     );
     let after = now_ms();
     let floor = RATE_LIMIT_MIN_BACKOFF_MS;
@@ -871,6 +876,7 @@ fn retry_after_defers_next_fetch_slot() {
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
+        false,
     );
     let after = now_ms();
     assert!(
@@ -887,6 +893,7 @@ fn retry_after_defers_next_fetch_slot() {
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
+        false,
     );
     let after = now_ms();
     let capped = MAX_RETRY_AFTER_MS - REFRESH_INTERVAL_MS;
@@ -908,6 +915,7 @@ fn retry_after_defers_next_fetch_slot() {
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
+        false,
     );
     let after = now_ms();
     assert!(
@@ -963,6 +971,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
             &last_fetched,
             &streaks,
             REFRESH_INTERVAL_MS,
+            false,
         );
         let after = now_ms();
         assert!(
@@ -980,6 +989,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
+        false,
     );
     let before = now_ms();
     apply_outcome(
@@ -989,6 +999,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
+        false,
     );
     let after = now_ms();
     assert!(
@@ -1048,6 +1059,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
             &last_fetched,
             &streaks,
             REFRESH_INTERVAL_MS,
+            false,
         );
         let after = now_ms();
         assert!(
@@ -1088,6 +1100,7 @@ fn transient_errors_preserve_rate_limit_streak() {
             &last_fetched,
             &streaks,
             REFRESH_INTERVAL_MS,
+            false,
         );
     };
     let stamp = || {
@@ -1879,5 +1892,171 @@ fn standdown_sweeps_bootstrap_queued_marks() {
     assert!(
         matches!(a.get("kitty"), Some(ProfileActivity::Refreshing)),
         "an in-flight worker's mark survives (it clears itself on landing)"
+    );
+}
+
+// ── active-profile 429 ladder cap ────────────────────────────────────────────
+//
+// A deep back-off slot on the active row mostly buys staleness on the exact
+// row the user watches (2026-07-12: the endpoint recovered while the active
+// account sat out a 14-minute slot as `RateLimited`), so shallow streaks cap
+// at 2× cadence. The cap RELEASES past `ACTIVE_CAP_MAX_STREAK`: the `/usage`
+// window counts rejected polls and only clauth's own polls fill it (#30), so
+// a sustained storm must climb the same drain ladder as idle profiles or the
+// capped re-polls keep the window pinned. Idle profiles always keep the full
+// ladder.
+
+#[test]
+fn active_profile_rate_limit_ladder_caps_at_one_extra_interval() {
+    use super::{IntervalMs, MAX_RETRY_AFTER_MS, next_slot_deferral};
+    let interval = 90_000u64;
+    // Deep streak: the idle ladder pushes the slot to the 15-min ceiling.
+    assert_eq!(
+        next_slot_deferral(true, None, 6, interval, false),
+        IntervalMs::from_millis(MAX_RETRY_AFTER_MS - interval),
+        "idle keeps the full drain ladder"
+    );
+    // Active: the slot lands at most one extra interval out (2x cadence).
+    assert_eq!(
+        next_slot_deferral(true, None, 6, interval, true),
+        IntervalMs::from_millis(interval),
+        "active caps at 2x cadence"
+    );
+}
+
+#[test]
+fn active_profile_cap_still_honors_a_real_server_hint() {
+    use super::{IntervalMs, next_slot_deferral};
+    let interval = 90_000u64;
+    // A genuine long retry-after is a server directive, not ladder guesswork —
+    // the active cap must not shorten it.
+    assert_eq!(
+        next_slot_deferral(
+            true,
+            Some(std::time::Duration::from_secs(600)),
+            6,
+            interval,
+            true
+        ),
+        IntervalMs::from_millis(600_000 - interval),
+        "a real retry-after wins over the active cap"
+    );
+}
+
+#[test]
+fn active_profile_cap_leaves_shallow_streaks_alone() {
+    use super::next_slot_deferral;
+    let interval = 90_000u64;
+    // streak 1 ladder (interval + 10s) sits under the cap: identical either way.
+    assert_eq!(
+        next_slot_deferral(true, None, 1, interval, true),
+        next_slot_deferral(true, None, 1, interval, false),
+    );
+}
+
+/// Pins where the cap first bites and where it releases, so a drift in either
+/// boundary fails loudly. At 90s cadence: streak 3's ladder (90s + 90s) equals
+/// the 2× cap exactly (a no-op), streak 4 (90s + 270s) is the first capped
+/// step, streak 6 the last, and streak 7 releases to the idle drain ladder.
+#[test]
+fn active_profile_cap_bites_at_streak_4_and_releases_past_6() {
+    use super::{IntervalMs, MAX_RETRY_AFTER_MS, next_slot_deferral};
+    let interval = 90_000u64;
+    // streak 3: ladder == cap, active and idle agree.
+    assert_eq!(
+        next_slot_deferral(true, None, 3, interval, true),
+        next_slot_deferral(true, None, 3, interval, false),
+        "streak 3 sits exactly on the cap"
+    );
+    // streak 4: first bite — active holds 2x cadence, idle walks away.
+    assert_eq!(
+        next_slot_deferral(true, None, 4, interval, true),
+        IntervalMs::from_millis(interval),
+        "streak 4 is the first capped step"
+    );
+    assert_ne!(
+        next_slot_deferral(true, None, 4, interval, false),
+        IntervalMs::from_millis(interval),
+        "idle streak 4 must not be capped"
+    );
+    // streak 7: the cap releases — the active row climbs the same drain
+    // ladder as an idle profile (the sustained-storm concession).
+    assert_eq!(
+        next_slot_deferral(true, None, 7, interval, true),
+        next_slot_deferral(true, None, 7, interval, false),
+        "past the bound the active row must drain like an idle one"
+    );
+    assert_eq!(
+        next_slot_deferral(true, None, 7, interval, true),
+        IntervalMs::from_millis(MAX_RETRY_AFTER_MS - interval),
+        "a released deep streak sits at the 15-min ceiling"
+    );
+}
+
+/// The `is_active` flag threads through `apply_outcome` into the deferral —
+/// a regression that drops or hardwires the flag stamps both rows the same.
+/// Two profiles at the same deep streak, one active one idle: their stamped
+/// next slots must differ by exactly the cap-vs-ladder gap.
+#[test]
+fn apply_outcome_threads_is_active_into_the_deferral() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome, now_ms};
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let statuses: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    // Both profiles arrive at streak 6 (deep, still capped for the active row).
+    streaks.lock().unwrap().insert("act".to_string(), 5);
+    streaks.lock().unwrap().insert("idle".to_string(), 5);
+
+    let outcome = |name: &str| FetchOutcome {
+        name: name.to_string(),
+        info: None,
+        status: FetchStatus::RateLimited,
+        rotated: None,
+        from_fetch: false,
+        retry_after: None,
+    };
+
+    let before = now_ms();
+    apply_outcome(
+        outcome("act"),
+        &store,
+        &statuses,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        true,
+    );
+    apply_outcome(
+        outcome("idle"),
+        &store,
+        &statuses,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+    );
+    let after = now_ms();
+
+    let stamp = |name: &str| {
+        last_fetched
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .expect("stamp present")
+            .as_millis()
+    };
+    // Active at streak 6: capped → deferral = one extra interval.
+    assert!(
+        (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&stamp("act")),
+        "active stamp must carry the 2x-cadence cap"
+    );
+    // Idle at streak 6: full ladder → the 15-min ceiling.
+    let idle_extra = super::MAX_RETRY_AFTER_MS - REFRESH_INTERVAL_MS;
+    assert!(
+        (before + idle_extra..=after + idle_extra).contains(&stamp("idle")),
+        "idle stamp must carry the full drain ladder"
     );
 }
