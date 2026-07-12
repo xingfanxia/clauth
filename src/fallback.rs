@@ -44,34 +44,46 @@ fn live_five_hour(profile: &Profile) -> Option<&UsageWindow> {
     usage.five_hour.as_ref()
 }
 
-/// Cap at which the OVERALL weekly window hard-blocks an account. Not a
-/// configurable headroom threshold like the 5h one: at 100% the API refuses
-/// requests until the weekly reset, and the idle account's 5h window drains
-/// and then LAPSES — which made a weekly-dead member look like the freshest
-/// target in the chain (observed live 2026-07-08: two members at exactly
-/// 100.0 with no live 5h window, and auto-fallback switched into one). Only
-/// `seven_day` gates here — a per-model `weekly_scoped` limit at 100 (e.g.
-/// "7d fable" spent while 7d has room) blocks just that model, and the walk
-/// cannot know which model the next session will drive.
-const WEEKLY_BLOCK_PCT: f64 = 100.0;
+/// Weekly line for the wrap-off `Off` decision: REAL exhaustion (the API's own
+/// cap), never the configurable soft line. Switching early to a sibling buys
+/// headroom safety; signing every account out early buys nothing — it only
+/// forfeits the tail between the soft line and the cap on the halt path.
+const WEEKLY_HARD_BLOCK_PCT: f64 = 100.0;
 
-/// Whether `info`'s live weekly window is spent to the cap — unusable until
-/// the weekly reset regardless of anything the 5h window says. Store-side
+/// Whether `info`'s live weekly window is past `weekly_pct` — treated as
+/// spent until the weekly reset regardless of anything the 5h window says.
+/// The line is a SOFT one below the API's 100% refusal cap, gating BOTH
+/// directions of the chain walk (the active profile's switch trigger and
+/// candidate acceptance, so a hop never lands on a member that would
+/// re-trigger next tick).
+///
+/// Why not wait for 100 (the original hard cap, 2026-07-08): an account
+/// riding 98%+ of its week bricks for DAYS the moment it tops out, and its
+/// idle 5h window drains and then LAPSES — so waiting for the refusal means
+/// dying mid-session and (before the gate) even switching INTO such a member.
+/// Hopping at the line leaves the tail as slack instead (2026-07-12).
+///
+/// `weekly_pct` is chain-global (`AppState::weekly_switch_threshold_pct`,
+/// default 98), not a per-member knob like the 5h threshold: the line
+/// protects the CHAIN (a wrong hop strands days, not hours), not one member's
+/// taste. Only `seven_day` gates here — a per-model `weekly_scoped` limit at
+/// 100 (e.g. "7d fable" spent while 7d has room) blocks just that model, and
+/// the walk cannot know which model the next session will drive. Store-side
 /// twin logic inlines this same shape (see `is_exhausted_from_store`).
-fn weekly_blocked_info(info: &crate::usage::UsageInfo, now_secs: i64) -> bool {
+fn weekly_blocked_info(info: &crate::usage::UsageInfo, now_secs: i64, weekly_pct: f64) -> bool {
     seven_day_live(info, now_secs)
         && info
             .seven_day
             .as_ref()
-            .is_some_and(|w| w.utilization >= WEEKLY_BLOCK_PCT)
+            .is_some_and(|w| w.utilization >= weekly_pct)
 }
 
 /// [`weekly_blocked_info`] over a profile's own usage snapshot.
-fn weekly_blocked(profile: &Profile) -> bool {
+fn weekly_blocked(profile: &Profile, weekly_pct: f64) -> bool {
     profile
         .usage
         .as_ref()
-        .is_some_and(|u| weekly_blocked_info(u, now_epoch_secs()))
+        .is_some_and(|u| weekly_blocked_info(u, now_epoch_secs(), weekly_pct))
 }
 
 /// True when the profile's 5h utilization has crossed its own threshold. Also
@@ -80,8 +92,8 @@ fn weekly_blocked(profile: &Profile) -> bool {
 /// `soonest_resume` keep this exact behavior by design; only the ACTIVE
 /// profile's own decision becomes projection-aware (see
 /// [`is_exhausted_active`]).
-pub(crate) fn is_exhausted(profile: &Profile) -> bool {
-    weekly_blocked(profile)
+pub(crate) fn is_exhausted(profile: &Profile, weekly_pct: f64) -> bool {
+    weekly_blocked(profile, weekly_pct)
         || live_five_hour(profile).is_some_and(|w| w.utilization >= threshold_for(profile))
 }
 
@@ -143,11 +155,12 @@ pub(crate) fn is_exhausted_active(
     burn_aware: bool,
     interval_ms: u64,
     active_burn_pct_per_hour: Option<f64>,
+    weekly_pct: f64,
 ) -> bool {
-    // Weekly hard block first: a 7d window at the cap is dead until its
+    // Weekly line first: a 7d window past it is treated as dead until its
     // weekly reset whatever the 5h window (often lapsed/idle by then) says,
     // and no burn projection applies — there is nothing left to project.
-    if weekly_blocked(profile) {
+    if weekly_blocked(profile, weekly_pct) {
         return true;
     }
     let Some(window) = live_five_hour(profile) else {
@@ -184,16 +197,17 @@ pub(crate) fn soonest_resume(config: &AppConfig) -> Option<(String, i64)> {
         return None;
     }
     let now = now_epoch_secs();
+    let weekly_pct = config.state.weekly_switch_threshold_pct();
     let mut best: Option<(&str, i64)> = None;
     for name in chain {
         let profile = config.find(name)?;
-        if !is_exhausted(profile) {
+        if !is_exhausted(profile, weekly_pct) {
             return None;
         }
         // A weekly-dead member resumes at its 7d reset (its 5h window may be
         // lapsed or absent entirely); anyone else at their next 5h reset.
         let usage = profile.usage.as_ref()?;
-        let window = if weekly_blocked(profile) {
+        let window = if weekly_blocked(profile, weekly_pct) {
             usage.seven_day.as_ref()?
         } else {
             usage.five_hour.as_ref()?
@@ -245,6 +259,9 @@ pub(crate) struct ChainSnapshot {
     /// hot-path `Arc<AtomicU64>`, mirroring exactly how `wrap_off` reaches
     /// this struct.
     pub(crate) interval_ms: u64,
+    /// Snapshot of `AppState::weekly_switch_threshold_pct()` — the chain-wide
+    /// weekly (7d) exhaustion line both walk directions gate on.
+    pub(crate) weekly_pct: f64,
 }
 
 /// Snapshot active profile + chain + per-member thresholds out of `AppConfig`.
@@ -280,6 +297,7 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
             .collect(),
         burn_aware: config.state.burn_aware_switching,
         interval_ms: config.state.refresh_interval_ms,
+        weekly_pct: config.state.weekly_switch_threshold_pct(),
     })
 }
 
@@ -287,11 +305,16 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
 /// `UsageStore` rather than `Profile.usage` (which only the UI thread writes via
 /// `apply_usage`). A poisoned store lock fails safe to "not exhausted" so a
 /// momentarily wedged mutex can't trigger a switch.
-fn is_exhausted_from_store(name: &str, threshold: f64, store: &UsageStore) -> bool {
+fn is_exhausted_from_store(
+    name: &str,
+    threshold: f64,
+    store: &UsageStore,
+    weekly_pct: f64,
+) -> bool {
     let now = now_epoch_secs();
     match store.lock() {
         Ok(s) => s.get(name).is_some_and(|info| {
-            weekly_blocked_info(info, now)
+            weekly_blocked_info(info, now, weekly_pct)
                 || (five_hour_live(info, now)
                     && info
                         .five_hour
@@ -314,14 +337,15 @@ fn is_exhausted_active_from_store(
     burn_aware: bool,
     interval_ms: u64,
     store: &UsageStore,
+    weekly_pct: f64,
 ) -> bool {
     let now = now_epoch_secs();
-    // One lock window for both reads; weekly hard block trumps projection
+    // One lock window for both reads; the weekly line trumps projection
     // (mirrors `is_exhausted_active`).
     let (blocked, window): (bool, Option<UsageWindow>) = match store.lock() {
         Ok(s) => match s.get(name) {
             Some(info) => (
-                weekly_blocked_info(info, now),
+                weekly_blocked_info(info, now, weekly_pct),
                 if five_hour_live(info, now) {
                     info.five_hour.clone()
                 } else {
@@ -392,6 +416,7 @@ pub(crate) fn next_target(
     let chain = &config.state.fallback_chain;
     let active_idx = chain.iter().position(|n| n == active)?;
     let len = chain.len();
+    let weekly_pct = config.state.weekly_switch_threshold_pct();
 
     let skip = |i: usize| {
         chain[i] == active || config.find(&chain[i]).is_none() || config.is_auth_broken(&chain[i])
@@ -403,7 +428,7 @@ pub(crate) fn next_target(
         pick.map(|i| chain[i].to_string())
     };
 
-    if let Some(name) = walk(&|p| !is_exhausted(p)) {
+    if let Some(name) = walk(&|p| !is_exhausted(p, weekly_pct)) {
         return Some(SwitchAction::To(name));
     }
 
@@ -424,7 +449,10 @@ pub(crate) fn next_target(
     // since this picker is also exercised on a healthy active. The ACTIVE
     // check is burn-aware (issue #8 follow-up b) so this agrees with
     // `next_auto_switch_target`'s scheduler-side gate; the candidate walk
-    // above stays on the static `is_exhausted`.
+    // above stays on the static `is_exhausted`. Weekly-wise Off keys on the
+    // HARD cap ([`WEEKLY_HARD_BLOCK_PCT`]), not the soft line: a soft-blocked
+    // active with real weekly room left stays put instead of signing every
+    // running claude out over the tail it could still spend.
     if config.state.wrap_off
         && config.find(active).is_some_and(|p| {
             is_exhausted_active(
@@ -432,6 +460,7 @@ pub(crate) fn next_target(
                 config.state.burn_aware_switching,
                 config.state.refresh_interval_ms,
                 active_burn_pct_per_hour,
+                WEEKLY_HARD_BLOCK_PCT,
             )
         })
     {
@@ -473,6 +502,7 @@ pub(crate) fn next_auto_switch_target(
         snapshot.burn_aware,
         snapshot.interval_ms,
         store,
+        snapshot.weekly_pct,
     );
     if !active_broken && !active_exhausted {
         return None;
@@ -487,7 +517,9 @@ pub(crate) fn next_auto_switch_target(
         pick.map(|i| snapshot.chain[i].name.clone())
     };
 
-    if let Some(name) = walk(&|m| !is_exhausted_from_store(&m.name, m.threshold, store)) {
+    if let Some(name) =
+        walk(&|m| !is_exhausted_from_store(&m.name, m.threshold, store, snapshot.weekly_pct))
+    {
         return Some(SwitchAction::To(name));
     }
 
@@ -503,8 +535,21 @@ pub(crate) fn next_auto_switch_target(
     // all usage instead of staying on the spent profile — keyed on REAL
     // exhaustion only: a broken-but-unspent active stays put (AUTH-4), since
     // the live session's own Keychain chain may still be healthy and switching
-    // off would log it out over a flag, not over spent quota.
-    if snapshot.wrap_off && active_exhausted {
+    // off would log it out over a flag, not over spent quota. Same principle
+    // weekly-wise: `active_exhausted` above (the switch trigger) honors the
+    // soft line, but Off re-checks at the HARD cap
+    // ([`WEEKLY_HARD_BLOCK_PCT`]) — a soft-blocked active with real weekly
+    // room left stays put rather than signing everything out over the tail.
+    if snapshot.wrap_off
+        && is_exhausted_active_from_store(
+            &active.name,
+            active.threshold,
+            snapshot.burn_aware,
+            snapshot.interval_ms,
+            store,
+            WEEKLY_HARD_BLOCK_PCT,
+        )
+    {
         return Some(SwitchAction::Off);
     }
     None
@@ -513,7 +558,11 @@ pub(crate) fn next_auto_switch_target(
 /// Find the first chain member whose utilization is below its threshold
 /// (has recovered headroom after switch-off-all). Returns the member name.
 /// Safe to call without holding the config lock — reads from [`UsageStore`].
-pub(crate) fn find_recovered_member(chain: &[ChainMember], store: &UsageStore) -> Option<String> {
+pub(crate) fn find_recovered_member(
+    chain: &[ChainMember],
+    store: &UsageStore,
+    weekly_pct: f64,
+) -> Option<String> {
     let now = now_epoch_secs();
     for member in chain {
         // A fetched entry whose 5h window is absent or past its reset is idle
@@ -523,7 +572,7 @@ pub(crate) fn find_recovered_member(chain: &[ChainMember], store: &UsageStore) -
         // exactly what made it look reborn while the 7d cap still blocks it.
         let recovered = match store.lock() {
             Ok(s) => s.get(&member.name).map(|info| {
-                !weekly_blocked_info(info, now)
+                !weekly_blocked_info(info, now, weekly_pct)
                     && (!five_hour_live(info, now)
                         || info
                             .five_hour
@@ -569,6 +618,7 @@ pub(crate) fn auto_switch_if_needed(
                 config.state.burn_aware_switching,
                 config.state.refresh_interval_ms,
                 active_burn_pct_per_hour,
+                config.state.weekly_switch_threshold_pct(),
             )
         {
             return Ok(None);

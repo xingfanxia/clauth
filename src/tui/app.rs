@@ -39,8 +39,9 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTERVAL_MS,
-    ModelSettings, Profile, ThemeName, app_state_mtime, load_config, save_app_state, save_profile,
+    AppConfig, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
+    MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings, Profile, ThemeName,
+    app_state_mtime, load_config, save_app_state, save_profile,
 };
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
@@ -229,6 +230,11 @@ impl ConfigRow {
 /// (no `model` key); a custom id set via ⏎ is outside this list.
 pub(crate) const MODEL_PRESETS: [&str; 4] = ["opus", "sonnet", "haiku", "opusplan"];
 
+/// The weekly-line preset ladder: one source for the Config row's segmented
+/// control AND `step_weekly_threshold`'s cycle. 100 reproduces the old
+/// hard-cap behavior (switch only once the API already refuses).
+pub(crate) const WEEKLY_PRESETS: [f64; 4] = [90.0, 95.0, 98.0, 100.0];
+
 /// One row on the program-wide Config tab. These back real persisted globals in
 /// [`AppState`] — no decorative toggles. ⏎/space cycles or flips in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +245,10 @@ pub(crate) enum GlobalConfigRow {
     /// Chain-wide "when spent" behavior (`AppState.wrap_off`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.
     WrapOff,
+    /// Chain-wide weekly (7d) exhaustion line
+    /// (`AppState.weekly_switch_threshold`, default 98) — space steps presets,
+    /// ⏎ opens the custom-value editor (50–100, decimals allowed).
+    WeeklyThreshold,
     /// Global refresh interval; `+`/`-` steps through presets in-place.
     RefreshInterval,
     /// Default action when CC overwrites the credentials symlink. ⏎/space cycles.
@@ -1219,6 +1229,9 @@ pub(crate) struct App {
     /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
     /// owns keyboard). Space/`+`/`-` still cycle the presets when `None`.
     pub(crate) refresh_interval_draft: Option<InputState>,
+    /// In-flight custom value for the Config tab's weekly-threshold editor
+    /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
+    pub(crate) weekly_threshold_draft: Option<InputState>,
 
     pub(crate) toasts: VecDeque<Toast>,
     /// Whether the terminal is currently too short for the normal layout (< 14 rows).
@@ -1517,6 +1530,7 @@ impl App {
             fallback_threshold_draft: None,
             global_config_cursor: 0,
             refresh_interval_draft: None,
+            weekly_threshold_draft: None,
             config_draft: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
@@ -2208,6 +2222,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // And the Config-tab weekly-threshold custom-value editor.
+    if app.tab == Tab::Config && app.weekly_threshold_draft.is_some() {
+        handle_weekly_threshold_edit_key(app, key);
+        return;
+    }
+
     // Esc/q abandon an in-flight login (the detached worker's result is
     // discarded by the generation guard). Catching q here keeps it symmetric
     // with esc — otherwise q would ascend out of the Setup form (orphaning the
@@ -2495,6 +2515,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
         Tab::Config => {
             app.global_config_cursor = 0;
             app.refresh_interval_draft = None;
+            app.weekly_threshold_draft = None;
         }
         Tab::Status => {
             // Keep the incident cursor; reset focus to the list per the contract.
@@ -3365,11 +3386,12 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
 ];
 
 /// Rows on the program-wide Config tab, in display order.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 6] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 7] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::WrapOff,
+    GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
     GlobalConfigRow::PreemptiveRotation,
 ];
@@ -3405,6 +3427,8 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
             let row = GLOBAL_CONFIG_ROWS[app.global_config_cursor];
             if row == GlobalConfigRow::RefreshInterval {
                 begin_refresh_interval_edit(app);
+            } else if row == GlobalConfigRow::WeeklyThreshold {
+                begin_weekly_threshold_edit(app);
             } else {
                 run_global_config_row(app, row);
             }
@@ -3421,6 +3445,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::Theme => cycle_theme(app),
         GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
         GlobalConfigRow::WrapOff => toggle_wrap_off(app),
+        GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
@@ -3713,6 +3738,82 @@ pub(crate) fn parse_refresh_secs(raw: &str) -> Option<u64> {
     (MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS)
         .contains(&ms)
         .then_some(ms)
+}
+
+/// Step the weekly exhaustion line forward through the preset ladder (space on
+/// the Config row), wrapping past the top back to the first — the same
+/// segmented-control grammar as the refresh row. Presets mirror
+/// `WEEKLY_PRESETS` in `render/global_config.rs`.
+fn step_weekly_threshold(app: &mut App) {
+    let current = app.config().state.weekly_switch_threshold_pct();
+    let next = WEEKLY_PRESETS
+        .iter()
+        .copied()
+        .find(|&p| p > current)
+        .unwrap_or(WEEKLY_PRESETS[0]);
+    {
+        let mut cfg = app.config();
+        cfg.state.weekly_switch_threshold = Some(next);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+}
+
+/// Open the inline custom-value editor for the weekly line, seeded with the
+/// current value. ⏎ commits, ⎋ discards.
+fn begin_weekly_threshold_edit(app: &mut App) {
+    let current = app.config().state.weekly_switch_threshold_pct();
+    app.weekly_threshold_draft = Some(InputState::new(&format_weekly_pct(current)));
+}
+
+/// Keystrokes while the weekly-threshold field is open: ⏎ saves, ⎋ discards.
+fn handle_weekly_threshold_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.weekly_threshold_draft = None,
+        KeyCode::Enter => commit_weekly_threshold_edit(app),
+        _ => {
+            if let Some(input) = app.weekly_threshold_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// Parse and persist the typed custom weekly line. Invalid input keeps the
+/// draft open with the inline Invalid-input treatment, same as the refresh
+/// editor — no toast.
+fn commit_weekly_threshold_edit(app: &mut App) {
+    let Some(raw) = app.weekly_threshold_draft.as_ref().map(|i| i.trimmed()) else {
+        return;
+    };
+    let Some(pct) = parse_weekly_pct(raw) else {
+        return;
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.weekly_switch_threshold = Some(pct);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+    app.weekly_threshold_draft = None;
+}
+
+/// A typed custom weekly line is valid as a finite percent (decimals allowed)
+/// within `MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT`. Shared by the
+/// commit path and the Config card's inline check.
+pub(crate) fn parse_weekly_pct(raw: &str) -> Option<f64> {
+    let pct = raw.parse::<f64>().ok()?;
+    (pct.is_finite() && (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(&pct))
+        .then_some(pct)
+}
+
+/// Render a percent without a trailing `.0` on whole numbers — `98`, `97.5`.
+pub(crate) fn format_weekly_pct(pct: f64) -> String {
+    if pct.fract() == 0.0 {
+        format!("{pct:.0}")
+    } else {
+        format!("{pct}")
+    }
 }
 
 /// Right-pane keymap for a member: ↑↓ walks rows, `+`/`-` steps the threshold,
@@ -6447,7 +6548,12 @@ fn update_banner(app: &mut App) {
     // "no active profile" (issue #2 read the generic banner as a stuck limit).
     let cfg = app.config();
     let no_active = !cfg.profiles.is_empty() && cfg.state.active_profile.is_none();
-    let any_spent = no_active && cfg.profiles.iter().any(crate::fallback::is_exhausted);
+    let weekly_pct = cfg.state.weekly_switch_threshold_pct();
+    let any_spent = no_active
+        && cfg
+            .profiles
+            .iter()
+            .any(|p| crate::fallback::is_exhausted(p, weekly_pct));
     drop(cfg);
 
     // Divergence outranks the compact-size nudge (both WARNING): a live-login
