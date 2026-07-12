@@ -20,15 +20,17 @@ pub(super) fn fixed(value: &str, width: usize) -> String {
 pub(super) fn fixed_split(value: &str, width: usize) -> (String, String) {
     let mut content = String::with_capacity(width);
     let mut count = 0;
-    let mut iter = value.chars();
-    for ch in iter.by_ref() {
-        if count >= width {
-            break;
-        }
+    // Peek instead of a plain `for`: the loop head must not consume the char
+    // AFTER the window, or a value exactly one char over `width` reads as
+    // exhausted and gets silently cropped with no ellipsis
+    // ("Max 20x" at 6 → "Max 20" instead of "Max 2…").
+    let mut iter = value.chars().peekable();
+    while count < width {
+        let Some(ch) = iter.next() else { break };
         content.push(ch);
         count += 1;
     }
-    if width > 0 && iter.next().is_some() {
+    if width > 0 && iter.peek().is_some() {
         content.pop();
         content.push('…');
         count = width;
@@ -36,6 +38,10 @@ pub(super) fn fixed_split(value: &str, width: usize) -> (String, String) {
     let pad = " ".repeat(width - count);
     (content, pad)
 }
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_format.rs"]
+mod tests;
 
 pub(super) fn name_style(profile: &Profile) -> Style {
     let base = Style::default().fg(theme::text_color());
