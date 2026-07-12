@@ -45,6 +45,16 @@ const RATE_LIMIT_MIN_BACKOFF_MS: u64 = 10_000;
 /// re-hit every cadence; the streak resets on the next live fetch.
 const RATE_LIMIT_BACKOFF_FACTOR: u64 = 3;
 
+/// Last streak level at which the ACTIVE profile's 429 ladder stays capped at
+/// 2× cadence ([`next_slot_deferral`]); deeper streaks release to the full
+/// drain ladder. The bound exists because the `/usage` throttle is per-account
+/// on requests to `/usage` itself and counts REJECTED polls (the #30
+/// learning) — a cap with no release would keep re-filling that window for as
+/// long as a genuine storm lasts. At the default 90s cadence this bound buys
+/// ~6 dense probes (≈3 min apart) over the storm's first quarter hour — enough
+/// to re-discover a recovered endpoint fast — before conceding to the ladder.
+const ACTIVE_CAP_MAX_STREAK: u32 = 6;
+
 /// Wall-clock instant in epoch-milliseconds. Distinct from [`IntervalMs`] so
 /// instants and spans can't be confused. `#[repr(transparent)]` keeps layout
 /// identical to the persisted `u64` in any `HashMap<String, u64>`.
@@ -838,12 +848,16 @@ fn rate_limit_backoff_ms(streak: u32) -> u64 {
 /// growing back-off can drain). Capped at [`MAX_RETRY_AFTER_MS`]. Non-429
 /// outcomes: no defer.
 ///
-/// The ACTIVE profile's ladder caps at one extra interval (2× cadence): its
-/// account's rate-limit window is dominated by the running claude's own API
-/// traffic, so clauth's one poll per slot neither pins nor drains it — a deep
-/// slot only buys staleness on the exact row the user is watching (observed
-/// 2026-07-12: the endpoint recovered while the active account sat out a
-/// 14-minute slot as `RateLimited`). A REAL server `retry-after` still wins.
+/// The ACTIVE profile's ladder caps at one extra interval (2× cadence) while
+/// the streak is shallow (≤ [`ACTIVE_CAP_MAX_STREAK`]): a deep slot on the row
+/// the user is watching mostly buys staleness (observed 2026-07-12: the
+/// endpoint recovered while the active account sat out a 14-minute slot as
+/// `RateLimited`). The cap must NOT be unconditional: the `/usage` window is
+/// filled only by clauth's own polls — the running claude's `/v1/messages`
+/// traffic never touches it — so on a SUSTAINED storm capped ~2×-cadence
+/// re-polls would keep the window pinned (the exact #30 failure); past the
+/// bound the active row climbs the same drain ladder as everyone else. A REAL
+/// server `retry-after` still wins (though `/usage` itself only ever sends 0).
 fn next_slot_deferral(
     rate_limited: bool,
     retry_after: Option<Duration>,
@@ -854,7 +868,7 @@ fn next_slot_deferral(
     let hint = retry_after.map(|ra| ra.as_millis() as u64);
     let target_ms = if rate_limited {
         let mut ladder = interval_ms.saturating_add(rate_limit_backoff_ms(streak));
-        if active {
+        if active && streak <= ACTIVE_CAP_MAX_STREAK {
             ladder = ladder.min(interval_ms.saturating_mul(2));
         }
         hint.unwrap_or(0).max(ladder)
