@@ -210,6 +210,109 @@ fn merge_forced_skips_switching() {
     assert_eq!(due[0].name, "plain");
 }
 
+/// Entering the rotation leg through the clock-expired-429 unmask must not
+/// cost the endpoint-level backoff when the refresh can't complete: the bail
+/// keeps `RateLimited` plus the server hint, while a 401-entered bail stays
+/// `Cached`.
+#[test]
+fn failed_unmask_bail_keeps_the_429_context() {
+    use std::time::Duration;
+
+    use super::{FetchStatus, rotation_bail_context};
+
+    // 429-entered with a server hint: both survive the failed refresh.
+    let (status, retry_after) = rotation_bail_context(Some(Some(Duration::from_secs(30))));
+    assert_eq!(status, FetchStatus::RateLimited);
+    assert_eq!(retry_after, Some(Duration::from_secs(30)));
+
+    // 429-entered without a hint: still RateLimited so the no-hint ladder runs.
+    let (status, retry_after) = rotation_bail_context(Some(None));
+    assert_eq!(status, FetchStatus::RateLimited);
+    assert_eq!(retry_after, None);
+
+    // 401-entered: plain cached bail, no phantom rate limit.
+    let (status, retry_after) = rotation_bail_context(None);
+    assert_eq!(status, FetchStatus::Cached);
+    assert_eq!(retry_after, None);
+}
+
+/// The unmask-bail outcome drives the same deferral + streak accounting as a
+/// plain 429: the next slot lands on `now + retry_after` and the consecutive
+/// count survives the failed refresh attempt.
+#[test]
+fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
+    use std::time::Duration;
+
+    use super::{
+        FetchOutcome, StatusStore, apply_outcome, now_ms, partition_due, rotation_bail_context,
+    };
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let statuses: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let (status, retry_after) = rotation_bail_context(Some(Some(Duration::from_secs(300))));
+    let outcome = FetchOutcome {
+        name: "u".to_string(),
+        info: None,
+        status,
+        rotated: None,
+        from_fetch: false,
+        retry_after,
+    };
+
+    let before = now_ms();
+    apply_outcome(
+        outcome,
+        &store,
+        &statuses,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+    );
+    let after = now_ms();
+
+    assert_eq!(
+        streaks.lock().unwrap().get("u").copied(),
+        Some(1),
+        "the failed unmask still counts toward the 429 streak"
+    );
+
+    let extra = 300_000 - REFRESH_INTERVAL_MS;
+    let stamp = last_fetched
+        .lock()
+        .unwrap()
+        .get("u")
+        .copied()
+        .expect("stamp present")
+        .as_millis();
+    assert!(
+        (before + extra..=after + extra).contains(&stamp),
+        "deferred stamp must sit retry_after - interval ahead of now"
+    );
+
+    // partition_due honors the deferral end to end.
+    let snapshot = vec![token("u")];
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let (due, _) = partition_due(
+        &snapshot,
+        stamp + REFRESH_INTERVAL_MS - 1,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+    );
+    assert!(due.is_empty(), "not due before the deferred slot");
+    let (due, _) = partition_due(
+        &snapshot,
+        stamp + REFRESH_INTERVAL_MS,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+    );
+    assert_eq!(due.len(), 1, "due once the deferred slot arrives");
+}
+
 /// A forced refetch marks `Queued`; if no leg schedules that name this tick (its
 /// profile vanished from both snapshots), the orphan sweep clears it so the
 /// spinner can't freeze — but a name that IS scheduled, and one mid-`Refreshing`,

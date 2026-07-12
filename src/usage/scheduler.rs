@@ -363,6 +363,21 @@ fn token_clock_expired(access_expires_at: Option<i64>, now_ms: i64) -> bool {
     access_expires_at.is_some_and(|exp| now_ms >= exp)
 }
 
+/// Status + server hint for a rotation-leg bail that couldn't complete a
+/// refresh (busy guard, live session, missing refresh token, failed refresh).
+/// A bail that entered the rotation leg through the clock-expired-429 unmask
+/// (`unmask_429` = the 429's `retry-after`) keeps that endpoint-level context
+/// — `RateLimited` plus the hint — so `apply_outcome`'s deferral and streak
+/// accounting survive the failed attempt; dropping them re-polled a
+/// rate-limited endpoint on the plain cadence. A 401-entered bail stays
+/// `Cached`.
+fn rotation_bail_context(unmask_429: Option<Option<Duration>>) -> (FetchStatus, Option<Duration>) {
+    match unmask_429 {
+        Some(retry_after) => (FetchStatus::RateLimited, retry_after),
+        None => (FetchStatus::Cached, None),
+    }
+}
+
 /// Floor (ms) for [`active_rotate_lead_ms`] — even on a very short refresh
 /// interval, leave a couple of minutes of margin.
 const ACTIVE_ROTATE_LEAD_FLOOR_MS: i64 = 180_000;
@@ -424,7 +439,9 @@ fn keychain_live() -> bool {
 /// Fetch + rotate + retry for one profile. On 401 — or a 429 on a clock-expired
 /// token (the AUTH-1 dead-login unmasking, see [`token_clock_expired`]) — refresh
 /// the OAuth pair, persist, retry once. A 429 on a still-valid token bails to disk
-/// cache as `RateLimited`; other errors bail as `Cached`. Pushes `name` onto
+/// cache as `RateLimited`; other errors bail as `Cached`. An unmask entry whose
+/// refresh can't complete keeps the 429's status + `retry-after`
+/// ([`rotation_bail_context`]). Pushes `name` onto
 /// `refetch` when rotation succeeded but the follow-up fetch failed. Returns a
 /// [`FetchOutcome`]: the rotated pair for the caller's `TokenList` sync, the
 /// `from_fetch` provenance flag, and the 429 `retry-after` hint that
@@ -470,6 +487,7 @@ fn fetch_with_rotation(
         now_ms() as i64,
         interval_ms,
     );
+    let mut unmask_429: Option<Option<Duration>> = None;
     if !proactive {
         match fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity)) {
             Ok(info) => return FetchOutcome::live(name, info, None),
@@ -482,8 +500,11 @@ fn fetch_with_rotation(
             }
             // 401, or a 429 on a clock-expired token (AUTH-1): fall through to the
             // rotation leg so a dead refresh token surfaces as `auth_broken` rather
-            // than staying masked as `RateLimited`.
-            Err(FetchError::Status(401)) | Err(FetchError::RateLimited { .. }) => {}
+            // than staying masked as `RateLimited`. The 429's endpoint-level
+            // context rides along so a failed unmask keeps the deferral + streak
+            // (see `rotation_bail_context`).
+            Err(FetchError::Status(401)) => {}
+            Err(FetchError::RateLimited { retry_after }) => unmask_429 = Some(retry_after),
             Err(_) => return FetchOutcome::cached(name, FetchStatus::Cached, None, None),
         }
     }
@@ -505,7 +526,8 @@ fn fetch_with_rotation(
                 Err(_) => FetchOutcome::cached(name, FetchStatus::Cached, None, None),
             }
         } else {
-            FetchOutcome::cached(name, FetchStatus::Cached, None, None)
+            let (status, retry_after) = rotation_bail_context(unmask_429);
+            FetchOutcome::cached(name, status, None, retry_after)
         }
     };
 
