@@ -402,20 +402,24 @@ fn fetch_with_rotation(
     let name = entry.name.as_str();
     let access_token = entry.access_token.as_str();
     let refresh_token = entry.refresh_token.as_deref();
-    let access_expires_at = entry.access_expires_at;
-    // Rotation coherence (#1): read the active flag and the preemptive toggle
-    // in one short config-lock window; the poll itself must never hold the
-    // lock. The stored expiry rides on the `TokenEntry` snapshot.
-    let (is_active, interval_ms, preemptive) = config
+    // Rotation coherence (#1): read the active flag, stored expiry, and the
+    // preemptive toggle in one short config-lock window; the poll itself must
+    // never hold the lock. Config — not the `TokenEntry` snapshot — is the
+    // expiry source: a kick that rotated earlier in this tick has already
+    // persisted the fresh expiry there, while the entry still carries the
+    // pre-kick one, and a stale past expiry here would read as clock-expired
+    // and re-spend the just-minted single-use pair.
+    let (is_active, access_expires_at, interval_ms, preemptive) = config
         .lock()
         .map(|c| {
             (
                 c.is_active(name),
+                c.find(name).and_then(|p| p.access_token_expires_at()),
                 c.state.refresh_interval_ms,
                 c.state.preemptive_rotation,
             )
         })
-        .unwrap_or((false, 90_000, false));
+        .unwrap_or((false, None, 90_000, false));
     let proactive = proactive_rotation_due(
         preemptive,
         is_active,

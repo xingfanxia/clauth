@@ -909,4 +909,24 @@ mod adopt_live_rotation {
         assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
+
+    /// An adopted pair proves the chain is alive, so a standing `auth_broken`
+    /// is stale — same lift as the scheduler's `carry_external_rotation`.
+    /// Without it, an active recovered by a CC-side re-login stays excluded
+    /// from the fallback walk and refused as a switch target until a manual
+    /// `clauth login` (the cross-PR seam the adopt PR deferred to the rebase).
+    #[test]
+    fn adopting_a_live_rotation_lifts_a_stale_quarantine() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-quarantined";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        handle.lock().unwrap().set_auth_broken(name, true);
+        let adopted =
+            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
+        assert!(adopted.is_some(), "the fresher same-account pair adopts");
+        assert!(
+            !handle.lock().unwrap().is_auth_broken(name),
+            "an adopted (alive) chain lifts a stale quarantine"
+        );
+    }
 }

@@ -919,6 +919,16 @@ pub(crate) fn try_adopt_live_rotation(
     if !adopted {
         return None;
     }
+    // The adopted pair proves the chain is alive, so a standing `auth_broken`
+    // is stale — the flag was set while CC held the fresher pair. Same lift as
+    // the scheduler's `carry_external_rotation` (inlined here because the
+    // config guard is already held); without it, an active recovered by a
+    // CC-side re-login stays excluded from the fallback walk and refused as a
+    // switch target until a manual `clauth login`.
+    if cfg.set_auth_broken(name, false) {
+        eprintln!("clauth: '{name}' re-authenticated — auth_broken cleared");
+        let _ = crate::profile::save_app_state(&cfg.state);
+    }
     write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &live_id);
     eprintln!(
         "clauth: adopted the live session's rotated login for '{name}' \
