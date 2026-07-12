@@ -584,6 +584,53 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
     );
 }
 
+/// Deleting the ACTIVE API-key profile must strip its endpoint + key from the
+/// live `~/.claude/settings.json`, not only the (absent) credentials link.
+/// Otherwise the deleted account's `ANTHROPIC_AUTH_TOKEN` lingers in plaintext
+/// and the next session still routes to the dead endpoint.
+#[test]
+fn delete_active_api_profile_unwires_settings_endpoint() {
+    let _home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "api-acct".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret".to_string()),
+        None,
+    )
+    .expect("create api profile");
+    // create_blank_profile does not activate; mark it active and wire the live
+    // settings.json the way a switch would, then delete it out from under that.
+    config.state.active_profile = Some("api-acct".into());
+    let profile = config.find("api-acct").expect("profile present").clone();
+    crate::claude::apply_profile_to_claude_settings(&profile, &[]).expect("seed settings.json");
+    assert_eq!(
+        crate::claude::read_claude_endpoint_config()
+            .expect("read endpoint")
+            .api_key
+            .as_deref(),
+        Some("sk-secret"),
+        "precondition: active api key is wired into settings.json"
+    );
+
+    delete_profile(&mut config, "api-acct").expect("delete active api profile");
+
+    let after = crate::claude::read_claude_endpoint_config().expect("read endpoint");
+    assert_eq!(
+        after.base_url, None,
+        "deleted endpoint must not linger in settings.json"
+    );
+    assert_eq!(
+        after.api_key, None,
+        "deleted api key must not linger in settings.json"
+    );
+}
+
 /// Blanking an active profile drops its credentials + per-account fetch caches
 /// and clears the live link + `active_profile`, while name/env/model survive.
 #[test]

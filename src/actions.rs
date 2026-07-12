@@ -466,6 +466,17 @@ pub(crate) fn rename_profile(config: &mut AppConfig, old: &str, new: &str) -> Re
 pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
         let was_active = config.is_active(name);
+        // An active API profile's base_url + api_key (and model-tier keys) live in
+        // ~/.claude/settings.json, not the credentials link. Capture its custom
+        // env keys before removal so the unwire below can strip those too.
+        let active_env_keys: Vec<String> = if was_active {
+            config
+                .find(name)
+                .map(|p| p.env.keys().cloned().collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let dir = profile_dir(name)?;
 
         // Remove directory first: a failed delete keeps the profile in state so
@@ -479,6 +490,11 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<()> {
 
         if was_active {
             clear_claude_credentials()?;
+            // Unwire the deleted account from live settings.json: a blank profile
+            // clears its endpoint/key/model env so the key can't linger in
+            // plaintext and the next session doesn't route to a dead endpoint.
+            let blank = Profile::new(name.to_string(), None, None);
+            apply_profile_to_claude_settings(&blank, &active_env_keys)?;
         }
         Ok(())
     })
