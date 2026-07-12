@@ -5,6 +5,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use crate::lockorder::{RankedMutex, rank};
+use crate::logline::logline;
 use crate::oauth::RefreshError;
 use crate::providers::ThirdPartyStats;
 
@@ -1180,6 +1181,29 @@ pub(crate) fn collect_third_party_entries(
         .collect()
 }
 
+/// Collect the OAuth profiles' token snapshots for the refresher's `TokenList`.
+/// Skips api-key/credential-less profiles (no `claudeAiOauth`). Snapshots the
+/// persisted quarantine flag so the poll partition can widen a flagged
+/// profile's cadence without a config lock. Shared by the TUI (`App::new` /
+/// `refresh_tokens`) and the headless `daemon`.
+pub(crate) fn collect_tokens(config: &crate::profile::AppConfig) -> Vec<TokenEntry> {
+    config
+        .profiles
+        .iter()
+        .filter_map(|p| {
+            let oauth = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
+            Some(TokenEntry {
+                name: p.name.to_string(),
+                access_token: oauth.access_token.clone(),
+                refresh_token: oauth.refresh_token.clone(),
+                auto_start: p.auto_start,
+                access_expires_at: oauth.expires_at,
+                auth_broken: config.is_auth_broken(&p.name),
+            })
+        })
+        .collect()
+}
+
 /// Remove session-suppressed generic profiles from the third-party snapshot so
 /// they aren't re-fetched on the timer. The set is cloned once (it is small) so
 /// no lock is held across the filter; a poisoned lock passes the snapshot through.
@@ -1482,6 +1506,14 @@ pub(crate) struct SchedulerState {
     third_party_status: ThirdPartyStatusStore,
     suppressed_generic: SuppressedGenericStore,
     shutting_down: Arc<AtomicBool>,
+    /// Dual-scheduler dedup (issue #27): probe for a live daemon each tick
+    /// and stand this refresher down while one runs. `true` ONLY for the TUI —
+    /// the daemon must never probe (its own held flock reads as "another
+    /// daemon", a self-stand-down).
+    standdown_probe: bool,
+    /// Whether the previous tick stood down — transition edges get one log
+    /// line each way, never a per-tick repeat.
+    standdown_active: AtomicBool,
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
@@ -1490,6 +1522,27 @@ pub(crate) struct SchedulerState {
 /// auto-switch chain.
 fn tick(state: &SchedulerState) {
     let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
+
+    // Dual-scheduler dedup (#27): while a live daemon owns the loop, this
+    // refresher stands down and renders the daemon's work product instead of
+    // competing for it (double HTTP polling drains the per-account usage
+    // quota; a doubled rotation races the single-use refresh chain; a doubled
+    // auto-switch scan is the switch thrash flagged on #27). The probe is
+    // per-tick, so the refresher re-arms within one tick of the daemon dying
+    // (flock released) or wedging (status.json stale).
+    if state.standdown_probe && crate::daemon::daemon_is_live() {
+        if !state.standdown_active.swap(true, Ordering::Relaxed) {
+            standdown_transition_log(
+                "clauth: live daemon detected — standing down the in-app refresher \
+                 (rendering from its feed)",
+            );
+        }
+        standdown_tick(state, interval_ms);
+        return;
+    }
+    if state.standdown_active.swap(false, Ordering::Relaxed) {
+        standdown_transition_log("clauth: daemon gone — re-arming the in-app refresher");
+    }
 
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
     // Drained once and handed to both legs; a forced name only matches the leg
@@ -1587,6 +1640,112 @@ fn tick(state: &SchedulerState) {
     );
 }
 
+/// Log a stand-down transition — but never onto a live terminal. The probe
+/// runs only inside the TUI, whose stderr IS the ratatui screen: an
+/// unconditional line would paint over the accounts pane on every launch
+/// beside a daemon. With stderr redirected (a file, a pipe, CI) the
+/// transition is recorded as usual.
+fn standdown_transition_log(msg: &str) {
+    use std::io::IsTerminal as _;
+    if !std::io::stderr().is_terminal() {
+        logline!("{msg}");
+    }
+}
+
+/// One scheduler tick while a live daemon owns the loop. The daemon
+/// fetches, rotates, and decides switches; this side only re-reads its work
+/// product so the UI stays current:
+///   * re-seed the usage / third-party stores from the disk caches the daemon
+///     keeps fresh ([`try_seed_cache`] stamps status Fresh/Cached off the cache
+///     mtime, and `last_fetched` AT the mtime — so the countdowns below track
+///     the daemon's real cadence);
+///   * republish countdowns from those stamps (partition is reused for its
+///     timing math only; the due list is deliberately discarded — nothing
+///     fetches here);
+///   * drain forced names (a manual `r`) and clear their Queued marks — the
+///     daemon can't be asked to fetch early from here, and a stranded mark
+///     would freeze the row's spinner;
+///   * skip rotation and both auto-switch scans entirely.
+fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
+    let forced: HashSet<String> = state
+        .refetch_queue
+        .lock()
+        .ok()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default();
+
+    let oauth_snapshot: Vec<TokenEntry> =
+        state.tokens.lock().map(|t| t.clone()).unwrap_or_default();
+    let tp_snapshot: Vec<ThirdPartyEntry> = state
+        .third_party_tokens
+        .lock()
+        .map(|t| t.clone())
+        .unwrap_or_default();
+
+    hydrate_from_daemon_caches(
+        &state.store,
+        &state.status,
+        &state.third_party_usage_store,
+        &state.third_party_status,
+        &state.last_fetched,
+        &oauth_snapshot,
+        &tp_snapshot,
+        interval_ms,
+    );
+
+    let now = now_ms();
+    let (_, oauth_next) = partition_due(
+        &oauth_snapshot,
+        now,
+        &state.last_fetched,
+        &state.activity,
+        interval_ms,
+    );
+    let (_, tp_next) = partition_due(
+        &tp_snapshot,
+        now,
+        &state.last_fetched,
+        &state.activity,
+        interval_ms,
+    );
+    publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
+
+    clear_orphaned_forced(&state.activity, &forced, &HashSet::new());
+    // With no worker running, EVERY Queued mark is an orphan — not only forced
+    // ones. The bootstrap pre-marks cache-due profiles Queued so the first
+    // paint shows a spinner instead of a stale countdown, expecting the first
+    // tick's worker to take over and clear it; standing down, nothing ever
+    // does, and the row would spin forever where the daemon-fed countdown
+    // belongs. Fetching/Refreshing/Switching stay — a worker from the last
+    // armed tick may genuinely still be in flight and clears itself.
+    if let Ok(mut a) = state.activity.lock() {
+        a.retain(|_, act| !matches!(act, ProfileActivity::Queued));
+    }
+}
+
+/// The store-refresh half of [`standdown_tick`], extracted store-narrow so the
+/// hydrate contract is testable without a full `SchedulerState`: every profile
+/// with an on-disk cache lands in its store with a freshness-derived status and
+/// `last_fetched` stamped at the cache mtime; cacheless profiles are left
+/// untouched (the daemon will publish them shortly).
+#[allow(clippy::too_many_arguments)]
+fn hydrate_from_daemon_caches(
+    store: &UsageStore,
+    status: &StatusStore,
+    tp_store: &ThirdPartyUsageStore,
+    tp_status: &ThirdPartyStatusStore,
+    last_fetched: &LastFetchedAt,
+    oauth: &[TokenEntry],
+    third_party: &[ThirdPartyEntry],
+    interval_ms: u64,
+) {
+    let now = now_ms();
+    for entry in oauth {
+        try_seed_cache(store, status, last_fetched, &entry.name, now, interval_ms);
+    }
+    bootstrap_third_party(tp_store, tp_status, last_fetched, third_party, interval_ms);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_refresher(
     config: crate::profile::ConfigHandle,
@@ -1606,6 +1765,7 @@ pub(crate) fn spawn_refresher(
     third_party_status: ThirdPartyStatusStore,
     suppressed_generic: SuppressedGenericStore,
     shutting_down: Arc<AtomicBool>,
+    standdown_probe: bool,
 ) {
     let state = SchedulerState {
         config,
@@ -1625,6 +1785,8 @@ pub(crate) fn spawn_refresher(
         third_party_status,
         suppressed_generic,
         shutting_down,
+        standdown_probe,
+        standdown_active: AtomicBool::new(false),
     };
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
     std::thread::Builder::new()

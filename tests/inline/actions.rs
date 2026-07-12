@@ -129,9 +129,9 @@ fn switch_replaces_active_account_mirror_without_refusing() {
 /// effect. Pre-fix the existence check lived in `finish_switch` — LAST in the
 /// sequence — so `force_link_profile_credentials` had already torn down the
 /// live `.credentials.json` for a ghost target (a profile deleted by
-/// `clauth delete` while a queued auto-switch, MCP switch, or CLI switch
-/// still held its name), destroying the live login even though the switch
-/// itself failed.
+/// `clauth delete` while a queued auto-switch — e.g. a daemon's pending
+/// switch — MCP switch, or CLI switch still held its name), destroying the
+/// live login even though the switch itself failed.
 #[test]
 fn switch_to_a_missing_profile_bails_before_touching_the_live_link() {
     let _home = HomeSandbox::new();

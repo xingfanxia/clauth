@@ -71,6 +71,19 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "sink_active_",
         ],
     ),
+    (
+        "Headless daemon + status feed",
+        &[
+            "build_status",
+            "tick_with_empty_queues",
+            "drain_pending_switch_executes",
+            "drain_pending_switch_skips",
+            "reload_if_changed_fires",
+            // dual-scheduler dedup: the TUI stands down while a daemon runs
+            "standdown_",
+            "held_lock_with_fresh_status",
+        ],
+    ),
     ("Stale-data cues", &["all_tabs_render"]),
     (
         "Account-change detection",

@@ -1105,7 +1105,7 @@ fn has_live_session_true_when_any_session_alive() {
         // parallel suite run can inflate a single reading. Poll briefly: only
         // a PERSISTENTLY-alive reading is a regression. Same hardening as
         // `live_session_count_counts_only_alive`.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let settled_dead = loop {
             let alive = has_live_session("alive");
             if !alive {
@@ -1161,7 +1161,7 @@ fn live_session_count_counts_only_alive() {
         // parallel suite run can inflate a single reading. Poll briefly: only
         // a PERSISTENT wrong count is a regression.
         let settled = |expect: usize| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 let n = live_session_count("counted");
                 if n == expect || std::time::Instant::now() >= deadline {
@@ -1668,6 +1668,15 @@ fn has_live_session_sees_isolated_session() {
         assert!(has_live_session("iso"), "isolated live session counts");
         assert_eq!(live_session_count("iso"), 1);
         drop(file);
+        // The probe is deliberately fail-alive (any try_lock I/O error reads
+        // as "alive" — see `is_session_alive`), so transient errors under a
+        // parallel suite run (fd pressure) can flip readings for a while. Poll
+        // generously; only a PERSISTENT "alive" after the lock holder dropped
+        // is a regression (flaked once under the full suite, 2026-07-12).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while has_live_session("iso") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(!has_live_session("iso"));
     });
 }
