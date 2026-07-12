@@ -930,3 +930,59 @@ mod adopt_live_rotation {
         );
     }
 }
+
+// ── post-guard re-read (the pre-RotationGuard token-snapshot race) ────────────
+//
+// Between the guard-less pre-check and RotationGuard acquisition a sibling
+// rotation can spend the single-use refresh token and persist a new pair;
+// refreshing from a pre-guard snapshot would 400 and wrongly quarantine a
+// healthy login. `gate_under_guard` therefore takes NO token arguments — its
+// decisions can only come from state read under the guard. These pin that
+// boundary directly.
+
+/// Stored pair already fresh when the guard leg runs (the sibling-refreshed
+/// interleave) → Ready, and the old chain is NOT double-spent (the refresher
+/// panics if called).
+#[test]
+fn gate_under_guard_installs_a_sibling_refreshed_pair_as_is() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-sibling-refreshed";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-fresh"),
+        Some(future_expiry()),
+    )));
+    assert!(matches!(
+        gate_under_guard(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+}
+
+/// Still expiring under the guard → the refresher is fed the CURRENTLY stored
+/// refresh token, never a caller-supplied snapshot.
+#[test]
+fn gate_under_guard_spends_the_currently_stored_refresh_token() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-current-rt";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-current"),
+        Some(past_expiry()),
+    )));
+    let refresher = |rt: &str| {
+        assert_eq!(
+            rt, "rt-current",
+            "must spend the token read under the guard"
+        );
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-next".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        gate_under_guard(&handle, name, refresher),
+        AuthGate::Refreshed
+    ));
+}
