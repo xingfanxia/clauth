@@ -10,8 +10,8 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use crate::profile::DivergenceChoice;
 
 use super::super::app::{
-    ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceForm, DivergenceTargetForm,
-    EnvCollisionChoice, EnvCollisionForm, InputState, LoginStage, Modal, Tab,
+    ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
+    DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginStage, Modal, Tab,
 };
 use super::super::theme;
 use super::format::spinner_frame;
@@ -207,37 +207,54 @@ fn danger_button(label: &str, focused: bool) -> Span<'static> {
 }
 
 fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
-    let options = DivergenceForm::options();
-    let cursor = form.cursor.min(options.len() - 1);
+    let actions = form.actions();
+    let cursor = form.cursor.min(actions.len() - 1);
 
-    let mut lines: Vec<Line<'_>> = vec![
-        Line::from(vec![
-            Span::styled("the live login no longer matches ", theme::dim()),
+    let mut lines: Vec<Line<'_>> = vec![Line::from(vec![
+        Span::styled("the live login no longer matches ", theme::dim()),
+        Span::styled(
+            format!("'{}'", form.active),
+            Style::default().fg(theme::accent_color()),
+        ),
+        Span::styled(".", theme::dim()),
+    ])];
+    if let Some(owner) = &form.sibling {
+        lines.push(Line::from(vec![
+            Span::styled("it is ", theme::dim()),
             Span::styled(
-                format!("'{}'", form.active),
+                format!("'{owner}'"),
                 Style::default().fg(theme::accent_color()),
             ),
-            Span::styled(".", theme::dim()),
-        ]),
-        Line::from(""),
-    ];
+            Span::styled("'s login.", theme::dim()),
+        ]));
+    }
+    lines.push(Line::from(""));
 
-    for (i, option) in options.iter().enumerate() {
+    for (i, action) in actions.iter().enumerate() {
         let selected = i == cursor;
         lines.push(option_line(
             selected,
-            divergence_option_text(*option, &form.active),
+            divergence_action_text(action, &form.active),
         ));
     }
 
     draw_modal(frame, area, "DIVERGENCE", lines);
 }
 
-fn divergence_option_text(option: DivergenceChoice, active: &str) -> String {
-    match option {
-        DivergenceChoice::Overwrite => format!("overwrite '{active}' with this login"),
-        DivergenceChoice::NewProfile => "save this login to another profile…".to_string(),
-        DivergenceChoice::Discard => format!("discard this login and restore '{active}'"),
+fn divergence_action_text(action: &DivergenceAction, active: &str) -> String {
+    match action {
+        DivergenceAction::SwitchToOwner(owner) => {
+            format!("switch to '{owner}' — this login is its account")
+        }
+        DivergenceAction::Choice(DivergenceChoice::Overwrite) => {
+            format!("overwrite '{active}' with this login")
+        }
+        DivergenceAction::Choice(DivergenceChoice::NewProfile) => {
+            "save this login to another profile…".to_string()
+        }
+        DivergenceAction::Choice(DivergenceChoice::Discard) => {
+            format!("discard this login and restore '{active}'")
+        }
     }
 }
 
@@ -483,6 +500,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("n", "new account"),
         ("r", "refresh usage now"),
         ("t", "rotate all tokens"),
+        ("d", "resolve credential divergence (when flagged)"),
         ("?", "toggle this help"),
         ("a", "actions"),
         ("x", "dismiss toast / alert"),
