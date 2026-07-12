@@ -16,6 +16,12 @@ pub(crate) const USAGE_CACHE_FILE: &str = "usage_cache.json";
 /// Filename of the third-party provider cache, relative to the per-profile dir.
 pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
 
+/// The account uuid this profile's login last authenticated as (a bare JSON
+/// string). Derived data, backfilled on login and on every successful mirror
+/// adoption — the identity anchor that lets an unattended adopt refuse a live
+/// login belonging to a DIFFERENT account (`oauth::try_adopt_live_rotation`).
+pub(crate) const ACCOUNT_ID_CACHE_FILE: &str = "account_id.json";
+
 /// Resolve `<profile_dir>/<file>` for `name`. `None` only when the per-profile
 /// dir itself can't be resolved (matches the prior per-layer `cache_path`).
 pub(crate) fn profile_cache_path(name: &str, file: &str) -> Option<PathBuf> {

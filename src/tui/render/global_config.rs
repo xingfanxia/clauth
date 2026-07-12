@@ -1,8 +1,9 @@
 //! Program-wide Config tab — a single panel of global settings, distinct from
 //! the per-account Setup tab. Rows back real persisted state in `AppState`:
 //! the theme tier (`[theme]`), the divergence default, the refresh interval, the
-//! chain-wide wrap-off default, and the opt-in burn-aware auto-switch mode
-//! (issue #8 follow-up b). ↑↓ walks the rows; space cycles a row's value
+//! chain-wide wrap-off default, the opt-in burn-aware auto-switch mode
+//! (issue #8 follow-up b), and the opt-in preemptive rotation of the active
+//! account (rotation coherence #1). ↑↓ walks the rows; space cycles a row's value
 //! in place; ⏎ opens the refresh-interval custom-value editor and otherwise
 //! mirrors space. No left selector, no popups — these settings are global.
 
@@ -26,8 +27,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let wrap_off = app.config().state.wrap_off;
-    let burn_aware = app.config().state.burn_aware_switching;
+    let toggles = {
+        let state = &app.config().state;
+        ToggleState {
+            wrap_off: state.wrap_off,
+            burn_aware: state.burn_aware_switching,
+            preemptive: state.preemptive_rotation,
+        }
+    };
     let refresh_interval_ms = app
         .refresh_interval
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -45,8 +52,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let line = detail_row(
             *row,
             selected,
-            wrap_off,
-            burn_aware,
+            toggles,
             refresh_interval_ms,
             default_divergence,
             row_editing,
@@ -70,9 +76,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 } else {
                     line
                 });
-                if selected
-                    && let Some(tip) = row_hint(*row, default_divergence, wrap_off, burn_aware)
-                {
+                if selected && let Some(tip) = row_hint(*row, default_divergence, toggles) {
                     lines.extend(help_tooltip_lines(&tip, inner.width as usize));
                 }
             }
@@ -87,11 +91,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 /// Inline help for rows whose value doesn't self-describe. Phrased for the
 /// value currently selected, so cycling a row re-explains what it now does.
+/// The boolean toggles the Config tab renders, bundled so `detail_row` /
+/// `row_hint` stay within clippy's argument budget as rows accumulate.
+#[derive(Clone, Copy)]
+struct ToggleState {
+    wrap_off: bool,
+    burn_aware: bool,
+    preemptive: bool,
+}
+
 fn row_hint(
     row: GlobalConfigRow,
     default_divergence: Option<DivergenceChoice>,
-    wrap_off: bool,
-    burn_aware: bool,
+    toggles: ToggleState,
 ) -> Option<String> {
     let tip = match row {
         GlobalConfigRow::Theme => return None,
@@ -109,17 +121,24 @@ fn row_hint(
         },
         GlobalConfigRow::RefreshInterval => "how often usage is refetched for every account",
         GlobalConfigRow::WrapOff => {
-            if wrap_off {
+            if toggles.wrap_off {
                 "once every account is spent, switch everything off until one recovers"
             } else {
                 "once every account is spent, stay on the last one until one recovers"
             }
         }
         GlobalConfigRow::BurnAware => {
-            if burn_aware {
+            if toggles.burn_aware {
                 "switch away once the burn rate projects 100% before the next poll"
             } else {
                 "switch away once usage crosses the account's threshold"
+            }
+        }
+        GlobalConfigRow::PreemptiveRotation => {
+            if toggles.preemptive {
+                "refresh the active account's login ahead of expiry (macos keychain)"
+            } else {
+                "refresh the active account's login only when a request rejects it"
             }
         }
     };
@@ -129,8 +148,7 @@ fn row_hint(
 fn detail_row(
     row: GlobalConfigRow,
     selected: bool,
-    wrap_off: bool,
-    burn_aware: bool,
+    toggles: ToggleState,
     refresh_interval_ms: u64,
     default_divergence: Option<DivergenceChoice>,
     editing: Option<&InputState>,
@@ -180,13 +198,28 @@ fn detail_row(
         GlobalConfigRow::WrapOff => cycle_row(
             arrow,
             "when spent",
-            &[("stay on last", !wrap_off), ("switch off all", wrap_off)],
+            &[
+                ("stay on last", !toggles.wrap_off),
+                ("switch off all", toggles.wrap_off),
+            ],
             selected,
         ),
         GlobalConfigRow::BurnAware => cycle_row(
             arrow,
             "switching",
-            &[("static", !burn_aware), ("burn-aware", burn_aware)],
+            &[
+                ("static", !toggles.burn_aware),
+                ("burn-aware", toggles.burn_aware),
+            ],
+            selected,
+        ),
+        GlobalConfigRow::PreemptiveRotation => cycle_row(
+            arrow,
+            "rotation",
+            &[
+                ("lazy", !toggles.preemptive),
+                ("preemptive", toggles.preemptive),
+            ],
             selected,
         ),
     }

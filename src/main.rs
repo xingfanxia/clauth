@@ -261,6 +261,23 @@ fn cmd_login(name: &str, model: Option<&str>) -> Result<()> {
         "clauth: login complete.\n{}",
         oauth_login::login_summary(&credentials)
     );
+    // Seed the identity anchor for unattended mirror adoption (best-effort —
+    // a probe failure never fails the login): the account uuid this login
+    // authenticates as, cached per profile so `oauth::try_adopt_live_rotation`
+    // can verify a diverged live login is the SAME account even after the
+    // stored token dies.
+    if let Some(tok) = credentials
+        .claude_ai_oauth
+        .as_ref()
+        .map(|o| o.access_token.clone())
+        && let Some(id) = crate::usage::fetch_account_uuid(&tok)
+    {
+        crate::profile_cache::write_profile_cache(
+            &target,
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            &id,
+        );
+    }
     let snapshot = actions::CaptureSnapshot {
         credentials: Some(credentials),
         base_url: None,

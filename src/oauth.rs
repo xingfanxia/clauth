@@ -709,6 +709,20 @@ pub(crate) fn apply_rotated_tokens_locked(
 ) -> Result<()> {
     #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     let mut cfg = config.lock().expect("config mutex poisoned");
+    // Rotation coherence (#1): a rotation of the ACTIVE profile revokes the
+    // single-use refresh token the macOS Keychain copy carries — the running
+    // `claude` (which re-reads the Keychain per request) would sign out at
+    // that stale token's expiry while every clauth copy stays green (observed
+    // on-device 2026-07-07). The mirror DECISION and the creds snapshot are
+    // made under the locked section below, so the written pair is exactly the
+    // persisted one; the `/usr/bin/security` shell-out itself runs after the
+    // flock is released (it can hang up to its 20 s kill deadline, and the
+    // global state flock must never be held across a subprocess — before this
+    // function the locked section contained only fast disk writes). In-process
+    // switches stay excluded for the whole window by the config mutex held
+    // across this function.
+    #[cfg(target_os = "macos")]
+    let mut mirror: Option<crate::profile::ClaudeCredentials> = None;
     with_state_lock(|| {
         let Some(profile) = cfg.find_mut(name) else {
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
@@ -719,6 +733,11 @@ pub(crate) fn apply_rotated_tokens_locked(
         let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         };
+        // Pre-rotation access token, kept for the Keychain-mirror gate below:
+        // it tells "the live file is a stale mirror of OUR OWN chain" apart
+        // from a genuinely foreign CC re-login.
+        #[cfg(target_os = "macos")]
+        let old_access = oauth.access_token.clone();
         write_token_fields(oauth, tok);
         // Stage the rotated pair durably before the structured save (see
         // `stage_rotated_credentials`): a failed save or crash is recovered on
@@ -731,10 +750,208 @@ pub(crate) fn apply_rotated_tokens_locked(
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         }
         clear_staged_credentials(name);
+        #[cfg(target_os = "macos")]
+        if crate::keychain::enabled() && cfg.is_active(name) {
+            if live_login_is_foreign(name, &old_access) {
+                eprintln!(
+                    "clauth: rotated '{name}' but the live login diverged (a re-login clauth \
+                     doesn't own) — Keychain left untouched; resolve the divergence in the TUI"
+                );
+            } else {
+                mirror = cfg.find(name).and_then(|p| p.credentials.as_ref()).cloned();
+            }
+        }
         Ok(())
+    })?;
+    // A failed state flock surfaces as the `Err` from `with_state_lock` above,
+    // so a poisoned/unavailable lock never looks like a successful rotation.
+    // A mirror failure is loud but non-fatal: the rotation itself is durable,
+    // and the next rotation or switch retries the write.
+    #[cfg(target_os = "macos")]
+    if let Some(creds) = mirror
+        && let Err(e) = crate::keychain::keychain_write(&creds)
+    {
+        eprintln!(
+            "clauth: rotated '{name}' but the Keychain mirror failed: {e:#} — a \
+             running claude signs out when its old token expires; run `clauth {name}` \
+             to reinstall"
+        );
+    }
+    Ok(())
+}
+
+/// Adopt the live session's OWN token rotation instead of fighting it
+/// (rotation coherence — the future-proof half). The running `claude` and
+/// clauth hold ONE single-use refresh family; whoever refreshes first revokes
+/// the other. Rather than racing, concede: CC maintains
+/// `~/.claude/.credentials.json` as a regular-file mirror of its Keychain
+/// login (rewritten at least on every CC launch), a prompt-free read path to
+/// CC's current pair. When that mirror holds a FRESHER pair for the SAME
+/// account, adopt it into the profile store — no refresh spent — so clauth
+/// stays correct whatever refresh schedule a future Claude Code ships.
+///
+/// Gates, in order — every one must pass:
+///   * `name` is the ACTIVE profile (only its chain is shared with a live CC);
+///   * the live path classifies [`crate::claude::LinkState::Diverged`]
+///     (`LinkedTo` = mirror equals the store, nothing to adopt);
+///   * the mirror pair carries a refresh token and a STRICTLY LATER expiry
+///     than the store (never adopt sideways or backwards);
+///   * identity: the mirror token's account uuid (via `identity`, injected so
+///     the gate is testable offline; prod passes `usage::fetch_account_uuid`)
+///     matches the profile's cached uuid — or, when no uuid is cached yet, the
+///     STORED token's own uuid fetched now (only possible while it still
+///     works). Unprovable identity refuses the adopt: a live login belonging
+///     to a different account (a manual CC `/login`) must never be captured
+///     into this profile unattended — that stays the TUI divergence flow's
+///     job.
+///
+/// On success the mirror uuid is cached (`ACCOUNT_ID_CACHE_FILE`), so later
+/// adopts can verify identity even when the stored token is already dead.
+/// The Keychain is NOT written here — in this state CC minted the pair, so
+/// the Keychain and mirror are already the fresh truth; only our store lags.
+///
+/// Returns the adopted `(access, refresh)` pair so the caller can sync its
+/// in-memory `TokenList` exactly like every other rotation site — without it,
+/// the next poll would run on the superseded entry, spend the revoked refresh
+/// token, and fail on the very account the adopt just saved.
+///
+/// `_rotation_guard` is proof the caller holds this profile's per-profile
+/// rotation lock: the adopt mutates the same stored credential fields as a
+/// refresh persist (`rotate_one_inner`), so both writers must serialize on
+/// the same [`crate::runtime::RotationGuard`], not just the state flock.
+/// Taken by reference because the flock is not reentrant — the refresh-failure
+/// call site already holds the guard when it retries the adopt.
+pub(crate) fn try_adopt_live_rotation(
+    config: &crate::profile::ConfigHandle,
+    name: &str,
+    _rotation_guard: &crate::runtime::RotationGuard,
+    identity: &dyn Fn(&str) -> Option<String>,
+) -> Option<(String, Option<String>)> {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache, write_profile_cache};
+
+    // Snapshot the store side under the config lock, then drop it — the
+    // identity fetches below are HTTP and must never hold the mutex.
+    let (stored_access, stored_expires) = {
+        let Ok(cfg) = config.lock() else { return None };
+        if !cfg.is_active(name) {
+            return None;
+        }
+        let p = cfg.find(name)?;
+        (
+            p.access_token().map(str::to_string),
+            p.access_token_expires_at(),
+        )
+    };
+
+    if !matches!(
+        crate::claude::classify_credentials_link(name),
+        Ok(crate::claude::LinkState::Diverged)
+    ) {
+        return None;
+    }
+    let Ok(Some(live)) = crate::claude::read_claude_credentials() else {
+        return None;
+    };
+    let live_oauth = live.claude_ai_oauth.as_ref()?;
+    live_oauth.refresh_token.as_ref()?;
+    let (Some(live_expires), Some(stored_expires)) = (live_oauth.expires_at, stored_expires) else {
+        return None;
+    };
+    if live_expires <= stored_expires {
+        return None;
+    }
+
+    // Identity anchor: cached uuid, else the stored token's own uuid while it
+    // still authenticates. No anchor → refuse (identity unprovable).
+    let expected: Option<String> = load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE)
+        .or_else(|| {
+            let alive = (now_ms() as i64) < stored_expires;
+            match (&stored_access, alive) {
+                (Some(tok), true) => identity(tok),
+                _ => None,
+            }
+        });
+    let Some(expected) = expected else {
+        eprintln!(
+            "clauth: live login for '{name}' is newer but its identity can't be proven \
+             (no cached account id and the stored token is dead) — not adopting; \
+             resolve in the TUI or re-run clauth login {name}"
+        );
+        return None;
+    };
+    let live_id = identity(&live_oauth.access_token)?;
+    // A blank uuid is shape drift, not an identity — two blanks matching each
+    // other must never prove two tokens are the same account.
+    if live_id.trim().is_empty() || expected.trim().is_empty() {
+        return None;
+    }
+    if live_id != expected {
+        eprintln!(
+            "clauth: live login for '{name}' belongs to a DIFFERENT account — not adopting; \
+             capture it via the TUI divergence flow if that was intentional"
+        );
+        return None;
+    }
+
+    // Persist under config mutex + state flock, re-checking the gates that
+    // could have moved during the HTTP window (an interleaved switch or a
+    // rotation that already advanced the store past the mirror).
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    let mut cfg = config.lock().expect("config mutex poisoned");
+    let adopted = with_state_lock(|| {
+        if !cfg.is_active(name) {
+            return Ok(false);
+        }
+        let Some(profile) = cfg.find_mut(name) else {
+            return Ok(false);
+        };
+        if profile
+            .access_token_expires_at()
+            .is_none_or(|cur| live_expires <= cur)
+        {
+            return Ok(false);
+        }
+        profile.credentials = Some(live.clone());
+        save_profile(profile)?;
+        Ok::<bool, anyhow::Error>(true)
     })
-    // A failed state flock surfaces as the `Err` from `with_state_lock`, so a
-    // poisoned/unavailable lock never looks like a successful rotation.
+    .unwrap_or(false);
+    if !adopted {
+        return None;
+    }
+    write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &live_id);
+    eprintln!(
+        "clauth: adopted the live session's rotated login for '{name}' \
+         (the running claude refreshed first — no token spent)"
+    );
+    Some((
+        live_oauth.access_token.clone(),
+        live_oauth.refresh_token.clone(),
+    ))
+}
+
+/// Whether the live `.credentials.json` holds a login clauth does NOT own —
+/// i.e. genuinely [`crate::claude::LinkState::Diverged`] and not merely a
+/// stale regular-file mirror of this profile's own pre-rotation pair. On
+/// macOS Claude Code rewrites the live file as a regular-file copy of the
+/// Keychain, so the moment a rotation lands, `classify_credentials_link`
+/// reports Diverged against the NEW stored token even though the live login
+/// is still our own chain one step behind — that stale-mirror case must still
+/// be mirrored, or the coherence write would skip exactly when it matters.
+/// Only a live token matching NEITHER the new nor the pre-rotation pair is
+/// foreign (a real CC re-login); an unreadable/unclassifiable state is
+/// treated as foreign so a state we cannot understand is never overwritten.
+#[cfg(target_os = "macos")]
+fn live_login_is_foreign(name: &str, old_access: &str) -> bool {
+    match crate::claude::classify_credentials_link(name) {
+        Ok(crate::claude::LinkState::LinkedTo) | Ok(crate::claude::LinkState::Missing) => false,
+        Ok(crate::claude::LinkState::Diverged) => {
+            let live = crate::claude::read_claude_credentials().ok().flatten();
+            let live_token = live.as_ref().and_then(|c| c.access_token());
+            !live_token.is_some_and(|t| !t.is_empty() && t == old_access)
+        }
+        Err(_) => true,
+    }
 }
 
 /// True when an active profile is set and its live .credentials.json no longer

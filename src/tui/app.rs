@@ -246,6 +246,12 @@ pub(crate) enum GlobalConfigRow {
     /// follow-up b) — off by default, projects the ACTIVE profile's
     /// utilization ahead of the next poll instead of the static threshold.
     BurnAware,
+    /// Opt-in preemptive rotation (`AppState.preemptive_rotation`, rotation
+    /// coherence #1) — off by default (stock stays strictly lazy: rotate only
+    /// on 401). Rotates the ACTIVE Keychain-installed profile ahead of token
+    /// expiry; an optimization over adopt + mirror-on-rotate, not a
+    /// correctness mechanism.
+    PreemptiveRotation,
 }
 
 /// Inline editor state for the Config detail pane. Built on entry, torn down
@@ -3237,12 +3243,13 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
 ];
 
 /// Rows on the program-wide Config tab, in display order.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 5] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 6] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::WrapOff,
     GlobalConfigRow::BurnAware,
+    GlobalConfigRow::PreemptiveRotation,
 ];
 
 /// Config tab keymap (enumerated rows only, per the unified value-row grammar):
@@ -3294,6 +3301,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::WrapOff => toggle_wrap_off(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
+        GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
     }
 }
 
@@ -3469,6 +3477,19 @@ fn toggle_burn_aware_switching(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.burn_aware_switching = !cfg.state.burn_aware_switching;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+}
+
+/// Flip the opt-in preemptive rotation of the ACTIVE profile (rotation
+/// coherence #1). Same persistence shape as `toggle_burn_aware_switching`;
+/// the scheduler reads the flag off the shared config each rotation-leg entry,
+/// so no separate propagation is needed.
+fn toggle_preemptive_rotation(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.preemptive_rotation = !cfg.state.preemptive_rotation;
         let _ = save_app_state(&cfg.state);
     }
     app.last_state_mtime = app_state_mtime();
