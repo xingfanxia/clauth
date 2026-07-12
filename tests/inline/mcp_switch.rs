@@ -233,6 +233,101 @@ fn divergence_discard_drops_relogin_and_relinks_target() {
     );
 }
 
+/// Diverged active + a vanished target through the Discard branch is the
+/// worst-case ghost switch: `switch_profile_discard` force-links with no prior
+/// snapshot, so pre-guard the uncaptured re-login was destroyed for good. The
+/// existence bail must fire before any side effect.
+#[test]
+fn divergence_discard_to_a_ghost_target_bails_before_side_effects() {
+    let _home = HomeSandbox::new();
+    let live = creds("relogin-a", "relogin-r");
+    let config = handle(seed_diverged(
+        "active",
+        creds("stored-a", "stored-r"),
+        &live,
+        "target",
+        Some(creds("target-a", "target-r")),
+    ));
+
+    let err = switch_profile_noninteractive(
+        &config,
+        "ghost",
+        Some(DivergenceChoice::Discard),
+        no_network,
+    )
+    .expect_err("a ghost target must bail");
+    assert!(
+        err.to_string().contains("not found"),
+        "bail names the cause, got: {err}"
+    );
+
+    // The uncaptured re-login is still the live file, still diverged.
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    let live_now: ClaudeCredentials = read_json_file(&live_path).expect("live file survives");
+    assert_eq!(
+        live_now.refresh_token(),
+        Some("relogin-r"),
+        "the ghost bail must not touch the uncaptured live login",
+    );
+    assert!(matches!(
+        classify_credentials_link("active").expect("classify"),
+        LinkState::Diverged
+    ));
+    assert_eq!(
+        config.lock().unwrap().state.active_profile.as_deref(),
+        Some("active"),
+        "active profile unchanged after the bail",
+    );
+}
+
+/// Same ghost target through the Overwrite branch: the bail must fire before
+/// `switch_profile_reconciled` snapshots the live login into the outgoing
+/// profile (a half-applied capture would rewrite outgoing's stored chain for
+/// a switch that then fails).
+#[test]
+fn divergence_overwrite_to_a_ghost_target_bails_before_capture() {
+    let _home = HomeSandbox::new();
+    let live = creds("relogin-a", "relogin-r");
+    let config = handle(seed_diverged(
+        "active",
+        creds("stored-a", "stored-r"),
+        &live,
+        "target",
+        Some(creds("target-a", "target-r")),
+    ));
+
+    let err = switch_profile_noninteractive(
+        &config,
+        "ghost",
+        Some(DivergenceChoice::Overwrite),
+        no_network,
+    )
+    .expect_err("a ghost target must bail");
+    assert!(
+        err.to_string().contains("not found"),
+        "bail names the cause, got: {err}"
+    );
+
+    // Bail fires before the snapshot: outgoing's stored chain is untouched.
+    let outgoing: ClaudeCredentials =
+        read_json_file(&profile_dir("active").unwrap().join("credentials.json"))
+            .expect("read outgoing creds");
+    assert_eq!(
+        outgoing.refresh_token(),
+        Some("stored-r"),
+        "the ghost bail must not capture the live login into outgoing",
+    );
+    let live_now: ClaudeCredentials = read_json_file(
+        &crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json"),
+    )
+    .expect("live file survives");
+    assert_eq!(live_now.refresh_token(), Some("relogin-r"));
+}
+
 #[test]
 fn non_diverged_switch_takes_plain_path() {
     let _home = HomeSandbox::new();
