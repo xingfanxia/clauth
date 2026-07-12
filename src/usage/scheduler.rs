@@ -270,11 +270,13 @@ fn refresh_failure_is_terminal(err: &RefreshError) -> bool {
 /// refresher that completed before this tick's guard was acquired (the
 /// in-memory `TokenEntry` snapshot predates the guard). Re-read the profile's
 /// on-disk credentials (call while STILL holding the rotation guard, so the
-/// read is stable): a stored pair that moved past the token we just spent
-/// means the chain is alive and someone else advanced it — return that fresh
-/// pair for the caller's `TokenList` sync instead of quarantining a healthy
-/// account. `None` (unchanged, unreadable, or tokenless) means the 400 was a
-/// real revocation.
+/// read is stable): a stored refresh token that DIFFERS from the one we just
+/// spent means someone else advanced the chain (tokens are opaque, so this is
+/// an inequality check, not an ordering — no writer rewinds the store, and a
+/// wrong carry self-corrects next tick) — return that fresh pair for the
+/// caller's `TokenList` sync instead of quarantining a healthy account.
+/// `None` (unchanged, unreadable, or tokenless) means the 400 was a real
+/// revocation.
 fn fresher_disk_pair(name: &str, spent_refresh: &str) -> Option<RotatedTokens> {
     let profile = crate::profile::load_profile(name).ok()?;
     let access = profile.access_token()?.to_string();
