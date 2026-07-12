@@ -45,22 +45,6 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    // Non-blocking divergence banner: one warning line above the table, in
-    // place of the modal that used to lock the whole TUI at startup. The rest
-    // of the screen (usage, tabs, actions) stays fully usable.
-    let banner = app.divergence_pending.as_ref().map(divergence_banner);
-    let inner = match banner {
-        Some(line) => {
-            let split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(1)])
-                .split(inner);
-            frame.render_widget(Paragraph::new(line).style(theme::base()), split[0]);
-            split[1]
-        }
-        None => inner,
-    };
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -93,42 +77,6 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let viewport = chunks[1].height as usize;
     draw_scrollbar(frame, chunks[1], total, state.offset(), viewport);
-}
-
-/// The one-line divergence warning. Sibling identified → say whose login it is;
-/// unknown → the generic mismatch. Both end in the `d` affordance.
-fn divergence_banner(notice: &super::super::app::DivergenceNotice) -> Line<'static> {
-    let mut spans = vec![Span::styled("\u{26a0} ", theme::warning())];
-    match &notice.sibling {
-        Some(owner) => {
-            spans.push(Span::styled("live login is ", theme::warning()));
-            spans.push(Span::styled(
-                format!("'{owner}'"),
-                Style::default()
-                    .fg(theme::accent_color())
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(
-                format!(" — not the active '{}'", notice.active),
-                theme::warning(),
-            ));
-        }
-        None => {
-            spans.push(Span::styled(
-                format!("live login no longer matches '{}'", notice.active),
-                theme::warning(),
-            ));
-        }
-    }
-    spans.push(Span::styled("  ·  press ", theme::dim()));
-    spans.push(Span::styled(
-        "d",
-        Style::default()
-            .fg(theme::accent_color())
-            .add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(" to resolve", theme::dim()));
-    Line::from(spans)
 }
 
 #[derive(Debug, Clone, Copy)]

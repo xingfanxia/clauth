@@ -883,6 +883,55 @@ fn divergence_identifies_a_sibling_owner_and_leads_with_switch_to_it() {
     );
 }
 
+/// A flagged divergence renders through the ONE system banner (`update_banner`),
+/// not a bespoke Overview-only line: a WARNING banner naming the owner when
+/// known, cleared the moment the link heals. Guards the banner-refactor codepath.
+#[test]
+fn divergence_renders_through_the_system_banner() {
+    use super::{BannerSeverity, update_banner};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    let mut play = Profile::new("play".to_string(), None, None);
+    play.credentials = Some(creds_ra("rt-play", "at-play"));
+    save_profile(&play).expect("save play");
+    // Live file carries play's EXACT stored pair while work is active → owner known.
+    write_live_creds(&creds_ra("rt-play", "at-play"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into(), "play".into()],
+            ..AppState::default()
+        },
+        profiles: vec![work, play],
+    });
+
+    force_poll(&mut app);
+    update_banner(&mut app);
+    let banner = app
+        .banner
+        .as_ref()
+        .expect("divergence raises the system banner");
+    assert_eq!(banner.severity, BannerSeverity::Warning);
+    assert_eq!(
+        banner.message,
+        "live login is 'play' · not the active 'work' · press d to resolve",
+    );
+
+    // Heal the link → the divergence clears and so does the banner.
+    crate::claude::force_link_profile_credentials("work").expect("relink");
+    force_poll(&mut app);
+    update_banner(&mut app);
+    assert!(
+        app.banner.is_none(),
+        "a clean link clears the divergence banner",
+    );
+}
+
 // Issue #20: "save elsewhere" must let the user route the live login into a
 // profile OTHER than the active one, so re-logging a second account while the
 // wrong profile is active no longer forces two profiles onto one account.

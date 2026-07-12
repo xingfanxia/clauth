@@ -427,6 +427,24 @@ pub(crate) struct DivergenceNotice {
     pub(crate) fingerprint: Option<u64>,
 }
 
+impl DivergenceNotice {
+    /// Banner copy for the one system banner: names the live login's owner when
+    /// known, else the generic mismatch, ending in the `d` affordance. Lowercase
+    /// fragments, mid-dot separators (cloudy-tui banner copy).
+    pub(crate) fn banner_message(&self) -> String {
+        match &self.sibling {
+            Some(owner) => format!(
+                "live login is '{owner}' · not the active '{}' · press d to resolve",
+                self.active
+            ),
+            None => format!(
+                "live login no longer matches '{}' · press d to resolve",
+                self.active
+            ),
+        }
+    }
+}
+
 /// One row on the Divergence prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DivergenceAction {
@@ -6358,6 +6376,15 @@ fn update_banner(app: &mut App) {
     let any_spent = no_active && cfg.profiles.iter().any(crate::fallback::is_exhausted);
     drop(cfg);
 
+    // Divergence outranks the compact-size nudge (both WARNING): a live-login
+    // mismatch is an account-integrity condition to act on, and `d` resolves it
+    // even in a small terminal. `no_active` (DANGER) still wins, and it implies
+    // no divergence anyway (the poll clears the notice without an active profile).
+    let divergence_msg = app
+        .divergence_pending
+        .as_ref()
+        .map(DivergenceNotice::banner_message);
+
     app.banner = if no_active {
         let message = if any_spent {
             "all accounts spent · switch to a profile to resume"
@@ -6367,6 +6394,11 @@ fn update_banner(app: &mut App) {
         Some(Banner {
             severity: BannerSeverity::Danger,
             message: message.to_string(),
+        })
+    } else if let Some(message) = divergence_msg {
+        Some(Banner {
+            severity: BannerSeverity::Warning,
+            message,
         })
     } else if app.compact {
         // Terminal too small for the full layout. Lower severity than the
