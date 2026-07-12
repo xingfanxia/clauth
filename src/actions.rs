@@ -134,16 +134,22 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     // Keychain (which re-authenticates every running `claude` on this machine).
     // Refusal + `clauth login` hint pinned by
     // `switch_cli_refuses_dead_target_with_login_hint`.
-    match oauth::ensure_installable(&config, canonical, oauth::refresh_result) {
-        oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
-        oauth::AuthGate::Broken => bail!(
-            "login for '{canonical}' has expired (refresh token revoked or invalid). \
-             run: clauth login {canonical}"
-        ),
-        oauth::AuthGate::Transient(e) => bail!(
-            "could not refresh '{canonical}' before switching ({e}); check your \
-             connection and retry"
-        ),
+    // The already-active profile is exempt: there is nothing new to install
+    // (`switch_profile` no-ops on `is_active`), and its chain is the one a
+    // plain `claude` may be refreshing through the symlink right now — gating
+    // it can lose that race and false-quarantine a healthy login.
+    if outgoing.as_deref() != Some(canonical) {
+        match oauth::ensure_installable(&config, canonical, oauth::refresh_result) {
+            oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
+            oauth::AuthGate::Broken => bail!(
+                "login for '{canonical}' has expired (refresh token revoked or invalid). \
+                 run: clauth login {canonical}"
+            ),
+            oauth::AuthGate::Transient(e) => bail!(
+                "could not refresh '{canonical}' before switching ({e}); check your \
+                 connection and retry"
+            ),
+        }
     }
 
     if reconciled {
@@ -219,27 +225,32 @@ pub(crate) fn switch_profile_noninteractive(
     on_divergence: Option<DivergenceChoice>,
     refresher: impl Fn(&str) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
 ) -> Result<(Option<String>, String)> {
-    // AUTH-1 (Incident C): gate the target before its credentials land in the
-    // Keychain — the same gate as the CLI switch, so "a quarantined account is
-    // refused as a switch target" holds for EVERY noninteractive entry point
-    // (MCP today; any future headless caller inherits it).
-    match oauth::ensure_installable(config, target, refresher) {
-        oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
-        oauth::AuthGate::Broken => bail!(
-            "login for '{target}' has expired (refresh token revoked or invalid). \
-             run: clauth login {target}"
-        ),
-        oauth::AuthGate::Transient(e) => bail!(
-            "could not refresh '{target}' before switching ({e}); check your \
-             connection and retry"
-        ),
-    }
-
     let previous = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
         cfg.state.active_profile.as_deref().map(str::to_string)
     };
+
+    // AUTH-1 (Incident C): gate the target before its credentials land in the
+    // Keychain — the same gate as the CLI switch, so "a quarantined account is
+    // refused as a switch target" holds for EVERY noninteractive entry point
+    // (MCP today; any future headless caller inherits it).
+    // The already-active profile is exempt for the same reason as the CLI
+    // path: nothing new to install, and gating it races a plain `claude`
+    // refreshing the symlinked live file (a lost race false-quarantines).
+    if previous.as_deref() != Some(target) {
+        match oauth::ensure_installable(config, target, refresher) {
+            oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
+            oauth::AuthGate::Broken => bail!(
+                "login for '{target}' has expired (refresh token revoked or invalid). \
+                 run: clauth login {target}"
+            ),
+            oauth::AuthGate::Transient(e) => bail!(
+                "could not refresh '{target}' before switching ({e}); check your \
+                 connection and retry"
+            ),
+        }
+    }
 
     let diverged = match previous.as_deref() {
         Some(active) => {

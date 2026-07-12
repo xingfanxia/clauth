@@ -793,7 +793,7 @@ pub(crate) fn ensure_installable(
     // Read the target's auth shape under the config lock, then release it — the
     // HTTP refresh below must never hold the config mutex (a slow refresh would
     // otherwise wedge the daemon's single-threaded run loop).
-    let (expires_at, refresh_token) = {
+    let (expires_at, refresh_token, flagged) = {
         let Ok(cfg) = config.lock() else {
             return AuthGate::Transient(anyhow::anyhow!("config mutex poisoned"));
         };
@@ -809,12 +809,20 @@ pub(crate) fn ensure_installable(
         (
             profile.access_token_expires_at(),
             profile.refresh_token().map(str::to_string),
+            cfg.is_auth_broken(name),
         )
     };
 
     // Unknown expiry → treat as not-expiring (mirrors `auto_start_kick`): install
-    // as-is and let the lazy 401→rotate path handle a surprise expiry.
-    let expiring = expires_at.is_some_and(|exp| (now_ms() as i64) + AUTH_GATE_GRACE_MS >= exp);
+    // as-is and let the lazy 401→rotate path handle a surprise expiry. A standing
+    // `auth_broken` flag overrides the clock: the chain's last refresh terminally
+    // failed, so a still-future `expires_at` proves nothing (server-side
+    // revocation outlives the stored clock). Route it through the refresher —
+    // a recovered chain comes back `Refreshed` and lifts the flag, a dead one
+    // confirms `Broken` — keeping this gate in agreement with the TUI's
+    // flag-only refusal.
+    let expiring =
+        flagged || expires_at.is_some_and(|exp| (now_ms() as i64) + AUTH_GATE_GRACE_MS >= exp);
     if !expiring {
         return AuthGate::Ready;
     }

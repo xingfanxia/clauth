@@ -525,6 +525,64 @@ fn gate_expiring_without_refresh_token_is_broken() {
     assert!(cfg.is_auth_broken(name));
 }
 
+/// A standing quarantine overrides a still-valid clock: the chain's last
+/// refresh terminally failed, so a future `expires_at` proves nothing
+/// (server-side revocation outlives the stored clock). The gate must route a
+/// flagged profile through the refresher instead of installing the dead token
+/// as `Ready` — the hole that let CLI/MCP disagree with the TUI's flag-only
+/// refusal. A recovered chain (external re-login) lifts the flag on the way
+/// through.
+#[test]
+fn gate_flagged_profile_refreshes_despite_a_valid_clock() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-flagged-recovers";
+    let mut config = oauth_config(name, Some("rt-relogin"), Some(future_expiry()));
+    config.set_auth_broken(name, true);
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher = |_rt: &str| {
+        Ok(TokenResponse {
+            access_token: "at-recovered".to_string(),
+            refresh_token: "rt-recovered".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        ensure_installable(&handle, name, refresher),
+        AuthGate::Refreshed
+    ));
+    #[allow(clippy::expect_used, reason = "test")]
+    let cfg = handle.lock().expect("lock");
+    assert!(
+        !cfg.is_auth_broken(name),
+        "a recovered chain lifts the quarantine on the way through the gate"
+    );
+    let p = cfg.find(name).unwrap_or_else(|| panic!("profile"));
+    assert_eq!(p.access_token(), Some("at-recovered"));
+}
+
+/// Same flagged shape with a genuinely dead chain: the gate confirms `Broken`
+/// (refusal + login hint), never a silent `Ready` install of the revoked pair.
+#[test]
+fn gate_flagged_profile_with_a_dead_chain_stays_broken() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-flagged-dead";
+    let mut config = oauth_config(name, Some("rt-revoked"), Some(future_expiry()));
+    config.set_auth_broken(name, true);
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher = |_rt: &str| Err(RefreshError::Invalid("HTTP 400: invalid_grant".to_string()));
+    assert!(matches!(
+        ensure_installable(&handle, name, refresher),
+        AuthGate::Broken
+    ));
+    #[allow(clippy::expect_used, reason = "test")]
+    let cfg = handle.lock().expect("lock");
+    assert!(
+        cfg.is_auth_broken(name),
+        "a dead chain keeps the quarantine"
+    );
+}
+
 /// A 2xx token-endpoint body that fails to deserialize still holds the live
 /// access+refresh tokens, so `token_parse_error` must surface only the serde
 /// error + HTTP status + body length — never the token values.

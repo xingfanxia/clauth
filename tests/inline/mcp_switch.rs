@@ -45,9 +45,10 @@ fn creds_expired(access: &str, refresh: &str) -> ClaudeCredentials {
     }
 }
 
-/// Gate fixture: every test profile carries `expires_at: None` (never
-/// "expiring"), so `ensure_installable` answers Ready without touching this —
-/// it exists only to satisfy the injected-refresher parameter offline.
+/// Gate fixture: an offline stand-in for the injected refresher. Tests whose
+/// profiles never route through the refresher ([`creds`]' `expires_at: None`
+/// reads as not-expiring) pass it as a placeholder; the Transient-arm test
+/// drives the gate through it on purpose via a [`creds_expired`] target.
 fn no_network(
     _rt: &str,
 ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
@@ -343,4 +344,40 @@ fn noninteractive_switch_transient_failure_refuses_without_quarantine() {
         "a transient blip must never quarantine"
     );
     assert!(config.lock().unwrap().is_active("active"));
+}
+
+/// Switching to the already-active profile must never run the AUTH-1 gate:
+/// nothing new is installed (`switch_profile` no-ops on `is_active`), and the
+/// active chain is the one a plain `claude` may be refreshing through the
+/// symlink concurrently — a lost race would false-quarantine a healthy login.
+/// Expired creds + a revoked refresher prove the gate is skipped: routing
+/// through it would refuse the switch and quarantine.
+#[test]
+fn switch_to_the_active_profile_never_gates() {
+    let _home = HomeSandbox::new();
+    let active_profile = stored_profile("active", Some(creds_expired("live-a", "live-r")));
+    crate::claude::force_link_profile_credentials("active").expect("link active");
+
+    let config = handle(AppConfig {
+        state: AppState {
+            active_profile: Some("active".into()),
+            profiles: vec!["active".into()],
+            ..Default::default()
+        },
+        profiles: vec![active_profile],
+    });
+
+    let revoked = |_: &str| {
+        Err(crate::oauth::RefreshError::Invalid(
+            "HTTP 400: refresh token not found or invalid".into(),
+        ))
+    };
+    let (previous, active) = switch_profile_noninteractive(&config, "active", None, revoked)
+        .expect("switch-to-active must no-op, never gate");
+    assert_eq!(previous.as_deref(), Some("active"));
+    assert_eq!(active, "active");
+    assert!(
+        !config.lock().unwrap().is_auth_broken("active"),
+        "the exempt path must never quarantine the active profile"
+    );
 }
