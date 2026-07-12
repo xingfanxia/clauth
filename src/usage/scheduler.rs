@@ -165,6 +165,10 @@ pub(crate) enum ProfileActivity {
     Fetching,
     /// OAuth token rotation in flight.
     Refreshing,
+    /// Off-thread AUTH-1 switch gate in flight for this profile (the switch
+    /// target). Doubles as the pending-switch state: cleared when the gate's
+    /// answer drains on the UI thread.
+    Switching,
 }
 
 /// Result of one tracked operation. Drained by `on_tick`, which clears the `ActivityStore`
@@ -226,6 +230,17 @@ pub(crate) fn is_idle(store: &ActivityStore, name: &str) -> bool {
 pub(crate) fn any_busy(store: &ActivityStore) -> bool {
     match store.lock() {
         Ok(g) => !g.is_empty(),
+        Err(_) => true,
+    }
+}
+
+/// True iff any profile's switch gate is in flight. Poisoned mutex fails safe
+/// to "busy". Switch entry points refuse while one is pending: a second switch
+/// spawned mid-gate could land first and be overturned by the older gate's
+/// completion.
+pub(crate) fn switch_gate_in_flight(store: &ActivityStore) -> bool {
+    match store.lock() {
+        Ok(g) => g.values().any(|a| matches!(a, ProfileActivity::Switching)),
         Err(_) => true,
     }
 }
@@ -1761,8 +1776,8 @@ fn merge_forced<T: NamedEntry + Clone>(
 
 /// Clear any forced name that no leg scheduled this tick — its profile vanished
 /// from both snapshots between the UI `r` and now, leaving a `Queued` mark that no
-/// worker owns and would otherwise spin forever. `Refreshing` names are owned by a
-/// rotate worker, so they are left in place.
+/// worker owns and would otherwise spin forever. `Refreshing`/`Switching` names
+/// are owned by a rotate / switch-gate worker, so they are left in place.
 fn clear_orphaned_forced(
     activity: &ActivityStore,
     forced: &HashSet<String>,
@@ -1774,7 +1789,10 @@ fn clear_orphaned_forced(
     if let Ok(mut a) = activity.lock() {
         for name in forced {
             if !scheduled.contains(name)
-                && !matches!(a.get(name), Some(ProfileActivity::Refreshing))
+                && !matches!(
+                    a.get(name),
+                    Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
+                )
             {
                 a.remove(name);
             }

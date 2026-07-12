@@ -2010,10 +2010,188 @@ mod new_account_model_row {
 
 // ── AUTH-1 gate on the TUI switch (Incident C, every entry point) ───────────
 
-/// The UI-thread switch shares the quarantine refusal: a flagged target's
-/// dead token must never land in the Keychain. Flag-only — no HTTP on the UI
-/// thread — so it keys on `is_auth_broken`, which the poller and every
-/// refresh site keep current.
+/// An OAuth profile with stored credentials on disk, so a passed gate can
+/// complete the relink. `expires_at` picks the gate branch: far future reads
+/// as healthy, past as expiring (routes through the injected refresher).
+fn stored_oauth_profile(name: &str, expires_at: i64) -> crate::profile::Profile {
+    use crate::profile::{ClaudeCredentials, OAuthToken, save_profile};
+    let mut p = crate::testutil::blank_profile(name);
+    p.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: Some(expires_at),
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&p).expect("save profile");
+    p
+}
+
+fn far_future() -> i64 {
+    crate::usage::now_ms() as i64 + 3_600_000
+}
+
+fn already_expired() -> i64 {
+    crate::usage::now_ms() as i64 - 60_000
+}
+
+/// A dead login whose flag hasn't been set yet must still be refused: the
+/// switch runs the full `ensure_installable` gate (off the UI thread in
+/// production), not the flag-only check that let an unflagged dead token
+/// into the Keychain.
+#[test]
+fn tui_switch_gate_refuses_a_dead_target_before_its_flag_is_set() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("dead", already_expired())]);
+    assert!(!app.config().is_auth_broken("dead"), "flag starts clear");
+
+    super::spawn_switch_gate(&mut app, "dead".to_string(), |_| {
+        Err(crate::oauth::RefreshError::Invalid("revoked".to_string()))
+    });
+    super::drain_switch_gates(&mut app);
+
+    assert!(
+        !app.config().is_active("dead"),
+        "a dead target must never become active"
+    );
+    assert!(
+        app.config().is_auth_broken("dead"),
+        "the gate quarantines the dead login"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("clauth login dead")),
+        "the refusal names the recovery"
+    );
+}
+
+/// The healthy path stays a plain switch: a target with real token life never
+/// touches the refresher and lands active once the gate answer drains.
+#[test]
+fn tui_switch_gate_passes_a_healthy_target_through() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("healthy", far_future())]);
+
+    super::spawn_switch_gate(&mut app, "healthy".to_string(), |_| {
+        panic!("a healthy target must not spend a refresh")
+    });
+    super::drain_switch_gates(&mut app);
+
+    assert!(app.config().is_active("healthy"), "healthy target switches");
+    assert!(
+        crate::usage::is_idle(&app.activity, "healthy"),
+        "the pending mark clears once the gate answers"
+    );
+}
+
+/// A transient gate failure (network, busy rotation lock) refuses the switch
+/// without quarantining — retry is free, a false flag is not.
+#[test]
+fn tui_switch_gate_transient_failure_refuses_without_quarantine() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app =
+        app_with_unlinked_profiles(vec![stored_oauth_profile("flaky", already_expired())]);
+
+    super::spawn_switch_gate(&mut app, "flaky".to_string(), |_| {
+        Err(crate::oauth::RefreshError::Transient(anyhow::anyhow!(
+            "no network"
+        )))
+    });
+    super::drain_switch_gates(&mut app);
+
+    assert!(!app.config().is_active("flaky"), "refused this attempt");
+    assert!(
+        !app.config().is_auth_broken("flaky"),
+        "a network blip must not quarantine"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("could not refresh 'flaky'")),
+        "the refusal says retry, not re-login"
+    );
+}
+
+/// A flagged target whose chain actually recovered switches after the gate
+/// refreshes it — the same self-heal the CLI/MCP gates already had, where the
+/// old flag-only check refused until some other site lifted the flag.
+#[test]
+fn tui_switch_gate_recovers_a_flagged_target() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("flagged", far_future())]);
+    app.config().set_auth_broken("flagged", true);
+
+    super::spawn_switch_gate(&mut app, "flagged".to_string(), |_| {
+        Ok(crate::oauth::TokenResponse {
+            access_token: "at-recovered".to_string(),
+            refresh_token: "rt-recovered".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    });
+    super::drain_switch_gates(&mut app);
+
+    assert!(
+        app.config().is_active("flagged"),
+        "a recovered chain switches"
+    );
+    assert!(
+        !app.config().is_auth_broken("flagged"),
+        "the successful refresh lifts the flag"
+    );
+}
+
+/// The gate answer is the pending switch's only completion path: it waits out
+/// open modals (completion can raise the Divergence prompt, which must not
+/// stack) and blocks a second switch while in flight (a later switch landing
+/// first would be overturned by the older gate's answer).
+#[test]
+fn tui_switch_gate_pending_blocks_switches_and_waits_for_modals() {
+    use super::{ConfirmAction, Modal, ToastKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        stored_oauth_profile("first", far_future()),
+        stored_oauth_profile("second", far_future()),
+    ]);
+
+    super::spawn_switch_gate(&mut app, "first".to_string(), |_| {
+        panic!("healthy target: no refresh")
+    });
+    // Un-drained gate = switch in flight: a second switch is refused.
+    super::run_confirm_action(&mut app, ConfirmAction::Switch("second".to_string()));
+    assert!(
+        !app.config().is_active("second"),
+        "a second switch mid-gate is refused"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.kind == ToastKind::Warning),
+        "the refusal is surfaced"
+    );
+
+    // An open modal defers completion to a later tick.
+    app.modals.push(Modal::Help);
+    super::drain_switch_gates(&mut app);
+    assert!(
+        !app.config().is_active("first"),
+        "no completion under an open modal"
+    );
+    app.modals.pop();
+    super::drain_switch_gates(&mut app);
+    assert!(
+        app.config().is_active("first"),
+        "completion lands once the modal closes"
+    );
+}
+
+/// A quarantined target stays refused end to end through `perform_switch`
+/// (the production entry): the flagged blank profile has no refresh token, so
+/// the gate confirms `Broken` without HTTP and the drain surfaces the login
+/// hint.
 #[test]
 fn tui_switch_refuses_a_quarantined_target_with_login_hint() {
     use super::ToastKind;
@@ -2025,6 +2203,7 @@ fn tui_switch_refuses_a_quarantined_target_with_login_hint() {
     app.config().set_auth_broken("broken", true);
 
     super::perform_switch(&mut app, "broken");
+    super::drain_switch_gates(&mut app);
 
     assert!(
         !app.config().is_active("broken"),

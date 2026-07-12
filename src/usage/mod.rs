@@ -21,4 +21,5 @@ pub(crate) use scheduler::{
     SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
     TokenEntry, TokenList, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
     clear_activity, collect_third_party_entries, is_idle, mark_activity, spawn_refresher,
+    switch_gate_in_flight,
 };

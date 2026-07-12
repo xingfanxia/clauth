@@ -52,6 +52,7 @@ use crate::usage::{
     SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
     TokenEntry, TokenList, UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
     clear_activity, collect_third_party_entries, is_idle, mark_activity, now_ms, spawn_refresher,
+    switch_gate_in_flight,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -1108,6 +1109,11 @@ pub(crate) struct App {
     pub(crate) op_results: OpResultReceiver,
     /// Sender side; cloned into workers so they can report without holding a lock.
     pub(crate) op_sender: OpResultSender,
+    /// Off-thread AUTH-1 switch-gate answers; drained in `on_tick` by
+    /// `drain_switch_gates`, which completes or refuses the pending switch.
+    pub(crate) switch_gates: std::sync::mpsc::Receiver<SwitchGateResult>,
+    /// Sender side; cloned into each switch-gate worker.
+    pub(crate) switch_gate_tx: std::sync::mpsc::Sender<SwitchGateResult>,
     /// Startup signals from reconcile/bootstrap workers; drained in `on_tick`.
     pub(crate) startup_results: StartupReceiver,
     /// Sender side for startup workers.
@@ -1331,6 +1337,7 @@ impl App {
             Arc::new(RankedMutex::new(HashMap::new()));
         let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
         let (op_sender, op_results) = std::sync::mpsc::channel::<OpResult>();
+        let (switch_gate_tx, switch_gates) = std::sync::mpsc::channel::<SwitchGateResult>();
         let (startup_sender, startup_results) = std::sync::mpsc::channel::<StartupSignal>();
         let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
         let rate_limit_streaks: RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
@@ -1426,6 +1433,8 @@ impl App {
             activity,
             op_results,
             op_sender,
+            switch_gates,
+            switch_gate_tx,
             startup_results,
             startup_sender,
             last_fetched,
@@ -3060,10 +3069,51 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
     }
 }
 
-/// Switch the active profile to `name`. Pure filesystem relink, no token
-/// rotation (401-recovery handles that lazily). Runs on the UI thread.
+/// One off-thread AUTH-1 switch-gate answer, posted by `spawn_switch_gate`'s
+/// worker and drained by `drain_switch_gates`.
+pub(crate) struct SwitchGateResult {
+    name: String,
+    gate: oauth::AuthGate,
+}
+
+/// Switch the active profile to `name`. The AUTH-1 pre-install gate
+/// (`ensure_installable`) may refresh the target's token over HTTP, so it runs
+/// off the UI thread; `drain_switch_gates` completes the relink when it
+/// answers. The already-active target skips the gate — nothing new to install
+/// (`switch_profile` no-ops on `is_active`), and gating it races a live
+/// `claude` refreshing through the symlink — the same exemption as the
+/// CLI/MCP paths.
 fn perform_switch(app: &mut App, name: &str) {
-    finalize_switch(app, name);
+    let active = app.config().state.active_profile.clone();
+    if active.as_deref() == Some(name) {
+        finalize_switch(app, name);
+        return;
+    }
+    spawn_switch_gate(app, name.to_string(), oauth::refresh_result);
+}
+
+/// Run `ensure_installable` for `name` off the UI thread and post the answer
+/// to the switch-gate channel. The `Switching` activity mark is the pending
+/// state: it shows the spinner and blocks further switches until the drain
+/// clears it. `refresher` is injected so tests gate offline; under `cfg(test)`
+/// the gate runs synchronously — a detached worker would race the test's
+/// `HomeSandbox` (the gate persists `auth_broken` transitions to home paths).
+fn spawn_switch_gate<F>(app: &mut App, name: String, refresher: F)
+where
+    F: Fn(&str) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError> + Send + 'static,
+{
+    mark_activity(&app.activity, &name, ProfileActivity::Switching);
+    let config = Arc::clone(&app.config);
+    let sender = app.switch_gate_tx.clone();
+    let gate = move || {
+        let gate = oauth::ensure_installable(&config, &name, refresher);
+        let _ = sender.send(SwitchGateResult { name, gate });
+    };
+    if cfg!(test) {
+        gate()
+    } else {
+        spawn_worker(gate)
+    }
 }
 
 /// True when the live credentials diverge from the stored chain and it's not a
@@ -3085,23 +3135,11 @@ fn prompt_divergence(app: &mut App, active: String, verb: &str) {
         .push(Modal::Divergence(DivergenceForm { active, cursor: 0 }));
 }
 
-/// Synchronous UI-thread switch. No HTTP; clears the Switching marker, runs
-/// `switch_profile`, refreshes token snapshot on success.
+/// Complete a switch on the UI thread: divergence guard, relink via
+/// `switch_profile`, token-snapshot refresh. No HTTP — the AUTH-1 gate has
+/// already answered (or the target is the already-active exemption) by the
+/// time this runs.
 fn finalize_switch(app: &mut App, name: &str) {
-    // AUTH-1 (Incident C) parity with the CLI/noninteractive gates: a
-    // quarantined target's dead token must never land in the Keychain (it
-    // would log out every running `claude`). Flag-only — no HTTP on the UI
-    // thread; the flag is set/cleared by the poller and every refresh site,
-    // so it is current within one tick. A flagged-but-actually-healthy
-    // account clears itself on its next successful refresh.
-    if app.config().is_auth_broken(name) {
-        clear_activity(&app.activity, name);
-        app.toast(
-            ToastKind::Danger,
-            format!("login for '{name}' has expired — run: clauth login {name}"),
-        );
-        return;
-    }
     // Guard a diverged outgoing active: `switch_profile` would no-op the
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
@@ -5507,6 +5545,13 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
         }
         ConfirmAction::Switch(name) => {
+            if switch_gate_in_flight(&app.activity) {
+                app.toast(
+                    ToastKind::Warning,
+                    "another switch is still in flight; try again in a moment",
+                );
+                return;
+            }
             if !is_idle(&app.activity, &name) {
                 app.toast(
                     ToastKind::Warning,
@@ -6174,13 +6219,15 @@ pub(crate) fn on_tick(app: &mut App) {
     }
     app.apply_usage();
 
+    drain_switch_gates(app);
+
     let auto_switch_targets: Vec<String> = app
         .pending_switch
         .lock()
         .map(|mut g| g.drain().collect())
         .unwrap_or_default();
     for name in auto_switch_targets {
-        if !is_idle(&app.activity, &name) {
+        if switch_gate_in_flight(&app.activity) || !is_idle(&app.activity, &name) {
             continue;
         }
         app.toast(ToastKind::Warning, format!("auto-switching to '{name}'"));
@@ -6280,6 +6327,35 @@ fn drain_op_results(app: &mut App) {
     }
     if needs_token_snapshot_rebuild {
         app.refresh_tokens();
+    }
+}
+
+/// Complete switches whose off-thread AUTH-1 gate answered: clear the pending
+/// mark, then relink (`Ready`/`Refreshed`) or refuse with the login hint
+/// (`Broken`) / a retry hint (`Transient`). Mirrors `drain_pending_switch_off`'s
+/// modal guard — completion can raise the Divergence prompt, which must not
+/// stack under an open modal.
+fn drain_switch_gates(app: &mut App) {
+    if !app.modals.is_empty() {
+        return;
+    }
+    while let Ok(SwitchGateResult { name, gate }) = app.switch_gates.try_recv() {
+        clear_activity(&app.activity, &name);
+        match gate {
+            oauth::AuthGate::Ready => finalize_switch(app, &name),
+            oauth::AuthGate::Refreshed => {
+                app.refresh_tokens();
+                finalize_switch(app, &name);
+            }
+            oauth::AuthGate::Broken => app.toast(
+                ToastKind::Danger,
+                format!("login for '{name}' has expired — run: clauth login {name}"),
+            ),
+            oauth::AuthGate::Transient(e) => app.toast(
+                ToastKind::Danger,
+                format!("could not refresh '{name}' before switching ({e}); try again in a moment"),
+            ),
+        }
     }
 }
 

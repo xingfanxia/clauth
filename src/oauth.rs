@@ -1046,8 +1046,7 @@ pub(crate) fn ensure_installable(
     // failed, so a still-future `expires_at` proves nothing (server-side
     // revocation outlives the stored clock). Route it through the refresher —
     // a recovered chain comes back `Refreshed` and lifts the flag, a dead one
-    // confirms `Broken` — keeping this gate in agreement with the TUI's
-    // flag-only refusal.
+    // confirms `Broken`.
     let expiring =
         flagged || expires_at.is_some_and(|exp| (now_ms() as i64) + AUTH_GATE_GRACE_MS >= exp);
     if !expiring {
