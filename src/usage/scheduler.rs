@@ -1706,11 +1706,12 @@ fn scan_recovery(
     // Build chain-member snapshot under config lock, then drop before
     // touching store (avoids the config↔store inversion that
     // `next_auto_switch_target` avoids via ChainSnapshot).
-    let members: Vec<crate::fallback::ChainMember> = {
+    let (members, weekly_pct): (Vec<crate::fallback::ChainMember>, f64) = {
         let cfg = match config.lock() {
             Ok(c) => c,
             Err(_) => return,
         };
+        let weekly_pct = cfg.state.weekly_switch_threshold_pct();
         // Only scan for recovery after switch-off-all (no active profile).
         if cfg.state.active_profile.is_some() {
             return;
@@ -1718,7 +1719,8 @@ fn scan_recovery(
         if cfg.state.fallback_chain.is_empty() {
             return;
         }
-        cfg.state
+        let members = cfg
+            .state
             .fallback_chain
             .iter()
             .map(|name| {
@@ -1731,7 +1733,8 @@ fn scan_recovery(
                     last_resort: profile.is_some_and(|p| p.last_resort),
                 }
             })
-            .collect()
+            .collect();
+        (members, weekly_pct)
     };
 
     // Relink only to a member with a confirmed-live read; a synthetic/stale 0%
@@ -1741,7 +1744,7 @@ fn scan_recovery(
         .filter(|m| decision_fresh(status, &m.name))
         .collect();
 
-    if let Some(name) = crate::fallback::find_recovered_member(&members, store)
+    if let Some(name) = crate::fallback::find_recovered_member(&members, store, weekly_pct)
         && let Ok(mut p) = pending_switch.lock()
     {
         p.insert(name);

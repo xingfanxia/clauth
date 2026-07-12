@@ -275,6 +275,26 @@ pub(crate) struct AppState {
     /// Divergence modal (current behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_divergence: Option<DivergenceChoice>,
+    /// Chain-wide weekly (7d) exhaustion line, percent — past it an account
+    /// counts as exhausted in BOTH walk directions (switch trigger + candidate
+    /// acceptance). `None` = [`DEFAULT_WEEKLY_SWITCH_PCT`]. Read through
+    /// [`AppState::weekly_switch_threshold_pct`], which clamps hand-edited
+    /// garbage back into the legal band. Global (not per-member like the 5h
+    /// threshold): the line protects the CHAIN — a wrong hop strands days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) weekly_switch_threshold: Option<f64>,
+}
+
+impl AppState {
+    /// The effective weekly exhaustion line: the configured value when it sits
+    /// inside [`MIN_WEEKLY_SWITCH_PCT`]`..=`[`MAX_WEEKLY_SWITCH_PCT`], else the
+    /// default — an out-of-band value hand-edited into profiles.toml must not
+    /// silently disable the weekly gate (rationale in `fallback.rs`).
+    pub(crate) fn weekly_switch_threshold_pct(&self) -> f64 {
+        self.weekly_switch_threshold
+            .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v))
+            .unwrap_or(DEFAULT_WEEKLY_SWITCH_PCT)
+    }
 }
 
 fn default_show_estimates() -> bool {
@@ -305,6 +325,21 @@ fn default_refresh_interval() -> u64 {
     DEFAULT_REFRESH_INTERVAL_MS
 }
 
+/// Default chain-wide weekly (7d) exhaustion line (percent). Why 98 and not
+/// the API's 100% refusal cap: topping out the week bricks an account for
+/// days, so the hop must fire while there is still room to land it — the
+/// full rationale lives on the gate in `fallback.rs`.
+pub(crate) const DEFAULT_WEEKLY_SWITCH_PCT: f64 = 98.0;
+
+/// Lowest configurable weekly line. Below this the chain thrashes: most
+/// members spend half their week above the line, so every hop immediately
+/// re-triggers.
+pub(crate) const MIN_WEEKLY_SWITCH_PCT: f64 = 50.0;
+
+/// Highest configurable weekly line — 100 reproduces the pre-2026-07-12
+/// hard-cap behavior (switch only once the API already refuses).
+pub(crate) const MAX_WEEKLY_SWITCH_PCT: f64 = 100.0;
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
@@ -321,6 +356,7 @@ impl Default for AppState {
             count_cache: false,
             refresh_interval_ms: default_refresh_interval(),
             default_divergence: None,
+            weekly_switch_threshold: None,
         }
     }
 }

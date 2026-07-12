@@ -14,7 +14,10 @@ use ratatui::widgets::Paragraph;
 
 use crate::profile::{DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTERVAL_MS};
 
-use super::super::app::{App, GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState, parse_refresh_secs};
+use super::super::app::{
+    App, GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState, format_weekly_pct, parse_refresh_secs,
+    parse_weekly_pct,
+};
 use super::super::theme::{self, Tier};
 use super::panes::{
     head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, label_style, section_box,
@@ -38,22 +41,29 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let refresh_interval_ms = app
         .refresh_interval
         .load(std::sync::atomic::Ordering::Relaxed);
+    let weekly_pct = app.config().state.weekly_switch_threshold_pct();
     let default_divergence = app.config().state.default_divergence;
     let cursor = app
         .global_config_cursor
         .min(GLOBAL_CONFIG_ROWS.len().saturating_sub(1));
     let editing = app.refresh_interval_draft.as_ref();
+    let weekly_editing = app.weekly_threshold_draft.as_ref();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut caret: Option<(u16, u16)> = None;
     for (i, row) in GLOBAL_CONFIG_ROWS.iter().enumerate() {
         let selected = i == cursor;
-        let row_editing = editing.filter(|_| *row == GlobalConfigRow::RefreshInterval);
+        let row_editing = match row {
+            GlobalConfigRow::RefreshInterval => editing,
+            GlobalConfigRow::WeeklyThreshold => weekly_editing,
+            _ => None,
+        };
         let line = detail_row(
             *row,
             selected,
             toggles,
             refresh_interval_ms,
+            weekly_pct,
             default_divergence,
             row_editing,
         );
@@ -68,7 +78,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 let cy = inner.y.saturating_add(lines.len() as u16);
                 caret = Some((cx, cy));
                 lines.push(line);
-                lines.extend(refresh_range_tooltip(input, inner.width as usize));
+                lines.extend(if *row == GlobalConfigRow::WeeklyThreshold {
+                    weekly_range_tooltip(input, inner.width as usize)
+                } else {
+                    refresh_range_tooltip(input, inner.width as usize)
+                });
             }
             None => {
                 lines.push(if selected {
@@ -120,6 +134,9 @@ fn row_hint(
             }
         },
         GlobalConfigRow::RefreshInterval => "how often usage is refetched for every account",
+        GlobalConfigRow::WeeklyThreshold => {
+            "auto-switch treats an account past this share of its weekly (7d) window as spent"
+        }
         GlobalConfigRow::WrapOff => {
             if toggles.wrap_off {
                 "once every account is spent, switch everything off until one recovers"
@@ -150,6 +167,7 @@ fn detail_row(
     selected: bool,
     toggles: ToggleState,
     refresh_interval_ms: u64,
+    weekly_pct: f64,
     default_divergence: Option<DivergenceChoice>,
     editing: Option<&InputState>,
 ) -> Line<'static> {
@@ -174,6 +192,10 @@ fn detail_row(
         GlobalConfigRow::RefreshInterval => match editing {
             Some(input) => refresh_edit_line(arrow, input),
             None => refresh_cycle_line(arrow, refresh_interval_ms, selected),
+        },
+        GlobalConfigRow::WeeklyThreshold => match editing {
+            Some(input) => weekly_edit_line(arrow, input),
+            None => weekly_cycle_line(arrow, weekly_pct, selected),
         },
         GlobalConfigRow::DivergenceDefault => cycle_row(
             arrow,
@@ -307,6 +329,65 @@ fn refresh_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>>
         invalid_tooltip_lines(&range, width)
     } else {
         help_tooltip_lines(&range, width)
+    }
+}
+
+/// The presets the weekly-line row steps through. Mirrors the
+/// `step_weekly_threshold` ladder in `app.rs`; 100 reproduces the old
+/// hard-cap behavior (switch only once the API already refuses).
+const WEEKLY_PRESETS: [f64; 4] = [90.0, 95.0, 98.0, 100.0];
+
+/// The `weekly limit` row at rest: a segmented control over
+/// [`WEEKLY_PRESETS`], with a custom value (set via ⏎) appended in `ACCENT`
+/// when it matches no preset — same grammar as the refresh row.
+fn weekly_cycle_line(arrow: Span<'static>, weekly_pct: f64, selected: bool) -> Line<'static> {
+    let labels: Vec<String> = WEEKLY_PRESETS
+        .iter()
+        .map(|p| format!("{}%", format_weekly_pct(*p)))
+        .collect();
+    let options: Vec<(&str, bool)> = labels
+        .iter()
+        .zip(WEEKLY_PRESETS.iter())
+        .map(|(label, p)| (label.as_str(), *p == weekly_pct))
+        .collect();
+    let mut line = cycle_row(arrow, "weekly limit", &options, selected);
+    if !WEEKLY_PRESETS.contains(&weekly_pct) {
+        line.push_span(Span::styled(
+            format!("   {}%", format_weekly_pct(weekly_pct)),
+            theme::accent(),
+        ));
+    }
+    line
+}
+
+/// The `weekly limit` row mid-edit: edit gutter + key block + typed buffer
+/// (DANGER when out of range) + ` %` unit. Mirrors `refresh_edit_line`.
+fn weekly_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
+    let invalid = parse_weekly_pct(input.trimmed()).is_none();
+    let key = "weekly limit";
+    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
+    let mut spans = vec![
+        arrow,
+        Span::styled(format!("{key}{}", " ".repeat(pad)), label_style(true)),
+    ];
+    spans.extend(value_caret(input, invalid));
+    let unit_style = if invalid {
+        theme::danger()
+    } else {
+        theme::faint()
+    };
+    spans.push(Span::styled(" %", unit_style));
+    Line::from(spans)
+}
+
+/// Sub-line under the weekly field while typing: the valid range, in DANGER
+/// when the buffer parses out of range, else faint.
+fn weekly_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
+    let range = "50-100 %";
+    if parse_weekly_pct(input.trimmed()).is_none() {
+        invalid_tooltip_lines(range, width)
+    } else {
+        help_tooltip_lines(range, width)
     }
 }
 
