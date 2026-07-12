@@ -55,6 +55,29 @@ pub(crate) struct TokenResponse {
     pub(crate) scope: Option<String>,
 }
 
+/// Build a safe error for a **2xx** token-endpoint body that failed to parse
+/// into [`TokenResponse`]. The body still holds the live access+refresh tokens,
+/// so neither it nor serde's `Display` (which echoes the offending scalar — a
+/// possible token substring) may reach an error surfaced on `clauth login` or a
+/// TUI toast; a leaked token is account takeover. The value-free channel
+/// (category + position + status + length) is pinned by
+/// `token_parse_error_redacts_the_2xx_body`.
+fn token_parse_error(e: serde_json::Error, status: u16, body_len: usize) -> anyhow::Error {
+    let kind = match e.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "malformed json",
+        serde_json::error::Category::Data => "unexpected shape",
+        serde_json::error::Category::Eof => "truncated",
+    };
+    anyhow::anyhow!(
+        "token endpoint returned HTTP {status} but its body did not parse as a token \
+         response ({kind} at line {}, column {}); {body_len} bytes withheld \
+         (contains live credentials)",
+        e.line(),
+        e.column(),
+    )
+}
+
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(4)))
@@ -87,28 +110,76 @@ fn http_error(status: u16, body: &str) -> anyhow::Error {
     }
 }
 
-pub(crate) fn refresh(refresh_token: &str) -> Result<TokenResponse> {
+/// A token-refresh failure, split so the AUTH-1 gate can tell a *permanently*
+/// revoked/invalid refresh token (quarantine the account — `clauth login` is the
+/// only fix) from a *transient* network/429/5xx blip (refuse this one switch,
+/// retry next tick — never quarantine a healthy account on a hiccup).
+pub(crate) enum RefreshError {
+    /// The token endpoint rejected the refresh token — it is revoked or
+    /// invalid. HTTP 400/401, or a 403 whose body confirms `invalid_grant`.
+    Invalid(String),
+    /// Transport failure, 429, 5xx, or an unconfirmed 403 (WAF/geo/challenge
+    /// blocks answer 403 too) — the refresh token may still be good.
+    Transient(anyhow::Error),
+}
+
+impl From<RefreshError> for anyhow::Error {
+    fn from(e: RefreshError) -> Self {
+        match e {
+            RefreshError::Invalid(msg) => anyhow::anyhow!(msg),
+            RefreshError::Transient(e) => e,
+        }
+    }
+}
+
+/// [`refresh`] preserving the permanent-vs-transient distinction the AUTH-1 gate
+/// needs. A 400/401 from the token endpoint means the refresh token is
+/// revoked/invalid (quarantine — OAuth2 reports a dead refresh token as a 400
+/// `invalid_grant`; some proxies answer 401). A 403 is terminal only when the
+/// body actually confirms `invalid_grant`: WAF/geo/challenge blocks answer 403
+/// too, and quarantining on one would take a healthy account out of rotation.
+/// A transport error, 429, or 5xx is transient (retry, never quarantine).
+pub(crate) fn refresh_result(
+    refresh_token: &str,
+) -> std::result::Result<TokenResponse, RefreshError> {
     let body = serde_json::to_string(&serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLIENT_ID,
-    }))?;
+    }))
+    .map_err(|e| RefreshError::Transient(e.into()))?;
 
     let mut response = AGENT
         .post(TOKEN_ENDPOINT)
         .header("Content-Type", "application/json")
         .send(&body)
-        .map_err(anyhow::Error::from)?;
+        .map_err(|e| RefreshError::Transient(anyhow::Error::from(e)))?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
         .read_to_string()
-        .map_err(anyhow::Error::from)?;
+        .map_err(|e| RefreshError::Transient(anyhow::Error::from(e)))?;
+    if refresh_rejection_is_terminal(status, &text) {
+        return Err(RefreshError::Invalid(http_error(status, &text).to_string()));
+    }
     if status >= 400 {
-        return Err(http_error(status, &text));
+        return Err(RefreshError::Transient(http_error(status, &text)));
     }
 
-    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))
+    serde_json::from_str(&text)
+        .map_err(|e| RefreshError::Transient(token_parse_error(e, status, text.len())))
+}
+
+/// Whether a token-endpoint rejection means the refresh token itself is dead
+/// (quarantine) rather than the request being blocked (retry). Extracted pure
+/// so the truth table is pinned offline
+/// (`refresh_rejection_terminal_truth_table`).
+fn refresh_rejection_is_terminal(status: u16, body: &str) -> bool {
+    matches!(status, 400 | 401) || (status == 403 && body.contains("invalid_grant"))
+}
+
+pub(crate) fn refresh(refresh_token: &str) -> Result<TokenResponse> {
+    refresh_result(refresh_token).map_err(Into::into)
 }
 
 /// Exchange an authorization code (from the interactive loopback login in
@@ -146,7 +217,7 @@ pub(crate) fn exchange_code(
         return Err(http_error(status, &text));
     }
 
-    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{e}: {text}"))
+    serde_json::from_str(&text).map_err(|e| token_parse_error(e, status, text.len()))
 }
 
 /// A kick failure. Distinguishes a 401 (access token expired — rotate the chain
@@ -677,6 +748,138 @@ fn active_link_diverged(config: &AppConfig) -> bool {
             Some(LinkState::Diverged)
         )
     })
+}
+
+/// Grace window (ms): a token with less than this much life left is treated as
+/// expiring, so the AUTH-1 gate refreshes it *before* install rather than
+/// letting the freshly-switched session hit a 401.
+const AUTH_GATE_GRACE_MS: i64 = 60_000;
+
+/// Outcome of the pre-install auth gate ([`ensure_installable`]).
+pub(crate) enum AuthGate {
+    /// Safe to install the target's stored credentials as-is: a third-party
+    /// (api-key) profile, an OAuth token with real life left, or a profile whose
+    /// live `clauth start` session keeps its own chain fresh.
+    Ready,
+    /// The target's expiring OAuth token was refreshed and the rotated pair
+    /// persisted; install the refreshed credentials.
+    Refreshed,
+    /// The target's refresh token is revoked/invalid — the profile is marked
+    /// `auth_broken` (persisted). The caller MUST NOT install: a dead token in
+    /// the Keychain logs out every running `claude` (Incident C).
+    Broken,
+    /// A transient failure (network/429/5xx, a busy rotation lock, or a poisoned
+    /// mutex) blocked a needed refresh. Do not install now; retry on a later
+    /// tick. The account is NOT quarantined.
+    Transient(anyhow::Error),
+}
+
+/// Pre-install auth gate (AUTH-1 / Incident C). Installing `name`'s stored
+/// credentials into the macOS Keychain instantly re-authenticates every running
+/// `claude` on this machine, so a dead token must never be installed: this
+/// refreshes an expiring OAuth token before install, quarantines a revoked one
+/// ([`AuthGate::Broken`]), and passes healthy or third-party targets through.
+/// Every branch is pinned by the `gate_*` tests in this module's test file.
+///
+/// `refresher` is injected so the gate is testable offline (real callers pass
+/// [`refresh_result`]). The config mutex is never held across the HTTP refresh,
+/// and the per-profile `RotationGuard` wraps the refresh so a live session or
+/// sibling worker cannot double-spend the single-use token.
+pub(crate) fn ensure_installable(
+    config: &crate::profile::ConfigHandle,
+    name: &str,
+    refresher: impl Fn(&str) -> std::result::Result<TokenResponse, RefreshError>,
+) -> AuthGate {
+    // Read the target's auth shape under the config lock, then release it — the
+    // HTTP refresh below must never hold the config mutex (a slow refresh would
+    // otherwise wedge the daemon's single-threaded run loop).
+    let (expires_at, refresh_token) = {
+        let Ok(cfg) = config.lock() else {
+            return AuthGate::Transient(anyhow::anyhow!("config mutex poisoned"));
+        };
+        let Some(profile) = cfg.find(name) else {
+            // Unknown profile: nothing to gate — the switch itself surfaces
+            // "Profile not found".
+            return AuthGate::Ready;
+        };
+        if !profile.is_oauth() {
+            // Third-party (api-key) profiles carry no OAuth token to expire.
+            return AuthGate::Ready;
+        }
+        (
+            profile.access_token_expires_at(),
+            profile.refresh_token().map(str::to_string),
+        )
+    };
+
+    // Unknown expiry → treat as not-expiring (mirrors `auto_start_kick`): install
+    // as-is and let the lazy 401→rotate path handle a surprise expiry.
+    let expiring = expires_at.is_some_and(|exp| (now_ms() as i64) + AUTH_GATE_GRACE_MS >= exp);
+    if !expiring {
+        return AuthGate::Ready;
+    }
+
+    // RotationGuard across the HTTP window (single-use double-spend guard),
+    // acquired with no config lock held. A busy guard means a live session or
+    // sibling worker is already on this chain — refuse this switch and retry.
+    let Ok(_guard) = RotationGuard::acquire(name) else {
+        return AuthGate::Transient(anyhow::anyhow!(
+            "'{name}' rotation lock busy; retry after the in-flight refresh"
+        ));
+    };
+    // Authoritative under the guard: a live `clauth start` session owns and
+    // advances this profile's single-use chain and keeps the Keychain fresh, so
+    // refreshing here would 400 the session — install as-is.
+    if has_live_session(name) {
+        return AuthGate::Ready;
+    }
+    let Some(rt) = refresh_token else {
+        // Expiring OAuth token with no refresh token — unrecoverable without a
+        // re-login.
+        mark_auth_broken(config, name, true);
+        return AuthGate::Broken;
+    };
+
+    match refresher(&rt) {
+        Ok(tok) => {
+            if apply_rotated_tokens_locked(config, name, tok).is_err() {
+                return AuthGate::Transient(anyhow::anyhow!(
+                    "refreshed '{name}' but failed to persist the rotated tokens"
+                ));
+            }
+            // A successful refresh clears any prior quarantine.
+            mark_auth_broken(config, name, false);
+            AuthGate::Refreshed
+        }
+        Err(RefreshError::Invalid(_)) => {
+            mark_auth_broken(config, name, true);
+            AuthGate::Broken
+        }
+        Err(RefreshError::Transient(e)) => AuthGate::Transient(e),
+    }
+}
+
+/// Set or clear a profile's persisted `auth_broken` flag and save. Best-effort:
+/// a failed save leaves the in-memory flag as set for this run (re-applied on the
+/// next attempt). Locks `config` (outer) then `save_app_state` takes the state
+/// flock (inner) — the established save order.
+pub(crate) fn mark_auth_broken(config: &crate::profile::ConfigHandle, name: &str, broken: bool) {
+    if let Ok(mut cfg) = config.lock()
+        && cfg.set_auth_broken(name, broken)
+    {
+        // Log the transition only — guarded by `set_auth_broken`'s changed-return
+        // (pinned by `set_auth_broken_reports_transitions_and_is_idempotent`) so a
+        // dropped login leaves one stderr line, never a per-tick repeat.
+        if broken {
+            eprintln!(
+                "clauth: login for '{name}' expired — refresh token dead; \
+                 flagged auth_broken. Recover with: clauth login {name}"
+            );
+        } else {
+            eprintln!("clauth: '{name}' re-authenticated — auth_broken cleared");
+        }
+        let _ = crate::profile::save_app_state(&cfg.state);
+    }
 }
 
 #[cfg(test)]

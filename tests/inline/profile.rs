@@ -152,6 +152,126 @@ fallback_chain = ["work"]
     );
 }
 
+// ── AUTH-1: `auth_broken` quarantine set semantics + persistence ──────────────
+
+// `set_auth_broken` returns whether the set actually changed — the transition
+// signal `mark_auth_broken` keys its single stderr line off of. Both directions
+// flip once and then no-op.
+#[test]
+fn set_auth_broken_reports_transitions_and_is_idempotent() {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    assert!(
+        config.set_auth_broken("x", true),
+        "clear→broken is a transition"
+    );
+    assert!(config.is_auth_broken("x"));
+    assert!(
+        !config.set_auth_broken("x", true),
+        "broken→broken is a no-op (no duplicate log)"
+    );
+    assert!(
+        config.set_auth_broken("x", false),
+        "broken→clear is a transition"
+    );
+    assert!(!config.is_auth_broken("x"));
+    assert!(
+        !config.set_auth_broken("x", false),
+        "clear→clear is a no-op"
+    );
+}
+
+// A quarantined account must survive a save/load of profiles.toml, and an older
+// state file written before the field existed must still load (serde default →
+// empty), or upgrading would either forget a dead login or fail to parse.
+#[test]
+fn auth_broken_round_trips_and_is_omitted_when_empty() {
+    let on = AppState {
+        auth_broken: vec!["dead".into()],
+        ..AppState::default()
+    };
+    let rendered = toml::to_string_pretty(&on).expect("render quarantined state");
+    assert!(
+        rendered.contains("auth_broken"),
+        "a populated quarantine must render, got:\n{rendered}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered).expect("reparse quarantined state");
+    assert_eq!(
+        reparsed
+            .auth_broken
+            .iter()
+            .map(ProfileName::as_str)
+            .collect::<Vec<_>>(),
+        ["dead"],
+        "the quarantined name survives the round-trip"
+    );
+
+    let rendered_off = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_off.contains("auth_broken"),
+        "an empty quarantine is omitted from disk, got:\n{rendered_off}"
+    );
+
+    let older: AppState = toml::from_str("profiles = []\n").expect("parse pre-field state");
+    assert!(
+        older.auth_broken.is_empty(),
+        "a state file without the field defaults to an empty quarantine"
+    );
+}
+
+// `remove` must drop the removed name from the quarantine list too — a stale
+// entry would otherwise linger and could re-attach to a re-created same-name
+// profile.
+#[test]
+fn remove_drops_auth_broken_entry() {
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![
+            Profile::new("a".to_string(), None, None),
+            Profile::new("b".to_string(), None, None),
+        ],
+    };
+    config.set_auth_broken("a", true);
+    config.set_auth_broken("b", true);
+    config.remove("a");
+    assert!(
+        !config.is_auth_broken("a"),
+        "removed name leaves the quarantine"
+    );
+    assert!(
+        config.is_auth_broken("b"),
+        "the other quarantine is untouched"
+    );
+}
+
+// `rename_all_occurrences` must carry the quarantine to the new name — a rename
+// that dropped it would silently un-quarantine a dead login.
+#[test]
+fn rename_carries_auth_broken_entry() {
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["old".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("old".to_string(), None, None)],
+    };
+    config.set_auth_broken("old", true);
+    config.rename_all_occurrences("old", "new");
+    assert!(
+        !config.is_auth_broken("old"),
+        "old name no longer quarantined"
+    );
+    assert!(
+        config.is_auth_broken("new"),
+        "quarantine follows the rename"
+    );
+}
+
 #[cfg(unix)]
 use crate::testutil::HomeSandbox;
 

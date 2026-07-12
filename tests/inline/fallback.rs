@@ -755,6 +755,195 @@ fn auto_switch_wrap_off_disabled_stays_put() {
     assert_eq!(next_auto_switch_target(&snap, &store), None);
 }
 
+// ── AUTH-1: auth-broken members excluded from the chain walk ──────────────────
+//
+// A member whose OAuth refresh is revoked/invalid (`AppState::auth_broken`) must
+// never be picked as a switch target — installing its dead token would log out
+// every running claude (Incident C). Excluded in the headroom pass AND the sink
+// pass, on both the config-side (`next_target`) and scheduler-side
+// (`next_auto_switch_target`) walks.
+
+// next_target: broken member with headroom is skipped; the next viable one wins.
+#[test]
+fn next_target_skips_broken_member_picks_next() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
+            profile_with_util("b", Some(95.0), Some(20.0)),  // headroom but broken
+            profile_with_util("c", Some(95.0), Some(20.0)),  // headroom, viable
+        ],
+        "a",
+    );
+    config.set_auth_broken("b", true);
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".into()))
+    );
+}
+
+// next_target: the only non-active member is broken → nothing viable → None.
+#[test]
+fn next_target_returns_none_when_only_alternative_is_broken() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
+            profile_with_util("b", Some(95.0), Some(20.0)),  // headroom but broken
+        ],
+        "a",
+    );
+    config.set_auth_broken("b", true);
+    assert_eq!(next_target(&config, None), None);
+}
+
+// next_auto_switch_target: the scheduler-side walk skips broken members too
+// (snapshot_chain carries `auth_broken` into ChainSnapshot.broken).
+#[test]
+fn auto_switch_skips_broken_member_picks_next() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.set_auth_broken("b", true);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert!(snap.broken.iter().any(|n| n == "b"));
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".into())),
+    );
+}
+
+// A broken 100%-sink is excluded from the sink pass: with wrap-off on and no
+// other viable member, the chain switches OFF rather than installing the dead
+// sink's token.
+#[test]
+fn next_target_broken_sink_wrap_off_switches_off() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted, not a sink
+            profile_with_util("b", Some(100.0), Some(100.0)), // sink — but broken
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    config.set_auth_broken("b", true);
+    assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
+}
+
+// ── AUTH-4: an auth-broken ACTIVE is itself a switch trigger ──────────────────
+//
+// A dead login can never produce a fresh usage read again, so its store entry
+// freezes at whatever it last held — typically a lapsed 5h window that reads
+// as idle headroom. Gating the walk on the active's exhaustion therefore
+// wedged the daemon on the dead account forever while a viable sibling idled
+// (observed 2026-07-09: the active broke mid-window; the next member sat at
+// 0%). The broken flag is terminal-confirmed (set only after a rejected
+// refresh AND a failed live-mirror adopt), so walking away is the only move
+// that keeps the machine serving.
+
+// Broken active whose frozen last read is a lapsed window (reads as idle
+// headroom, NOT exhausted) → the walk runs anyway and leaves for the sibling.
+#[test]
+fn auto_switch_broken_active_walks_away_despite_stale_headroom() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.set_auth_broken("a", true);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        // The active's last-ever read: maxed on a window that has since
+        // lapsed — the exact frozen shape the wedge held.
+        ("a", usage_info(Some(window(100.0, Some(expired_reset()))))),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".into())),
+    );
+}
+
+// Broken active with NO viable member: stays put. Wrap-off in particular must
+// not fire off the broken flag alone — the live session's own Keychain chain
+// may still be healthy, and only real usage exhaustion may halt it.
+#[test]
+fn auto_switch_broken_active_without_viable_member_never_wraps_off() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    config.set_auth_broken("a", true);
+    config.set_auth_broken("b", true); // the only sibling is dead too
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(expired_reset()))))),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+// Broken AND genuinely exhausted (live window over threshold): the Off leg
+// keys on the real exhaustion, which broken must not suppress either.
+#[test]
+fn auto_switch_broken_and_exhausted_active_still_wraps_off() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    config.set_auth_broken("a", true);
+    config.set_auth_broken("b", true);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(100.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::Off),
+    );
+}
+
+// The last-resort pass excludes a broken member too (not just the headroom
+// pass): a `last_resort` sink whose token is dead must not be migrated to. The
+// base case migrates a→b; quarantining b makes the last-resort walk find
+// nothing.
+#[test]
+fn next_target_skips_broken_last_resort_member() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted, not last_resort
+            mark_last_resort(profile_with_util("b", Some(80.0), Some(100.0))), // last_resort sink
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".into())),
+        "base case: the last-resort pass migrates to the sink"
+    );
+    config.set_auth_broken("b", true);
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "a broken last_resort sink is excluded from the last-resort pass"
+    );
+}
+
 // ── issue #8 follow-up b: burn-aware auto-switch (opt-in, default off) ─────
 //
 // `is_exhausted_projected`/`is_exhausted_active`/`is_exhausted_active_from_store`

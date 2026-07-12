@@ -309,3 +309,283 @@ fn rotation_guard_is_independent_across_profiles() {
 // gate that decides whether to kick is unit-tested in `scheduler.rs`
 // (`window_lapsed`), and the opt-in gate is `Profile::auto_start` threaded into
 // `TokenEntry`.
+
+// ── AUTH-1: pre-install auth gate (`ensure_installable`) ──────────────────────
+//
+// All offline: the HTTP refresh is injected as a closure, so these pin the
+// gate's decision + persistence without touching the network or the real
+// Keychain (Incident C guardrail).
+
+/// Epoch-ms already in the past — an expired access token.
+fn past_expiry() -> i64 {
+    crate::usage::now_ms() as i64 - 60_000
+}
+
+/// Epoch-ms an hour ahead — a token with real life left.
+fn future_expiry() -> i64 {
+    crate::usage::now_ms() as i64 + 3_600_000
+}
+
+fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>) -> AppConfig {
+    use std::collections::BTreeMap;
+    let profile = Profile {
+        name: name.into(),
+        base_url: None,
+        api_key: None,
+        auto_start: false,
+        env: BTreeMap::new(),
+        models: Default::default(),
+        fallback_threshold: None,
+        last_resort: false,
+        bell_threshold: None,
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-old".to_string(),
+                refresh_token: refresh_token.map(String::from),
+                expires_at,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }),
+        usage: None,
+        fetch_status: None,
+        provider: None,
+        third_party_usage: None,
+    };
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.profiles.push(name.into());
+    config
+}
+
+fn third_party_config(name: &str) -> AppConfig {
+    use std::collections::BTreeMap;
+    let profile = Profile {
+        name: name.into(),
+        base_url: Some("https://api.deepseek.com/anthropic".to_string()),
+        api_key: Some("sk-fixture".to_string()),
+        auto_start: false,
+        env: BTreeMap::new(),
+        models: Default::default(),
+        fallback_threshold: None,
+        last_resort: false,
+        bell_threshold: None,
+        credentials: None,
+        usage: None,
+        fetch_status: None,
+        provider: None,
+        third_party_usage: None,
+    };
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.profiles.push(name.into());
+    config
+}
+
+/// A refresher that must never run — bypass/valid-token paths take no refresh.
+fn never_refresh(_rt: &str) -> std::result::Result<TokenResponse, RefreshError> {
+    panic!("ensure_installable must not refresh in this scenario");
+}
+
+/// Third-party (api-key) profile → gate bypassed, no refresh attempted.
+#[test]
+fn gate_third_party_bypasses() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-third-party";
+    let handle = Arc::new(RankedMutex::new(third_party_config(name)));
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+}
+
+/// OAuth token with real life left → install as-is, no refresh.
+#[test]
+fn gate_valid_token_ready_without_refresh() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-valid";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-good"),
+        Some(future_expiry()),
+    )));
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+}
+
+/// Expired-but-refreshable → rotated tokens minted, persisted, installed.
+#[test]
+fn gate_refreshes_expiring_token_and_installs() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-refreshable";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-old"),
+        Some(past_expiry()),
+    )));
+    let refresher = |_rt: &str| {
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        ensure_installable(&handle, name, refresher),
+        AuthGate::Refreshed
+    ));
+    #[allow(clippy::expect_used, reason = "test")]
+    let cfg = handle.lock().expect("lock");
+    let p = cfg.find(name).expect("profile");
+    assert_eq!(
+        p.access_token(),
+        Some("at-new"),
+        "rotated access token stored"
+    );
+    assert_eq!(
+        p.refresh_token(),
+        Some("rt-new"),
+        "rotated refresh token stored"
+    );
+    assert!(
+        !cfg.is_auth_broken(name),
+        "a successful refresh is not broken"
+    );
+}
+
+/// Refresh rejected as invalid → switch refused + profile quarantined.
+#[test]
+fn gate_invalid_refresh_marks_broken_and_refuses() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-invalid";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-revoked"),
+        Some(past_expiry()),
+    )));
+    let refresher = |_rt: &str| Err(RefreshError::Invalid("HTTP 400: invalid_grant".to_string()));
+    assert!(matches!(
+        ensure_installable(&handle, name, refresher),
+        AuthGate::Broken
+    ));
+    #[allow(clippy::expect_used, reason = "test")]
+    let cfg = handle.lock().expect("lock");
+    assert!(
+        cfg.is_auth_broken(name),
+        "a revoked refresh token quarantines the profile"
+    );
+}
+
+/// A transient failure refuses the switch but does NOT quarantine the account.
+#[test]
+fn gate_transient_refresh_does_not_quarantine() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-transient";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-ok"),
+        Some(past_expiry()),
+    )));
+    let refresher = |_rt: &str| Err(RefreshError::Transient(anyhow::anyhow!("connection reset")));
+    assert!(matches!(
+        ensure_installable(&handle, name, refresher),
+        AuthGate::Transient(_)
+    ));
+    #[allow(clippy::expect_used, reason = "test")]
+    let cfg = handle.lock().expect("lock");
+    assert!(
+        !cfg.is_auth_broken(name),
+        "a network blip must not quarantine a healthy account"
+    );
+}
+
+/// An expiring OAuth token with no refresh token is unrecoverable → quarantined.
+#[test]
+fn gate_expiring_without_refresh_token_is_broken() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-no-rt";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        None,
+        Some(past_expiry()),
+    )));
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Broken
+    ));
+    #[allow(clippy::expect_used, reason = "test")]
+    let cfg = handle.lock().expect("lock");
+    assert!(cfg.is_auth_broken(name));
+}
+
+/// A 2xx token-endpoint body that fails to deserialize still holds the live
+/// access+refresh tokens, so `token_parse_error` must surface only the serde
+/// error + HTTP status + body length — never the token values.
+#[test]
+fn token_parse_error_redacts_the_2xx_body() {
+    // Missing `expires_in` → fails to parse into TokenResponse, but the body
+    // carries live-looking tokens.
+    let body =
+        r#"{"access_token":"sk-ant-oat01-SECRETLEAK","refresh_token":"sk-ant-ort01-SECRETLEAK"}"#;
+    // Avoid `.expect_err` so `TokenResponse` need not derive `Debug` — a token-
+    // bearing struct with a `Debug` impl is its own leak surface.
+    let err = match serde_json::from_str::<TokenResponse>(body) {
+        Ok(_) => panic!("2xx body without expires_in must fail to parse into TokenResponse"),
+        Err(e) => e,
+    };
+    let msg = super::token_parse_error(err, 200, body.len()).to_string();
+
+    assert!(
+        !msg.contains("SECRETLEAK"),
+        "no token value substring may appear in the error: {msg}"
+    );
+    assert!(
+        !msg.contains("access_token\":\""),
+        "raw body must not be echoed: {msg}"
+    );
+    assert!(msg.contains("200"), "HTTP status is reported: {msg}");
+    assert!(
+        msg.contains(&body.len().to_string()),
+        "body length is reported: {msg}"
+    );
+    // Locks the value-free channel: the message reports the failure *position*,
+    // never the serde Display `{e}` (which could echo an offending scalar).
+    assert!(
+        msg.contains("column"),
+        "the parse position (not the serde value) is reported: {msg}"
+    );
+}
+
+// ── refresh_rejection_is_terminal (the 400/401/403 truth table) ─────────────
+
+/// 400/401 are terminal regardless of body (OAuth2 reports a dead refresh
+/// token as 400 `invalid_grant`; some proxies answer 401). 403 is terminal
+/// ONLY with a confirming `invalid_grant` body — WAF/geo/challenge blocks
+/// answer 403 too, and quarantining on one would take a healthy account out
+/// of rotation until its next successful refresh.
+#[test]
+fn refresh_rejection_terminal_truth_table() {
+    assert!(refresh_rejection_is_terminal(400, "invalid_grant"));
+    assert!(refresh_rejection_is_terminal(
+        400,
+        "refresh token not found or invalid"
+    ));
+    assert!(refresh_rejection_is_terminal(401, "unauthorized"));
+    assert!(refresh_rejection_is_terminal(
+        403,
+        r#"{"error":"invalid_grant"}"#
+    ));
+    assert!(!refresh_rejection_is_terminal(
+        403,
+        "<html>Access denied by security policy</html>"
+    ));
+    assert!(!refresh_rejection_is_terminal(429, "rate limited"));
+    assert!(!refresh_rejection_is_terminal(500, "internal error"));
+}

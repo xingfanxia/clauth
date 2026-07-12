@@ -226,6 +226,13 @@ pub(crate) struct AppState {
     /// credentials and unsets the active profile instead of staying put.
     #[serde(default)]
     pub(crate) wrap_off: bool,
+    /// Profiles quarantined after a *permanent* OAuth refresh rejection (AUTH-1 /
+    /// Incident C) — a transient network/5xx blip never lands here. Excluded from
+    /// the fallback chain walk and refused as a switch target so a dead token is
+    /// never installed into the Keychain (which would log out every running
+    /// `claude`); cleared on a successful refresh or `clauth login`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) auth_broken: Vec<ProfileName>,
     /// When true, the fallback-chain auto-switch decision for the ACTIVE
     /// profile projects its utilization at the next poll (current + recent
     /// burn rate × refresh interval) instead of comparing against the static
@@ -297,6 +304,7 @@ impl Default for AppState {
             profiles: Vec::new(),
             fallback_chain: Vec::new(),
             wrap_off: false,
+            auth_broken: Vec::new(),
             burn_aware_switching: false,
             theme: None,
             show_estimates: true,
@@ -320,6 +328,28 @@ pub(crate) type ConfigHandle =
 impl AppConfig {
     pub(crate) fn is_active(&self, name: &str) -> bool {
         self.state.active_profile.as_deref() == Some(name)
+    }
+
+    /// True when `name`'s last OAuth refresh was rejected as revoked/invalid
+    /// (AUTH-1). Such a profile is skipped by the fallback chain walk.
+    pub(crate) fn is_auth_broken(&self, name: &str) -> bool {
+        self.state.auth_broken.iter().any(|n| n.as_str() == name)
+    }
+
+    /// Mark or clear `name`'s auth-broken flag. Returns `true` when the set
+    /// actually changed, so the caller can skip a redundant `save_app_state`.
+    /// Pure in-memory mutation — the caller persists via `save_app_state`.
+    pub(crate) fn set_auth_broken(&mut self, name: &str, broken: bool) -> bool {
+        let present = self.is_auth_broken(name);
+        if broken && !present {
+            self.state.auth_broken.push(name.into());
+            true
+        } else if !broken && present {
+            self.state.auth_broken.retain(|n| n.as_str() != name);
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn find(&self, name: &str) -> Option<&Profile> {
@@ -351,6 +381,7 @@ impl AppConfig {
         self.profiles.retain(|p| p.name != name);
         self.state.profiles.retain(|n| n.as_str() != name);
         self.state.fallback_chain.retain(|n| n.as_str() != name);
+        self.state.auth_broken.retain(|n| n.as_str() != name);
         if self.is_active(name) {
             self.state.active_profile = None;
         }
@@ -372,6 +403,14 @@ impl AppConfig {
         if let Some(slot) = self
             .state
             .fallback_chain
+            .iter_mut()
+            .find(|n| n.as_str() == old)
+        {
+            *slot = new.into();
+        }
+        if let Some(slot) = self
+            .state
+            .auth_broken
             .iter_mut()
             .find(|n| n.as_str() == old)
         {
@@ -683,7 +722,7 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
     })
 }
 
-fn load_profile(name: &str) -> Result<Profile> {
+pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,

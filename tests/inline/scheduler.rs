@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::lockorder::RankedMutex;
+use crate::oauth::RefreshError;
 
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
@@ -403,6 +404,101 @@ fn only_a_fresh_read_drives_a_switch_decision() {
     assert!(
         !decision_fresh(&status, "absent"),
         "no read yet → no decision"
+    );
+}
+
+/// AUTH-4: `scan_auto_switch` bypasses the freshness gate for an auth-broken
+/// active — its reads can never be `Fresh` again (the login is dead), so
+/// requiring one froze the scan forever and wedged the daemon on the dead
+/// account while a viable sibling idled (observed live 2026-07-09). A healthy
+/// active keeps the gate: the same frozen store state must NOT drive a switch
+/// when the account is merely stale, only when it is confirmed dead.
+#[test]
+fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
+    use super::{FetchStatus, PendingSwitch, PendingSwitchOff, StatusStore, scan_auto_switch};
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let frozen_state = || {
+        // The wedge's exact shape: the active's last-ever read is maxed on a
+        // window that has since lapsed (reads as idle headroom), status stuck
+        // on RateLimited; the sibling is genuinely viable and Fresh.
+        let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+            (
+                "a".to_string(),
+                UsageInfo {
+                    five_hour: Some(UsageWindow {
+                        utilization: 100.0,
+                        resets_at: Some(epoch_secs_to_iso(now_epoch_secs() - 3600)),
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                "b".to_string(),
+                UsageInfo {
+                    five_hour: Some(UsageWindow {
+                        utilization: 10.0,
+                        resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ])));
+        let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+            ("a".to_string(), FetchStatus::RateLimited),
+            ("b".to_string(), FetchStatus::Fresh),
+        ])));
+        let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+        let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+        (store, status, activity, pending, pending_off)
+    };
+    let config_handle = |broken: bool| -> crate::profile::ConfigHandle {
+        let mut cfg = AppConfig {
+            state: AppState {
+                active_profile: Some("a".into()),
+                profiles: vec!["a".into(), "b".into()],
+                fallback_chain: vec!["a".into(), "b".into()],
+                ..AppState::default()
+            },
+            profiles: vec![
+                Profile::new("a".to_string(), None, None),
+                Profile::new("b".to_string(), None, None),
+            ],
+        };
+        cfg.set_auth_broken("a", broken);
+        Arc::new(RankedMutex::new(cfg))
+    };
+
+    // Broken active → the gate is bypassed and the walk queues the sibling.
+    let (store, status, activity, pending, pending_off) = frozen_state();
+    scan_auto_switch(
+        &config_handle(true),
+        &store,
+        &status,
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    assert!(
+        pending.lock().unwrap().contains("b"),
+        "a dead active must be walked away from without waiting for a Fresh read"
+    );
+
+    // Healthy active, identical frozen stores → the freshness gate holds.
+    let (store, status, activity, pending, pending_off) = frozen_state();
+    scan_auto_switch(
+        &config_handle(false),
+        &store,
+        &status,
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a merely-stale healthy active must still not drive a switch"
     );
 }
 
@@ -1009,4 +1105,151 @@ fn bootstrap_third_party_seeds_any_cache() {
         stamp <= now && stamp >= now.saturating_sub(5_000),
         "the seeded third-party profile stamps last_fetched at the cache mtime"
     );
+}
+
+// ── AUTH-1: proactive auth-health during the usage poll ──────────────────────
+// `refresh_failure_is_terminal` decides whether a poll-time refresh failure means
+// the OAuth login DROPPED (quarantine the account now) or is a transient blip
+// (leave the flag, retry). This is the classification behind the account surfacing
+// "needs reauth" on the tick the drop is detected, not only on the next switch.
+
+#[test]
+fn dead_refresh_token_is_terminal() {
+    // A 4xx from the token endpoint (revoked / expired refresh token) → the login
+    // is gone; quarantine so the UI surfaces reauth immediately.
+    let err = RefreshError::Invalid("HTTP 400: invalid_grant".to_string());
+    assert!(super::refresh_failure_is_terminal(&err));
+}
+
+#[test]
+fn transient_refresh_failure_is_not_terminal() {
+    // A network / 5xx / parse blip must NOT quarantine — the token may be fine; the
+    // fixed cadence retries next tick.
+    let err = RefreshError::Transient(anyhow::anyhow!("connection reset by peer"));
+    assert!(!super::refresh_failure_is_terminal(&err));
+}
+
+// `fresher_disk_pair` is the double-spend guard in front of the quarantine: a
+// terminal 400 is also what a benign single-use double-spend returns (Claude
+// Code refreshing the active profile's symlinked credentials mid-poll, or a
+// refresher that completed before this tick's guard was acquired). Only an
+// UNCHANGED on-disk pair proves a real revocation.
+
+#[test]
+fn a_disk_pair_that_moved_past_the_spent_token_is_returned_not_quarantined() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "double-spend-benign";
+    let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+    p.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-new".into(),
+            refresh_token: Some("rt-new".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&p).expect("save profile");
+
+    // We spent "rt-old"; the store moved to "rt-new" — someone else rotated.
+    assert_eq!(
+        super::fresher_disk_pair(name, "rt-old"),
+        Some(("at-new".to_string(), Some("rt-new".to_string())))
+    );
+    // We spent "rt-new" itself and it 400d — a real revocation, quarantine.
+    assert_eq!(super::fresher_disk_pair(name, "rt-new"), None);
+}
+
+/// The carry path must also LIFT a stale quarantine: the moved pair proves the
+/// chain is alive, and without the clear, an account recovered by an external
+/// re-login stays excluded from the fallback walk and refused by every switch
+/// gate forever (its own refresh never succeeds — the carry preempts it).
+#[test]
+fn carrying_an_external_rotation_clears_a_stale_quarantine() {
+    use crate::lockorder::RankedMutex;
+    use std::sync::Arc;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "double-spend-quarantined";
+    let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+    p.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-new".into(),
+            refresh_token: Some("rt-new".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&p).expect("save profile");
+
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![p],
+    };
+    config.state.profiles = vec![name.into()];
+    config.set_auth_broken(name, true);
+    let handle: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(config));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(Default::default()));
+
+    // Spent "rt-old"; store holds "rt-new" → carry fires and lifts the flag.
+    let outcome = super::carry_external_rotation(&handle, name, "rt-old", &refetch);
+    assert!(outcome.is_some(), "a moved pair must carry");
+    assert!(
+        !handle.lock().unwrap().is_auth_broken(name),
+        "the carried (alive) chain must lift a stale quarantine"
+    );
+    assert!(
+        refetch.lock().unwrap().contains(name),
+        "the carried pair is refetched next tick"
+    );
+
+    // Spent the store's own pair → no carry, and the flag is left alone.
+    handle.lock().unwrap().set_auth_broken(name, true);
+    let outcome = super::carry_external_rotation(&handle, name, "rt-new", &refetch);
+    assert!(outcome.is_none(), "an unchanged pair is a real revocation");
+    assert!(
+        handle.lock().unwrap().is_auth_broken(name),
+        "a real revocation keeps the quarantine"
+    );
+}
+
+#[test]
+fn a_missing_or_tokenless_profile_never_reads_as_a_benign_double_spend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // No profile on disk at all.
+    assert_eq!(
+        super::fresher_disk_pair("double-spend-missing", "rt-x"),
+        None
+    );
+    // Profile exists but has no stored credentials.
+    let p = crate::profile::Profile::new("double-spend-bare".to_string(), None, None);
+    crate::profile::save_profile(&p).expect("save profile");
+    assert_eq!(super::fresher_disk_pair("double-spend-bare", "rt-x"), None);
+}
+
+// `token_clock_expired` gates whether a 429 on the usage fetch falls through to the
+// refresh leg (the AUTH-1 fix so a dead login that 429s surfaces as auth_broken
+// instead of being masked as RateLimited forever) vs bails to cache. Only a
+// clock-EXPIRED token is worth spending the single-use refresh on.
+
+#[test]
+fn rate_limited_expired_token_rotates_so_a_dead_login_surfaces() {
+    // 429 + access token expired 1s ago → rotate (a dead refresh token then flags
+    // auth_broken; a live one just re-fetches). now=10_000ms, exp=9_000ms.
+    assert!(super::token_clock_expired(Some(9_000), 10_000));
+}
+
+#[test]
+fn rate_limited_valid_token_does_not_rotate() {
+    // 429 on a still-valid token is a pure endpoint rate limit — refusing to refresh
+    // protects the single-use token from being re-spent every tick. exp in the future.
+    assert!(!super::token_clock_expired(Some(20_000), 10_000));
+}
+
+#[test]
+fn rate_limited_unknown_expiry_does_not_rotate() {
+    // No expiry known → conservative: never spend a refresh on a token we can't prove
+    // is expired (matches auto_start_kick's `is_some_and` gate).
+    assert!(!super::token_clock_expired(None, 10_000));
 }

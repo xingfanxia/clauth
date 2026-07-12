@@ -125,6 +125,75 @@ fn switch_replaces_active_account_mirror_without_refusing() {
     );
 }
 
+/// AUTH-4 parity, TUI side: `auto_switch_if_needed` must leave an auth-broken
+/// active even when its (frozen-stale) usage still reads as headroom — the
+/// same wedge `scan_auto_switch` had on the daemon side. Pre-fix, the
+/// exhaustion gate alone returned `None` here and the TUI parked on the dead
+/// account forever.
+#[test]
+fn auto_switch_if_needed_walks_off_a_broken_active() {
+    use crate::fallback::{SwitchAction, auto_switch_if_needed};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = HomeSandbox::new();
+
+    let mk = |name: &str, access: &str, util: f64, resets_at: i64| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some(format!("{access}-refresh")),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        });
+        p.usage = Some(UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: util,
+                resets_at: Some(epoch_secs_to_iso(resets_at)),
+            }),
+            ..Default::default()
+        });
+        crate::profile::save_profile(&p).expect("save profile");
+        p
+    };
+    // Active "a": broken, last-ever read maxed on a LAPSED window (reads as
+    // idle headroom). Target "b": healthy, live window with real headroom.
+    let a = mk("a", "a-access", 100.0, now_epoch_secs() - 3600);
+    let b = mk("b", "b-access", 10.0, now_epoch_secs() + 3600);
+
+    // Live file = the active account's own captured mirror (macOS shape), so
+    // the switch's foreign-file guard sees its own mirror and proceeds.
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(a.credentials.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let mut config = AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            auth_broken: vec!["a".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+
+    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    assert_eq!(
+        action,
+        Some(SwitchAction::To("b".to_string())),
+        "a dead active with stale-headroom usage must still be walked away from"
+    );
+    assert!(config.is_active("b"));
+}
+
 #[test]
 fn edit_profile_env_persists_to_config_toml() {
     let _home = HomeSandbox::new();
@@ -399,6 +468,58 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
             "{file} must be dropped — it describes the old account"
         );
     }
+}
+
+/// A reauth overwrite replaces the dead credential chain — the whole point of
+/// re-logging in — so it must lift the profile's `auth_broken` quarantine,
+/// exactly like the fresh-capture path (`capture_into_profile`) does. Left
+/// set, the flag keeps the just-relogged account excluded from every chain
+/// walk and keeps the "login expired" banner up (observed 2026-07-09: a
+/// re-login via the menu bar left the profile quarantined).
+#[test]
+fn overwrite_captured_profile_clears_auth_broken_quarantine() {
+    let _home = HomeSandbox::new();
+
+    let first = Profile::new("first".to_string(), None, None);
+    save_profile(&first).expect("save first");
+    let target = Profile::new("acme".to_string(), None, None);
+    save_profile(&target).expect("save target");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["first".into(), "acme".into()],
+            fallback_chain: vec!["first".into(), "acme".into()],
+            active_profile: Some("first".into()),
+            auth_broken: vec!["acme".into()],
+            ..AppState::default()
+        },
+        profiles: vec![first, target],
+    };
+
+    let snapshot = CaptureSnapshot {
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "fresh-access".to_string(),
+                refresh_token: Some("fresh-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }),
+        base_url: None,
+        api_key: None,
+    };
+    overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite");
+
+    assert!(
+        !config.is_auth_broken("acme"),
+        "in-memory quarantine must lift with the fresh credentials"
+    );
+    let persisted = crate::profile::load_config().expect("reload").state;
+    assert!(
+        !persisted.auth_broken.iter().any(|n| n.as_str() == "acme"),
+        "persisted quarantine must lift too"
+    );
 }
 
 /// Overwriting the ACTIVE profile must re-apply to live `~/.claude` state —
@@ -751,4 +872,87 @@ fn oauth_creds(access: &str) -> crate::profile::ClaudeCredentials {
             subscription_type: None,
         }),
     }
+}
+
+/// AUTH-1 reauth: `clauth login <existing>` overwrites a quarantined profile's
+/// stored tokens through `overwrite_captured_profile` — the documented recovery
+/// for a revoked login — and must clear its auth-broken flag so the recovered
+/// account rejoins the fallback chain and is a valid switch target again. The
+/// active-but-dead account here is the Incident C scenario.
+#[test]
+fn reauth_overwrite_clears_broken_flag() {
+    let _home = HomeSandbox::new();
+
+    let mut stale = Profile::new("xfx".to_string(), None, None);
+    stale.credentials = Some(oauth_creds("stale-access"));
+    save_profile(&stale).expect("save profile");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["xfx".into()],
+            active_profile: Some("xfx".into()),
+            ..AppState::default()
+        },
+        profiles: vec![stale],
+    };
+    config.set_auth_broken("xfx", true);
+    assert!(config.is_auth_broken("xfx"), "precondition: quarantined");
+
+    overwrite_captured_profile(
+        &mut config,
+        "xfx",
+        CaptureSnapshot {
+            credentials: Some(oauth_creds("fresh-access")),
+            base_url: None,
+            api_key: None,
+        },
+    )
+    .expect("re-auth overwrite");
+
+    assert_eq!(
+        config.find("xfx").and_then(|p| p.access_token()),
+        Some("fresh-access"),
+        "credentials overwritten by re-auth",
+    );
+    assert!(
+        !config.is_auth_broken("xfx"),
+        "auth-broken quarantine cleared by re-auth",
+    );
+}
+
+/// AUTH-1 switch gate (Incident C): a CLI switch to a target whose OAuth login
+/// is dead — expired access token, no refresh token, so unrecoverable without a
+/// re-login — is refused with the exact `clauth login <name>` recovery hint
+/// instead of installing the dead token into the Keychain. The no-refresh-token
+/// path reaches `AuthGate::Broken` with no network call, so the assertion stays
+/// hermetic.
+#[test]
+fn switch_cli_refuses_dead_target_with_login_hint() {
+    let _home = HomeSandbox::new();
+
+    let mut dead = Profile::new("dead-acct".to_string(), None, None);
+    dead.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "expired".to_string(),
+            refresh_token: None,
+            expires_at: Some(1), // epoch-ms 1 → long expired
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["dead-acct".into()],
+            active_profile: None, // no outgoing profile → no link reconcile before the gate
+            ..AppState::default()
+        },
+        profiles: vec![dead],
+    };
+
+    let err = switch_profile_cli(config, "dead-acct").expect_err("a dead target must be refused");
+    assert!(
+        err.to_string().contains("clauth login dead-acct"),
+        "the refusal must name the recovery command, got: {err}",
+    );
 }
