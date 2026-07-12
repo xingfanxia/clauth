@@ -15,8 +15,8 @@ use ratatui::widgets::Paragraph;
 use crate::profile::{DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTERVAL_MS};
 
 use super::super::app::{
-    App, GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState, format_weekly_pct, parse_refresh_secs,
-    parse_weekly_pct,
+    App, GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState, WEEKLY_PRESETS, format_weekly_pct,
+    parse_refresh_secs, parse_weekly_pct,
 };
 use super::super::theme::{self, Tier};
 use super::panes::{
@@ -331,11 +331,6 @@ fn refresh_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>>
         help_tooltip_lines(&range, width)
     }
 }
-
-/// The presets the weekly-line row steps through. Mirrors the
-/// `step_weekly_threshold` ladder in `app.rs`; 100 reproduces the old
-/// hard-cap behavior (switch only once the API already refuses).
-const WEEKLY_PRESETS: [f64; 4] = [90.0, 95.0, 98.0, 100.0];
 
 /// The `weekly limit` row at rest: a segmented control over
 /// [`WEEKLY_PRESETS`], with a custom value (set via ⏎) appended in `ACCENT`

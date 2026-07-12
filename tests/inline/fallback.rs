@@ -1402,3 +1402,102 @@ fn weekly_line_is_configurable_chain_wide() {
         "an out-of-band hand-edit falls back to the default line"
     );
 }
+
+/// A soft-blocked (7d >= line, < 100) profile with fresh 5h headroom.
+fn weekly_soft_profile(name: &str) -> Profile {
+    profile_with_usage(
+        name,
+        Some(95.0),
+        Some(usage_both(
+            Some(window(40.0, Some(live_reset()))),
+            Some(window(98.5, Some(live_reset()))),
+        )),
+    )
+}
+
+#[test]
+fn wrap_off_keys_on_the_weekly_hard_cap_not_the_soft_line() {
+    // Whole chain soft-blocked with fresh 5h headroom: switching is correctly
+    // refused everywhere (the soft line's job), but wrap-off must NOT sign
+    // everything out — the active still has real weekly room up to the API's
+    // own cap, and Off would forfeit that tail for no gain.
+    let mut config = config_with_chain(
+        vec![weekly_soft_profile("a"), weekly_soft_profile("b")],
+        "a",
+    );
+    config.state.wrap_off = true;
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "a soft-blocked active with weekly room left must stay put"
+    );
+
+    // Same chain with the ACTIVE at the hard cap: Off fires.
+    let dead = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_both(
+            Some(window(40.0, Some(live_reset()))),
+            Some(window(100.0, Some(live_reset()))),
+        )),
+    );
+    let mut config = config_with_chain(vec![dead, weekly_soft_profile("b")], "a");
+    config.state.wrap_off = true;
+    assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
+}
+
+#[test]
+fn wrap_off_keys_on_the_hard_cap_in_the_store_walk_too() {
+    // Scheduler-side twin of the test above.
+    let mk = || {
+        config_with_chain(
+            vec![
+                profile_with_util("a", Some(95.0), None),
+                profile_with_util("b", Some(95.0), None),
+            ],
+            "a",
+        )
+    };
+    let soft = || {
+        usage_both(
+            Some(window(40.0, Some(live_reset()))),
+            Some(window(98.5, Some(live_reset()))),
+        )
+    };
+    let mut config = mk();
+    config.state.wrap_off = true;
+    let snapshot = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![("a", soft()), ("b", soft())]);
+    assert_eq!(
+        next_auto_switch_target(&snapshot, &store),
+        None,
+        "the soft-line trigger walks, finds nothing, and must NOT fall to Off"
+    );
+
+    let hard = usage_both(
+        Some(window(40.0, Some(live_reset()))),
+        Some(window(100.0, Some(live_reset()))),
+    );
+    let store = store_with_infos(vec![("a", hard), ("b", soft())]);
+    assert_eq!(
+        next_auto_switch_target(&snapshot, &store),
+        Some(SwitchAction::Off),
+        "the hard-capped active turns the chain off"
+    );
+}
+
+#[test]
+fn weekly_accessor_pins_the_band_and_resets_garbage_to_default() {
+    let mut s = crate::profile::AppState {
+        weekly_switch_threshold: Some(50.0),
+        ..Default::default()
+    };
+    assert_eq!(s.weekly_switch_threshold_pct(), 50.0, "50.0 is in-band");
+    s.weekly_switch_threshold = Some(100.0);
+    assert_eq!(s.weekly_switch_threshold_pct(), 100.0, "100.0 is in-band");
+    // Out-of-band RESETS to the default — never a clamp to the nearest bound.
+    s.weekly_switch_threshold = Some(49.99);
+    assert_eq!(s.weekly_switch_threshold_pct(), 98.0);
+    s.weekly_switch_threshold = Some(f64::NAN);
+    assert_eq!(s.weekly_switch_threshold_pct(), 98.0);
+}

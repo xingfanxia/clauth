@@ -44,6 +44,12 @@ fn live_five_hour(profile: &Profile) -> Option<&UsageWindow> {
     usage.five_hour.as_ref()
 }
 
+/// Weekly line for the wrap-off `Off` decision: REAL exhaustion (the API's own
+/// cap), never the configurable soft line. Switching early to a sibling buys
+/// headroom safety; signing every account out early buys nothing — it only
+/// forfeits the tail between the soft line and the cap on the halt path.
+const WEEKLY_HARD_BLOCK_PCT: f64 = 100.0;
+
 /// Whether `info`'s live weekly window is past `weekly_pct` — treated as
 /// spent until the weekly reset regardless of anything the 5h window says.
 /// The line is a SOFT one below the API's 100% refusal cap, gating BOTH
@@ -443,7 +449,10 @@ pub(crate) fn next_target(
     // since this picker is also exercised on a healthy active. The ACTIVE
     // check is burn-aware (issue #8 follow-up b) so this agrees with
     // `next_auto_switch_target`'s scheduler-side gate; the candidate walk
-    // above stays on the static `is_exhausted`.
+    // above stays on the static `is_exhausted`. Weekly-wise Off keys on the
+    // HARD cap ([`WEEKLY_HARD_BLOCK_PCT`]), not the soft line: a soft-blocked
+    // active with real weekly room left stays put instead of signing every
+    // running claude out over the tail it could still spend.
     if config.state.wrap_off
         && config.find(active).is_some_and(|p| {
             is_exhausted_active(
@@ -451,7 +460,7 @@ pub(crate) fn next_target(
                 config.state.burn_aware_switching,
                 config.state.refresh_interval_ms,
                 active_burn_pct_per_hour,
-                weekly_pct,
+                WEEKLY_HARD_BLOCK_PCT,
             )
         })
     {
@@ -526,8 +535,21 @@ pub(crate) fn next_auto_switch_target(
     // all usage instead of staying on the spent profile — keyed on REAL
     // exhaustion only: a broken-but-unspent active stays put (AUTH-4), since
     // the live session's own Keychain chain may still be healthy and switching
-    // off would log it out over a flag, not over spent quota.
-    if snapshot.wrap_off && active_exhausted {
+    // off would log it out over a flag, not over spent quota. Same principle
+    // weekly-wise: `active_exhausted` above (the switch trigger) honors the
+    // soft line, but Off re-checks at the HARD cap
+    // ([`WEEKLY_HARD_BLOCK_PCT`]) — a soft-blocked active with real weekly
+    // room left stays put rather than signing everything out over the tail.
+    if snapshot.wrap_off
+        && is_exhausted_active_from_store(
+            &active.name,
+            active.threshold,
+            snapshot.burn_aware,
+            snapshot.interval_ms,
+            store,
+            WEEKLY_HARD_BLOCK_PCT,
+        )
+    {
         return Some(SwitchAction::Off);
     }
     None

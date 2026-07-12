@@ -230,6 +230,11 @@ impl ConfigRow {
 /// (no `model` key); a custom id set via ⏎ is outside this list.
 pub(crate) const MODEL_PRESETS: [&str; 4] = ["opus", "sonnet", "haiku", "opusplan"];
 
+/// The weekly-line preset ladder: one source for the Config row's segmented
+/// control AND `step_weekly_threshold`'s cycle. 100 reproduces the old
+/// hard-cap behavior (switch only once the API already refuses).
+pub(crate) const WEEKLY_PRESETS: [f64; 4] = [90.0, 95.0, 98.0, 100.0];
+
 /// One row on the program-wide Config tab. These back real persisted globals in
 /// [`AppState`] — no decorative toggles. ⏎/space cycles or flips in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3740,13 +3745,12 @@ pub(crate) fn parse_refresh_secs(raw: &str) -> Option<u64> {
 /// segmented-control grammar as the refresh row. Presets mirror
 /// `WEEKLY_PRESETS` in `render/global_config.rs`.
 fn step_weekly_threshold(app: &mut App) {
-    const PRESETS: [f64; 4] = [90.0, 95.0, 98.0, 100.0];
     let current = app.config().state.weekly_switch_threshold_pct();
-    let next = PRESETS
+    let next = WEEKLY_PRESETS
         .iter()
         .copied()
         .find(|&p| p > current)
-        .unwrap_or(PRESETS[0]);
+        .unwrap_or(WEEKLY_PRESETS[0]);
     {
         let mut cfg = app.config();
         cfg.state.weekly_switch_threshold = Some(next);

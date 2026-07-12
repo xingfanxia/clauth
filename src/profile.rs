@@ -277,9 +277,11 @@ pub(crate) struct AppState {
     pub(crate) default_divergence: Option<DivergenceChoice>,
     /// Chain-wide weekly (7d) exhaustion line, percent — past it an account
     /// counts as exhausted in BOTH walk directions (switch trigger + candidate
-    /// acceptance). `None` = [`DEFAULT_WEEKLY_SWITCH_PCT`]. Read through
-    /// [`AppState::weekly_switch_threshold_pct`], which clamps hand-edited
-    /// garbage back into the legal band. Global (not per-member like the 5h
+    /// acceptance); the wrap-off `Off` decision ignores it and keys on the
+    /// 100% hard cap (`WEEKLY_HARD_BLOCK_PCT` in `fallback.rs`). `None` =
+    /// [`DEFAULT_WEEKLY_SWITCH_PCT`]. Read through
+    /// [`AppState::weekly_switch_threshold_pct`], which resets hand-edited
+    /// garbage to the default. Global (not per-member like the 5h
     /// threshold): the line protects the CHAIN — a wrong hop strands days.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) weekly_switch_threshold: Option<f64>,
@@ -288,8 +290,10 @@ pub(crate) struct AppState {
 impl AppState {
     /// The effective weekly exhaustion line: the configured value when it sits
     /// inside [`MIN_WEEKLY_SWITCH_PCT`]`..=`[`MAX_WEEKLY_SWITCH_PCT`], else the
-    /// default — an out-of-band value hand-edited into profiles.toml must not
-    /// silently disable the weekly gate (rationale in `fallback.rs`).
+    /// DEFAULT (a reset, not a clamp-to-nearest-bound: fail-safe high beats
+    /// honoring a hand-edited `40.0` as `50`) — an out-of-band value edited
+    /// into profiles.toml must not silently disable the weekly gate
+    /// (rationale in `fallback.rs`).
     pub(crate) fn weekly_switch_threshold_pct(&self) -> f64 {
         self.weekly_switch_threshold
             .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v))

@@ -2598,3 +2598,19 @@ fn tokens_topping_up_tracks_the_load_lifecycle() {
     assert!(!app.tokens_topping_up, "Failed clears the loading flag");
     assert_eq!(app.tokens_progress, None, "Failed clears the sweep counts");
 }
+
+/// Pins `parse_weekly_pct`'s band edges: both bounds accepted verbatim,
+/// anything past them (or non-finite) rejected — the commit path and the
+/// Config card's inline check both ride this one predicate.
+#[test]
+fn parse_weekly_pct_pins_the_band_edges() {
+    use super::parse_weekly_pct;
+    assert_eq!(parse_weekly_pct("50"), Some(50.0), "lower bound accepted");
+    assert_eq!(parse_weekly_pct("100"), Some(100.0), "upper bound accepted");
+    assert_eq!(parse_weekly_pct("97.5"), Some(97.5), "decimals accepted");
+    assert_eq!(parse_weekly_pct("49.99"), None, "below the band");
+    assert_eq!(parse_weekly_pct("100.1"), None, "above the band");
+    assert_eq!(parse_weekly_pct("NaN"), None, "non-finite rejected");
+    assert_eq!(parse_weekly_pct("inf"), None, "non-finite rejected");
+    assert_eq!(parse_weekly_pct(""), None, "empty rejected");
+}
