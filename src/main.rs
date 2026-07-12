@@ -289,7 +289,15 @@ fn collect_api_endpoint(
     let interactive = std::io::stdin().is_terminal();
 
     let base_url = match base_url {
-        Some(u) => Some(u.to_string()),
+        // A flag value gets the same trim + empty-reject as the prompt, so
+        // `--base-url ""` or a space-padded value can't slip through unvalidated.
+        Some(u) => {
+            let u = u.trim();
+            if u.is_empty() {
+                anyhow::bail!("base url is required for an API account");
+            }
+            Some(u.to_string())
+        }
         None => {
             if !interactive {
                 anyhow::bail!("non-interactive stdin: pass --base-url (and --api-key) explicitly");
@@ -308,6 +316,10 @@ fn collect_api_endpoint(
 
     let api_key = match api_key {
         Some(k) => {
+            let k = k.trim();
+            if k.is_empty() {
+                anyhow::bail!("api key is required for an API account");
+            }
             eprintln!(
                 "clauth: warning: --api-key is visible in shell history and process listings; prefer the prompt"
             );
@@ -488,24 +500,28 @@ fn parse_delete_args(rest: &[String]) -> Option<(&str, bool)> {
 
 /// `clauth delete <name> [--yes]` — remove a profile and all its credentials
 /// (the whole on-disk profile dir + state + caches), OAuth or API-key. Prompts
-/// `[y/N]` on a TTY unless `--yes`; a non-TTY stdin skips the prompt so scripts
-/// can delete, matching the reauth contract. If the deleted profile was active,
-/// its live `~/.claude/.credentials.json` link is cleared too.
+/// `[y/N]` on a TTY unless `--yes`. Delete is an irreversible `remove_dir_all`,
+/// so unlike a reauth a non-TTY stdin does NOT get an implicit yes: it must pass
+/// `--yes`, else the delete is refused. If the deleted profile was active, its
+/// live `~/.claude/.credentials.json` link and settings.json endpoint are cleared.
 fn cmd_delete(name: &str, yes: bool) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
     if !yes {
         use std::io::{IsTerminal as _, Write as _};
-        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-            print!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
-            std::io::stdout().flush()?;
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer)?;
-            if !reauth_confirmed(&answer) {
-                println!("clauth: aborted. '{canonical}' left in place.");
-                return Ok(());
-            }
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            anyhow::bail!(
+                "refusing to delete '{canonical}' without confirmation; pass --yes for a non-interactive delete"
+            );
+        }
+        print!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !reauth_confirmed(&answer) {
+            println!("clauth: aborted. '{canonical}' left in place.");
+            return Ok(());
         }
     }
     let was_active = config.is_active(&canonical);

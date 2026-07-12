@@ -179,6 +179,29 @@ fn parse_login_args_bare_name_is_oauth_mode() {
     assert!(!parsed.is_api_mode());
 }
 
+// ── collect_api_endpoint: flag values get the prompt's trim + empty-reject ──
+// Both flags present means no stdin read, so these run headless.
+
+#[test]
+fn collect_api_endpoint_trims_flag_values() {
+    let (base, key) = collect_api_endpoint(Some("  https://api.x  "), Some("  sk-y  "))
+        .expect("both flags present, no prompt");
+    assert_eq!(base.as_deref(), Some("https://api.x"));
+    assert_eq!(key.as_deref(), Some("sk-y"));
+}
+
+#[test]
+fn collect_api_endpoint_rejects_empty_flag_values() {
+    assert!(
+        collect_api_endpoint(Some("   "), Some("sk")).is_err(),
+        "a blank --base-url must bail, not create an empty-endpoint profile"
+    );
+    assert!(
+        collect_api_endpoint(Some("https://x"), Some("")).is_err(),
+        "a blank --api-key must bail, not store an empty key"
+    );
+}
+
 // ── parse_delete_args ──
 
 #[test]
