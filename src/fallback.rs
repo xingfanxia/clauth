@@ -44,26 +44,33 @@ fn live_five_hour(profile: &Profile) -> Option<&UsageWindow> {
     usage.five_hour.as_ref()
 }
 
-/// Cap at which the OVERALL weekly window hard-blocks an account. Not a
-/// configurable headroom threshold like the 5h one: at 100% the API refuses
-/// requests until the weekly reset, and the idle account's 5h window drains
-/// and then LAPSES — which made a weekly-dead member look like the freshest
-/// target in the chain (observed live 2026-07-08: two members at exactly
-/// 100.0 with no live 5h window, and auto-fallback switched into one). Only
+/// Line past which the OVERALL weekly window counts an account as exhausted —
+/// a SOFT line below the API's 100% refusal cap, gating BOTH directions of the
+/// chain walk (the active profile's switch trigger and candidate acceptance,
+/// so a hop never lands on a member that would re-trigger next tick).
+///
+/// Why not 100 (the original hard cap, 2026-07-08): an account riding 98%+ of
+/// its week bricks for DAYS the moment it tops out, and its idle 5h window
+/// drains and then LAPSES — so waiting for the refusal means dying
+/// mid-session and (before the gate) even switching INTO such a member.
+/// Hopping at 98% leaves the tail as slack instead (2026-07-12). Why not a
+/// per-member knob like the 5h threshold: the weekly line protects the CHAIN
+/// (a wrong hop strands days, not hours), not one member's taste. Only
 /// `seven_day` gates here — a per-model `weekly_scoped` limit at 100 (e.g.
 /// "7d fable" spent while 7d has room) blocks just that model, and the walk
 /// cannot know which model the next session will drive.
-const WEEKLY_BLOCK_PCT: f64 = 100.0;
+const WEEKLY_EXHAUST_PCT: f64 = 98.0;
 
-/// Whether `info`'s live weekly window is spent to the cap — unusable until
-/// the weekly reset regardless of anything the 5h window says. Store-side
-/// twin logic inlines this same shape (see `is_exhausted_from_store`).
+/// Whether `info`'s live weekly window is past [`WEEKLY_EXHAUST_PCT`] —
+/// treated as spent until the weekly reset regardless of anything the 5h
+/// window says. Store-side twin logic inlines this same shape (see
+/// `is_exhausted_from_store`).
 fn weekly_blocked_info(info: &crate::usage::UsageInfo, now_secs: i64) -> bool {
     seven_day_live(info, now_secs)
         && info
             .seven_day
             .as_ref()
-            .is_some_and(|w| w.utilization >= WEEKLY_BLOCK_PCT)
+            .is_some_and(|w| w.utilization >= WEEKLY_EXHAUST_PCT)
 }
 
 /// [`weekly_blocked_info`] over a profile's own usage snapshot.

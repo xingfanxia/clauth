@@ -1137,12 +1137,14 @@ fn burn_aware_heavy_burn_flips_wrap_off_decision_on_both_walks() {
     );
 }
 
-// ── weekly hard block (7d at 100%) ────────────────────────────────────────────
+// ── weekly exhaustion (7d soft line, 98%) ─────────────────────────────────────
 //
 // A weekly-dead account's 5h window drains and then LAPSES (no live reset), so
 // the 5h-only predicates read it as the freshest member in the chain — the
 // observed 2026-07-08 bug: auto-fallback switched INTO a 7d=100 account, and
-// recovery kept relinking it every time its 5h window rolled over.
+// recovery kept relinking it every time its 5h window rolled over. 2026-07-12
+// lowered the line from the 100% hard cap to a 98% soft line: EITHER window
+// crossing its line triggers the hop, while there is still room to land it.
 
 /// UsageInfo with both windows populated explicitly.
 fn usage_both(five_hour: Option<UsageWindow>, seven_day: Option<UsageWindow>) -> UsageInfo {
@@ -1194,22 +1196,79 @@ fn weekly_dead_active_is_exhausted_despite_idle_5h() {
 }
 
 #[test]
-fn weekly_below_cap_or_lapsed_does_not_block() {
-    // 99.9% still serves requests — only the cap blocks. The 5h side has
-    // threshold semantics; the weekly side is a hard-block check by design.
-    let almost = profile_with_usage(
+fn weekly_soft_line_gates_below_it_and_lapsed_resets_renew() {
+    // The weekly side is a soft line at 98%, not a 100% hard cap (2026-07-12):
+    // an account riding 98%+ of its week bricks for DAYS the moment it tops
+    // out, so the switch must happen while there is still room to land it —
+    // waiting for the API to start refusing means dying mid-session.
+    let below = profile_with_usage(
         "a",
         Some(95.0),
-        Some(usage_both(None, Some(window(99.9, Some(live_reset()))))),
+        Some(usage_both(None, Some(window(97.9, Some(live_reset()))))),
     );
-    assert!(!is_exhausted(&almost));
-    // A 7d=100 whose reset has PASSED is a renewed quota, not a block.
+    assert!(!is_exhausted(&below), "97.9% weekly still has headroom");
+    let at_line = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_both(None, Some(window(98.0, Some(live_reset()))))),
+    );
+    assert!(is_exhausted(&at_line), "98% weekly counts as exhausted");
+    // A 7d window whose reset has PASSED is a renewed quota, not a block.
     let renewed = profile_with_usage(
         "a",
         Some(95.0),
         Some(usage_both(None, Some(window(100.0, Some(expired_reset()))))),
     );
     assert!(!is_exhausted(&renewed));
+}
+
+#[test]
+fn weekly_soft_exhausted_active_triggers_a_switch_despite_5h_headroom() {
+    // The user-reported gap (2026-07-12): active at 5h 40% / 7d 98.5% sat
+    // unswitched until the weekly cap bricked it. EITHER window crossing its
+    // line must trigger the hop.
+    let active = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_both(
+            Some(window(40.0, Some(live_reset()))),
+            Some(window(98.5, Some(live_reset()))),
+        )),
+    );
+    assert!(is_exhausted(&active), "7d 98.5% triggers despite 5h 40%");
+    assert!(is_exhausted_active(&active, false, 90_000, None));
+    let config = config_with_chain(
+        vec![active, profile_with_util("b", Some(95.0), Some(10.0))],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".into()))
+    );
+}
+
+#[test]
+fn weekly_soft_member_is_not_a_target() {
+    // Symmetric: hopping INTO a 98%+ weekly member just re-triggers next tick.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(97.0)),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_both(
+                    Some(window(10.0, Some(live_reset()))),
+                    Some(window(98.5, Some(live_reset()))),
+                )),
+            ),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".into()))
+    );
 }
 
 #[test]
