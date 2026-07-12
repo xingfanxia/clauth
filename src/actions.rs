@@ -54,8 +54,22 @@ pub(crate) fn validate_profile_name(
     Ok(())
 }
 
+/// Every switch primitive tears the live credentials link down before
+/// `finish_switch` would notice a ghost, and the discard path takes no prior
+/// snapshot — an uncaptured re-login would be gone for good. So existence
+/// FIRST: a caller holding a stale name (a queued auto-switch target, the MCP
+/// switch tool with a divergence default) bounces off before any side effect
+/// instead of stranding the machine half-switched with the live link destroyed.
+fn ensure_profile_exists(config: &AppConfig, name: &str) -> Result<()> {
+    if config.find(name).is_none() {
+        bail!("profile '{name}' not found");
+    }
+    Ok(())
+}
+
 pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
+        ensure_profile_exists(config, name)?;
         if config.is_active(name) {
             return Ok(());
         }
@@ -93,6 +107,7 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
 /// un-captured re-login) precisely because the caller chose to drop it.
 pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &str) -> Result<()> {
     with_state_lock(|| {
+        ensure_profile_exists(config, target)?;
         if config.is_active(target) {
             return Ok(());
         }
@@ -104,6 +119,7 @@ pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &str) -> Re
 /// Force-snapshot the outgoing creds then force the symlink. CLI prompt path only.
 pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
+        ensure_profile_exists(config, name)?;
         if config.is_active(name) {
             return Ok(());
         }
