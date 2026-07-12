@@ -49,9 +49,9 @@ use crate::usage::{
     ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
     OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RateLimitStreaks,
     RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
-    SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
-    TokenEntry, TokenList, UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
-    clear_activity, collect_third_party_entries, is_idle, mark_activity, now_ms, spawn_refresher,
+    SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
+    UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
+    collect_third_party_entries, collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher,
     switch_gate_in_flight,
 };
 
@@ -1696,6 +1696,12 @@ impl App {
         self.refresh_tokens();
         self.start_scheduler();
         self.apply_usage();
+        // Dual-scheduler dedup (#27): with a live daemon running, the switch decision is the daemon's
+        // alone — a startup one-shot here would race a decision it has already
+        // made (or declined) from the very same cache (switch thrash, #27).
+        if crate::daemon::daemon_is_live() {
+            return;
+        }
         let switched = {
             let mut cfg = self.config();
             // Run the startup one-shot on Fresh data only. A Cached seed's numbers
@@ -1762,6 +1768,9 @@ impl App {
             h.third_party_status,
             suppressed_generic,
             h.shutting_down,
+            // Dual-scheduler dedup (#27): the TUI stands its refresher down while a live daemon runs
+            // (probed per tick), re-arming the moment the daemon dies.
+            true,
         );
     }
 
@@ -2082,24 +2091,6 @@ impl App {
 }
 
 // ── Token snapshot ────────────────────────────────────────────────────────────
-
-fn collect_tokens(config: &AppConfig) -> Vec<TokenEntry> {
-    config
-        .profiles
-        .iter()
-        .filter_map(|p| {
-            let oauth = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
-            Some(TokenEntry {
-                name: p.name.to_string(),
-                access_token: oauth.access_token.clone(),
-                refresh_token: oauth.refresh_token.clone(),
-                auto_start: p.auto_start,
-                access_expires_at: oauth.expires_at,
-                auth_broken: config.is_auth_broken(&p.name),
-            })
-        })
-        .collect()
-}
 
 // ── Startup reconciliation ────────────────────────────────────────────────────
 

@@ -16,6 +16,7 @@ pub(crate) enum DivergenceChoice {
 }
 
 use crate::lock::with_state_lock;
+use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
 use crate::usage::{FetchStatus, UsageInfo};
 
@@ -594,7 +595,7 @@ pub(crate) fn prune_usage_history(name: &str) {
         let body = kept.join("\n");
         let body = if body.is_empty() { body } else { body + "\n" };
         if let Err(e) = atomic_write(&path, body) {
-            eprintln!("clauth: failed to prune usage history for {name}: {e}");
+            logline!("clauth: failed to prune usage history for {name}: {e}");
         }
     }
 }
@@ -688,7 +689,7 @@ pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::i
 
 /// Create `path` as a directory (recursively) with mode 0o700 on Unix,
 /// or the default mode on non-Unix.
-fn mkdir_700(path: &Path) -> std::io::Result<()> {
+pub(crate) fn mkdir_700(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;

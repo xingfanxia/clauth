@@ -2,6 +2,7 @@ mod actions;
 mod claude;
 mod claude_json;
 mod completions;
+mod daemon;
 mod fallback;
 mod format;
 // macOS-only: Claude Code reads its login from the Keychain, not the credentials
@@ -10,6 +11,7 @@ mod format;
 mod keychain;
 mod lock;
 mod lockorder;
+mod logline;
 mod mcp;
 mod oauth;
 mod oauth_login;
@@ -19,6 +21,7 @@ mod poll;
 mod pricing;
 mod profile;
 mod profile_cache;
+mod profile_json;
 mod providers;
 mod runtime;
 mod spinner;
@@ -108,6 +111,11 @@ fn dispatch(args: &[String]) -> Result<()> {
         // Hidden: the bundled PostToolUse `asyncRewake` hook body. Reads the hook
         // payload on stdin, waits for a background delegate, and wakes the model.
         [cmd] if cmd == "mcp-await-job" => mcp::await_job(),
+        [cmd] if cmd == "daemon" => daemon::serve(),
+        [cmd, flag] if cmd == "status" && flag == "--json" => daemon::status_oneshot(),
+        [cmd, ..] if cmd == "status" => {
+            anyhow::bail!("usage: clauth status --json");
+        }
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
         _ => anyhow::bail!(
@@ -577,6 +585,10 @@ fn print_help() {
          remove a profile and all its credentials; --yes skips the confirm\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
          credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
+           clauth daemon                   run the headless scheduler with no TUI: refresh\n                                  \
+         usage, auto-switch on exhaustion, and write ~/.clauth/status.json\n  \
+           clauth status --json            print the current usage / auto-switch snapshot\n                                  \
+         as JSON (same shape the daemon writes)\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \
            clauth completions install [shell]\n                                  \
          install completions into the user's shell rc\n  \

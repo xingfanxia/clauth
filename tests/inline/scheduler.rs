@@ -1633,3 +1633,193 @@ fn proactive_rotation_never_fires_on_unknown_expiry() {
         true, true, true, None, 10_000, 90_000
     ));
 }
+
+// ── stand-down hydrate (a live daemon owns the loop) ─────────────────────────
+//
+// While `standdown_tick` runs, this side never fetches or rotates — it only
+// re-seeds the stores from the disk caches the daemon keeps fresh. These pin
+// the hydrate contract: cache → store with a freshness-derived status and
+// `last_fetched` stamped AT the cache mtime (so the published countdowns track
+// the daemon's real cadence, not this process's clock).
+
+#[test]
+fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::{UsageInfo, UsageWindow};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let info = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..UsageInfo::default()
+    };
+    write_profile_cache("kitty", USAGE_CACHE_FILE, &info);
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    super::hydrate_from_daemon_caches(
+        &store,
+        &status,
+        &tp_store,
+        &tp_status,
+        &last_fetched,
+        &[token("kitty"), token("cacheless")],
+        &[],
+        REFRESH_INTERVAL_MS,
+    );
+
+    let seeded = store.lock().unwrap().get("kitty").cloned();
+    assert_eq!(
+        seeded.and_then(|i| i.five_hour.map(|w| w.utilization)),
+        Some(42.0),
+        "the daemon-written cache lands in the live store"
+    );
+    // A just-written cache (mtime ≈ now) is inside the fetch window → Fresh,
+    // and its stamp anchors the countdown to the daemon's write time.
+    assert_eq!(
+        status.lock().unwrap().get("kitty").copied(),
+        Some(super::FetchStatus::Fresh),
+    );
+    let stamp = last_fetched.lock().unwrap().get("kitty").copied();
+    let now = super::now_ms();
+    assert!(
+        stamp.is_some_and(|s| now.saturating_sub(s.as_millis()) < 30_000),
+        "last_fetched stamped at the cache mtime: {stamp:?} vs now {now}"
+    );
+
+    // No cache → left untouched (the daemon publishes it shortly); never a
+    // synthetic entry that would render as data.
+    assert!(store.lock().unwrap().get("cacheless").is_none());
+    assert!(status.lock().unwrap().get("cacheless").is_none());
+    assert!(last_fetched.lock().unwrap().get("cacheless").is_none());
+}
+
+/// Re-hydrating every tick must track the daemon's writes: a NEWER cache body
+/// replaces the seeded one (same profile, later mtime), never the reverse.
+#[test]
+fn standdown_hydrate_follows_the_daemon_cache_forward() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::{UsageInfo, UsageWindow};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let at = |util: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: util,
+            resets_at: None,
+        }),
+        ..UsageInfo::default()
+    };
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let hydrate = |snapshot: &[TokenEntry]| {
+        super::hydrate_from_daemon_caches(
+            &store,
+            &status,
+            &tp_store,
+            &tp_status,
+            &last_fetched,
+            snapshot,
+            &[],
+            REFRESH_INTERVAL_MS,
+        )
+    };
+
+    write_profile_cache("kitty", USAGE_CACHE_FILE, &at(10.0));
+    hydrate(&[token("kitty")]);
+    write_profile_cache("kitty", USAGE_CACHE_FILE, &at(55.0));
+    hydrate(&[token("kitty")]);
+
+    let seeded = store.lock().unwrap().get("kitty").cloned();
+    assert_eq!(
+        seeded.and_then(|i| i.five_hour.map(|w| w.utilization)),
+        Some(55.0),
+        "the daemon's newer write wins on the next hydrate"
+    );
+}
+
+/// `standdown_tick` end to end (minus the probe): forced names from a manual
+/// `r` are drained and their Queued marks cleared (the daemon can't be asked
+/// to fetch early — a stranded mark freezes the row spinner), the store is
+/// hydrated, and countdowns are published off the cache stamp. Nothing here
+/// performs HTTP: every assertion is served by disk state alone.
+#[test]
+fn standdown_tick_drains_forced_and_publishes_countdowns() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::UsageInfo;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    }));
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![token("kitty")])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        rate_limit_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        standdown_probe: true,
+        standdown_active: AtomicBool::new(true),
+    };
+
+    // A manual `r` landed just before this tick: forced name + Queued mark.
+    state.refetch_queue.lock().unwrap().insert("kitty".into());
+    mark_activity(&state.activity, "kitty", ProfileActivity::Queued);
+
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+
+    assert!(
+        state.refetch_queue.lock().unwrap().is_empty(),
+        "forced names are consumed, not left to pile up"
+    );
+    assert!(
+        state.activity.lock().unwrap().get("kitty").is_none(),
+        "the Queued mark is cleared — no frozen spinner"
+    );
+    assert!(
+        state.store.lock().unwrap().contains_key("kitty"),
+        "the store is hydrated from the daemon cache"
+    );
+    let next = state
+        .next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .get("kitty")
+        .copied();
+    let stamp = state
+        .last_fetched
+        .lock()
+        .unwrap()
+        .get("kitty")
+        .map(|e| e.as_millis());
+    assert_eq!(
+        next,
+        stamp.map(|s| s + REFRESH_INTERVAL_MS),
+        "the countdown tracks the cache stamp + one interval"
+    );
+}

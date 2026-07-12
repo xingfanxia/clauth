@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use crate::claude::{LinkState, classify_credentials_link};
 use crate::lock::with_state_lock;
+use crate::logline::logline;
 use crate::profile::{
     AppConfig, OAuthToken, clear_staged_credentials, save_profile, stage_rotated_credentials,
 };
@@ -753,7 +754,7 @@ pub(crate) fn apply_rotated_tokens_locked(
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() && cfg.is_active(name) {
             if live_login_is_foreign(name, &old_access) {
-                eprintln!(
+                logline!(
                     "clauth: rotated '{name}' but the live login diverged (a re-login clauth \
                      doesn't own) — Keychain left untouched; resolve the divergence in the TUI"
                 );
@@ -771,7 +772,7 @@ pub(crate) fn apply_rotated_tokens_locked(
     if let Some(creds) = mirror
         && let Err(e) = crate::keychain::keychain_write(&creds)
     {
-        eprintln!(
+        logline!(
             "clauth: rotated '{name}' but the Keychain mirror failed: {e:#} — a \
              running claude signs out when its old token expires; run `clauth {name}` \
              to reinstall"
@@ -872,7 +873,7 @@ pub(crate) fn try_adopt_live_rotation(
             }
         });
     let Some(expected) = expected else {
-        eprintln!(
+        logline!(
             "clauth: live login for '{name}' is newer but its identity can't be proven \
              (no cached account id and the stored token is dead) — not adopting; \
              resolve in the TUI or re-run clauth login {name}"
@@ -886,7 +887,7 @@ pub(crate) fn try_adopt_live_rotation(
         return None;
     }
     if live_id != expected {
-        eprintln!(
+        logline!(
             "clauth: live login for '{name}' belongs to a DIFFERENT account — not adopting; \
              capture it via the TUI divergence flow if that was intentional"
         );
@@ -926,11 +927,11 @@ pub(crate) fn try_adopt_live_rotation(
     // CC-side re-login stays excluded from the fallback walk and refused as a
     // switch target until a manual `clauth login`.
     if cfg.set_auth_broken(name, false) {
-        eprintln!("clauth: '{name}' re-authenticated — auth_broken cleared");
+        logline!("clauth: '{name}' re-authenticated — auth_broken cleared");
         let _ = crate::profile::save_app_state(&cfg.state);
     }
     write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &live_id);
-    eprintln!(
+    logline!(
         "clauth: adopted the live session's rotated login for '{name}' \
          (the running claude refreshed first — no token spent)"
     );
@@ -1105,12 +1106,12 @@ pub(crate) fn mark_auth_broken(config: &crate::profile::ConfigHandle, name: &str
         // (pinned by `set_auth_broken_reports_transitions_and_is_idempotent`) so a
         // dropped login leaves one stderr line, never a per-tick repeat.
         if broken {
-            eprintln!(
+            logline!(
                 "clauth: login for '{name}' expired — refresh token dead; \
                  flagged auth_broken. Recover with: clauth login {name}"
             );
         } else {
-            eprintln!("clauth: '{name}' re-authenticated — auth_broken cleared");
+            logline!("clauth: '{name}' re-authenticated — auth_broken cleared");
         }
         let _ = crate::profile::save_app_state(&cfg.state);
     }

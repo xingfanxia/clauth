@@ -1,0 +1,205 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! `daemon::status_json::build_status` shape + field derivation.
+//!
+//! These exercise the single-shot path (`live = None`, freshness/next-refresh
+//! from cache mtime) against a `HomeSandbox` so no real `~/.clauth` is touched.
+
+use super::*;
+use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, save_profile};
+use crate::testutil::HomeSandbox;
+
+fn oauth_profile(name: &str) -> Profile {
+    let mut p = Profile::new(name.to_string(), None, None);
+    p.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: format!("{name}-access"),
+            refresh_token: Some(format!("{name}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("max".to_string()),
+        }),
+    });
+    p
+}
+
+#[test]
+fn build_status_top_level_shape_and_active() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work"), oauth_profile("home")],
+    };
+    config.state.active_profile = Some("work".into());
+    config.state.refresh_interval_ms = 300_000;
+
+    let v = build_status(&config, config.state.refresh_interval_ms, None);
+
+    assert_eq!(v["schema"], SCHEMA_VERSION);
+    assert_eq!(v["active_profile"], "work");
+    assert_eq!(v["wrap_off"], false);
+    assert_eq!(v["refresh_interval_ms"], 300_000);
+    assert!(v["generated_at"].as_str().unwrap().contains('T'));
+    // Exact key sets — a silent rename/removal anywhere in the contract fails
+    // here rather than in a downstream reader.
+    let mut top: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    top.sort_unstable();
+    assert_eq!(
+        top,
+        [
+            "active_profile",
+            "generated_at",
+            "pending_switch",
+            "profiles",
+            "refresh_interval_ms",
+            "schema",
+            "wrap_off",
+        ],
+    );
+    let profiles = v["profiles"].as_array().unwrap();
+    let mut per: Vec<&str> = profiles[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    per.sort_unstable();
+    assert_eq!(
+        per,
+        [
+            "active",
+            "auth_status",
+            "auto_start",
+            "base_url",
+            "bell_threshold",
+            "fallback",
+            "fetch_status",
+            "fetched_at",
+            "has_live_session",
+            "name",
+            "next_refresh_at",
+            "provider",
+            "third_party",
+            "tier",
+            "windows",
+        ],
+    );
+    assert_eq!(profiles.len(), 2);
+    let work = profiles.iter().find(|p| p["name"] == "work").unwrap();
+    assert_eq!(work["active"], true);
+    assert_eq!(work["provider"], "anthropic");
+    // No cache on disk → never-fetched profile reports nulls, not stale numbers.
+    assert!(work["fetch_status"].is_null());
+    assert!(work["fetched_at"].is_null());
+    assert!(work["next_refresh_at"].is_null());
+    assert!(work["windows"].as_array().unwrap().is_empty());
+    let home = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "home")
+        .unwrap()
+        .clone();
+    assert_eq!(home["active"], false);
+}
+
+#[test]
+fn build_status_fallback_membership_and_armed() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("a"), oauth_profile("b"), oauth_profile("c")],
+    };
+    for p in &config.profiles {
+        save_profile(p).unwrap();
+    }
+    config.state.active_profile = Some("a".into());
+    config.state.fallback_chain = vec!["a".into(), "b".into()];
+
+    let v = build_status(&config, 300_000, None);
+    let profiles = v["profiles"].as_array().unwrap();
+
+    let a = profiles.iter().find(|p| p["name"] == "a").unwrap();
+    assert_eq!(a["fallback"]["position"], 1);
+    assert_eq!(a["fallback"]["threshold"], 95.0); // DEFAULT_THRESHOLD
+    assert_eq!(a["fallback"]["armed"], true, "active + in chain = armed");
+
+    let b = profiles.iter().find(|p| p["name"] == "b").unwrap();
+    assert_eq!(b["fallback"]["position"], 2);
+    assert_eq!(b["fallback"]["armed"], false, "in chain but not active");
+
+    let c = profiles.iter().find(|p| p["name"] == "c").unwrap();
+    assert!(c["fallback"].is_null(), "not a chain member → null");
+}
+
+// ── AUTH-2: auth_status + pending_switch contract ─────────────────────────────
+
+fn set_expiry(p: &mut Profile, expires_at: i64) {
+    p.credentials
+        .as_mut()
+        .unwrap()
+        .claude_ai_oauth
+        .as_mut()
+        .unwrap()
+        .expires_at = Some(expires_at);
+}
+
+#[test]
+fn build_status_auth_status_ok_expiring_broken() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms() as i64;
+
+    let mut ok = oauth_profile("ok");
+    set_expiry(&mut ok, now + 3_600_000); // real life left → ok
+    let mut expiring = oauth_profile("expiring");
+    set_expiry(&mut expiring, now - 1_000); // past due, not flagged → expiring
+    let mut broken = oauth_profile("broken");
+    set_expiry(&mut broken, now - 1_000); // past due AND flagged → broken wins
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![ok, expiring, broken],
+    };
+    config.set_auth_broken("broken", true);
+
+    let v = build_status(&config, 300_000, None);
+    let profiles = v["profiles"].as_array().unwrap();
+    let get = |n: &str| profiles.iter().find(|p| p["name"] == n).unwrap();
+    assert_eq!(get("ok")["auth_status"], "ok");
+    assert_eq!(get("expiring")["auth_status"], "expiring");
+    assert_eq!(
+        get("broken")["auth_status"],
+        "broken",
+        "broken outranks expiring"
+    );
+}
+
+#[test]
+fn build_status_pending_switch_reflects_live_signal() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+
+    // single-shot (no daemon) → pending_switch is present-but-null.
+    let none = build_status(&config, 300_000, None);
+    assert!(
+        none.get("pending_switch").is_some(),
+        "pending_switch key is always present"
+    );
+    assert!(none["pending_switch"].is_null());
+
+    let live = LiveSignals {
+        status: &empty_status,
+        next_refresh: &empty_next,
+        pending_switch: Some("home"),
+    };
+    let v = build_status(&config, 300_000, Some(&live));
+    assert_eq!(v["pending_switch"], "home");
+    assert_eq!(
+        v["schema"], SCHEMA_VERSION,
+        "pending_switch is part of schema 1 — no bump"
+    );
+}
