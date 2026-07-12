@@ -837,15 +837,26 @@ fn rate_limit_backoff_ms(streak: u32) -> u64 {
 /// (observed 2026-07-11: hours of uninterrupted per-account 429s that only a
 /// growing back-off can drain). Capped at [`MAX_RETRY_AFTER_MS`]. Non-429
 /// outcomes: no defer.
+///
+/// The ACTIVE profile's ladder caps at one extra interval (2× cadence): its
+/// account's rate-limit window is dominated by the running claude's own API
+/// traffic, so clauth's one poll per slot neither pins nor drains it — a deep
+/// slot only buys staleness on the exact row the user is watching (observed
+/// 2026-07-12: the endpoint recovered while the active account sat out a
+/// 14-minute slot as `RateLimited`). A REAL server `retry-after` still wins.
 fn next_slot_deferral(
     rate_limited: bool,
     retry_after: Option<Duration>,
     streak: u32,
     interval_ms: u64,
+    active: bool,
 ) -> IntervalMs {
     let hint = retry_after.map(|ra| ra.as_millis() as u64);
     let target_ms = if rate_limited {
-        let ladder = interval_ms.saturating_add(rate_limit_backoff_ms(streak));
+        let mut ladder = interval_ms.saturating_add(rate_limit_backoff_ms(streak));
+        if active {
+            ladder = ladder.min(interval_ms.saturating_mul(2));
+        }
         hint.unwrap_or(0).max(ladder)
     } else {
         hint.unwrap_or(0)
@@ -908,6 +919,7 @@ fn apply_outcome(
     last_fetched: &LastFetchedAt,
     streaks: &RateLimitStreaks,
     interval_ms: u64,
+    is_active: bool,
 ) -> EpochMs {
     let now = EpochMs::from_millis(now_ms());
 
@@ -954,7 +966,13 @@ fn apply_outcome(
     // also get a per-profile spread so two profiles don't fall due on the same tick.
     let rate_limited = matches!(outcome.status, FetchStatus::RateLimited);
     let streak = update_rate_limit_streak(streaks, &outcome.name, outcome.status);
-    let defer = next_slot_deferral(rate_limited, outcome.retry_after, streak, interval_ms);
+    let defer = next_slot_deferral(
+        rate_limited,
+        outcome.retry_after,
+        streak,
+        interval_ms,
+        is_active,
+    );
     let spread = if outcome.from_fetch {
         deadline_spread(&outcome.name, now, interval_ms)
     } else {
@@ -1208,6 +1226,14 @@ fn fetch_oauth_due(state: &SchedulerState, due: Vec<TokenEntry>, interval_ms: u6
                     entry.access_token = new_access.clone();
                     entry.refresh_token = new_refresh.clone();
                 }
+                // The active profile's 429 ladder caps low (see
+                // `next_slot_deferral`); read the flag at apply time so a
+                // switch mid-flight lands the right cadence.
+                let is_active = state
+                    .config
+                    .lock()
+                    .map(|c| c.is_active(&outcome.name))
+                    .unwrap_or(false);
                 let stamped = apply_outcome(
                     outcome,
                     &state.store,
@@ -1215,6 +1241,7 @@ fn fetch_oauth_due(state: &SchedulerState, due: Vec<TokenEntry>, interval_ms: u6
                     &state.last_fetched,
                     &state.rate_limit_streaks,
                     interval_ms,
+                    is_active,
                 );
                 publish_one_countdown(&state.next_refresh_per_profile, name, stamped, interval_ms);
             }
@@ -1357,7 +1384,7 @@ fn stamp_last_fetched(
 ) {
     // Third-party providers are independent hosts with their own limits; keep the
     // flat base backoff (streak 1) rather than the per-account exponential ramp.
-    let defer = next_slot_deferral(rate_limited, retry_after, 1, interval_ms);
+    let defer = next_slot_deferral(rate_limited, retry_after, 1, interval_ms, false);
     let stamped = EpochMs::from_millis(now_ms()).saturating_add(defer);
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(name.clone(), stamped);
