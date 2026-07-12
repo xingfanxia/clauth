@@ -997,6 +997,66 @@ fn consecutive_rate_limits_back_off_exponentially() {
     );
 }
 
+/// PR #30 guard: the streak ladder escalates a repeated 429 even while the server
+/// hint stays PRESENT. A constant sub-cadence `retry-after` is overridden at every
+/// streak by `max(hint, interval + backoff(streak))`, so the same account 429ing
+/// three times in a row backs off base → base·f → base·f² just like the no-hint
+/// path. Without the `max`, an always-present hint (the real endpoint answers
+/// `retry-after: 0`) would freeze the streak counter and pin the account forever.
+#[test]
+fn hint_present_429s_still_ride_the_streak_ladder() {
+    use std::time::Duration;
+
+    use super::{
+        FetchOutcome, FetchStatus, RATE_LIMIT_BACKOFF_FACTOR, RATE_LIMIT_MIN_BACKOFF_MS,
+        StatusStore, apply_outcome, now_ms,
+    };
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // A constant hint well under the ladder floor — present on every 429, so the
+    // escalation below can only come from the streak ladder overriding it.
+    let hinted = || FetchOutcome {
+        name: "a".to_string(),
+        info: None,
+        status: FetchStatus::RateLimited,
+        rotated: None,
+        from_fetch: false,
+        retry_after: Some(Duration::from_secs(5)),
+    };
+    let stamp = || {
+        last_fetched
+            .lock()
+            .unwrap()
+            .get("a")
+            .copied()
+            .expect("stamp present")
+            .as_millis()
+    };
+
+    let base = RATE_LIMIT_MIN_BACKOFF_MS;
+    let f = RATE_LIMIT_BACKOFF_FACTOR;
+    for expect in [base, base * f, base * f * f] {
+        let before = now_ms();
+        apply_outcome(
+            hinted(),
+            &store,
+            &status,
+            &last_fetched,
+            &streaks,
+            REFRESH_INTERVAL_MS,
+        );
+        let after = now_ms();
+        assert!(
+            (before + expect..=after + expect).contains(&stamp()),
+            "a hinted 429 backs off to {expect}ms past now — the ladder, not the 5s hint"
+        );
+    }
+}
+
 /// A transient `Cached`/`Failed` outcome between two 429s must NOT reset the
 /// consecutive-429 streak — a network blip mid-storm should leave the ramp
 /// climbing (base → base*factor), not drop it back to the base.
