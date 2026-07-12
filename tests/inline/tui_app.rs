@@ -239,15 +239,20 @@ fn config_rows_login_and_delete_creds_visibility() {
     let mut oauth_with = Profile::new("oauth-with".to_string(), None, None);
     oauth_with.credentials = Some(creds());
     let oauth_without = Profile::new("oauth-without".to_string(), None, None);
-    let api = Profile::new(
-        "api".to_string(),
+    let api_no_key = Profile::new(
+        "api-no-key".to_string(),
         Some("https://api.example.com".to_string()),
         None,
+    );
+    let api_with_key = Profile::new(
+        "api-with-key".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret".to_string()),
     );
 
     let mut app = App::new(AppConfig {
         state: AppState::default(),
-        profiles: vec![oauth_with, oauth_without, api],
+        profiles: vec![oauth_with, oauth_without, api_no_key, api_with_key],
     });
     app.config_draft = None;
 
@@ -269,17 +274,26 @@ fn config_rows_login_and_delete_creds_visibility() {
         "oauth blank hides delete-creds"
     );
 
-    // API account (base_url set) → neither.
+    // API account with no key → login (re-enter url+key), no log-out yet.
     app.profile_cursor = 2;
     let rows = config_rows(&app);
-    assert!(!rows.contains(&ConfigRow::Login), "api hides login");
+    assert!(rows.contains(&ConfigRow::Login), "api blank shows login");
     assert!(
         !rows.contains(&ConfigRow::DeleteCreds),
-        "api hides delete-creds"
+        "api blank hides delete-creds"
+    );
+
+    // API account holding a key → login (re-login) plus log-out.
+    app.profile_cursor = 3;
+    let rows = config_rows(&app);
+    assert!(rows.contains(&ConfigRow::Login), "api+key shows login");
+    assert!(
+        rows.contains(&ConfigRow::DeleteCreds),
+        "api+key shows delete-creds"
     );
 
     // `+ new` form with an empty base_url buffer → login before create.
-    app.profile_cursor = 3;
+    app.profile_cursor = 4;
     let rows = config_rows(&app);
     let login_idx = rows
         .iter()
@@ -295,8 +309,91 @@ fn config_rows_login_and_delete_creds_visibility() {
     );
 }
 
+/// The API-account re-login row walks a two-step inline chain: base url first,
+/// then api key, persisting both like `login --base-url --api-key`. ⎋ at either
+/// step abandons the whole chain.
 #[test]
-fn config_rows_login_hidden_when_draft_types_a_base_url() {
+fn api_relogin_chain_walks_base_url_then_api_key() {
+    use super::{
+        ConfigFocus, ConfigRow, InputState, cancel_config_edit, commit_config_field, config_rows,
+        enter_config_detail, run_config_row,
+    };
+    use crate::profile::{AppConfig, AppState, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let api = Profile::new(
+        "api".to_string(),
+        Some("https://old.example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec!["api".into()],
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    });
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+    assert_eq!(app.config_focus, ConfigFocus::Actions);
+
+    // Activate the re-login row → chain opens on the base-url field.
+    let rows = config_rows(&app);
+    app.config_action_cursor = rows
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("api account shows a login row");
+    run_config_row(&mut app, ConfigRow::Login);
+    {
+        let d = app.config_draft.as_ref().expect("draft");
+        assert!(d.relogin_chain, "re-login opens the chain");
+        assert_eq!(
+            d.active,
+            Some(ConfigRow::BaseUrl),
+            "chain starts on base url"
+        );
+    }
+
+    // Type a fresh base url and commit → advances to the api-key step.
+    app.config_draft.as_mut().unwrap().base_url = InputState::new("https://new.example.com");
+    commit_config_field(&mut app, ConfigRow::BaseUrl);
+    {
+        let d = app.config_draft.as_ref().expect("draft");
+        assert!(d.relogin_chain, "chain still live after the base-url step");
+        assert_eq!(
+            d.active,
+            Some(ConfigRow::ApiKey),
+            "chain advances to api key"
+        );
+    }
+
+    // Type a fresh key and commit → chain ends, both values persisted.
+    app.config_draft.as_mut().unwrap().api_key = InputState::new("new-key");
+    commit_config_field(&mut app, ConfigRow::ApiKey);
+    {
+        let d = app.config_draft.as_ref().expect("draft");
+        assert!(!d.relogin_chain, "chain cleared after the api-key step");
+        assert_eq!(d.active, None, "editing ended");
+    }
+    {
+        let cfg = app.config();
+        let p = cfg.find("api").expect("profile present");
+        assert_eq!(p.base_url.as_deref(), Some("https://new.example.com"));
+        assert_eq!(p.api_key.as_deref(), Some("new-key"));
+    }
+
+    // ⎋ mid-chain abandons it: re-open, then cancel on the base-url step.
+    run_config_row(&mut app, ConfigRow::Login);
+    assert!(app.config_draft.as_ref().unwrap().relogin_chain);
+    cancel_config_edit(&mut app, ConfigRow::BaseUrl);
+    let d = app.config_draft.as_ref().expect("draft");
+    assert!(!d.relogin_chain, "⎋ abandons the chain");
+    assert_eq!(d.active, None, "⎋ ends editing");
+}
+
+#[test]
+fn config_rows_login_tracks_api_mode_when_draft_types_a_base_url() {
     use super::{ConfigRow, InputState, build_draft_existing, build_draft_new, config_rows};
     use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
     let _home = crate::testutil::HomeSandbox::new();
@@ -317,23 +414,25 @@ fn config_rows_login_hidden_when_draft_types_a_base_url() {
         profiles: vec![oauth],
     });
 
-    // Existing OAuth draft that types a base url flips the row to API mode:
-    // both OAuth-only login rows disappear even though the saved profile is OAuth.
+    // Existing OAuth draft that types a base url flips the row to API mode: the
+    // login row stays (now an API re-login), but delete-creds tracks the API
+    // credential — the saved profile has no api key, so it's hidden.
     app.profile_cursor = 0;
     let mut draft = build_draft_existing(&app, "oauth");
     draft.base_url = InputState::new("https://api.example.com");
     app.config_draft = Some(draft);
     let rows = config_rows(&app);
     assert!(
-        !rows.contains(&ConfigRow::Login),
-        "typing a base url hides login on an existing account"
+        rows.contains(&ConfigRow::Login),
+        "typing a base url keeps login (re-login) on an existing account"
     );
     assert!(
         !rows.contains(&ConfigRow::DeleteCreds),
-        "typing a base url hides delete-creds on an existing account"
+        "delete-creds tracks the api key, absent here, so it stays hidden"
     );
 
-    // `+ new` form with a typed base url is an API create → no login row.
+    // `+ new` form with a typed base url is an API create → no login row (the
+    // base url + api key + create rows already stand in for it).
     app.profile_cursor = 1;
     let mut draft = build_draft_new();
     draft.base_url = InputState::new("https://api.example.com");

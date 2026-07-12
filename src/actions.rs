@@ -771,6 +771,30 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &str) -> R
     })
 }
 
+/// Setup-tab "log out" for an API account: drop the stored api key while keeping
+/// the base-url shell so it stays an API account you can re-login. The OAuth arm
+/// is [`clear_profile_credentials`]; this one reuses [`edit_profile_endpoint`],
+/// which re-derives the provider, drops stale third-party stats, and re-applies
+/// the live `settings.json` (removing `ANTHROPIC_AUTH_TOKEN`) when the account is
+/// active — so a running `claude` loses the token too. The account stays active:
+/// its base url is still wired, only the key is gone.
+pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &str) -> Result<()> {
+    with_state_lock(|| {
+        let base_url = config.find(name).and_then(|p| p.base_url.clone());
+        edit_profile_endpoint(config, name, base_url, None)?;
+        // The endpoint editor clears the in-memory stats; also drop the on-disk
+        // third-party cache so a stale copy can't resurface on reload (no key left
+        // to refresh it).
+        if let Some(path) = crate::profile_cache::profile_cache_path(
+            name,
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        ) {
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(())
+    })
+}
+
 pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) -> Result<()> {
     if from == to || from >= config.profiles.len() || to >= config.profiles.len() {
         return Ok(());

@@ -288,6 +288,44 @@ fn setup_delete_row_hint_names_usage_history() {
 }
 
 #[test]
+fn setup_api_account_shows_relogin_and_logout_rows() {
+    use crate::tui::app::{ConfigRow, Tab, config_rows};
+    let mut api = oauth("acme", 0.0, 0.0, false);
+    api.base_url = Some("https://api.example.com".to_string());
+    api.api_key = Some("sk-secret".to_string());
+    api.usage = None;
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["acme".into()],
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    };
+    let mut app = App::new(config);
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    // Park the cursor on the login row so its API hint renders too.
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("api account shows a login row");
+
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("re-login"),
+        "api account with a key shows a re-login row:\n{out}",
+    );
+    assert!(
+        out.contains("log out"),
+        "api account with a key shows a log-out row:\n{out}",
+    );
+    assert!(
+        out.contains("re-enter the base url"),
+        "the login row's hint describes the API re-entry:\n{out}",
+    );
+}
+
+#[test]
 fn capture_name_caret_follows_edit_position() {
     use crate::actions::CaptureSnapshot;
     use crate::tui::app::{CaptureNameForm, InputState, Modal};

@@ -23,10 +23,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{
     CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
-    clear_profile_credentials, create_blank_profile, create_profile_from_login, delete_profile,
-    edit_profile_endpoint, edit_profile_env, edit_profile_model, find_matching_oauth_profile,
-    overwrite_captured_profile, rename_profile, reorder_profile, switch_off, switch_profile,
-    validate_profile_name,
+    clear_profile_api_key, clear_profile_credentials, create_blank_profile,
+    create_profile_from_login, delete_profile, edit_profile_endpoint, edit_profile_env,
+    edit_profile_model, find_matching_oauth_profile, overwrite_captured_profile, rename_profile,
+    reorder_profile, switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -279,6 +279,10 @@ pub(crate) struct ConfigDraft {
     pub(crate) active: Option<ConfigRow>,
     /// First ⏎ on delete arms it; second confirms. Any cursor move disarms.
     pub(crate) armed_delete: bool,
+    /// API-account re-login is in flight: committing the base-url field advances
+    /// to the api-key field (re-enter both, mirroring `login --base-url --api-key`)
+    /// instead of ending the edit. Cleared on the api-key commit or any ⎋.
+    pub(crate) relogin_chain: bool,
     /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
     /// collapsed (set overrides still render; unset ones hide behind the chip).
     pub(crate) overrides_expanded: bool,
@@ -4523,13 +4527,19 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     let env_count = profile.map(|p| p.env.len()).unwrap_or(0);
     rows.extend((0..env_count).map(ConfigRow::EnvEntry));
     rows.push(ConfigRow::EnvAdd);
-    if !is_api {
-        // OAuth account: log in (or re-login), and drop creds only when some exist.
-        rows.push(ConfigRow::Login);
-        let has_creds = profile.and_then(|p| p.credentials.as_ref()).is_some();
-        if has_creds {
-            rows.push(ConfigRow::DeleteCreds);
-        }
+    // Log in / re-login, then log out once a credential exists — for both OAuth
+    // (browser mint) and API (base url + api key) accounts. "Has a credential"
+    // reads the OAuth token or the api key depending on the account type.
+    rows.push(ConfigRow::Login);
+    let has_creds = if is_api {
+        profile
+            .and_then(|p| p.api_key.as_deref())
+            .is_some_and(|k| !k.trim().is_empty())
+    } else {
+        profile.and_then(|p| p.credentials.as_ref()).is_some()
+    };
+    if has_creds {
+        rows.push(ConfigRow::DeleteCreds);
     }
     rows.push(ConfigRow::Delete);
     rows
@@ -4572,6 +4582,7 @@ fn build_draft_new() -> ConfigDraft {
         env_new_key: InputState::new(""),
         active: None,
         armed_delete: false,
+        relogin_chain: false,
         overrides_expanded: false,
         captured_creds: None,
     }
@@ -4595,6 +4606,7 @@ fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
         env_new_key: InputState::new(""),
         active: None,
         armed_delete: false,
+        relogin_chain: false,
         overrides_expanded: false,
         captured_creds: None,
     }
@@ -4685,6 +4697,16 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 .config_draft
                 .as_ref()
                 .and_then(|d| d.editing_name.clone());
+            // An existing API account re-enters its base url + api key inline (no
+            // browser); only OAuth accounts run the token-minting flow below.
+            let is_api_account = editing.as_deref().is_some_and(|n| {
+                let cfg = app.config();
+                cfg.find(n).map(|p| !p.is_oauth()).unwrap_or(false)
+            });
+            if is_api_account {
+                start_api_relogin(app);
+                return;
+            }
             let target = match editing {
                 Some(name) => Some((name, false)),
                 None => {
@@ -4731,18 +4753,50 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         ConfigRow::DeleteCreds => {
             if let Some(name) = name {
+                let is_api = {
+                    let cfg = app.config();
+                    cfg.find(&name).map(|p| !p.is_oauth()).unwrap_or(false)
+                };
+                let detail = if is_api {
+                    "Blanks the api key; keeps the base url, model, and env. Re-login any time."
+                } else {
+                    "Blanks the login; keeps the profile, model, env, and chain slot. Re-login any time."
+                };
                 app.modals.push(Modal::Confirm(ConfirmState {
                     message: format!("Log out of '{name}'?"),
-                    detail: Some(
-                        "Blanks the login; keeps the profile, model, env, and chain slot. Re-login any time."
-                            .to_string(),
-                    ),
+                    detail: Some(detail.to_string()),
                     choice: false,
                     on_confirm: ConfirmAction::BlankCredentials(name),
                 }));
             }
         }
         _ => {}
+    }
+}
+
+/// API-account "re-login": re-enter the base url + api key inline, mirroring the
+/// CLI's `login --base-url --api-key`. Seeds both buffers from the stored values
+/// and opens the base-url editor; committing it advances to the api-key editor
+/// (the `relogin_chain`), and committing that persists both via `commit_endpoint`.
+fn start_api_relogin(app: &mut App) {
+    let name = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone());
+    let (base, key) = {
+        let cfg = app.config();
+        let p = name.as_deref().and_then(|n| cfg.find(n));
+        (
+            p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
+            p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
+        )
+    };
+    if let Some(d) = app.config_draft.as_mut() {
+        d.base_url = InputState::new(&base);
+        d.api_key = InputState::new(&key);
+        d.base_url.end();
+        d.relogin_chain = true;
+        d.active = Some(ConfigRow::BaseUrl);
     }
 }
 
@@ -4845,6 +4899,9 @@ fn cancel_config_edit(app: &mut App, field: ConfigRow) {
         }
     }
     if let Some(d) = app.config_draft.as_mut() {
+        // ⎋ mid re-login abandons the whole base-url → api-key chain, not just the
+        // current field.
+        d.relogin_chain = false;
         d.active = None;
     }
 }
@@ -5383,6 +5440,7 @@ fn commit_endpoint(app: &mut App) {
     let Some(name) = d.editing_name.clone() else {
         return;
     };
+    let active_field = d.active;
     let base_url = d.base_url.trimmed_some();
     // An API key only makes sense with a base URL; drop it for OAuth.
     let api_key = if base_url.is_some() {
@@ -5408,7 +5466,16 @@ fn commit_endpoint(app: &mut App) {
             if let Some(d) = app.config_draft.as_mut() {
                 d.base_url = InputState::new(&base);
                 d.api_key = InputState::new(&key);
-                d.active = None;
+                // Re-login chain: after the base-url step, advance into the
+                // api-key editor instead of ending (only while it's still an API
+                // account — an emptied base url flipped it to OAuth, key dropped).
+                if d.relogin_chain && active_field == Some(ConfigRow::BaseUrl) && !base.is_empty() {
+                    d.api_key.end();
+                    d.active = Some(ConfigRow::ApiKey);
+                } else {
+                    d.relogin_chain = false;
+                    d.active = None;
+                }
             }
         }
         Err(e) => app.toast(ToastKind::Danger, format!("edit failed: {e}")),
@@ -5715,7 +5782,14 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         ConfirmAction::BlankCredentials(name) => {
             let result = {
                 let mut cfg = app.config();
-                clear_profile_credentials(&mut cfg, &name)
+                // OAuth accounts drop the token via the shared clearer; API
+                // accounts drop only the api key, keeping the base-url shell.
+                let is_oauth = cfg.find(&name).map(|p| p.is_oauth()).unwrap_or(true);
+                if is_oauth {
+                    clear_profile_credentials(&mut cfg, &name)
+                } else {
+                    clear_profile_api_key(&mut cfg, &name)
+                }
             };
             match result {
                 Ok(()) => {
