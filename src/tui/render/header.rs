@@ -160,7 +160,7 @@ fn gauge_spans(
     spans
 }
 
-fn pulse_name_spans(name: &str, style: Style, elapsed_ms: u64) -> Vec<Span<'static>> {
+pub(super) fn pulse_name_spans(name: &str, style: Style, elapsed_ms: u64) -> Vec<Span<'static>> {
     use std::f32::consts::{PI, TAU};
     let plain = || vec![Span::styled(name.to_string(), style)];
     if theme::tier() != theme::Tier::Full {

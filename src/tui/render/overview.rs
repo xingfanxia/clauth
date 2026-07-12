@@ -12,6 +12,7 @@ use super::format::{
     account_type_label, account_type_style, fixed, fixed_split, health_color, name_style,
     spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
+use super::header::pulse_name_spans;
 use super::panes::{bold_when, draw_scrollbar, empty_state, section_box, select_line};
 use crate::fallback::{SwitchAction, next_target, soonest_resume, threshold_for};
 use crate::profile::{AppConfig, Profile};
@@ -287,10 +288,21 @@ fn render_overview_row(
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
     spans.push(gap(widths));
-    spans.push(Span::styled(
-        fixed(&account_type_label(profile), widths.kind),
-        account_type_style(profile),
-    ));
+    let label = account_type_label(profile);
+    if profile.credentials.is_some() {
+        let elapsed = app.started_at.elapsed().as_millis() as u64;
+        let mut pulse = pulse_name_spans(&label, theme::dim(), elapsed);
+        let pad = widths.kind.saturating_sub(label.chars().count());
+        if pad > 0 {
+            pulse.push(Span::raw(" ".repeat(pad)));
+        }
+        spans.extend(pulse);
+    } else {
+        spans.push(Span::styled(
+            fixed(&label, widths.kind),
+            account_type_style(profile),
+        ));
+    }
     spans.push(narrow_gap(widths));
     spans.push(timer_span);
     // Bracketed bars ([███░░░]) for overview account rows only.

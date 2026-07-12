@@ -72,8 +72,12 @@ pub(super) fn account_type_label(profile: &Profile) -> String {
         .to_string()
 }
 
-pub(super) fn account_type_style(_profile: &Profile) -> Style {
-    theme::dim()
+pub(super) fn account_type_style(profile: &Profile) -> Style {
+    if profile.credentials.is_some() {
+        Style::default().fg(theme::accent_2_color())
+    } else {
+        theme::dim()
+    }
 }
 
 pub(super) fn bar_string_with_cells(pct: f64, cells: usize) -> String {
