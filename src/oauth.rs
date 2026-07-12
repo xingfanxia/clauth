@@ -1032,7 +1032,7 @@ pub(crate) fn ensure_installable(
     // RotationGuard across the HTTP window (single-use double-spend guard),
     // acquired with no config lock held. A busy guard means a live session or
     // sibling worker is already on this chain — refuse this switch and retry.
-    let Ok(_guard) = RotationGuard::acquire(name) else {
+    let Ok(guard) = RotationGuard::acquire(name) else {
         return AuthGate::Transient(anyhow::anyhow!(
             "'{name}' rotation lock busy; retry after the in-flight refresh"
         ));
@@ -1043,7 +1043,7 @@ pub(crate) fn ensure_installable(
     if has_live_session(name) {
         return AuthGate::Ready;
     }
-    gate_under_guard(config, name, refresher)
+    gate_under_guard(config, name, refresher, &guard)
 }
 
 /// The target's auth shape — `(access-token expiry, refresh token, standing
@@ -1091,17 +1091,55 @@ fn expiring(expires_at: Option<i64>, flagged: bool) -> bool {
     flagged || expires_at.is_some_and(|exp| (now_ms() as i64) + AUTH_GATE_GRACE_MS >= exp)
 }
 
-/// The refresh leg, entered only with the [`RotationGuard`] held. Re-reads the
-/// auth shape UNDER the guard — between the pre-check and guard acquisition a
-/// sibling rotation may have spent the single-use refresh token and persisted
-/// a new pair, and refreshing from that stale snapshot would 400 and wrongly
-/// quarantine a healthy login. This function takes no token arguments, so
-/// post-guard decisions structurally cannot reuse pre-guard data.
+/// Reconcile the in-memory profile with the on-disk store; the `_guard`
+/// witness proves the [`RotationGuard`] is held, which makes the disk read
+/// stable. A cross-process peer (the daemon, a second clauth) rotates and
+/// persists under this same flock, and a caller that loaded config from disk
+/// once (CLI, MCP) can hold a snapshot predating that write. Tokens are opaque
+/// and no writer rewinds the store (see the scheduler's `fresher_disk_pair`),
+/// so a stored refresh token that DIFFERS from the in-memory one proves
+/// someone advanced the single-use chain: adopt the disk pair, and lift a
+/// stale quarantine — the chain is alive under someone else's advance
+/// (mirrors `carry_external_rotation`; a wrong lift self-corrects when the
+/// carried pair's own refresh 400s). Unreadable or tokenless disk state is a
+/// no-op: the in-memory shape stays the best available truth.
+fn adopt_disk_rotation(config: &crate::profile::ConfigHandle, name: &str, _guard: &RotationGuard) {
+    let Ok(disk) = crate::profile::load_profile(name) else {
+        return;
+    };
+    if disk.refresh_token().is_none() {
+        return;
+    }
+    {
+        let Ok(mut cfg) = config.lock() else {
+            return;
+        };
+        let Some(profile) = cfg.find_mut(name) else {
+            return;
+        };
+        if profile.refresh_token() == disk.refresh_token() {
+            return;
+        }
+        profile.credentials = disk.credentials;
+    }
+    mark_auth_broken(config, name, false);
+}
+
+/// The refresh leg; the `guard` witness proves the [`RotationGuard`] is held.
+/// First adopts a cross-process rotation from disk ([`adopt_disk_rotation`]),
+/// then re-reads the auth shape UNDER the guard — between the pre-check and
+/// guard acquisition a sibling rotation (in-process or peer) may have spent
+/// the single-use refresh token and persisted a new pair, and refreshing from
+/// that stale snapshot would 400 and wrongly quarantine a healthy login. This
+/// function takes no token arguments, so post-guard decisions structurally
+/// cannot reuse pre-guard data.
 fn gate_under_guard(
     config: &crate::profile::ConfigHandle,
     name: &str,
     refresher: impl Fn(&str) -> std::result::Result<TokenResponse, RefreshError>,
+    guard: &RotationGuard,
 ) -> AuthGate {
+    adopt_disk_rotation(config, name, guard);
     let (expires_at, refresh_token, flagged) = match oauth_shape(config, name) {
         Err(gate) => return gate,
         Ok(shape) => shape,
