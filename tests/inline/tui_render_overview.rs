@@ -118,3 +118,34 @@ fn healthy_chain_hides_resumes_hint() {
     let lines = fallback_flow_lines(&app, 60, 20);
     assert!(resumes_line(&lines).is_none());
 }
+
+/// Gap widening must work from the row's REAL width. `fixed_overview_width`
+/// omits the TIMER_SLOT the row always renders, and widening gaps from that
+/// undercounted figure overflows the row at narrow widths, clipping the tail
+/// of the 5h column (observed at a 50-column pane: `[░░░░░]  0` with the `%`
+/// pushed off-screen). Whenever the columns fit at all at minimum gaps, the
+/// gap-widened layout must still fit.
+#[test]
+fn gap_widening_never_clips_the_row() {
+    let a = profile("ax-main", 95.0, 10.0, 3600);
+    let b = profile("ax-backup", 95.0, 20.0, 3600);
+    let config = config_with(vec![a, b], Some("ax-main"), vec![]);
+    let app = App::new(config);
+    for width in 34u16..=200 {
+        let w = OverviewWidths::new(width, &app);
+        let min =
+            fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.route, 2) + TIMER_SLOT;
+        if min > width as usize {
+            // Below this the shrink loop has already bottomed out and the row
+            // deliberately overflows-and-clips; gap widening isn't the cause.
+            continue;
+        }
+        let used = fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.route, w.gap)
+            + TIMER_SLOT;
+        assert!(
+            used <= width as usize,
+            "row overflows at width {width}: used {used} (gap {})",
+            w.gap
+        );
+    }
+}

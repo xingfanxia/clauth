@@ -156,7 +156,11 @@ impl OverviewWidths {
         let base = fixed_overview_width(name, kind, five_hour, seven_day, route, gap_min);
         let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
         let gap_slots = column_count.saturating_sub(1).max(1);
-        let gap = (gap_min + total.saturating_sub(base) / gap_slots).clamp(gap_min, 8);
+        // `fixed_overview_width` omits the TIMER_SLOT the row always renders;
+        // widening gaps from that undercounted figure overflows the row at
+        // narrow widths and clips the tail of the 5h column. Widen from the
+        // real leftover instead.
+        let gap = (gap_min + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(gap_min, 8);
 
         Self {
             name,
