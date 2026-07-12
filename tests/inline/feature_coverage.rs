@@ -27,8 +27,10 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "base64url_nopad",
             "login_route",
             "reauth_confirmed",
+            "parse_login_args_api_mode",
         ],
     ),
+    ("Delete an account", &["parse_delete_args"]),
     (
         "Automatic token refresh",
         &[

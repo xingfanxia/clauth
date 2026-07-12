@@ -91,8 +91,14 @@ fn dispatch(args: &[String]) -> Result<()> {
         }
         [cmd, name, rest @ ..] if cmd == "start" => cmd_start(name, rest, Isolation::Shared),
         [cmd, rest @ ..] if cmd == "login" => match parse_login_args(rest) {
-            Some((name, model)) => cmd_login(name, model),
-            None => anyhow::bail!("usage: clauth login <profile> [--model <id>]"),
+            Some(args) => cmd_login(args),
+            None => anyhow::bail!(
+                "usage: clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>]"
+            ),
+        },
+        [cmd, rest @ ..] if cmd == "delete" => match parse_delete_args(rest) {
+            Some((name, yes)) => cmd_delete(name, yes),
+            None => anyhow::bail!("usage: clauth delete <profile> [--yes]"),
         },
         [cmd, ..] if cmd == "run" => anyhow::bail!(
             "`clauth run` isn't a command; for a headless delegate use \
@@ -105,7 +111,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
         _ => anyhow::bail!(
-            "usage: clauth [profile] | clauth start [--isolated] <profile> [args] | clauth login <profile> [--model <id>] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
+            "usage: clauth [profile] | clauth start [--isolated] <profile> [args] | clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>] | clauth delete <profile> [--yes] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
         ),
     }
 }
@@ -140,22 +146,76 @@ fn cmd_start(name: &str, rest: &[String], isolation: Isolation) -> Result<()> {
     start::run(&config, &canonical, rest, isolation)
 }
 
-/// `clauth login`'s args after the `login` token: bare `<profile>` or
-/// `<profile> --model <id>`. `None` on any other shape (missing profile,
-/// `--model` with no value, an unrecognized flag, extra args) — the caller
-/// turns that into one usage bail. Kept as its own pure fn (dispatch's other
-/// subcommands hand-roll the match inline) so the shape is unit-testable
-/// without invoking `cmd_login`, which opens a real browser.
-fn parse_login_args(rest: &[String]) -> Option<(&str, Option<&str>)> {
-    match rest {
-        // A `--`-prefixed "name" is a typo'd/misplaced flag, not a profile —
-        // `clauth login --model` must bail with usage, not create "--model".
-        [name] if !name.starts_with("--") => Some((name.as_str(), None)),
-        [name, flag, value] if flag == "--model" && !name.starts_with("--") => {
-            Some((name.as_str(), Some(value.as_str())))
-        }
-        _ => None,
+/// `clauth login`'s parsed args after the `login` token: one profile name plus
+/// any of `--model <id>`, `--base-url <url>`, `--api-key <key>` (each takes the
+/// next token as its value), in any order. Presence of `--base-url` or
+/// `--api-key` selects API-key mode; both absent selects browser OAuth (the
+/// original behaviour). `None` on any other shape (missing profile, a flag with
+/// no value or a `--`-prefixed value, an unrecognized flag, two positional
+/// names) — the caller turns that into one usage bail. Kept as its own pure fn
+/// so the shape is unit-testable without invoking `cmd_login`, which opens a
+/// real browser or reads a key.
+#[derive(Debug, PartialEq)]
+struct LoginArgs<'a> {
+    name: &'a str,
+    model: Option<&'a str>,
+    base_url: Option<&'a str>,
+    api_key: Option<&'a str>,
+}
+
+impl LoginArgs<'_> {
+    /// API-key mode: capture a base_url + api_key pair instead of browser OAuth.
+    fn is_api_mode(&self) -> bool {
+        self.base_url.is_some() || self.api_key.is_some()
     }
+}
+
+fn parse_login_args(rest: &[String]) -> Option<LoginArgs<'_>> {
+    let mut name: Option<&str> = None;
+    let mut model: Option<&str> = None;
+    let mut base_url: Option<&str> = None;
+    let mut api_key: Option<&str> = None;
+
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = rest[i].as_str();
+        // A known value flag consumes the next token as its value.
+        let slot = match arg {
+            "--model" => Some(&mut model),
+            "--base-url" => Some(&mut base_url),
+            "--api-key" => Some(&mut api_key),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            // Missing value, or a value that is itself a flag (`login acme
+            // --model --base-url` is a forgotten model value) → bail.
+            let value = rest.get(i + 1)?.as_str();
+            if value.starts_with("--") {
+                return None;
+            }
+            *slot = Some(value);
+            i += 2;
+            continue;
+        }
+        // Any other `--` token is an unrecognized flag.
+        if arg.starts_with("--") {
+            return None;
+        }
+        // Positional token: the profile name. A second one is a typo'd extra,
+        // not a second profile.
+        if name.is_some() {
+            return None;
+        }
+        name = Some(arg);
+        i += 1;
+    }
+
+    Some(LoginArgs {
+        name: name?,
+        model,
+        base_url,
+        api_key,
+    })
 }
 
 /// Where `clauth login <name>` lands. An EXISTING profile (matched
@@ -195,56 +255,87 @@ fn reauth_confirmed(input: &str) -> bool {
     a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes")
 }
 
-/// `clauth login <name>` — add a new OAuth account by real browser login, with
-/// visible progress, or RE-AUTHENTICATE an existing profile in place (#7).
-/// clauth reproduces Claude Code's own PKCE + loopback flow (see `oauth_login`)
-/// and writes the minted tokens straight into the profile's
-/// `.credentials.json`, so it works identically on every platform — unlike
-/// running CC's own `/login`, which on macOS lands only in a per-config-dir
-/// hashed Keychain item and leaves the profile file empty (#1/#3).
-///
-/// A NEW name captures into a fresh profile; an EXISTING name routes through
-/// [`actions::overwrite_captured_profile`] — fresh tokens replace the
-/// credential set in place (chain slot, env, and model settings survive; stale
-/// per-account fetch caches are dropped; when it is the ACTIVE profile the
-/// live link is re-run so a running `claude` picks the new login up). Neither
-/// path switches to the profile (`clauth <name>` does that). `--model` (any
-/// preset alias or a full custom id, same values the Setup tab's model row
-/// accepts) is persisted onto the profile after capture, so its sessions route
-/// to that model from the first launch. Tokens are never printed — only a
-/// sha256 prefix.
-fn cmd_login(name: &str, model: Option<&str>) -> Result<()> {
-    platform::init();
-    let mut config = load_config()?;
-    let route = login_route(&config, name);
-    let target = match &route {
-        LoginRoute::Reauth(existing) => existing.clone(),
-        LoginRoute::New(fresh) => {
-            actions::validate_profile_name(fresh, &config.names(), None)?;
-            fresh.clone()
+/// Prompt `[y/N]` before a reauth overwrites a profile's stored credentials.
+/// Non-TTY stdin proceeds (a piped script can't be prompted), matching the
+/// OAuth reauth contract. `is_api` tailors the copy (endpoint + key vs tokens).
+fn confirm_reauth(target: &str, is_api: bool) -> Result<bool> {
+    use std::io::{IsTerminal as _, Write as _};
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(true);
+    }
+    let object = if is_api {
+        "endpoint + API key"
+    } else {
+        "stored credentials"
+    };
+    print!(
+        "clauth: profile '{target}' already exists. Re-authenticating replaces its {object}. Continue? [y/N] "
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(reauth_confirmed(&answer))
+}
+
+/// Collect the base_url + api_key pair for API-key mode. Each value comes from
+/// its `--flag` when given; otherwise a prompt: base_url on a normal echo'ing
+/// line, api_key echo-off (it's a secret). A non-TTY stdin that still owes a
+/// value bails — a script must pass both flags explicitly.
+fn collect_api_endpoint(
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    use std::io::{IsTerminal as _, Write as _};
+    let interactive = std::io::stdin().is_terminal();
+
+    let base_url = match base_url {
+        Some(u) => Some(u.to_string()),
+        None => {
+            if !interactive {
+                anyhow::bail!("non-interactive stdin: pass --base-url (and --api-key) explicitly");
+            }
+            print!("Base URL: ");
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let trimmed = line.trim().to_string();
+            if trimmed.is_empty() {
+                anyhow::bail!("base url is required for an API account");
+            }
+            Some(trimmed)
         }
     };
 
-    let reauth = matches!(route, LoginRoute::Reauth(_));
-
-    if reauth {
-        // A reauth overwrites the profile's stored credentials, so guard the
-        // typo case (a new account was meant, an existing name was typed) with
-        // a confirm. Only when BOTH ends are a TTY: a piped/non-interactive
-        // stdin can't be prompted and proceeds, so scripted reauth still works.
-        use std::io::{IsTerminal as _, Write as _};
-        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-            print!(
-                "clauth: profile '{target}' already exists. Re-authenticating replaces its stored credentials. Continue? [y/N] "
+    let api_key = match api_key {
+        Some(k) => {
+            eprintln!(
+                "clauth: warning: --api-key is visible in shell history and process listings; prefer the prompt"
             );
-            let _ = std::io::stdout().flush();
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer)?;
-            if !reauth_confirmed(&answer) {
-                println!("clauth: aborted. '{target}' left unchanged.");
-                return Ok(());
-            }
+            Some(k.to_string())
         }
+        None => {
+            if !interactive {
+                anyhow::bail!("non-interactive stdin: pass --api-key explicitly");
+            }
+            let k = rpassword::prompt_password("API key: ")
+                .map_err(|e| anyhow::anyhow!("failed to read API key: {e}"))?;
+            let k = k.trim().to_string();
+            if k.is_empty() {
+                anyhow::bail!("api key is required for an API account");
+            }
+            Some(k)
+        }
+    };
+
+    Ok((base_url, api_key))
+}
+
+/// Run the browser OAuth flow (preamble, authorize-URL paste fallback, minted
+/// tokens, login summary, identity-anchor seed) and wrap it in a capture
+/// snapshot. Shared by `cmd_login`'s new and reauth OAuth arms so the two stay
+/// in lockstep.
+fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
+    if reauth {
         println!("clauth: re-authenticating existing profile '{target}', opening a browser…");
     } else {
         println!("clauth: opening a browser to log in to a new account for '{target}'…");
@@ -256,7 +347,6 @@ fn cmd_login(name: &str, model: Option<&str>) -> Result<()> {
             println!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
         }
     })?;
-
     println!(
         "clauth: login complete.\n{}",
         oauth_login::login_summary(&credentials)
@@ -273,31 +363,157 @@ fn cmd_login(name: &str, model: Option<&str>) -> Result<()> {
         && let Some(id) = crate::usage::fetch_account_uuid(&tok)
     {
         crate::profile_cache::write_profile_cache(
-            &target,
+            target,
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
             &id,
         );
     }
-    let snapshot = actions::CaptureSnapshot {
+    Ok(actions::CaptureSnapshot {
         credentials: Some(credentials),
         base_url: None,
         api_key: None,
+    })
+}
+
+/// `clauth login <name> [--base-url <url>] [--api-key <key>] [--model <id>]` —
+/// add a new account or re-authenticate an existing one in place (#7). The auth
+/// method is flag-selected: bare (no `--base-url`/`--api-key`) runs the browser
+/// OAuth flow (`oauth_login`) and writes the minted tokens straight into the
+/// profile's `.credentials.json`, identically on every platform; passing either
+/// endpoint flag switches to API-key mode and captures a base_url + api_key pair
+/// instead, prompting (echo-off for the key) for whatever a flag omitted.
+///
+/// A NEW name captures into a fresh profile; an EXISTING name routes through
+/// [`actions::overwrite_captured_profile`] — the fresh credential set (tokens OR
+/// endpoint + key) replaces the old in place (chain slot, env, and model
+/// settings survive; stale per-account fetch caches are dropped; when it is the
+/// ACTIVE profile the live link is re-run so a running `claude` picks the new
+/// login up). A reauth that crosses types (OAuth ↔ API) is allowed: the
+/// snapshot overwrites all three of credentials/base_url/api_key, so the old
+/// type's leftovers are cleared. Neither path switches to the profile (`clauth
+/// <name>` does that). `--model` is persisted onto the profile after capture.
+/// Tokens are never printed — only a sha256 prefix.
+fn cmd_login(args: LoginArgs<'_>) -> Result<()> {
+    platform::init();
+    let mut config = load_config()?;
+    let route = login_route(&config, args.name);
+    let target = match &route {
+        LoginRoute::Reauth(existing) => existing.clone(),
+        LoginRoute::New(fresh) => {
+            actions::validate_profile_name(fresh, &config.names(), None)?;
+            fresh.clone()
+        }
     };
+    let reauth = matches!(route, LoginRoute::Reauth(_));
+    let is_api = args.is_api_mode();
+
+    // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
+    // declined overwrite must not open a browser or read a secret.
+    if reauth && !confirm_reauth(&target, is_api)? {
+        println!("clauth: aborted. '{target}' left unchanged.");
+        return Ok(());
+    }
+
     if reauth {
+        let snapshot = if is_api {
+            let (base_url, api_key) = collect_api_endpoint(args.base_url, args.api_key)?;
+            actions::CaptureSnapshot {
+                credentials: None,
+                base_url,
+                api_key,
+            }
+        } else {
+            run_oauth_browser(true, &target)?
+        };
         actions::overwrite_captured_profile(&mut config, &target, snapshot)?;
-    } else {
-        actions::capture_into_profile(&mut config, target.clone(), snapshot)?;
-    }
-    // Apply the requested default model to the captured profile so its
-    // sessions route there from the first launch. On a reauth this is an
-    // explicit override — without `--model` the profile's settings survive.
-    if let Some(model) = model {
-        actions::set_profile_default_model(&mut config, &target, model)?;
-    }
-    if reauth {
-        println!("clauth: re-authenticated '{target}'. Fresh tokens are in place.");
-    } else {
+        // On a reauth `--model` is an explicit override; without it the
+        // profile's existing model settings survive.
+        if let Some(model) = args.model {
+            actions::set_profile_default_model(&mut config, &target, model)?;
+        }
+        let what = if is_api { "endpoint + key" } else { "tokens" };
+        println!("clauth: re-authenticated '{target}'. Fresh {what} are in place.");
+    } else if is_api {
+        // A new API profile goes through `create_blank_profile` (the TUI's
+        // path), NOT `capture_into_profile`: the latter auto-activates the
+        // first profile and links credentials, but an API account carries no
+        // credentials.json and its base_url/api_key reach the live
+        // settings.json only via a switch — so auto-activating would mark it
+        // "active" before it's wired. The user switches explicitly (the print
+        // below), which writes settings.json. `create_blank_profile` also
+        // takes the model inline, so no separate model write is needed here.
+        let (base_url, api_key) = collect_api_endpoint(args.base_url, args.api_key)?;
+        actions::create_blank_profile(
+            &mut config,
+            target.clone(),
+            base_url,
+            api_key,
+            args.model.map(str::to_string),
+        )?;
         println!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
+    } else {
+        let snapshot = run_oauth_browser(false, &target)?;
+        actions::capture_into_profile(&mut config, target.clone(), snapshot)?;
+        // Apply the requested default model so the captured profile's sessions
+        // route there from the first launch.
+        if let Some(model) = args.model {
+            actions::set_profile_default_model(&mut config, &target, model)?;
+        }
+        println!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
+    }
+    Ok(())
+}
+
+/// `clauth delete <name> [--yes]`'s args after the `delete` token: one profile
+/// name plus an optional `--yes`/`-y` (anywhere). `None` on any other shape
+/// (missing name, an unrecognized flag, two names). Pure, so unit-testable
+/// without invoking `cmd_delete`, which touches the filesystem.
+fn parse_delete_args(rest: &[String]) -> Option<(&str, bool)> {
+    let mut name: Option<&str> = None;
+    let mut yes = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--yes" | "-y" => yes = true,
+            a if a.starts_with("--") => return None,
+            a => {
+                if name.is_some() {
+                    return None;
+                }
+                name = Some(a);
+            }
+        }
+    }
+    Some((name?, yes))
+}
+
+/// `clauth delete <name> [--yes]` — remove a profile and all its credentials
+/// (the whole on-disk profile dir + state + caches), OAuth or API-key. Prompts
+/// `[y/N]` on a TTY unless `--yes`; a non-TTY stdin skips the prompt so scripts
+/// can delete, matching the reauth contract. If the deleted profile was active,
+/// its live `~/.claude/.credentials.json` link is cleared too.
+fn cmd_delete(name: &str, yes: bool) -> Result<()> {
+    platform::init();
+    let mut config = load_config()?;
+    let canonical = resolve_or_bail(&config, name)?;
+    if !yes {
+        use std::io::{IsTerminal as _, Write as _};
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            print!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !reauth_confirmed(&answer) {
+                println!("clauth: aborted. '{canonical}' left in place.");
+                return Ok(());
+            }
+        }
+    }
+    let was_active = config.is_active(&canonical);
+    actions::delete_profile(&mut config, &canonical)?;
+    if was_active {
+        println!("clauth: deleted profile '{canonical}' (was active; live credentials cleared).");
+    } else {
+        println!("clauth: deleted profile '{canonical}'.");
     }
     Ok(())
 }
@@ -335,11 +551,14 @@ fn print_help() {
          CLAUDE_CONFIG_DIR; --isolated injects creds but drops operator\n                                  \
          memory/plugins/hooks (run in a clean cwd for a blind session);\n                                  \
          extra args go to claude\n  \
-           clauth login <profile> [--model <id>]\n                                  \
-         add a new account via browser OAuth login and capture it into a\n                                  \
-         new profile, or re-authenticate an existing one in place (neither\n                                  \
-         switches to it); --model sets its default model (opus/sonnet/\n                                  \
-         haiku/opusplan or a full model id)\n  \
+           clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>]\n                                  \
+         add a new account, or re-authenticate an existing one in place\n                                  \
+         (neither switches to it). Bare = browser OAuth; pass --base-url\n                                  \
+         or --api-key to capture an API-key account instead (a missing\n                                  \
+         value is prompted; the key is read echo-off). --model sets its\n                                  \
+         default model (opus/sonnet/haiku/opusplan or a full model id)\n  \
+           clauth delete <profile> [--yes]\n                                  \
+         remove a profile and all its credentials; --yes skips the confirm\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
          credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \

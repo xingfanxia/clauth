@@ -6,10 +6,27 @@
 
 use super::*;
 
+fn login_args<'a>(
+    name: &'a str,
+    model: Option<&'a str>,
+    base_url: Option<&'a str>,
+    api_key: Option<&'a str>,
+) -> Option<LoginArgs<'a>> {
+    Some(LoginArgs {
+        name,
+        model,
+        base_url,
+        api_key,
+    })
+}
+
 #[test]
 fn parse_login_args_bare_name_has_no_model() {
     let args = ["acme".to_string()];
-    assert_eq!(parse_login_args(&args), Some(("acme", None)));
+    assert_eq!(
+        parse_login_args(&args),
+        login_args("acme", None, None, None)
+    );
 }
 
 #[test]
@@ -19,7 +36,10 @@ fn parse_login_args_accepts_model_flag() {
         "--model".to_string(),
         "opus".to_string(),
     ];
-    assert_eq!(parse_login_args(&args), Some(("acme", Some("opus"))));
+    assert_eq!(
+        parse_login_args(&args),
+        login_args("acme", Some("opus"), None, None)
+    );
 }
 
 #[test]
@@ -31,7 +51,7 @@ fn parse_login_args_accepts_a_full_custom_model_id() {
     ];
     assert_eq!(
         parse_login_args(&args),
-        Some(("acme", Some("claude-opus-4-8")))
+        login_args("acme", Some("claude-opus-4-8"), None, None)
     );
 }
 
@@ -46,12 +66,12 @@ fn parse_login_args_rejects_flag_shaped_profile_names() {
     // `clauth login --model` (value forgotten, name missing) must bail with
     // usage instead of creating a profile literally named "--model".
     assert_eq!(parse_login_args(&["--model".to_string()]), None);
-    let flag_name = [
+    let flag_value = [
         "--model".to_string(),
         "--model".to_string(),
         "opus".to_string(),
     ];
-    assert_eq!(parse_login_args(&flag_name), None);
+    assert_eq!(parse_login_args(&flag_value), None);
 }
 
 #[test]
@@ -70,6 +90,137 @@ fn parse_login_args_rejects_empty_and_trailing_extra_args() {
         "extra".to_string(),
     ];
     assert_eq!(parse_login_args(&extra), None);
+}
+
+// ── API-key mode: --base-url/--api-key select it, in any order ──
+
+#[test]
+fn parse_login_args_api_mode_both_endpoint_flags() {
+    let args = [
+        "acme".to_string(),
+        "--base-url".to_string(),
+        "https://api.deepseek.com".to_string(),
+        "--api-key".to_string(),
+        "sk-x".to_string(),
+    ];
+    let parsed = parse_login_args(&args);
+    assert_eq!(
+        parsed,
+        login_args("acme", None, Some("https://api.deepseek.com"), Some("sk-x"))
+    );
+    assert!(parsed.unwrap().is_api_mode());
+}
+
+#[test]
+fn parse_login_args_api_mode_one_flag_leaves_the_other_for_prompt() {
+    // Only --api-key: base_url stays None (prompted at runtime).
+    let args = [
+        "acme".to_string(),
+        "--api-key".to_string(),
+        "sk-x".to_string(),
+    ];
+    let parsed = parse_login_args(&args).expect("api-key flag parses");
+    assert_eq!(parsed.name, "acme");
+    assert_eq!(parsed.base_url, None);
+    assert_eq!(parsed.api_key, Some("sk-x"));
+    assert!(parsed.is_api_mode());
+}
+
+#[test]
+fn parse_login_args_api_mode_flags_in_any_order_with_model() {
+    let args = [
+        "deepseek".to_string(),
+        "--api-key".to_string(),
+        "sk-x".to_string(),
+        "--model".to_string(),
+        "deepseek-chat".to_string(),
+        "--base-url".to_string(),
+        "https://api.deepseek.com".to_string(),
+    ];
+    assert_eq!(
+        parse_login_args(&args),
+        login_args(
+            "deepseek",
+            Some("deepseek-chat"),
+            Some("https://api.deepseek.com"),
+            Some("sk-x")
+        )
+    );
+}
+
+#[test]
+fn parse_login_args_api_mode_flag_without_value_is_none() {
+    assert_eq!(
+        parse_login_args(&["acme".to_string(), "--base-url".to_string()]),
+        None
+    );
+    assert_eq!(
+        parse_login_args(&["acme".to_string(), "--api-key".to_string()]),
+        None
+    );
+}
+
+#[test]
+fn parse_login_args_api_mode_rejects_flag_as_value() {
+    // `--base-url --api-key` is a forgotten base-url value, not base_url="--api-key".
+    let args = [
+        "acme".to_string(),
+        "--base-url".to_string(),
+        "--api-key".to_string(),
+        "sk-x".to_string(),
+    ];
+    assert_eq!(parse_login_args(&args), None);
+}
+
+#[test]
+fn parse_login_args_bare_name_is_oauth_mode() {
+    let args = ["acme".to_string()];
+    let parsed = parse_login_args(&args).expect("bare name parses");
+    assert!(!parsed.is_api_mode());
+}
+
+// ── parse_delete_args ──
+
+#[test]
+fn parse_delete_args_bare_name_no_yes() {
+    assert_eq!(
+        parse_delete_args(&["acme".to_string()]),
+        Some(("acme", false))
+    );
+}
+
+#[test]
+fn parse_delete_args_accepts_yes_and_short_flag_anywhere() {
+    assert_eq!(
+        parse_delete_args(&["acme".to_string(), "--yes".to_string()]),
+        Some(("acme", true))
+    );
+    assert_eq!(
+        parse_delete_args(&["-y".to_string(), "acme".to_string()]),
+        Some(("acme", true))
+    );
+}
+
+#[test]
+fn parse_delete_args_requires_a_name() {
+    assert_eq!(parse_delete_args(&[]), None);
+    assert_eq!(
+        parse_delete_args(&["--yes".to_string()]),
+        None,
+        "--yes without a name must bail, not delete nothing"
+    );
+}
+
+#[test]
+fn parse_delete_args_rejects_unknown_flag_and_second_name() {
+    assert_eq!(
+        parse_delete_args(&["acme".to_string(), "--bogus".to_string()]),
+        None
+    );
+    assert_eq!(
+        parse_delete_args(&["acme".to_string(), "other".to_string()]),
+        None
+    );
 }
 
 /// End-to-end through `dispatch` for the one login shape that's safe to run

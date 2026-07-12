@@ -11,15 +11,17 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login which completions" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ]; }; then
+        COMPREPLY=( $(compgen -W "${profiles} start login delete which completions" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--base-url --api-key --model" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "delete" ]; }; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "login" ]; then
-        COMPREPLY=( $(compgen -W "--model" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
     fi
     return 0
 }
@@ -34,17 +36,20 @@ _clauth() {
         _describe 'profile' profiles
         _values 'subcommand' \
             'start[launch claude with that profile]' \
-            'login[log in via browser OAuth]' \
+            'login[log in via browser OAuth or an API key]' \
+            'delete[remove a profile and its credentials]' \
             'which[print profile owning the loaded credentials]' \
             'completions[emit shell completion script]'
-    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login) ]]; then
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|delete) ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
-    elif (( CURRENT == 4 )) && [[ "${words[2]}" == login ]]; then
-        _values 'flag' '--model[set the default model before signing in]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
+        _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--model[set the default model before signing in]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
+        _values 'flag' '--yes[skip the confirm prompt]'
     fi
 }
 _clauth "$@"
@@ -56,12 +61,16 @@ end
 complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
-complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth"
+complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
+complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
 complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
-complete -c clauth -f -n "__fish_seen_subcommand_from start login" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from start login delete" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "API base url"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --api-key -d "API key (prompted echo-off if omitted)"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --model -d "Set default model before signing in"
+complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
 "#;
 
 pub(crate) fn print_script(shell: &str) -> Result<()> {

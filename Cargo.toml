@@ -27,6 +27,10 @@ minisign-verify = "0.2.5"
 # CSPRNG bytes for the OAuth PKCE code_verifier + state (already in the tree
 # transitively; pinned here as a direct dep). No unsafe in our crate.
 getrandom = "0.4.3"
+# Echo-off prompt for the API key in `clauth login --base-url/--api-key`, so the
+# key never routes through argv / shell history / process listings. Cross-
+# platform; no transitive deps beyond libc (already in the tree).
+rpassword = "7"
 rmcp = { version = "2.1.0", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1.52.3", features = ["rt", "io-std"] }
 
