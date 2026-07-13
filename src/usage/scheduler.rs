@@ -54,7 +54,7 @@ const RATE_LIMIT_BACKOFF_FACTOR: u64 = 3;
 /// long as a genuine storm lasts. At the default 90s cadence this bound buys
 /// ~6 dense probes (≈3 min apart) over the storm's first quarter hour — enough
 /// to re-discover a recovered endpoint fast — before conceding to the ladder.
-const ACTIVE_CAP_MAX_STREAK: u32 = 6;
+pub(crate) const ACTIVE_CAP_MAX_STREAK: u32 = 6;
 
 /// Wall-clock instant in epoch-milliseconds. Distinct from [`IntervalMs`] so
 /// instants and spans can't be confused. `#[repr(transparent)]` keeps layout
@@ -1628,6 +1628,7 @@ fn tick(state: &SchedulerState) {
         &state.config,
         &state.store,
         &state.status,
+        &state.rate_limit_streaks,
         &state.activity,
         &state.pending_switch,
         &state.pending_switch_off,
@@ -1824,10 +1825,31 @@ fn decision_fresh(status: &StatusStore, name: &str) -> bool {
     )
 }
 
+/// True when `name`'s last reading is a **deep-slot stuck** `RateLimited`: the
+/// status is `RateLimited` AND its consecutive-429 streak has passed
+/// [`ACTIVE_CAP_MAX_STREAK`] — the boundary where the active cap stops holding
+/// retries frequent. Past it, a still-`RateLimited` read is genuinely stuck (the
+/// `/usage` throttle window never drained), not a transient blip.
+///
+/// ONE predicate, two consumers, so display and decision cannot drift:
+///   * `scan_auto_switch` distrusts a stuck-RateLimited active — it bypasses the
+///     [`decision_fresh`] gate exactly like an auth-broken active (AUTH-4) so the
+///     walk can rotate away instead of wedging on an account that can never
+///     return `Fresh`. The switch still requires the walk's own last-known
+///     exhaustion gate ([`crate::fallback::next_auto_switch_target`]), so a
+///     throttle artifact with real headroom stays put — only a genuinely spent
+///     stuck active moves.
+///   * `status.json`'s per-profile `stale` flag publishes the same judgment so a
+///     menu-bar reader renders the reading as distrusted, not current truth.
+pub(crate) fn is_stuck_rate_limited(status: FetchStatus, streak: u32) -> bool {
+    matches!(status, FetchStatus::RateLimited) && streak > ACTIVE_CAP_MAX_STREAK
+}
+
 fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     status: &StatusStore,
+    streaks: &RateLimitStreaks,
     _activity: &ActivityStore,
     pending_switch: &PendingSwitch,
     pending_switch_off: &PendingSwitchOff,
@@ -1863,12 +1885,23 @@ fn scan_auto_switch(
 
     // Only act on a confirmed-live read of the active profile — a stale or
     // synthetic store entry would drive a false switch (see `decision_fresh`).
-    // EXCEPT an auth-broken active (AUTH-4): its fetches can never come back
-    // Fresh again (the login is dead), so requiring one froze this scan
-    // forever and wedged the daemon on the dead account (observed
-    // 2026-07-09); the walk never consults the broken active's own usage.
+    // TWO exceptions bypass the freshness gate, both because the active can
+    // never come back Fresh on its own so requiring one wedges the scan on it:
+    //   * an auth-broken active (AUTH-4) — its login is dead (observed
+    //     2026-07-09); the walk never consults its usage.
+    //   * a deep-slot stuck RateLimited active (the RateLimited analogue) — the
+    //     `/usage` throttle stayed pinned past the active cap, so no Fresh read
+    //     is coming. Unlike auth-broken, this one still faces the walk's
+    //     last-known exhaustion gate, so a throttle artifact with headroom stays
+    //     put and only a genuinely spent stuck active rotates away.
     let active_broken = snapshot.broken.iter().any(|b| b == &snapshot.active);
-    if !active_broken && !decision_fresh(status, &snapshot.active) {
+    let active_status = status
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&snapshot.active).copied());
+    let active_stuck_rl = active_status
+        .is_some_and(|s| is_stuck_rate_limited(s, rate_limit_streak(streaks, &snapshot.active)));
+    if !active_broken && !active_stuck_rl && !matches!(active_status, Some(FetchStatus::Fresh)) {
         return;
     }
 

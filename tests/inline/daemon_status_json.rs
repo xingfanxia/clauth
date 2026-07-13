@@ -78,6 +78,7 @@ fn build_status_top_level_shape_and_active() {
             "name",
             "next_refresh_at",
             "provider",
+            "stale",
             "third_party",
             "tier",
             "windows",
@@ -182,6 +183,7 @@ fn build_status_pending_switch_reflects_live_signal() {
     };
     let empty_status = std::collections::HashMap::new();
     let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
 
     // single-shot (no daemon) → pending_switch is present-but-null.
     let none = build_status(&config, 300_000, None);
@@ -194,6 +196,7 @@ fn build_status_pending_switch_reflects_live_signal() {
     let live = LiveSignals {
         status: &empty_status,
         next_refresh: &empty_next,
+        streaks: &empty_streaks,
         pending_switch: Some("home"),
     };
     let v = build_status(&config, 300_000, Some(&live));
@@ -248,9 +251,11 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     // never do for api-key profiles): same derivation, not null.
     let empty_status = std::collections::HashMap::new();
     let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
         status: &empty_status,
         next_refresh: &empty_next,
+        streaks: &empty_streaks,
         pending_switch: None,
     };
     let v = build_status(&config, 300_000, Some(&live));
@@ -260,4 +265,91 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         "a live daemon must not blank an api-key profile's freshness"
     );
     assert!(!p["next_refresh_at"].is_null());
+}
+
+// RLS-1: the additive per-profile `stale` flag = the daemon distrusts this
+// reading as a deep-slot stuck RateLimited (live status RateLimited AND the 429
+// streak past the active cap) — the SAME predicate `scan_auto_switch` acts on,
+// so the published cue and the switch decision cannot drift. Additive: schema
+// stays 1; the single-shot (no streaks) is always false.
+#[test]
+fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
+    use crate::usage::FetchStatus;
+    use std::collections::HashMap;
+
+    let _home = HomeSandbox::new();
+    // TWO profiles, so a "computed once and applied to every row" regression
+    // (rather than keyed per profile name) is catchable.
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work"), oauth_profile("home")],
+    };
+    let next: HashMap<String, u64> = HashMap::new();
+    let deep = crate::usage::ACTIVE_CAP_MAX_STREAK + 1;
+    let stale_of = |name: &str, v: &serde_json::Value| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()["stale"]
+            .clone()
+    };
+
+    // single-shot (no daemon / no streaks) → stale is present-and-false.
+    let none = build_status(&config, 300_000, None);
+    assert_eq!(
+        none["schema"], 1,
+        "stale is additive — schema must not bump"
+    );
+    assert_eq!(
+        stale_of("work", &none),
+        false,
+        "single-shot never publishes a distrusted reading"
+    );
+
+    // Two profiles in ONE body: `work` is a deep-slot stuck RateLimited (→ stale),
+    // `home` is Fresh with an (irrelevant) equally-deep streak (→ NOT stale). This
+    // one call proves the flag keys on the profile's OWN status+streak, is
+    // per-profile (not one value smeared across the array), and that streak depth
+    // alone never stales a live reading.
+    let status = HashMap::from([
+        ("work".to_string(), FetchStatus::RateLimited),
+        ("home".to_string(), FetchStatus::Fresh),
+    ]);
+    let streaks = HashMap::from([("work".to_string(), deep), ("home".to_string(), deep)]);
+    let live = LiveSignals {
+        status: &status,
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+    };
+    let v = build_status(&config, 300_000, Some(&live));
+    assert_eq!(
+        stale_of("work", &v),
+        true,
+        "a deep-slot stuck RateLimited reading is published as stale"
+    );
+    assert_eq!(
+        stale_of("home", &v),
+        false,
+        "a Fresh sibling is never stale however deep its streak — and stale is \
+         per-profile, not computed once and applied to the whole array"
+    );
+
+    // Shallow RateLimited (≤ cap) → not yet distrusted.
+    let status = HashMap::from([("work".to_string(), FetchStatus::RateLimited)]);
+    let streaks = HashMap::from([("work".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK)]);
+    let live = LiveSignals {
+        status: &status,
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+    };
+    let v = build_status(&config, 300_000, Some(&live));
+    assert_eq!(
+        stale_of("work", &v),
+        false,
+        "a shallow RateLimited reading is not stale"
+    );
 }

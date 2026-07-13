@@ -20,6 +20,12 @@ pub(crate) use scheduler::{
     RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
     UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
-    collect_third_party_entries, collect_tokens, is_idle, mark_activity, spawn_refresher,
-    switch_gate_in_flight,
+    collect_third_party_entries, collect_tokens, is_idle, is_stuck_rate_limited, mark_activity,
+    spawn_refresher, switch_gate_in_flight,
 };
+// The active-cap boundary is only referenced by tests (production code reaches it
+// through `is_stuck_rate_limited`); gate the re-export behind `cfg(test)` so it
+// isn't a dead symbol in the shipped binary, while keeping the `stale`/distrust
+// tests robust against a change to the constant's value.
+#[cfg(test)]
+pub(crate) use scheduler::ACTIVE_CAP_MAX_STREAK;
