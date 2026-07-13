@@ -57,6 +57,11 @@ pub(crate) fn run(
     let signal_watcher = SignalWatcher::new()?;
 
     let mut command = crate::runtime::claude_command();
+    // Scrub clauth-managed + active custom env so a session started under
+    // profile B doesn't inherit profile A's endpoint/auth/model overrides from
+    // the parent process env. The target's runtime settings.json re-supplies
+    // whichever it defines. Mirrors the delegate path (run_delegate).
+    crate::runtime::scrub_profile_env(&mut command, &active_env_keys);
     command.env("CLAUDE_CONFIG_DIR", runtime.config_dir());
     // Isolated: also suppress global/project MCP servers wired through
     // `.claude.json`, so the only extension surface is what the caller passes.

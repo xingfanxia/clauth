@@ -1804,3 +1804,26 @@ fn gc_removes_stale_runtime_but_spares_live() {
         drop(held);
     });
 }
+
+#[test]
+fn scrub_profile_env_drops_managed_and_active_custom_keys() {
+    // `clauth start <B>` from a session running profile A must not inherit A's
+    // endpoint/auth/model overrides nor A's custom `[env]`. The target's
+    // runtime settings.json re-supplies whichever it defines.
+    let mut cmd = std::process::Command::new("claude");
+    scrub_profile_env(&mut cmd, &["FOO".to_string()]);
+
+    let envs = crate::testutil::env_overrides(&cmd);
+    for key in MANAGED_ENV_KEYS {
+        assert_eq!(
+            envs.get(*key),
+            Some(&None),
+            "{key} must be stripped from the inherited env",
+        );
+    }
+    assert_eq!(
+        envs.get("FOO"),
+        Some(&None),
+        "active custom env key must be stripped",
+    );
+}

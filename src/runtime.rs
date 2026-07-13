@@ -458,6 +458,37 @@ impl Drop for ProfileRuntime {
 /// order could otherwise surface it first), else take the first match and let
 /// std route it through cmd.exe with hardened escaping (post-CVE-2024-24576).
 /// Unix keeps the bare lookup.
+/// clauth-owned env keys that must reach the spawned `claude` only via the
+/// target profile's runtime `settings.json`, never inherited from the parent
+/// process. A parent `claude` running profile A had these written into its own
+/// `settings.json.env`, which Claude Code applies to `process.env` at startup;
+/// without scrubbing they leak across profiles and re-route the spawned session
+/// to A's endpoint or account.
+pub(crate) const MANAGED_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+];
+
+/// Drop [`MANAGED_ENV_KEYS`] plus the active profile's custom env keys from
+/// `command`'s inherited env, so the target's runtime `settings.json` is the
+/// sole source for them. Shared by `clauth start` and the MCP delegate. Call
+/// before layering any caller-supplied env, so a caller can still set a key
+/// back deliberately.
+pub(crate) fn scrub_profile_env(command: &mut std::process::Command, active_env_keys: &[String]) {
+    for key in MANAGED_ENV_KEYS {
+        command.env_remove(key);
+    }
+    for key in active_env_keys {
+        command.env_remove(key);
+    }
+}
+
 pub(crate) fn claude_command() -> std::process::Command {
     #[cfg(windows)]
     if let Ok(matches) = which::which_all("claude") {

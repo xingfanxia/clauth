@@ -2,7 +2,9 @@
 //! (`tests/inline/*.rs`). Defined once here rather than copied per module so the
 //! home-sandbox, mtime, and key-event scaffolding stays in a single place.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::SystemTime;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -80,4 +82,19 @@ pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
 /// A `Press` key event with no modifiers.
 pub(crate) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+/// Collect a `Command`'s queued env overrides: key → `Some(value)` for a set
+/// var, key → `None` for a removed one. `get_envs` reflects only the explicit
+/// `env`/`env_remove` ops, which is exactly what we assert. No process env or
+/// spawn needed, so this is lock-free and non-flaky.
+pub(crate) fn env_overrides(cmd: &Command) -> HashMap<String, Option<String>> {
+    cmd.get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.map(|s| s.to_string_lossy().into_owned()),
+            )
+        })
+        .collect()
 }

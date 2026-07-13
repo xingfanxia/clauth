@@ -102,30 +102,21 @@ fn depth_guard_also_refuses_above_one() {
 
 // ---- delegate env composition (provider-routing isolation) ----
 
-/// Collect a `Command`'s queued env overrides: key → `Some(value)` for a set
-/// var, key → `None` for a removed one. `get_envs` reflects only the explicit
-/// `env`/`env_remove` ops, which is exactly what we assert — no process env or
-/// spawn needed, so this is lock-free and non-flaky.
-fn env_overrides(cmd: &Command) -> HashMap<String, Option<String>> {
-    cmd.get_envs()
-        .map(|(k, v)| {
-            (
-                k.to_string_lossy().into_owned(),
-                v.map(|s| s.to_string_lossy().into_owned()),
-            )
-        })
-        .collect()
-}
-
 #[test]
 fn delegate_env_strips_inherited_provider_routing() {
     let mut cmd = Command::new("claude");
-    apply_delegate_env(&mut cmd, &HashMap::new(), std::path::Path::new("/cfg"), 0);
-    let envs = env_overrides(&cmd);
+    apply_delegate_env(
+        &mut cmd,
+        &HashMap::new(),
+        &[],
+        std::path::Path::new("/cfg"),
+        0,
+    );
+    let envs = crate::testutil::env_overrides(&cmd);
 
     // every provider-routing key is queued for removal so a parent session's
     // endpoint/token can't cross-route the delegate to the wrong provider.
-    for key in DELEGATE_ENV_STRIP {
+    for key in crate::runtime::MANAGED_ENV_KEYS {
         assert_eq!(
             envs.get(*key),
             Some(&None),
@@ -145,6 +136,28 @@ fn delegate_env_strips_inherited_provider_routing() {
 }
 
 #[test]
+fn delegate_env_strips_active_profile_custom_env() {
+    // the active profile's custom env keys are scrubbed from the inherited
+    // process env too, so a delegate aimed at profile B drops profile A's
+    // custom `[env]`. Mirrors the settings.json channel (active_env_keys).
+    let mut cmd = Command::new("claude");
+    apply_delegate_env(
+        &mut cmd,
+        &HashMap::new(),
+        &["FOO".to_string(), "BAR".to_string()],
+        std::path::Path::new("/cfg"),
+        0,
+    );
+    let envs = crate::testutil::env_overrides(&cmd);
+    assert_eq!(
+        envs.get("FOO"),
+        Some(&None),
+        "active custom env key must be stripped",
+    );
+    assert_eq!(envs.get("BAR"), Some(&None));
+}
+
+#[test]
 fn delegate_env_caller_reauthority_and_clauth_keys_win() {
     let mut caller = HashMap::new();
     // a caller may deliberately re-route by re-adding a stripped key,
@@ -161,8 +174,8 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
     );
 
     let mut cmd = Command::new("claude");
-    apply_delegate_env(&mut cmd, &caller, std::path::Path::new("/cfg"), 0);
-    let envs = env_overrides(&cmd);
+    apply_delegate_env(&mut cmd, &caller, &[], std::path::Path::new("/cfg"), 0);
+    let envs = crate::testutil::env_overrides(&cmd);
 
     assert_eq!(
         envs.get("ANTHROPIC_BASE_URL"),

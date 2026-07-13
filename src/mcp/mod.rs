@@ -683,39 +683,20 @@ struct DelegateOpts<'a> {
     depth: u32,
 }
 
-/// Per-profile routing env vars dropped from the inherited environment before a
-/// delegate spawns. clauth writes these into each profile's `settings.json`
-/// `env` (see `claude.rs`), so if this MCP server runs under profile A they sit
-/// in its process env and would otherwise leak into a delegate aimed at profile
-/// B — cross-routing it to the wrong endpoint, or pinning a model alias that
-/// doesn't exist on B's endpoint. Stripped before the caller's `env` is layered,
-/// so a caller can still set one back deliberately; the target profile's own
-/// `settings.json` re-supplies whichever it defines.
-const DELEGATE_ENV_STRIP: &[&str] = &[
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_CUSTOM_HEADERS",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    "CLAUDE_CODE_SUBAGENT_MODEL",
-];
-
 /// Compose a delegate's environment on `command`: drop inherited provider
-/// routing ([`DELEGATE_ENV_STRIP`]), layer the caller's `env`, then clauth's own
-/// keys which always win — `CLAUDE_CONFIG_DIR` and the depth guard can't be
-/// overridden, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` only defaults when the caller
-/// didn't set it.
+/// routing + the active profile's custom env
+/// ([`crate::runtime::scrub_profile_env`]), layer the caller's `env`, then
+/// clauth's own keys which always win. `CLAUDE_CONFIG_DIR` and the depth guard
+/// can't be overridden, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` only defaults when
+/// the caller didn't set it.
 fn apply_delegate_env(
     command: &mut Command,
     caller_env: &HashMap<String, String>,
+    active_env_keys: &[String],
     config_dir: &std::path::Path,
     depth: u32,
 ) {
-    for key in DELEGATE_ENV_STRIP {
-        command.env_remove(key);
-    }
+    crate::runtime::scrub_profile_env(command, active_env_keys);
     command.envs(caller_env);
     if !caller_env.contains_key("CLAUDE_CODE_MAX_OUTPUT_TOKENS") {
         command.env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
@@ -758,7 +739,13 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         .map_err(|e| format!("failed to acquire runtime: {e}"))?;
 
     let mut command = crate::runtime::claude_command();
-    apply_delegate_env(&mut command, &opts.env, runtime.config_dir(), opts.depth);
+    apply_delegate_env(
+        &mut command,
+        &opts.env,
+        &active_env_keys,
+        runtime.config_dir(),
+        opts.depth,
+    );
     command
         .args(["-p", opts.prompt, "--output-format", "json"])
         .stdout(Stdio::piped())
