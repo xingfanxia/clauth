@@ -22,9 +22,10 @@ stays the only resolution surface.
   it, so a wedged tick can freeze the single-threaded loop. If no tick
   completes within 60 s the daemon `abort()`s for a clean supervisor restart.
 - **Log hygiene**: every daemon-visible stderr line carries an ISO-8601 UTC
-  prefix (enabled only in daemon mode — interactive stderr stays bare), and
-  `~/.clauth/daemon.log` is size-capped in place when a supervisor points
-  stderr at it. The in-place trim is only sound for an APPEND-mode fd: use
+  prefix, enabled only in daemon mode. An interactive terminal instead diverts
+  its lines to `~/.clauth/clauth.log` so a background thread never paints over
+  the TUI; a redirected or piped stderr keeps the bare line. `~/.clauth/daemon.log`
+  is size-capped in place when a supervisor points stderr at it. The in-place trim is only sound for an APPEND-mode fd: use
   launchd `StandardErrorPath` or systemd `StandardError=append:...` — a
   non-append redirect (`file:`, a plain `>`) keeps its own offset, so the
   next write after a trim leaves a sparse NUL hole and the size cap is
