@@ -14,7 +14,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{App, Tab};
 use super::super::theme;
-use super::format::{bar_string_with_cells, fixed_split, name_style};
+use super::format::{bar_string_with_cells, fixed_split};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -56,7 +56,6 @@ impl GaugeFit {
 struct ActiveGauge {
     name: String,
     pct: Option<f64>,
-    style: Style,
 }
 
 fn active_gauge(app: &App) -> Option<ActiveGauge> {
@@ -75,7 +74,6 @@ fn active_gauge(app: &App) -> Option<ActiveGauge> {
     Some(ActiveGauge {
         name: name.to_string(),
         pct,
-        style: name_style(profile),
     })
 }
 
@@ -125,16 +123,11 @@ fn gauge_fit(avail: usize, name_len: usize, has_pct: bool) -> GaugeFit {
     }
 }
 
-fn gauge_spans(
-    fit: GaugeFit,
-    name: &str,
-    style: Style,
-    pct: Option<f64>,
-    elapsed_ms: u64,
-) -> Vec<Span<'static>> {
+fn gauge_spans(fit: GaugeFit, name: &str, pct: Option<f64>, elapsed_ms: u64) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if fit.name_w > 0 {
         let (nt, _pad) = fixed_split(name, fit.name_w);
+        let style = Style::default().fg(theme::text_color());
         spans.extend(pulse_name_spans(&nt, style, elapsed_ms));
         spans.push(Span::raw("  "));
     }
@@ -256,7 +249,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
         if fit.visible {
             let elapsed = app.started_at.elapsed().as_millis() as u64;
-            left_spans.extend(gauge_spans(fit, &g.name, g.style, g.pct, elapsed));
+            left_spans.extend(gauge_spans(fit, &g.name, g.pct, elapsed));
         }
     }
     let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();

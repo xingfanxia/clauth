@@ -1,10 +1,11 @@
 //! `fallback_flow_lines`'s all-exhausted "resumes: <name> in ~<eta>" caption
 //! (issue #10 follow-up) — the sibling of the "switching to <name> in ~<eta>"
 //! projection line, driven by `crate::fallback::soonest_resume`.
+//! Plus the overview-row state cues: marker precedence + countdown fetch cue.
 
 use super::*;
 use crate::profile::{AppState, ProfileName};
-use crate::usage::{UsageInfo, epoch_secs_to_iso, now_epoch_secs};
+use crate::usage::{FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
 use std::collections::BTreeMap;
 
 /// ISO reset `secs` in the future.
@@ -117,6 +118,99 @@ fn healthy_chain_hides_resumes_hint() {
     let app = App::new(config);
     let lines = fallback_flow_lines(&app, 60, 20);
     assert!(resumes_line(&lines).is_none());
+}
+
+// ── overview row state cues ──────────────────────────────────────────────
+
+/// Marker column: a broken login (×) outranks both the bell (!) and the
+/// active dot (●) — usage alerts are moot until re-login.
+#[test]
+fn broken_login_marker_outranks_bell_and_active() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let mut config = config_with(vec![a], Some("a"), vec![]);
+    config.state.auth_broken.push("a".into());
+    let mut app = App::new(config);
+    app.bell_fired.insert("a".into(), true);
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let text = line_text(&line);
+    assert!(text.contains('×'), "broken login renders ×: {text}");
+    assert!(!text.contains('!'), "bell yields to ×: {text}");
+    assert!(!text.contains('●'), "active dot yields to ×: {text}");
+    let marker = line.spans.iter().find(|s| s.content == "×").unwrap();
+    assert_eq!(marker.style.fg, theme::danger().fg);
+}
+
+#[test]
+fn bell_marker_shows_when_login_is_fine() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], None, vec![]);
+    let mut app = App::new(config);
+    app.bell_fired.insert("a".into(), true);
+    let widths = OverviewWidths::new(80, &app);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    assert!(text.contains('!'), "{text}");
+    assert!(!text.contains('×'), "{text}");
+}
+
+/// The stale-data cue lives on the refresh countdown now — an underlined name
+/// would double-signal, and the bar brackets stay plain dim.
+#[test]
+fn cached_row_colors_countdown_amber_and_underlines_nothing() {
+    let mut a = profile("a", 95.0, 10.0, 3600);
+    a.fetch_status = Some(FetchStatus::Cached);
+    let config = config_with(vec![a], None, vec![]);
+    let app = App::new(config);
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), now_ms() + 30_000);
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    assert!(
+        line.spans
+            .iter()
+            .all(|s| !s.style.add_modifier.contains(Modifier::UNDERLINED)),
+        "underline cue is retired"
+    );
+    let bracket = line
+        .spans
+        .iter()
+        .find(|s| s.content == "[")
+        .expect("bracketed 5h bar");
+    assert_eq!(bracket.style.fg, theme::dim().fg, "brackets stay plain dim");
+    let countdown = line
+        .spans
+        .iter()
+        .find(|s| s.content.ends_with("s "))
+        .expect("refresh countdown");
+    assert_eq!(countdown.style.fg, Some(theme::warning_color()));
+}
+
+#[test]
+fn failed_row_colors_countdown_red() {
+    let mut a = profile("a", 95.0, 10.0, 3600);
+    a.fetch_status = Some(FetchStatus::Failed);
+    let config = config_with(vec![a], None, vec![]);
+    let app = App::new(config);
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), now_ms() + 30_000);
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let bracket = line
+        .spans
+        .iter()
+        .find(|s| s.content == "[")
+        .expect("bracketed 5h bar");
+    assert_eq!(bracket.style.fg, theme::dim().fg, "brackets stay plain dim");
+    let countdown = line
+        .spans
+        .iter()
+        .find(|s| s.content.ends_with("s "))
+        .expect("refresh countdown");
+    assert_eq!(countdown.style.fg, Some(theme::danger_color()));
 }
 
 /// Gap widening must work from the row's REAL width. `fixed_overview_width`

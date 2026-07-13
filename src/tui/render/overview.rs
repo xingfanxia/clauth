@@ -9,11 +9,11 @@ use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::format::{
-    account_type_label, account_type_style, fixed, fixed_split, health_color, name_style,
-    spinner_frame, spinner_style, window_summary_spans_bracketed,
+    account_type_label, account_type_style, cue_style, fetch_cue_color, fixed, fixed_split,
+    health_color, spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
 use super::header::pulse_name_spans;
-use super::panes::{bold_when, draw_scrollbar, empty_state, section_box, select_line};
+use super::panes::{bold_when, draw_scrollbar, empty_state, name_color, section_box, select_line};
 use crate::fallback::{SwitchAction, next_target, soonest_resume, threshold_for};
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_ms};
@@ -231,6 +231,10 @@ fn render_overview_row(
 
     let active = cfg.is_active(&profile.name);
     let name_str = profile.name.to_string();
+    // Overview rows only: the refresh countdown carries the profile's
+    // fetch-state cue (amber = last-known numbers, red = failed) so staleness
+    // reads off the timer instead of the bar brackets.
+    let cue = fetch_cue_color(profile);
     let cursor = if selected && focused {
         Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
     } else {
@@ -260,14 +264,22 @@ fn render_overview_row(
                     format!("{secs}s")
                 });
             match secs_str {
-                Some(s) => Span::styled(format!("{:>inner$} ", s, inner = inner), theme::faint()),
+                Some(s) => Span::styled(
+                    format!("{:>inner$} ", s, inner = inner),
+                    cue_style(cue, theme::faint()),
+                ),
                 None => Span::raw(" ".repeat(TIMER_SLOT)),
             }
         }
     };
 
     let mut spans = vec![cursor];
-    if app.bell_fired.contains_key(&name_str) {
+    // Marker precedence: broken login (×) > bell (!) > active (●) — a dead
+    // login makes usage alerts moot until re-login.
+    if cfg.is_auth_broken(&profile.name) {
+        spans.push(Span::styled("×", theme::danger()));
+        spans.push(Span::raw(" "));
+    } else if app.bell_fired.contains_key(&name_str) {
         spans.push(Span::styled("!", theme::danger()));
         spans.push(Span::raw(" "));
     } else if active {
@@ -277,14 +289,7 @@ fn render_overview_row(
         spans.push(Span::raw("  "));
     }
     let (nt, np) = fixed_split(&profile.name, widths.name);
-    let ns = bold_when(
-        if active {
-            name_style(profile).fg(theme::accent_2_color())
-        } else {
-            name_style(profile)
-        },
-        selected && focused,
-    );
+    let ns = bold_when(name_color(active), selected && focused);
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
     spans.push(gap(widths));
@@ -305,7 +310,8 @@ fn render_overview_row(
     }
     spans.push(narrow_gap(widths));
     spans.push(timer_span);
-    // Bracketed bars ([███░░░]) for overview account rows only.
+    // Bracketed bars ([███░░░]) for overview account rows only; brackets stay
+    // dim — the fetch-state cue lives on the countdown above instead.
     // Usage-page gauges, chain bars, and fallback thresholds stay bracket-less.
     // OAuth windows come from `usage`; api-key/provider profiles have no `usage`,
     // so the 5h/7d windows are synthesized from the matching third-party bars.

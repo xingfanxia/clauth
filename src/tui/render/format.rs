@@ -1,7 +1,7 @@
 //! Shared formatters and style helpers used across multiple screens.
 //! Screen-only helpers stay in their own modules.
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use super::super::theme;
@@ -43,22 +43,25 @@ pub(super) fn fixed_split(value: &str, width: usize) -> (String, String) {
 #[path = "../../../tests/inline/tui_render_format.rs"]
 mod tests;
 
-pub(super) fn name_style(profile: &Profile) -> Style {
-    let base = Style::default().fg(theme::text_color());
+/// Fetch-state cue for a profile's bracketed bars: amber while the row serves
+/// last-known numbers (cached / rate-limited both do — matches the amber
+/// `rate limited` badge on the usage detail line), red when the fetch failed,
+/// `None` when live.
+pub(super) fn fetch_cue_color(profile: &Profile) -> Option<Color> {
     if !profile.is_oauth() {
-        return base;
+        return None;
     }
     match profile.fetch_status {
-        // Cached and rate-limited both serve last-known numbers — same stale cue
-        // (matches the amber `rate limited` badge on the usage detail line).
-        Some(FetchStatus::Cached | FetchStatus::RateLimited) => base
-            .underline_color(theme::warning_color())
-            .add_modifier(Modifier::UNDERLINED),
-        Some(FetchStatus::Failed) => base
-            .underline_color(theme::danger_color())
-            .add_modifier(Modifier::UNDERLINED),
-        _ => base,
+        Some(FetchStatus::Cached | FetchStatus::RateLimited) => Some(theme::warning_color()),
+        Some(FetchStatus::Failed) => Some(theme::danger_color()),
+        _ => None,
     }
+}
+
+/// The cue color when one is live, else the resting style (dim brackets,
+/// faint no-data dash).
+pub(super) fn cue_style(cue: Option<Color>, resting: Style) -> Style {
+    cue.map(|c| Style::default().fg(c)).unwrap_or(resting)
 }
 
 pub(super) fn account_type_label(profile: &Profile) -> String {
@@ -98,6 +101,7 @@ pub(super) fn window_summary_spans_bracketed(
     let Some(window) = window else {
         return vec![Span::styled("—".to_string(), theme::faint())];
     };
+    let bracket = theme::dim();
     let pct = window.utilization.clamp(0.0, 100.0);
     let color = theme::util_color(pct);
     let style = Style::default().fg(color);
@@ -105,9 +109,9 @@ pub(super) fn window_summary_spans_bracketed(
     if include_bar && width >= 26 {
         // [██████░░░░] XX% (reset)
         let mut spans = vec![
-            Span::styled("[", theme::dim()),
+            Span::styled("[", bracket),
             Span::styled(bar_string_with_cells(pct, 10), style),
-            Span::styled("]", theme::dim()),
+            Span::styled("]", bracket),
             Span::styled(format!(" {:>3.0}%", pct), style),
         ];
         if let Some(r) = format_reset(window) {
@@ -117,18 +121,18 @@ pub(super) fn window_summary_spans_bracketed(
     } else if include_bar && width >= 17 {
         // [██████░░░░] XX%
         vec![
-            Span::styled("[", theme::dim()),
+            Span::styled("[", bracket),
             Span::styled(bar_string_with_cells(pct, 10), style),
-            Span::styled("]", theme::dim()),
+            Span::styled("]", bracket),
             Span::styled(format!(" {:>3.0}%", pct), style),
         ]
     } else if include_bar && width >= 12 {
         // [███░░░] XX%  — bar shrinks to fit
         let bar_cells = width.saturating_sub(7).clamp(3, 7);
         vec![
-            Span::styled("[", theme::dim()),
+            Span::styled("[", bracket),
             Span::styled(bar_string_with_cells(pct, bar_cells), style),
-            Span::styled("]", theme::dim()),
+            Span::styled("]", bracket),
             Span::styled(format!(" {:>3.0}%", pct), style),
         ]
     } else {
