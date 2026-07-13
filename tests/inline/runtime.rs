@@ -761,6 +761,87 @@ fn build_runtime_dir_writes_settings_not_symlink() {
 }
 
 #[test]
+fn build_runtime_dir_strips_active_env_from_another_profile() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        // Live settings carry the active profile's custom env (`FOO`) plus an
+        // operator-owned key (`KEEP`) that must survive every switch/start.
+        fs::write(
+            claude_home.join("settings.json"),
+            br#"{"env":{"FOO":"active","KEEP":"mine"}}"#,
+        )
+        .expect("write settings");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let target = make_profile("target");
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir_with_active_env(
+            &runtime,
+            &claude_home,
+            &target,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+            &["FOO".to_string()],
+        )
+        .expect("build");
+
+        let settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(runtime.join("settings.json")).expect("read"))
+                .expect("parse");
+        assert!(
+            settings["env"].get("FOO").is_none(),
+            "active profile's custom env must not leak into another profile's runtime"
+        );
+        assert_eq!(
+            settings["env"]["KEEP"],
+            serde_json::json!("mine"),
+            "operator env inherited untouched"
+        );
+    });
+}
+
+#[test]
+fn build_runtime_dir_active_env_strip_is_noop_when_target_is_active() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(
+            claude_home.join("settings.json"),
+            br#"{"env":{"FOO":"active"}}"#,
+        )
+        .expect("write settings");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let mut target = make_profile("target");
+        target.env.insert("FOO".into(), "active".into());
+        let canonical = tmp.path().join("creds.json");
+
+        build_runtime_dir_with_active_env(
+            &runtime,
+            &claude_home,
+            &target,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+            &["FOO".to_string()],
+        )
+        .expect("build");
+
+        let settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(runtime.join("settings.json")).expect("read"))
+                .expect("parse");
+        assert_eq!(
+            settings["env"]["FOO"],
+            serde_json::json!("active"),
+            "starting the active profile itself keeps its own env (strip is a no-op)"
+        );
+    });
+}
+
+#[test]
 fn build_runtime_dir_credentials_not_from_claude_home() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
@@ -1184,7 +1265,7 @@ fn acquire_creates_runtime_and_pid_file() {
         fake_claude_home(tmp.path());
         let profile = make_profile("lifecycle");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("acquire");
 
         assert!(
             rt.config_dir().is_dir(),
@@ -1269,7 +1350,7 @@ fn acquire_isolates_credentials_from_real_home() {
             .expect("mkdir profile dir");
         fs::write(&canonical, CREDS_V2).expect("write canonical");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("acquire");
         let runtime_creds = rt.config_dir().join(".credentials.json");
 
         // The runtime's credentials resolve to the profile's OWN chain (V2),
@@ -1322,9 +1403,10 @@ fn acquire_twice_same_process_counts_two_sessions() {
         fake_claude_home(tmp.path());
         let profile = make_profile("concurrent");
 
-        let rt1 = ProfileRuntime::acquire(&profile, Isolation::Shared).expect("first acquire");
+        let rt1 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
         // Pre-fix this second acquire blocks forever on the shared PID flock.
-        let rt2 = ProfileRuntime::acquire(&profile, Isolation::Shared).expect("second acquire");
+        let rt2 =
+            ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
 
         assert_eq!(
             live_session_count("concurrent"),

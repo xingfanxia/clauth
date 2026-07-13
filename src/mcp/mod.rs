@@ -743,8 +743,18 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         return Err(format!("cwd does not exist or is not a directory: {dir}"));
     }
 
+    // Strip the active profile's custom env so a delegate for `<target>` does
+    // not inherit whoever is globally active (mirrors `clauth start`).
+    let active_env_keys: Vec<String> = config
+        .state
+        .active_profile
+        .as_deref()
+        .and_then(|n| config.find(n))
+        .map(|p| p.env.keys().cloned().collect())
+        .unwrap_or_default();
+
     // Guard kept alive across spawn+wait; dropped on return for RAII teardown.
-    let runtime = ProfileRuntime::acquire(target, opts.isolation)
+    let runtime = ProfileRuntime::acquire(target, opts.isolation, &active_env_keys)
         .map_err(|e| format!("failed to acquire runtime: {e}"))?;
 
     let mut command = crate::runtime::claude_command();

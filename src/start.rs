@@ -36,9 +36,21 @@ pub(crate) fn run(
 ) -> Result<()> {
     let profile = config.find(name).context("profile not found")?;
 
+    // Strip the active profile's custom env from the inherited base so a
+    // `clauth start <other>` session doesn't inherit it. The live
+    // `settings.json` is owned by whoever is active; starting that same profile
+    // passes its own keys, which the merge re-inserts (no-op).
+    let active_env_keys: Vec<String> = config
+        .state
+        .active_profile
+        .as_deref()
+        .and_then(|n| config.find(n))
+        .map(|p| p.env.keys().cloned().collect())
+        .unwrap_or_default();
+
     let runtime = {
         let _spinner = Spinner::start("clauth: preparing runtime");
-        ProfileRuntime::acquire(profile, isolation)?
+        ProfileRuntime::acquire(profile, isolation, &active_env_keys)?
     };
 
     #[cfg(unix)]

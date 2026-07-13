@@ -297,7 +297,11 @@ pub(crate) struct ProfileRuntime {
 }
 
 impl ProfileRuntime {
-    pub(crate) fn acquire(profile: &Profile, isolation: Isolation) -> Result<Self> {
+    pub(crate) fn acquire(
+        profile: &Profile,
+        isolation: Isolation,
+        active_env_keys: &[String],
+    ) -> Result<Self> {
         let name = &profile.name;
         let claude_home = claude_dir()?;
         if !claude_home.exists() {
@@ -331,7 +335,15 @@ impl ProfileRuntime {
             std::fs::create_dir_all(&runtime)
                 .with_context(|| format!("failed to create {}", runtime.display()))?;
             let mode = detect_link_mode(&runtime)?;
-            build_runtime_dir(&runtime, &claude_home, profile, &canonical, mode, isolation)?;
+            build_runtime_dir_with_active_env(
+                &runtime,
+                &claude_home,
+                profile,
+                &canonical,
+                mode,
+                isolation,
+                active_env_keys,
+            )?;
             let file = open_pid_file(&pid_file)
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
             file.lock()
@@ -556,13 +568,20 @@ fn is_session_alive(pid_file: &Path) -> bool {
 /// In [`Isolation::Isolated`] mode the [`ISOLATED_SKIP`] entries (operator
 /// memory/plugins/hooks/commands/agents) are omitted and `settings.json` is
 /// built from an empty base, so an authenticated session inherits no house style.
-fn build_runtime_dir(
+///
+/// `active_env_keys` (the live-active profile's custom env) are stripped from
+/// the shared `settings.json` base before this profile's overrides are merged,
+/// so a `clauth start <other>` session does not inherit the active profile's
+/// custom `[env]`. Model + endpoint keys are re-derived per profile in
+/// `build_claude_settings_json`, so only custom `[env]` needs this strip.
+fn build_runtime_dir_with_active_env(
     runtime: &Path,
     claude_home: &Path,
     profile: &Profile,
     canonical: &Path,
     mode: LinkMode,
     isolation: Isolation,
+    active_env_keys: &[String],
 ) -> Result<()> {
     // Drop any top-level symlink whose `~/.claude/` target has vanished before
     // the re-walk. A prior session's link can dangle once the operator moves the
@@ -595,7 +614,7 @@ fn build_runtime_dir(
         pending.push((entry.path(), dst));
     }
     materialize_entries(pending, mode)?;
-    write_merged_settings(runtime, claude_home, profile, isolation)?;
+    write_merged_settings(runtime, claude_home, profile, isolation, active_env_keys)?;
 
     let creds_link = runtime.join(".credentials.json");
     reconcile_credentials(&creds_link, canonical, mode)?;
@@ -603,6 +622,29 @@ fn build_runtime_dir(
     seed_claude_json(runtime, claude_home)?;
 
     Ok(())
+}
+
+/// Test-only convenience over [`build_runtime_dir_with_active_env`]: no active
+/// profile, so nothing is stripped from the inherited base. Inline runtime
+/// tests build dirs directly without a live active profile in scope.
+#[cfg(test)]
+fn build_runtime_dir(
+    runtime: &Path,
+    claude_home: &Path,
+    profile: &Profile,
+    canonical: &Path,
+    mode: LinkMode,
+    isolation: Isolation,
+) -> Result<()> {
+    build_runtime_dir_with_active_env(
+        runtime,
+        claude_home,
+        profile,
+        canonical,
+        mode,
+        isolation,
+        &[],
+    )
 }
 
 /// Remove top-level symlinks in the runtime whose target no longer resolves
@@ -633,18 +675,26 @@ fn prune_dangling_links(runtime: &Path) -> Result<()> {
 /// a last-writer race and stomp a sibling's write. Isolated mode builds from an
 /// empty base (no operator hooks/permissions/statusline/plugin config), keeping
 /// only the profile's own env + model routing.
+///
+/// `active_env_keys` (the live-active profile's custom env) are stripped from
+/// the shared base first, so a `clauth start <other>` session does not inherit
+/// the active profile's custom `[env]`. Model + endpoint keys are re-derived
+/// per profile in `build_claude_settings_json`, so only custom `[env]` needs
+/// this. Callers with no active profile pass empty; starting the active profile
+/// itself passes its own keys, which the merge re-inserts (a no-op strip).
 fn write_merged_settings(
     runtime: &Path,
     claude_home: &Path,
     profile: &Profile,
     isolation: Isolation,
+    active_env_keys: &[String],
 ) -> Result<()> {
     let settings_src = claude_home.join("settings.json");
     let base = match isolation {
         Isolation::Shared => Some(settings_src.as_path()),
         Isolation::Isolated => None,
     };
-    let merged = build_claude_settings_json(base, profile, &[])?;
+    let merged = build_claude_settings_json(base, profile, active_env_keys)?;
     let settings_dst = runtime.join("settings.json");
     let needs_write = std::fs::read(&settings_dst)
         .map(|existing| existing != merged.as_bytes())
