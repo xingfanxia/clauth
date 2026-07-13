@@ -7,8 +7,9 @@
 //! a `clauth start` runtime, fall back to the profile named by
 //! `CLAUDE_CONFIG_DIR` (`profiles/<name>/runtime`): the runtime tree is
 //! per-profile, so that profile owns the session even before its first login
-//! is stored. (3) Otherwise, attribute a fresh login to the credential-less
-//! active profile.
+//! is stored. (3) Otherwise, attribute to the credential-less active profile
+//! (an API-key/endpoint profile, whose creds file is absent after a switch, or
+//! a fresh OAuth login not yet snapshotted).
 //!
 //! Path: honors `CLAUDE_CONFIG_DIR` (the same env var `clauth start` sets) so
 //! a status line running inside an isolated session finds the right file.
@@ -130,7 +131,7 @@ fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
 /// Order: (1) exact refresh-token match; (2) inside a `clauth start` runtime,
 /// the profile named by `CLAUDE_CONFIG_DIR` owns the session even before its
 /// first login is stored; (3) for a non-runtime caller, the credential-less
-/// active profile a fresh login was just written into.
+/// active profile (API-key/endpoint, or a fresh login not yet snapshotted).
 ///
 /// A `CLAUDE_CONFIG_DIR` that isn't a clauth runtime gets step 1 only — its
 /// credentials don't belong to the global active profile.
@@ -152,24 +153,18 @@ fn resolve_profile<'a>(
     if in_session {
         return None;
     }
-    creds
-        .and_then(|c| match_credential_less_active(config, c))
-        .map(|name| (name, Source::CredentialLessActive))
-}
-
-/// Matches a fresh first-login to the credential-less active profile.
-/// Fires only when the active profile has no stored token but the loaded file
-/// has a completed OAuth login — no `refreshToken` match is possible yet.
-fn match_credential_less_active<'a>(
-    config: &'a AppConfig,
-    creds: &ClaudeCredentials,
-) -> Option<&'a str> {
-    creds.refresh_token()?;
-    let active = config.state.active_profile.as_deref()?;
+    // Attribute to the active profile when it has no stored OAuth creds
+    // (API-key/endpoint, or a fresh login not yet snapshotted). Not gated on
+    // `creds`: switching to an API-key profile deletes the creds file, so a
+    // prior refresh-token guard here mis-attributed the active profile as
+    // `unknown`.
     config
-        .find(active)
+        .state
+        .active_profile
+        .as_deref()
+        .and_then(|n| config.find(n))
         .filter(|p| p.credentials.is_none())
-        .map(|p| p.name.as_str())
+        .map(|p| (p.name.as_str(), Source::CredentialLessActive))
 }
 
 fn match_by_refresh_token<'a>(config: &'a AppConfig, refresh_token: &str) -> Option<&'a str> {

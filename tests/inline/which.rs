@@ -181,10 +181,26 @@ fn no_attribution_when_no_active_profile() {
 }
 
 #[test]
-fn no_attribution_without_refresh_token() {
+fn attributes_credential_less_active_without_loaded_refresh_token() {
+    // active credential-less profile owns the session even when the loaded
+    // file carries no refresh token (API-key/endpoint auth carries none).
     let config = config_with(vec![blank_profile("new")], Some("new"));
     let live = live_oauth(None);
-    assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
+    assert_eq!(
+        resolve_profile(&config, Some(&live), false, None),
+        Some(("new", Source::CredentialLessActive))
+    );
+}
+
+#[test]
+fn attributes_api_key_active_when_credentials_file_absent() {
+    // switching to an API-key profile deletes ~/.claude/.credentials.json, so
+    // the loaded creds are `None`. the active profile still owns the session.
+    let config = config_with(vec![endpoint_profile("api")], Some("api"));
+    assert_eq!(
+        resolve_profile(&config, None, false, None),
+        Some(("api", Source::CredentialLessActive))
+    );
 }
 
 #[test]
