@@ -670,10 +670,11 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
             ("a".to_string(), FetchStatus::RateLimited),
             ("b".to_string(), FetchStatus::Fresh),
         ])));
+        let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
         let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
         let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
-        (store, status, activity, pending, pending_off)
+        (store, status, streaks, activity, pending, pending_off)
     };
     let config_handle = |broken: bool| -> crate::profile::ConfigHandle {
         let mut cfg = AppConfig {
@@ -693,11 +694,12 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
     };
 
     // Broken active → the gate is bypassed and the walk queues the sibling.
-    let (store, status, activity, pending, pending_off) = frozen_state();
+    let (store, status, streaks, activity, pending, pending_off) = frozen_state();
     scan_auto_switch(
         &config_handle(true),
         &store,
         &status,
+        &streaks,
         &activity,
         &pending,
         &pending_off,
@@ -707,12 +709,14 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         "a dead active must be walked away from without waiting for a Fresh read"
     );
 
-    // Healthy active, identical frozen stores → the freshness gate holds.
-    let (store, status, activity, pending, pending_off) = frozen_state();
+    // Healthy active, identical frozen stores (lapsed window = headroom, shallow
+    // streak) → the freshness gate holds: not broken, not stuck-RL, not Fresh.
+    let (store, status, streaks, activity, pending, pending_off) = frozen_state();
     scan_auto_switch(
         &config_handle(false),
         &store,
         &status,
+        &streaks,
         &activity,
         &pending,
         &pending_off,
@@ -720,6 +724,130 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
     assert!(
         pending.lock().unwrap().is_empty(),
         "a merely-stale healthy active must still not drive a switch"
+    );
+}
+
+/// RLS-1 (the RateLimited analogue of AUTH-4): a **deep-slot stuck RateLimited**
+/// active bypasses the freshness gate so the daemon stops wedging on a
+/// rate-limited account — but, unlike auth-broken, the switch still faces the
+/// walk's last-known exhaustion gate. Four cases share one frozen shape:
+///   * deep streak (> cap) + genuinely-spent LIVE window → switches away;
+///   * deep streak + LIVE headroom → stays (throttle artifact, no false switch);
+///   * deep streak + stale-HIGH but LAPSED window → stays — the load-bearing
+///     RLS-1↔AUTH-4 asymmetry: this is the exact frozen shape a real 429 storm
+///     holds (the last Fresh window is preserved; after ~5h it lapses to
+///     `resets_at` in the past). An auth-broken active WALKS AWAY on this same
+///     store (it bypasses the exhaustion gate too); a stuck-RL active must NOT,
+///     since `five_hour_live` reads the lapsed window as regained headroom. A
+///     false switch here would log out every running claude over a reset account;
+///   * shallow streak (≤ cap) + spent window → stays (give the active cap's
+///     frequent retries a chance to return a Fresh read first).
+#[test]
+fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
+    use super::{
+        ACTIVE_CAP_MAX_STREAK, FetchStatus, PendingSwitch, PendingSwitchOff, RateLimitStreaks,
+        StatusStore, scan_auto_switch,
+    };
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    // `a` is active and RateLimited; `active_util` on a 5h window whose reset is
+    // `resets_offset` seconds from now (negative = a LAPSED window, which
+    // `five_hour_live` reads as regained headroom regardless of `active_util`);
+    // `streak` sets slot depth. `b` is a viable Fresh sibling.
+    let frozen_state = |active_util: f64, resets_offset: i64, streak: u32| {
+        let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+            (
+                "a".to_string(),
+                UsageInfo {
+                    five_hour: Some(UsageWindow {
+                        utilization: active_util,
+                        resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + resets_offset)),
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                "b".to_string(),
+                UsageInfo {
+                    five_hour: Some(UsageWindow {
+                        utilization: 10.0,
+                        resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ])));
+        let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+            ("a".to_string(), FetchStatus::RateLimited),
+            ("b".to_string(), FetchStatus::Fresh),
+        ])));
+        let streaks: RateLimitStreaks =
+            Arc::new(RankedMutex::new(HashMap::from([("a".to_string(), streak)])));
+        let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+        let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+        (store, status, streaks, activity, pending, pending_off)
+    };
+    let config_handle = || -> crate::profile::ConfigHandle {
+        Arc::new(RankedMutex::new(AppConfig {
+            state: AppState {
+                active_profile: Some("a".into()),
+                profiles: vec!["a".into(), "b".into()],
+                fallback_chain: vec!["a".into(), "b".into()],
+                ..AppState::default()
+            },
+            profiles: vec![
+                Profile::new("a".to_string(), None, None),
+                Profile::new("b".to_string(), None, None),
+            ],
+        }))
+    };
+    let deep = ACTIVE_CAP_MAX_STREAK + 1;
+    // The set of profiles the scan queued a switch to (sorted for determinism).
+    let run = |util: f64, resets_offset: i64, streak: u32| -> Vec<String> {
+        let (store, status, streaks, activity, pending, pending_off) =
+            frozen_state(util, resets_offset, streak);
+        scan_auto_switch(
+            &config_handle(),
+            &store,
+            &status,
+            &streaks,
+            &activity,
+            &pending,
+            &pending_off,
+        );
+        let mut queued: Vec<String> = pending.lock().unwrap().iter().cloned().collect();
+        queued.sort();
+        queued
+    };
+
+    // Deep slot + genuinely spent (LIVE window ≥ threshold) → the wedge breaks.
+    assert_eq!(
+        run(100.0, 3600, deep),
+        vec!["b".to_string()],
+        "a deep-slot stuck RateLimited active that is genuinely spent must be walked away from"
+    );
+    // Deep slot but real LIVE headroom → no false switch (the walk's exhaustion
+    // gate still holds; distrusting the STATUS never means trusting spent NUMBERS).
+    assert!(
+        run(10.0, 3600, deep).is_empty(),
+        "a stuck RateLimited active with last-known headroom must stay put"
+    );
+    // Deep slot + stale-HIGH but LAPSED window (the real post-storm shape) → STAY.
+    // This is where RLS-1 diverges from AUTH-4: a broken active walks away on this
+    // identical store, a stuck-RL one must not — `five_hour_live` reads the lapsed
+    // window as regained headroom, so the account is NOT exhausted.
+    assert!(
+        run(100.0, -3600, deep).is_empty(),
+        "a stuck RateLimited active whose maxed window has since LAPSED must stay put \
+         (regained headroom), never false-switch off a reset account"
+    );
+    // Shallow slot + spent → still gated on Fresh; the active cap's frequent
+    // retries get a chance to return a live read before we distrust.
+    assert!(
+        run(100.0, 3600, ACTIVE_CAP_MAX_STREAK).is_empty(),
+        "a shallow RateLimited active must still wait for a Fresh read"
     );
 }
 

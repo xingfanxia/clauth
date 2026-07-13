@@ -18,7 +18,7 @@ use crate::profile_cache::{
 };
 use crate::profile_json::{provider_label, tier_label, windows_json};
 use crate::providers::ThirdPartyStats;
-use crate::usage::{FetchStatus, epoch_secs_to_iso, now_ms};
+use crate::usage::{FetchStatus, epoch_secs_to_iso, is_stuck_rate_limited, now_ms};
 
 /// Bump when the JSON shape changes in a way readers must branch on.
 pub(crate) const SCHEMA_VERSION: u64 = 1;
@@ -35,6 +35,12 @@ pub(crate) const SCHEMA_VERSION: u64 = 1;
 pub(crate) struct LiveSignals<'a> {
     pub(crate) status: &'a HashMap<String, FetchStatus>,
     pub(crate) next_refresh: &'a HashMap<String, u64>,
+    /// Consecutive-429 streaks, so a profile whose live `status` is `RateLimited`
+    /// AND whose streak has passed the active cap can be published as `stale` (a
+    /// deep-slot stuck read the daemon distrusts — the same judgment
+    /// `scan_auto_switch` acts on). Empty for the single-shot `status --json` (no
+    /// daemon), so `stale` is always `false` there.
+    pub(crate) streaks: &'a HashMap<String, u32>,
     /// The switch target the daemon has accepted but not yet applied (from
     /// `pending_switch`), so a reader can show in-flight truth instead of a
     /// timing heuristic. `None` for the single-shot `status --json` (no daemon).
@@ -144,6 +150,20 @@ pub(crate) fn build_status(
                 None => derived_next(),
             };
 
+            // `stale` = the daemon distrusts this reading — a deep-slot stuck
+            // RateLimited (live status RateLimited AND the 429 streak past the
+            // active cap). Read from the LIVE store, not the mtime-derived
+            // fetch_status string (which never yields RateLimited), so it is only
+            // ever true under a real daemon. The single-shot has no streaks →
+            // always false. Same predicate `scan_auto_switch` distrusts, so the
+            // published flag and the switch decision cannot drift.
+            let stale = match live {
+                Some(sig) => sig.status.get(name).copied().is_some_and(|s| {
+                    is_stuck_rate_limited(s, sig.streaks.get(name).copied().unwrap_or(0))
+                }),
+                None => false,
+            };
+
             // Structured third-party balance isn't carried by ThirdPartyStats
             // (it lives in free-text `rows`); expose only the availability flag
             // for now — enough for a reader's red/green reachability dot.
@@ -163,6 +183,11 @@ pub(crate) fn build_status(
                 "has_live_session": crate::runtime::has_live_session(name),
                 "auth_status": auth_status_str(config, p, now as i64),
                 "fetch_status": fetch_status,
+                // Additive (schema stays 1): true when the daemon distrusts this
+                // reading as a deep-slot stuck RateLimited — readers dim it / show
+                // a "stuck" cue instead of treating it as current truth. Always
+                // false for the single-shot `status --json`.
+                "stale": stale,
                 "fetched_at": mtime_ms.map(iso_from_ms),
                 "next_refresh_at": next_refresh_ms.map(iso_from_ms),
                 "auto_start": p.auto_start,

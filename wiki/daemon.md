@@ -60,6 +60,7 @@ key** — names, tiers, percentages, timestamps only.
       "has_live_session": true,
       "auth_status": "ok",
       "fetch_status": "Fresh",
+      "stale": false,
       "fetched_at": "2026-07-03T19:04:20+00:00",
       "next_refresh_at": "2026-07-03T19:09:20+00:00",
       "auto_start": true,
@@ -89,6 +90,7 @@ key** — names, tiers, percentages, timestamps only.
 | `profiles[].tier` | Plan label (`"Max 5x"`…), `null` when unknown. Opaque display string. |
 | `profiles[].auth_status` | `"ok" \| "expiring" \| "broken"`. `broken` = last refresh rejected as revoked/invalid → excluded from fallback walks, refused as a switch target. `expiring` = past expiry, not yet refreshed. `broken` outranks `expiring`. Absent ⇒ `"ok"`. |
 | `profiles[].fetch_status` | `"Fresh" \| "Cached" \| "Failed" \| "RateLimited"` — the usage fetch's last outcome, so readers can distinguish live bars from last-known. `Failed`/`RateLimited` come only from a live daemon's OAuth fetch leg; api-key profiles (and any name the live stores don't carry yet) derive `Fresh`/`Cached` from their own cache's mtime instead — an api-key profile with a warm cache is never reported as unfetched. `null` = no cache at all (genuinely never fetched). |
+| `profiles[].stale` | `bool` (additive, schema stays 1; absent ⇒ `false`). `true` when the daemon distrusts this reading as a **deep-slot stuck `RateLimited`**: `fetch_status == "RateLimited"` AND the consecutive-429 streak has passed the active-retry cap, so the `/usage` throttle never drained and no `Fresh` read is coming. This is the same judgment the daemon's auto-switch acts on — a stuck-RateLimited active bypasses the "only act on a Fresh read" gate so the chain rotates away instead of wedging (the `RateLimited` analogue of the `auth_status: "broken"` bypass); the switch still requires the active's last-known usage to be genuinely spent, so a throttle blip with headroom stays put. Readers should dim the meter / show a "stuck" cue rather than render the frozen number as current truth. `false` for a shallow/transient `RateLimited`, for every non-`RateLimited` status, and **always** for the single-shot `clauth status --json` (no daemon, no streak history). |
 | `profiles[].fallback` | `null` when not in the chain; else 1-based `position`, `threshold` (%), `armed` (this member is the active one the auto-switch watches). |
 | `profiles[].windows[]` | `label` is **derived, not an enum**: `"5h"` and `"7d"` always; the third is a plan-tier label (`"7d Opus"`…). Treat labels as opaque display strings, never keys to switch on. `utilization_pct` 0–100 float; `resets_at` nullable. |
 | `profiles[].third_party` | `{ "available": bool }` for api-key profiles once probed, else `null` — including an api-key profile whose provider has never been reached (no cache yet). Plain reachability; structured balances deliberately deferred. |

@@ -418,6 +418,14 @@ impl Daemon {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
+        // Snapshot the 429 streaks so build_status can publish `stale` (a
+        // deep-slot stuck RateLimited). Lower rank than config, like the stores
+        // above — snapshot + release before the config lock.
+        let streaks_snap: HashMap<String, u32> = self
+            .rate_limit_streaks
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
         // The in-flight switch target (accepted, not yet applied), so the UI
         // shows in-flight truth instead of a timing heuristic. Snapshot + release
         // before the config lock, like the freshness stores above. The set holds
@@ -431,6 +439,7 @@ impl Daemon {
         let live = LiveSignals {
             status: &status_snap,
             next_refresh: &next_snap,
+            streaks: &streaks_snap,
             pending_switch: pending_snap.as_deref(),
         };
         let body = {
