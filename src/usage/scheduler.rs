@@ -1641,16 +1641,12 @@ fn tick(state: &SchedulerState) {
     );
 }
 
-/// Log a stand-down transition — but never onto a live terminal. The probe
-/// runs only inside the TUI, whose stderr IS the ratatui screen: an
-/// unconditional line would paint over the accounts pane on every launch
-/// beside a daemon. With stderr redirected (a file, a pipe, CI) the
-/// transition is recorded as usual.
+/// Log a stand-down transition. This probe runs only inside the TUI, whose
+/// stderr IS the ratatui screen — but `logline!` now diverts an interactive
+/// terminal to `~/.clauth/clauth.log`, so the line is recorded without ever
+/// painting over the accounts pane.
 fn standdown_transition_log(msg: &str) {
-    use std::io::IsTerminal as _;
-    if !std::io::stderr().is_terminal() {
-        logline!("{msg}");
-    }
+    logline!("{msg}");
 }
 
 /// One scheduler tick while a live daemon owns the loop. The daemon

@@ -40,6 +40,7 @@ use anyhow::{Context, Result};
 
 use crate::claude::{build_claude_settings_json, create_symlink};
 use crate::lock::with_state_lock;
+use crate::logline::logline;
 use crate::profile::{
     ClaudeCredentials, Profile, atomic_write, atomic_write_600, claude_dir, clauth_dir, home_dir,
     profile_subpath,
@@ -368,7 +369,7 @@ impl ProfileRuntime {
                 let mut until_cred = cred_every;
                 while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(CJSON_INTERVAL) {
                     if let Err(e) = crate::claude_json::sync_once() {
-                        eprintln!("clauth: .claude.json sync failed: {e}");
+                        logline!("clauth: .claude.json sync failed: {e}");
                     }
                     until_cred -= 1;
                     if until_cred == 0 {
@@ -380,7 +381,7 @@ impl ProfileRuntime {
                             &watchdog_claude_home,
                             &watchdog_canonical,
                         ) {
-                            eprintln!("clauth: watchdog tick failed: {e}");
+                            logline!("clauth: watchdog tick failed: {e}");
                         }
                     }
                 }
@@ -421,20 +422,20 @@ impl Drop for ProfileRuntime {
             &self.claude_home,
             &self.canonical,
         ) {
-            eprintln!("clauth: final sync failed: {e}");
+            logline!("clauth: final sync failed: {e}");
         }
 
         // Flush this session's last `.claude.json` changes to the global file
         // and siblings before a possible teardown removes this runtime copy.
         if let Err(e) = crate::claude_json::sync_once() {
-            eprintln!("clauth: final .claude.json sync failed: {e}");
+            logline!("clauth: final .claude.json sync failed: {e}");
         }
 
         if let Err(e) = with_state_lock(|| {
             if let Err(e) = std::fs::remove_file(&self.pid_file)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
-                eprintln!("clauth: remove pid file failed: {e}");
+                logline!("clauth: remove pid file failed: {e}");
             }
             let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
             if still_active == 0 {
@@ -443,7 +444,7 @@ impl Drop for ProfileRuntime {
             }
             Ok::<_, anyhow::Error>(())
         }) {
-            eprintln!("clauth: drop cleanup failed: {e}");
+            logline!("clauth: drop cleanup failed: {e}");
         }
     }
 }
@@ -1012,7 +1013,7 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
         if resolve_credential_winner(canonical_exp, runtime_exp, canonical_mtime, runtime_mtime) {
             // Canonical written at/after the runtime re-login (or wins the
             // tie-break); don't overwrite it with the runtime bytes.
-            eprintln!(
+            logline!(
                 "clauth: watchdog kept canonical credentials \
                  (canonical written more recently than runtime); \
                  not overwriting with runtime re-login bytes"

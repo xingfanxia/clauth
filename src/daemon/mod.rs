@@ -12,7 +12,7 @@
 //! the daemon and the TUI share one cache. A single-instance advisory lock keeps
 //! two schedulers from double-firing.
 
-mod log_rotate;
+pub(crate) mod log_rotate;
 mod probe;
 mod status_json;
 mod tick;

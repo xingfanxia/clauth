@@ -16,6 +16,8 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
+#[cfg(unix)]
+use crate::logline::logline;
 use crate::profile::AppConfig;
 use crate::runtime::{Isolation, ProfileRuntime};
 use crate::spinner::Spinner;
@@ -223,7 +225,7 @@ fn forward_signal_or_warn(child: &std::process::Child, signal: i32) {
     if let Err(e) = forward_signal(child, signal)
         && e.raw_os_error() != Some(libc::ESRCH)
     {
-        eprintln!("clauth: failed to forward signal to claude: {e}");
+        logline!("clauth: failed to forward signal to claude: {e}");
     }
 }
 

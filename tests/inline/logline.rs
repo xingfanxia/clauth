@@ -14,10 +14,47 @@ fn daemon_mode_prefixes_an_iso_utc_stamp() {
 }
 
 #[test]
-fn interactive_mode_stays_bare() {
+fn daemon_mode_stays_bare_on_stderr() {
     assert_eq!(
         render(false, BASE_UTC, "clauth: 'a' re-authenticated"),
         "clauth: 'a' re-authenticated",
-        "CLI/TUI stderr keeps the historical bare format"
+        "the daemon's redirected stderr keeps the historical bare format"
     );
+}
+
+#[test]
+fn only_a_non_daemon_line_on_a_terminal_diverts_to_the_log_file() {
+    // The 2026-07-14 corruption: a background scheduler thread's stderr line
+    // paints over the TUI's alternate screen. Diverting to the log file is the
+    // fix, and it must fire in exactly one context.
+    assert_eq!(
+        route(false, true),
+        Sink::LogFile,
+        "interactive TUI/CLI on a tty"
+    );
+    assert_eq!(route(false, false), Sink::Stderr, "piped/redirected stderr");
+    assert_eq!(
+        route(true, true),
+        Sink::Stderr,
+        "daemon in a foreground console"
+    );
+    assert_eq!(
+        route(true, false),
+        Sink::Stderr,
+        "daemon under a supervisor"
+    );
+}
+
+#[test]
+fn write_log_line_appends_each_call() {
+    let path = std::env::temp_dir().join(format!("clauth-logline-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    write_log_line(&path, "first");
+    write_log_line(&path, "second");
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        body, "first\nsecond\n",
+        "each line appends, none clobbers the prior"
+    );
+    let _ = std::fs::remove_file(&path);
 }
