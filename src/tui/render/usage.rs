@@ -21,7 +21,7 @@ use crate::profile::Profile;
 use crate::providers::StatRowKind;
 use crate::usage::{
     ExtraPeriod, FetchStatus, ProfileActivity, UsageWindow, WindowDollars, ideal_pace_pct,
-    is_stuck_rate_limited, now_epoch_secs, now_ms,
+    now_epoch_secs, now_ms,
 };
 
 const KEY_W: usize = 8;
@@ -32,10 +32,10 @@ struct HeaderState {
     activity: ProfileActivity,
     next_refresh_ms: Option<u64>,
     tick: u64,
-    /// Deep-slot stuck `RateLimited` (`is_stuck_rate_limited`, #40): the same
-    /// judgment the auto-switch distrusts and `status.json` publishes as
-    /// `stale`, so all three surfaces share one predicate.
-    stuck: bool,
+    /// Consecutive-429 streak for the shown profile (0 when absent). The
+    /// `RateLimited` suffix names which retry the countdown leads to, so a
+    /// deep slot reads as stuck from the count alone, no judgment label.
+    streak: u32,
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -100,10 +100,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .ok()
             .and_then(|m| m.get(profile.name.as_str()).copied()),
         tick: app.tick_count,
-        stuck: matches!(profile.fetch_status, Some(s) if is_stuck_rate_limited(
-            s,
-            streaks.get(profile.name.as_str()).copied().unwrap_or(0),
-        )),
+        streak: streaks.get(profile.name.as_str()).copied().unwrap_or(0),
     };
 
     let show_estimates = cfg.state.show_estimates;
@@ -728,20 +725,24 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
             // A staleness cue, not a failure: the endpoint is throttling us and
             // the shown numbers are last-known — amber like `cached`, not the
             // red `failed` gets, so it doesn't contradict the live-looking bar.
-            // A deep-slot stuck read names the wedge: the throttle never
-            // drained, so "retrying" would oversell how live the numbers are.
-            let label = if header.stuck {
-                "rate limited, stuck"
-            } else {
-                "rate limited"
-            };
             spans.extend([
                 Span::styled("[ ", theme::dim()),
-                Span::styled(label, theme::warning().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "rate limited",
+                    theme::warning().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" ]", theme::dim()),
             ]);
             if let Some(c) = countdown {
-                spans.push(Span::styled(format!("  · retry in {c}"), theme::faint()));
+                // The retry ordinal makes slot depth visible — a high count
+                // means the throttle never drained (#40's distrust boundary
+                // sits past the 6th) — without a judgment label.
+                let suffix = if header.streak > 0 {
+                    format!("  · {} retry in {c}", ordinal(header.streak))
+                } else {
+                    format!("  · retry in {c}")
+                };
+                spans.push(Span::styled(suffix, theme::faint()));
             }
         }
         _ => match countdown {
@@ -750,6 +751,18 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
         },
     }
     Line::from(spans)
+}
+
+/// English ordinal (`1st`, `2nd`, `3rd`, `4th`, `11th`…) for the retry count.
+fn ordinal(n: u32) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
 }
 
 /// Terminal message for an OAuth profile with nothing renderable. "loading"

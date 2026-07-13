@@ -208,29 +208,50 @@ fn empty_msg_pending_fetch_loads() {
     assert_eq!(oauth_empty_msg(&profile), "loading");
 }
 
-/// The `[ rate limited ]` pill names a deep-slot stuck read (`HeaderState.stuck`,
-/// the #40 distrust predicate) so the frozen numbers read as distrusted, not
-/// merely mid-retry; a shallow 429 keeps the plain label.
+/// The `[ rate limited ]` suffix names which retry the countdown leads to
+/// (`HeaderState.streak`) so a deep slot reads as stuck from the count alone;
+/// a zero streak keeps the bare `retry in` suffix.
 #[test]
-fn status_pill_names_a_deep_slot_stuck_rate_limited() {
+fn rate_limited_suffix_counts_the_retry() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.fetch_status = Some(FetchStatus::RateLimited);
-    let header = |stuck: bool| HeaderState {
+    let header = |streak: u32| HeaderState {
         is_active: false,
         activity: ProfileActivity::Idle,
-        next_refresh_ms: None,
+        next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
-        stuck,
+        streak,
     };
     let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
 
-    assert!(text(status_line(&profile, &header(true))).contains("rate limited, stuck"));
-    let plain = text(status_line(&profile, &header(false)));
-    assert!(plain.contains("rate limited"));
+    assert!(text(status_line(&profile, &header(7))).contains("7th retry in"));
+    let bare = text(status_line(&profile, &header(0)));
+    assert!(bare.contains("· retry in"));
     assert!(
-        !plain.contains("stuck"),
-        "a shallow RateLimited must not be labeled stuck"
+        !bare.contains("th retry"),
+        "a zero streak must not invent a retry count"
     );
+}
+
+/// The retry ordinal survives English's teen exceptions (`11th`–`13th` beat
+/// the `1`/`2`/`3` last-digit rules).
+#[test]
+fn ordinal_covers_teens_and_edge_digits() {
+    for (n, want) in [
+        (1, "1st"),
+        (2, "2nd"),
+        (3, "3rd"),
+        (4, "4th"),
+        (11, "11th"),
+        (12, "12th"),
+        (13, "13th"),
+        (21, "21st"),
+        (22, "22nd"),
+        (23, "23rd"),
+        (111, "111th"),
+    ] {
+        assert_eq!(ordinal(n), want);
+    }
 }
 
 // ── extra / spend credit bar ──────────────────────────────────────────────────
