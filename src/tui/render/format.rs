@@ -104,22 +104,23 @@ pub(super) fn window_summary_spans_bracketed(
 
     if include_bar && width >= 26 {
         // [██████░░░░] XX% (reset)
-        let reset = format_reset(window)
-            .map(|r| format!(" ({r})"))
-            .unwrap_or_default();
-        vec![
+        let mut spans = vec![
             Span::styled("[", theme::dim()),
             Span::styled(bar_string_with_cells(pct, 10), style),
             Span::styled("]", theme::dim()),
-            Span::styled(format!(" {:>2.0}%{reset}", pct), style),
-        ]
+            Span::styled(format!(" {:>3.0}%", pct), style),
+        ];
+        if let Some(r) = format_reset(window) {
+            spans.push(Span::styled(format!(" ({r})"), theme::faint()));
+        }
+        spans
     } else if include_bar && width >= 17 {
         // [██████░░░░] XX%
         vec![
             Span::styled("[", theme::dim()),
             Span::styled(bar_string_with_cells(pct, 10), style),
             Span::styled("]", theme::dim()),
-            Span::styled(format!(" {:>2.0}%", pct), style),
+            Span::styled(format!(" {:>3.0}%", pct), style),
         ]
     } else if include_bar && width >= 12 {
         // [███░░░] XX%  — bar shrinks to fit
@@ -128,10 +129,10 @@ pub(super) fn window_summary_spans_bracketed(
             Span::styled("[", theme::dim()),
             Span::styled(bar_string_with_cells(pct, bar_cells), style),
             Span::styled("]", theme::dim()),
-            Span::styled(format!(" {:>2.0}%", pct), style),
+            Span::styled(format!(" {:>3.0}%", pct), style),
         ]
     } else {
-        vec![Span::styled(format!("{pct:>2.0}%"), style)]
+        vec![Span::styled(format!("{pct:>3.0}%"), style)]
     }
 }
 
