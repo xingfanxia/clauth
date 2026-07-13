@@ -81,6 +81,47 @@ fn per_profile_fields_never_propagate() {
 }
 
 #[test]
+fn account_scoped_model_caches_stay_per_profile() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let a = tmp.path().join("a.json");
+    let b = tmp.path().join("b.json");
+    write_json(
+        &a,
+        &json!({
+            "numStartups": 2,
+            "orgModelDefaultCache": {"model": "opus"},
+            "modelAccessCache": {"opus": true},
+            "additionalModelCostsCache": {"opus": 1},
+            "additionalModelOptionsCache": {"opus": ["context-1m"]}
+        }),
+    );
+    // b omits two of the caches entirely and carries its own values for the rest.
+    write_json(
+        &b,
+        &json!({
+            "numStartups": 1,
+            "modelAccessCache": {"sonnet": true},
+            "additionalModelCostsCache": {},
+        }),
+    );
+    set_mtime(&a, t(10));
+    set_mtime(&b, t(5));
+
+    sync_paths(&[a, b.clone()]).expect("sync");
+
+    let bj = read_json(&b);
+    assert_eq!(bj["numStartups"], json!(2), "shared field still propagates");
+    // a's account-scoped model state never bleeds into b
+    assert!(
+        bj.get("orgModelDefaultCache").is_none(),
+        "absent per-profile key must not be injected from the winner"
+    );
+    assert!(bj.get("additionalModelOptionsCache").is_none());
+    assert_eq!(bj["modelAccessCache"], json!({"sonnet": true}));
+    assert_eq!(bj["additionalModelCostsCache"], json!({}));
+}
+
+#[test]
 fn shared_key_absent_in_winner_is_removed_from_target() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = tmp.path().join("a.json");

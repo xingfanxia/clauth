@@ -35,6 +35,14 @@ const PER_PROFILE_FIELDS: &[&str] = &[
     "passesEligibilityCache",
     "passesLastSeenRemaining",
     "cachedExtraUsageDisabledReason",
+    // Account/org-scoped model caches Claude Code writes into `.claude.json`.
+    // Syncing them would bleed one account's model access, org default, and
+    // per-model cost/option tables into every other account. Each profile
+    // re-fetches its own on first boot, so per-profile is lossless.
+    "orgModelDefaultCache",
+    "modelAccessCache",
+    "additionalModelCostsCache",
+    "additionalModelOptionsCache",
 ];
 
 /// Newest mtime from the last [`sync_once`] that did work. Short-circuits ticks
