@@ -766,6 +766,16 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     if let Some(dir) = opts.cwd {
         command.current_dir(dir);
     }
+    // Resolve the cwd the spawned `claude` will actually run in: the caller's
+    // override, else this process's own cwd (inherited like `start.rs`). If
+    // it's the real `$HOME`, guard against the project-settings leak.
+    let effective_cwd = match opts.cwd {
+        Some(dir) => Some(std::path::PathBuf::from(dir)),
+        None => std::env::current_dir().ok(),
+    };
+    if let Some(dir) = effective_cwd.as_deref() {
+        crate::runtime::guard_home_project_settings(&mut command, dir);
+    }
     command.args(&opts.extra_args);
 
     let mut child = command

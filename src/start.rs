@@ -62,6 +62,13 @@ pub(crate) fn run(
     // the parent process env. The target's runtime settings.json re-supplies
     // whichever it defines. Mirrors the delegate path (run_delegate).
     crate::runtime::scrub_profile_env(&mut command, &active_env_keys);
+    // `claude` inherits this process's cwd (no `.current_dir()` call here); if
+    // that's the real `$HOME`, its project-tier settings lookup would hit the
+    // real `~/.claude/settings.json` and re-leak the globally active profile's
+    // env, this time outranking the runtime settings.json below.
+    if let Ok(cwd) = std::env::current_dir() {
+        crate::runtime::guard_home_project_settings(&mut command, &cwd);
+    }
     command.env("CLAUDE_CONFIG_DIR", runtime.config_dir());
     // Isolated: also suppress global/project MCP servers wired through
     // `.claude.json`, so the only extension surface is what the caller passes.

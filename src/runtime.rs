@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 use crate::claude::{build_claude_settings_json, create_symlink};
 use crate::lock::with_state_lock;
 use crate::profile::{
-    ClaudeCredentials, Profile, atomic_write, atomic_write_600, claude_dir, clauth_dir,
+    ClaudeCredentials, Profile, atomic_write, atomic_write_600, claude_dir, clauth_dir, home_dir,
     profile_subpath,
 };
 
@@ -486,6 +486,38 @@ pub(crate) fn scrub_profile_env(command: &mut std::process::Command, active_env_
     }
     for key in active_env_keys {
         command.env_remove(key);
+    }
+}
+
+/// True when `dir` resolves to the real `$HOME`. `CLAUDE_CONFIG_DIR` only
+/// relocates Claude Code's USER-tier settings source; the PROJECT tier is a
+/// wholly separate `<cwd>/.claude/settings.json` lookup with no ancestor walk,
+/// and it outranks the user tier on any key it defines. When the spawned
+/// `claude`'s cwd is exactly `$HOME`, `<cwd>/.claude/` IS the real
+/// `~/.claude/` — the file clauth itself writes for whichever profile is
+/// globally active — so that profile's `env` silently overrides the target's.
+/// Canonicalizes both sides so a symlinked `$HOME` still matches.
+fn cwd_is_real_home(dir: &Path) -> bool {
+    let Ok(home) = home_dir() else {
+        return false;
+    };
+    match (dir.canonicalize(), home.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => dir == home,
+    }
+}
+
+/// When `cwd` resolves to the real `$HOME`, append `--setting-sources user` so
+/// Claude Code skips the project/local settings tiers entirely (their lookup
+/// is cwd-based, and `<$HOME>/.claude/` is the same directory as the real
+/// user-tier settings). Elsewhere a project's own committed
+/// `.claude/settings.json` (permissions, hooks, statusline) still applies, as
+/// today. `cwd` is the resolved directory the spawned `claude` will actually
+/// run in — the caller's explicit cwd override if any, else the process's own
+/// current directory.
+pub(crate) fn guard_home_project_settings(command: &mut std::process::Command, cwd: &Path) {
+    if cwd_is_real_home(cwd) {
+        command.arg("--setting-sources").arg("user");
     }
 }
 

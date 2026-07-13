@@ -3,7 +3,7 @@ use super::*;
 use std::fs;
 use std::time::{Duration, SystemTime};
 
-use crate::testutil::set_mtime;
+use crate::testutil::{HomeSandbox, set_mtime};
 
 // V1 expires_at < V2 so tie-break tests can assert which side wins unambiguously.
 const CREDS_V1: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok1","expiresAt":1000}}"#;
@@ -1825,5 +1825,41 @@ fn scrub_profile_env_drops_managed_and_active_custom_keys() {
         envs.get("FOO"),
         Some(&None),
         "active custom env key must be stripped",
+    );
+}
+
+#[test]
+fn cwd_is_real_home_matches_only_the_sandboxed_home() {
+    let sandbox = HomeSandbox::new();
+    assert!(cwd_is_real_home(sandbox.home()));
+
+    let elsewhere = sandbox.home().join("repos").join("some-project");
+    fs::create_dir_all(&elsewhere).expect("create project dir");
+    assert!(!cwd_is_real_home(&elsewhere));
+}
+
+#[test]
+fn guard_home_project_settings_appends_setting_sources_only_at_home() {
+    let sandbox = HomeSandbox::new();
+
+    let mut at_home = std::process::Command::new("claude");
+    guard_home_project_settings(&mut at_home, sandbox.home());
+    let args: Vec<_> = at_home
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        vec!["--setting-sources".to_string(), "user".to_string()],
+        "cwd == $HOME must force the user-only settings tier"
+    );
+
+    let elsewhere = sandbox.home().join("repos").join("some-project");
+    fs::create_dir_all(&elsewhere).expect("create project dir");
+    let mut in_project = std::process::Command::new("claude");
+    guard_home_project_settings(&mut in_project, &elsewhere);
+    assert!(
+        in_project.get_args().next().is_none(),
+        "a normal project cwd must keep reading its own project settings"
     );
 }
