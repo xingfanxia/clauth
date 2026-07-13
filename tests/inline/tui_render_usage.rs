@@ -208,6 +208,31 @@ fn empty_msg_pending_fetch_loads() {
     assert_eq!(oauth_empty_msg(&profile), "loading");
 }
 
+/// The `[ rate limited ]` pill names a deep-slot stuck read (`HeaderState.stuck`,
+/// the #40 distrust predicate) so the frozen numbers read as distrusted, not
+/// merely mid-retry; a shallow 429 keeps the plain label.
+#[test]
+fn status_pill_names_a_deep_slot_stuck_rate_limited() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::RateLimited);
+    let header = |stuck: bool| HeaderState {
+        is_active: false,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        stuck,
+    };
+    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+
+    assert!(text(status_line(&profile, &header(true))).contains("rate limited, stuck"));
+    let plain = text(status_line(&profile, &header(false)));
+    assert!(plain.contains("rate limited"));
+    assert!(
+        !plain.contains("stuck"),
+        "a shallow RateLimited must not be labeled stuck"
+    );
+}
+
 // ── extra / spend credit bar ──────────────────────────────────────────────────
 //
 // `extra_usage` (legacy) and `spend` (newer) are the same credit cap on a real
