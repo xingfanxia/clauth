@@ -479,7 +479,14 @@ pub(crate) fn rename_profile(config: &mut AppConfig, old: &str, new: &str) -> Re
             link_profile_credentials(new)?;
         }
         Ok(())
-    })
+    })?;
+    // The dir move carried the durable `/profile` stamp to `new`, so only the OLD
+    // name's memo is left — authoritative over a stamp no longer under that name.
+    // Sequential, never inside the closure: `ProfileTtl` (450) ranks outside the
+    // state flock (500), so this asserts if it ever moves in — see that rank's doc
+    // for why the clock's file IO must not hold a cross-process flock.
+    crate::usage::expire_profile_ttl(old);
+    Ok(())
 }
 
 pub(crate) fn delete_profile(config: &mut AppConfig, name: &str, force: bool) -> Result<()> {
@@ -531,7 +538,12 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str, force: bool) ->
         config.remove(name);
         save_app_state(&config.state)?;
         Ok(())
-    })
+    })?;
+    // `remove_dir_all` took the durable stamp with it; the memo would outlive the
+    // profile and mute the first `/profile` of a same-name relogin inside the hour.
+    // Outside the closure — see `rename_profile` on the rank order.
+    crate::usage::expire_profile_ttl(name);
+    Ok(())
 }
 
 pub(crate) fn create_blank_profile(
@@ -703,7 +715,10 @@ pub(crate) fn create_profile_from_login(
 /// `usage_history.jsonl` is a persisted log, not a cache, and is left alone;
 /// the per-profile fetch caches (`usage_cache.json`, `third_party_cache.json`,
 /// `throughput_cache.json`) describe the OLD account and are dropped so the
-/// UI doesn't show stale numbers under the swapped-in credentials.
+/// UI doesn't show stale numbers under the swapped-in credentials. The
+/// `/profile` TTL clock describes the old account too and is expired for the
+/// same reason — otherwise the swapped-in account's tier stays unfetched (and,
+/// with `usage_cache.json` just dropped, unrendered) for up to an hour.
 pub(crate) fn overwrite_captured_profile(
     config: &mut AppConfig,
     name: &str,
@@ -734,9 +749,7 @@ pub(crate) fn overwrite_captured_profile(
             crate::profile_cache::THIRD_PARTY_CACHE_FILE,
             crate::throughput::THROUGHPUT_CACHE_FILE,
         ] {
-            if let Some(path) = crate::profile_cache::profile_cache_path(name, file) {
-                let _ = std::fs::remove_file(path);
-            }
+            crate::profile_cache::remove_profile_cache(name, file);
         }
 
         if config.state.active_profile.is_none() {
@@ -762,7 +775,15 @@ pub(crate) fn overwrite_captured_profile(
         // Pinned by `reauth_overwrite_clears_broken_flag`.
         config.set_auth_broken(name, false);
         save_app_state(&config.state)
-    })
+    })?;
+    // Outside the closure — see `rename_profile` on the rank order. Skipped when
+    // the swap fails, which is imprecise rather than atomic: a failure after
+    // `save_profile` leaves the new credentials on disk under the old account's
+    // stamp. Bounded either way — an unexpired stamp lapses within the hour, and a
+    // tick racing the gap between the flock release and this expire spends the
+    // stale stamp once or loses a fresh one and re-pulls once.
+    crate::usage::expire_profile_ttl(name);
+    Ok(())
 }
 
 /// Blank a profile's OAuth login: drop its stored credentials and per-account
@@ -791,9 +812,7 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &str) -> R
             crate::profile_cache::THIRD_PARTY_CACHE_FILE,
             crate::throughput::THROUGHPUT_CACHE_FILE,
         ] {
-            if let Some(path) = crate::profile_cache::profile_cache_path(name, file) {
-                let _ = std::fs::remove_file(path);
-            }
+            crate::profile_cache::remove_profile_cache(name, file);
         }
 
         if was_active {
@@ -802,7 +821,14 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &str) -> R
             save_app_state(&config.state)?;
         }
         Ok(())
-    })
+    })?;
+    // The dropped login's TTL clock is the old account's; a re-login into this
+    // shell must pull its own tier now, not an hour from now. Outside the closure
+    // — see `rename_profile` on the rank order. Skipped when the logout fails,
+    // which `clear_claude_credentials` makes imprecise rather than atomic: the
+    // stored credentials are already gone by then, with the stamp left to lapse.
+    crate::usage::expire_profile_ttl(name);
+    Ok(())
 }
 
 /// Setup-tab "log out" for an API account: drop the stored api key while keeping

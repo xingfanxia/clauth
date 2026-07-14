@@ -522,6 +522,124 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
     }
 }
 
+// ── /profile TTL clock across account swaps ─────────────────────────────────
+//
+// The clock is per profile NAME but describes the account behind it. Swapping a
+// different account onto a name (reauth, capture-overwrite, adopt-divergence)
+// leaves an anchored profile whose stamp belongs to the old account — the anchor
+// gate can't catch that, so the new account's tier would go unfetched for up to
+// an hour, with `usage_cache.json` just dropped and nothing to render meanwhile.
+// Asserting through `take_profile_fetch` (not the stamp file) covers BOTH halves:
+// the TUI swaps in-process, where a surviving memo outranks a deleted file.
+
+/// Save `name` as an ANCHORED profile — the anchor is what makes the durable half
+/// of its clock count — and arm the clock exactly as a live fetch would.
+fn armed_ttl_profile(name: &str, t0: u64) -> Profile {
+    let profile = Profile::new(name.to_string(), None, None);
+    save_profile(&profile).expect("save profile");
+    crate::profile_cache::write_profile_cache(
+        name,
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        &"uuid-old-account".to_string(),
+    );
+    assert!(
+        crate::usage::take_profile_fetch(name, false, t0),
+        "the first attempt arms the clock"
+    );
+    assert!(
+        !crate::usage::take_profile_fetch(name, false, t0 + 60_000),
+        "precondition: the clock is armed and would mute /profile"
+    );
+    profile
+}
+
+/// Config holding `profile`, with a different profile marked active so the swap
+/// paths skip their live-relink branches.
+fn inactive_config(profile: Profile) -> AppConfig {
+    AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            fallback_chain: vec![profile.name.clone()],
+            active_profile: Some("someone-else".into()),
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    }
+}
+
+#[test]
+fn overwrite_captured_profile_expires_the_profile_ttl_clock() {
+    let _home = HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    let mut config = inactive_config(armed_ttl_profile("ttl-swap", t0));
+
+    overwrite_captured_profile(
+        &mut config,
+        "ttl-swap",
+        CaptureSnapshot {
+            credentials: None,
+            base_url: Some("https://api.example.com".to_string()),
+            api_key: Some("new-api-key".to_string()),
+        },
+    )
+    .expect("overwrite in place");
+
+    assert!(
+        crate::usage::take_profile_fetch("ttl-swap", false, t0 + 120_000),
+        "the swapped-in account must pull its own /profile now, not up to an hour later"
+    );
+}
+
+#[test]
+fn clear_profile_credentials_expires_the_profile_ttl_clock() {
+    let _home = HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    let mut config = inactive_config(armed_ttl_profile("ttl-logout", t0));
+
+    clear_profile_credentials(&mut config, "ttl-logout").expect("log out");
+
+    assert!(
+        crate::usage::take_profile_fetch("ttl-logout", false, t0 + 120_000),
+        "a re-login into the blanked shell must pull its own tier, not the old account's clock"
+    );
+}
+
+#[test]
+fn delete_profile_expires_the_profile_ttl_clock() {
+    let _home = HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    let mut config = inactive_config(armed_ttl_profile("ttl-del", t0));
+
+    delete_profile(&mut config, "ttl-del", false).expect("delete");
+
+    // `remove_dir_all` took the durable stamp; only the memo could survive here,
+    // and it would mute the first /profile of a same-name relogin in this process.
+    assert!(
+        crate::usage::take_profile_fetch("ttl-del", false, t0 + 120_000),
+        "the memo must not outlive the profile it describes"
+    );
+}
+
+#[test]
+fn rename_profile_expires_the_old_names_ttl_clock_and_carries_the_stamp() {
+    let _home = HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    let mut config = inactive_config(armed_ttl_profile("ttl-ren-old", t0));
+
+    rename_profile(&mut config, "ttl-ren-old", "ttl-ren-new").expect("rename");
+
+    assert!(
+        crate::usage::take_profile_fetch("ttl-ren-old", false, t0 + 120_000),
+        "the old name's memo is stranded over a stamp that moved away — expire it"
+    );
+    // Same account, same clock: the dir move carried the anchor and the stamp, so
+    // the new name inherits the hour rather than paying a fresh /profile for it.
+    assert!(
+        !crate::usage::take_profile_fetch("ttl-ren-new", false, t0 + 120_000),
+        "a rename is not an account swap — the new name reuses the durable stamp"
+    );
+}
+
 /// A reauth overwrite replaces the dead credential chain — the whole point of
 /// re-logging in — so it must lift the profile's `auth_broken` quarantine,
 /// exactly like the fresh-capture path (`capture_into_profile`) does. Left

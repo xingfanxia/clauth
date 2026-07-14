@@ -22,6 +22,8 @@
 //! - `partition_due`: `last_fetched` → `activity`.
 //! - `apply_usage`: `usage_store` → `usage_status` → `config`.
 //! - rotation/save sites: `config` → state flock → `activity`.
+//! - `/profile` TTL clock: `rotation` → `profile_ttl` (post-401 retry) and
+//!   `config` → `profile_ttl` (the account-swap actions that expire it).
 //!
 //! Standalone leaves (`refetch_queue`, the `pending_*` sets) are never nested
 //! with another tracked lock; they are ranked above the rest so that a future
@@ -79,9 +81,6 @@ pub(crate) mod rank {
         /// post-rotation retry reserves a slot while the rotation flock is held.
         UsageThrottle = 150;
         LastFetched = 200;
-        /// `/profile` re-fetch TTL clock in `usage::fetch`. Leaf — acquired and
-        /// released inside the profile-fetch decision, never under another lock.
-        ProfileTtl = 210;
         /// Per-profile consecutive-429 streak driving exponential rate-limit
         /// backoff in `usage::scheduler`. Leaf — bumped and released before the
         /// `last_fetched`/`status` write in `apply_outcome`.
@@ -93,6 +92,24 @@ pub(crate) mod rank {
         UsageStore = 300;
         UsageStatus = 350;
         Config = 400;
+        /// `/profile` re-fetch TTL clock in `usage::fetch` (in-memory memo +
+        /// durable stamp). A true leaf: every acquisition is take-read/insert-
+        /// release, and the stamp's disk IO stays outside it, so nothing is ever
+        /// acquired while it is held. That is what lets it rank as late as its
+        /// HOLDERS need rather than as early as it is taken — ranking a true leaf
+        /// later is monotonically safe, since a higher rank can only legalize call
+        /// sites, never invert an existing one. Two real holders: `Rotation`, on
+        /// every `fetch_with_rotation` → `fetch_raw` → take path that runs under
+        /// the rotation guard, and `Config`, on the account-swap actions that
+        /// expire it.
+        ///
+        /// Deliberately INSIDE `Config` (400) and OUTSIDE `State` (500). The rank
+        /// is what enforces the latter: taking or expiring the clock does file IO,
+        /// and the state flock is a CROSS-PROCESS serialization point, so holding
+        /// it across that IO lengthens contention for every other clauth process.
+        /// Move an `expire_profile_ttl` back inside a `with_state_lock` and this
+        /// asserts.
+        ProfileTtl = 450;
         /// `with_state_lock` (cross-process state flock). Inner of `config`.
         State = 500;
         Activity = 600;

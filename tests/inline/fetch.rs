@@ -338,6 +338,9 @@ fn window_duration_parses_provider_labels() {
 /// persistently failing endpoint is still capped at one attempt per hour.
 #[test]
 fn take_profile_fetch_honors_ttl_force_and_expiry() {
+    // Sandboxed: the decision now stamps a per-profile file, which must never
+    // land in the real `~/.clauth`.
+    let _home = crate::testutil::HomeSandbox::new();
     let t0 = 1_000_000_000_000u64;
 
     // First load (no stamp) → fetch; then the same name within the hour → reuse,
@@ -372,6 +375,233 @@ fn take_profile_fetch_honors_ttl_force_and_expiry() {
     assert!(
         take_profile_fetch("ttl-expire", false, t0 + 120_000),
         "expiring the TTL forces a re-pull"
+    );
+}
+
+// ── durable /profile TTL (survives a restart) ────────────────────────────────
+//
+// The in-memory clock is empty at every process start, so the first tick after a
+// launch used to pull `/profile` for EVERY profile at once — against a 429-prone
+// host, and with the plan already sitting in `usage_cache.json`. The stamp is
+// persisted per profile so the hour the policy claims is the hour it enforces.
+
+/// Give `name` an identity anchor, the gate that lets its durable stamp count.
+fn anchor(name: &str) {
+    write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &"uuid-anchored".to_string());
+}
+
+/// The persisted `/profile` attempt stamp, as the next process would read it.
+fn durable_stamp(name: &str) -> Option<u64> {
+    load_profile_cache::<u64>(name, PROFILE_FETCHED_CACHE_FILE)
+}
+
+#[test]
+fn a_relaunch_inside_the_hour_reuses_the_durable_stamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    anchor("ttl-relaunch");
+
+    assert!(
+        take_profile_fetch("ttl-relaunch", false, t0),
+        "first ever load has no stamp anywhere → pull /profile"
+    );
+    assert_eq!(
+        durable_stamp("ttl-relaunch"),
+        Some(t0),
+        "the attempt is stamped to disk, not just to the map"
+    );
+
+    forget_profile_memo("ttl-relaunch");
+    assert!(
+        !take_profile_fetch("ttl-relaunch", false, t0 + 60_000),
+        "a relaunch inside the hour must reuse the cached plan — the whole point"
+    );
+}
+
+#[test]
+fn a_durable_stamp_past_the_ttl_still_re_pulls() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    anchor("ttl-durable-stale");
+
+    assert!(take_profile_fetch("ttl-durable-stale", false, t0));
+    forget_profile_memo("ttl-durable-stale");
+    assert!(
+        take_profile_fetch("ttl-durable-stale", false, t0 + PROFILE_TTL_MS + 1),
+        "the hour lapses across a restart like any other — the stamp is a clock, not a mute"
+    );
+}
+
+#[test]
+fn an_unanchored_profile_ignores_the_durable_stamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    // No `anchor()` — `seed_identity_anchor`'s backfill rides the /profile body,
+    // and deferring it by an hour is exactly what wedges an unanchored profile in
+    // `auth_broken` once its stored pair dies.
+    assert!(take_profile_fetch("ttl-unanchored", false, t0));
+    forget_profile_memo("ttl-unanchored");
+    assert!(
+        take_profile_fetch("ttl-unanchored", false, t0 + 60_000),
+        "an anchor-less profile pays one /profile per launch until the backfill lands"
+    );
+}
+
+#[test]
+fn a_blank_anchor_counts_as_absent_for_the_durable_stamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    // Shape drift, not an identity — same contract as `seed_identity_anchor`.
+    write_profile_cache(
+        "ttl-blank-anchor",
+        ACCOUNT_ID_CACHE_FILE,
+        &"   ".to_string(),
+    );
+
+    assert!(take_profile_fetch("ttl-blank-anchor", false, t0));
+    forget_profile_memo("ttl-blank-anchor");
+    assert!(
+        take_profile_fetch("ttl-blank-anchor", false, t0 + 60_000),
+        "a blank uuid is no anchor, so its durable stamp must not be honored"
+    );
+}
+
+#[test]
+fn expire_profile_ttl_clears_the_durable_stamp_too() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    anchor("ttl-expire-durable");
+
+    assert!(take_profile_fetch("ttl-expire-durable", false, t0));
+    assert!(!take_profile_fetch(
+        "ttl-expire-durable",
+        false,
+        t0 + 60_000
+    ));
+
+    expire_profile_ttl("ttl-expire-durable");
+    assert_eq!(
+        durable_stamp("ttl-expire-durable"),
+        None,
+        "the manual single refresh must drop the durable stamp, not only the memo"
+    );
+    // Dropping only the memo would fall straight back to the fresh disk stamp and
+    // silently reduce the manual refresh to a no-op for /profile.
+    assert!(
+        take_profile_fetch("ttl-expire-durable", false, t0 + 120_000),
+        "expiring the TTL forces a re-pull"
+    );
+}
+
+#[test]
+fn force_bypasses_a_fresh_durable_stamp_and_restamps_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    anchor("ttl-force-durable");
+
+    assert!(take_profile_fetch("ttl-force-durable", false, t0));
+    forget_profile_memo("ttl-force-durable");
+    assert!(
+        take_profile_fetch("ttl-force-durable", true, t0 + 60_000),
+        "a 401 retry re-pulls /profile despite a fresh durable stamp"
+    );
+    assert_eq!(
+        durable_stamp("ttl-force-durable"),
+        Some(t0 + 60_000),
+        "the forced attempt re-stamps the durable clock"
+    );
+}
+
+#[test]
+fn a_failing_endpoint_stays_capped_across_restarts() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    anchor("ttl-storm");
+
+    // The decision is taken BEFORE the request, so an attempt that yields no plan
+    // (a persistently 500ing /profile) is stamped exactly like a successful one.
+    assert!(take_profile_fetch("ttl-storm", false, t0));
+    assert_eq!(
+        durable_stamp("ttl-storm"),
+        Some(t0),
+        "a failure can't un-stamp an attempt"
+    );
+
+    forget_profile_memo("ttl-storm");
+    assert!(
+        !take_profile_fetch("ttl-storm", false, t0 + 60_000),
+        "a failing endpoint must not become a per-launch storm either"
+    );
+}
+
+/// The TUI holds the `Config` guard across its account swaps (`let mut cfg =
+/// app.config(); overwrite_captured_profile(&mut cfg, ..)`), so the clock is taken
+/// at rank `Config`. Rank `ProfileTtl` INSIDE it or every debug-build TUI
+/// rename/delete/reauth/logout panics on the lock-order assert. The action tests
+/// pass a bare `&mut AppConfig` and never enter the ranked guard, so this is the
+/// only place that sees it.
+#[test]
+fn the_ttl_clock_is_reachable_under_the_config_guard() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _config_rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::Config>();
+
+    // Both halves of the swap path: a lock-order violation panics here, it does
+    // not merely return the wrong answer.
+    expire_profile_ttl("ttl-under-config");
+    assert!(
+        take_profile_fetch("ttl-under-config", false, 1_000_000_000_000),
+        "the clock stays usable while the guard the TUI swaps hold is held"
+    );
+}
+
+#[test]
+fn a_stamp_in_the_future_is_not_freshness() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    anchor("ttl-rollback");
+
+    // Stamped against a wall clock running an hour fast, which NTP then corrects
+    // back. Saturating the age to 0 would read as perpetually fresh — and, now
+    // that the stamp is durable, would mute /profile across every restart until
+    // real time caught up.
+    assert!(take_profile_fetch(
+        "ttl-rollback",
+        false,
+        t0 + PROFILE_TTL_MS
+    ));
+    forget_profile_memo("ttl-rollback");
+
+    assert!(
+        take_profile_fetch("ttl-rollback", false, t0),
+        "a stamp in the future is not trustworthy freshness — fail toward fetching"
+    );
+    assert_eq!(
+        durable_stamp("ttl-rollback"),
+        Some(t0),
+        "the corrected clock re-stamps the bogus one instead of preserving it"
+    );
+}
+
+#[test]
+fn the_durable_stamp_is_read_at_most_once_per_process() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    anchor("ttl-memo");
+
+    assert!(take_profile_fetch("ttl-memo", false, t0));
+    forget_profile_memo("ttl-memo");
+    assert!(
+        !take_profile_fetch("ttl-memo", false, t0 + 60_000),
+        "the cold map falls back to the durable stamp"
+    );
+
+    // Both inputs deleted: a per-tick disk read would now see an unanchored
+    // profile with no stamp and fire.
+    remove_profile_cache("ttl-memo", PROFILE_FETCHED_CACHE_FILE);
+    remove_profile_cache("ttl-memo", ACCOUNT_ID_CACHE_FILE);
+    assert!(
+        !take_profile_fetch("ttl-memo", false, t0 + 120_000),
+        "the memoized stamp answers every later tick — one disk read per profile per process"
     );
 }
 

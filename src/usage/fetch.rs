@@ -5,6 +5,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::lockorder::{RankedMutex, rank};
+use crate::profile_cache::{
+    ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache, remove_profile_cache,
+    write_profile_cache,
+};
 
 use super::scheduler::{ActivityStore, ProfileActivity, mark_activity};
 
@@ -18,9 +22,12 @@ const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
 /// clock). Halves the steady request volume against the rate-limited host.
 const PROFILE_TTL_MS: u64 = 60 * 60 * 1000;
 
-/// Per-profile epoch-ms of the last `/profile` fetch attempt — the TTL clock for
-/// the policy above. Process-global and leaf-ranked: locked and released
-/// entirely within the fetch decision, never nested under another tracked lock.
+/// Per-profile epoch-ms of the last `/profile` fetch attempt — the in-memory half
+/// of the TTL clock for the policy above, backed by a durable per-profile stamp
+/// ([`PROFILE_FETCHED_CACHE_FILE`]) so the hour survives a restart. A true leaf
+/// (`rank::ProfileTtl`): every acquisition is take-read/insert-release and none
+/// spans the stamp's disk IO, which is what lets the rank sit late enough for its
+/// real holders (`Rotation` on the post-401 retry, `Config` on an account swap).
 static PROFILE_FETCHED: LazyLock<RankedMutex<HashMap<String, u64>, rank::ProfileTtl>> =
     LazyLock::new(|| RankedMutex::new(HashMap::new()));
 
@@ -846,28 +853,84 @@ fn get_json(
 
 /// Mark `name`'s plan stale so the next fetch re-pulls `/profile` — the manual
 /// single-profile refresh (Usage `r` / action menu). A global "refresh all"
-/// deliberately does not call this, so it keeps reusing the cached plan.
+/// deliberately does not call this, so it keeps reusing the cached plan. Clears
+/// BOTH halves of the clock: dropping only the map entry would leave the durable
+/// stamp to be read straight back in as fresh, silently reducing the manual
+/// refresh to a no-op for `/profile`.
 pub(crate) fn expire_profile_ttl(name: &str) {
+    if let Ok(mut m) = PROFILE_FETCHED.lock() {
+        m.remove(name);
+    }
+    remove_profile_cache(name, PROFILE_FETCHED_CACHE_FILE);
+}
+
+/// Drop `name`'s in-memory memo while leaving the durable stamp in place — what
+/// a process restart looks like to [`take_profile_fetch`], which is the whole
+/// point of the durable half and can't otherwise be exercised in one process.
+#[cfg(test)]
+fn forget_profile_memo(name: &str) {
     if let Ok(mut m) = PROFILE_FETCHED.lock() {
         m.remove(name);
     }
 }
 
-/// Decide whether to fetch `/profile` this round and stamp the attempt. Fetches
-/// on a forced refresh (401 retry / manual single), on first load (no stamp yet,
-/// incl. each process start), or once the hourly TTL lapses. Stamping on attempt
-/// — success or failure alike — caps `/profile` at one hit per hour per profile,
-/// so a persistently failing endpoint can't turn into a per-tick storm (the plan
-/// is best-effort; a cold profile just shows no tier until the next hourly try).
-fn take_profile_fetch(name: &str, force: bool, now: u64) -> bool {
-    let fresh = PROFILE_FETCHED
+/// The profile has a usable identity anchor. A blank/whitespace uuid is shape
+/// drift, never an identity — same contract as [`seed_identity_anchor`] and
+/// [`fetch_account_uuid`].
+fn has_identity_anchor(name: &str) -> bool {
+    load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE).is_some_and(|u| !u.trim().is_empty())
+}
+
+/// The last `/profile` attempt stamp for `name`, honouring the durable stamp only
+/// once the profile is anchored. `seed_identity_anchor` backfills the anchor as a
+/// ride-along on the `/profile` body, so trusting the stamp of an anchor-less
+/// profile would defer that backfill by up to an hour — and it is exactly the
+/// unanchored profile that needs it, since without an anchor a dead stored pair
+/// wedges the profile in `auth_broken`. Unanchored profiles therefore pay one
+/// `/profile` per launch until the first backfill lands, then join everyone else.
+fn last_profile_attempt(name: &str) -> Option<u64> {
+    if let Some(t) = PROFILE_FETCHED
         .lock()
         .ok()
         .and_then(|m| m.get(name).copied())
-        .is_some_and(|t| now.saturating_sub(t) < PROFILE_TTL_MS);
+    {
+        return Some(t);
+    }
+    if !has_identity_anchor(name) {
+        return None;
+    }
+    // Cold map (process start): adopt the durable stamp and memoize it, so the
+    // disk is read at most once per profile per process. The lock is taken fresh
+    // here — never held across the read above.
+    let disk = load_profile_cache::<u64>(name, PROFILE_FETCHED_CACHE_FILE)?;
+    if let Ok(mut m) = PROFILE_FETCHED.lock() {
+        m.insert(name.to_string(), disk);
+    }
+    Some(disk)
+}
+
+/// Decide whether to fetch `/profile` this round and stamp the attempt. Fetches
+/// on a forced refresh (401 retry / manual single), on first load (no stamp on
+/// disk either), or once the hourly TTL lapses. Stamping on attempt — success or
+/// failure alike — caps `/profile` at one hit per hour per profile, so a
+/// persistently failing endpoint can't turn into a per-tick storm (the plan is
+/// best-effort; a cold profile just shows no tier until the next hourly try).
+///
+/// A stamp in the FUTURE (clock rollback: an NTP correction, a VM restore) is not
+/// freshness and never counts as such — `checked_sub` fails toward fetching, which
+/// also re-stamps the bogus clock back to sanity. Saturating the age to `0` here
+/// would instead mute `/profile` until wall-clock caught up, and — now that the
+/// stamp outlives the process — it would stay muted across every restart.
+pub(crate) fn take_profile_fetch(name: &str, force: bool, now: u64) -> bool {
+    let fresh = last_profile_attempt(name)
+        .and_then(|t| now.checked_sub(t))
+        .is_some_and(|age| age < PROFILE_TTL_MS);
     let want = force || !fresh;
-    if want && let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.insert(name.to_string(), now);
+    if want {
+        if let Ok(mut m) = PROFILE_FETCHED.lock() {
+            m.insert(name.to_string(), now);
+        }
+        write_profile_cache(name, PROFILE_FETCHED_CACHE_FILE, &now);
     }
     want
 }
@@ -951,7 +1014,6 @@ pub(super) fn fetch_raw(
 /// fails SAFE — a wrong anchor only makes adoption refuse and self-heals on
 /// the next login/adopt, so a cross-process lock isn't worth its weight here.
 fn seed_identity_anchor(name: &str, profile: &RawProfile) {
-    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache, write_profile_cache};
     let Some(uuid) = profile
         .account
         .as_ref()

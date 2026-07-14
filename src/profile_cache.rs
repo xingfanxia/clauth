@@ -22,6 +22,12 @@ pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
 /// login belonging to a DIFFERENT account (`oauth::try_adopt_live_rotation`).
 pub(crate) const ACCOUNT_ID_CACHE_FILE: &str = "account_id.json";
 
+/// Epoch-ms of this profile's last `/profile` fetch attempt (a bare JSON number).
+/// Derived data: the durable half of `usage::fetch`'s once-per-hour-per-profile
+/// TTL clock, so a relaunch reuses the cached plan instead of re-pulling
+/// `/profile` for every profile at once.
+pub(crate) const PROFILE_FETCHED_CACHE_FILE: &str = "profile_fetched.json";
+
 /// Resolve `<profile_dir>/<file>` for `name`. `None` only when the per-profile
 /// dir itself can't be resolved (matches the prior per-layer `cache_path`).
 pub(crate) fn profile_cache_path(name: &str, file: &str) -> Option<PathBuf> {
@@ -52,6 +58,15 @@ pub(crate) fn write_profile_cache<T: Serialize>(name: &str, file: &str, value: &
         return;
     };
     let _ = crate::profile::atomic_write_600(&path, json.as_bytes());
+}
+
+/// Delete `<profile_dir>/<file>`. Best-effort, same contract as the writer: an
+/// already-absent file and any removal error alike leave the caller with "no
+/// cache", which is the intended post-state either way.
+pub(crate) fn remove_profile_cache(name: &str, file: &str) {
+    if let Some(path) = profile_cache_path(name, file) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Epoch-ms of `<profile_dir>/<file>`'s last write, or `None` when it's absent.
