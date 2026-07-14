@@ -1,11 +1,12 @@
 //! Program-wide Config tab — a single panel of global settings, distinct from
 //! the per-account Setup tab. Rows back real persisted state in `AppState`:
 //! the theme tier (`[theme]`), the divergence default, the refresh interval, the
-//! chain-wide wrap-off default, the opt-in burn-aware auto-switch mode
-//! (issue #8 follow-up b), and the opt-in preemptive rotation of the active
-//! account (rotation coherence #1). ↑↓ walks the rows; space cycles a row's value
-//! in place; ⏎ opens the refresh-interval custom-value editor and otherwise
-//! mirrors space. No left selector, no popups — these settings are global.
+//! spent-account poll toggle, the chain-wide wrap-off default, the weekly
+//! exhaustion line, the opt-in burn-aware auto-switch mode (issue #8 follow-up
+//! b), and the opt-in preemptive rotation of the active account (rotation
+//! coherence #1). ↑↓ walks the rows; space cycles a row's value in place; ⏎
+//! opens the refresh-interval and weekly-threshold custom-value editors and
+//! otherwise mirrors space. No left selector, no popups — settings are global.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -23,7 +24,18 @@ use super::panes::{
     head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, label_style, section_box,
 };
 
+/// Width of the key column: the longest key (`weekly limit`). Keys pad to it,
+/// then [`KEY_GUTTER`] separates them from the value — so every row's value
+/// starts at the same column (the Config tab is a cloudy-tui tight chip group).
 const KEY_W: usize = 12;
+/// Fixed gap between the padded key and the value column.
+const KEY_GUTTER: usize = 2;
+
+/// `key` padded to the shared value column: `KEY_W` cells + a `KEY_GUTTER` gap.
+fn key_cell(key: &str) -> String {
+    let width = KEY_W.max(key.chars().count());
+    format!("{key:<width$}{}", " ".repeat(KEY_GUTTER))
+}
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let block = section_box("settings", true, true);
@@ -36,6 +48,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             wrap_off: state.wrap_off,
             burn_aware: state.burn_aware_switching,
             preemptive: state.preemptive_rotation,
+            refresh_spent: state.refresh_spent_accounts,
         }
     };
     let refresh_interval_ms = app
@@ -71,10 +84,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Some(input) => {
                 // The native terminal cursor owns the caret; the row renders plain
                 // (no highlight) with the edit gutter + sunken field, like the chain
-                // threshold editor. x = "✎ " (2) + key block (KEY_W) + pre-caret cols.
+                // threshold editor. x = "✎ " (2) + key block + pre-caret cols.
                 let cx = inner
                     .x
-                    .saturating_add((2 + KEY_W + head_cols(input)) as u16);
+                    .saturating_add((2 + KEY_W + KEY_GUTTER + head_cols(input)) as u16);
                 let cy = inner.y.saturating_add(lines.len() as u16);
                 caret = Some((cx, cy));
                 lines.push(line);
@@ -112,6 +125,7 @@ struct ToggleState {
     wrap_off: bool,
     burn_aware: bool,
     preemptive: bool,
+    refresh_spent: bool,
 }
 
 fn row_hint(
@@ -156,6 +170,13 @@ fn row_hint(
                 "refresh the active account's login ahead of expiry (macos keychain)"
             } else {
                 "refresh the active account's login only when a request rejects it"
+            }
+        }
+        GlobalConfigRow::RefreshSpentAccounts => {
+            if toggles.refresh_spent {
+                "keep refetching usage for spent accounts every interval"
+            } else {
+                "skip refetching a spent account until its window resets"
             }
         }
     };
@@ -244,6 +265,9 @@ fn detail_row(
             ],
             selected,
         ),
+        GlobalConfigRow::RefreshSpentAccounts => {
+            toggle_row(arrow, "poll spent", toggles.refresh_spent, selected)
+        }
     }
 }
 
@@ -276,8 +300,10 @@ fn refresh_cycle_line(
         .iter()
         .any(|(_, ms)| *ms == refresh_interval_ms)
     {
+        // 2 spaces + the last option's reserved trailing cell = the same 3-cell
+        // gap the options keep between themselves.
         line.push_span(Span::styled(
-            format!("   {}s", refresh_interval_ms / 1000),
+            format!("  {}s", refresh_interval_ms / 1000),
             theme::accent(),
         ));
     }
@@ -289,11 +315,7 @@ fn refresh_cycle_line(
 /// caret, so the buffer renders with uniform styling — no simulated block cursor.
 fn refresh_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
     let invalid = parse_refresh_secs(input.trimmed()).is_none();
-    let pad = KEY_W.saturating_sub("refresh".chars().count()).max(1);
-    let mut spans = vec![
-        arrow,
-        Span::styled(format!("refresh{}", " ".repeat(pad)), label_style(true)),
-    ];
+    let mut spans = vec![arrow, Span::styled(key_cell("refresh"), label_style(true))];
     spans.extend(value_caret(input, invalid));
     let unit_style = if invalid {
         theme::danger()
@@ -348,7 +370,7 @@ fn weekly_cycle_line(arrow: Span<'static>, weekly_pct: f64, selected: bool) -> L
     let mut line = cycle_row(arrow, "weekly limit", &options, selected);
     if !WEEKLY_PRESETS.contains(&weekly_pct) {
         line.push_span(Span::styled(
-            format!("   {}%", format_weekly_pct(weekly_pct)),
+            format!("  {}%", format_weekly_pct(weekly_pct)),
             theme::accent(),
         ));
     }
@@ -359,11 +381,9 @@ fn weekly_cycle_line(arrow: Span<'static>, weekly_pct: f64, selected: bool) -> L
 /// (DANGER when out of range) + ` %` unit. Mirrors `refresh_edit_line`.
 fn weekly_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
     let invalid = parse_weekly_pct(input.trimmed()).is_none();
-    let key = "weekly limit";
-    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     let mut spans = vec![
         arrow,
-        Span::styled(format!("{key}{}", " ".repeat(pad)), label_style(true)),
+        Span::styled(key_cell("weekly limit"), label_style(true)),
     ];
     spans.extend(value_caret(input, invalid));
     let unit_style = if invalid {
@@ -386,21 +406,20 @@ fn weekly_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> 
     }
 }
 
-/// A cloudy-tui cycle row: `key   [active]  other`. The active option is `ACCENT`
-/// (bracketed only while the row is the cursor), the rest `TEXT_FAINT`; space
-/// cycles the value in place. Reads as the segmented control it is, instead of a
-/// single value that silently swaps text on cycle.
+/// A cloudy-tui cycle row: `key  label  [active]  other`. Options are bare
+/// labels separated by 2-space gaps; the active option is `ACCENT` and wraps in
+/// `[]` only while the row holds the cursor, the rest stay `TEXT_FAINT`. `space`
+/// cycles the value in place. Reads as the segmented control it is, instead of
+/// a single value that silently swaps text on cycle.
 fn cycle_row(
     arrow: Span<'static>,
     key: &str,
     options: &[(&str, bool)],
     row_selected: bool,
 ) -> Line<'static> {
-    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
-    let key_style = label_style(row_selected);
     let mut spans = vec![
         arrow,
-        Span::styled(format!("{key}{}", " ".repeat(pad)), key_style),
+        Span::styled(key_cell(key), label_style(row_selected)),
     ];
     for (i, (label, active)) in options.iter().enumerate() {
         if i > 0 {
@@ -411,18 +430,39 @@ fn cycle_row(
     Line::from(spans)
 }
 
-/// One segment of a cycle row. Active → `ACCENT`: `[label]` when the row is the
-/// cursor, ` label ` (bracket cells reserved as spaces) when blurred so focus
-/// never reflows the row. Inactive → bare `TEXT_FAINT`.
+/// One segment of a cycle row: the active option renders `[label]` while the row
+/// holds the cursor (the bracket pair is the focus cue), bare `label` otherwise.
+/// Active → `ACCENT`, rest `TEXT_FAINT`.
 fn cycle_option(label: &str, active: bool, row_selected: bool) -> Span<'static> {
-    if active {
-        let text = if row_selected {
-            format!("[{label}]")
-        } else {
-            format!(" {label} ")
-        };
-        Span::styled(text, theme::accent())
+    let style = if active {
+        theme::accent()
     } else {
-        Span::styled(label.to_string(), theme::faint())
-    }
+        theme::faint()
+    };
+    let text = if active && row_selected {
+        format!("[{label}]")
+    } else {
+        label.to_string()
+    };
+    Span::styled(text, style)
 }
+
+/// A cloudy-tui toggle row: `key  ─●` / `key  ○─`. A pure on/off boolean is a
+/// toggle, not a 2-option cycle — `on`/`off` labels in brackets read as a cycle,
+/// not the switch the contract draws. Knob `ACCENT` when on, `TEXT_FAINT` off.
+fn toggle_row(arrow: Span<'static>, key: &str, on: bool, row_selected: bool) -> Line<'static> {
+    let (glyph, style) = if on {
+        (theme::toggle_on(), theme::accent())
+    } else {
+        (theme::toggle_off(), theme::faint())
+    };
+    Line::from(vec![
+        arrow,
+        Span::styled(key_cell(key), label_style(row_selected)),
+        Span::styled(glyph, style),
+    ])
+}
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_global_config.rs"]
+mod tests;

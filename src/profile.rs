@@ -280,6 +280,15 @@ pub(crate) struct AppState {
     /// See `usage::scheduler::proactive_rotation_due`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) preemptive_rotation: bool,
+    /// When false, the background usage fetch skips accounts already pinned at
+    /// their 100% window cap (spent) until the window resets — a spent window
+    /// can't change until then, so re-polling only burns quota + poll load.
+    /// Default true (poll every account every interval — today's behavior). A
+    /// forced `r` refresh and a never-fetched account still poll once (a reset
+    /// is only observed by polling). Fetch-leg only: never touches
+    /// switch/fallback predicates. See `usage::scheduler` + `windows_maxed`.
+    #[serde(default = "default_refresh_spent", skip_serializing_if = "is_true")]
+    pub(crate) refresh_spent_accounts: bool,
     /// Config-file theme override. CLI `--theme` flag takes priority; auto-
     /// detect applies when this is `None` and no flag was passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -333,6 +342,10 @@ fn default_show_estimates() -> bool {
     true
 }
 
+fn default_refresh_spent() -> bool {
+    true
+}
+
 fn is_true(b: &bool) -> bool {
     *b
 }
@@ -382,6 +395,7 @@ impl Default for AppState {
             auth_broken: Vec::new(),
             burn_aware_switching: false,
             preemptive_rotation: false,
+            refresh_spent_accounts: true,
             theme: None,
             show_estimates: true,
             show_pace: false,

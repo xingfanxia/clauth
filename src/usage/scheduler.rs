@@ -11,7 +11,7 @@ use crate::providers::ThirdPartyStats;
 
 use super::fetch::{
     FetchError, PlanInfo, UsageInfo, UsageWindow, await_request_slot, epoch_secs_to_iso, fetch_raw,
-    five_hour_live, iso_to_epoch_secs, now_epoch_secs, now_ms,
+    five_hour_live, iso_to_epoch_secs, now_epoch_secs, now_ms, windows_maxed,
 };
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
@@ -1659,8 +1659,22 @@ fn tick(state: &SchedulerState) {
     // countdown map never shows a leg as momentarily missing (and a deleted
     // profile's stale key is dropped by the full replace).
     let now = now_ms();
-    let (oauth_due, oauth_next) =
+    let (mut oauth_due, oauth_next) =
         partition_and_merge(&oauth_snapshot, &forced, state, now, interval_ms);
+    // Config toggle (`refresh_spent_accounts`): when off, drop accounts already
+    // pinned at their 100% window cap from this tick's OAuth fetch — a spent
+    // window can't change until it resets, so re-polling only burns quota +
+    // poll load. Forced (`r`) and never-fetched accounts are never dropped (a
+    // reset is only observed by polling). Fetch-leg only; switch/fallback
+    // predicates are untouched. Default-on keeps stock behavior bit-identical.
+    let refresh_spent = state
+        .config
+        .lock()
+        .map(|c| c.state.refresh_spent_accounts)
+        .unwrap_or(true);
+    if !refresh_spent {
+        drop_spent_oauth(state, &mut oauth_due, &forced);
+    }
     let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
@@ -2139,6 +2153,41 @@ fn merge_forced<T: NamedEntry + Clone>(
         extras.push(entry.clone());
     }
     due.extend(extras);
+}
+
+/// Drop OAuth entries whose usage windows are maxed (spent) from this tick's due
+/// set, unless the name was force-refreshed. Reads the usage store once. A
+/// never-fetched account (no store entry) is kept — a reset can only be seen by
+/// polling. A dropped account keeps its published countdown and is re-judged
+/// next interval, so it resumes the moment its window lapses. Backs the
+/// `refresh_spent_accounts` config toggle; never consulted while it's on.
+fn drop_spent_oauth(state: &SchedulerState, due: &mut Vec<TokenEntry>, forced: &HashSet<String>) {
+    if due.is_empty() {
+        return;
+    }
+    let now_secs = now_epoch_secs();
+    let Ok(store) = state.store.lock() else {
+        return; // can't read usage → fail safe to polling everything
+    };
+    retain_pollable(due, forced, &store, now_secs);
+}
+
+/// Keep only entries worth polling with `refresh_spent_accounts` OFF: a forced
+/// name, a never-fetched name (no store entry — a reset is only seen by
+/// polling), or one whose windows aren't maxed. Pure over the store map so it
+/// tests without a full `SchedulerState`.
+fn retain_pollable(
+    due: &mut Vec<TokenEntry>,
+    forced: &HashSet<String>,
+    store: &HashMap<String, UsageInfo>,
+    now_secs: i64,
+) {
+    due.retain(|entry| {
+        forced.contains(&entry.name)
+            || store
+                .get(&entry.name)
+                .is_none_or(|info| !windows_maxed(info, now_secs))
+    });
 }
 
 /// Clear any forced name that no leg scheduled this tick — its profile vanished

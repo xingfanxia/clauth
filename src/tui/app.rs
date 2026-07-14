@@ -249,7 +249,8 @@ pub(crate) enum GlobalConfigRow {
     /// (`AppState.weekly_switch_threshold`, default 98) — space steps presets,
     /// ⏎ opens the custom-value editor (50–100, decimals allowed).
     WeeklyThreshold,
-    /// Global refresh interval; `+`/`-` steps through presets in-place.
+    /// Global refresh interval; space cycles presets in-place, ⏎ opens the
+    /// custom-value editor (10–3600 s).
     RefreshInterval,
     /// Default action when CC overwrites the credentials symlink. ⏎/space cycles.
     DivergenceDefault,
@@ -263,6 +264,11 @@ pub(crate) enum GlobalConfigRow {
     /// expiry; an optimization over adopt + mirror-on-rotate, not a
     /// correctness mechanism.
     PreemptiveRotation,
+    /// Whether the background usage fetch still polls spent (100%-capped)
+    /// accounts (`AppState.refresh_spent_accounts`, default on). Off skips a
+    /// spent account until its window resets — a fetch-leg optimization only,
+    /// never a switch/fallback input. ENUMERATED on/off, ⏎ mirrors space.
+    RefreshSpentAccounts,
 }
 
 /// Inline editor state for the Config detail pane. Built on entry, torn down
@@ -3385,10 +3391,11 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
 ];
 
 /// Rows on the program-wide Config tab, in display order.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 7] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 8] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
+    GlobalConfigRow::RefreshSpentAccounts,
     GlobalConfigRow::WrapOff,
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
@@ -3397,10 +3404,9 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 7] = [
 
 /// Config tab keymap (enumerated rows only, per the unified value-row grammar):
 /// ↑↓ walks rows; space cycles every row's value forward, wrapping the top
-/// value back to the first (theme tier, divergence default, refresh preset,
-/// wrap-off); ⏎ opens the refresh-interval custom-value editor and otherwise
-/// mirrors space. No row here binds `+`/`-` (that's reserved for the Fallback
-/// tab's continuous `rotate at` threshold).
+/// value back to the first; ⏎ opens the refresh-interval and weekly-threshold
+/// custom-value editors and otherwise mirrors space. No row here binds `+`/`-`
+/// (that's reserved for the Fallback tab's continuous `rotate at` threshold).
 fn handle_global_config_key(app: &mut App, key: KeyEvent) {
     let last = GLOBAL_CONFIG_ROWS.len() - 1;
     app.global_config_cursor = app.global_config_cursor.min(last);
@@ -3448,6 +3454,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
+        GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
     }
 }
 
@@ -3636,6 +3643,19 @@ fn toggle_preemptive_rotation(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.preemptive_rotation = !cfg.state.preemptive_rotation;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_state_mtime = app_state_mtime();
+}
+
+/// Flip whether the background fetch polls spent (100%-capped) accounts
+/// (`refresh_spent_accounts`, default on). Same persistence shape as
+/// `toggle_preemptive_rotation`; the scheduler reads the flag off the shared
+/// config each tick, so no separate propagation is needed.
+fn toggle_refresh_spent_accounts(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.refresh_spent_accounts = !cfg.state.refresh_spent_accounts;
         let _ = save_app_state(&cfg.state);
     }
     app.last_state_mtime = app_state_mtime();

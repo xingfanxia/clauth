@@ -123,6 +123,34 @@ fn preemptive_rotation_defaults_false_and_round_trips() {
     );
 }
 
+// `refresh_spent_accounts` defaults to TRUE (poll every account — today's
+// behavior) so pre-field profiles.toml files load unchanged; only an explicit
+// `false` opt-out renders, and the default is omitted (the inverse serde shape
+// of the default-off toggles above, matching `show_estimates`).
+#[test]
+fn refresh_spent_accounts_defaults_true_and_round_trips() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(state.refresh_spent_accounts, "absent → default on");
+
+    let off = AppState {
+        refresh_spent_accounts: false,
+        ..AppState::default()
+    };
+    let rendered_off = toml::to_string_pretty(&off).expect("render off state");
+    assert!(
+        rendered_off.contains("refresh_spent_accounts = false"),
+        "an explicit opt-out must render, got:\n{rendered_off}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_off).expect("reparse off state");
+    assert!(!reparsed.refresh_spent_accounts);
+
+    let rendered_on = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_on.contains("refresh_spent_accounts"),
+        "default (on) must be omitted, got:\n{rendered_on}"
+    );
+}
+
 #[test]
 fn profile_name_is_serde_transparent() {
     // `ProfileName` must serialize as a bare string so profiles.toml stays

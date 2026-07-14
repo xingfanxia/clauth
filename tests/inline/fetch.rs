@@ -19,6 +19,69 @@ fn raw_profile(uuid: Option<&str>) -> RawProfile {
     serde_json::from_str(&text).expect("fixture profile parses")
 }
 
+// ── windows_maxed: the `refresh_spent_accounts` fetch-skip predicate ─────────
+
+fn window(util: f64, resets_at: &str) -> UsageWindow {
+    UsageWindow {
+        utilization: util,
+        resets_at: Some(resets_at.to_string()),
+    }
+}
+
+const FUTURE: &str = "2999-01-01T00:00:00+00:00";
+const PAST: &str = "2020-01-01T00:00:00+00:00";
+
+/// A live window at (or past) the 100% cap reads as maxed on either the 5h or
+/// the 7d leg; a live 7d cap alone is enough.
+#[test]
+fn windows_maxed_true_for_a_live_capped_window() {
+    let now = BASE_UTC;
+    let five_capped = UsageInfo {
+        five_hour: Some(window(100.0, FUTURE)),
+        ..Default::default()
+    };
+    assert!(windows_maxed(&five_capped, now), "live 5h at 100% is maxed");
+
+    let seven_capped = UsageInfo {
+        seven_day: Some(window(100.0, FUTURE)),
+        ..Default::default()
+    };
+    assert!(
+        windows_maxed(&seven_capped, now),
+        "live 7d at 100% is maxed"
+    );
+}
+
+/// Not maxed when the window is below the cap, lapsed (reset already passed, so
+/// quota is renewed), or absent — each is a case the fetch must keep polling.
+#[test]
+fn windows_maxed_false_when_below_cap_or_lapsed_or_absent() {
+    let now = BASE_UTC;
+
+    let below = UsageInfo {
+        five_hour: Some(window(99.9, FUTURE)),
+        ..Default::default()
+    };
+    assert!(
+        !windows_maxed(&below, now),
+        "99.9% is still moving, not maxed"
+    );
+
+    let lapsed = UsageInfo {
+        five_hour: Some(window(100.0, PAST)),
+        ..Default::default()
+    };
+    assert!(
+        !windows_maxed(&lapsed, now),
+        "a 100% window whose reset has passed has renewed quota",
+    );
+
+    assert!(
+        !windows_maxed(&UsageInfo::default(), now),
+        "a windowless snapshot is never maxed",
+    );
+}
+
 #[test]
 fn identity_anchor_backfills_only_when_missing() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};

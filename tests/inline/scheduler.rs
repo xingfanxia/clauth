@@ -71,6 +71,60 @@ fn partition_due_uses_fixed_interval() {
     assert_eq!(due.len(), 1, "due once the fixed interval has elapsed");
 }
 
+/// `retain_pollable` (the `refresh_spent_accounts` OFF gate): only an unforced,
+/// already-fetched, spent account is dropped from the due set. A forced (`r`)
+/// account, a never-fetched one, a below-cap one, and one whose spent window
+/// has lapsed all survive — the last two are how a reset gets observed.
+#[test]
+fn retain_pollable_drops_only_unforced_spent_accounts() {
+    use super::retain_pollable;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let now = 1_779_027_600i64; // 2026-05-17 UTC
+    let capped = |resets: &str| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(resets.to_string()),
+        }),
+        ..Default::default()
+    };
+    let store: HashMap<String, UsageInfo> = HashMap::from([
+        ("spent".to_string(), capped("2999-01-01T00:00:00+00:00")),
+        (
+            "spent_forced".to_string(),
+            capped("2999-01-01T00:00:00+00:00"),
+        ),
+        ("lapsed".to_string(), capped("2020-01-01T00:00:00+00:00")),
+        (
+            "busy".to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: 40.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                ..Default::default()
+            },
+        ),
+        // "fresh" has no store entry → never fetched → always polled.
+    ]);
+    let forced: HashSet<String> = HashSet::from(["spent_forced".to_string()]);
+
+    let mut due = vec![
+        token("spent"),
+        token("spent_forced"),
+        token("lapsed"),
+        token("busy"),
+        token("fresh"),
+    ];
+    retain_pollable(&mut due, &forced, &store, now);
+    let kept: Vec<&str> = due.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        kept,
+        vec!["spent_forced", "lapsed", "busy", "fresh"],
+        "only the unforced spent account drops; forced/lapsed/below-cap/never-fetched survive",
+    );
+}
+
 /// Profiles mid-refresh are excluded from the due set even when their interval
 /// has elapsed, but their countdown still publishes so the UI shows when they
 /// become eligible again.

@@ -1163,6 +1163,25 @@ pub(crate) fn seven_day_live(info: &UsageInfo, now_secs: i64) -> bool {
         .is_some_and(|resets_at| now_secs < resets_at)
 }
 
+/// True iff a request would currently be REFUSED: a live 5h **or** 7d window
+/// pinned at the API's 100% cap. Such a window can't change until it resets, so
+/// the opt-out `refresh_spent_accounts` fetch gate may skip the account until
+/// then. Deliberately keyed on the 100% hard cap, NOT the sub-100 fallback
+/// switch threshold: a below-cap window still moves and must keep being polled,
+/// and this predicate must never influence switch/fallback decisions.
+pub(crate) fn windows_maxed(info: &UsageInfo, now_secs: i64) -> bool {
+    (five_hour_live(info, now_secs)
+        && info
+            .five_hour
+            .as_ref()
+            .is_some_and(|w| w.utilization >= 100.0))
+        || (seven_day_live(info, now_secs)
+            && info
+                .seven_day
+                .as_ref()
+                .is_some_and(|w| w.utilization >= 100.0))
+}
+
 /// Parse ISO-8601 timestamp (e.g. `2026-05-17T14:20:00.121699+00:00`) into Unix epoch seconds.
 pub(crate) fn iso_to_epoch_secs(s: &str) -> Option<i64> {
     let bytes = s.as_bytes();
