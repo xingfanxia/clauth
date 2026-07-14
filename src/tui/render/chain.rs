@@ -22,8 +22,8 @@ use super::super::app::{
 use super::super::theme;
 use super::panes::{
     active_pill, bold_when, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
-    invalid_tooltip_lines, label_style, name_color, section_box, section_box_verbatim, select_line,
-    selector_width, wrap_words,
+    invalid_tooltip_lines, key_cell, label_style, name_color, section_box, section_box_verbatim,
+    select_line, selector_width, wrap_words,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, soonest_resume, threshold_for};
 use crate::profile::AppConfig;
@@ -31,8 +31,13 @@ use crate::usage::humanize_duration;
 
 /// Wide enough to read a threshold tick.
 const GAUGE_W: usize = 22;
-/// Key column width, matching the Setup tab.
+/// Key column width: the longest key (`last resort`, 11), matching the Config
+/// tab's `KEY_W` so the two master-detail panes open their value column at the
+/// same place. `KEY_GUTTER` is the separator, so an exactly-fitting key never
+/// collides with its value.
 const KEY_W: usize = 11;
+/// Fixed gap between the padded key and the value column (house standard).
+const KEY_GUTTER: usize = 2;
 /// Fixed lines `member_detail` pushes before the FALLBACK_ROWS loop: priority,
 /// blank, `5h usage` gauge (key row), headroom figure, blank. The native-cursor
 /// math and the `rotate at` row index both key off this.
@@ -162,8 +167,8 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         && let Some(ChainItemKind::Member(_)) = selected
         && let Some(draft) = &app.fallback_threshold_draft
     {
-        // x = "❯ " (2) + "rotate at" key+pad block (exactly KEY_W cols) + cols before caret.
-        let prefix_cols = 2 + KEY_W + head_cols(draft);
+        // x = "❯ " (2) + "rotate at" key block (KEY_W + KEY_GUTTER cols) + cols before caret.
+        let prefix_cols = 2 + KEY_W + KEY_GUTTER + head_cols(draft);
         let cx = inner.x.saturating_add(prefix_cols as u16);
         let cy = inner.y.saturating_add(ROWS_BEFORE as u16);
         frame.set_cursor_position((cx, cy));
@@ -206,11 +211,11 @@ fn member_detail(
     // `priority` — position in the chain (order = priority).
     let value = format!("#{} of {chain_len}", index + 1);
     let mut priority_spans = vec![
-        Span::styled(kv_key("priority"), theme::label()),
+        Span::styled(key_cell("priority", KEY_W, KEY_GUTTER), theme::label()),
         Span::styled(value.clone(), theme::body()),
     ];
     if active {
-        let left_w = KEY_W + value.chars().count();
+        let left_w = KEY_W + KEY_GUTTER + value.chars().count();
         let indicator_w = "[ active ]".chars().count(); // 10
         let pad = width.saturating_sub(left_w).saturating_sub(indicator_w);
         priority_spans.push(Span::raw(" ".repeat(pad)));
@@ -222,7 +227,10 @@ fn member_detail(
     // `5h usage` — gauge lives on the kv key row (matching `priority` / `rotate
     // at` grammar), headroom figure indented beneath it. Two lines, not three:
     // the standalone eyebrow is folded into the key.
-    let mut gauge_spans = vec![Span::styled(kv_key("5h usage"), theme::label())];
+    let mut gauge_spans = vec![Span::styled(
+        key_cell("5h usage", KEY_W, KEY_GUTTER),
+        theme::label(),
+    )];
     gauge_spans.extend(gauge_with_tick(pct, Some(threshold)));
     if let Some(v) = pct {
         gauge_spans.push(Span::styled(format!("  {v:.0}% used"), theme::util(v)));
@@ -236,7 +244,7 @@ fn member_detail(
         None => String::new(),
     };
     lines.push(Line::from(vec![
-        Span::raw(" ".repeat(KEY_W)),
+        Span::raw(" ".repeat(KEY_W + KEY_GUTTER)),
         Span::styled(figure, theme::faint()),
     ]));
     lines.push(Line::from(""));
@@ -344,7 +352,10 @@ fn detail_row(
         FallbackRow::Threshold => {
             let mut spans = vec![
                 arrow,
-                Span::styled(kv_key("rotate at"), label_style(selected)),
+                Span::styled(
+                    key_cell("rotate at", KEY_W, KEY_GUTTER),
+                    label_style(selected),
+                ),
             ];
             match editing {
                 Some(input) => {
@@ -382,7 +393,10 @@ fn detail_row(
             };
             Line::from(vec![
                 arrow,
-                Span::styled(kv_key("last resort"), label_style(selected)),
+                Span::styled(
+                    key_cell("last resort", KEY_W, KEY_GUTTER),
+                    label_style(selected),
+                ),
                 Span::styled(value, style),
             ])
         }
@@ -394,7 +408,7 @@ fn detail_row(
             };
             Line::from(vec![
                 arrow,
-                Span::styled(kv_key("remove"), label_style(selected)),
+                Span::styled(key_cell("remove", KEY_W, KEY_GUTTER), label_style(selected)),
                 Span::styled(label, theme::danger()),
             ])
         }
@@ -508,13 +522,6 @@ fn gauge_with_tick(pct: Option<f64>, threshold: Option<f64>) -> Vec<Span<'static
         }
     }
     spans
-}
-
-/// Interactive form-row label: `TEXT + bold` when the row is focused,
-/// `TEXT_DIM` blurred (matches the setup-tab `label_style`).
-fn kv_key(key: &str) -> String {
-    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
-    format!("{key}{}", " ".repeat(pad))
 }
 
 #[cfg(test)]

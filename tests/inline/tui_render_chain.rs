@@ -133,3 +133,54 @@ fn last_resort_hint_names_the_currently_marked_member() {
         .expect("hint renders");
     assert!(hint.contains("from 'b'"), "{hint}");
 }
+
+// ── key-column alignment ────────────────────────────────────────────────────
+
+/// Column a row's value opens at: the first non-space cell past the key text.
+/// `str::find` is byte-based, so re-count chars for the head to stay glyph-
+/// accurate past any multi-byte arrow (e.g. `❯`).
+fn value_col(key: &str, rendered: &str) -> usize {
+    let after = rendered.find(key).expect("row renders its key") + key.len();
+    let head_chars = rendered[..after].chars().count();
+    let gap = rendered[after..].chars().take_while(|c| *c == ' ').count();
+    head_chars + gap
+}
+
+// `last resort` is exactly the old `KEY_W` (11) chars, so a
+// `saturating_sub(len).max(1)` pad pushed its value a column right of every
+// other interactive row. The shared `key_cell` keeps the gap separate from the
+// width, so every interactive row opens its value at the same column.
+#[test]
+fn last_resort_value_aligns_with_other_rows() {
+    let a = profile("a", 95.0, 20.0, 3600);
+    let cfg = config_with(vec![a], Some("a"), vec!["a"]);
+    let texts: Vec<String> = member_detail(&cfg, "a", 0, 1, true, 1, false, None, 60)
+        .iter()
+        .map(line_text)
+        .collect();
+
+    let rotate = texts
+        .iter()
+        .find(|t| t.contains("rotate at"))
+        .expect("rotate at row");
+    let last = texts
+        .iter()
+        .find(|t| t.contains("last resort"))
+        .expect("last resort row");
+    let remove = texts
+        .iter()
+        .find(|t| t.contains("remove"))
+        .expect("remove row");
+
+    let col = value_col("rotate at", rotate);
+    assert_eq!(
+        col,
+        value_col("last resort", last),
+        "`last resort` (== old KEY_W chars) must not push its value column right"
+    );
+    assert_eq!(
+        col,
+        value_col("remove", remove),
+        "all rows share the value column"
+    );
+}
