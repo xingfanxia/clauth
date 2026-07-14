@@ -111,11 +111,16 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
         },
         Tab::Config => {
-            if app.refresh_interval_draft.is_some() {
+            if app.refresh_interval_draft.is_some() || app.weekly_threshold_draft.is_some() {
                 &[("↵", "save"), ("←→", "caret"), ("esc", "cancel")]
             } else if GLOBAL_CONFIG_ROWS
                 .get(app.global_config_cursor)
-                .is_some_and(|r| *r == GlobalConfigRow::RefreshInterval)
+                .is_some_and(|r| {
+                    matches!(
+                        r,
+                        GlobalConfigRow::RefreshInterval | GlobalConfigRow::WeeklyThreshold
+                    )
+                })
             {
                 &[
                     ("↑↓", "row"),
