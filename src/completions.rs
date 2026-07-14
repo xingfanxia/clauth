@@ -21,7 +21,7 @@ const BASH: &str = r#"_clauth() {
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--yes -y --force" -- "${cur}") )
     fi
     return 0
 }
@@ -49,7 +49,7 @@ _clauth() {
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
         _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--model[set the default model before signing in]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
-        _values 'flag' '--yes[skip the confirm prompt]'
+        _values 'flag' '--yes[skip the confirm prompt]' '--force[override the live-session guard]'
     fi
 }
 _clauth "$@"
@@ -71,6 +71,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "A
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --api-key -d "API key (prompted echo-off if omitted)"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --model -d "Set default model before signing in"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --force -d "Override the live-session guard"
 "#;
 
 pub(crate) fn print_script(shell: &str) -> Result<()> {

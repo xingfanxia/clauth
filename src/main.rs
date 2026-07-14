@@ -100,8 +100,8 @@ fn dispatch(args: &[String]) -> Result<()> {
             ),
         },
         [cmd, rest @ ..] if cmd == "delete" => match parse_delete_args(rest) {
-            Some((name, yes)) => cmd_delete(name, yes),
-            None => anyhow::bail!("usage: clauth delete <profile> [--yes]"),
+            Some((name, yes, force)) => cmd_delete(name, yes, force),
+            None => anyhow::bail!("usage: clauth delete <profile> [--yes] [--force]"),
         },
         [cmd, ..] if cmd == "run" => anyhow::bail!(
             "`clauth run` isn't a command; for a headless delegate use \
@@ -119,7 +119,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
         _ => anyhow::bail!(
-            "usage: clauth [profile] | clauth start [--isolated] <profile> [args] | clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>] | clauth delete <profile> [--yes] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
+            "usage: clauth [profile] | clauth start [--isolated] <profile> [args] | clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>] | clauth delete <profile> [--yes] [--force] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
         ),
     }
 }
@@ -484,16 +484,21 @@ fn cmd_login(args: LoginArgs<'_>) -> Result<()> {
     Ok(())
 }
 
-/// `clauth delete <name> [--yes]`'s args after the `delete` token: one profile
-/// name plus an optional `--yes`/`-y` (anywhere). `None` on any other shape
-/// (missing name, an unrecognized flag, two names). Pure, so unit-testable
-/// without invoking `cmd_delete`, which touches the filesystem.
-fn parse_delete_args(rest: &[String]) -> Option<(&str, bool)> {
+/// `clauth delete <name> [--yes] [--force]`'s args after the `delete` token: one
+/// profile name plus optional `--yes`/`-y` and `--force` (anywhere). `None` on
+/// any other shape (missing name, an unrecognized flag, two names). Pure, so
+/// unit-testable without invoking `cmd_delete`, which touches the filesystem.
+///
+/// The two flags are distinct: `--yes` skips the `[y/N]` confirm; `--force`
+/// overrides the live-session guard. `--yes` alone does NOT override the guard.
+fn parse_delete_args(rest: &[String]) -> Option<(&str, bool, bool)> {
     let mut name: Option<&str> = None;
     let mut yes = false;
+    let mut force = false;
     for arg in rest {
         match arg.as_str() {
             "--yes" | "-y" => yes = true,
+            "--force" => force = true,
             a if a.starts_with("--") => return None,
             a => {
                 if name.is_some() {
@@ -503,16 +508,18 @@ fn parse_delete_args(rest: &[String]) -> Option<(&str, bool)> {
             }
         }
     }
-    Some((name?, yes))
+    Some((name?, yes, force))
 }
 
-/// `clauth delete <name> [--yes]` — remove a profile and all its credentials
-/// (the whole on-disk profile dir + state + caches), OAuth or API-key. Prompts
-/// `[y/N]` on a TTY unless `--yes`. Delete is an irreversible `remove_dir_all`,
-/// so unlike a reauth a non-TTY stdin does NOT get an implicit yes: it must pass
-/// `--yes`, else the delete is refused. If the deleted profile was active, its
-/// live `~/.claude/.credentials.json` link and settings.json endpoint are cleared.
-fn cmd_delete(name: &str, yes: bool) -> Result<()> {
+/// `clauth delete <name> [--yes] [--force]` — remove a profile and all its
+/// credentials (the whole on-disk profile dir + state + caches), OAuth or
+/// API-key. Prompts `[y/N]` on a TTY unless `--yes`. Delete is an irreversible
+/// `remove_dir_all`, so unlike a reauth a non-TTY stdin does NOT get an implicit
+/// yes: it must pass `--yes`, else the delete is refused. A profile held by a
+/// live `clauth start` session is refused unless `--force` (independent of
+/// `--yes`). If the deleted profile was active, its live
+/// `~/.claude/.credentials.json` link and settings.json endpoint are cleared.
+fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
@@ -533,7 +540,7 @@ fn cmd_delete(name: &str, yes: bool) -> Result<()> {
         }
     }
     let was_active = config.is_active(&canonical);
-    actions::delete_profile(&mut config, &canonical)?;
+    actions::delete_profile(&mut config, &canonical, force)?;
     if was_active {
         println!("clauth: deleted profile '{canonical}' (was active; live credentials cleared).");
     } else {
@@ -581,8 +588,9 @@ fn print_help() {
          or --api-key to capture an API-key account instead (a missing\n                                  \
          value is prompted; the key is read echo-off). --model sets its\n                                  \
          default model (opus/sonnet/haiku/opusplan or a full model id)\n  \
-           clauth delete <profile> [--yes]\n                                  \
-         remove a profile and all its credentials; --yes skips the confirm\n  \
+           clauth delete <profile> [--yes] [--force]\n                                  \
+         remove a profile and all its credentials; --yes skips the confirm,\n                                  \
+         --force overrides the live-session guard\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
          credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
            clauth daemon                   run the headless scheduler with no TUI: refresh\n                                  \

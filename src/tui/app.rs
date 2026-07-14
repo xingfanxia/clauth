@@ -5634,7 +5634,7 @@ fn commit_new_account(app: &mut App) {
 fn perform_delete(app: &mut App, name: &str) {
     let result = {
         let mut cfg = app.config();
-        delete_profile(&mut cfg, name)
+        delete_profile(&mut cfg, name, false)
     };
     match result {
         Ok(()) => {

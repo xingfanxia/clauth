@@ -670,7 +670,7 @@ fn delete_active_api_profile_unwires_settings_endpoint() {
         "precondition: active api key is wired into settings.json"
     );
 
-    delete_profile(&mut config, "api-acct").expect("delete active api profile");
+    delete_profile(&mut config, "api-acct", false).expect("delete active api profile");
 
     let after = crate::claude::read_claude_endpoint_config().expect("read endpoint");
     assert_eq!(
@@ -680,6 +680,91 @@ fn delete_active_api_profile_unwires_settings_endpoint() {
     assert_eq!(
         after.api_key, None,
         "deleted api key must not linger in settings.json"
+    );
+}
+
+/// #4: a profile held by a live `clauth start` session must not be deleted
+/// without `--force` — the running session's account can't be pulled out from
+/// under it. An unforced delete refuses and leaves the record intact; `force`
+/// overrides and removes it.
+#[test]
+fn delete_refuses_live_session_unless_forced() {
+    let home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "busy".to_string(), None, None, None)
+        .expect("create profile");
+
+    // Simulate a live session: a locked pid file in the profile's sessions dir
+    // reads as alive via `has_live_session` (the probe's `try_lock` on a
+    // separate fd fails while this fd holds the flock).
+    let sessions = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("busy")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
+    pid.lock().expect("lock pid");
+
+    let refused = delete_profile(&mut config, "busy", false);
+    assert!(
+        refused.is_err(),
+        "a live session must block an unforced delete"
+    );
+    assert!(
+        config.find("busy").is_some(),
+        "the refused delete must leave the profile record intact"
+    );
+
+    delete_profile(&mut config, "busy", true).expect("force overrides the live-session guard");
+    assert!(
+        config.find("busy").is_none(),
+        "force must remove the profile despite the live session"
+    );
+}
+
+/// #5: for an ACTIVE profile the settings-unwire (a fallible external write) must
+/// run BEFORE any irreversible local removal. When the unwire fails, the whole
+/// delete fails leaving BOTH the record and the dir intact and fully retryable —
+/// not the account stranded in live settings.json with its record already gone.
+#[test]
+fn delete_active_unwire_failure_keeps_profile_retryable() {
+    let home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "api-acct".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret".to_string()),
+        None,
+    )
+    .expect("create api profile");
+    config.state.active_profile = Some("api-acct".into());
+
+    // Force the settings unwire to fail: make ~/.claude/settings.json a directory
+    // so the merge-read inside `apply_profile_to_claude_settings` errors before
+    // any write. Deterministic and root-safe (a read-only chmod would be bypassed
+    // when the suite runs as root).
+    let settings = home.home().join(".claude").join("settings.json");
+    std::fs::create_dir_all(&settings).expect("settings.json as dir");
+
+    let result = delete_profile(&mut config, "api-acct", false);
+    assert!(
+        result.is_err(),
+        "a failed settings unwire must fail the whole delete"
+    );
+    assert!(
+        config.find("api-acct").is_some(),
+        "a failed unwire must leave the profile record intact and retryable"
     );
 }
 

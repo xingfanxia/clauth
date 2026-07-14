@@ -208,7 +208,7 @@ fn collect_api_endpoint_rejects_empty_flag_values() {
 fn parse_delete_args_bare_name_no_yes() {
     assert_eq!(
         parse_delete_args(&["acme".to_string()]),
-        Some(("acme", false))
+        Some(("acme", false, false))
     );
 }
 
@@ -216,11 +216,30 @@ fn parse_delete_args_bare_name_no_yes() {
 fn parse_delete_args_accepts_yes_and_short_flag_anywhere() {
     assert_eq!(
         parse_delete_args(&["acme".to_string(), "--yes".to_string()]),
-        Some(("acme", true))
+        Some(("acme", true, false))
     );
     assert_eq!(
         parse_delete_args(&["-y".to_string(), "acme".to_string()]),
-        Some(("acme", true))
+        Some(("acme", true, false))
+    );
+}
+
+#[test]
+fn parse_delete_args_force_is_independent_of_yes() {
+    // --force overrides the live-session guard but does NOT skip the confirm.
+    assert_eq!(
+        parse_delete_args(&["acme".to_string(), "--force".to_string()]),
+        Some(("acme", false, true)),
+        "--force alone leaves yes unset"
+    );
+    assert_eq!(
+        parse_delete_args(&[
+            "--force".to_string(),
+            "--yes".to_string(),
+            "acme".to_string()
+        ]),
+        Some(("acme", true, true)),
+        "both flags parse together, order-independent"
     );
 }
 

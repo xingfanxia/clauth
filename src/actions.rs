@@ -479,8 +479,19 @@ pub(crate) fn rename_profile(config: &mut AppConfig, old: &str, new: &str) -> Re
     })
 }
 
-pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<()> {
+pub(crate) fn delete_profile(config: &mut AppConfig, name: &str, force: bool) -> Result<()> {
     with_state_lock(|| {
+        // Refuse to pull an account out from under a running `clauth start`
+        // session (either flavor), checked before any removal so a refused
+        // delete is a clean no-op. `--yes` skips the confirm prompt but does NOT
+        // override this; only `force` does.
+        if !force && crate::runtime::has_live_session(name) {
+            bail!(
+                "profile '{name}' has a live session; refusing to delete it out from under a \
+                 running `clauth start`. Pass --force to override."
+            );
+        }
+
         let was_active = config.is_active(name);
         // An active API profile's base_url + api_key (and model-tier keys) live in
         // ~/.claude/settings.json, not the credentials link. Capture its custom
@@ -493,25 +504,29 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         } else {
             Vec::new()
         };
-        let dir = profile_dir(name)?;
 
-        // Remove directory first: a failed delete keeps the profile in state so
-        // the user can retry; persisting state first would leave an orphan dir.
+        // Unwire the active account from the live credentials link + settings.json
+        // BEFORE any irreversible local removal. These are fallible external
+        // writes: running them first means a failure leaves both the record and
+        // the dir intact and fully retryable, rather than stranding the api key in
+        // plaintext settings.json with the profile record already gone. A blank
+        // profile clears its endpoint/key/model env so the key can't linger and
+        // the next session doesn't route to a dead endpoint.
+        if was_active {
+            clear_claude_credentials()?;
+            let blank = Profile::new(name.to_string(), None, None);
+            apply_profile_to_claude_settings(&blank, &active_env_keys)?;
+        }
+
+        // Dir before state: a failed removal keeps the profile in state so the
+        // user can retry; persisting state first would leave an orphan dir.
+        let dir = profile_dir(name)?;
         if dir.exists() {
             std::fs::remove_dir_all(&dir)
                 .with_context(|| format!("failed to delete profile directory for '{name}'"))?;
         }
         config.remove(name);
         save_app_state(&config.state)?;
-
-        if was_active {
-            clear_claude_credentials()?;
-            // Unwire the deleted account from live settings.json: a blank profile
-            // clears its endpoint/key/model env so the key can't linger in
-            // plaintext and the next session doesn't route to a dead endpoint.
-            let blank = Profile::new(name.to_string(), None, None);
-            apply_profile_to_claude_settings(&blank, &active_env_keys)?;
-        }
         Ok(())
     })
 }
