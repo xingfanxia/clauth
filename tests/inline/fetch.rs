@@ -530,3 +530,110 @@ fn blind_fields_parse_defensively() {
     assert_eq!(daily.used_credits, Some(1.5));
     assert!(ExtraPeriod::from_value(extra.weekly.as_ref().unwrap()).is_none());
 }
+
+// ── get_json emits Claude Code's exact per-client header set (wire parity) ────
+//
+// Captured 2026-07-14 against CC 2.1.209 (docs/wire-parity.md): CC polls /usage
+// with its claude-cli client (+anthropic-beta, no cache-control) and reads
+// /profile with a plain axios client (axios UA, Cache-Control: no-cache, no
+// beta). This drives the REAL get_json builder against a loopback listener and
+// asserts the bytes it actually emits — a header drift off CC's shape fails here.
+
+fn capture_get_json_headers(client: AuthClient, path: &str) -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 512];
+        while let Ok(n) = sock.read(&mut tmp) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        // minimal 200 so get_json's read_to_string returns Ok
+        let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    // bypass the 5s per-host request spacing so the test doesn't sleep
+    if let Ok(mut m) = NEXT_REQUEST_SLOT.lock() {
+        m.clear();
+    }
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let _ = get_json(&url, "TESTTOKEN", None, "wiretest", client);
+    server.join().expect("listener thread")
+}
+
+fn header_value<'a>(req: &'a str, name: &str) -> Option<&'a str> {
+    let want = format!("{}:", name.to_ascii_lowercase());
+    req.lines()
+        .find(|l| l.to_ascii_lowercase().starts_with(&want))
+        .and_then(|l| l.split_once(':').map(|x| x.1))
+        .map(str::trim)
+}
+
+#[test]
+fn get_json_emits_cc_per_client_wire_headers() {
+    // /usage: the claude-cli client.
+    let usage = capture_get_json_headers(AuthClient::Usage, "/api/oauth/usage");
+    assert!(
+        usage.starts_with("GET /api/oauth/usage "),
+        "targets the usage path"
+    );
+    // version resolves from the locally-installed CC; bare `claude-cli` in a
+    // no-CC environment (CI). Either way it's the claude-cli client prefix.
+    let ua = header_value(&usage, "user-agent").unwrap_or("");
+    assert!(
+        ua.starts_with("claude-cli"),
+        "usage UA is claude-cli, got {ua:?}"
+    );
+    assert_eq!(
+        header_value(&usage, "accept"),
+        Some("application/json, text/plain, */*")
+    );
+    assert_eq!(
+        header_value(&usage, "content-type"),
+        Some("application/json")
+    );
+    assert_eq!(
+        header_value(&usage, "anthropic-beta"),
+        Some("oauth-2025-04-20")
+    );
+    assert_eq!(
+        header_value(&usage, "cache-control"),
+        None,
+        "usage sends no cache-control"
+    );
+    assert_eq!(
+        header_value(&usage, "authorization"),
+        Some("Bearer TESTTOKEN")
+    );
+
+    // /profile: the axios client — deterministic UA constant, cache-control, no beta.
+    let profile = capture_get_json_headers(AuthClient::Profile, "/api/oauth/profile");
+    assert!(profile.starts_with("GET /api/oauth/profile "));
+    assert_eq!(header_value(&profile, "user-agent"), Some("axios/1.15.2"));
+    assert_eq!(
+        header_value(&profile, "accept"),
+        Some("application/json, text/plain, */*")
+    );
+    assert_eq!(
+        header_value(&profile, "content-type"),
+        Some("application/json")
+    );
+    assert_eq!(header_value(&profile, "cache-control"), Some("no-cache"));
+    assert_eq!(
+        header_value(&profile, "anthropic-beta"),
+        None,
+        "profile sends no beta"
+    );
+}

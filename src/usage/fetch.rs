@@ -77,6 +77,17 @@ pub(crate) fn await_request_slot(host: &str) {
     }
 }
 
+/// Clear every host's reserved spacing slot. Test-only: a real-bytes listener
+/// test that drives a request builder through [`await_request_slot`] resets the
+/// slot first so it never sleeps out the [`REQUEST_SPACING_MS`] window under the
+/// shared-process `cargo test` runner (nextest isolates per process).
+#[cfg(test)]
+pub(crate) fn reset_request_slots() {
+    if let Ok(mut slots) = NEXT_REQUEST_SLOT.lock() {
+        slots.clear();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct UsageWindow {
     pub(crate) utilization: f64,

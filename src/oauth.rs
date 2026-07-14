@@ -77,6 +77,20 @@ pub(crate) const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// Claude Code puts on every messages request (verified on the wire).
 const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages?beta=true";
 
+/// The `anthropic-beta` set Claude Code sends on `/v1/messages` — its full
+/// feature list, distinct from the single `oauth-2025-04-20` on `/usage`.
+/// Captured 2026-07-14 against CC 2.1.209; drifts with CC's bundle, re-capture
+/// on a bump (`docs/wire-parity.md`).
+const KICK_ANTHROPIC_BETA: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+
+/// anthropic-sdk-js (stainless) version CC 2.1.209 bundles, sent verbatim on the
+/// kick so its client-instrumentation headers match CC's. NOTE: this is a
+/// deliberately *partial* stainless set (lang/runtime/package-version only) — a
+/// real SDK client also sends `x-stainless-arch/os/runtime-version`, which are
+/// host-derived (and clauth has no honest node runtime-version), so they stay
+/// off. Drifts with CC's bundle.
+const KICK_STAINLESS_PACKAGE_VERSION: &str = "0.94.0";
+
 /// Cheapest available model — single token costs ~0.001¢.
 const KICK_MODEL: &str = "claude-haiku-4-5-20251001";
 
@@ -182,17 +196,42 @@ impl From<RefreshError> for anyhow::Error {
 /// body actually confirms `invalid_grant`: WAF/geo/challenge blocks answer 403
 /// too, and quarantining on one would take a healthy account out of rotation.
 /// A transport error, 429, or 5xx is transient (retry, never quarantine).
-pub(crate) fn refresh_result(
-    refresh_token: &str,
-    scopes: Option<&str>,
-) -> std::result::Result<TokenResponse, RefreshError> {
-    let body = serde_json::to_string(&serde_json::json!({
+/// The refresh request body CC's axios client posts to the token endpoint.
+/// Pure so the exact wire JSON (field set + canonical `scope` order) is
+/// golden-tested against the captured CC shape (`docs/wire-parity.md`).
+fn refresh_body(refresh_token: &str, scopes: Option<&str>) -> serde_json::Result<String> {
+    serde_json::to_string(&serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLIENT_ID,
         "scope": canonicalize_scopes(scopes.unwrap_or(REFRESH_SCOPES_FALLBACK)),
     }))
-    .map_err(|e| RefreshError::Transient(e.into()))?;
+}
+
+/// The `authorization_code` exchange body (interactive login). Pure for the
+/// same wire-parity golden test as [`refresh_body`].
+fn exchange_body(
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+    state: &str,
+) -> serde_json::Result<String> {
+    serde_json::to_string(&serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "code_verifier": code_verifier,
+        "client_id": CLIENT_ID,
+        "state": state,
+    }))
+}
+
+pub(crate) fn refresh_result(
+    refresh_token: &str,
+    scopes: Option<&str>,
+) -> std::result::Result<TokenResponse, RefreshError> {
+    let body =
+        refresh_body(refresh_token, scopes).map_err(|e| RefreshError::Transient(e.into()))?;
 
     let mut response = AGENT
         .post(TOKEN_ENDPOINT)
@@ -250,14 +289,7 @@ pub(crate) fn exchange_code(
     redirect_uri: &str,
     state: &str,
 ) -> Result<TokenResponse> {
-    let body = serde_json::to_string(&serde_json::json!({
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": redirect_uri,
-        "code_verifier": code_verifier,
-        "client_id": CLIENT_ID,
-        "state": state,
-    }))?;
+    let body = exchange_body(code, code_verifier, redirect_uri, state)?;
 
     let mut response = AGENT
         .post(TOKEN_ENDPOINT)
@@ -303,6 +335,18 @@ impl From<KickError> for anyhow::Error {
 /// request-spacing slot so a same-instant multi-profile window-reset doesn't burst
 /// `/v1/messages`.
 fn kick(access_token: &str) -> std::result::Result<(), KickError> {
+    kick_to(MESSAGES_ENDPOINT, access_token)
+}
+
+/// The kick's actual work, with the target `url` parameterized so a loopback
+/// listener can pin the emitted header set (`kick_emits_cc_message_wire_shape`).
+/// Carries Claude Code's `/v1/messages` client shape — the SDK instrumentation +
+/// full beta set CC sends — minus the per-session headers
+/// (`x-claude-code-session-id`, `x-client-request-id`) clauth has no honest value
+/// for, and the host-derived `x-stainless-arch/os/runtime-version` (see
+/// [`KICK_STAINLESS_PACKAGE_VERSION`]). The `system` prefix stays: an OAuth token
+/// without it is rejected as non-CC inference.
+fn kick_to(url: &str, access_token: &str) -> std::result::Result<(), KickError> {
     await_request_slot(ANTHROPIC_ORIGIN);
     let body = serde_json::to_string(&serde_json::json!({
         "model": KICK_MODEL,
@@ -313,11 +357,20 @@ fn kick(access_token: &str) -> std::result::Result<(), KickError> {
     .map_err(|e| KickError::Other(e.into()))?;
 
     let status = AGENT
-        .post(MESSAGES_ENDPOINT)
+        .post(url)
         .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
         .header("Authorization", &format!("Bearer {access_token}"))
         .header("anthropic-version", "2023-06-01")
-        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("anthropic-beta", KICK_ANTHROPIC_BETA)
+        .header("anthropic-dangerous-direct-browser-access", "true")
+        .header("x-app", "cli")
+        .header("x-stainless-lang", "js")
+        .header("x-stainless-runtime", "node")
+        .header(
+            "x-stainless-package-version",
+            KICK_STAINLESS_PACKAGE_VERSION,
+        )
         .send(&body)
         .map_err(|e| KickError::Other(anyhow::Error::from(e)))?
         .status()

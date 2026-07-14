@@ -29,3 +29,7 @@ pub(crate) use scheduler::{
 // tests robust against a change to the constant's value.
 #[cfg(test)]
 pub(crate) use scheduler::ACTIVE_CAP_MAX_STREAK;
+// Test-only: reset the per-host request-spacing slots so a real-bytes wire test
+// driving a builder through `await_request_slot` doesn't sleep out the window.
+#[cfg(test)]
+pub(crate) use fetch::reset_request_slots;

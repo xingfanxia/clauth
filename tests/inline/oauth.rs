@@ -1134,3 +1134,159 @@ fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
         "an adopted (alive) chain lifts a stale quarantine"
     );
 }
+
+// ── token-endpoint request bodies (platform.claude.com wire parity) ──────────
+//
+// The exact JSON body CC's axios client posts to platform.claude.com/v1/oauth/
+// token, captured 2026-07-14 against CC 2.1.209 (docs/wire-parity.md). Field
+// set is compared order-independently (a JSON body's key order is not a wire
+// signal); `scope` value + canonical order carry their own assertions.
+
+#[test]
+fn refresh_body_matches_cc_field_set_and_scope() {
+    // 5 granted scopes (no org:create_api_key, as every real Max/Pro login
+    // grants) → the 5-scope canonical string CC echoed on the wire.
+    let body = refresh_body(
+        "RT",
+        Some("user:file_upload user:inference user:mcp_servers user:profile user:sessions:claude_code"),
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["client_id", "grant_type", "refresh_token", "scope"]);
+    assert_eq!(v["grant_type"], "refresh_token");
+    assert_eq!(v["refresh_token"], "RT");
+    assert_eq!(v["client_id"], CLIENT_ID);
+    assert_eq!(
+        v["scope"],
+        "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+    );
+}
+
+#[test]
+fn exchange_body_matches_cc_field_set() {
+    let body = exchange_body(
+        "CODE",
+        "VERIFIER",
+        "http://localhost:1234/callback",
+        "STATE",
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "client_id",
+            "code",
+            "code_verifier",
+            "grant_type",
+            "redirect_uri",
+            "state"
+        ]
+    );
+    assert_eq!(v["grant_type"], "authorization_code");
+    assert_eq!(v["code"], "CODE");
+    assert_eq!(v["code_verifier"], "VERIFIER");
+    assert_eq!(v["redirect_uri"], "http://localhost:1234/callback");
+    assert_eq!(v["client_id"], CLIENT_ID);
+}
+
+#[test]
+fn token_endpoint_constants_match_cc_wire() {
+    // CC's axios client on platform.claude.com/v1/oauth/token, verified on the
+    // wire 2026-07-14. If CC's bundle bumps axios, re-capture and update here.
+    assert_eq!(TOKEN_USER_AGENT, "axios/1.15.2");
+    assert_eq!(TOKEN_ACCEPT, "application/json, text/plain, */*");
+    assert_eq!(TOKEN_ENDPOINT, "https://platform.claude.com/v1/oauth/token");
+}
+
+// ── kick emits Claude Code's /v1/messages client shape (wire parity) ─────────
+//
+// The window-priming POST carries CC's SDK instrumentation + full beta set
+// (captured 2026-07-14, CC 2.1.209, docs/wire-parity.md). Drives the REAL
+// kick_to builder against a loopback listener and asserts the emitted bytes.
+// Deliberately partial vs a real stainless client (no host-derived
+// arch/os/runtime-version, no per-session ids) — asserted here so the boundary
+// is explicit, not accidental.
+
+fn kick_header<'a>(req: &'a str, name: &str) -> Option<&'a str> {
+    let want = format!("{}:", name.to_ascii_lowercase());
+    req.lines()
+        .find(|l| l.to_ascii_lowercase().starts_with(&want))
+        .and_then(|l| l.split_once(':').map(|x| x.1))
+        .map(str::trim)
+}
+
+#[test]
+fn kick_emits_cc_message_wire_shape() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 512];
+        while let Ok(n) = sock.read(&mut tmp) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
+    let url = format!("http://127.0.0.1:{port}/v1/messages?beta=true");
+    let _ = kick_to(&url, "TESTTOKEN");
+    let req = server.join().unwrap();
+
+    assert!(
+        req.starts_with("POST /v1/messages?beta=true "),
+        "kick keeps the ?beta=true query, got {:?}",
+        req.lines().next()
+    );
+    assert_eq!(kick_header(&req, "content-type"), Some("application/json"));
+    assert_eq!(kick_header(&req, "accept"), Some("application/json"));
+    assert_eq!(kick_header(&req, "authorization"), Some("Bearer TESTTOKEN"));
+    assert_eq!(kick_header(&req, "anthropic-version"), Some("2023-06-01"));
+    assert_eq!(
+        kick_header(&req, "anthropic-beta"),
+        Some(KICK_ANTHROPIC_BETA)
+    );
+    assert_eq!(
+        kick_header(&req, "anthropic-dangerous-direct-browser-access"),
+        Some("true")
+    );
+    assert_eq!(kick_header(&req, "x-app"), Some("cli"));
+    assert_eq!(kick_header(&req, "x-stainless-lang"), Some("js"));
+    assert_eq!(kick_header(&req, "x-stainless-runtime"), Some("node"));
+    assert_eq!(
+        kick_header(&req, "x-stainless-package-version"),
+        Some(KICK_STAINLESS_PACKAGE_VERSION)
+    );
+    // the partial-set boundary: these are intentionally NOT sent
+    assert_eq!(kick_header(&req, "x-stainless-os"), None);
+    assert_eq!(kick_header(&req, "x-stainless-arch"), None);
+    assert_eq!(kick_header(&req, "x-claude-code-session-id"), None);
+}
+
+#[test]
+fn kick_beta_is_ccs_full_six_value_list() {
+    // Distinct from the single oauth-2025-04-20 on /usage; CC sends 6 on messages.
+    assert_eq!(
+        KICK_ANTHROPIC_BETA,
+        "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+    );
+    assert_eq!(KICK_ANTHROPIC_BETA.split(',').count(), 6);
+    assert!(KICK_ANTHROPIC_BETA.starts_with("oauth-2025-04-20,"));
+}
