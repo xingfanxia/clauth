@@ -185,12 +185,20 @@ pub(crate) fn is_exhausted_active(
 /// switch-off-all (active cleared) and wrap mode's stalled-active equivalent
 /// (`next_target` returns `None` with every member maxed). Reuses
 /// [`is_exhausted`]'s wall-clock gates (`five_hour_live` and the weekly
-/// `seven_day_live` hard-block): a member exhausted in neither window
+/// `seven_day_live` block): a member exhausted in neither window
 /// already has headroom — `find_recovered_member` /
 /// `scan_recovery` would relink it on the very next tick — so that member's
 /// presence bails the WHOLE result to `None` rather than being skipped around;
 /// the caption's premise is that NOTHING in the chain is currently usable.
 /// Ties on `resets_at` keep the earlier chain-order member.
+///
+/// Weekly-wise the premise keys on the HARD cap ([`WEEKLY_HARD_BLOCK_PCT`]),
+/// not the soft line (2026-07-10 triage): a member past the line still serves
+/// every request its live 5h window allows, so counting it spent captioned a
+/// days-out weekly reset over a working account. The window PICK below keeps
+/// the soft line — once a member is genuinely out of 5h, its soft-blocked week
+/// is what `find_recovered_member` gates on, so its 7d reset (not the 5h one)
+/// is when the chain can use it again.
 pub(crate) fn soonest_resume(config: &AppConfig) -> Option<(String, i64)> {
     let chain = &config.state.fallback_chain;
     if chain.is_empty() {
@@ -201,7 +209,7 @@ pub(crate) fn soonest_resume(config: &AppConfig) -> Option<(String, i64)> {
     let mut best: Option<(&str, i64)> = None;
     for name in chain {
         let profile = config.find(name)?;
-        if !is_exhausted(profile, weekly_pct) {
+        if !is_exhausted(profile, WEEKLY_HARD_BLOCK_PCT) {
             return None;
         }
         // A weekly-dead member resumes at its 7d reset (its 5h window may be

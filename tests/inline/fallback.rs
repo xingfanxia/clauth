@@ -1487,6 +1487,50 @@ fn wrap_off_keys_on_the_hard_cap_in_the_store_walk_too() {
 }
 
 #[test]
+fn soonest_resume_keys_on_the_weekly_hard_cap_not_the_soft_line() {
+    // A member past the SOFT line but under the API's cap still SERVES every
+    // request its fresh 5h window allows. Keying the all-exhausted premise on
+    // the soft line read the chain as dead and captioned a days-out weekly
+    // reset over an account that works right now (2026-07-10 triage).
+    let config = config_with_chain(vec![weekly_soft_profile("a")], "a");
+    assert_eq!(
+        soonest_resume(&config),
+        None,
+        "a soft-blocked member with fresh 5h headroom is not all-exhausted"
+    );
+}
+
+#[test]
+fn soonest_resume_all_exhausted_at_the_hard_cap_and_on_the_5h_line() {
+    // The opposite direction, unmoved by the hard-cap fix: a weekly window AT
+    // the cap is all-exhausted whatever its 5h window says (caption → the 7d
+    // reset), and the 5h threshold leg still stands on its own.
+    let capped = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_both(
+            Some(window(40.0, Some(live_reset()))),
+            Some(window(100.0, Some(reset_in(48 * 3600)))),
+        )),
+    );
+    let (name, secs) =
+        soonest_resume(&config_with_chain(vec![capped], "a")).expect("weekly cap is all-exhausted");
+    assert_eq!(name, "a");
+    assert!(
+        (172_700..=172_800).contains(&secs),
+        "the 7d reset drives the eta, got {secs}"
+    );
+
+    let five_hour = config_with_chain(vec![profile_with_util("b", Some(95.0), Some(97.0))], "b");
+    let (name, secs) = soonest_resume(&five_hour).expect("5h past threshold is all-exhausted");
+    assert_eq!(name, "b");
+    assert!(
+        (3500..=3600).contains(&secs),
+        "the 5h reset drives the eta, got {secs}"
+    );
+}
+
+#[test]
 fn weekly_accessor_pins_the_band_and_resets_garbage_to_default() {
     let mut s = crate::profile::AppState {
         weekly_switch_threshold: Some(50.0),
