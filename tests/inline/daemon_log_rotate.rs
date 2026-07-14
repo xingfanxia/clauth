@@ -62,3 +62,25 @@ fn absent_log_is_a_no_op() {
     let log = dir.path().join("nonexistent.log");
     assert!(!rotate_log_if_large(&log, 1024, 512).unwrap());
 }
+
+/// The boot warning fires for exactly one fd shape: a regular file that is not in
+/// append mode (`clauth daemon > daemon.log`), where the in-place trim cannot
+/// bound the file. An appending file is the supported setup, and a tty/pipe has
+/// no cap to defeat.
+#[cfg(unix)]
+#[test]
+fn only_a_non_append_regular_file_defeats_the_cap() {
+    assert!(
+        log_cap_defeated(true, false),
+        "a truncating `>` redirect: the trim leaves a hole and the log grows unbounded"
+    );
+    assert!(
+        !log_cap_defeated(true, true),
+        "launchd's O_APPEND fd resumes at the new EOF — the cap holds"
+    );
+    assert!(
+        !log_cap_defeated(false, false),
+        "a tty or pipe has no size cap to defeat"
+    );
+    assert!(!log_cap_defeated(false, true));
+}

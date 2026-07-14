@@ -28,10 +28,11 @@ pub(crate) const SCHEMA_VERSION: u64 = 1;
 /// are derived from the cache-file mtime instead.
 ///
 /// These are already-snapshotted plain maps, not the live `Arc<RankedMutex<…>>`
-/// stores: the caller must snapshot the status/next-refresh stores and release
-/// those locks *before* taking the `config` lock and calling [`build_status`],
-/// because `config` (rank CONFIG) outranks `USAGE_STATUS` — reading the live
-/// stores while holding `config` would invert lock order.
+/// stores. [`build_status`] runs holding NO lock at all — the config it takes is
+/// a snapshot too — because it stats and reads every profile's caches and sweeps
+/// the session flocks; a caller that held CONFIG (which outranks `USAGE_STATUS`)
+/// across those reads would both invert lock order and stall every other config
+/// user for the duration.
 pub(crate) struct LiveSignals<'a> {
     pub(crate) status: &'a HashMap<String, FetchStatus>,
     pub(crate) next_refresh: &'a HashMap<String, u64>,

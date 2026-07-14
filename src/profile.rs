@@ -244,7 +244,7 @@ pub(crate) enum ThemeName {
 
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
 /// Credentials and endpoint config live in per-profile subdirectories.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AppState {
     pub(crate) active_profile: Option<ProfileName>,
     pub(crate) profiles: Vec<ProfileName>,
@@ -393,6 +393,10 @@ impl Default for AppState {
     }
 }
 
+/// `Clone` is what lets a reader snapshot the config and drop the lock before
+/// doing disk work with it (`daemon::write_status`); CONFIG outranks the locks
+/// that work takes.
+#[derive(Clone)]
 pub(crate) struct AppConfig {
     pub(crate) state: AppState,
     pub(crate) profiles: Vec<Profile>,

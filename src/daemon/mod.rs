@@ -115,6 +115,7 @@ pub(crate) fn serve() -> Result<()> {
     // daemon stderr IS daemon.log, and undated lines cost real forensics time
     // (2026-07-09 — see `logline`).
     crate::logline::enable_timestamps();
+    log_rotate::warn_if_log_cap_defeated();
     crate::platform::init();
     crate::runtime::gc_stale_runtimes();
 
@@ -406,6 +407,11 @@ impl Daemon {
     /// fully released at the end of its own statement, so none is ever held
     /// when the `config` lock below is taken — then build and atomically
     /// write `status.json`.
+    ///
+    /// The config is snapshotted too: [`build_status`] stats and reads each
+    /// profile's cache files and sweeps the session flocks, and holding CONFIG
+    /// across that disk work every tick stalls every other config user (a switch,
+    /// a TUI edit) behind it. The clone is a handful of small strings.
     fn write_status(&self) {
         let interval = self.refresh_interval.load(Ordering::Relaxed);
         let status_snap: HashMap<String, FetchStatus> = self
@@ -442,14 +448,15 @@ impl Daemon {
             streaks: &streaks_snap,
             pending_switch: pending_snap.as_deref(),
         };
-        let body = {
+        let cfg_snap = {
             #[allow(
                 clippy::expect_used,
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let cfg = self.config.lock().expect("config poisoned");
-            build_status(&cfg, interval, Some(&live))
+            cfg.clone()
         };
+        let body = build_status(&cfg_snap, interval, Some(&live));
         match serde_json::to_vec_pretty(&body) {
             Ok(json) => {
                 if let Err(e) = atomic_write_600(&self.status_path, &json) {
