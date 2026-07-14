@@ -44,7 +44,7 @@ Every request clauth makes, and what rides along with it:
 | Endpoint | When | Carries |
 |----------|------|---------|
 | `api.github.com/repos/uwuclxdy/clauth/releases/latest` + release assets | background update check on launch (binary installs only) | no credentials, just a `User-Agent` |
-| `api.anthropic.com/v1/oauth/token` | lazy token refresh (on a 401) and `t` force-rotate | your stored refresh token |
+| `platform.claude.com/v1/oauth/token` | lazy token refresh (on a 401) and `t` force-rotate | your stored refresh token |
 | `claude.com/cai/oauth/authorize` | `clauth login` interactive sign-in, opened in your browser | no credentials; a PKCE challenge + random `state` |
 | `platform.claude.com/v1/oauth/token` | `clauth login` authorization-code exchange | the one-time auth code + PKCE verifier (mints a fresh token pair) |
 | `api.anthropic.com/api/oauth/usage` | usage poll on the refresh interval | access token (Bearer) |
@@ -55,11 +55,12 @@ Every request clauth makes, and what rides along with it:
 | `api.deepseek.com/user/balance` | only for profiles whose base URL is DeepSeek | that provider's API key |
 | a custom base URL you set | requests against an API-endpoint profile | whatever you configured |
 
-Your stored access/refresh tokens go to `api.anthropic.com` and nowhere else. The only
-exception is the interactive `clauth login`, which follows Claude Code's own OAuth flow:
-it opens `claude.com` in your browser to authorize and posts the one-time authorization
-code to `platform.claude.com` to mint the new profile's token pair. clauth runs no
-telemetry or analytics; it talks to the hosts above and no others.
+Your stored access tokens go to `api.anthropic.com` and nowhere else. Your refresh token
+goes to `platform.claude.com`, which is the token endpoint Claude Code's own client
+refreshes against: every pair is minted there, whether from a refresh or from the
+interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com`
+in your browser to authorize and posting the one-time code back to `platform.claude.com`.
+clauth runs no telemetry or analytics; it talks to the hosts above and no others.
 
 ## What acts on your behalf
 
