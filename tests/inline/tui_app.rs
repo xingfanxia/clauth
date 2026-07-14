@@ -1386,6 +1386,122 @@ fn divergence_picker_saves_the_login_into_a_chosen_profile() {
     );
 }
 
+/// A configured `default_divergence` is owner-gated: it may only resolve a login
+/// no stored sibling owns. An owner-blind default captures a SIBLING profile's
+/// re-login into the active profile — credential misattribution the user never
+/// gets a say in. A sibling-owned divergence falls through to the banner, whose
+/// "switch to it" action is the right resolution.
+#[test]
+fn divergence_default_never_captures_a_sibling_owned_login() {
+    use super::{StartupSignal, drain_startup_signals};
+    use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // work is active; the live file carries play's EXACT stored pair (the
+    // half-landed-switch / sibling-re-login shape).
+    let sibling_owned_app = |default: DivergenceChoice| {
+        let mut work = Profile::new("work".to_string(), None, None);
+        work.credentials = Some(creds_ra("rt-work", "at-work"));
+        save_profile(&work).expect("save work");
+        let mut play = Profile::new("play".to_string(), None, None);
+        play.credentials = Some(creds_ra("rt-play", "at-play"));
+        save_profile(&play).expect("save play");
+        write_live_creds(&creds_ra("rt-play", "at-play"));
+        App::new(AppConfig {
+            state: AppState {
+                active_profile: Some("work".into()),
+                profiles: vec!["work".into(), "play".into()],
+                default_divergence: Some(default),
+                ..AppState::default()
+            },
+            profiles: vec![work, play],
+        })
+    };
+
+    // Overwrite default + sibling-owned login: no capture, banner instead.
+    let mut app = sibling_owned_app(DivergenceChoice::Overwrite);
+    force_poll(&mut app);
+    assert_eq!(
+        app.config().find("work").and_then(|p| p.refresh_token()),
+        Some("rt-work"),
+        "an Overwrite default must not capture play's login into work"
+    );
+    assert_eq!(
+        app.config().find("play").and_then(|p| p.refresh_token()),
+        Some("rt-play"),
+        "play's stored creds are untouched"
+    );
+    assert_eq!(
+        app.divergence_pending
+            .as_ref()
+            .and_then(|n| n.sibling.as_deref()),
+        Some("play"),
+        "the sibling-owner banner is offered instead of the default"
+    );
+    assert!(app.modals.is_empty(), "the banner never becomes a modal");
+
+    // NewProfile default: same gate — no target picker, banner instead.
+    let mut app = sibling_owned_app(DivergenceChoice::NewProfile);
+    force_poll(&mut app);
+    assert!(
+        app.modals.is_empty(),
+        "a NewProfile default must not open the picker on a sibling-owned login"
+    );
+    assert_eq!(
+        app.divergence_pending
+            .as_ref()
+            .and_then(|n| n.sibling.as_deref()),
+        Some("play"),
+    );
+
+    // The startup reconcile path resolves defaults through the same gate.
+    let mut app = sibling_owned_app(DivergenceChoice::Overwrite);
+    app.startup_sender
+        .send(StartupSignal::ReconcileNeedsPrompt {
+            active: "work".to_string(),
+        })
+        .expect("send reconcile signal");
+    drain_startup_signals(&mut app);
+    assert_eq!(
+        app.config().find("work").and_then(|p| p.refresh_token()),
+        Some("rt-work"),
+        "the startup reconcile default is owner-gated too"
+    );
+    assert_eq!(
+        app.divergence_pending
+            .as_ref()
+            .and_then(|n| n.sibling.as_deref()),
+        Some("play"),
+        "startup flags the sibling banner"
+    );
+
+    // Other direction: an owner-UNKNOWN (foreign) login still auto-resolves.
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(creds_ra("rt-work", "at-work"));
+    save_profile(&work).expect("save work");
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into()],
+            default_divergence: Some(DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+    force_poll(&mut app);
+    assert_eq!(
+        app.config().find("work").and_then(|p| p.refresh_token()),
+        Some("rt-fresh"),
+        "no sibling owns the login, so the Overwrite default applies as before"
+    );
+    assert!(
+        app.divergence_pending.is_none(),
+        "the resolved default leaves no banner behind"
+    );
+    assert!(app.modals.is_empty(), "an Overwrite default asks nothing");
+}
+
 #[test]
 fn compact_entry_sets_flag_no_toast() {
     let mut app = bare_app();

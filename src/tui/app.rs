@@ -6690,16 +6690,7 @@ fn drain_startup_signals(app: &mut App) {
             }
             StartupSignal::ReconcileNeedsPrompt { active } => {
                 app.reconcile_done = true;
-                let default = app.config().state.default_divergence;
-                if let Some(choice) = default {
-                    run_divergence_choice(app, &active, choice);
-                } else {
-                    // Non-blocking: flag the banner; the user opens the
-                    // resolver with <kbd>d</kbd> when they want it, and any
-                    // switch-shaped action raises it itself. Startup must never
-                    // lock the TUI behind a modal.
-                    note_divergence(app, &active);
-                }
+                resolve_or_note_divergence(app, &active);
             }
             StartupSignal::BootstrapDone => {
                 app.finish_bootstrap();
@@ -6723,8 +6714,9 @@ fn maybe_spawn_bootstrap(app: &mut App) {
 /// creds. Never pushes the modal — a divergence must not lock the whole TUI out
 /// of browsing usage; <kbd>d</kbd> opens the resolver on demand, and
 /// switch-shaped actions raise it themselves when resolution is actually
-/// required. First-login adoption and a configured `default_divergence` still
-/// resolve automatically here.
+/// required. First-login adoption resolves automatically here, as does a
+/// configured `default_divergence` within its owner gate
+/// ([`resolve_or_note_divergence`]).
 fn poll_credentials_divergence(app: &mut App) {
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -6769,34 +6761,58 @@ fn poll_credentials_divergence(app: &mut App) {
         }
         return;
     }
-    let default = app.config().state.default_divergence;
-    if let Some(choice) = default {
-        run_divergence_choice(app, &active, choice);
-        return;
-    }
-    note_divergence(app, &active);
+    resolve_or_note_divergence(app, &active);
 }
 
-/// Set/refresh the non-blocking divergence banner. The (local) owner lookup
-/// runs only when the live login actually changed — the fingerprint memo keeps
-/// the 1Hz poll to a single file read in the steady state.
-fn note_divergence(app: &mut App, active: &str) {
+/// Apply the configured `default_divergence`, or flag the non-blocking banner
+/// when nothing is configured — the shared tail of the startup reconcile and the
+/// 1Hz poll.
+///
+/// The default is owner-gated: it may only resolve a login no stored SIBLING
+/// owns. Owner-blind, an `Overwrite`/`NewProfile` default captures a sibling
+/// profile's re-login into the active profile — credential misattribution with
+/// no user say. A sibling-owned divergence falls through to the banner, whose
+/// "switch to it" action is the resolution that case actually wants.
+///
+/// The banner is never a modal: the user opens the resolver with <kbd>d</kbd>
+/// when they want it, and any switch-shaped action raises it itself. Startup and
+/// the poll must never lock the TUI.
+fn resolve_or_note_divergence(app: &mut App, active: &str) {
+    if note_divergence(app, active) {
+        return;
+    }
+    let default = app.config().state.default_divergence;
+    if let Some(choice) = default {
+        // The default IS the resolution, so drop the banner it would otherwise
+        // paint for the tick between resolving and the next poll's re-classify.
+        app.divergence_pending = None;
+        run_divergence_choice(app, active, choice);
+    }
+}
+
+/// Set/refresh the non-blocking divergence banner; returns whether a SIBLING
+/// profile owns the live login. The (local) owner lookup runs only when the live
+/// login actually changed — the fingerprint memo keeps the 1Hz poll to a single
+/// file read in the steady state.
+fn note_divergence(app: &mut App, active: &str) -> bool {
     let fingerprint = live_creds_fingerprint();
     if let Some(p) = &app.divergence_pending
         && p.active == active
         && p.fingerprint == fingerprint
     {
-        return;
+        return p.sibling.is_some();
     }
     let sibling = {
         let cfg = app.config();
         crate::actions::identify_live_login_owner(&cfg).filter(|owner| owner != active)
     };
+    let sibling_owned = sibling.is_some();
     app.divergence_pending = Some(DivergenceNotice {
         active: active.to_string(),
         sibling,
         fingerprint,
     });
+    sibling_owned
 }
 
 /// SipHash of the live access token — a cheap identity for "which login sits in
