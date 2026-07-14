@@ -48,7 +48,7 @@ Every request clauth makes, and what rides along with it:
 | `claude.com/cai/oauth/authorize` | `clauth login` interactive sign-in, opened in your browser | no credentials; a PKCE challenge + random `state` |
 | `platform.claude.com/v1/oauth/token` | `clauth login` authorization-code exchange | the one-time auth code + PKCE verifier (mints a fresh token pair) |
 | `api.anthropic.com/api/oauth/usage` | usage poll on the refresh interval | access token (Bearer) |
-| `api.anthropic.com/api/oauth/profile` | plan-tier detection | access token |
+| `api.anthropic.com/api/oauth/profile` | plan-tier detection, and reading which account a token belongs to (so a live re-login can be told apart) | access token |
 | `api.anthropic.com/v1/messages` | auto-start kick (opt-in, off by default) | access token; a 1-token Haiku request |
 | `status.claude.com/api/v2/incidents.json` | Status tab and background poll | no credentials |
 | `raw.githubusercontent.com/BerriAI/litellm/...` | model price table for the Tokens tab cost lens, fetched and disk-cached | no credentials |

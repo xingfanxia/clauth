@@ -238,6 +238,8 @@ The **Fallback** tab holds an ordered chain of profiles clauth hops between when
       config.toml        # base_url, api_key, auto_start, fallback_threshold, [env], [models]
       credentials.json   # OAuth token snapshot (credentials.json.pending while a rotation is mid-write)
       usage_cache.json   # last known utilization + plan info
+      account_id.json    # which account this profile is, so a live re-login can be told apart
+      profile_fetched.json  # when the plan/tier was last fetched, so a restart doesn't re-ask
       runtime/           # per-profile CLAUDE_CONFIG_DIR tree for `clauth start`
       runtime-isolated/  # same, for `clauth start --isolated` (no operator memory/plugins/hooks)
       sessions/          # per-session PID files (ref-counting live launches)
