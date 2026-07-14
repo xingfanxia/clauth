@@ -15,11 +15,14 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    active_pill, draw_selector_list, head_cols, help_tooltip_lines, highlight_row, label_style,
-    name_color, picker_row, section_box, section_box_verbatim, selector_width,
+    active_pill, cycle_option, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
+    key_cell, label_style, name_color, picker_row, section_box, section_box_verbatim,
+    selector_width,
 };
 
 const KEY_W: usize = 11;
+/// Fixed gap between the padded key and the value column (house standard).
+const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
@@ -221,12 +224,12 @@ fn draw_settings_rows(
     };
 
     let mut type_spans = vec![
-        Span::styled(format!("type{}", " ".repeat(KEY_W - 4)), theme::label()),
+        Span::styled(key_cell("type", KEY_W, KEY_GUTTER), theme::label()),
         Span::styled(type_value, type_style),
     ];
     if snap.is_active {
-        // "[ active ]" = 10 chars; left side = KEY_W + type_value chars; pad the gap.
-        let left_w = KEY_W + type_value.chars().count();
+        // "[ active ]" = 10 chars; left side = key block + type_value chars; pad the gap.
+        let left_w = KEY_W + KEY_GUTTER + type_value.chars().count();
         let indicator_w = "[ active ]".chars().count(); // 10
         let pad = (inner.width as usize)
             .saturating_sub(left_w)
@@ -241,7 +244,7 @@ fn draw_settings_rows(
     let provider_label = if is_api { snap.provider } else { None };
     if let Some(label) = provider_label {
         lines.push(Line::from(vec![
-            Span::styled(format!("provider{}", " ".repeat(KEY_W - 8)), theme::label()),
+            Span::styled(key_cell("provider", KEY_W, KEY_GUTTER), theme::label()),
             Span::styled(label, theme::accent()),
         ]));
     }
@@ -280,7 +283,7 @@ fn draw_settings_rows(
 
     // Position the native terminal cursor at the caret when a text/model field is active.
     if let Some((ly, input, row)) = edit_caret {
-        // x = "❯ " (2) + label block (KEY_W, or key+1 for a long env key) + caret cols
+        // x = "❯ " (2) + label block (row_label_cols: KEY_W+gutter, or key+gutter for a long env key) + caret cols
         let prefix_cols = 2 + row_label_cols(row, snap) + head_cols(&input);
         let cx = inner.x.saturating_add(prefix_cols as u16);
         let cy = inner.y.saturating_add(ly);
@@ -288,16 +291,16 @@ fn draw_settings_rows(
     }
 }
 
-/// Width of a row's label block (caret excluded) for native-cursor placement.
-/// Fixed labels pad to `KEY_W`; an env key longer than that pads to `key + 1`,
-/// mirroring [`kv_field`]'s padding.
+/// Width of a row's label block (caret excluded) for native-cursor placement:
+/// the shared key-cell width (`max(KEY_W, key.len()) + KEY_GUTTER`), mirroring
+/// [`kv_field`] so the caret lands right after the gap.
 fn row_label_cols(row: ConfigRow, snap: &Snap) -> usize {
     match row {
         ConfigRow::EnvEntry(i) => {
             let key_len = snap.env.get(i).map(|(k, _)| k.chars().count()).unwrap_or(0);
-            key_len + KEY_W.saturating_sub(key_len).max(1)
+            KEY_W.max(key_len) + KEY_GUTTER
         }
-        _ => KEY_W,
+        _ => KEY_W + KEY_GUTTER,
     }
 }
 
@@ -460,10 +463,9 @@ fn kv_field(
     focused: bool,
     mask_value: bool,
 ) -> Line<'static> {
-    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     let mut spans = vec![
         arrow,
-        Span::styled(format!("{key}{}", " ".repeat(pad)), label_style(focused)),
+        Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(focused)),
     ];
     spans.extend(value_spans(input, editing, mask_value));
     Line::from(spans)
@@ -476,10 +478,9 @@ fn kv_static(
     value_style: Style,
     focused: bool,
 ) -> Line<'static> {
-    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
     Line::from(vec![
         arrow,
-        Span::styled(format!("{key}{}", " ".repeat(pad)), label_style(focused)),
+        Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(focused)),
         Span::styled(value, value_style),
     ])
 }
@@ -512,15 +513,16 @@ fn value_spans(input: &InputState, editing: bool, mask_value: bool) -> Vec<Span<
     vec![Span::styled(input.value.clone(), body)]
 }
 
-/// The `model` row at rest: a segmented alias control (`default` + presets). The
-/// active option is `ACCENT`, bracketed only while the row is the cursor so focus
-/// never reflows the row. A custom id (set via ⏎) matches no preset, so the real
-/// value is appended in `ACCENT` rather than mis-bracketing the nearest alias.
+/// The `model` row at rest: a segmented alias control (`default` + presets).
+/// The active option is `ACCENT` and wraps in `[]` only while the row is the
+/// cursor (the row widens by 2 on focus — the Config-tab focus cue); the rest
+/// stay bare `TEXT_FAINT`. A custom id (set via ⏎) matches no preset, so the
+/// real value is appended in `ACCENT` rather than mis-bracketing the nearest
+/// alias.
 fn model_cycle_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'static> {
-    let pad = KEY_W.saturating_sub("model".len()).max(1);
     let mut spans = vec![
         arrow,
-        Span::styled(format!("model{}", " ".repeat(pad)), label_style(selected)),
+        Span::styled(key_cell("model", KEY_W, KEY_GUTTER), label_style(selected)),
     ];
     let mut options: Vec<(&str, bool)> = vec![("default", current.is_empty())];
     options.extend(MODEL_PRESETS.iter().map(|p| (*p, *p == current)));
@@ -528,7 +530,7 @@ fn model_cycle_line(arrow: Span<'static>, current: &str, selected: bool) -> Line
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(model_cycle_option(label, *active, selected));
+        spans.push(cycle_option(label, *active, selected));
     }
     if !current.is_empty() && !MODEL_PRESETS.contains(&current) {
         spans.push(Span::styled(format!("   {current}"), theme::accent()));
@@ -536,17 +538,6 @@ fn model_cycle_line(arrow: Span<'static>, current: &str, selected: bool) -> Line
     Line::from(spans)
 }
 
-/// One segment of the `model` cycle: active → `ACCENT` (`[label]` when the row is
-/// the cursor, ` label ` blurred); inactive → bare `TEXT_FAINT`.
-fn model_cycle_option(label: &str, active: bool, row_selected: bool) -> Span<'static> {
-    if active {
-        let text = if row_selected {
-            format!("[{label}]")
-        } else {
-            format!(" {label} ")
-        };
-        Span::styled(text, theme::accent())
-    } else {
-        Span::styled(label.to_string(), theme::faint())
-    }
-}
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_config.rs"]
+mod tests;
