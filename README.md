@@ -88,7 +88,7 @@ flowchart LR
     P["profiles in<br/>~/.clauth"]
     P -->|"clauth work"| S["swap ~/.claude<br/>credentials + env, in place"]
     P -->|"clauth start work"| I["launch claude in an<br/>isolated config dir"]
-    ANT["api.anthropic.com"] -. "poll usage, refresh tokens" .-> P
+    ANT["Anthropic<br/>(api + platform)"] -. "poll usage, refresh tokens" .-> P
     P -. "auto-switch at your limit" .-> P
 ```
 
