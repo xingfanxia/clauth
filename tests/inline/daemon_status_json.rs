@@ -174,6 +174,44 @@ fn build_status_auth_status_ok_expiring_broken() {
     );
 }
 
+/// `auth_status` reports on the credential a profile STORES, not on where its
+/// requests route: a hybrid (OAuth pair + `base_url`) with a dead access token
+/// must publish `expiring`, while an endpoint-only profile has no token to expire.
+#[test]
+fn build_status_auth_status_types_the_hybrid_on_its_credential() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms() as i64;
+
+    let mut hybrid = oauth_profile("hybrid");
+    set_expiry(&mut hybrid, now - 1_000);
+    hybrid.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+
+    let api_key_only = Profile::new(
+        "apikey".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-test".to_string()),
+    );
+
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![hybrid, api_key_only],
+    };
+
+    let v = build_status(&config, 300_000, None);
+    let profiles = v["profiles"].as_array().unwrap();
+    let get = |n: &str| profiles.iter().find(|p| p["name"] == n).unwrap();
+    assert_eq!(
+        get("hybrid")["auth_status"],
+        "expiring",
+        "a stored pair expires regardless of the endpoint it routes past"
+    );
+    assert_eq!(
+        get("apikey")["auth_status"],
+        "ok",
+        "no stored pair → nothing to expire"
+    );
+}
+
 #[test]
 fn build_status_pending_switch_reflects_live_signal() {
     let _home = HomeSandbox::new();

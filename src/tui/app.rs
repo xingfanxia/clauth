@@ -2291,7 +2291,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                     let cfg = app.config();
                     cfg.profiles
                         .get(app.profile_cursor)
-                        .map(|p| (p.name.clone(), p.is_oauth(), p.is_third_party()))
+                        .map(|p| (p.name.clone(), p.login_is_oauth(), p.is_third_party()))
                 };
                 match selected {
                     Some((name, true, _)) | Some((name, _, true)) => {
@@ -4369,14 +4369,20 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// The account under the cursor as `(name, is_oauth, is_third_party)`. `profile_cursor` is shared
-/// across Overview, Usage, and Setup, so this resolves the focused account on any
-/// of them. `None` when the cursor sits past the profile list (e.g. `+ new`).
+/// The account under the cursor as `(name, has_oauth_login, is_third_party)`.
+/// `profile_cursor` is shared across Overview, Usage, and Setup, so this resolves
+/// the focused account on any of them. `None` when the cursor sits past the
+/// profile list (e.g. `+ new`).
+///
+/// The OAuth bool is credential typing ([`Profile::login_is_oauth`]), not endpoint
+/// routing: the actions it gates (rotate, refresh) act on the stored token chain,
+/// so a hybrid holding a real pair behind a `base_url` can rotate it, and an
+/// endpoint-only profile cannot.
 fn focused_account(app: &App) -> Option<(String, bool, bool)> {
     let cfg = app.config();
     cfg.profiles
         .get(app.profile_cursor)
-        .map(|p| (p.name.to_string(), p.is_oauth(), p.is_third_party()))
+        .map(|p| (p.name.to_string(), p.login_is_oauth(), p.is_third_party()))
 }
 
 /// Dispatch a selected action menu item to its handler.
@@ -6585,14 +6591,16 @@ fn update_banner(app: &mut App) {
     // spent" only while some profile still shows a live spent window; without
     // that evidence (e.g. a credential-less sole profile) the honest wording is
     // "no active profile" (issue #2 read the generic banner as a stuck limit).
+    // The evidence is the HARD cap, not the configurable soft line: `Off` (what
+    // clears the active in the first place) keys on the cap, and a soft-blocked
+    // member still serves — calling it spent would be a lie the code disagrees with.
     let cfg = app.config();
     let no_active = !cfg.profiles.is_empty() && cfg.state.active_profile.is_none();
-    let weekly_pct = cfg.state.weekly_switch_threshold_pct();
     let any_spent = no_active
         && cfg
             .profiles
             .iter()
-            .any(|p| crate::fallback::is_exhausted(p, weekly_pct));
+            .any(|p| crate::fallback::is_exhausted(p, crate::fallback::WEEKLY_HARD_BLOCK_PCT));
     drop(cfg);
 
     // Divergence outranks the compact-size nudge (both WARNING): a live-login

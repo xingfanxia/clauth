@@ -2188,6 +2188,56 @@ mod env_editor {
     }
 }
 
+/// The action menu's rotate/refresh gate is credential typing, not endpoint
+/// routing: a hybrid holds a real token chain behind its `base_url` and must be
+/// offered the rotate it can actually perform, while an endpoint-only account has
+/// nothing to rotate.
+#[test]
+fn focused_account_types_the_hybrid_on_its_credential() {
+    use super::focused_account;
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut hybrid = Profile::new(
+        "hybrid".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        None,
+    );
+    hybrid.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some("ref".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    let api_key_only = Profile::new(
+        "apikey".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-test".to_string()),
+    );
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![hybrid, api_key_only],
+    });
+
+    app.profile_cursor = 0;
+    assert_eq!(
+        focused_account(&app),
+        Some(("hybrid".to_string(), true, true)),
+        "a stored pair is rotatable no matter where requests route"
+    );
+
+    app.profile_cursor = 1;
+    assert_eq!(
+        focused_account(&app),
+        Some(("apikey".to_string(), false, true)),
+        "an endpoint-only account has no token chain"
+    );
+}
+
 // ── banner wording ────────────────────────────────────────────────────────────
 //
 // "all accounts spent" needs evidence: a profile with a live spent window.
@@ -2231,6 +2281,52 @@ fn all_spent_banner_needs_live_spent_window() {
         ..UsageInfo::default()
     });
     let mut app = app_with_unlinked_profiles(vec![spent]);
+    update_banner(&mut app);
+    assert_eq!(
+        app.banner.as_ref().expect("banner").message,
+        "all accounts spent · switch to a profile to resume"
+    );
+}
+
+/// A weekly window past the SOFT switch line but under the API's hard cap is not
+/// evidence of a spent account: that member still serves requests, and `Off` (the
+/// decision that clears the active in the first place) keys on the cap too.
+#[test]
+fn all_spent_banner_ignores_a_soft_blocked_member_that_still_serves() {
+    use super::update_banner;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mut soft = crate::testutil::blank_profile("a");
+    soft.usage = Some(UsageInfo {
+        seven_day: Some(UsageWindow {
+            // Past the default 98 soft line, under the 100 hard cap.
+            utilization: 99.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 86_400)),
+        }),
+        ..UsageInfo::default()
+    });
+    let mut app = app_with_unlinked_profiles(vec![soft]);
+    update_banner(&mut app);
+    assert_eq!(
+        app.banner.as_ref().expect("banner").message,
+        "no active profile · select one to resume",
+        "soft-blocked is not spent — the banner must not claim it is"
+    );
+}
+
+/// The same member at the hard cap IS spent.
+#[test]
+fn all_spent_banner_fires_at_the_weekly_hard_cap() {
+    use super::update_banner;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mut dead = crate::testutil::blank_profile("a");
+    dead.usage = Some(UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 86_400)),
+        }),
+        ..UsageInfo::default()
+    });
+    let mut app = app_with_unlinked_profiles(vec![dead]);
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,

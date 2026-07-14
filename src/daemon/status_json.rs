@@ -84,11 +84,17 @@ fn fallback_json(config: &AppConfig, p: &Profile) -> Option<serde_json::Value> {
 /// access token past its expiry, refresh not yet run); everything else is
 /// `ok`. Readers default an absent field to `ok` (the additive-evolution
 /// rule); it is still emitted for an explicit, greppable contract.
+///
+/// Keyed on credential typing ([`Profile::login_is_oauth`]), not endpoint routing:
+/// this reports on the token the profile STORES, and a hybrid (an OAuth pair plus
+/// a `base_url`) holds one that expires like any other. Reading it behind the
+/// endpoint gate published a permanent `ok` over a dead token. The value set is
+/// unchanged, so the schema stays 1.
 fn auth_status_str(config: &AppConfig, p: &Profile, now_ms: i64) -> &'static str {
     if config.is_auth_broken(p.name.as_str()) {
         return "broken";
     }
-    if p.is_oauth() && p.access_token_expires_at().is_some_and(|exp| now_ms >= exp) {
+    if p.login_is_oauth() && p.access_token_expires_at().is_some_and(|exp| now_ms >= exp) {
         return "expiring";
     }
     "ok"

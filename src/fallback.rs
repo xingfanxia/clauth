@@ -48,7 +48,11 @@ fn live_five_hour(profile: &Profile) -> Option<&UsageWindow> {
 /// cap), never the configurable soft line. Switching early to a sibling buys
 /// headroom safety; signing every account out early buys nothing — it only
 /// forfeits the tail between the soft line and the cap on the halt path.
-const WEEKLY_HARD_BLOCK_PCT: f64 = 100.0;
+///
+/// Every surface that DESCRIBES the halted state reads the same line — the
+/// all-spent banner and `soonest_resume`'s caption included — or it would claim
+/// a member is spent while that member still serves requests.
+pub(crate) const WEEKLY_HARD_BLOCK_PCT: f64 = 100.0;
 
 /// Whether `info`'s live weekly window is past `weekly_pct` — treated as
 /// spent until the weekly reset regardless of anything the 5h window says.
