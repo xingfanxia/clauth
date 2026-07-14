@@ -364,6 +364,7 @@ fn kick_to(url: &str, access_token: &str) -> std::result::Result<(), KickError> 
         .header("anthropic-version", "2023-06-01")
         .header("anthropic-beta", KICK_ANTHROPIC_BETA)
         .header("anthropic-dangerous-direct-browser-access", "true")
+        .header("User-Agent", crate::usage::cli_user_agent())
         .header("x-app", "cli")
         .header("x-stainless-lang", "js")
         .header("x-stainless-runtime", "node")

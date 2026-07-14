@@ -1259,6 +1259,14 @@ fn kick_emits_cc_message_wire_shape() {
     assert_eq!(kick_header(&req, "accept"), Some("application/json"));
     assert_eq!(kick_header(&req, "authorization"), Some("Bearer TESTTOKEN"));
     assert_eq!(kick_header(&req, "anthropic-version"), Some("2023-06-01"));
+    // the fingerprint-critical header: the kick must identify as claude-cli, not
+    // leak ureq's default UA (it silently did until 2026-07-14).
+    let ua = kick_header(&req, "user-agent").unwrap_or("");
+    assert!(
+        ua.starts_with("claude-cli"),
+        "kick UA must be claude-cli, got {ua:?}"
+    );
+    assert!(!ua.contains("ureq"), "kick must not leak ureq's default UA");
     assert_eq!(
         kick_header(&req, "anthropic-beta"),
         Some(KICK_ANTHROPIC_BETA)

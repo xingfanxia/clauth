@@ -776,6 +776,14 @@ static USER_AGENT: LazyLock<String> =
         None => "claude-cli".to_string(),
     });
 
+/// CC's `claude-cli/<ver> (external, cli)` User-Agent, shared by every request
+/// that identifies as the interactive CLI client: `/usage` and the `/v1/messages`
+/// window kick (`crate::oauth::kick`). One source of truth so the kick can't
+/// drift back to ureq's default UA — the header the rate limiter keys on hardest.
+pub(crate) fn cli_user_agent() -> &'static str {
+    USER_AGENT.as_str()
+}
+
 /// Which of Claude Code's two `api.anthropic.com` clients to imitate. CC polls
 /// `/usage` with its `claude-cli` client but reads `/profile` through a plain
 /// axios instance — different UA, and `/profile` carries `Cache-Control: no-cache`
