@@ -638,6 +638,14 @@ pub(crate) struct CaptureSnapshot {
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
+    /// The account uuid an interactive login's own `/profile` probe saw these
+    /// credentials authenticate as. Travels with the snapshot so whichever
+    /// function COMMITS it seeds the identity anchor — including the paths that
+    /// park the snapshot in a confirm modal first. `None` for a snapshot with no
+    /// proven identity (a probe failure, or [`capture_snapshot`] reading live
+    /// credentials off disk); that seeds nothing and leaves any existing anchor
+    /// alone, exactly as before.
+    pub(crate) account_uuid: Option<String>,
 }
 
 pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
@@ -647,6 +655,8 @@ pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
         credentials,
         base_url,
         api_key,
+        // Read off disk, not from a login — this snapshot proves no identity.
+        account_uuid: None,
     })
 }
 
@@ -655,12 +665,14 @@ pub(crate) fn capture_into_profile(
     name: String,
     snapshot: CaptureSnapshot,
 ) -> Result<()> {
+    let CaptureSnapshot {
+        credentials,
+        base_url,
+        api_key,
+        account_uuid,
+    } = snapshot;
+    let seed_name = name.clone();
     with_state_lock(|| {
-        let CaptureSnapshot {
-            credentials,
-            base_url,
-            api_key,
-        } = snapshot;
         let mut profile = Profile::new(name.clone(), base_url, api_key);
         profile.credentials = credentials;
         save_profile(&profile)?;
@@ -674,7 +686,11 @@ pub(crate) fn capture_into_profile(
             config.state.active_profile = Some(name.into());
         }
         save_app_state(&config.state)
-    })
+    })?;
+    // Only once the credentials are committed, and only here — no caller seeds
+    // its own anchor, so no caller can forget to.
+    crate::usage::seed_login_anchor(&seed_name, account_uuid.as_deref());
+    Ok(())
 }
 
 /// Create a fresh OAuth profile from an in-memory minted login — the Setup
@@ -687,7 +703,9 @@ pub(crate) fn create_profile_from_login(
     name: String,
     model: Option<String>,
     credentials: ClaudeCredentials,
+    account_uuid: Option<String>,
 ) -> Result<()> {
+    let seed_name = name.clone();
     with_state_lock(|| {
         let mut profile = Profile::new(name.clone(), None, None);
         profile.models.default = model
@@ -704,7 +722,11 @@ pub(crate) fn create_profile_from_login(
             config.state.active_profile = Some(name.into());
         }
         save_app_state(&config.state)
-    })
+    })?;
+    // The draft parked the login's uuid until `create account` fixed the name;
+    // this is that name, so the anchor lands here rather than at the call site.
+    crate::usage::seed_login_anchor(&seed_name, account_uuid.as_deref());
+    Ok(())
 }
 
 /// Capture-name collision (issue #7): replace an EXISTING profile's credential
@@ -718,18 +740,23 @@ pub(crate) fn create_profile_from_login(
 /// UI doesn't show stale numbers under the swapped-in credentials. The
 /// `/profile` TTL clock describes the old account too and is expired for the
 /// same reason — otherwise the swapped-in account's tier stays unfetched (and,
-/// with `usage_cache.json` just dropped, unrendered) for up to an hour.
+/// with `usage_cache.json` just dropped, unrendered) for up to an hour. A
+/// snapshot carrying a proven identity (`account_uuid`, from an interactive
+/// login's probe) re-anchors the profile here, on the commit — the confirm-gated
+/// relogin parks the snapshot in a modal, so the anchor can only be seeded by
+/// whoever finally commits it.
 pub(crate) fn overwrite_captured_profile(
     config: &mut AppConfig,
     name: &str,
     snapshot: CaptureSnapshot,
 ) -> Result<()> {
+    let CaptureSnapshot {
+        credentials,
+        base_url,
+        api_key,
+        account_uuid,
+    } = snapshot;
     with_state_lock(|| {
-        let CaptureSnapshot {
-            credentials,
-            base_url,
-            api_key,
-        } = snapshot;
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         let was_active = config.is_active(name);
         let profile = config
@@ -783,6 +810,13 @@ pub(crate) fn overwrite_captured_profile(
     // tick racing the gap between the flock release and this expire spends the
     // stale stamp once or loses a fresh one and re-pulls once.
     crate::usage::expire_profile_ttl(name);
+    // Same commit-or-nothing rule for the identity: only credentials this profile
+    // now actually holds may be vouched for by its anchor. The same
+    // failure-after-`save_profile` window is NOT bounded here the way the stamp's
+    // is: the anchor would keep proving the old account against the new pair, and
+    // `seed_identity_anchor`'s ride-along is write-if-missing, so nothing corrects
+    // it until the next successful login.
+    crate::usage::seed_login_anchor(name, account_uuid.as_deref());
     Ok(())
 }
 

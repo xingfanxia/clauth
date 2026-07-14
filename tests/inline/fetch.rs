@@ -55,6 +55,150 @@ fn identity_anchor_refuses_blank_or_absent_uuid() {
     );
 }
 
+// ── login /profile probe (one request, both values) ──────────────────────────
+//
+// `clauth login` used to hit /profile TWICE ~5s apart with the same fresh token:
+// once for the tier, once for the uuid, each discarding what the other wanted.
+
+/// A `/profile` body carrying any combination of the two values the login reads.
+fn login_body(uuid: Option<&str>, max: bool) -> RawProfile {
+    let account = match uuid {
+        Some(u) => format!(r#"{{"uuid":"{u}","has_claude_max":{max}}}"#),
+        None => format!(r#"{{"has_claude_max":{max}}}"#),
+    };
+    serde_json::from_str(&format!(r#"{{"account":{account}}}"#)).expect("fixture profile parses")
+}
+
+#[test]
+fn one_login_body_yields_both_the_tier_and_the_uuid() {
+    let probe = login_profile_from_raw(login_body(Some("uuid-live"), true));
+    assert_eq!(
+        probe.subscription_type.as_deref(),
+        Some("max"),
+        "the tier the login stamps onto the mint"
+    );
+    assert_eq!(
+        probe.account_uuid.as_deref(),
+        Some("uuid-live"),
+        "the identity the login anchors — from the SAME body, not a second request"
+    );
+}
+
+/// Every tier the login can stamp maps to the exact string Claude Code stores in
+/// `subscriptionType`. The arms are a hand-written match, so a table over all of
+/// them is what keeps a future edit from silently renaming one.
+#[test]
+fn every_tier_maps_to_the_string_claude_code_stores() {
+    let body = |json: &str| -> Option<String> {
+        let raw: RawProfile = serde_json::from_str(json).expect("fixture profile parses");
+        login_profile_from_raw(raw).subscription_type
+    };
+    assert_eq!(
+        body(r#"{"account":{"has_claude_max":true}}"#).as_deref(),
+        Some("max")
+    );
+    assert_eq!(
+        body(r#"{"account":{"has_claude_pro":true}}"#).as_deref(),
+        Some("pro")
+    );
+    assert_eq!(
+        body(r#"{"organization":{"organization_type":"claude_team"}}"#).as_deref(),
+        Some("team")
+    );
+    assert_eq!(
+        body(r#"{"organization":{"organization_type":"claude_enterprise"}}"#).as_deref(),
+        Some("enterprise")
+    );
+    assert_eq!(
+        body(r#"{"organization":{"organization_type":"claude_free"}}"#).as_deref(),
+        Some("free")
+    );
+    assert_eq!(
+        body(r#"{"account":{}}"#),
+        None,
+        "an unrecognized tier stamps nothing — the usage poll re-derives it"
+    );
+}
+
+#[test]
+fn a_login_body_without_a_uuid_still_yields_the_tier() {
+    let probe = login_profile_from_raw(login_body(None, true));
+    assert_eq!(probe.subscription_type.as_deref(), Some("max"));
+    assert_eq!(
+        probe.account_uuid, None,
+        "no identity to anchor, but the tier still stands"
+    );
+}
+
+#[test]
+fn a_login_body_without_a_tier_still_yields_the_uuid() {
+    let probe = login_profile_from_raw(login_body(Some("uuid-live"), false));
+    assert_eq!(
+        probe.subscription_type, None,
+        "an unrecognized tier is None, exactly as the old probe reported it"
+    );
+    assert_eq!(
+        probe.account_uuid.as_deref(),
+        Some("uuid-live"),
+        "one absent value must not suppress the other"
+    );
+}
+
+#[test]
+fn a_login_bodys_blank_uuid_reads_as_no_identity() {
+    // Same contract as `fetch_account_uuid`: two blanks comparing equal must
+    // never prove two tokens are the same account.
+    assert_eq!(
+        login_profile_from_raw(login_body(Some("   "), true)).account_uuid,
+        None
+    );
+    assert_eq!(
+        login_profile_from_raw(login_body(Some(""), true)).account_uuid,
+        None
+    );
+}
+
+#[test]
+fn a_login_anchor_overwrites_the_previous_account() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    seed_login_anchor("acme", Some("uuid-first"));
+    // The reauth-onto-a-DIFFERENT-account case: `clauth login` is the
+    // authoritative (re)seeder, so unlike the ride-along backfill it must
+    // replace the anchor rather than keep proving the old identity.
+    seed_login_anchor("acme", Some("uuid-second"));
+    assert_eq!(
+        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE).as_deref(),
+        Some("uuid-second"),
+        "a login re-seeds the anchor unconditionally"
+    );
+}
+
+#[test]
+fn a_login_anchor_write_ignores_an_absent_or_blank_uuid() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // A failed probe (`None`) or shape drift must never mint an anchor…
+    seed_login_anchor("acme", None);
+    seed_login_anchor("acme", Some("  "));
+    assert_eq!(
+        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE),
+        None,
+        "no anchor may be minted from an absent or blank uuid"
+    );
+
+    // …and must never wipe a good one either.
+    seed_login_anchor("acme", Some("uuid-good"));
+    seed_login_anchor("acme", None);
+    assert_eq!(
+        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE).as_deref(),
+        Some("uuid-good"),
+        "a probe failure leaves the existing anchor intact"
+    );
+}
+
 #[test]
 fn short_label_drops_claude_prefix_and_keeps_max_multiplier() {
     assert_eq!(

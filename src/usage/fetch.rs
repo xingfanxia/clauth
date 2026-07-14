@@ -1028,16 +1028,56 @@ fn seed_identity_anchor(name: &str, profile: &RawProfile) {
     }
 }
 
-/// Fetch `/profile` with a freshly minted OAuth access token and derive the
-/// subscription-type string Claude Code stores (`"max"`/`"pro"`/`"team"`/
-/// `"enterprise"`/`"free"`; `None` for an unrecognized tier). Used by the
-/// interactive login (`oauth_login`) to (a) confirm the minted token actually
-/// works against the API — a `401` here means the login produced a dud token —
-/// and (b) stamp the new profile's tier so it shows the real plan immediately
-/// instead of the unknown-tier "Pro" fallback. Goes through the shared `/profile`
-/// fetch ([`AuthClient::Profile`]). Returns the HTTP error text so the caller can
-/// surface it.
-pub(crate) fn probe_subscription_type(access_token: &str) -> anyhow::Result<Option<String>> {
+/// Everything a login needs from one `/profile` body: the subscription-type
+/// string Claude Code stores (`"max"`/`"pro"`/`"team"`/`"enterprise"`/`"free"`;
+/// `None` for an unrecognized tier) and the account uuid the token authenticates
+/// as. Either field is independently `None` — a body carrying one but not the
+/// other still yields what it has.
+pub(crate) struct LoginProfile {
+    pub(crate) subscription_type: Option<String>,
+    pub(crate) account_uuid: Option<String>,
+}
+
+/// Pull both login values out of an already-parsed `/profile` response. Split
+/// from the HTTP leg so the mapping is testable against literal bodies.
+/// A present-but-blank uuid is shape drift, never an identity (same contract as
+/// [`fetch_account_uuid`]).
+fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
+    let tier = {
+        let org = p.organization.as_ref();
+        PlanTier::from_profile(
+            org.and_then(|o| o.organization_type.as_deref()),
+            p.account.as_ref().is_some_and(|a| a.has_claude_max),
+            p.account.as_ref().is_some_and(|a| a.has_claude_pro),
+            org.and_then(|o| o.rate_limit_tier.as_deref()),
+        )
+    };
+    LoginProfile {
+        subscription_type: match tier {
+            PlanTier::Max(_) => Some("max".to_string()),
+            PlanTier::Pro => Some("pro".to_string()),
+            PlanTier::Team => Some("team".to_string()),
+            PlanTier::Enterprise => Some("enterprise".to_string()),
+            PlanTier::Free => Some("free".to_string()),
+            PlanTier::Unknown => None,
+        },
+        account_uuid: p
+            .account
+            .and_then(|a| a.uuid)
+            .filter(|u| !u.trim().is_empty()),
+    }
+}
+
+/// Fetch `/profile` ONCE with a freshly minted OAuth access token and read every
+/// value the login needs out of that single body. Used by the interactive login
+/// (`oauth_login`) to (a) confirm the minted token actually works against the API
+/// — a `401` here means the login produced a dud token — (b) stamp the new
+/// profile's tier so it shows the real plan immediately instead of the
+/// unknown-tier "Pro" fallback, and (c) seed the identity anchor
+/// ([`seed_login_anchor`]) without a second round trip. Goes through the shared
+/// `/profile` fetch ([`AuthClient::Profile`]). Returns the HTTP error text so the
+/// caller can surface it.
+pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginProfile> {
     let text = get_json(
         PROFILE_ENDPOINT,
         access_token,
@@ -1053,21 +1093,20 @@ pub(crate) fn probe_subscription_type(access_token: &str) -> anyhow::Result<Opti
     })?;
     let p: RawProfile = serde_json::from_str(&text)
         .map_err(|_| anyhow::anyhow!("profile response was not JSON"))?;
-    let org = p.organization.as_ref();
-    let tier = PlanTier::from_profile(
-        org.and_then(|o| o.organization_type.as_deref()),
-        p.account.as_ref().is_some_and(|a| a.has_claude_max),
-        p.account.as_ref().is_some_and(|a| a.has_claude_pro),
-        org.and_then(|o| o.rate_limit_tier.as_deref()),
-    );
-    Ok(match tier {
-        PlanTier::Max(_) => Some("max".to_string()),
-        PlanTier::Pro => Some("pro".to_string()),
-        PlanTier::Team => Some("team".to_string()),
-        PlanTier::Enterprise => Some("enterprise".to_string()),
-        PlanTier::Free => Some("free".to_string()),
-        PlanTier::Unknown => None,
-    })
+    Ok(login_profile_from_raw(p))
+}
+
+/// Seed a profile's identity anchor from a completed `clauth login`. UNCONDITIONAL
+/// overwrite, unlike [`seed_identity_anchor`]'s write-if-missing ride-along: this
+/// is the authoritative (re)seeder, so a reauth that swaps a DIFFERENT account
+/// onto the name must replace the old anchor rather than keep proving the old
+/// identity. Best-effort and silent on an absent/blank uuid (a failed probe or
+/// shape drift) — a login is never failed over its anchor.
+pub(crate) fn seed_login_anchor(name: &str, account_uuid: Option<&str>) {
+    let Some(uuid) = account_uuid.map(str::trim).filter(|u| !u.is_empty()) else {
+        return;
+    };
+    write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &uuid.to_string());
 }
 
 /// The account uuid `access_token` authenticates as, via `/api/oauth/profile`

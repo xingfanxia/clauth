@@ -360,7 +360,7 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
     } else {
         println!("clauth: opening a browser to log in to a new account for '{target}'…");
     }
-    let credentials = oauth_login::login_with(|progress| {
+    let outcome = oauth_login::login_with(|progress| {
         // The CLI surfaces only the paste-fallback URL; the later milestones
         // are TUI-modal fodder and would just be noise between the prints here.
         if let oauth_login::LoginProgress::AuthorizeUrl(url) = progress {
@@ -369,29 +369,18 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
     })?;
     println!(
         "clauth: login complete.\n{}",
-        oauth_login::login_summary(&credentials)
+        oauth_login::login_summary(&outcome.credentials)
     );
-    // Seed the identity anchor for unattended mirror adoption (best-effort —
-    // a probe failure never fails the login): the account uuid this login
-    // authenticates as, cached per profile so `oauth::try_adopt_live_rotation`
-    // can verify a diverged live login is the SAME account even after the
-    // stored token dies.
-    if let Some(tok) = credentials
-        .claude_ai_oauth
-        .as_ref()
-        .map(|o| o.access_token.clone())
-        && let Some(id) = crate::usage::fetch_account_uuid(&tok)
-    {
-        crate::profile_cache::write_profile_cache(
-            target,
-            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
-            &id,
-        );
-    }
+    // The uuid the login's own verification probe saw rides the snapshot to
+    // whichever action commits it, which is what anchors the profile — so
+    // `oauth::try_adopt_live_rotation` can prove a diverged live login is the
+    // SAME account even after the stored token dies. Seeding it here instead
+    // would anchor an account whose commit may still fail.
     Ok(actions::CaptureSnapshot {
-        credentials: Some(credentials),
+        credentials: Some(outcome.credentials),
         base_url: None,
         api_key: None,
+        account_uuid: outcome.account_uuid,
     })
 }
 
@@ -441,6 +430,8 @@ fn cmd_login(args: LoginArgs<'_>) -> Result<()> {
                 credentials: None,
                 base_url,
                 api_key,
+                // An api-key login authenticates no Anthropic account.
+                account_uuid: None,
             }
         } else {
             run_oauth_browser(true, &target)?

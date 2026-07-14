@@ -399,15 +399,25 @@ fn credentials_from_token(token: crate::oauth::TokenResponse) -> ClaudeCredentia
     }
 }
 
+/// A completed interactive login: the minted credentials plus the account uuid
+/// the verification probe saw them authenticate as. `account_uuid` is `None` when
+/// the probe failed or the body carried no usable uuid — the login still stands,
+/// and the anchor is simply left to the hourly ride-along backfill.
+#[derive(Debug, Clone)]
+pub(crate) struct LoginOutcome {
+    pub(crate) credentials: ClaudeCredentials,
+    pub(crate) account_uuid: Option<String>,
+}
+
 /// Run the full interactive login: open the browser, catch the loopback
-/// redirect, exchange the code, and return a completed `ClaudeCredentials`.
+/// redirect, exchange the code, and return a completed [`LoginOutcome`].
 /// `progress` receives [`LoginProgress`] milestones — the `AuthorizeUrl` event
 /// fires just before opening the browser (the CLI prints it so the flow is
 /// observable and the URL can be pasted if the browser doesn't open; the TUI
 /// also renders the later stages). Opening the browser is best-effort: on
 /// failure the announced URL is the fallback and the listener still waits.
 /// Blocks the caller for the browser round-trip (up to [`LOGIN_TIMEOUT_SECS`]).
-pub(crate) fn login_with(progress: impl Fn(LoginProgress<'_>)) -> Result<ClaudeCredentials> {
+pub(crate) fn login_with(progress: impl Fn(LoginProgress<'_>)) -> Result<LoginOutcome> {
     let (verifier, challenge) = new_pkce()?;
     let state = random_b64url(32)?;
 
@@ -427,16 +437,24 @@ pub(crate) fn login_with(progress: impl Fn(LoginProgress<'_>)) -> Result<ClaudeC
     let mut creds = credentials_from_token(token);
 
     progress(LoginProgress::Verifying);
-    // Confirm the minted token works against the API and stamp the real plan tier,
-    // so the captured profile shows e.g. "Claude Max" immediately instead of the
-    // unknown-tier "Pro" fallback. Best-effort: a probe failure never fails the
-    // login — clauth's usage poll re-derives the tier within a cycle.
+    // One `/profile` round trip carries all of it: confirm the minted token works
+    // against the API, stamp the real plan tier so the captured profile shows e.g.
+    // "Claude Max" immediately instead of the unknown-tier "Pro" fallback, and
+    // carry out the account uuid so the caller can anchor the profile without a
+    // second identical request. Best-effort: a probe failure never fails the login
+    // — clauth's usage poll re-derives the tier within a cycle and the anchor
+    // backfills on the hourly ride-along.
+    let mut account_uuid = None;
     if let Some(oauth) = creds.claude_ai_oauth.as_mut()
-        && let Ok(sub) = crate::usage::probe_subscription_type(&oauth.access_token)
+        && let Ok(probe) = crate::usage::probe_login_profile(&oauth.access_token)
     {
-        oauth.subscription_type = sub;
+        oauth.subscription_type = probe.subscription_type;
+        account_uuid = probe.account_uuid;
     }
-    Ok(creds)
+    Ok(LoginOutcome {
+        credentials: creds,
+        account_uuid,
+    })
 }
 
 /// A one-glance summary of a captured login for the `clauth login` CLI. Never

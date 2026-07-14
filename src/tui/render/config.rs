@@ -137,7 +137,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
         snap.captured = app
             .config_draft
             .as_ref()
-            .is_some_and(|d| d.captured_creds.is_some() && d.base_url.value.trim().is_empty());
+            .is_some_and(|d| d.captured_login.is_some() && d.base_url.value.trim().is_empty());
         return snap;
     }
     match cfg.profiles.get(app.profile_cursor) {

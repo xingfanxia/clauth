@@ -444,6 +444,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         }),
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
+        account_uuid: None,
     };
 
     overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite in place");
@@ -567,6 +568,100 @@ fn inactive_config(profile: Profile) -> AppConfig {
     }
 }
 
+// ── identity anchor rides the snapshot into the commit ───────────────────────
+//
+// The uuid an interactive login probed is only trustworthy once the credentials
+// it belongs to are actually stored. Every path (CLI reauth, CLI new, TUI silent,
+// TUI confirm-gated, session-save) funnels through these two fns, so they own the
+// seeding — no call site does, and none can forget to.
+
+/// Read the on-disk identity anchor for `name`.
+fn anchor_of(name: &str) -> Option<String> {
+    crate::profile_cache::load_profile_cache::<String>(
+        name,
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+    )
+}
+
+/// An OAuth snapshot as a completed login hands it over.
+fn login_snapshot(refresh: &str, account_uuid: Option<&str>) -> CaptureSnapshot {
+    CaptureSnapshot {
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "acc".to_string(),
+                refresh_token: Some(refresh.to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }),
+        base_url: None,
+        api_key: None,
+        account_uuid: account_uuid.map(str::to_string),
+    }
+}
+
+#[test]
+fn overwrite_captured_profile_anchors_the_account_it_committed() {
+    let _home = HomeSandbox::new();
+    let target = Profile::new("swap".to_string(), None, None);
+    save_profile(&target).expect("save target");
+    let mut config = inactive_config(target);
+    crate::usage::seed_login_anchor("swap", Some("uuid-old-account"));
+
+    overwrite_captured_profile(&mut config, "swap", login_snapshot("new", Some("uuid-new")))
+        .expect("overwrite in place");
+
+    assert_eq!(
+        anchor_of("swap").as_deref(),
+        Some("uuid-new"),
+        "a reauth onto a DIFFERENT account replaces the anchor it invalidated"
+    );
+}
+
+#[test]
+fn capture_into_profile_anchors_the_account_it_committed() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+
+    capture_into_profile(
+        &mut config,
+        "fresh".to_string(),
+        login_snapshot("minted", Some("uuid-fresh")),
+    )
+    .expect("capture");
+
+    assert_eq!(
+        anchor_of("fresh").as_deref(),
+        Some("uuid-fresh"),
+        "a new account is anchored by the login that created it"
+    );
+}
+
+#[test]
+fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
+    let _home = HomeSandbox::new();
+    let target = Profile::new("unproven".to_string(), None, None);
+    save_profile(&target).expect("save target");
+    let mut config = inactive_config(target);
+    crate::usage::seed_login_anchor("unproven", Some("uuid-existing"));
+
+    // `capture_snapshot()` reads live creds off disk and proves no identity; a
+    // failed login probe reports none either. Neither may mint OR clear an anchor
+    // — a `None` stays the silent no-op it has always been.
+    overwrite_captured_profile(&mut config, "unproven", login_snapshot("new", None))
+        .expect("overwrite in place");
+
+    assert_eq!(
+        anchor_of("unproven").as_deref(),
+        Some("uuid-existing"),
+        "an unproven swap must not clear a live anchor"
+    );
+}
+
 #[test]
 fn overwrite_captured_profile_expires_the_profile_ttl_clock() {
     let _home = HomeSandbox::new();
@@ -580,6 +675,7 @@ fn overwrite_captured_profile_expires_the_profile_ttl_clock() {
             credentials: None,
             base_url: Some("https://api.example.com".to_string()),
             api_key: Some("new-api-key".to_string()),
+            account_uuid: None,
         },
     )
     .expect("overwrite in place");
@@ -678,6 +774,7 @@ fn overwrite_captured_profile_clears_auth_broken_quarantine() {
         }),
         base_url: None,
         api_key: None,
+        account_uuid: None,
     };
     overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite");
 
@@ -730,6 +827,7 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
         credentials: None,
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
+        account_uuid: None,
     };
     overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite active profile");
 
@@ -1267,6 +1365,7 @@ fn reauth_overwrite_clears_broken_flag() {
             credentials: Some(oauth_creds("fresh-access")),
             base_url: None,
             api_key: None,
+            account_uuid: None,
         },
     )
     .expect("re-auth overwrite");

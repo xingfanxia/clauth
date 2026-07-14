@@ -430,6 +430,7 @@ fn capture_name_caret_follows_edit_position() {
             credentials: None,
             base_url: None,
             api_key: None,
+            account_uuid: None,
         }),
         input,
         from_divergence: false,

@@ -602,6 +602,16 @@ fn login_creds(refresh: &str) -> crate::profile::ClaudeCredentials {
     }
 }
 
+/// A completed login as `login_with` hands it back: the mint plus the account
+/// uuid its `/profile` verification probe saw. `uuid` is `None` for a login whose
+/// probe failed or returned no usable identity.
+fn login_outcome(refresh: &str, uuid: Option<&str>) -> crate::oauth_login::LoginOutcome {
+    crate::oauth_login::LoginOutcome {
+        credentials: login_creds(refresh),
+        account_uuid: uuid.map(str::to_string),
+    }
+}
+
 /// Like [`login_creds`] but with a caller-chosen access token, so a test can
 /// change the live login's fingerprint without changing its account.
 fn creds_ra(refresh: &str, access: &str) -> crate::profile::ClaudeCredentials {
@@ -658,7 +668,7 @@ fn drain_login_events_discards_a_superseded_result() {
     app.login_generation = 2;
     app.login = Some(login_session("ghost", true, 2));
     app.login_result_tx
-        .send((1, Ok(login_creds("ref"))))
+        .send((1, Ok(login_outcome("ref", Some("uuid-live")))))
         .unwrap();
 
     drain_login_events(&mut app);
@@ -691,7 +701,7 @@ fn login_result_on_the_new_form_stashes_into_the_draft() {
     app.login = Some(login_session("fresh", true, 1));
     app.modals.push(Modal::Login);
     app.login_result_tx
-        .send((1, Ok(login_creds("ref"))))
+        .send((1, Ok(login_outcome("ref", Some("uuid-live")))))
         .unwrap();
 
     drain_login_events(&mut app);
@@ -703,7 +713,7 @@ fn login_result_on_the_new_form_stashes_into_the_draft() {
     assert!(
         app.config_draft
             .as_ref()
-            .is_some_and(|d| d.captured_creds.is_some()),
+            .is_some_and(|d| d.captured_login.is_some()),
         "the mint lands in the draft"
     );
     assert!(app.login.is_none(), "the session ends with the result");
@@ -733,7 +743,7 @@ fn relogin_on_a_stashed_new_form_confirms_before_replacing_the_stash() {
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     // A mint already captured → the `✓ logged in` done-state row.
-    draft.captured_creds = Some(Box::new(login_creds("stashed")));
+    draft.captured_login = Some(Box::new(login_outcome("stashed", Some("uuid-stashed"))));
     app.config_draft = Some(draft);
     app.config_focus = ConfigFocus::Actions;
 
@@ -766,7 +776,7 @@ fn login_result_with_the_form_closed_is_dropped_with_a_warning() {
     app.login_generation = 1;
     app.login = Some(login_session("fresh", true, 1));
     app.login_result_tx
-        .send((1, Ok(login_creds("ref"))))
+        .send((1, Ok(login_outcome("ref", Some("uuid-live")))))
         .unwrap();
 
     drain_login_events(&mut app);
@@ -794,7 +804,7 @@ fn commit_new_account_consumes_the_draft_mint() {
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     draft.model = InputState::new("opus");
-    draft.captured_creds = Some(Box::new(login_creds("minted")));
+    draft.captured_login = Some(Box::new(login_outcome("minted", Some("uuid-minted"))));
     app.config_draft = Some(draft);
 
     commit_new_account(&mut app);
@@ -817,6 +827,118 @@ fn commit_new_account_consumes_the_draft_mint() {
         cfg.state.active_profile.as_deref(),
         Some("fresh"),
         "the first profile links and activates like a capture"
+    );
+    drop(cfg);
+    assert_eq!(
+        crate::profile_cache::load_profile_cache::<String>(
+            "fresh",
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE
+        )
+        .as_deref(),
+        Some("uuid-minted"),
+        "the anchor lands under the name the create committed — the draft carried \
+         the login's uuid this far precisely because the name was still editable"
+    );
+}
+
+/// The TUI re-login seeds the identity anchor from the uuid its own `/profile`
+/// verification probe already saw — the CLI login has always done this, the TUI
+/// login row never did, and an unanchored profile pays a `/profile` every launch
+/// (the anchor gate) and can wedge in `auth_broken` once its stored pair dies.
+#[test]
+fn a_committed_relogin_anchors_the_profile_it_swapped_onto() {
+    use super::apply_login;
+    use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("old"));
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            default_divergence: Some(DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+    // A reauth that swapped a DIFFERENT account onto the name: the stale anchor
+    // must be replaced, or identity would keep proving the old account.
+    crate::usage::seed_login_anchor("work", Some("uuid-old-account"));
+
+    apply_login(
+        &mut app,
+        login_session("work", false, 1),
+        login_outcome("new", Some("uuid-new-account")),
+    );
+
+    assert_eq!(
+        crate::profile_cache::load_profile_cache::<String>(
+            "work",
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE
+        )
+        .as_deref(),
+        Some("uuid-new-account"),
+        "a committed re-login re-anchors to the account that just authenticated"
+    );
+}
+
+/// The gated relogin — the DEFAULT path, since `default_divergence` starts unset.
+/// Before the user confirms, the stored pair is untouched, so anchoring would
+/// claim an identity the profile's credentials can't back (and a wrong anchor is
+/// what lets `try_adopt_live_rotation` capture a foreign live login). On confirm,
+/// the snapshot carries its uuid into the commit and the anchor follows.
+#[test]
+fn a_gated_relogin_anchors_only_once_the_user_confirms() {
+    use super::{Modal, apply_login, run_confirm_action};
+    use crate::profile::{AppConfig, AppState, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let anchor = || {
+        crate::profile_cache::load_profile_cache::<String>(
+            "work",
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        )
+    };
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("old"));
+    let mut app = App::new(AppConfig {
+        state: AppState::default(), // unset divergence default → ask first
+        profiles: vec![work],
+    });
+    // A reauth swapping a DIFFERENT account onto the name.
+    crate::usage::seed_login_anchor("work", Some("uuid-old-account"));
+
+    apply_login(
+        &mut app,
+        login_session("work", false, 1),
+        login_outcome("new", Some("uuid-new-account")),
+    );
+
+    assert_eq!(
+        app.config().find("work").and_then(|p| p.refresh_token()),
+        Some("old"),
+        "precondition: the overwrite is still gated behind the confirm"
+    );
+    assert_eq!(
+        anchor().as_deref(),
+        Some("uuid-old-account"),
+        "the anchor must track the STORED credentials, not an unapplied login"
+    );
+
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        unreachable!("asserted above: the gate opened a confirm");
+    };
+    run_confirm_action(&mut app, state.on_confirm);
+
+    assert_eq!(
+        app.config().find("work").and_then(|p| p.refresh_token()),
+        Some("new"),
+        "precondition: the confirmed relogin committed the swap"
+    );
+    assert_eq!(
+        anchor().as_deref(),
+        Some("uuid-new-account"),
+        "the confirmed relogin re-anchors — the uuid rode the snapshot into the commit"
     );
 }
 
@@ -923,7 +1045,7 @@ fn relogin_gate_maps_divergence_defaults() {
     apply_login(
         &mut app,
         login_session("work", false, 1),
-        login_creds("new"),
+        login_outcome("new", Some("uuid-new")),
     );
     assert!(
         matches!(
@@ -961,7 +1083,7 @@ fn relogin_gate_maps_divergence_defaults() {
         apply_login(
             &mut app,
             login_session("work", false, 1),
-            login_creds("new"),
+            login_outcome("new", Some("uuid-new")),
         );
         assert!(
             matches!(app.modals.last(), Some(Modal::Confirm(_))),
@@ -980,7 +1102,7 @@ fn relogin_gate_maps_divergence_defaults() {
     apply_login(
         &mut app,
         login_session("work", false, 1),
-        login_creds("new"),
+        login_outcome("new", Some("uuid-new")),
     );
     assert!(
         app.modals.is_empty(),
@@ -1000,7 +1122,7 @@ fn relogin_gate_maps_divergence_defaults() {
     apply_login(
         &mut app,
         login_session("work", false, 1),
-        login_creds("new"),
+        login_outcome("new", Some("uuid-new")),
     );
     assert!(
         app.modals.is_empty(),
@@ -2157,6 +2279,7 @@ fn capture_name_collision_opens_overwrite_confirm_instead_of_erroring() {
         credentials: None,
         base_url: Some("https://new.example.com".to_string()),
         api_key: Some("new-key".to_string()),
+        account_uuid: None,
     };
     app.modals
         .push(super::Modal::CaptureName(super::CaptureNameForm {
@@ -2210,6 +2333,7 @@ fn capture_overwrite_cancel_changes_nothing() {
         credentials: None,
         base_url: Some("https://new.example.com".to_string()),
         api_key: Some("new-key".to_string()),
+        account_uuid: None,
     };
     app.modals.push(super::Modal::Confirm(super::ConfirmState {
         message: "Profile 'acme' already exists.".to_string(),

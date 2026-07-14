@@ -296,10 +296,12 @@ pub(crate) struct ConfigDraft {
     /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
     /// collapsed (set overrides still render; unset ones hide behind the chip).
     pub(crate) overrides_expanded: bool,
-    /// Minted credentials from a `+ new`-form browser login, held in memory
-    /// until `create account` consumes them (capture-then-commit). Dropped
+    /// A `+ new`-form browser login, held in memory until `create account`
+    /// consumes it (capture-then-commit). Carries the probed account uuid
+    /// alongside the mint so the anchor is seeded under the name the create
+    /// actually commits — the draft's name is still editable until then. Dropped
     /// with the draft; never set on an existing account's draft.
-    pub(crate) captured_creds: Option<Box<crate::profile::ClaudeCredentials>>,
+    pub(crate) captured_login: Option<Box<crate::oauth_login::LoginOutcome>>,
 }
 
 impl ConfigDraft {
@@ -1251,11 +1253,11 @@ pub(crate) struct App {
     pub(crate) login_event_tx: std::sync::mpsc::Sender<(u64, LoginEvent)>,
     pub(crate) login_result_rx: std::sync::mpsc::Receiver<(
         u64,
-        std::result::Result<crate::profile::ClaudeCredentials, String>,
+        std::result::Result<crate::oauth_login::LoginOutcome, String>,
     )>,
     pub(crate) login_result_tx: std::sync::mpsc::Sender<(
         u64,
-        std::result::Result<crate::profile::ClaudeCredentials, String>,
+        std::result::Result<crate::oauth_login::LoginOutcome, String>,
     )>,
 
     /// Claude status feed state; UI-thread-only (no shared lock).
@@ -4681,7 +4683,7 @@ fn build_draft_new() -> ConfigDraft {
         armed_delete: false,
         relogin_chain: false,
         overrides_expanded: false,
-        captured_creds: None,
+        captured_login: None,
     }
 }
 
@@ -4705,7 +4707,7 @@ fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
         armed_delete: false,
         relogin_chain: false,
         overrides_expanded: false,
-        captured_creds: None,
+        captured_login: None,
     }
 }
 
@@ -4716,7 +4718,7 @@ fn leave_config_detail(app: &mut App) {
     let mint_dropped = app
         .config_draft
         .as_ref()
-        .is_some_and(|d| d.editing_name.is_none() && d.captured_creds.is_some());
+        .is_some_and(|d| d.editing_name.is_none() && d.captured_login.is_some());
     app.config_focus = ConfigFocus::Profiles;
     app.config_draft = None;
     if mint_dropped {
@@ -4832,7 +4834,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 let has_stash = app
                     .config_draft
                     .as_ref()
-                    .is_some_and(|d| d.captured_creds.is_some());
+                    .is_some_and(|d| d.captured_login.is_some());
                 if has_stash {
                     app.modals.push(Modal::Confirm(ConfirmState {
                         message: "Replace the captured login?".to_string(),
@@ -5592,11 +5594,11 @@ fn commit_new_account(app: &mut App) {
     // A draft-held mint only makes sense for an OAuth create; a typed base url
     // flipped the form to API mode (login row hidden), so the mint is dropped.
     let captured = if base_url.is_none() {
-        d.captured_creds.clone()
+        d.captured_login.clone()
     } else {
         None
     };
-    let mint_discarded = base_url.is_some() && d.captured_creds.is_some();
+    let mint_discarded = base_url.is_some() && d.captured_login.is_some();
     let validation = {
         let cfg = app.config();
         validate_profile_name(&name, &cfg.names(), None)
@@ -5609,7 +5611,15 @@ fn commit_new_account(app: &mut App) {
     let result = {
         let mut cfg = app.config();
         match captured {
-            Some(creds) => create_profile_from_login(&mut cfg, name.clone(), model, *creds),
+            // The draft parked the login's uuid until this moment fixed the
+            // name; `create_profile_from_login` anchors it on the commit.
+            Some(login) => create_profile_from_login(
+                &mut cfg,
+                name.clone(),
+                model,
+                login.credentials,
+                login.account_uuid,
+            ),
             None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, model),
         }
     };
@@ -6373,17 +6383,19 @@ fn drain_login_events(app: &mut App) {
 /// existence at apply time and, since fresh creds replacing stored ones IS a
 /// divergence, gates the overwrite on `AppState.default_divergence`: only an
 /// `Overwrite` default applies silently; anything else asks first.
-fn apply_login(app: &mut App, session: LoginSession, creds: crate::profile::ClaudeCredentials) {
+fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login::LoginOutcome) {
     if session.is_new {
         // The `+ new` form may have been closed during the browser round-trip;
-        // the mint lives only in the draft, so without one it is dropped.
+        // the mint lives only in the draft, so without one it is dropped. The
+        // anchor waits for `create account`: the draft's name is still editable,
+        // so the profile this login belongs to has no final name yet.
         let stashed = match app
             .config_draft
             .as_mut()
             .filter(|d| d.editing_name.is_none())
         {
             Some(draft) => {
-                draft.captured_creds = Some(Box::new(creds));
+                draft.captured_login = Some(Box::new(outcome));
                 true
             }
             None => false,
@@ -6421,10 +6433,13 @@ fn apply_login(app: &mut App, session: LoginSession, creds: crate::profile::Clau
         );
         return;
     }
+    // The uuid rides the snapshot: this may land in a confirm modal instead of
+    // committing now, and only the commit may seed the anchor.
     let snapshot = CaptureSnapshot {
-        credentials: Some(creds),
+        credentials: Some(outcome.credentials),
         base_url: None,
         api_key: None,
+        account_uuid: outcome.account_uuid,
     };
     // No stored creds → nothing diverges; adopt silently (mirrors the
     // first-login adopt in `poll_credentials_divergence`).
