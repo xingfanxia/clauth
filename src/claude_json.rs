@@ -166,6 +166,29 @@ fn sync_paths(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// CC's cached account uuid from `~/.claude.json`'s `oauthAccount.accountUuid`,
+/// or `None` when the file, block, or value is absent/blank/unparseable.
+/// Read-then-parse with the same discipline as [`strip_home_oauth_account`]: a
+/// missing file is never created and a file caught mid-write by CC is left
+/// untouched rather than clobbered. CC trusts this cached block and does not
+/// re-derive it from a swapped credentials file — so a hit is "CC's last booted
+/// identity", not fresh proof of the live token's account.
+pub(crate) fn home_oauth_account_uuid() -> Option<String> {
+    let path = home_dir().ok()?.join(".claude.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return None; // missing — never create
+    };
+    let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(&bytes) else {
+        return None; // unparseable (CC mid-write) — never clobber
+    };
+    obj.get("oauthAccount")
+        .and_then(|a| a.get("accountUuid"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+}
+
 /// Delete the stale `oauthAccount` identity block from the home
 /// `~/.claude.json` on profile switch (issue #17). Claude Code trusts a
 /// cached identity block and does not re-derive it from a relinked

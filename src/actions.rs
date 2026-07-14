@@ -590,32 +590,61 @@ pub(crate) fn set_profile_default_model(
 }
 
 /// Which profile the CURRENT live login (`~/.claude/.credentials.json`)
-/// belongs to, by exact token match — no network:
+/// belongs to, fully offline. Two tiers, tried in order:
 ///
-/// **Exact token match** (refresh or access token equal to a profile's stored
-/// pair): the live file IS that profile's credential — a stale mirror, or a
-/// half-landed switch that moved the link but not the state.
+/// **Token equality** (authoritative): the live refresh OR access token equals
+/// a profile's stored pair — the live file IS that profile's credential. Never
+/// stale, so it wins outright when it hits.
+///
+/// **Account uuid** (fallback, only when token equality misses): a sibling's
+/// genuine re-login through Claude Code mints all-new tokens that match no
+/// stored pair, so tier 1 reads UNKNOWN — and a configured `overwrite`/`new`
+/// default would then capture that login into the WRONG (active) profile. This
+/// tier matches CC's own identity record (`~/.claude.json`'s
+/// `oauthAccount.accountUuid`) against each profile's cached anchor
+/// (`profile_cache::ACCOUNT_ID_CACHE_FILE`). A missing/unparseable file, a
+/// missing block, or a blank uuid on either side yields no match — two blanks
+/// never prove identity.
 ///
 /// Returns the owning profile's name — possibly the ACTIVE profile itself (a
-/// same-account divergence, which the adopt path self-heals). Callers wanting a
-/// SIBLING must compare against the active name. `None` when the login matches
-/// no stored token — either a genuinely foreign account (a human decision) or a
-/// CC re-login where every token is new. An account-uuid tier (CC's own
-/// `~/.claude.json` identity record matched against a profile's cached identity
-/// anchor) can layer on once per-profile identity anchors exist (PR #24); until
-/// then this is token-equality only.
+/// same-account divergence the adopt path self-heals). Callers wanting a SIBLING
+/// compare against the active name. `None` when neither tier proves ownership: a
+/// genuinely foreign account, which is a human decision.
+///
+/// Staleness caveat: CC trusts the cached `oauthAccount` block and does not
+/// re-derive it from a swapped credentials file (exactly why clauth strips it on
+/// switch — [`crate::claude_json::strip_home_oauth_account`]). So a tier-2 hit is "CC's
+/// last booted identity", not fresh proof of the live token's account. That can
+/// only bias the verdict conservatively: pointing at a SIBLING routes the
+/// divergence to the banner (user decides), and pointing at the active profile
+/// is filtered out by the caller (`note_divergence` drops an owner equal to
+/// active) — the same as no match, so the configured default applies unchanged.
+/// The tier can never manufacture the one harmful outcome — auto-capturing a
+/// sibling's login into the wrong profile — so its worst case is the banner.
 pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<String> {
     let live = read_claude_credentials().ok().flatten()?;
     let live_access = live.access_token().filter(|t| !t.is_empty());
     let live_refresh = live.refresh_token().filter(|t| !t.is_empty());
-    config
-        .profiles
-        .iter()
-        .find(|p| {
-            (live_refresh.is_some() && p.refresh_token() == live_refresh)
-                || (live_access.is_some() && p.access_token() == live_access)
-        })
-        .map(|p| p.name.as_str().to_string())
+
+    // Tier 1 — token equality: authoritative, never stale.
+    if let Some(owner) = config.profiles.iter().find(|p| {
+        (live_refresh.is_some() && p.refresh_token() == live_refresh)
+            || (live_access.is_some() && p.access_token() == live_access)
+    }) {
+        return Some(owner.name.as_str().to_string());
+    }
+
+    // Tier 2 — account uuid: a sibling's CC re-login mints fresh tokens tier 1
+    // can't recognize, so match CC's cached identity against the anchor instead.
+    let live_uuid = crate::claude_json::home_oauth_account_uuid()?;
+    config.profiles.iter().find_map(|p| {
+        let anchor = crate::profile_cache::load_profile_cache::<String>(
+            &p.name,
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+        )?;
+        let anchor = anchor.trim();
+        (!anchor.is_empty() && anchor == live_uuid.as_str()).then(|| p.name.as_str().to_string())
+    })
 }
 
 /// Returns a profile whose `refresh_token` matches `live`. Matches on refresh

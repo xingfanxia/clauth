@@ -1420,9 +1420,8 @@ fn switch_cli_refuses_dead_target_with_login_hint() {
 
 // ── identify_live_login_owner: whose login sits in ~/.claude right now ──────
 //
-// Token-equality tier only. An account-uuid tier (CC's `~/.claude.json`
-// identity record matched against a profile's cached anchor) layers on once
-// per-profile identity anchors exist (PR #24) — no anchors upstream yet.
+// Two tiers: token equality (authoritative), then account uuid (fallback for a
+// sibling's CC re-login that mints fresh tokens no stored pair recognizes).
 
 #[cfg(unix)]
 mod identify_live_login_owner {
@@ -1467,6 +1466,28 @@ mod identify_live_login_owner {
         std::fs::write(&live, serde_json::to_vec(c).expect("ser")).expect("write");
     }
 
+    fn home_claude_json() -> std::path::PathBuf {
+        crate::profile::home_dir().unwrap().join(".claude.json")
+    }
+
+    /// Write `~/.claude.json` carrying an `oauthAccount.accountUuid` of `uuid`,
+    /// or a file with no `oauthAccount` block at all when `uuid` is `None`.
+    fn write_home_identity(uuid: Option<&str>) {
+        let mut obj = serde_json::json!({"numStartups": 1});
+        if let Some(u) = uuid {
+            obj["oauthAccount"] = serde_json::json!({"accountUuid": u});
+        }
+        std::fs::write(home_claude_json(), serde_json::to_vec_pretty(&obj).unwrap()).unwrap();
+    }
+
+    fn anchor(name: &str, uuid: &str) {
+        crate::profile_cache::write_profile_cache(
+            name,
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            &uuid.to_string(),
+        );
+    }
+
     /// Exact token equality — the live file IS a profile's stored credential
     /// (stale mirror / half-landed switch).
     #[test]
@@ -1483,13 +1504,117 @@ mod identify_live_login_owner {
         );
     }
 
-    /// No token match → unknown; a CC re-login where every token is new (no
-    /// anchors yet) and a genuinely foreign account both identify nobody.
+    /// No token match → unknown; a genuinely foreign account (no anchor on the
+    /// live identity either) identifies nobody.
     #[test]
     fn a_foreign_login_identifies_nobody() {
         let _home = HomeSandbox::new();
         let cfg = config_with(vec![("a", creds("at-a", "rt-a"))]);
         write_live(&creds("at-foreign", "rt-foreign"));
         assert_eq!(crate::actions::identify_live_login_owner(&cfg), None);
+    }
+
+    /// Token equality is authoritative: even when CC's identity block points at
+    /// a DIFFERENT profile, a matching stored token still wins.
+    #[test]
+    fn token_tier_wins_over_uuid_tier_when_tokens_match() {
+        let _home = HomeSandbox::new();
+        let cfg = config_with(vec![
+            ("a", creds("at-a", "rt-a")),
+            ("b", creds("at-b", "rt-b")),
+        ]);
+        // Live = b's exact tokens, but the identity block says a.
+        write_live(&creds("at-b", "rt-b"));
+        anchor("a", "uuid-a");
+        write_home_identity(Some("uuid-a"));
+        assert_eq!(
+            crate::actions::identify_live_login_owner(&cfg).as_deref(),
+            Some("b"),
+        );
+    }
+
+    /// The fix target: a sibling's CC re-login mints fresh tokens that match no
+    /// stored pair, but its `oauthAccount.accountUuid` equals profile b's cached
+    /// anchor → returns `Some("b")`. Fails before the uuid tier existed.
+    #[test]
+    fn uuid_tier_identifies_a_sibling_relogin_when_no_token_matches() {
+        let _home = HomeSandbox::new();
+        let cfg = config_with(vec![
+            ("a", creds("at-a", "rt-a")),
+            ("b", creds("at-b", "rt-b")),
+        ]);
+        // b re-logged in through CC — every token is new, no stored pair hits.
+        write_live(&creds("fresh-at", "fresh-rt"));
+        anchor("b", "uuid-b");
+        write_home_identity(Some("uuid-b"));
+        assert_eq!(
+            crate::actions::identify_live_login_owner(&cfg).as_deref(),
+            Some("b"),
+        );
+    }
+
+    #[test]
+    fn uuid_tier_no_cached_anchor_identifies_nobody() {
+        let _home = HomeSandbox::new();
+        let cfg = config_with(vec![("a", creds("at-a", "rt-a"))]);
+        write_live(&creds("fresh-at", "fresh-rt"));
+        write_home_identity(Some("uuid-a"));
+        // a has NO cached anchor → no match.
+        assert_eq!(crate::actions::identify_live_login_owner(&cfg), None);
+    }
+
+    #[test]
+    fn uuid_tier_no_oauth_account_block_identifies_nobody() {
+        let _home = HomeSandbox::new();
+        let cfg = config_with(vec![("a", creds("at-a", "rt-a"))]);
+        write_live(&creds("fresh-at", "fresh-rt"));
+        anchor("a", "uuid-a");
+        // No oauthAccount block in ~/.claude.json → no live uuid.
+        write_home_identity(None);
+        assert_eq!(crate::actions::identify_live_login_owner(&cfg), None);
+    }
+
+    /// A blank uuid on either side — and both blank — must never compare equal.
+    #[test]
+    fn uuid_tier_blank_uuid_on_either_side_identifies_nobody() {
+        let _home = HomeSandbox::new();
+        let cfg = config_with(vec![("a", creds("at-a", "rt-a"))]);
+        write_live(&creds("fresh-at", "fresh-rt"));
+
+        // Blank live uuid, real anchor.
+        write_home_identity(Some("   "));
+        anchor("a", "uuid-a");
+        assert_eq!(crate::actions::identify_live_login_owner(&cfg), None);
+
+        // Real live uuid, blank anchor.
+        write_home_identity(Some("uuid-a"));
+        anchor("a", "   ");
+        assert_eq!(crate::actions::identify_live_login_owner(&cfg), None);
+
+        // Both blank — must never prove identity.
+        write_home_identity(Some(""));
+        anchor("a", "");
+        assert_eq!(crate::actions::identify_live_login_owner(&cfg), None);
+    }
+
+    /// A file caught mid-write by CC (unparseable) yields nobody and is left
+    /// byte-for-byte untouched — never clobbered.
+    #[test]
+    fn uuid_tier_unparseable_claude_json_identifies_nobody_and_leaves_it() {
+        let _home = HomeSandbox::new();
+        let cfg = config_with(vec![("a", creds("at-a", "rt-a"))]);
+        write_live(&creds("fresh-at", "fresh-rt"));
+        anchor("a", "uuid-a");
+
+        let path = home_claude_json();
+        let garbage = b"{ this is not valid json ";
+        std::fs::write(&path, garbage).unwrap();
+
+        assert_eq!(crate::actions::identify_live_login_owner(&cfg), None);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            garbage,
+            "an unparseable file caught mid-write by CC must be left untouched",
+        );
     }
 }
