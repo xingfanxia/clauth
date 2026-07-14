@@ -400,6 +400,10 @@ pub(crate) enum ConfirmAction {
     /// row), so re-running would silently replace it. Confirm first, then
     /// re-dispatch `start_login`. `bool` = `is_new`, carried to the restart.
     RestartLogin(String, bool),
+    /// Delete row on a profile with a live `clauth start` session: the unforced
+    /// guard in `delete_profile` refuses this, so confirm the deauth risk here
+    /// and re-run the delete with `force`.
+    DeleteLiveSession(String),
 }
 
 #[derive(Debug, Clone)]
@@ -5649,9 +5653,30 @@ fn commit_new_account(app: &mut App) {
 }
 
 fn perform_delete(app: &mut App, name: &str) {
+    // The unforced guard in `delete_profile` refuses a live-session profile,
+    // which would otherwise dead-end the TUI on a danger toast with no way
+    // forward. Confirm the deauth risk instead of attempting (and failing)
+    // the unforced delete first.
+    if crate::runtime::has_live_session(name) {
+        app.modals.push(Modal::Confirm(ConfirmState {
+            message: format!("Delete '{name}' anyway?"),
+            detail: Some(
+                "This profile has a live `clauth start` session; deleting it may log that \
+                 session out."
+                    .to_string(),
+            ),
+            choice: false,
+            on_confirm: ConfirmAction::DeleteLiveSession(name.to_string()),
+        }));
+        return;
+    }
+    finish_delete(app, name, false);
+}
+
+fn finish_delete(app: &mut App, name: &str, force: bool) {
     let result = {
         let mut cfg = app.config();
-        delete_profile(&mut cfg, name, false)
+        delete_profile(&mut cfg, name, force)
     };
     match result {
         Ok(()) => {
@@ -5910,6 +5935,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
+        ConfirmAction::DeleteLiveSession(name) => finish_delete(app, &name, true),
     }
 }
 

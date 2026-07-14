@@ -142,6 +142,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::RelinkCredentials(_) => "CONFIRM",
         ConfirmAction::BlankCredentials(_) => "CONFIRM",
         ConfirmAction::RestartLogin(..) => "CONFIRM",
+        ConfirmAction::DeleteLiveSession(_) => "CONFIRM",
     };
 
     // Destructive/global ops carry a DANGER cue on their confirm button.
@@ -155,6 +156,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::CaptureOverwrite(..)
             | ConfirmAction::AdoptDivergence(..)
             | ConfirmAction::BlankCredentials(_)
+            | ConfirmAction::DeleteLiveSession(_)
     );
 
     let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(

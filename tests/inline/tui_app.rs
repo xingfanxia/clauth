@@ -589,6 +589,82 @@ fn pure_oauth_logout_clears_the_credentials() {
     assert_eq!(p.base_url, None, "no endpoint appears out of a log out");
 }
 
+/// Simulate a live `clauth start` session for `name`: a locked pid file in its
+/// sessions dir reads as alive via `has_live_session` (mirrors the fixture in
+/// `tests/inline/actions.rs::delete_refuses_live_session_unless_forced`). The
+/// caller must keep the returned file alive for as long as the session should
+/// read as live — dropping it releases the flock.
+fn arm_live_session(home: &std::path::Path, name: &str) -> std::fs::File {
+    let sessions = home
+        .join(".clauth")
+        .join("profiles")
+        .join(name)
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
+    pid.lock().expect("lock pid");
+    pid
+}
+
+/// A live-session delete must not dead-end on the guard's refusal toast: it
+/// arms a confirm modal instead, leaving the profile untouched until confirmed.
+#[test]
+fn perform_delete_with_live_session_arms_a_confirm_modal() {
+    use super::{ConfirmAction, Modal, perform_delete, run_confirm_action};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
+    let _pid_guard = arm_live_session(home.home(), "busy");
+
+    perform_delete(&mut app, "busy");
+    assert!(
+        app.config().find("busy").is_some(),
+        "a live-session delete must not remove the profile before confirmation"
+    );
+    let confirm = app
+        .modals
+        .last()
+        .and_then(|m| match m {
+            Modal::Confirm(s) => Some(s),
+            _ => None,
+        })
+        .expect("a live session arms a confirm modal");
+    assert!(
+        matches!(&confirm.on_confirm, ConfirmAction::DeleteLiveSession(n) if n == "busy"),
+        "the confirm carries the delete-live-session action for the right profile"
+    );
+
+    let action = confirm.on_confirm.clone();
+    run_confirm_action(&mut app, action);
+    assert!(
+        app.config().find("busy").is_none(),
+        "confirming deletes the profile despite the live session"
+    );
+}
+
+/// No live session: the delete must land immediately, bit-identical to the
+/// pre-existing behavior, with no confirm modal in the way.
+#[test]
+fn perform_delete_without_live_session_deletes_immediately() {
+    use super::{Modal, perform_delete};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("quiet".to_string(), None, None)]);
+
+    perform_delete(&mut app, "quiet");
+
+    assert!(
+        app.config().find("quiet").is_none(),
+        "a delete with no live session removes the profile right away"
+    );
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+        "no live session means no confirm modal is pushed"
+    );
+}
+
 /// Minted-credential fixture for the login tests.
 fn login_creds(refresh: &str) -> crate::profile::ClaudeCredentials {
     crate::profile::ClaudeCredentials {
