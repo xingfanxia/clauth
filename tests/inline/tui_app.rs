@@ -414,9 +414,10 @@ fn config_rows_login_tracks_api_mode_when_draft_types_a_base_url() {
         profiles: vec![oauth],
     });
 
-    // Existing OAuth draft that types a base url flips the row to API mode: the
-    // login row stays (now an API re-login), but delete-creds tracks the API
-    // credential — the saved profile has no api key, so it's hidden.
+    // Existing OAuth draft that types a base url flips the endpoint rows to API
+    // mode (api key shows), but the login rows type off the stored credential:
+    // committing that base url would make this a hybrid, and its OAuth pair stays
+    // logged out-able throughout.
     app.profile_cursor = 0;
     let mut draft = build_draft_existing(&app, "oauth");
     draft.base_url = InputState::new("https://api.example.com");
@@ -427,8 +428,12 @@ fn config_rows_login_tracks_api_mode_when_draft_types_a_base_url() {
         "typing a base url keeps login (re-login) on an existing account"
     );
     assert!(
-        !rows.contains(&ConfigRow::DeleteCreds),
-        "delete-creds tracks the api key, absent here, so it stays hidden"
+        rows.contains(&ConfigRow::ApiKey),
+        "typing a base url reveals the api key row"
+    );
+    assert!(
+        rows.contains(&ConfigRow::DeleteCreds),
+        "an uncommitted base url can't hide the stored OAuth pair's log-out row"
     );
 
     // `+ new` form with a typed base url is an API create → no login row (the
@@ -442,6 +447,146 @@ fn config_rows_login_tracks_api_mode_when_draft_types_a_base_url() {
         !rows.contains(&ConfigRow::Login),
         "the new form hides login once a base url makes it an API account"
     );
+}
+
+/// A hybrid account: a stored OAuth pair AND a base url on one profile. Capture
+/// reads the two live files independently, and setting a base url on an OAuth
+/// account never drops its credentials — so this shape is reachable from both
+/// paths, and the Setup rows must act on the credential that actually exists.
+fn hybrid(name: &str, api_key: Option<&str>) -> crate::profile::Profile {
+    let mut p = crate::profile::Profile::new(
+        name.to_string(),
+        Some("https://api.example.com".to_string()),
+        api_key.map(str::to_string),
+    );
+    p.credentials = Some(login_creds("ref"));
+    p
+}
+
+fn app_with(profiles: Vec<crate::profile::Profile>) -> App {
+    use crate::profile::{AppConfig, AppState};
+    let names = profiles.iter().map(|p| p.name.clone()).collect();
+    App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            ..AppState::default()
+        },
+        profiles,
+    })
+}
+
+#[test]
+fn config_rows_hybrid_shows_the_logout_row_for_its_oauth_pair() {
+    use super::{ConfigRow, config_rows};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // No api key: the endpoint needs none (a local base url), so the only stored
+    // credential is the OAuth pair.
+    let mut app = app_with(vec![hybrid("hybrid", None)]);
+    app.config_draft = None;
+    app.profile_cursor = 0;
+
+    let rows = config_rows(&app);
+    assert!(
+        rows.contains(&ConfigRow::DeleteCreds),
+        "a stored OAuth pair keeps the log-out row on a hybrid: {rows:?}"
+    );
+}
+
+#[test]
+fn hybrid_logout_clears_the_oauth_pair_and_keeps_the_api_shell() {
+    use super::{ConfirmAction, run_confirm_action};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![hybrid("hybrid", Some("sk-secret"))]);
+    run_confirm_action(&mut app, ConfirmAction::BlankCredentials("hybrid".into()));
+
+    let cfg = app.config();
+    let p = cfg.find("hybrid").expect("profile present");
+    assert!(
+        p.credentials.is_none(),
+        "log out drops the stored OAuth pair, not just the api key"
+    );
+    assert_eq!(
+        p.base_url.as_deref(),
+        Some("https://api.example.com"),
+        "the endpoint shell survives the log out"
+    );
+    assert_eq!(
+        p.api_key.as_deref(),
+        Some("sk-secret"),
+        "an OAuth log out leaves the api key alone"
+    );
+}
+
+#[test]
+fn hybrid_login_row_routes_to_the_browser_mint_not_the_api_chain() {
+    use super::{ConfigRow, Modal, build_draft_existing, run_config_row};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![hybrid("hybrid", Some("sk-secret"))]);
+    // A login already in flight parks `start_login` on its in-progress guard, so
+    // the route is observable without minting anything.
+    app.login_generation = 1;
+    app.login = Some(login_session("other", true, 1));
+    app.profile_cursor = 0;
+    let draft = build_draft_existing(&app, "hybrid");
+    app.config_draft = Some(draft);
+
+    run_config_row(&mut app, ConfigRow::Login);
+    assert!(
+        app.modals.iter().any(|m| matches!(m, Modal::Login)),
+        "a hybrid's login row runs the OAuth mint"
+    );
+    assert!(
+        !app.config_draft.as_ref().is_some_and(|d| d.relogin_chain),
+        "a hybrid's login row is not the API base-url + api-key re-entry"
+    );
+}
+
+/// Pin: a pure API account (no stored OAuth pair) logs out of its api key only.
+#[test]
+fn pure_api_logout_clears_only_the_api_key() {
+    use super::{ConfirmAction, run_confirm_action};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new(
+        "api".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret".to_string()),
+    )]);
+    run_confirm_action(&mut app, ConfirmAction::BlankCredentials("api".into()));
+
+    let cfg = app.config();
+    let p = cfg.find("api").expect("profile present");
+    assert_eq!(p.api_key, None, "log out blanks the api key");
+    assert_eq!(
+        p.base_url.as_deref(),
+        Some("https://api.example.com"),
+        "the endpoint shell survives the log out"
+    );
+}
+
+/// Pin: a pure OAuth account logs out of its credentials, endpoint-less as ever.
+#[test]
+fn pure_oauth_logout_clears_the_credentials() {
+    use super::{ConfirmAction, run_confirm_action};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut oauth = Profile::new("oauth".to_string(), None, None);
+    oauth.credentials = Some(login_creds("ref"));
+    let mut app = app_with(vec![oauth]);
+    run_confirm_action(&mut app, ConfirmAction::BlankCredentials("oauth".into()));
+
+    let cfg = app.config();
+    let p = cfg.find("oauth").expect("profile present");
+    assert!(
+        p.credentials.is_none(),
+        "log out drops the stored OAuth pair"
+    );
+    assert_eq!(p.base_url, None, "no endpoint appears out of a log out");
 }
 
 /// Minted-credential fixture for the login tests.

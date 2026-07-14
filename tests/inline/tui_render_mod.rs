@@ -37,6 +37,18 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
     }
 }
 
+fn hybrid_creds() -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some("ref".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    }
+}
+
 fn demo_incidents() -> Vec<Incident> {
     vec![
         Incident {
@@ -322,6 +334,79 @@ fn setup_api_account_shows_relogin_and_logout_rows() {
     assert!(
         out.contains("re-enter the base url"),
         "the login row's hint describes the API re-entry:\n{out}",
+    );
+}
+
+/// A hybrid (stored OAuth pair + base url) with no api key: the login/log-out
+/// rows must read off the credential that exists, or the tab reads "logged out"
+/// over a live token.
+#[test]
+fn setup_hybrid_account_reads_logged_in_on_its_oauth_pair() {
+    use crate::tui::app::{ConfigRow, Tab, config_rows};
+    let mut hybrid = oauth("acme", 0.0, 0.0, false);
+    hybrid.base_url = Some("http://127.0.0.1:1234".to_string());
+    hybrid.credentials = Some(hybrid_creds());
+    hybrid.usage = None;
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["acme".into()],
+            ..AppState::default()
+        },
+        profiles: vec![hybrid],
+    };
+    let mut app = App::new(config);
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    // Park on the login row (always present) so its hint renders too.
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("every account shows a login row");
+
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("re-login"),
+        "a stored OAuth pair reads as logged in:\n{out}",
+    );
+    assert!(
+        out.contains("log out"),
+        "a stored OAuth pair keeps the log-out row:\n{out}",
+    );
+    assert!(
+        out.contains("browser OAuth login"),
+        "the login row's hint describes the OAuth mint:\n{out}",
+    );
+}
+
+/// Same typing rule for the log-out row's own hint: a hybrid holding both an api
+/// key and an OAuth pair logs out of the pair, and the copy must say so.
+#[test]
+fn setup_hybrid_logout_hint_names_the_oauth_login() {
+    use crate::tui::app::{ConfigRow, Tab, config_rows};
+    let mut hybrid = oauth("acme", 0.0, 0.0, false);
+    hybrid.base_url = Some("https://api.example.com".to_string());
+    hybrid.api_key = Some("sk-secret".to_string());
+    hybrid.credentials = Some(hybrid_creds());
+    hybrid.usage = None;
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["acme".into()],
+            ..AppState::default()
+        },
+        profiles: vec![hybrid],
+    };
+    let mut app = App::new(config);
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::DeleteCreds)
+        .expect("an api key alone already shows the log-out row");
+
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("clears the stored OAuth"),
+        "the log-out hint names the OAuth login it clears:\n{out}",
     );
 }
 

@@ -86,6 +86,10 @@ struct Snap {
     /// API account, the api key. Drives the `Login` row's re-login vs first-login
     /// label and the `DeleteCreds` row's presence.
     logged_in: bool,
+    /// Credential typing for the login / log-out rows (`Profile::login_is_oauth`,
+    /// so a hybrid's stored pair wins over its base url). Endpoint-shaped rows
+    /// keep tracking the base-url buffer instead.
+    login_is_oauth: bool,
     /// `+ new` form only: the draft holds a minted login awaiting `create
     /// account` — flips the `Login` row to its `✓ logged in` state.
     captured: bool,
@@ -110,6 +114,7 @@ impl Snap {
             auto_start: false,
             is_active: false,
             logged_in: false,
+            login_is_oauth: true,
             captured: false,
             provider: None,
         }
@@ -157,11 +162,12 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             auto_start: p.auto_start,
             // OAuth accounts carry a token; API accounts carry an api key. Either
             // one flips the Login row to "re-login" and shows the log-out row.
-            logged_in: if p.is_oauth() {
+            logged_in: if p.login_is_oauth() {
                 p.credentials.is_some()
             } else {
                 p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
             },
+            login_is_oauth: p.login_is_oauth(),
             captured: false,
             provider: p.provider.map(|p| p.display_name()),
         },
@@ -262,7 +268,7 @@ fn draw_settings_rows(
         line_idx += 1;
         if selected
             && !is_editing
-            && let Some(text) = row_hint(*row, is_api)
+            && let Some(text) = row_hint(*row, !snap.login_is_oauth)
         {
             let hint = help_tooltip_lines(text, inner.width as usize);
             line_idx += hint.len() as u16;
@@ -326,10 +332,11 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
     }
 }
 
-/// Inline help for rows whose labels don't self-describe. `is_api` picks the
+/// Inline help for rows whose labels don't self-describe. `api_login` picks the
 /// login/log-out wording: an API account re-enters a base url + api key, an OAuth
-/// account mints tokens through the browser.
-fn row_hint(row: ConfigRow, is_api: bool) -> Option<&'static str> {
+/// account mints tokens through the browser. It's the rows' credential typing,
+/// not the base-url buffer — the copy has to name what ⏎ really does.
+fn row_hint(row: ConfigRow, api_login: bool) -> Option<&'static str> {
     match row {
         ConfigRow::BaseUrl => {
             Some("api endpoint for this account; leave empty for claude.ai OAuth")
@@ -347,9 +354,9 @@ fn row_hint(row: ConfigRow, is_api: bool) -> Option<&'static str> {
         ConfigRow::ModelOverrideAdd => {
             Some("pin what an alias resolves to, or force the subagent model")
         }
-        ConfigRow::Login if is_api => Some("re-enter the base url + api key for this account"),
+        ConfigRow::Login if api_login => Some("re-enter the base url + api key for this account"),
         ConfigRow::Login => Some("browser OAuth login; mints fresh tokens for this account"),
-        ConfigRow::DeleteCreds if is_api => {
+        ConfigRow::DeleteCreds if api_login => {
             Some("clears the stored api key; keeps the account and its settings")
         }
         ConfigRow::DeleteCreds => {

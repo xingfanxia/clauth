@@ -189,6 +189,17 @@ impl Profile {
         self.base_url.is_none()
     }
 
+    /// Credential typing: which stored credential the login / log-out surfaces
+    /// act on. A profile can hold both an OAuth pair and a `base_url` (capture
+    /// reads the two live files independently; setting an endpoint never drops
+    /// stored credentials), and on such a hybrid the pair is the thing a log out
+    /// has to clear — otherwise a live token sits on disk behind a logged-out
+    /// UI. Endpoint routing stays on [`Profile::is_oauth`]: a `base_url` decides
+    /// where requests go regardless of what else is stored.
+    pub(crate) fn login_is_oauth(&self) -> bool {
+        self.credentials.is_some() || self.is_oauth()
+    }
+
     pub(crate) fn is_third_party(&self) -> bool {
         self.provider.is_some()
     }

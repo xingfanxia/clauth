@@ -4621,14 +4621,17 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     rows.push(ConfigRow::EnvAdd);
     // Log in / re-login, then log out once a credential exists — for both OAuth
     // (browser mint) and API (base url + api key) accounts. "Has a credential"
-    // reads the OAuth token or the api key depending on the account type.
+    // reads the OAuth token or the api key depending on the account's credential
+    // typing (`login_is_oauth`, not the endpoint-shaped `is_api`): the log-out
+    // row acts on what's on disk, so a hybrid's token can't be hidden behind
+    // either a base url or an uncommitted draft.
     rows.push(ConfigRow::Login);
-    let has_creds = if is_api {
+    let has_creds = if profile.is_some_and(|p| p.login_is_oauth()) {
+        profile.and_then(|p| p.credentials.as_ref()).is_some()
+    } else {
         profile
             .and_then(|p| p.api_key.as_deref())
             .is_some_and(|k| !k.trim().is_empty())
-    } else {
-        profile.and_then(|p| p.credentials.as_ref()).is_some()
     };
     if has_creds {
         rows.push(ConfigRow::DeleteCreds);
@@ -4793,7 +4796,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
             // browser); only OAuth accounts run the token-minting flow below.
             let is_api_account = editing.as_deref().is_some_and(|n| {
                 let cfg = app.config();
-                cfg.find(n).map(|p| !p.is_oauth()).unwrap_or(false)
+                cfg.find(n).map(|p| !p.login_is_oauth()).unwrap_or(false)
             });
             if is_api_account {
                 start_api_relogin(app);
@@ -4847,7 +4850,9 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
             if let Some(name) = name {
                 let is_api = {
                     let cfg = app.config();
-                    cfg.find(&name).map(|p| !p.is_oauth()).unwrap_or(false)
+                    cfg.find(&name)
+                        .map(|p| !p.login_is_oauth())
+                        .unwrap_or(false)
                 };
                 let detail = if is_api {
                     "Blanks the api key; keeps the base url, model, and env. Re-login any time."
@@ -5876,7 +5881,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 let mut cfg = app.config();
                 // OAuth accounts drop the token via the shared clearer; API
                 // accounts drop only the api key, keeping the base-url shell.
-                let is_oauth = cfg.find(&name).map(|p| p.is_oauth()).unwrap_or(true);
+                let is_oauth = cfg.find(&name).map(|p| p.login_is_oauth()).unwrap_or(true);
                 if is_oauth {
                     clear_profile_credentials(&mut cfg, &name)
                 } else {
