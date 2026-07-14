@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::poll::run_polling_loop;
+use crate::poll::{first_delay, run_polling_loop};
 use crate::profile::clauth_dir;
 use crate::usage::{iso_to_epoch_secs, now_ms};
 
@@ -506,9 +506,9 @@ fn wire_to_update(w: UpdateWire) -> Option<IncidentUpdate> {
 // ── Background thread ───────────────────────────────────────────────────────
 
 /// Spawn the status feed worker. On start it cold-loads the disk cache (so the
-/// TUI is never empty offline), then fetches the live feed and loops on a fixed
-/// cadence; a `()` on `refresh_rx` triggers an immediate refetch. Exits when the
-/// refresh channel disconnects (TUI shutdown).
+/// TUI is never empty offline), then fetches the live feed once the cache has
+/// aged past the cadence and loops on it; a `()` on `refresh_rx` triggers an
+/// immediate refetch. Exits when the refresh channel disconnects (TUI shutdown).
 ///
 /// Mirrors `update::spawn`: a plain `std::thread`, a ureq agent with short
 /// timeouts, and `anyhow::Error::from` for error mapping. No shared
@@ -521,14 +521,17 @@ pub(crate) fn spawn(tx: Sender<StatusEvent>, refresh_rx: Receiver<()>) {
     };
     std::thread::spawn(move || {
         // Cold-fill from cache first so the first paint has data.
+        let mut cached_at_ms = None;
         if let Some(cache) = load_cache(&cache_file) {
+            cached_at_ms = Some(cache.fetched_at_ms);
             let _ = tx.send(StatusEvent::Cached {
                 incidents: cache.incidents,
                 fetched_at_ms: cache.fetched_at_ms,
             });
         }
 
-        run_polling_loop(&refresh_rx, REFRESH_INTERVAL, || {
+        let first = first_delay(cached_at_ms, now_ms(), REFRESH_INTERVAL);
+        run_polling_loop(&refresh_rx, first, REFRESH_INTERVAL, || {
             run_fetch(&tx, &cache_file)
         });
     });

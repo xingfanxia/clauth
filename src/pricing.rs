@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::poll::run_polling_loop;
+use crate::poll::{first_delay, run_polling_loop};
 use crate::profile::{atomic_write, clauth_dir};
 use crate::tokens::ModelTokens;
 use crate::usage::now_ms;
@@ -158,9 +158,10 @@ pub(crate) enum PricingEvent {
 }
 
 /// Spawn the pricing worker. On start it cold-loads the disk cache (so cost
-/// renders instantly and offline once primed), then fetches the live feed and
-/// loops on a slow cadence; a `()` on `refresh_rx` triggers an immediate refetch.
-/// Exits when the refresh channel disconnects (TUI shutdown).
+/// renders instantly and offline once primed), then fetches the live feed once
+/// the cache has aged past the cadence and loops on it — the 24h table survives a
+/// relaunch instead of being re-downloaded; a `()` on `refresh_rx` triggers an
+/// immediate refetch. Exits when the refresh channel disconnects (TUI shutdown).
 ///
 /// Mirrors `status::spawn`: a plain `std::thread`, a ureq agent with short
 /// timeouts, and the cache path resolved on the calling thread before detaching
@@ -172,11 +173,14 @@ pub(crate) fn spawn(tx: Sender<PricingEvent>, refresh_rx: Receiver<()>) {
     };
     std::thread::spawn(move || {
         // Cold-fill from cache first so the first paint can price immediately.
+        let mut cached_at_ms = None;
         if let Some(table) = load_cache(&cache_file) {
+            cached_at_ms = Some(table.fetched_at_ms);
             let _ = tx.send(PricingEvent::Loaded(Box::new(table)));
         }
 
-        run_polling_loop(&refresh_rx, REFRESH_INTERVAL, || {
+        let first = first_delay(cached_at_ms, now_ms(), REFRESH_INTERVAL);
+        run_polling_loop(&refresh_rx, first, REFRESH_INTERVAL, || {
             run_fetch(&tx, &cache_file)
         });
     });

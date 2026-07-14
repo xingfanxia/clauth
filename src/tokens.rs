@@ -33,11 +33,12 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
+use crate::poll::run_polling_loop;
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs, now_epoch_secs};
 
 // ── Refresh cadence ─────────────────────────────────────────────────────────
@@ -1106,14 +1107,9 @@ pub(crate) enum TokensEvent {
 
 /// Spawn the token-stats background worker. Each run emits two events: `Base`
 /// (the instant stats-cache parse) then `Loaded` (after the transcript top-up).
-/// Loads once on start, then loops on `refresh_rx.recv_timeout(REFRESH_INTERVAL)`,
-/// reusing a per-file cache so each sweep re-reads only changed transcripts. Exits
-/// when `refresh_rx` disconnects (TUI shutdown).
-///
-/// Unlike `status`/`pricing`, this loop is match-first-then-send (not
-/// `run_polling_loop`'s tick-first shape): the first reload after the cold load
-/// happens only once the interval elapses or a signal arrives, avoiding a
-/// duplicate emit at startup.
+/// Loads once on start, then loops on `REFRESH_INTERVAL`, reusing a per-file
+/// cache so each sweep re-reads only changed transcripts. Exits when `refresh_rx`
+/// disconnects (TUI shutdown).
 ///
 /// `claude_dir` must already be resolved by the caller — the worker never
 /// re-resolves `home_dir()`, matching the pattern in `status::spawn`.
@@ -1144,16 +1140,10 @@ pub(crate) fn spawn(tx: Sender<TokensEvent>, refresh_rx: Receiver<()>, claude_di
             let _ = tx.send(TokensEvent::Loaded(Box::new(base)));
         };
 
-        run(&mut cache);
-
-        loop {
-            match refresh_rx.recv_timeout(REFRESH_INTERVAL) {
-                Ok(()) => while refresh_rx.try_recv().is_ok() {},
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-            run(&mut cache);
-        }
+        // No disk cache to age-gate the first sweep against: load now, then poll.
+        run_polling_loop(&refresh_rx, Duration::ZERO, REFRESH_INTERVAL, || {
+            run(&mut cache)
+        });
     });
 }
 
