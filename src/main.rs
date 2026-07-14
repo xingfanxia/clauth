@@ -579,9 +579,9 @@ fn print_help() {
          or --api-key to capture an API-key account instead (a missing\n                                  \
          value is prompted; the key is read echo-off). --model sets its\n                                  \
          default model (opus/sonnet/haiku/opusplan or a full model id)\n  \
-           clauth delete <profile> [--yes] [--force]\n                                  \
-         remove a profile and all its credentials; --yes skips the confirm,\n                                  \
-         --force overrides the live-session guard\n  \
+           clauth delete <profile> [--yes|-y] [--force]\n                                  \
+         remove a profile and all its credentials; --yes (-y) skips the\n                                  \
+         confirm, --force overrides the live-session guard\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
          credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
            clauth daemon                   run the headless scheduler with no TUI: refresh\n                                  \
