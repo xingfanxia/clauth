@@ -447,6 +447,29 @@ fn keychain_live() -> bool {
     false
 }
 
+/// Wrap an identity probe so each access token is resolved at most once per
+/// caller. An access token's account uuid is immutable, so a memo hit is exact
+/// rather than merely fresh — which is what makes caching safe for a check whose
+/// whole job is proving two tokens belong to the same account.
+///
+/// ONLY a `Some` is cached. A `None` means the probe failed (network, 401, shape
+/// drift), and the adopt retry after a failed refresh exists precisely because the
+/// live mirror may have surfaced a fresh pair since the first attempt — memoizing
+/// the failure would quietly turn that second adopt into a no-op.
+fn memoized_identity<'a>(
+    probe: &'a dyn Fn(&str) -> Option<String>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    let seen: std::cell::RefCell<HashMap<String, String>> = std::cell::RefCell::new(HashMap::new());
+    move |tok: &str| {
+        if let Some(hit) = seen.borrow().get(tok).cloned() {
+            return Some(hit);
+        }
+        let uuid = probe(tok)?;
+        seen.borrow_mut().insert(tok.to_string(), uuid.clone());
+        Some(uuid)
+    }
+}
+
 /// Fetch + rotate + retry for one profile. On 401 — or a 429 on a clock-expired
 /// token (the AUTH-1 dead-login unmasking, see [`token_clock_expired`]) — refresh
 /// the OAuth pair, persist, retry once. A 429 on a still-valid token bails to disk
@@ -552,6 +575,11 @@ fn fetch_with_rotation(
         return bail_unrotated();
     };
 
+    // Both adopts below resolve the same two tokens (ours + the live mirror's), so
+    // they share one memo for this call rather than re-spending `/profile` on a
+    // uuid already resolved seconds ago.
+    let identity = memoized_identity(&|tok| crate::usage::fetch_account_uuid(tok));
+
     // Adopt before spending: when the ACTIVE Keychain profile's live file
     // mirror already holds a FRESHER same-account pair, the running claude
     // rotated first — adopt its pair (identity-guarded) instead of burning
@@ -561,9 +589,7 @@ fn fetch_with_rotation(
     if is_active
         && keychain_live()
         && let Some(adopted) =
-            crate::oauth::try_adopt_live_rotation(config, name, &rotation_guard, &|tok| {
-                crate::usage::fetch_account_uuid(tok)
-            })
+            crate::oauth::try_adopt_live_rotation(config, name, &rotation_guard, &identity)
     {
         if let Ok(mut q) = refetch.lock() {
             q.insert(name.to_string());
@@ -602,9 +628,7 @@ fn fetch_with_rotation(
             if is_active
                 && keychain_live()
                 && let Some(adopted) =
-                    crate::oauth::try_adopt_live_rotation(config, name, &rotation_guard, &|tok| {
-                        crate::usage::fetch_account_uuid(tok)
-                    })
+                    crate::oauth::try_adopt_live_rotation(config, name, &rotation_guard, &identity)
             {
                 if let Ok(mut q) = refetch.lock() {
                     q.insert(name.to_string());
@@ -646,9 +670,13 @@ fn fetch_with_rotation(
     // (mirrors `ensure_installable`); a no-op when the flag was already clear.
     crate::oauth::mark_auth_broken(config, name, false);
     let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
-    // Post-rotation retry forces a `/profile` pull: the token just changed, so
-    // refresh the plan alongside it (the 401 profile-fetch trigger).
-    match fetch_raw(name, &access, prev_plan, true, Some(activity)) {
+    // A refresh mints a new token for the SAME account, so no `/profile` field can
+    // change because of it — the hourly TTL governs the plan here exactly as it
+    // does on the plain leg above. The one case worth a pull is holding NO plan
+    // (never fetched, or an earlier `/profile` failed): then this retry is the
+    // chance to get one.
+    let force_profile = prev_plan.is_none();
+    match fetch_raw(name, &access, prev_plan, force_profile, Some(activity)) {
         Ok(info) => FetchOutcome::live(name, info, rotated),
         Err(FetchError::RateLimited { retry_after }) => {
             // Retry itself rate-limited. Don't push to RefetchQueue — that risks

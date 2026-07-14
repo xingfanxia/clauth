@@ -910,8 +910,10 @@ fn last_profile_attempt(name: &str) -> Option<u64> {
 }
 
 /// Decide whether to fetch `/profile` this round and stamp the attempt. Fetches
-/// on a forced refresh (401 retry / manual single), on first load (no stamp on
-/// disk either), or once the hourly TTL lapses. Stamping on attempt — success or
+/// when `force` is set (a rotation retry holding no plan yet), on first load (no
+/// stamp on disk either), or once the hourly TTL lapses. A manual single-profile
+/// refresh arrives here as a lapsed clock, not a force: it calls
+/// [`expire_profile_ttl`] first. Stamping on attempt — success or
 /// failure alike — caps `/profile` at one hit per hour per profile, so a
 /// persistently failing endpoint can't turn into a per-tick storm (the plan is
 /// best-effort; a cold profile just shows no tier until the next hourly try).
@@ -936,9 +938,10 @@ pub(crate) fn take_profile_fetch(name: &str, force: bool, now: u64) -> bool {
 }
 
 /// Fetch `/usage`; fetch `/profile` only when [`take_profile_fetch`] says so,
-/// otherwise carry `prev_plan` forward. `force_profile` bypasses the TTL (used
-/// for the post-401-rotation retry). A `/profile` failure never drops usage —
-/// it falls back to `prev_plan`.
+/// otherwise carry `prev_plan` forward. `force_profile` bypasses the TTL; the
+/// rotation retry sets it only when no plan is held yet, since a refresh mints a
+/// token for the same account and can't change what `/profile` would say. A
+/// `/profile` failure never drops usage — it falls back to `prev_plan`.
 pub(super) fn fetch_raw(
     name: &str,
     access_token: &str,

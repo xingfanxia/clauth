@@ -9,7 +9,7 @@ use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 use super::{
     ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, SuppressedGenericStore,
     ThirdPartyEntry, TokenEntry, clear_activity, clear_orphaned_forced, filter_suppressed,
-    mark_activity, partition_due, window_lapsed,
+    mark_activity, memoized_identity, partition_due, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -2338,5 +2338,66 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
     assert!(
         nrpp.contains_key("fast") && nrpp.contains_key("slow"),
         "both countdowns published by batch end"
+    );
+}
+
+// ── identity memo (adopt path) ───────────────────────────────────────────────
+//
+// A rotation tick can run two adopts, each resolving the stored and the live
+// token's account uuid — up to four `/profile` GETs, 5s apart, for the same two
+// immutable answers.
+
+/// A resolved uuid is fetched once per token: immutable, so a hit is exact.
+/// Distinct tokens still each get their own probe.
+#[test]
+fn the_identity_memo_resolves_each_token_once() {
+    let calls = std::cell::RefCell::new(Vec::<String>::new());
+    let probe = |tok: &str| {
+        calls.borrow_mut().push(tok.to_string());
+        Some(format!("uuid-of-{tok}"))
+    };
+    let identity = memoized_identity(&probe);
+
+    assert_eq!(identity("stored").as_deref(), Some("uuid-of-stored"));
+    assert_eq!(
+        identity("stored").as_deref(),
+        Some("uuid-of-stored"),
+        "the memo answers, and answers identically"
+    );
+    assert_eq!(identity("live").as_deref(), Some("uuid-of-live"));
+
+    assert_eq!(
+        calls.borrow().as_slice(),
+        ["stored", "live"],
+        "one probe per distinct token, no matter how often it is asked for"
+    );
+}
+
+/// A failed probe must stay retryable. The adopt after a failed refresh exists
+/// because the live mirror may have surfaced a fresh pair since the first
+/// attempt — caching the `None` would silently make that second adopt a no-op.
+#[test]
+fn the_identity_memo_never_caches_a_failed_probe() {
+    let calls = std::cell::RefCell::new(0usize);
+    // Fails the first time, succeeds after — the mirror catching up mid-tick.
+    let probe = |_tok: &str| {
+        *calls.borrow_mut() += 1;
+        (*calls.borrow() > 1).then(|| "uuid-late".to_string())
+    };
+    let identity = memoized_identity(&probe);
+
+    assert_eq!(identity("live"), None, "first probe fails");
+    assert_eq!(
+        identity("live").as_deref(),
+        Some("uuid-late"),
+        "the retry must reach the probe, not a cached failure"
+    );
+    assert_eq!(*calls.borrow(), 2, "a None is never cached");
+
+    assert_eq!(identity("live").as_deref(), Some("uuid-late"));
+    assert_eq!(
+        *calls.borrow(),
+        2,
+        "once it resolves, the answer is cached like any other"
     );
 }
