@@ -15,7 +15,7 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::format::spinner_frame;
-use super::panes::{bold_when, head_cols};
+use super::panes::{bold_when, head_cols, key_cell};
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
     match modal {
@@ -549,12 +549,11 @@ fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<Line<'static>> {
 }
 
 fn help_row(key: &str, desc: &str) -> Line<'static> {
-    // Always leave at least 1 space — `{:<18}` emits no padding at the width.
     const KEY_W: usize = 18;
-    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
+    const KEY_GUTTER: usize = 2;
     Line::from(vec![
         Span::styled(
-            format!("  {key}{}", " ".repeat(pad)),
+            format!("  {}", key_cell(key, KEY_W, KEY_GUTTER)),
             Style::default().fg(theme::accent_color()).bold(),
         ),
         Span::styled(desc.to_string(), Style::default().fg(theme::text_color())),

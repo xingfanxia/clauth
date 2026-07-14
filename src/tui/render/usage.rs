@@ -14,7 +14,7 @@ use super::super::app::App;
 use super::super::theme;
 use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
 use super::panes::{
-    active_pill, draw_profile_selector, section_box, section_box_verbatim, selector_width,
+    active_pill, draw_profile_selector, key_cell, section_box, section_box_verbatim, selector_width,
 };
 use crate::format::plan_label;
 use crate::profile::Profile;
@@ -25,6 +25,8 @@ use crate::usage::{
 };
 
 const KEY_W: usize = 8;
+/// Fixed gap between the padded key and the value column (house standard).
+const KEY_GUTTER: usize = 2;
 
 /// Runtime state gathered once under locks; keeps line builders lock-free.
 struct HeaderState {
@@ -667,8 +669,8 @@ fn header_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Li
         });
     let mut plan_spans = vec![key_span("plan"), Span::styled(plan.clone(), theme::body())];
     if header.is_active {
-        // "[ active ]" = 10 chars; left side = KEY_W + plan chars; pad the gap.
-        let left_w = KEY_W + plan.chars().count();
+        // "[ active ]" = 10 chars; left side = key block + plan chars; pad the gap.
+        let left_w = KEY_W + KEY_GUTTER + plan.chars().count();
         let indicator_w = "[ active ]".chars().count(); // 10
         let pad = (inner_w as usize)
             .saturating_sub(left_w)
@@ -964,16 +966,16 @@ fn fmt_amount(n: f64) -> String {
 const TP_KEY_W: usize = 10;
 
 fn key_value_span(key: &str, value: &str, value_style: Style) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(format!("  {key}"), theme::faint())];
-    let pad = TP_KEY_W.saturating_sub(key.chars().count()).max(1);
-    spans.push(Span::raw(" ".repeat(pad)));
+    let mut spans = vec![Span::styled(
+        format!("  {}", key_cell(key, TP_KEY_W, KEY_GUTTER)),
+        theme::faint(),
+    )];
     spans.push(Span::styled(value.to_string(), value_style));
     spans
 }
 
 fn key_span(key: &str) -> Span<'static> {
-    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
-    Span::styled(format!("{key}{}", " ".repeat(pad)), theme::label())
+    Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::label())
 }
 
 #[cfg(test)]

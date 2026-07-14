@@ -17,11 +17,15 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
 use super::format::{clock_label, relative_age, spinner_frame};
-use super::panes::{draw_scrollbar, empty_state, section_box, selector_width, wrap_words};
+use super::panes::{
+    draw_scrollbar, empty_state, key_cell, section_box, selector_width, wrap_words,
+};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase, shorten_component_status};
 
 /// Detail-pane key column width (matches the usage tab's `KEY_W`).
 const KEY_W: usize = 11;
+/// Fixed gap between the padded key and the value column (house standard).
+const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
@@ -535,7 +539,7 @@ fn component_status_color(status: &str) -> ratatui::style::Color {
 /// deviation from the dim-label rule). Fits whole entries only; dropped entries
 /// append `+N`. When the column has zero room, shows just `…`.
 fn components_line(components: &[(String, String)], inner_w: usize) -> Line<'static> {
-    let avail = inner_w.saturating_sub(KEY_W);
+    let avail = inner_w.saturating_sub(KEY_W + KEY_GUTTER);
     let mut spans: Vec<Span<'static>> = vec![key_span("components")];
 
     // Zero-width guard: no room for even one entry → a faint ellipsis.
@@ -597,10 +601,10 @@ fn duration_label(secs: u64) -> String {
     }
 }
 
-/// Detail key column: `key` padded to [`KEY_W`] in the eyebrow label style.
+/// Detail key column: `key` padded to the shared key-cell width in the eyebrow
+/// label style.
 fn key_span(key: &str) -> Span<'static> {
-    let pad = KEY_W.saturating_sub(key.chars().count()).max(1);
-    Span::styled(format!("{key}{}", " ".repeat(pad)), theme::label())
+    Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::label())
 }
 
 // ── Small text helpers ──────────────────────────────────────────────────────
