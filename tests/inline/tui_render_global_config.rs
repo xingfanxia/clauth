@@ -35,7 +35,7 @@ fn toggles() -> ToggleState {
 fn key_cell_is_uniform_width() {
     for key in ["theme", "weekly limit", "on mismatch", "poll spent"] {
         assert_eq!(
-            key_cell(key).chars().count(),
+            key_cell(key, KEY_W, KEY_GUTTER).chars().count(),
             KEY_W + KEY_GUTTER,
             "{key} key block must be exactly KEY_W + KEY_GUTTER wide"
         );

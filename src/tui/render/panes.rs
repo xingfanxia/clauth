@@ -35,6 +35,34 @@ pub(super) fn bold_when(style: Style, cond: bool) -> Style {
     }
 }
 
+/// Key-column cell: `key` left-justified to `max(width, key.len())` then a
+/// fixed `gutter`-space gap, so every row's value opens at the same column
+/// even when one key fills `width`. A plain `width.saturating_sub(len).max(1)`
+/// pad pushes an exactly-fitting key one cell past its siblings; this shape
+/// keeps the gap separate from the width so it never collides. Each pane passes
+/// its own `width` (its longest key) and the house `gutter` of 2.
+pub(super) fn key_cell(key: &str, width: usize, gutter: usize) -> String {
+    let w = width.max(key.chars().count());
+    format!("{key:<w$}{}", " ".repeat(gutter))
+}
+
+/// One segment of a cycle row: the active option renders `[label]` while the
+/// row holds the cursor (the bracket pair is the focus cue — the row widens by
+/// 2 on focus), bare `label` otherwise. Active → `ACCENT`, rest `TEXT_FAINT`.
+pub(super) fn cycle_option(label: &str, active: bool, row_selected: bool) -> Span<'static> {
+    let style = if active {
+        theme::accent()
+    } else {
+        theme::faint()
+    };
+    let text = if active && row_selected {
+        format!("[{label}]")
+    } else {
+        label.to_string()
+    };
+    Span::styled(text, style)
+}
+
 /// Full-width selection bar: bg tint and stretch. Callers handle per-row bold.
 pub(super) fn highlight_row(line: Line<'static>, width: usize) -> Line<'static> {
     let pad = width.saturating_sub(line.width());

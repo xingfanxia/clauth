@@ -21,7 +21,8 @@ use super::super::app::{
 };
 use super::super::theme::{self, Tier};
 use super::panes::{
-    head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, label_style, section_box,
+    cycle_option, head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell,
+    label_style, section_box,
 };
 
 /// Width of the key column: the longest key (`weekly limit`). Keys pad to it,
@@ -30,12 +31,6 @@ use super::panes::{
 const KEY_W: usize = 12;
 /// Fixed gap between the padded key and the value column.
 const KEY_GUTTER: usize = 2;
-
-/// `key` padded to the shared value column: `KEY_W` cells + a `KEY_GUTTER` gap.
-fn key_cell(key: &str) -> String {
-    let width = KEY_W.max(key.chars().count());
-    format!("{key:<width$}{}", " ".repeat(KEY_GUTTER))
-}
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let block = section_box("settings", true, true);
@@ -315,7 +310,10 @@ fn refresh_cycle_line(
 /// caret, so the buffer renders with uniform styling — no simulated block cursor.
 fn refresh_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
     let invalid = parse_refresh_secs(input.trimmed()).is_none();
-    let mut spans = vec![arrow, Span::styled(key_cell("refresh"), label_style(true))];
+    let mut spans = vec![
+        arrow,
+        Span::styled(key_cell("refresh", KEY_W, KEY_GUTTER), label_style(true)),
+    ];
     spans.extend(value_caret(input, invalid));
     let unit_style = if invalid {
         theme::danger()
@@ -383,7 +381,10 @@ fn weekly_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> {
     let invalid = parse_weekly_pct(input.trimmed()).is_none();
     let mut spans = vec![
         arrow,
-        Span::styled(key_cell("weekly limit"), label_style(true)),
+        Span::styled(
+            key_cell("weekly limit", KEY_W, KEY_GUTTER),
+            label_style(true),
+        ),
     ];
     spans.extend(value_caret(input, invalid));
     let unit_style = if invalid {
@@ -419,7 +420,7 @@ fn cycle_row(
 ) -> Line<'static> {
     let mut spans = vec![
         arrow,
-        Span::styled(key_cell(key), label_style(row_selected)),
+        Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(row_selected)),
     ];
     for (i, (label, active)) in options.iter().enumerate() {
         if i > 0 {
@@ -428,23 +429,6 @@ fn cycle_row(
         spans.push(cycle_option(label, *active, row_selected));
     }
     Line::from(spans)
-}
-
-/// One segment of a cycle row: the active option renders `[label]` while the row
-/// holds the cursor (the bracket pair is the focus cue), bare `label` otherwise.
-/// Active → `ACCENT`, rest `TEXT_FAINT`.
-fn cycle_option(label: &str, active: bool, row_selected: bool) -> Span<'static> {
-    let style = if active {
-        theme::accent()
-    } else {
-        theme::faint()
-    };
-    let text = if active && row_selected {
-        format!("[{label}]")
-    } else {
-        label.to_string()
-    };
-    Span::styled(text, style)
 }
 
 /// A cloudy-tui toggle row: `key  ─●` / `key  ○─`. A pure on/off boolean is a
@@ -458,7 +442,7 @@ fn toggle_row(arrow: Span<'static>, key: &str, on: bool, row_selected: bool) -> 
     };
     Line::from(vec![
         arrow,
-        Span::styled(key_cell(key), label_style(row_selected)),
+        Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(row_selected)),
         Span::styled(glyph, style),
     ])
 }
