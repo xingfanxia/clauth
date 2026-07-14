@@ -9,8 +9,8 @@ use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::format::{
-    account_type_label, account_type_style, cue_style, fetch_cue_color, fixed, fixed_split,
-    health_color, spinner_frame, spinner_style, window_summary_spans_bracketed,
+    account_type_label, cue_style, fetch_cue_color, fixed, fixed_split, health_color,
+    spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
 use super::header::pulse_name_spans;
 use super::panes::{bold_when, draw_scrollbar, empty_state, name_color, section_box, select_line};
@@ -295,18 +295,13 @@ fn render_overview_row(
     spans.push(gap(widths));
     let label = account_type_label(profile);
     if profile.credentials.is_some() {
+        let (clamped, pad) = fixed_split(&label, widths.kind);
         let elapsed = app.started_at.elapsed().as_millis() as u64;
-        let mut pulse = pulse_name_spans(&label, theme::dim(), elapsed);
-        let pad = widths.kind.saturating_sub(label.chars().count());
-        if pad > 0 {
-            pulse.push(Span::raw(" ".repeat(pad)));
-        }
+        let mut pulse = pulse_name_spans(&clamped, theme::dim(), elapsed);
+        pulse.push(Span::raw(pad));
         spans.extend(pulse);
     } else {
-        spans.push(Span::styled(
-            fixed(&label, widths.kind),
-            account_type_style(profile),
-        ));
+        spans.push(Span::styled(fixed(&label, widths.kind), theme::dim()));
     }
     spans.push(narrow_gap(widths));
     spans.push(timer_span);

@@ -4,7 +4,7 @@
 //! Plus the overview-row state cues: marker precedence + countdown fetch cue.
 
 use super::*;
-use crate::profile::{AppState, ProfileName};
+use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName};
 use crate::usage::{FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
 use std::collections::BTreeMap;
 
@@ -242,4 +242,66 @@ fn gap_widening_never_clips_the_row() {
             w.gap
         );
     }
+}
+
+/// A credentialed OAuth profile with no fetched `usage.plan` yet, so
+/// `account_type_label` falls back to the token's `subscription_type` via
+/// `PlanTier::from_subscription_type(..).display()`.
+fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
+    Profile {
+        name: name.into(),
+        base_url: None,
+        api_key: None,
+        auto_start: false,
+        env: BTreeMap::new(),
+        models: Default::default(),
+        fallback_threshold: None,
+        last_resort: false,
+        bell_threshold: None,
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "tok".into(),
+                refresh_token: None,
+                expires_at: None,
+                scopes: None,
+                subscription_type: Some(subscription_type.into()),
+            }),
+        }),
+        usage: None,
+        fetch_status: None,
+        provider: None,
+        third_party_usage: None,
+    }
+}
+
+/// The credentialed pulse arm must clamp the type-column label to
+/// `widths.kind` exactly like the non-credentialed `fixed` arm does. A
+/// long label ("Enterprise", 10 chars) must not overflow a narrow `kind`
+/// column (6 chars) and bleed into the following gap/timer columns.
+#[test]
+fn credentialed_long_label_clamps_to_kind_width() {
+    let a = credentialed_profile("acct", "enterprise");
+    let config = config_with(vec![a], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(60, &app);
+    assert_eq!(
+        widths.kind, 6,
+        "test assumes a 6-wide kind column at this pane width"
+    );
+
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let chars: Vec<char> = line_text(&line).chars().collect();
+
+    // 2 = cursor slot, 2 = marker slot (both always exactly 2 chars).
+    let start = 2 + 2 + widths.name + widths.gap;
+    let kind_field: String = chars[start..start + widths.kind].iter().collect();
+    assert_eq!(
+        kind_field, "Enter…",
+        "type column must truncate+pad to exactly `kind` width"
+    );
+    assert_eq!(
+        chars[start + widths.kind],
+        ' ',
+        "type column must not bleed into the following gap/timer columns"
+    );
 }
