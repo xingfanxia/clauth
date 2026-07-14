@@ -14,6 +14,12 @@ const BASH: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "${profiles} start login delete which completions" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--base-url --api-key --model" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--isolated" -- "${cur}") )
+    elif [ "$prev" = "--isolated" ]; then
+        local profiles
+        profiles=$(clauth __complete 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "delete" ]; }; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
@@ -44,6 +50,11 @@ _clauth() {
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
+        [[ "${words[2]}" == start ]] && _values 'flag' '--isolated[clean isolated runtime; drops operator config]'
+    elif (( CURRENT == 4 )) && [[ "${words[2]}" == start && "${words[3]}" == --isolated ]]; then
+        local -a profiles
+        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
@@ -66,6 +77,7 @@ complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile an
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
 complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login delete" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "API base url"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --api-key -d "API key (prompted echo-off if omitted)"

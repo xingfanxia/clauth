@@ -12,6 +12,36 @@ fn print_script_supports_bash_zsh_fish() {
     }
 }
 
+/// Every shell's script must offer `--isolated` under the `start` subcommand —
+/// it's a documented `clauth start` flag (`main.rs`) and was previously uncovered.
+#[test]
+fn every_shell_completes_start_isolated_flag() {
+    // (script body, the flag token as each shell spells its `start` branch)
+    let cases = [
+        (
+            BASH,
+            "\"${COMP_WORDS[1]}\" = \"start\" ] && [ \"${cur:0:2}\" = \"--\"",
+        ),
+        (
+            ZSH,
+            "\"${words[2]}\" == start ]] && _values 'flag' '--isolated",
+        ),
+        (FISH, "__fish_seen_subcommand_from start\" -a --isolated"),
+    ];
+    for (script, branch) in cases {
+        assert!(
+            script.contains("--isolated"),
+            "script must offer --isolated",
+        );
+        assert!(
+            script.contains(branch),
+            "the --isolated completion must be gated to the `start` subcommand, not global",
+        );
+    }
+    // Guard against regressing the other subcommands' flags in the same edit.
+    assert!(ZSH.contains("--json") && ZSH.contains("--base-url") && ZSH.contains("--force"));
+}
+
 #[test]
 fn print_script_rejects_unsupported_shell() {
     let err = print_script("powershell").expect_err("unsupported shell must error");
