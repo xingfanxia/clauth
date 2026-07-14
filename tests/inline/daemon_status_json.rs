@@ -305,6 +305,51 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     assert!(!p["next_refresh_at"].is_null());
 }
 
+/// `refresh_spent_accounts` OFF + a spent (100%-capped) OAuth window: the
+/// account is skipped until reset, so it has no pending refresh — the feed nulls
+/// `next_refresh_at` instead of the past mtime+interval stamp the derivation
+/// would otherwise emit. With the toggle ON (default) the same account keeps its
+/// derived countdown.
+#[test]
+fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
+    let _home = HomeSandbox::new();
+    let config = |refresh_spent: bool| AppConfig {
+        state: AppState {
+            refresh_spent_accounts: refresh_spent,
+            ..AppState::default()
+        },
+        profiles: vec![oauth_profile("maxed")],
+    };
+    // Warm the OAuth usage cache with a live 100%-capped 5h window.
+    crate::profile_cache::write_profile_cache(
+        "maxed",
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+
+    // Toggle OFF → skipped-spent → next_refresh_at nulled.
+    let off = build_status(&config(false), 300_000, None);
+    let p = &off["profiles"].as_array().unwrap()[0];
+    assert!(
+        p["next_refresh_at"].is_null(),
+        "a spent skipped account has no pending refresh: {p}"
+    );
+
+    // Toggle ON (default) → still polled → derived countdown present.
+    let on = build_status(&config(true), 300_000, None);
+    let p = &on["profiles"].as_array().unwrap()[0];
+    assert!(
+        !p["next_refresh_at"].is_null(),
+        "polling a spent account still schedules a refresh: {p}"
+    );
+}
+
 // RLS-1: the additive per-profile `stale` flag = the daemon distrusts this
 // reading as a deep-slot stuck RateLimited (live status RateLimited AND the 429
 // streak past the active cap) — the SAME predicate `scan_auto_switch` acts on,

@@ -1163,6 +1163,20 @@ pub(crate) fn seven_day_live(info: &UsageInfo, now_secs: i64) -> bool {
         .is_some_and(|resets_at| now_secs < resets_at)
 }
 
+/// Seconds until a live window pinned at the 100% cap resets, or `None` when it
+/// is below the cap, lapsed, or absent — the per-window primitive shared by
+/// [`windows_maxed`] and [`spent_resume_in_secs`] so the two never drift. `live`
+/// is the caller's already-computed liveness (guarantees a future, parseable
+/// `resets_at`), so the re-parse here is total.
+fn maxed_window_reset_in(live: bool, window: Option<&UsageWindow>, now_secs: i64) -> Option<i64> {
+    let window = window?;
+    if !live || window.utilization < 100.0 {
+        return None;
+    }
+    let resets_at = window.resets_at.as_deref().and_then(iso_to_epoch_secs)?;
+    Some(resets_at - now_secs)
+}
+
 /// True iff a request would currently be REFUSED: a live 5h **or** 7d window
 /// pinned at the API's 100% cap. Such a window can't change until it resets, so
 /// the opt-out `refresh_spent_accounts` fetch gate may skip the account until
@@ -1170,16 +1184,40 @@ pub(crate) fn seven_day_live(info: &UsageInfo, now_secs: i64) -> bool {
 /// switch threshold: a below-cap window still moves and must keep being polled,
 /// and this predicate must never influence switch/fallback decisions.
 pub(crate) fn windows_maxed(info: &UsageInfo, now_secs: i64) -> bool {
-    (five_hour_live(info, now_secs)
-        && info
-            .five_hour
-            .as_ref()
-            .is_some_and(|w| w.utilization >= 100.0))
-        || (seven_day_live(info, now_secs)
-            && info
-                .seven_day
-                .as_ref()
-                .is_some_and(|w| w.utilization >= 100.0))
+    maxed_window_reset_in(
+        five_hour_live(info, now_secs),
+        info.five_hour.as_ref(),
+        now_secs,
+    )
+    .is_some()
+        || maxed_window_reset_in(
+            seven_day_live(info, now_secs),
+            info.seven_day.as_ref(),
+            now_secs,
+        )
+        .is_some()
+}
+
+/// Seconds until a spent account (`windows_maxed`) resumes polling: the LATEST
+/// reset among its live-maxed 5h/7d windows. It stays blocked until every maxed
+/// window lapses, so a maxed weekly (7d) window dominates a maxed 5h one — the
+/// caption reads "resets in <weekly>", not the sooner-but-still-blocked 5h.
+/// `None` when the account is not currently maxed.
+pub(crate) fn spent_resume_in_secs(info: &UsageInfo, now_secs: i64) -> Option<i64> {
+    let five = maxed_window_reset_in(
+        five_hour_live(info, now_secs),
+        info.five_hour.as_ref(),
+        now_secs,
+    );
+    let seven = maxed_window_reset_in(
+        seven_day_live(info, now_secs),
+        info.seven_day.as_ref(),
+        now_secs,
+    );
+    match (five, seven) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Parse ISO-8601 timestamp (e.g. `2026-05-17T14:20:00.121699+00:00`) into Unix epoch seconds.

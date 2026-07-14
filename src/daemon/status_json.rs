@@ -18,7 +18,9 @@ use crate::profile_cache::{
 };
 use crate::profile_json::{provider_label, tier_label, windows_json};
 use crate::providers::ThirdPartyStats;
-use crate::usage::{FetchStatus, epoch_secs_to_iso, is_stuck_rate_limited, now_ms};
+use crate::usage::{
+    FetchStatus, UsageInfo, epoch_secs_to_iso, is_stuck_rate_limited, now_ms, windows_maxed,
+};
 
 /// Bump when the JSON shape changes in a way readers must branch on.
 pub(crate) const SCHEMA_VERSION: u64 = 1;
@@ -150,11 +152,23 @@ pub(crate) fn build_status(
             };
 
             // next_refresh_at: the live countdown store, else mtime + interval
-            // (also the fallback for names the live store doesn't carry).
+            // (also the fallback for names the live store doesn't carry). A
+            // spent OAuth account under `refresh_spent_accounts` OFF has no
+            // pending refresh — the scheduler blanks its live entry, so guard the
+            // derivation too, else it falls through to a past mtime+interval
+            // stamp that reads as perpetually overdue.
             let derived_next = || mtime_ms.map(|mt| mt.saturating_add(interval_ms));
-            let next_refresh_ms: Option<u64> = match live {
-                Some(sig) => sig.next_refresh.get(name).copied().or_else(derived_next),
-                None => derived_next(),
+            let spent_skipped = !config.state.refresh_spent_accounts
+                && !p.is_third_party()
+                && load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
+                    .is_some_and(|u| windows_maxed(&u, (now / 1000) as i64));
+            let next_refresh_ms: Option<u64> = if spent_skipped {
+                None
+            } else {
+                match live {
+                    Some(sig) => sig.next_refresh.get(name).copied().or_else(derived_next),
+                    None => derived_next(),
+                }
             };
 
             // `stale` = the daemon distrusts this reading — a deep-slot stuck

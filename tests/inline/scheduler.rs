@@ -71,13 +71,13 @@ fn partition_due_uses_fixed_interval() {
     assert_eq!(due.len(), 1, "due once the fixed interval has elapsed");
 }
 
-/// `retain_pollable` (the `refresh_spent_accounts` OFF gate): only an unforced,
-/// already-fetched, spent account is dropped from the due set. A forced (`r`)
-/// account, a never-fetched one, a below-cap one, and one whose spent window
-/// has lapsed all survive — the last two are how a reset gets observed.
+/// `spent_skip_set` (the `refresh_spent_accounts` OFF gate): only an unforced,
+/// already-fetched, spent account is skipped. A forced (`r`) account, a never-
+/// fetched one, a below-cap one, and one whose spent window has lapsed are all
+/// absent from the set — the last two are how a reset gets observed.
 #[test]
-fn retain_pollable_drops_only_unforced_spent_accounts() {
-    use super::retain_pollable;
+fn spent_skip_set_selects_only_unforced_spent_accounts() {
+    use super::spent_skip_set;
     use crate::usage::{UsageInfo, UsageWindow};
 
     let now = 1_779_027_600i64; // 2026-05-17 UTC
@@ -109,19 +109,18 @@ fn retain_pollable_drops_only_unforced_spent_accounts() {
     ]);
     let forced: HashSet<String> = HashSet::from(["spent_forced".to_string()]);
 
-    let mut due = vec![
+    let snapshot = vec![
         token("spent"),
         token("spent_forced"),
         token("lapsed"),
         token("busy"),
         token("fresh"),
     ];
-    retain_pollable(&mut due, &forced, &store, now);
-    let kept: Vec<&str> = due.iter().map(|e| e.name.as_str()).collect();
+    let skip = spent_skip_set(&snapshot, &forced, &store, now);
     assert_eq!(
-        kept,
-        vec!["spent_forced", "lapsed", "busy", "fresh"],
-        "only the unforced spent account drops; forced/lapsed/below-cap/never-fetched survive",
+        skip,
+        HashSet::from(["spent".to_string()]),
+        "only the unforced spent account is skipped; forced/lapsed/below-cap/never-fetched poll",
     );
 }
 

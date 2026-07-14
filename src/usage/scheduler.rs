@@ -1659,21 +1659,28 @@ fn tick(state: &SchedulerState) {
     // countdown map never shows a leg as momentarily missing (and a deleted
     // profile's stale key is dropped by the full replace).
     let now = now_ms();
-    let (mut oauth_due, oauth_next) =
+    let (mut oauth_due, mut oauth_next) =
         partition_and_merge(&oauth_snapshot, &forced, state, now, interval_ms);
     // Config toggle (`refresh_spent_accounts`): when off, drop accounts already
     // pinned at their 100% window cap from this tick's OAuth fetch — a spent
     // window can't change until it resets, so re-polling only burns quota +
     // poll load. Forced (`r`) and never-fetched accounts are never dropped (a
-    // reset is only observed by polling). Fetch-leg only; switch/fallback
-    // predicates are untouched. Default-on keeps stock behavior bit-identical.
+    // reset is only observed by polling). Also blanks a dropped account's
+    // countdown + clears its Queued spinner (no pending fetch). Fetch-leg only;
+    // switch/fallback predicates are untouched. Default-on keeps stock behavior.
     let refresh_spent = state
         .config
         .lock()
         .map(|c| c.state.refresh_spent_accounts)
         .unwrap_or(true);
     if !refresh_spent {
-        drop_spent_oauth(state, &mut oauth_due, &forced);
+        drop_spent_oauth(
+            state,
+            &oauth_snapshot,
+            &mut oauth_due,
+            &mut oauth_next,
+            &forced,
+        );
     }
     let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
@@ -1779,13 +1786,27 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     );
 
     let now = now_ms();
-    let (_, oauth_next) = partition_due(
+    let (_, mut oauth_next) = partition_due(
         &oauth_snapshot,
         now,
         &state.last_fetched,
         &state.activity,
         interval_ms,
     );
+    // Mirror the fetch tick's `refresh_spent_accounts` OFF handling: the daemon
+    // skips spent accounts, so their disk cache stops advancing and the derived
+    // countdown would freeze at `0s`. Blank it here too (the Queued sweep below
+    // already clears any stranded spinner) so a stood-down TUI shows a spent row
+    // the same as an armed one.
+    let refresh_spent = state
+        .config
+        .lock()
+        .map(|c| c.state.refresh_spent_accounts)
+        .unwrap_or(true);
+    if !refresh_spent && let Ok(store) = state.store.lock() {
+        let skip = spent_skip_set(&oauth_snapshot, &forced, &store, now_epoch_secs());
+        oauth_next.retain(|name, _| !skip.contains(name));
+    }
     let (_, tp_next) = partition_due(
         &tp_snapshot,
         now,
@@ -2155,39 +2176,66 @@ fn merge_forced<T: NamedEntry + Clone>(
     due.extend(extras);
 }
 
-/// Drop OAuth entries whose usage windows are maxed (spent) from this tick's due
-/// set, unless the name was force-refreshed. Reads the usage store once. A
-/// never-fetched account (no store entry) is kept — a reset can only be seen by
-/// polling. A dropped account keeps its published countdown and is re-judged
-/// next interval, so it resumes the moment its window lapses. Backs the
-/// `refresh_spent_accounts` config toggle; never consulted while it's on.
-fn drop_spent_oauth(state: &SchedulerState, due: &mut Vec<TokenEntry>, forced: &HashSet<String>) {
-    if due.is_empty() {
+/// Apply `refresh_spent_accounts` OFF to this tick: drop spent accounts from the
+/// due set, blank their published countdown, and clear any bootstrap `Queued`
+/// mark. A skipped account has no pending fetch, so a countdown frozen at `0s`
+/// (its `last_fetched + interval` is already past — that's why it was due) and a
+/// `Queued` spinner that no worker will ever clear are both stale UI. The
+/// overview timer renders blank and the usage tab reads "up to date"/"spent"
+/// instead. Reads the usage store once. Fetch-leg only; switch/fallback
+/// predicates are untouched.
+fn drop_spent_oauth(
+    state: &SchedulerState,
+    snapshot: &[TokenEntry],
+    due: &mut Vec<TokenEntry>,
+    next: &mut HashMap<String, u64>,
+    forced: &HashSet<String>,
+) {
+    let now_secs = now_epoch_secs();
+    let skip = {
+        let Ok(store) = state.store.lock() else {
+            return; // can't read usage → fail safe to polling everything
+        };
+        spent_skip_set(snapshot, forced, &store, now_secs)
+    };
+    if skip.is_empty() {
         return;
     }
-    let now_secs = now_epoch_secs();
-    let Ok(store) = state.store.lock() else {
-        return; // can't read usage → fail safe to polling everything
-    };
-    retain_pollable(due, forced, &store, now_secs);
+    due.retain(|entry| !skip.contains(&entry.name));
+    next.retain(|name, _| !skip.contains(name));
+    // Clear a stranded bootstrap `Queued` mark so the row stops spinning on a
+    // fetch that never runs. `Fetching`/`Refreshing`/`Switching` are worker-owned
+    // and left alone — one may still be in flight and clears itself on landing.
+    if let Ok(mut act) = state.activity.lock() {
+        for name in &skip {
+            if matches!(act.get(name), Some(ProfileActivity::Queued)) {
+                act.remove(name);
+            }
+        }
+    }
 }
 
-/// Keep only entries worth polling with `refresh_spent_accounts` OFF: a forced
-/// name, a never-fetched name (no store entry — a reset is only seen by
-/// polling), or one whose windows aren't maxed. Pure over the store map so it
-/// tests without a full `SchedulerState`.
-fn retain_pollable(
-    due: &mut Vec<TokenEntry>,
+/// Names `refresh_spent_accounts` OFF skips this tick: an unforced, already-
+/// fetched account whose windows are maxed (spent). A forced (`r`) name, a
+/// never-fetched one (no store entry — a reset is only seen by polling), and a
+/// below-cap or lapsed one are all absent (they still poll). Pure over the store
+/// map so it tests without a full `SchedulerState`.
+fn spent_skip_set(
+    snapshot: &[TokenEntry],
     forced: &HashSet<String>,
     store: &HashMap<String, UsageInfo>,
     now_secs: i64,
-) {
-    due.retain(|entry| {
-        forced.contains(&entry.name)
-            || store
-                .get(&entry.name)
-                .is_none_or(|info| !windows_maxed(info, now_secs))
-    });
+) -> HashSet<String> {
+    snapshot
+        .iter()
+        .filter(|entry| {
+            !forced.contains(&entry.name)
+                && store
+                    .get(&entry.name)
+                    .is_some_and(|info| windows_maxed(info, now_secs))
+        })
+        .map(|entry| entry.name.clone())
+        .collect()
 }
 
 /// Clear any forced name that no leg scheduled this tick — its profile vanished

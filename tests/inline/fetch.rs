@@ -82,6 +82,44 @@ fn windows_maxed_false_when_below_cap_or_lapsed_or_absent() {
     );
 }
 
+/// `spent_resume_in_secs` names when a spent account resumes polling: the LATEST
+/// reset among the maxed windows, so a maxed weekly (7d) dominates a maxed 5h —
+/// the account stays blocked until every maxed window lapses. `None` when not
+/// maxed (below-cap or lapsed windows never gate polling).
+#[test]
+fn spent_resume_in_secs_takes_the_latest_maxed_reset() {
+    let now = BASE_UTC;
+    // 5h resets sooner than the maxed weekly; the weekly gates, so it wins.
+    let five_soon = "2026-05-17T15:20:00Z"; // now + 1h
+    let seven_late = "2026-05-24T14:20:00Z"; // now + 7d
+    let both = UsageInfo {
+        five_hour: Some(window(100.0, five_soon)),
+        seven_day: Some(window(100.0, seven_late)),
+        ..Default::default()
+    };
+    assert_eq!(
+        spent_resume_in_secs(&both, now),
+        Some(7 * 24 * 3600),
+        "the maxed weekly reset dominates the sooner maxed 5h reset",
+    );
+
+    // Only the 5h is maxed → its reset; a below-cap weekly never gates.
+    let five_only = UsageInfo {
+        five_hour: Some(window(100.0, five_soon)),
+        seven_day: Some(window(40.0, seven_late)),
+        ..Default::default()
+    };
+    assert_eq!(spent_resume_in_secs(&five_only, now), Some(3600));
+
+    // Not maxed anywhere → no resume time (the account still polls normally).
+    assert_eq!(spent_resume_in_secs(&UsageInfo::default(), now), None);
+    let below = UsageInfo {
+        five_hour: Some(window(99.9, FUTURE)),
+        ..Default::default()
+    };
+    assert_eq!(spent_resume_in_secs(&below, now), None);
+}
+
 #[test]
 fn identity_anchor_backfills_only_when_missing() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};

@@ -708,7 +708,7 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
                 Span::styled(" ]", theme::dim()),
             ]);
             if let Some(c) = countdown {
-                spans.push(Span::styled(format!("  · retry in {c}"), theme::faint()));
+                spans.push(Span::styled(format!("  retry in {c}"), theme::faint()));
             }
         }
         Some(FetchStatus::Cached) => {
@@ -718,7 +718,7 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
                 Span::styled(" ]", theme::dim()),
             ]);
             if let Some(c) = countdown {
-                spans.push(Span::styled(format!("  · refresh in {c}"), theme::faint()));
+                spans.push(Span::styled(format!("  refresh in {c}"), theme::faint()));
             }
         }
         Some(FetchStatus::RateLimited) => {
@@ -738,16 +738,39 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
                 // means the throttle never drained (#40's distrust boundary
                 // sits past the 6th) — without a judgment label.
                 let suffix = if header.streak > 0 {
-                    format!("  · {} retry in {c}", ordinal(header.streak))
+                    format!("  {} retry in {c}", ordinal(header.streak))
                 } else {
-                    format!("  · retry in {c}")
+                    format!("  retry in {c}")
                 };
                 spans.push(Span::styled(suffix, theme::faint()));
             }
         }
         _ => match countdown {
             Some(c) => spans.push(Span::styled(format!("↻ refresh in {c}"), theme::faint())),
-            None => spans.push(Span::styled("↻ up to date", theme::faint())),
+            None => {
+                // No scheduled refresh means `refresh_spent_accounts` is OFF and
+                // this account is spent — skipped until its window resets. Render
+                // it as a status pill like the fetch states above, naming the
+                // binding reset (weekly dominates 5h) so the blank overview timer
+                // reads as intent; a genuinely quiet account with no maxed window
+                // falls through to "up to date".
+                let resumes = profile
+                    .usage
+                    .as_ref()
+                    .and_then(|u| crate::usage::spent_resume_in_secs(u, now_epoch_secs()));
+                match resumes {
+                    Some(secs) => spans.extend([
+                        Span::styled("[ ", theme::dim()),
+                        Span::styled("spent", theme::warning().add_modifier(Modifier::BOLD)),
+                        Span::styled(" ]", theme::dim()),
+                        Span::styled(
+                            format!("  resets in {}", crate::usage::humanize_duration(secs)),
+                            theme::faint(),
+                        ),
+                    ]),
+                    None => spans.push(Span::styled("↻ up to date", theme::faint())),
+                }
+            }
         },
     }
     Line::from(spans)

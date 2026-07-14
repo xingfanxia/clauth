@@ -226,10 +226,55 @@ fn rate_limited_suffix_counts_the_retry() {
 
     assert!(text(status_line(&profile, &header(7))).contains("7th retry in"));
     let bare = text(status_line(&profile, &header(0)));
-    assert!(bare.contains("· retry in"));
+    assert!(bare.contains("retry in"));
     assert!(
         !bare.contains("th retry"),
         "a zero streak must not invent a retry count"
+    );
+}
+
+/// `refresh_spent_accounts` OFF drops a spent account's countdown (no pending
+/// refresh, `next_refresh_ms` None): the status line renders a `[ spent ]` pill
+/// naming the binding reset instead of the stale "0s" the frozen countdown
+/// showed, while a below-cap idle account with no scheduled refresh still reads
+/// "up to date".
+#[test]
+fn spent_skipped_account_names_its_reset() {
+    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+    let header = HeaderState {
+        is_active: false,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streak: 0,
+    };
+    let with_window = |util: f64| {
+        let mut p = crate::testutil::blank_profile("a");
+        p.fetch_status = None;
+        p.usage = Some(crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: util,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        });
+        p
+    };
+
+    let spent = text(status_line(&with_window(100.0), &header));
+    assert!(
+        spent.contains("[ spent ]") && spent.contains("resets in"),
+        "a spent skipped account renders a pill naming its reset: {spent}"
+    );
+    assert!(
+        !spent.contains("0s"),
+        "must not freeze at a stale 0s: {spent}"
+    );
+
+    let below = text(status_line(&with_window(50.0), &header));
+    assert!(
+        below.contains("up to date"),
+        "a below-cap idle account with no scheduled refresh is up to date: {below}"
     );
 }
 

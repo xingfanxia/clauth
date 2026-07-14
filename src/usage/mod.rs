@@ -13,7 +13,7 @@ pub(crate) use fetch::{
     cli_user_agent, epoch_secs_to_iso, expire_profile_ttl, fetch_account_uuid, five_hour_live,
     http_agent, humanize_duration, ideal_pace_pct, iso_to_epoch_secs, now_epoch_secs, now_ms,
     parse_retry_after, probe_login_profile, seed_login_anchor, seven_day_live,
-    window_avg_pace_per_day,
+    spent_resume_in_secs, window_avg_pace_per_day, windows_maxed,
 };
 pub(crate) use scheduler::{
     ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
