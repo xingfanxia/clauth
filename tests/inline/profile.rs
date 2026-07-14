@@ -315,6 +315,35 @@ fn oauth_credentials() -> ClaudeCredentials {
     }
 }
 
+/// `scopes_joined` feeds the refresh `scope` field (Claude Code echoes its
+/// credential's granted scopes on refresh). Order must survive and an empty set
+/// must read as `None` so the refresh path falls back instead of sending `""`.
+#[test]
+fn scopes_joined_space_joins_preserving_order_and_maps_empty_to_none() {
+    let creds = |scopes: Option<Vec<String>>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at".to_string(),
+            refresh_token: Some("rt".to_string()),
+            expires_at: None,
+            scopes,
+            subscription_type: None,
+        }),
+    };
+    assert_eq!(
+        creds(Some(vec!["user:profile".into(), "user:inference".into()])).scopes_joined(),
+        Some("user:profile user:inference".to_string())
+    );
+    assert_eq!(creds(Some(Vec::new())).scopes_joined(), None);
+    assert_eq!(creds(None).scopes_joined(), None);
+    assert_eq!(
+        ClaudeCredentials {
+            claude_ai_oauth: None
+        }
+        .scopes_joined(),
+        None
+    );
+}
+
 /// credentials.json, its `.pending` rotation sidecar, and the per-profile dir
 /// must carry tightened permissions: 0o600 files, 0o700 dir.
 #[cfg(unix)]

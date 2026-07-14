@@ -239,7 +239,10 @@ pub(crate) fn switch_profile_noninteractive(
     config: &crate::profile::ConfigHandle,
     target: &str,
     on_divergence: Option<DivergenceChoice>,
-    refresher: impl Fn(&str) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
+    refresher: impl Fn(
+        &str,
+        Option<&str>,
+    ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
 ) -> Result<(Option<String>, String)> {
     let previous = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]

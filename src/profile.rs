@@ -115,6 +115,17 @@ impl ClaudeCredentials {
     pub(crate) fn access_token_expires_at(&self) -> Option<i64> {
         self.claude_ai_oauth.as_ref()?.expires_at
     }
+
+    /// The granted OAuth scopes, space-joined — what Claude Code echoes in the
+    /// `scope` field of a refresh request. `None` when unset or empty so the
+    /// refresh path can fall back to the standard scope set.
+    pub(crate) fn scopes_joined(&self) -> Option<String> {
+        let scopes = self.claude_ai_oauth.as_ref()?.scopes.as_ref()?;
+        if scopes.is_empty() {
+            return None;
+        }
+        Some(scopes.join(" "))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +225,11 @@ impl Profile {
 
     pub(crate) fn access_token_expires_at(&self) -> Option<i64> {
         self.credentials.as_ref()?.access_token_expires_at()
+    }
+
+    /// Granted OAuth scopes space-joined (see [`ClaudeCredentials::scopes_joined`]).
+    pub(crate) fn scopes_joined(&self) -> Option<String> {
+        self.credentials.as_ref()?.scopes_joined()
     }
 }
 

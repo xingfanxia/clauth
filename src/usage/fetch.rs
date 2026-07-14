@@ -752,15 +752,17 @@ pub(crate) fn http_agent() -> &'static ureq::Agent {
 
 /// `User-Agent` for `/usage` + `/profile` requests. Anthropic rate-limits this
 /// endpoint far harder for clients that don't identify as Claude Code
-/// (anthropics/claude-code#31637), so mimic its UA using the locally-detected CC
-/// version (resolved once per process), falling back to a bare `claude-code`.
+/// (anthropics/claude-code#31637), so mimic its UA byte-for-byte: CC's axios
+/// client sends `claude-cli/<version> (external, cli)` (verified on the wire —
+/// `cli` is the interactive entrypoint tag). Version resolved once per process
+/// from the locally-detected CC; falls back to a bare `claude-cli`.
 static USER_AGENT: LazyLock<String> =
     LazyLock::new(|| match crate::plugin_probe::cc_version().as_deref() {
         Some(v) => match v.split_whitespace().next() {
-            Some(ver) if !ver.is_empty() => format!("claude-code/{ver}"),
-            _ => "claude-code".to_string(),
+            Some(ver) if !ver.is_empty() => format!("claude-cli/{ver} (external, cli)"),
+            _ => "claude-cli".to_string(),
         },
-        None => "claude-code".to_string(),
+        None => "claude-cli".to_string(),
     });
 
 fn get_json(
@@ -781,6 +783,10 @@ fn get_json(
         .header("Authorization", &format!("Bearer {access_token}"))
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("User-Agent", USER_AGENT.as_str())
+        // Claude Code's axios client sends both on these GETs (Content-Type even
+        // without a body); mirror them so the request is indistinguishable.
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Content-Type", "application/json")
         .call()
         .map_err(|_| FetchError::Network)?;
     let status = response.status().as_u16();

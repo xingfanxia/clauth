@@ -3181,7 +3181,9 @@ fn perform_switch(app: &mut App, name: &str) {
 /// `HomeSandbox` (the gate persists `auth_broken` transitions to home paths).
 fn spawn_switch_gate<F>(app: &mut App, name: String, refresher: F)
 where
-    F: Fn(&str) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError> + Send + 'static,
+    F: Fn(&str, Option<&str>) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>
+        + Send
+        + 'static,
 {
     mark_activity(&app.activity, &name, ProfileActivity::Switching);
     let config = Arc::clone(&app.config);

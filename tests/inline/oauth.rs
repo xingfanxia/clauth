@@ -387,7 +387,10 @@ fn third_party_config(name: &str) -> AppConfig {
 }
 
 /// A refresher that must never run — bypass/valid-token paths take no refresh.
-fn never_refresh(_rt: &str) -> std::result::Result<TokenResponse, RefreshError> {
+fn never_refresh(
+    _rt: &str,
+    _scopes: Option<&str>,
+) -> std::result::Result<TokenResponse, RefreshError> {
     panic!("ensure_installable must not refresh in this scenario");
 }
 
@@ -429,7 +432,7 @@ fn gate_refreshes_expiring_token_and_installs() {
         Some("rt-old"),
         Some(past_expiry()),
     )));
-    let refresher = |_rt: &str| {
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
         Ok(TokenResponse {
             access_token: "at-new".to_string(),
             refresh_token: "rt-new".to_string(),
@@ -470,7 +473,9 @@ fn gate_invalid_refresh_marks_broken_and_refuses() {
         Some("rt-revoked"),
         Some(past_expiry()),
     )));
-    let refresher = |_rt: &str| Err(RefreshError::Invalid("HTTP 400: invalid_grant".to_string()));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Err(RefreshError::Invalid("HTTP 400: invalid_grant".to_string()))
+    };
     assert!(matches!(
         ensure_installable(&handle, name, refresher),
         AuthGate::Broken
@@ -493,7 +498,9 @@ fn gate_transient_refresh_does_not_quarantine() {
         Some("rt-ok"),
         Some(past_expiry()),
     )));
-    let refresher = |_rt: &str| Err(RefreshError::Transient(anyhow::anyhow!("connection reset")));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Err(RefreshError::Transient(anyhow::anyhow!("connection reset")))
+    };
     assert!(matches!(
         ensure_installable(&handle, name, refresher),
         AuthGate::Transient(_)
@@ -539,7 +546,7 @@ fn gate_flagged_profile_refreshes_despite_a_valid_clock() {
     let mut config = oauth_config(name, Some("rt-relogin"), Some(future_expiry()));
     config.set_auth_broken(name, true);
     let handle = Arc::new(RankedMutex::new(config));
-    let refresher = |_rt: &str| {
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
         Ok(TokenResponse {
             access_token: "at-recovered".to_string(),
             refresh_token: "rt-recovered".to_string(),
@@ -570,7 +577,9 @@ fn gate_flagged_profile_with_a_dead_chain_stays_broken() {
     let mut config = oauth_config(name, Some("rt-revoked"), Some(future_expiry()));
     config.set_auth_broken(name, true);
     let handle = Arc::new(RankedMutex::new(config));
-    let refresher = |_rt: &str| Err(RefreshError::Invalid("HTTP 400: invalid_grant".to_string()));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Err(RefreshError::Invalid("HTTP 400: invalid_grant".to_string()))
+    };
     assert!(matches!(
         ensure_installable(&handle, name, refresher),
         AuthGate::Broken
@@ -991,7 +1000,7 @@ fn gate_under_guard_spends_the_currently_stored_refresh_token() {
         Some("rt-current"),
         Some(past_expiry()),
     )));
-    let refresher = |rt: &str| {
+    let refresher = |rt: &str, _scopes: Option<&str>| {
         assert_eq!(
             rt, "rt-current",
             "must spend the token read under the guard"
@@ -1048,7 +1057,7 @@ fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
         Some(past_expiry()),
     )));
     save_disk_profile(name, "rt-peer", Some(past_expiry()));
-    let refresher = |rt: &str| {
+    let refresher = |rt: &str, _scopes: Option<&str>| {
         assert_eq!(rt, "rt-peer", "must spend the disk pair, not the snapshot");
         Ok(TokenResponse {
             access_token: "at-new".to_string(),

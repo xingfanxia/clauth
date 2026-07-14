@@ -16,14 +16,24 @@ use crate::usage::{
     await_request_slot, clear_activity, mark_activity, now_ms,
 };
 
-/// Anthropic's OAuth token endpoint. Same one Claude Code uses on startup to
-/// mint an access token from the stored refresh token.
-const TOKEN_ENDPOINT: &str = "https://api.anthropic.com/v1/oauth/token";
+/// OAuth token endpoint for BOTH the refresh and the interactive
+/// authorization-code exchange — the host the current Claude Code binary uses
+/// for each (verified on the wire: CC's axios refresh posts here, not to
+/// `api.anthropic.com`). Paired with the `platform.claude.com` authorize host in
+/// `oauth_login`.
+const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 
-/// Token endpoint for the interactive authorization-code exchange. Paired with
-/// the `platform.claude.com` authorize host the current Claude Code binary uses
-/// (see `oauth_login`). Refresh stays on [`TOKEN_ENDPOINT`] (proven working).
-const LOGIN_TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
+/// `User-Agent` + `Accept` Claude Code's axios client sends on every token-endpoint
+/// request. Mimicked so a refresh/exchange is byte-indistinguishable from CC's
+/// (the version string is axios's, not ours, and will drift with CC's bundle).
+const TOKEN_USER_AGENT: &str = "axios/1.15.2";
+const TOKEN_ACCEPT: &str = "application/json, text/plain, */*";
+
+/// Scopes echoed in the refresh `scope` field when a profile has none stored
+/// (Claude Code sends its credential's granted scopes; this is that set for a
+/// standard Pro/Max login, sans the Console-only `org:create_api_key`).
+const REFRESH_SCOPES_FALLBACK: &str =
+    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 /// UUID of the "Claude Code" OAuth application; required for refresh and the
 /// interactive login (`oauth_login` builds the authorize URL with it).
@@ -32,8 +42,9 @@ pub(crate) const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// Minimal inference endpoint we use to "kick" the 5-hour usage window.
 /// Token refresh alone does NOT start the timer — only a real `/v1/messages`
 /// call does. Probing with `count_tokens`, `oauth/usage`, or session
-/// endpoints all confirmed this experimentally.
-const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
+/// endpoints all confirmed this experimentally. `?beta=true` matches the query
+/// Claude Code puts on every messages request (verified on the wire).
+const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages?beta=true";
 
 /// Cheapest available model — single token costs ~0.001¢.
 const KICK_MODEL: &str = "claude-haiku-4-5-20251001";
@@ -142,17 +153,21 @@ impl From<RefreshError> for anyhow::Error {
 /// A transport error, 429, or 5xx is transient (retry, never quarantine).
 pub(crate) fn refresh_result(
     refresh_token: &str,
+    scopes: Option<&str>,
 ) -> std::result::Result<TokenResponse, RefreshError> {
     let body = serde_json::to_string(&serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLIENT_ID,
+        "scope": scopes.unwrap_or(REFRESH_SCOPES_FALLBACK),
     }))
     .map_err(|e| RefreshError::Transient(e.into()))?;
 
     let mut response = AGENT
         .post(TOKEN_ENDPOINT)
         .header("Content-Type", "application/json")
+        .header("Accept", TOKEN_ACCEPT)
+        .header("User-Agent", TOKEN_USER_AGENT)
         .send(&body)
         .map_err(|e| RefreshError::Transient(anyhow::Error::from(e)))?;
     let status = response.status().as_u16();
@@ -179,16 +194,25 @@ fn refresh_rejection_is_terminal(status: u16, body: &str) -> bool {
     matches!(status, 400 | 401) || (status == 403 && body.contains("invalid_grant"))
 }
 
-pub(crate) fn refresh(refresh_token: &str) -> Result<TokenResponse> {
-    refresh_result(refresh_token).map_err(Into::into)
+pub(crate) fn refresh(refresh_token: &str, scopes: Option<&str>) -> Result<TokenResponse> {
+    refresh_result(refresh_token, scopes).map_err(Into::into)
+}
+
+/// A profile's stored granted scopes, space-joined, for the refresh `scope`
+/// field — read under the config lock and returned owned so no lock is held
+/// across the HTTP refresh. `None` (→ [`REFRESH_SCOPES_FALLBACK`]) for an
+/// unknown profile or one without stored scopes. Callers must not already hold
+/// the config lock.
+pub(crate) fn stored_scopes(config: &crate::profile::ConfigHandle, name: &str) -> Option<String> {
+    config.lock().ok()?.find(name)?.scopes_joined()
 }
 
 /// Exchange an authorization code (from the interactive loopback login in
 /// `oauth_login`) for an OAuth token pair. Uses the same client + HTTP agent as
-/// [`refresh`], against [`LOGIN_TOKEN_ENDPOINT`] (paired with the authorize host
-/// the current Claude Code binary uses). `redirect_uri` MUST byte-match the one
-/// sent to the authorize endpoint, and `state` echoes the value round-tripped
-/// through the browser.
+/// [`refresh`], against [`TOKEN_ENDPOINT`] (the `platform.claude.com` host the
+/// current Claude Code binary uses), carrying the same axios-mimicking headers.
+/// `redirect_uri` MUST byte-match the one sent to the authorize endpoint, and
+/// `state` echoes the value round-tripped through the browser.
 pub(crate) fn exchange_code(
     code: &str,
     code_verifier: &str,
@@ -205,8 +229,10 @@ pub(crate) fn exchange_code(
     }))?;
 
     let mut response = AGENT
-        .post(LOGIN_TOKEN_ENDPOINT)
+        .post(TOKEN_ENDPOINT)
         .header("Content-Type", "application/json")
+        .header("Accept", TOKEN_ACCEPT)
+        .header("User-Agent", TOKEN_USER_AGENT)
         .send(&body)
         .map_err(anyhow::Error::from)?;
     let status = response.status().as_u16();
@@ -354,7 +380,7 @@ pub(crate) fn auto_start_kick(
     if let Some(activity) = activity {
         mark_activity(activity, name, ProfileActivity::Refreshing);
     }
-    let refreshed = refresh(rt);
+    let refreshed = refresh(rt, stored_scopes(config, name).as_deref());
     if let Some(activity) = activity {
         mark_activity(activity, name, ProfileActivity::Fetching);
     }
@@ -445,28 +471,33 @@ fn rotate_one_inner(
             if has_live_session(name) {
                 return Ok::<_, anyhow::Error>(None);
             }
-            let rt = cfg
+            let Some(rt) = cfg
                 .find(name)
-                .and_then(|p| p.refresh_token().map(str::to_string));
-            if rt.is_some()
-                && let Some(activity) = activity
-            {
+                .and_then(|p| p.refresh_token().map(str::to_string))
+            else {
+                return Ok(None);
+            };
+            // Granted scopes read under the SAME lock as the refresh token so the
+            // refresh body echoes them exactly (matches Claude Code's wire shape).
+            let scopes = cfg.find(name).and_then(|p| p.scopes_joined());
+            if let Some(activity) = activity {
                 // Stamp Refreshing under the state lock so partition_due cannot
                 // observe this profile as Idle between the credential read and
                 // the HTTP call. Lock order (AppConfig → state → leaf) is preserved:
                 // activity is a leaf mutex acquired inside with_state_lock.
                 mark_activity(activity, name, ProfileActivity::Refreshing);
             }
-            Ok(rt)
+            Ok(Some((rt, scopes)))
         })
         .ok()
         .flatten()
     };
 
-    let Some(rt) = token else {
+    let Some((rt, scopes)) = token else {
         return RotateOutcome::Persisted(false);
     };
-    let outcome = refresh(&rt).and_then(|tok| apply_rotated_tokens_locked(config, name, tok));
+    let outcome = refresh(&rt, scopes.as_deref())
+        .and_then(|tok| apply_rotated_tokens_locked(config, name, tok));
     let applied = outcome.is_ok();
     if let Some(activity) = activity {
         clear_activity(activity, name);
@@ -1016,7 +1047,7 @@ pub(crate) enum AuthGate {
 pub(crate) fn ensure_installable(
     config: &crate::profile::ConfigHandle,
     name: &str,
-    refresher: impl Fn(&str) -> std::result::Result<TokenResponse, RefreshError>,
+    refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> AuthGate {
     // Cheap pre-check WITHOUT the rotation guard: non-OAuth and
     // comfortably-live tokens install as-is. Token data read here is
@@ -1024,7 +1055,7 @@ pub(crate) fn ensure_installable(
     // pre-guard snapshot can go stale the moment a sibling rotation runs).
     match oauth_shape(config, name) {
         Err(gate) => return gate,
-        Ok((expires_at, _, flagged)) if !expiring(expires_at, flagged) => {
+        Ok((expires_at, _, _, flagged)) if !expiring(expires_at, flagged) => {
             return AuthGate::Ready;
         }
         Ok(_) => {}
@@ -1054,12 +1085,12 @@ pub(crate) fn ensure_installable(
 /// cases.
 #[allow(
     clippy::type_complexity,
-    reason = "one-shot triple, named at both call sites"
+    reason = "one-shot tuple, named at both call sites"
 )]
 fn oauth_shape(
     config: &crate::profile::ConfigHandle,
     name: &str,
-) -> std::result::Result<(Option<i64>, Option<String>, bool), AuthGate> {
+) -> std::result::Result<(Option<i64>, Option<String>, Option<String>, bool), AuthGate> {
     let Ok(cfg) = config.lock() else {
         return Err(AuthGate::Transient(anyhow::anyhow!(
             "config mutex poisoned"
@@ -1077,6 +1108,7 @@ fn oauth_shape(
     Ok((
         profile.access_token_expires_at(),
         profile.refresh_token().map(str::to_string),
+        profile.scopes_joined(),
         cfg.is_auth_broken(name),
     ))
 }
@@ -1137,11 +1169,11 @@ fn adopt_disk_rotation(config: &crate::profile::ConfigHandle, name: &str, _guard
 fn gate_under_guard(
     config: &crate::profile::ConfigHandle,
     name: &str,
-    refresher: impl Fn(&str) -> std::result::Result<TokenResponse, RefreshError>,
+    refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     guard: &RotationGuard,
 ) -> AuthGate {
     adopt_disk_rotation(config, name, guard);
-    let (expires_at, refresh_token, flagged) = match oauth_shape(config, name) {
+    let (expires_at, refresh_token, scopes, flagged) = match oauth_shape(config, name) {
         Err(gate) => return gate,
         Ok(shape) => shape,
     };
@@ -1157,7 +1189,7 @@ fn gate_under_guard(
         return AuthGate::Broken;
     };
 
-    match refresher(&rt) {
+    match refresher(&rt, scopes.as_deref()) {
         Ok(tok) => {
             if apply_rotated_tokens_locked(config, name, tok).is_err() {
                 return AuthGate::Transient(anyhow::anyhow!(

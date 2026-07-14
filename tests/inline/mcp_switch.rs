@@ -51,6 +51,7 @@ fn creds_expired(access: &str, refresh: &str) -> ClaudeCredentials {
 /// drives the gate through it on purpose via a [`creds_expired`] target.
 fn no_network(
     _rt: &str,
+    _scopes: Option<&str>,
 ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
     Err(crate::oauth::RefreshError::Transient(anyhow::anyhow!(
         "no network in tests"
@@ -382,7 +383,7 @@ fn noninteractive_switch_refuses_a_dead_target_with_login_hint() {
         profiles: vec![active_profile, target_profile],
     });
 
-    let revoked = |_: &str| {
+    let revoked = |_: &str, _: Option<&str>| {
         Err(crate::oauth::RefreshError::Invalid(
             "HTTP 400: refresh token not found or invalid".into(),
         ))
@@ -462,7 +463,7 @@ fn switch_to_the_active_profile_never_gates() {
         profiles: vec![active_profile],
     });
 
-    let revoked = |_: &str| {
+    let revoked = |_: &str, _: Option<&str>| {
         Err(crate::oauth::RefreshError::Invalid(
             "HTTP 400: refresh token not found or invalid".into(),
         ))

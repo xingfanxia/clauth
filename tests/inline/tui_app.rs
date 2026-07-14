@@ -2448,7 +2448,7 @@ fn tui_switch_gate_refuses_a_dead_target_before_its_flag_is_set() {
     let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("dead", already_expired())]);
     assert!(!app.config().is_auth_broken("dead"), "flag starts clear");
 
-    super::spawn_switch_gate(&mut app, "dead".to_string(), |_| {
+    super::spawn_switch_gate(&mut app, "dead".to_string(), |_, _| {
         Err(crate::oauth::RefreshError::Invalid("revoked".to_string()))
     });
     super::drain_switch_gates(&mut app);
@@ -2476,7 +2476,7 @@ fn tui_switch_gate_passes_a_healthy_target_through() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("healthy", far_future())]);
 
-    super::spawn_switch_gate(&mut app, "healthy".to_string(), |_| {
+    super::spawn_switch_gate(&mut app, "healthy".to_string(), |_, _| {
         panic!("a healthy target must not spend a refresh")
     });
     super::drain_switch_gates(&mut app);
@@ -2497,7 +2497,7 @@ fn tui_switch_gate_transient_failure_refuses_without_quarantine() {
     let mut app =
         app_with_unlinked_profiles(vec![stored_oauth_profile("flaky", already_expired())]);
 
-    super::spawn_switch_gate(&mut app, "flaky".to_string(), |_| {
+    super::spawn_switch_gate(&mut app, "flaky".to_string(), |_, _| {
         Err(crate::oauth::RefreshError::Transient(anyhow::anyhow!(
             "no network"
         )))
@@ -2526,7 +2526,7 @@ fn tui_switch_gate_recovers_a_flagged_target() {
     let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("flagged", far_future())]);
     app.config().set_auth_broken("flagged", true);
 
-    super::spawn_switch_gate(&mut app, "flagged".to_string(), |_| {
+    super::spawn_switch_gate(&mut app, "flagged".to_string(), |_, _| {
         Ok(crate::oauth::TokenResponse {
             access_token: "at-recovered".to_string(),
             refresh_token: "rt-recovered".to_string(),
@@ -2559,7 +2559,7 @@ fn tui_switch_gate_pending_blocks_switches_and_waits_for_modals() {
         stored_oauth_profile("second", far_future()),
     ]);
 
-    super::spawn_switch_gate(&mut app, "first".to_string(), |_| {
+    super::spawn_switch_gate(&mut app, "first".to_string(), |_, _| {
         panic!("healthy target: no refresh")
     });
     // Un-drained gate = switch in flight: a second switch is refused.

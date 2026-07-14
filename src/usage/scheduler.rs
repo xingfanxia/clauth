@@ -587,7 +587,8 @@ fn fetch_with_rotation(
     mark_activity(activity, name, ProfileActivity::Refreshing);
     // `refresh_result` (not `refresh`) so the RefreshError variant survives — the
     // poll needs to tell a dead token (quarantine) from a transient blip (retry).
-    let rotation = crate::oauth::refresh_result(rt);
+    let rotation =
+        crate::oauth::refresh_result(rt, crate::oauth::stored_scopes(config, name).as_deref());
     mark_activity(activity, name, ProfileActivity::Fetching);
     let tok = match rotation {
         Ok(t) => t,
