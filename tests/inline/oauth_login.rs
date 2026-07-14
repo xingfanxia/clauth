@@ -87,9 +87,10 @@ fn authorize_url_uses_claude_ai_host_code_true_and_six_scopes() {
     assert!(url.contains("code_challenge_method=S256"));
     assert!(url.contains("state=STATE"));
     assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1234%2Fcallback"));
-    // The full 6-scope union (ALL_OAUTH_SCOPES), percent-encoded.
+    // The full 6-scope union (ALL_OAUTH_SCOPES), colons percent-encoded and
+    // separators as `+` — the exact byte shape Claude Code sends (wire-parity).
     assert!(url.contains(
-        "scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload"
+        "scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload"
     ));
 }
 

@@ -657,6 +657,44 @@ fn refresh_rejection_terminal_truth_table() {
     assert!(!refresh_rejection_is_terminal(500, "internal error"));
 }
 
+// ── canonicalize_scopes (refresh `scope` byte-parity with Claude Code) ────────
+
+/// CC emits the refresh `scope` in a fixed order regardless of how the
+/// credential file stored the granted scopes (`docs/wire-parity.md`). Reorder to
+/// that canonical order, preserving the exact granted set.
+#[test]
+fn canonicalize_scopes_matches_claude_code_order() {
+    // A credential's stored order (as seen on real Pro/Max profiles) reorders to
+    // the canonical CC wire order.
+    assert_eq!(
+        canonicalize_scopes(
+            "user:file_upload user:inference user:mcp_servers user:profile user:sessions:claude_code"
+        ),
+        "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+    );
+    // The already-canonical fallback string is a no-op.
+    assert_eq!(
+        canonicalize_scopes(REFRESH_SCOPES_FALLBACK),
+        REFRESH_SCOPES_FALLBACK
+    );
+    // `org:create_api_key` (present only on some credentials) sorts to the front.
+    assert_eq!(
+        canonicalize_scopes("user:profile org:create_api_key"),
+        "org:create_api_key user:profile"
+    );
+    // An unrecognized scope is preserved (never dropped), appended after the
+    // known ones, so the set is never altered — only the order.
+    assert_eq!(
+        canonicalize_scopes("user:weird_future_scope user:profile"),
+        "user:profile user:weird_future_scope"
+    );
+    // Extra whitespace collapses to single spaces.
+    assert_eq!(
+        canonicalize_scopes("  user:profile   user:inference  "),
+        "user:profile user:inference"
+    );
+}
+
 // `live_login_is_foreign` gates the rotation→Keychain mirror (rotation
 // coherence, #1): the mirror must still fire when the live `.credentials.json`
 // is merely a stale regular-file copy of OUR OWN pre-rotation pair (Claude

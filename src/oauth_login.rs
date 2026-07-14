@@ -143,7 +143,10 @@ fn authorize_url(redirect_uri: &str, challenge: &str, state: &str) -> String {
          &scope={scope}&code_challenge={cc}&code_challenge_method=S256&state={state}",
         cid = percent_encode(crate::oauth::CLIENT_ID),
         ru = percent_encode(redirect_uri),
-        scope = percent_encode(SCOPES),
+        // Claude Code form-encodes the scope separators as `+`, not `%20`
+        // (`docs/wire-parity.md`); every scope token is itself unreserved-safe
+        // apart from its colons, which `percent_encode` still renders as `%3A`.
+        scope = percent_encode(SCOPES).replace("%20", "+"),
         cc = percent_encode(challenge),
         state = percent_encode(state),
     )

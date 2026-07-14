@@ -26,7 +26,7 @@ const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 /// `User-Agent` + `Accept` Claude Code's axios client sends on every token-endpoint
 /// request. Mimicked so a refresh/exchange is byte-indistinguishable from CC's
 /// (the version string is axios's, not ours, and will drift with CC's bundle).
-const TOKEN_USER_AGENT: &str = "axios/1.15.2";
+pub(crate) const TOKEN_USER_AGENT: &str = "axios/1.15.2";
 const TOKEN_ACCEPT: &str = "application/json, text/plain, */*";
 
 /// Scopes echoed in the refresh `scope` field when a profile has none stored
@@ -34,6 +34,37 @@ const TOKEN_ACCEPT: &str = "application/json, text/plain, */*";
 /// standard Pro/Max login, sans the Console-only `org:create_api_key`).
 const REFRESH_SCOPES_FALLBACK: &str =
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+
+/// Claude Code emits the refresh `scope` in this fixed order regardless of the
+/// order its credential file happens to store the granted scopes in (verified on
+/// the wire, `docs/wire-parity.md`). A profile's stored `scopes` array is often
+/// ordered differently, so reorder to this before sending to byte-match CC.
+const CANONICAL_SCOPE_ORDER: [&str; 6] = [
+    "org:create_api_key",
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+];
+
+/// Reorder a space-joined scope set into [`CANONICAL_SCOPE_ORDER`], appending any
+/// unrecognized scope in its original position. Preserves the actual granted set
+/// (never adds/drops a scope) — only the order changes.
+fn canonicalize_scopes(scopes: &str) -> String {
+    let present: Vec<&str> = scopes.split_whitespace().collect();
+    let mut out: Vec<&str> = CANONICAL_SCOPE_ORDER
+        .iter()
+        .copied()
+        .filter(|c| present.contains(c))
+        .collect();
+    out.extend(
+        present
+            .iter()
+            .filter(|s| !CANONICAL_SCOPE_ORDER.contains(s)),
+    );
+    out.join(" ")
+}
 
 /// UUID of the "Claude Code" OAuth application; required for refresh and the
 /// interactive login (`oauth_login` builds the authorize URL with it).
@@ -159,7 +190,7 @@ pub(crate) fn refresh_result(
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLIENT_ID,
-        "scope": scopes.unwrap_or(REFRESH_SCOPES_FALLBACK),
+        "scope": canonicalize_scopes(scopes.unwrap_or(REFRESH_SCOPES_FALLBACK)),
     }))
     .map_err(|e| RefreshError::Transient(e.into()))?;
 

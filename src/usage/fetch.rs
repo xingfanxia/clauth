@@ -765,11 +765,24 @@ static USER_AGENT: LazyLock<String> =
         None => "claude-cli".to_string(),
     });
 
+/// Which of Claude Code's two `api.anthropic.com` clients to imitate. CC polls
+/// `/usage` with its `claude-cli` client but reads `/profile` through a plain
+/// axios instance — different UA, and `/profile` carries `Cache-Control: no-cache`
+/// with no `anthropic-beta`. See `docs/wire-parity.md`.
+#[derive(Clone, Copy)]
+enum AuthClient {
+    /// `/usage`: `claude-cli/<ver> (external, cli)` UA + `anthropic-beta`.
+    Usage,
+    /// `/profile`: `axios/1.15.2` UA + `Cache-Control: no-cache`, no beta.
+    Profile,
+}
+
 fn get_json(
     url: &str,
     access_token: &str,
     activity: Option<&ActivityStore>,
     name: &str,
+    client: AuthClient,
 ) -> std::result::Result<String, FetchError> {
     await_request_slot(ANTHROPIC_ORIGIN);
     // The throttle wait is over and the request is about to leave the gate — flip
@@ -778,17 +791,22 @@ fn get_json(
     if let Some(activity) = activity {
         mark_activity(activity, name, ProfileActivity::Fetching);
     }
-    let mut response = AGENT
+    // Both CC clients send Accept + Content-Type (the latter even without a body);
+    // the UA and the beta/cache-control headers are what split the two.
+    let req = AGENT
         .get(url)
         .header("Authorization", &format!("Bearer {access_token}"))
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("User-Agent", USER_AGENT.as_str())
-        // Claude Code's axios client sends both on these GETs (Content-Type even
-        // without a body); mirror them so the request is indistinguishable.
         .header("Accept", "application/json, text/plain, */*")
-        .header("Content-Type", "application/json")
-        .call()
-        .map_err(|_| FetchError::Network)?;
+        .header("Content-Type", "application/json");
+    let req = match client {
+        AuthClient::Usage => req
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header("User-Agent", USER_AGENT.as_str()),
+        AuthClient::Profile => req
+            .header("User-Agent", crate::oauth::TOKEN_USER_AGENT)
+            .header("Cache-Control", "no-cache"),
+    };
+    let mut response = req.call().map_err(|_| FetchError::Network)?;
     let status = response.status().as_u16();
     if status == 429 {
         let retry_after = response
@@ -846,28 +864,40 @@ pub(super) fn fetch_raw(
     force_profile: bool,
     activity: Option<&ActivityStore>,
 ) -> std::result::Result<UsageInfo, FetchError> {
-    let usage_text = get_json(USAGE_ENDPOINT, access_token, activity, name)?;
+    let usage_text = get_json(
+        USAGE_ENDPOINT,
+        access_token,
+        activity,
+        name,
+        AuthClient::Usage,
+    )?;
     let raw: RawUsage = serde_json::from_str(&usage_text).map_err(|_| FetchError::Parse)?;
 
     let plan = if take_profile_fetch(name, force_profile, now_ms()) {
-        get_json(PROFILE_ENDPOINT, access_token, activity, name)
-            .ok()
-            .and_then(|text| serde_json::from_str::<RawProfile>(&text).ok())
-            .map(|p| {
-                seed_identity_anchor(name, &p);
-                let org = p.organization.as_ref();
-                PlanInfo {
-                    tier: PlanTier::from_profile(
-                        org.and_then(|o| o.organization_type.as_deref()),
-                        p.account.as_ref().is_some_and(|a| a.has_claude_max),
-                        p.account.as_ref().is_some_and(|a| a.has_claude_pro),
-                        org.and_then(|o| o.rate_limit_tier.as_deref()),
-                    ),
-                }
-            })
-            // Profile leg failed (transient / 401 on a stale token) — keep the
-            // prior plan rather than dropping it from the snapshot.
-            .or(prev_plan)
+        get_json(
+            PROFILE_ENDPOINT,
+            access_token,
+            activity,
+            name,
+            AuthClient::Profile,
+        )
+        .ok()
+        .and_then(|text| serde_json::from_str::<RawProfile>(&text).ok())
+        .map(|p| {
+            seed_identity_anchor(name, &p);
+            let org = p.organization.as_ref();
+            PlanInfo {
+                tier: PlanTier::from_profile(
+                    org.and_then(|o| o.organization_type.as_deref()),
+                    p.account.as_ref().is_some_and(|a| a.has_claude_max),
+                    p.account.as_ref().is_some_and(|a| a.has_claude_pro),
+                    org.and_then(|o| o.rate_limit_tier.as_deref()),
+                ),
+            }
+        })
+        // Profile leg failed (transient / 401 on a stale token) — keep the
+        // prior plan rather than dropping it from the snapshot.
+        .or(prev_plan)
     } else {
         prev_plan
     };
@@ -923,10 +953,18 @@ fn seed_identity_anchor(name: &str, profile: &RawProfile) {
 /// interactive login (`oauth_login`) to (a) confirm the minted token actually
 /// works against the API — a `401` here means the login produced a dud token —
 /// and (b) stamp the new profile's tier so it shows the real plan immediately
-/// instead of the unknown-tier "Pro" fallback. Reuses the same request path the
-/// usage poll uses. Returns the HTTP error text so the caller can surface it.
+/// instead of the unknown-tier "Pro" fallback. Goes through the shared `/profile`
+/// fetch ([`AuthClient::Profile`]). Returns the HTTP error text so the caller can
+/// surface it.
 pub(crate) fn probe_subscription_type(access_token: &str) -> anyhow::Result<Option<String>> {
-    let text = get_json(PROFILE_ENDPOINT, access_token, None, "login").map_err(|e| match e {
+    let text = get_json(
+        PROFILE_ENDPOINT,
+        access_token,
+        None,
+        "login",
+        AuthClient::Profile,
+    )
+    .map_err(|e| match e {
         FetchError::Status(s) => anyhow::anyhow!("profile endpoint returned HTTP {s}"),
         FetchError::RateLimited { .. } => anyhow::anyhow!("profile endpoint rate-limited (429)"),
         FetchError::Network => anyhow::anyhow!("network error reaching the profile endpoint"),
@@ -957,7 +995,14 @@ pub(crate) fn probe_subscription_type(access_token: &str) -> anyhow::Result<Opti
 /// iff their uuids match. Best-effort `None` on any failure (network, 401,
 /// shape drift) — callers must treat that as "identity unproven" and refuse.
 pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<String> {
-    let text = get_json(PROFILE_ENDPOINT, access_token, None, "identity").ok()?;
+    let text = get_json(
+        PROFILE_ENDPOINT,
+        access_token,
+        None,
+        "identity",
+        AuthClient::Profile,
+    )
+    .ok()?;
     serde_json::from_str::<RawProfile>(&text)
         .ok()?
         .account?
