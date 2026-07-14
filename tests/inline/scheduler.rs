@@ -2188,3 +2188,155 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         "idle stamp must carry the full drain ladder"
     );
 }
+
+// ── OAuth refresh-all: completion-ordered result processing ──────────────────
+//
+// Each due profile fetches on its own worker; result processing (spinner clear +
+// countdown publish) must fire the instant that profile's OWN fetch resolves,
+// keyed on completion order — not the `due` list order. The old join-in-list
+// loop stalled a fast account's clear behind an earlier slow account, so a fast
+// row's spinner stayed lit / its countdown hidden until the slow one ahead
+// finished. This is the regression guard.
+
+/// Build a `SchedulerState` whose two OAuth profiles are `slow` (listed first)
+/// and `fast` (listed second) — the ordering that trips the join-order stall.
+fn completion_order_state() -> super::SchedulerState {
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    super::SchedulerState {
+        config: Arc::new(RankedMutex::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        })),
+        tokens: Arc::new(RankedMutex::new(vec![token("slow"), token("fast")])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        rate_limit_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        standdown_probe: false,
+        standdown_active: AtomicBool::new(false),
+    }
+}
+
+/// A pure, disk-free outcome: `info: None` + `from_fetch: false` keeps
+/// `apply_outcome` entirely in-memory (no cache read/write), so this test needs
+/// no `HomeSandbox` and stays parallel-safe.
+fn cached_outcome(name: &str) -> super::FetchOutcome {
+    super::FetchOutcome {
+        name: name.to_string(),
+        info: None,
+        status: super::FetchStatus::Cached,
+        rotated: None,
+        from_fetch: false,
+        retry_after: None,
+    }
+}
+
+#[test]
+fn oauth_completions_apply_in_completion_order_not_list_order() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let state = completion_order_state();
+
+    // `slow` (index 0) blocks in its worker until the test releases it; `fast`
+    // (index 1) returns at once. The release is sent from a drop-guard at the end
+    // of the scope, so even a failing assertion (RED) unblocks `slow` and lets
+    // the scope join instead of hanging.
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let worker = |entry: TokenEntry| -> super::FetchOutcome {
+        if entry.name == "slow" {
+            let _ = release_rx.lock().unwrap().recv();
+        }
+        cached_outcome(&entry.name)
+    };
+
+    /// Releases `slow` on drop so the scope always joins — success or panic.
+    struct Release<'a>(&'a mpsc::Sender<()>);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    std::thread::scope(|scope| {
+        // Dropped at closure end (success or panic), releasing `slow` so the
+        // scope's implicit join never hangs.
+        let _release = Release(&release_tx);
+        scope.spawn(|| {
+            super::fetch_oauth_due_with(
+                &state,
+                vec![token("slow"), token("fast")],
+                REFRESH_INTERVAL_MS,
+                worker,
+            );
+        });
+
+        // Wait for `fast` to be fully applied (countdown published). In
+        // completion order this happens within microseconds while `slow` is
+        // still blocked; a list-order drain is stuck on `slow` and never applies
+        // `fast`, so the deadline fires and the test fails RED.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key("fast")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "`fast` was never applied while `slow` held the head of the list — \
+                 result-processing is still gated on list order, not completion order"
+            );
+            std::thread::yield_now();
+        }
+
+        // The core guarantee: at the instant `fast` is applied, `slow` is still
+        // pending (spinner mark intact, no countdown). So the later-listed fast
+        // account resolved strictly ahead of the slow account before it.
+        {
+            let activity = state.activity.lock().unwrap();
+            assert!(
+                activity.get("fast").is_none(),
+                "`fast` spinner cleared on its own completion"
+            );
+            assert!(
+                matches!(activity.get("slow"), Some(ProfileActivity::Queued)),
+                "`slow` is still queued — it did not gate `fast`"
+            );
+        }
+        assert!(
+            !state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key("slow"),
+            "`slow` countdown is not yet published — it lands after `fast`"
+        );
+    });
+
+    // Both profiles are fully applied once the batch drains. Read `activity`
+    // (rank 600) before `next_refresh` (rank 1100) so the two reads honour the
+    // global lock order even though they are logically independent here.
+    assert!(
+        state.activity.lock().unwrap().is_empty(),
+        "every spinner cleared by batch end"
+    );
+    let nrpp = state.next_refresh_per_profile.lock().unwrap();
+    assert!(
+        nrpp.contains_key("fast") && nrpp.contains_key("slow"),
+        "both countdowns published by batch end"
+    );
+}

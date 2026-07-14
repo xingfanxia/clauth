@@ -1228,66 +1228,111 @@ fn filter_suppressed(
 /// publishing happen in `tick`; this leg only fetches. Each worker paces against
 /// the shared `api.anthropic.com` host inside `get_json`.
 fn fetch_oauth_due(state: &SchedulerState, due: Vec<TokenEntry>, interval_ms: u64) {
+    fetch_oauth_due_with(state, due, interval_ms, |entry| {
+        run_fetch(
+            &state.config,
+            entry,
+            &state.store,
+            &state.refetch_queue,
+            &state.activity,
+            &state.rate_limit_streaks,
+        )
+    });
+}
+
+/// Fan out one worker per due profile and apply each outcome the instant its own
+/// fetch resolves. Result processing is keyed on COMPLETION order — each worker
+/// sends on an `mpsc` channel when `run` returns and the drain applies in arrival
+/// order — so a slow account never stalls a faster one's spinner-clear and
+/// countdown behind it in the `due` list (the join-order stall). `run` is the
+/// per-profile fetch: real [`run_fetch`] in production, a deterministic fake in
+/// tests. Marked `Queued`, not `Fetching`: the per-host throttle
+/// (`REQUEST_SPACING_MS`) serializes the HTTP, so each worker flips itself to
+/// `Fetching` (in `get_json`) only when its request clears the gate.
+fn fetch_oauth_due_with<F>(state: &SchedulerState, due: Vec<TokenEntry>, interval_ms: u64, run: F)
+where
+    F: Fn(TokenEntry) -> FetchOutcome + Sync,
+{
     for entry in &due {
-        // Marked `Queued`, not `Fetching`: the per-host request throttle
-        // (`REQUEST_SPACING_MS`) serializes the actual HTTP, so each worker flips
-        // itself to `Fetching` (in `get_json`) only when its request clears the
-        // gate — the rest read as queued meanwhile.
         mark_activity(&state.activity, &entry.name, ProfileActivity::Queued);
     }
+    let expected = due.len();
+    let (tx, rx) = std::sync::mpsc::channel::<FetchOutcome>();
+    let run = &run;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = due
+            .into_iter()
+            .map(|entry| {
+                let name = entry.name.clone();
+                let tx = tx.clone();
+                let h = scope.spawn(move || {
+                    let outcome = run(entry);
+                    // A drained receiver (already got its `expected` count) drops
+                    // this send; harmless. A panicking worker never reaches here.
+                    let _ = tx.send(outcome);
+                });
+                (name, h)
+            })
+            .collect();
+        // Drop the spare sender so the drain's `recv` unblocks once every worker's
+        // clone is gone (a panicked worker drops its clone on unwind) — it then
+        // never waits on a message that will never arrive.
+        drop(tx);
 
-    let handles: Vec<_> = due
-        .into_iter()
-        .map(|entry| {
-            let name = entry.name.clone();
-            let config = Arc::clone(&state.config);
-            let store = Arc::clone(&state.store);
-            let refetch_queue = Arc::clone(&state.refetch_queue);
-            let activity = Arc::clone(&state.activity);
-            let streaks = Arc::clone(&state.rate_limit_streaks);
-            let h = std::thread::spawn(move || {
-                run_fetch(&config, entry, &store, &refetch_queue, &activity, &streaks)
-            });
-            (name, h)
-        })
-        .collect();
-    for (name, h) in handles {
-        match h.join() {
-            Ok(outcome) => {
-                clear_activity(&state.activity, &outcome.name);
-                // Propagate rotated tokens back into the live snapshot — otherwise
-                // tick N+1 reuses the stale access token, 401s, and double-burns the chain.
-                if let Some((new_access, new_refresh)) = &outcome.rotated
-                    && let Ok(mut t) = state.tokens.lock()
-                    && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
-                {
-                    entry.access_token = new_access.clone();
-                    entry.refresh_token = new_refresh.clone();
-                }
-                // The active profile's 429 ladder caps low (see
-                // `next_slot_deferral`); read the flag at apply time so a
-                // switch mid-flight lands the right cadence.
-                let is_active = state
-                    .config
-                    .lock()
-                    .map(|c| c.is_active(&outcome.name))
-                    .unwrap_or(false);
-                let stamped = apply_outcome(
-                    outcome,
-                    &state.store,
-                    &state.status,
-                    &state.last_fetched,
-                    &state.rate_limit_streaks,
-                    interval_ms,
-                    is_active,
-                );
-                publish_one_countdown(&state.next_refresh_per_profile, name, stamped, interval_ms);
-            }
-            Err(_) => {
-                // Worker panicked — clear slot so the spinner doesn't freeze.
+        drain_oauth_completions(state, &rx, expected, interval_ms);
+
+        // Reap the workers; a panicked worker sent nothing, so its slot may still
+        // read `Queued` — clear it here so the spinner doesn't freeze.
+        for (name, h) in handles {
+            if h.join().is_err() {
                 clear_activity(&state.activity, &name);
             }
         }
+    });
+}
+
+/// Apply up to `expected` OAuth outcomes in the order their fetches COMPLETE
+/// (each worker sends on `rx` when its fetch returns). Per outcome: clear the
+/// spinner, propagate a rotated token pair into the live snapshot, read
+/// `is_active` at apply time, write the outcome, republish the countdown.
+/// Bounded by `expected`, and it bails the instant `rx` disconnects (every
+/// sender dropped) so a panicked worker's missing message can never wedge it.
+fn drain_oauth_completions(
+    state: &SchedulerState,
+    rx: &Receiver<FetchOutcome>,
+    expected: usize,
+    interval_ms: u64,
+) {
+    for _ in 0..expected {
+        let Ok(outcome) = rx.recv() else { break };
+        let name = outcome.name.clone();
+        clear_activity(&state.activity, &outcome.name);
+        // Propagate rotated tokens back into the live snapshot — otherwise
+        // tick N+1 reuses the stale access token, 401s, and double-burns the chain.
+        if let Some((new_access, new_refresh)) = &outcome.rotated
+            && let Ok(mut t) = state.tokens.lock()
+            && let Some(entry) = t.iter_mut().find(|e| e.name == outcome.name)
+        {
+            entry.access_token = new_access.clone();
+            entry.refresh_token = new_refresh.clone();
+        }
+        // The active profile's 429 ladder caps low (see `next_slot_deferral`);
+        // read the flag at apply time so a switch mid-flight lands the right cadence.
+        let is_active = state
+            .config
+            .lock()
+            .map(|c| c.is_active(&outcome.name))
+            .unwrap_or(false);
+        let stamped = apply_outcome(
+            outcome,
+            &state.store,
+            &state.status,
+            &state.last_fetched,
+            &state.rate_limit_streaks,
+            interval_ms,
+            is_active,
+        );
+        publish_one_countdown(&state.next_refresh_per_profile, name, stamped, interval_ms);
     }
 }
 
