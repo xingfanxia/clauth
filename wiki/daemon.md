@@ -29,7 +29,9 @@ stays the only resolution surface.
   launchd `StandardErrorPath` or systemd `StandardError=append:...` — a
   non-append redirect (`file:`, a plain `>`) keeps its own offset, so the
   next write after a trim leaves a sparse NUL hole and the size cap is
-  defeated.
+  defeated. The daemon checks its own stderr at boot and warns loudly when it
+  is a non-append file, so a defeated cap shows up in the log instead of only
+  in this page.
 - **Dual-scheduler dedup (TUI stand-down)**: a TUI opened alongside the daemon
   probes the singleton lock + feed freshness every tick and stands its own
   refresher down while the daemon is live — rendering from the daemon's disk
@@ -89,7 +91,7 @@ key** — names, tiers, percentages, timestamps only.
 | `wrap_off` | The fallback chain's stop-vs-stay-on-last flag, verbatim from state. |
 | `profiles[].provider` | `"anthropic"` for OAuth profiles, else the recognised provider's display name. |
 | `profiles[].tier` | Plan label (`"Max 5x"`…), `null` when unknown. Opaque display string. |
-| `profiles[].auth_status` | `"ok" \| "expiring" \| "broken"`. `broken` = last refresh rejected as revoked/invalid → excluded from fallback walks, refused as a switch target. `expiring` = past expiry, not yet refreshed. `broken` outranks `expiring`. Absent ⇒ `"ok"`. |
+| `profiles[].auth_status` | `"ok" \| "expiring" \| "broken"`. `broken` = last refresh rejected as revoked/invalid → excluded from fallback walks, refused as a switch target. `expiring` = past expiry, not yet refreshed. `broken` outranks `expiring`. Reports on the credential a profile STORES, not on where its requests route: a hybrid (an OAuth pair kept alongside a `base_url`) reports `expiring` on a dead token like any other account. Absent ⇒ `"ok"`. |
 | `profiles[].fetch_status` | `"Fresh" \| "Cached" \| "Failed" \| "RateLimited"` — the usage fetch's last outcome, so readers can distinguish live bars from last-known. `Failed`/`RateLimited` come only from a live daemon's OAuth fetch leg; api-key profiles (and any name the live stores don't carry yet) derive `Fresh`/`Cached` from their own cache's mtime instead — an api-key profile with a warm cache is never reported as unfetched. `null` = no cache at all (genuinely never fetched). |
 | `profiles[].stale` | `bool` (additive, schema stays 1; absent ⇒ `false`). `true` when the daemon distrusts this reading as a **deep-slot stuck `RateLimited`**: `fetch_status == "RateLimited"` AND the consecutive-429 streak has passed the active-retry cap, so the `/usage` throttle never drained and no `Fresh` read is coming. This is the same judgment the daemon's auto-switch acts on — a stuck-RateLimited active bypasses the "only act on a Fresh read" gate so the chain rotates away instead of wedging (the `RateLimited` analogue of the `auth_status: "broken"` bypass); the switch still requires the active's last-known usage to be genuinely spent, so a throttle blip with headroom stays put. Readers should dim the meter / show a "stuck" cue rather than render the frozen number as current truth. `false` for a shallow/transient `RateLimited`, for every non-`RateLimited` status, and **always** for the single-shot `clauth status --json` (no daemon, no streak history). |
 | `profiles[].fallback` | `null` when not in the chain; else 1-based `position`, `threshold` (%), `armed` (this member is the active one the auto-switch watches). |
