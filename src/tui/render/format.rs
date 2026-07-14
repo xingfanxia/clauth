@@ -84,11 +84,14 @@ pub(super) fn bar_string_with_cells(pct: f64, cells: usize) -> String {
 
 /// Overview accounts rows only: `[███░░░]` with dim brackets around the bar.
 /// Brackets render in `dim`; filled/empty cells keep their semantic util color.
+/// `reset_style` colors the trailing ` (reset)` countdown (wide layout only) —
+/// pass the drain hue for a live window, `None` to keep it faint.
 /// All other bar sites use [`bar_string_with_cells`] directly (no brackets).
 pub(super) fn window_summary_spans_bracketed(
     window: Option<&UsageWindow>,
     width: usize,
     include_bar: bool,
+    reset_style: Option<Style>,
 ) -> Vec<Span<'static>> {
     let Some(window) = window else {
         return vec![Span::styled("—".to_string(), theme::faint())];
@@ -107,7 +110,10 @@ pub(super) fn window_summary_spans_bracketed(
             Span::styled(format!(" {:>3.0}%", pct), style),
         ];
         if let Some(r) = format_reset(window) {
-            spans.push(Span::styled(format!(" ({r})"), theme::faint()));
+            spans.push(Span::styled(
+                format!(" ({r})"),
+                reset_style.unwrap_or_else(theme::faint),
+            ));
         }
         spans
     } else if include_bar && width >= 17 {

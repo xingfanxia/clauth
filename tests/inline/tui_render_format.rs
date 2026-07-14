@@ -125,7 +125,7 @@ fn cue_absent_for_api_key_profiles() {
 #[test]
 fn brackets_stay_dim_regardless_of_fetch_state() {
     let w = cue_window(50.0);
-    let spans = window_summary_spans_bracketed(Some(&w), 17, true);
+    let spans = window_summary_spans_bracketed(Some(&w), 17, true, None);
     assert_eq!(spans[0].content, "[");
     assert_eq!(spans[0].style.fg, theme::dim().fg);
     assert_eq!(spans[2].content, "]");
@@ -136,7 +136,7 @@ fn brackets_stay_dim_regardless_of_fetch_state() {
 /// other no-data cell — the cue lives on the overview countdown instead.
 #[test]
 fn no_data_dash_stays_faint() {
-    let spans = window_summary_spans_bracketed(None, 17, true);
+    let spans = window_summary_spans_bracketed(None, 17, true, None);
     assert_eq!(spans[0].content, "—");
     assert_eq!(spans[0].style.fg, theme::faint().fg);
 }

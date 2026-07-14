@@ -14,9 +14,12 @@ use super::format::{
 };
 use super::header::pulse_name_spans;
 use super::panes::{bold_when, draw_scrollbar, empty_state, name_color, section_box, select_line};
+use super::usage::{eta_left_secs, window_rate_unit};
 use crate::fallback::{SwitchAction, next_target, soonest_resume, threshold_for};
 use crate::profile::{AppConfig, Profile};
-use crate::usage::{LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_ms};
+use crate::usage::{
+    LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
+};
 
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
@@ -311,7 +314,22 @@ fn render_overview_row(
     // OAuth windows come from `usage`; api-key/provider profiles have no `usage`,
     // so the 5h/7d windows are synthesized from the matching third-party bars.
     let (five_window, seven_window) = overview_windows(profile);
-    let five_spans = window_summary_spans_bracketed(five_window.as_ref(), widths.five_hour, true);
+    // Drain-color each reset countdown by the window's burn rate — see
+    // `drain_rate` for where that rate comes from per window.
+    let reset_style = |label, window: Option<&UsageWindow>| {
+        let window = window?;
+        drain_reset_style(
+            drain_rate(app, &name_str, profile, label, window),
+            window_rate_unit(label),
+            window,
+        )
+    };
+    let five_spans = window_summary_spans_bracketed(
+        five_window.as_ref(),
+        widths.five_hour,
+        true,
+        reset_style(LABEL_5H, five_window.as_ref()),
+    );
     let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
     spans.extend(five_spans);
@@ -322,6 +340,7 @@ fn render_overview_row(
             seven_window.as_ref(),
             widths.seven_day,
             widths.seven_day >= 18,
+            reset_style(LABEL_7D, seven_window.as_ref()),
         );
         let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
         let seven_pad = widths.seven_day.saturating_sub(seven_len);
@@ -627,6 +646,53 @@ fn burn_rate_eta(rate: Option<f64>, current: f64, threshold: f64) -> Option<i64>
         return None;
     }
     Some((hours * 3600.0) as i64)
+}
+
+/// Drain color for an overview reset-countdown suffix (wide layout only).
+/// `util_color` of the burn `rate` (slow drain dim, fast warning/danger —
+/// mirrors the usage page), escalated to a flat WARNING when the window
+/// projects to hit 100% BEFORE it resets ("runs dry first" — you top out ahead
+/// of the refill). `rate` is in `rate_unit` (`%/h` or `%/d`) — the window's own
+/// unit, the same one the usage page hues by, so both surfaces agree.
+/// `None` (caller keeps the faint default) when there's no positive rate yet.
+fn drain_reset_style(rate: Option<f64>, rate_unit: &str, window: &UsageWindow) -> Option<Style> {
+    let rate = rate.filter(|r| *r > 0.0)?;
+    let eta = eta_left_secs(rate, window.utilization, rate_unit);
+    let reset = super::format::reset_in_secs(window);
+    let runs_dry_first = matches!((eta, reset), (Some(e), Some(r)) if e < r);
+    Some(if runs_dry_first {
+        theme::warning()
+    } else {
+        Style::default().fg(theme::util_color(rate.clamp(0.0, 100.0)))
+    })
+}
+
+/// The rate to drain-color `window`'s countdown by, in the window's native unit
+/// (see [`drain_reset_style`]).
+///
+/// An OAuth 5h window uses the recency-weighted recent burn — in-memory
+/// `history_cache`, so no disk read happens under the config guard. Every other
+/// window falls back to the window's own average pace, which needs no burn
+/// history at all: 7d moves too slowly for the recency weighting to say much,
+/// and a synthesized third-party window has no history to weigh.
+fn drain_rate(
+    app: &App,
+    name: &str,
+    profile: &Profile,
+    label: &str,
+    window: &UsageWindow,
+) -> Option<f64> {
+    if label == LABEL_5H
+        && let Some(usage) = profile.usage.as_ref()
+    {
+        return app.active_burn_rate(name, usage);
+    }
+    let per_day = crate::usage::window_avg_pace_per_day(label, window, now_epoch_secs(), 3600)?;
+    Some(if window_rate_unit(label) == "d" {
+        per_day
+    } else {
+        per_day / 24.0
+    })
 }
 
 #[cfg(test)]

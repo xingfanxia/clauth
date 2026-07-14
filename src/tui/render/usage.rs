@@ -258,7 +258,7 @@ struct Stat {
 
 /// Seconds until the window hits 100% at the current burn rate.
 /// `rate` may be in %/h or %/d (determined by `rate_unit`).
-fn eta_left_secs(rate: f64, pct: f64, rate_unit: &str) -> Option<i64> {
+pub(super) fn eta_left_secs(rate: f64, pct: f64, rate_unit: &str) -> Option<i64> {
     if rate <= 0.0 || pct >= 100.0 {
         return None;
     }
@@ -392,7 +392,7 @@ impl Stat {
 /// the front (`"7d sonnet"`, `"7d opus"`, `"5h"` → `starts_with("7d")`); the
 /// third-party bar labels carry it at the end (`"30d"`, `"7d"` → `ends_with('d')`
 /// with a leading ascii digit). Anything else is treated as an hour window.
-fn window_rate_unit(label: &str) -> &'static str {
+pub(super) fn window_rate_unit(label: &str) -> &'static str {
     if label.starts_with("7d") {
         return "d";
     }
