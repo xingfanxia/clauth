@@ -459,3 +459,54 @@ fn model_settings_round_trip_through_config_toml() {
     let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
     assert_eq!(parsed.models, profile.models);
 }
+
+/// Write `profiles.toml` into the sandboxed home and read it back through the
+/// real load boundary — the point of these tests is where normalization
+/// happens, so nothing may bypass `load_app_state`.
+fn load_state_from_toml(toml: &str) -> AppState {
+    std::fs::create_dir_all(clauth_dir().expect("clauth dir")).expect("create clauth dir");
+    std::fs::write(app_state_path().expect("state path"), toml).expect("write profiles.toml");
+    load_app_state().expect("load state")
+}
+
+// A hand-edited out-of-band line must be normalized on LOAD, not on read
+// alone: left raw on disk it survives every save and any direct field read
+// trusts it. The reset target is the DEFAULT, never the nearest bound —
+// honoring a hand-edited 40.0 as 50.0 keeps the weakened gate the edit asked
+// for, so fail-safe high instead.
+#[test]
+fn weekly_switch_threshold_out_of_band_resets_to_default_at_load() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let low = load_state_from_toml("profiles = []\nweekly_switch_threshold = 40.0\n");
+    assert_eq!(
+        low.weekly_switch_threshold,
+        Some(DEFAULT_WEEKLY_SWITCH_PCT),
+        "40.0 resets to the default, never clamps up to MIN"
+    );
+    let high = load_state_from_toml("profiles = []\nweekly_switch_threshold = 150.0\n");
+    assert_eq!(
+        high.weekly_switch_threshold,
+        Some(DEFAULT_WEEKLY_SWITCH_PCT),
+        "150.0 resets to the default, never clamps down to MAX"
+    );
+}
+
+#[test]
+fn weekly_switch_threshold_in_band_survives_load() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = load_state_from_toml("profiles = []\nweekly_switch_threshold = 75.0\n");
+    assert_eq!(state.weekly_switch_threshold, Some(75.0));
+}
+
+#[test]
+fn weekly_switch_threshold_absent_loads_as_default() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = load_state_from_toml("profiles = []\n");
+    // Unset stays unset: materializing a value here would start writing the
+    // key into every state file that never had it (`skip_serializing_if`).
+    assert_eq!(state.weekly_switch_threshold, None);
+    assert_eq!(
+        state.weekly_switch_threshold_pct(),
+        DEFAULT_WEEKLY_SWITCH_PCT
+    );
+}

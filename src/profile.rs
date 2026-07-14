@@ -761,6 +761,14 @@ fn load_app_state() -> Result<AppState> {
     }
     let mut state: AppState = read_toml_file(&path)?;
     state.refresh_interval_ms = state.refresh_interval_ms.max(MIN_REFRESH_INTERVAL_MS);
+    // Normalize a hand-edited weekly line here, not on read alone: left raw the
+    // out-of-band value survives every save and any direct field read trusts
+    // it. Through the accessor so the band and its reset-to-default (never
+    // clamp-to-nearest-bound) semantics stay defined in one place; an unset
+    // field stays unset so `skip_serializing_if` keeps omitting it.
+    if state.weekly_switch_threshold.is_some() {
+        state.weekly_switch_threshold = Some(state.weekly_switch_threshold_pct());
+    }
     Ok(state)
 }
 
