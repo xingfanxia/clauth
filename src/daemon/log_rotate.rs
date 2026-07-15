@@ -16,6 +16,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+#[cfg(unix)]
 use crate::logline::logline;
 
 /// Trim once the log passes ~5 MiB…
