@@ -772,18 +772,138 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
 fn kick_suppressed_during_rate_limit_streak() {
     use super::should_open_window;
 
-    assert!(should_open_window(0, true), "lapsed + no streak → open");
     assert!(
-        !should_open_window(1, true),
+        should_open_window(0, true, true),
+        "lapsed + no streak → open"
+    );
+    assert!(
+        !should_open_window(1, true, true),
         "lapsed but 429-streaking → suppress the kick"
     );
     assert!(
-        !should_open_window(5, true),
+        !should_open_window(5, true, true),
         "deep streak → still suppressed"
     );
     assert!(
-        !should_open_window(0, false),
+        !should_open_window(0, false, true),
         "a live window never kicks, streak or not"
+    );
+    assert!(
+        !should_open_window(0, true, false),
+        "a kick-429 block whose retry isn't due suppresses the kick even with \
+         a clean /usage streak — the messages limiter can reject while /usage \
+         stays 200"
+    );
+}
+
+/// The kick-429 block's retry clock: the streak climbs the shared backoff
+/// ladder but never schedules past the limiter's advertised ceiling, and a
+/// passed ceiling (or no block at all) is always due.
+#[test]
+fn kick_block_backoff_decays_toward_the_advertised_ceiling() {
+    use super::{kick_block_after_429, kick_retry_due};
+    use crate::oauth::KickRateLimit;
+
+    let now = 1_000_000;
+    let rl = KickRateLimit {
+        rejected: true,
+        until_epoch_secs: Some(now + 10_000),
+    };
+
+    let first = kick_block_after_429(None, &rl, now);
+    assert_eq!(first.streak, 1);
+    assert!(first.rejected);
+    assert_eq!(first.until, Some(now + 10_000));
+    assert_eq!(
+        first.next_retry,
+        now + 10,
+        "streak 1 rides the ladder base (10s), far below the ceiling"
+    );
+    assert!(
+        !kick_retry_due(Some(&first), now + 5),
+        "before next_retry → not due"
+    );
+    assert!(
+        kick_retry_due(Some(&first), now + 10),
+        "at next_retry → due"
+    );
+    assert!(kick_retry_due(None, now), "no block → always due");
+
+    // Climb the ladder deep enough that it would overshoot a near ceiling.
+    let deep = kick_block_after_429(Some(first), &rl, now + 9_990);
+    assert_eq!(deep.streak, 2);
+    let near_rl = KickRateLimit {
+        rejected: true,
+        until_epoch_secs: Some(now + 9_995),
+    };
+    let clamped = kick_block_after_429(Some(deep), &near_rl, now + 9_990);
+    assert_eq!(
+        clamped.next_retry,
+        now + 9_995,
+        "ladder overshooting the advertised ceiling clamps to the ceiling — \
+         the reset is an upper bound the retry must reach, never sleep past"
+    );
+
+    // No headers at all still blocks, on the pure ladder.
+    let bare = KickRateLimit {
+        rejected: false,
+        until_epoch_secs: None,
+    };
+    let no_hint = kick_block_after_429(None, &bare, now);
+    assert!(!no_hint.rejected);
+    assert_eq!(no_hint.until, None);
+    assert_eq!(no_hint.next_retry, now + 10);
+}
+
+/// `note_kick_outcome` lifecycle: a 429 upserts the block and writes the
+/// per-profile cache file; a later successful kick clears both. A no-metadata
+/// failure (transport, 401 path) leaves existing state untouched.
+#[test]
+fn kick_block_persists_and_clears_by_outcome() {
+    use super::{kick_block, note_kick_outcome, sync_kick_blocks_from_cache};
+    use crate::oauth::KickRateLimit;
+    use crate::profile_cache::{KICK_BLOCK_CACHE_FILE, load_profile_cache};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let now = 2_000_000;
+    let rl = KickRateLimit {
+        rejected: true,
+        until_epoch_secs: Some(now + 600),
+    };
+
+    note_kick_outcome(&blocks, "kitty", false, Some(rl), now);
+    let live = kick_block(&blocks, "kitty").expect("429 outcome must block");
+    assert_eq!(live.streak, 1);
+    let on_disk: super::KickBlock =
+        load_profile_cache("kitty", KICK_BLOCK_CACHE_FILE).expect("block written through");
+    assert_eq!(on_disk, live);
+
+    // A failure with no limiter metadata must not disturb the block.
+    note_kick_outcome(&blocks, "kitty", false, None, now + 20);
+    assert_eq!(kick_block(&blocks, "kitty"), Some(live));
+
+    // A second 429 grows the streak in place.
+    note_kick_outcome(&blocks, "kitty", false, Some(rl), now + 30);
+    assert_eq!(kick_block(&blocks, "kitty").map(|b| b.streak), Some(2));
+
+    // A fresh map (new process) resumes the persisted block…
+    let rehydrated: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    sync_kick_blocks_from_cache(&rehydrated, &["kitty".to_string()]);
+    assert_eq!(kick_block(&rehydrated, "kitty").map(|b| b.streak), Some(2));
+
+    // …and a successful kick clears map + file, so the next sync clears mirrors.
+    note_kick_outcome(&blocks, "kitty", true, None, now + 40);
+    assert_eq!(kick_block(&blocks, "kitty"), None);
+    assert!(
+        load_profile_cache::<super::KickBlock>("kitty", KICK_BLOCK_CACHE_FILE).is_none(),
+        "clearing must remove the cache file"
+    );
+    sync_kick_blocks_from_cache(&rehydrated, &["kitty".to_string()]);
+    assert_eq!(
+        kick_block(&rehydrated, "kitty"),
+        None,
+        "a mirroring instance drops the block once the file is gone"
     );
 }
 
@@ -2119,6 +2239,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         activity: Arc::new(RankedMutex::new(HashMap::new())),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -2196,6 +2317,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         activity: Arc::new(RankedMutex::new(HashMap::new())),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -2271,6 +2393,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         activity: Arc::new(RankedMutex::new(HashMap::new())),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -2513,6 +2636,7 @@ fn completion_order_state() -> super::SchedulerState {
         activity: Arc::new(RankedMutex::new(HashMap::new())),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),

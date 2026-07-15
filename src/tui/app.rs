@@ -47,12 +47,13 @@ use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
-    OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks, ProfileActivity, RefetchQueue,
-    StartupReceiver, StartupSender, StartupSignal, StatusStore, SuppressedGenericStore,
-    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore,
-    any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity, collect_third_party_entries,
-    collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher, switch_gate_in_flight,
+    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, OpResult,
+    OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
+    ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
+    SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
+    UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
+    collect_third_party_entries, collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher,
+    switch_gate_in_flight,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -1203,6 +1204,9 @@ pub(crate) struct App {
     /// Per-profile consecutive-failure counters (429s + transient refresh
     /// failures) driving exponential usage-fetch backoff.
     pub(crate) poll_streaks: PollStreaks,
+    /// Per-profile kick-429 blocks (the messages endpoint rejecting the 5h
+    /// auto-start kick) — feeds the usage tab's blocked pill.
+    pub(crate) kick_blocks: KickBlocks,
     /// Scheduler-posted auto-switch decisions; drained in `on_tick`.
     pub(crate) pending_switch: PendingSwitch,
     /// Set by the scheduler when the whole chain is spent; `on_tick` drains it
@@ -1391,6 +1395,7 @@ struct WorkerHandles {
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
     poll_streaks: PollStreaks,
+    kick_blocks: KickBlocks,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -1413,6 +1418,7 @@ impl WorkerHandles {
             activity: Arc::clone(&app.activity),
             last_fetched: Arc::clone(&app.last_fetched),
             poll_streaks: Arc::clone(&app.poll_streaks),
+            kick_blocks: Arc::clone(&app.kick_blocks),
             pending_switch: Arc::clone(&app.pending_switch),
             pending_switch_off: Arc::clone(&app.pending_switch_off),
             refetch_queue: Arc::clone(&app.refetch_queue),
@@ -1438,6 +1444,7 @@ impl App {
         let (startup_sender, startup_results) = std::sync::mpsc::channel::<StartupSignal>();
         let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
         let poll_streaks: PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+        let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
         let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_switch_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
@@ -1536,6 +1543,7 @@ impl App {
             startup_sender,
             last_fetched,
             poll_streaks,
+            kick_blocks,
             pending_switch,
             pending_switch_off,
             refetch_queue,
@@ -1807,6 +1815,7 @@ impl App {
             h.activity,
             h.last_fetched,
             h.poll_streaks,
+            h.kick_blocks,
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,

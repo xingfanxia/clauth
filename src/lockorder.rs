@@ -86,6 +86,11 @@ pub(crate) mod rank {
         /// `usage::scheduler`. Leaf — bumped and released before the
         /// `last_fetched`/`status` write in `apply_outcome`.
         PollStreak = 220;
+        /// Per-profile kick-429 block state (`usage::scheduler::KickBlocks`):
+        /// the messages endpoint is rejecting the 5h auto-start kick. Leaf like
+        /// `PollStreak` — read/copied alone, released before any other lock,
+        /// and its cache-file IO stays outside the guard.
+        KickBlockState = 230;
         Tokens = 250;
         ThirdParty = 260;
         ThirdPartyUsageStore = 270;

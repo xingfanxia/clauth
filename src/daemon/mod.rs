@@ -42,7 +42,7 @@ use crate::profile::{
     AppConfig, ConfigHandle, app_state_mtime, atomic_write_600, clauth_dir, load_config, mkdir_700,
 };
 use crate::usage::{
-    ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, PendingSwitch,
+    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, PendingSwitch,
     PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore, SuppressedGenericStore,
     ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList, UsageStore,
     bootstrap_fetch, bootstrap_third_party, collect_third_party_entries, collect_tokens,
@@ -326,6 +326,10 @@ impl Daemon {
     /// TUI's `start_scheduler` makes). The suppressed-generic set is daemon-local.
     fn spawn_scheduler(&self) {
         let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashSet::new()));
+        // Daemon-local like `suppressed`: the daemon never renders pills, so the
+        // block map only backs the scheduler's own gate + its write-through
+        // cache files (which a standdown TUI mirrors).
+        let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
         spawn_refresher(
             Arc::clone(&self.config),
             Arc::clone(&self.usage_tokens),
@@ -336,6 +340,7 @@ impl Daemon {
             Arc::clone(&self.activity),
             Arc::clone(&self.last_fetched),
             Arc::clone(&self.poll_streaks),
+            kick_blocks,
             Arc::clone(&self.pending_switch),
             Arc::clone(&self.pending_switch_off),
             Arc::clone(&self.refetch_queue),

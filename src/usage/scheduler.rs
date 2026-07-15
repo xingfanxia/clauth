@@ -11,12 +11,14 @@ use crate::providers::ThirdPartyStats;
 
 use super::fetch::{
     FetchError, PlanInfo, UsageInfo, UsageWindow, await_request_slot, epoch_secs_to_iso, fetch_raw,
-    five_hour_live, iso_to_epoch_secs, now_epoch_secs, now_ms, windows_maxed,
+    five_hour_live, humanize_duration, iso_to_epoch_secs, now_epoch_secs, now_ms, windows_maxed,
 };
+use crate::oauth::KickRateLimit;
 use crate::profile_cache::{
-    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
-    write_profile_cache,
+    KICK_BLOCK_CACHE_FILE, THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache,
+    profile_cache_mtime_ms, remove_profile_cache, write_profile_cache,
 };
+use serde::{Deserialize, Serialize};
 
 /// Scheduler wake interval. Network work only fires for profiles whose cadence has elapsed.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -115,6 +117,31 @@ pub(crate) struct StreakCounts {
 /// Per-profile poll-health streaks, driving exponential backoff in
 /// [`apply_outcome`] and [`partition_due`]. Reset on the next live fetch.
 pub(crate) type PollStreaks = Arc<RankedMutex<HashMap<String, StreakCounts>, rank::PollStreak>>;
+
+/// One profile's live kick-429 block: the messages endpoint is rejecting the
+/// 5h auto-start kick. Deliberately NOT a [`StreakCounts`] axis — those clear
+/// on the next live `/usage` body, but `/usage` stays 200 straight through a
+/// messages-limiter outage (observed 2026-07-15), so only a kick outcome may
+/// clear this. Persisted per profile ([`KICK_BLOCK_CACHE_FILE`]) so a standdown
+/// TUI mirrors the fetching instance and a restart doesn't forget a live block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct KickBlock {
+    /// Consecutive kick 429s.
+    pub(crate) streak: u32,
+    /// The limiter said `unified-status: rejected` — the account-level hard
+    /// rejection that also gates the fallback auto-switch, not a burst 429.
+    pub(crate) rejected: bool,
+    /// Advertised retry ceiling (epoch secs). Upper bound only — the limiter
+    /// has relented 2.4h before its own reset — so retries decay toward it
+    /// instead of sleeping until it.
+    pub(crate) until: Option<i64>,
+    /// Next allowed kick attempt (epoch secs): `min(now + ladder, until)`.
+    pub(crate) next_retry: i64,
+}
+
+/// Per-profile kick-429 blocks. Same leaf discipline as [`PollStreaks`]:
+/// read/copied alone, released before any other lock, file IO outside the guard.
+pub(crate) type KickBlocks = Arc<RankedMutex<HashMap<String, KickBlock>, rank::KickBlockState>>;
 
 /// Names pushed here after a successful token rotation bypass the cadence on the next tick.
 pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, rank::RefetchQueue>>;
@@ -842,13 +869,115 @@ fn streak_snapshot(streaks: &PollStreaks) -> HashMap<String, StreakCounts> {
 }
 
 /// Whether `run_fetch` should open the 5h window before fetching: the window has
-/// lapsed AND we are not mid-429-streak. A streak means the endpoint is already
-/// throttling us, and a kick on a still-valid access token can neither rotate
-/// nor open anything (see `auto_start_kick`) — re-hitting it every due slot only
-/// adds load and can prolong the limit. The `/usage` retry detects recovery;
-/// once a live body resets the streak, the next lapsed tick opens cleanly.
-fn should_open_window(streak: u32, window_lapsed: bool) -> bool {
-    window_lapsed && streak == 0
+/// lapsed AND we are not mid-429-streak AND the kick's own block (if any) says a
+/// retry is due. A streak means the endpoint is already throttling us, and a
+/// kick on a still-valid access token can neither rotate nor open anything (see
+/// `auto_start_kick`) — re-hitting it every due slot only adds load and can
+/// prolong the limit. The `/usage` retry detects recovery; once a live body
+/// resets the streak, the next lapsed tick opens cleanly. `kick_due` is the
+/// messages-limiter analogue ([`kick_retry_due`]): `/usage` can stay 200 while
+/// `/v1/messages` rejects every kick (observed 2026-07-15), so that block
+/// carries its own decaying retry clock instead of riding the streak.
+fn should_open_window(streak: u32, window_lapsed: bool, kick_due: bool) -> bool {
+    window_lapsed && streak == 0 && kick_due
+}
+
+/// Copy of `name`'s kick block (`None` when absent or poisoned). Read alone and
+/// released immediately — KickBlockState(230) is a leaf like PollStreak.
+fn kick_block(blocks: &KickBlocks, name: &str) -> Option<KickBlock> {
+    blocks.lock().ok().and_then(|m| m.get(name).copied())
+}
+
+/// Fold one more kick 429 into the block: the streak climbs the shared
+/// [`rate_limit_backoff_ms`] ladder (10s ×3, 15min cap), clamped to the
+/// limiter's advertised ceiling — once that passes, the next tick is always due.
+fn kick_block_after_429(prev: Option<KickBlock>, rl: &KickRateLimit, now_secs: i64) -> KickBlock {
+    let streak = prev.map_or(1, |b| b.streak.saturating_add(1));
+    let ladder_secs = (rate_limit_backoff_ms(streak) / 1000).max(1) as i64;
+    let mut next_retry = now_secs.saturating_add(ladder_secs);
+    if let Some(until) = rl.until_epoch_secs {
+        next_retry = next_retry.min(until);
+    }
+    KickBlock {
+        streak,
+        rejected: rl.rejected,
+        until: rl.until_epoch_secs,
+        next_retry,
+    }
+}
+
+/// Whether a blocked profile may kick again. `next_retry` is already clamped to
+/// the advertised ceiling, so a passed ceiling is always due.
+fn kick_retry_due(block: Option<&KickBlock>, now_secs: i64) -> bool {
+    block.is_none_or(|b| now_secs >= b.next_retry)
+}
+
+/// Fold a kick's outcome into the block map + its per-profile cache file, and
+/// logline the state TRANSITIONS only (silent while a streak merely grows).
+fn note_kick_outcome(
+    blocks: &KickBlocks,
+    name: &str,
+    opened: bool,
+    blocked: Option<KickRateLimit>,
+    now_secs: i64,
+) {
+    let prev = kick_block(blocks, name);
+    if opened {
+        if prev.is_some() {
+            if let Ok(mut m) = blocks.lock() {
+                m.remove(name);
+            }
+            remove_profile_cache(name, KICK_BLOCK_CACHE_FILE);
+            logline!("{name}: 5h auto-start unblocked, kick accepted");
+        }
+        return;
+    }
+    let Some(rl) = blocked else {
+        return;
+    };
+    let next = kick_block_after_429(prev, &rl, now_secs);
+    if let Ok(mut m) = blocks.lock() {
+        m.insert(name.to_string(), next);
+    }
+    write_profile_cache(name, KICK_BLOCK_CACHE_FILE, &next);
+    if prev.is_none() {
+        let ceiling = next
+            .until
+            .map(|u| {
+                format!(
+                    ", api ceiling in {}",
+                    humanize_duration(u.saturating_sub(now_secs))
+                )
+            })
+            .unwrap_or_default();
+        logline!(
+            "{name}: 5h auto-start kick rate-limited (rejected: {}){ceiling}; backing off",
+            next.rejected
+        );
+    }
+}
+
+/// Overwrite the in-memory kick blocks with each profile's on-disk cache file —
+/// the standdown mirror of the fetching instance's write-through, and the
+/// bootstrap seed so a restart doesn't forget a live block. All file IO happens
+/// before the single lock take.
+fn sync_kick_blocks_from_cache(blocks: &KickBlocks, names: &[String]) {
+    let loaded: Vec<(String, Option<KickBlock>)> = names
+        .iter()
+        .map(|n| (n.clone(), load_profile_cache(n, KICK_BLOCK_CACHE_FILE)))
+        .collect();
+    if let Ok(mut m) = blocks.lock() {
+        for (name, block) in loaded {
+            match block {
+                Some(b) => {
+                    m.insert(name, b);
+                }
+                None => {
+                    m.remove(&name);
+                }
+            }
+        }
+    }
 }
 
 /// Fetch one profile's usage on the periodic tick. When the profile opted into
@@ -862,9 +991,11 @@ fn run_fetch(
     refetch: &RefetchQueue,
     activity: &ActivityStore,
     streaks: &PollStreaks,
+    kick_blocks: &KickBlocks,
 ) -> FetchOutcome {
     // Auto-start leg: open a window before fetching when this profile opted in,
-    // its last-known window has lapsed, and we aren't already 429-streaking (see
+    // its last-known window has lapsed, we aren't already 429-streaking, and the
+    // kick's own 429 block (if any) says a retry is due (see
     // `should_open_window`). The kick may rotate the chain (401 OR 429 in this
     // branch only); fold its rotated pair into both the local entry (so the
     // fetch below uses the fresh token, never re-spending) and the returned
@@ -873,7 +1004,12 @@ fn run_fetch(
     if entry.auto_start {
         let streak = rate_limit_streak(streaks, &entry.name);
         let now_secs = now_epoch_secs();
-        if should_open_window(streak, window_lapsed(store, &entry.name, now_secs)) {
+        let block = kick_block(kick_blocks, &entry.name);
+        if should_open_window(
+            streak,
+            window_lapsed(store, &entry.name, now_secs),
+            kick_retry_due(block.as_ref(), now_secs),
+        ) {
             let kicked = crate::oauth::auto_start_kick(
                 config,
                 &entry.name,
@@ -881,6 +1017,13 @@ fn run_fetch(
                 entry.refresh_token.as_deref(),
                 entry.access_expires_at,
                 Some(activity),
+            );
+            note_kick_outcome(
+                kick_blocks,
+                &entry.name,
+                kicked.opened,
+                kicked.blocked,
+                now_epoch_secs(),
             );
             if let Some((access, refresh)) = kicked.rotated.clone() {
                 entry.access_token = access;
@@ -1341,6 +1484,7 @@ fn fetch_oauth_due(state: &SchedulerState, due: Vec<TokenEntry>, interval_ms: u6
             &state.refetch_queue,
             &state.activity,
             &state.poll_streaks,
+            &state.kick_blocks,
         )
     });
 }
@@ -1649,6 +1793,7 @@ pub(crate) struct SchedulerState {
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
     poll_streaks: PollStreaks,
+    kick_blocks: KickBlocks,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -1866,6 +2011,10 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         &tp_snapshot,
         interval_ms,
     );
+    // Mirror the fetching instance's kick blocks (write-through cache files) so
+    // a stood-down TUI still shows the blocked pill for an outage it can't see.
+    let oauth_names: Vec<String> = oauth_snapshot.iter().map(|e| e.name.clone()).collect();
+    sync_kick_blocks_from_cache(&state.kick_blocks, &oauth_names);
 
     let now = now_ms();
     let streaks = streak_snapshot(&state.poll_streaks);
@@ -1948,6 +2097,7 @@ pub(crate) fn spawn_refresher(
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
     poll_streaks: PollStreaks,
+    kick_blocks: KickBlocks,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -1968,6 +2118,7 @@ pub(crate) fn spawn_refresher(
         activity,
         last_fetched,
         poll_streaks,
+        kick_blocks,
         pending_switch,
         pending_switch_off,
         refetch_queue,
@@ -1983,6 +2134,14 @@ pub(crate) fn spawn_refresher(
     std::thread::Builder::new()
         .name("clauth-tick".into())
         .spawn(move || {
+            // Seed kick blocks from the per-profile cache files so a restart
+            // mid-outage resumes the decayed retry clock instead of hammering.
+            let names: Vec<String> = state
+                .tokens
+                .lock()
+                .map(|t| t.iter().map(|e| e.name.clone()).collect())
+                .unwrap_or_default();
+            sync_kick_blocks_from_cache(&state.kick_blocks, &names);
             loop {
                 if state.shutting_down.load(Ordering::SeqCst) {
                     break;

@@ -28,6 +28,11 @@ pub(crate) const ACCOUNT_ID_CACHE_FILE: &str = "account_id.json";
 /// `/profile` for every profile at once.
 pub(crate) const PROFILE_FETCHED_CACHE_FILE: &str = "profile_fetched.json";
 
+/// Per-profile kick-429 block (`usage::scheduler::KickBlock`): written by the
+/// fetching instance so a standdown TUI can mirror the judgment and a restart
+/// doesn't forget a live block mid-outage; removed the moment a kick lands.
+pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
+
 /// Resolve `<profile_dir>/<file>` for `name`. `None` only when the per-profile
 /// dir itself can't be resolved (matches the prior per-layer `cache_path`).
 pub(crate) fn profile_cache_path(name: &str, file: &str) -> Option<PathBuf> {

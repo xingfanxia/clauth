@@ -1319,6 +1319,106 @@ fn kick_beta_is_ccs_full_six_value_list() {
     assert!(KICK_ANTHROPIC_BETA.starts_with("oauth-2025-04-20,"));
 }
 
+/// The pure header distillation behind a kick 429: `rejected` keys on
+/// `unified-status`, and the ceiling is the LATER of `unified-reset` and
+/// `retry-after`, with an already-past reset dropped. The ceiling is an upper
+/// bound the scheduler decays toward, never a schedule (2026-07-15: the
+/// limiter relented 2.4h before its own advertised reset).
+#[test]
+fn kick_rate_limit_distills_status_reset_and_retry_after() {
+    let now = 1_784_000_000;
+
+    let both = kick_rate_limit_at(
+        Some("rejected"),
+        Some(&(now + 9_000).to_string()),
+        Some("120"),
+        now,
+    );
+    assert!(both.rejected);
+    assert_eq!(
+        both.until_epoch_secs,
+        Some(now + 9_000),
+        "reset later than retry-after → reset wins"
+    );
+
+    let after_wins = kick_rate_limit_at(None, Some(&(now + 60).to_string()), Some("300"), now);
+    assert!(!after_wins.rejected);
+    assert_eq!(
+        after_wins.until_epoch_secs,
+        Some(now + 300),
+        "retry-after later than reset → retry-after wins"
+    );
+
+    let past_reset = kick_rate_limit_at(Some("allowed"), Some(&(now - 5).to_string()), None, now);
+    assert!(!past_reset.rejected, "non-rejected status stays false");
+    assert_eq!(
+        past_reset.until_epoch_secs, None,
+        "an already-past reset is no ceiling"
+    );
+
+    let bare = kick_rate_limit_at(None, None, None, now);
+    assert!(!bare.rejected);
+    assert_eq!(bare.until_epoch_secs, None);
+}
+
+/// A live kick 429 carries the limiter's own headers out through `KickError`,
+/// and `auto_start_kick` (no refresh token → no rotation attempt) surfaces them
+/// as `KickResult.blocked` instead of swallowing the outage like it did through
+/// the 2026-07-15 incident.
+#[test]
+fn kick_429_surfaces_limiter_metadata() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let reset = crate::usage::now_epoch_secs() + 100_000;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 512];
+        while let Ok(n) = sock.read(&mut tmp) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\n\
+             retry-after: 120\r\n\
+             anthropic-ratelimit-unified-status: rejected\r\n\
+             anthropic-ratelimit-unified-reset: {reset}\r\n\
+             content-length: 0\r\n\r\n"
+        );
+        let _ = sock.write_all(response.as_bytes());
+    });
+
+    crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
+    let url = format!("http://127.0.0.1:{port}/v1/messages?beta=true");
+    let err = kick_to(&url, "TESTTOKEN").expect_err("429 must error");
+    server.join().unwrap();
+
+    let KickError::Status(429, Some(rl)) = err else {
+        panic!(
+            "expected a 429 with limiter metadata, got {:?}",
+            anyhow::Error::from(err)
+        );
+    };
+    assert!(
+        rl.rejected,
+        "unified-status: rejected must survive the parse"
+    );
+    assert_eq!(
+        rl.until_epoch_secs,
+        Some(reset),
+        "unified-reset (later than retry-after) is the ceiling"
+    );
+}
+
 // ── ureq's non-2xx default on the token/kick agent ───────────────────────────
 
 /// The sibling of `non_2xx_arrives_as_ok_so_the_status_branches_stay_reachable`

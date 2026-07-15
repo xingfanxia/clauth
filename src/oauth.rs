@@ -328,8 +328,9 @@ pub(crate) fn exchange_code(
 /// HTTP status), which is terminal for this attempt. Mirrors `FetchError::Status`
 /// so the auto-start rotation leg reacts to the same signal the fetch path does.
 enum KickError {
-    /// The Messages endpoint returned this >=400 status.
-    Status(u16),
+    /// The Messages endpoint returned this >=400 status; a 429 carries the
+    /// limiter's own metadata when the response held any.
+    Status(u16, Option<KickRateLimit>),
     /// Body encode or transport failure before a status was seen.
     Other(anyhow::Error),
 }
@@ -337,9 +338,44 @@ enum KickError {
 impl From<KickError> for anyhow::Error {
     fn from(e: KickError) -> Self {
         match e {
-            KickError::Status(s) => anyhow::anyhow!("HTTP {s}"),
+            KickError::Status(s, _) => anyhow::anyhow!("HTTP {s}"),
             KickError::Other(e) => e,
         }
+    }
+}
+
+/// What the messages limiter said alongside a kick 429. `until_epoch_secs` is
+/// the advertised retry ceiling — the later of
+/// `anthropic-ratelimit-unified-reset` and `retry-after` — and is an UPPER
+/// BOUND only: the limiter has been observed relenting 2.4h before its own
+/// advertised reset (2026-07-15, `docs/wire-parity.md`), so callers retry with
+/// decay toward it, never sleep until it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KickRateLimit {
+    /// `anthropic-ratelimit-unified-status: rejected` — the account-level hard
+    /// rejection, as opposed to a plain burst throttle.
+    pub(crate) rejected: bool,
+    pub(crate) until_epoch_secs: Option<i64>,
+}
+
+/// Distill a kick 429's rate-limit headers. Pure so the parse is testable
+/// without HTTP; `now_secs` anchors the relative `retry-after` form and drops
+/// an already-past advertised reset.
+fn kick_rate_limit_at(
+    unified_status: Option<&str>,
+    unified_reset: Option<&str>,
+    retry_after: Option<&str>,
+    now_secs: i64,
+) -> KickRateLimit {
+    let reset = unified_reset
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&t| t > now_secs);
+    let after = retry_after
+        .and_then(|v| crate::usage::parse_retry_after_at(v, now_secs))
+        .map(|d| now_secs.saturating_add(i64::try_from(d.as_secs()).unwrap_or(i64::MAX)));
+    KickRateLimit {
+        rejected: unified_status.is_some_and(|s| s.eq_ignore_ascii_case("rejected")),
+        until_epoch_secs: reset.max(after),
     }
 }
 
@@ -369,7 +405,7 @@ fn kick_to(url: &str, access_token: &str) -> std::result::Result<(), KickError> 
     }))
     .map_err(|e| KickError::Other(e.into()))?;
 
-    let status = AGENT
+    let response = AGENT
         .post(url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
@@ -386,11 +422,19 @@ fn kick_to(url: &str, access_token: &str) -> std::result::Result<(), KickError> 
             KICK_STAINLESS_PACKAGE_VERSION,
         )
         .send(&body)
-        .map_err(|e| KickError::Other(anyhow::Error::from(e)))?
-        .status()
-        .as_u16();
+        .map_err(|e| KickError::Other(anyhow::Error::from(e)))?;
+    let status = response.status().as_u16();
     if status >= 400 {
-        return Err(KickError::Status(status));
+        let rate_limit = (status == 429).then(|| {
+            let header = |k: &str| response.headers().get(k).and_then(|v| v.to_str().ok());
+            kick_rate_limit_at(
+                header("anthropic-ratelimit-unified-status"),
+                header("anthropic-ratelimit-unified-reset"),
+                header("retry-after"),
+                crate::usage::now_epoch_secs(),
+            )
+        });
+        return Err(KickError::Status(status, rate_limit));
     }
     Ok(())
 }
@@ -405,13 +449,22 @@ fn kick_to(url: &str, access_token: &str) -> std::result::Result<(), KickError> 
 pub(crate) struct KickResult {
     pub(crate) opened: bool,
     pub(crate) rotated: Option<(String, Option<String>)>,
+    /// The limiter's metadata when the deciding failure was a 429 (first kick
+    /// or the post-rotation retry) — what the scheduler's block state and the
+    /// TUI pill are built from.
+    pub(crate) blocked: Option<KickRateLimit>,
 }
 
 impl KickResult {
     fn not_opened() -> Self {
+        Self::not_opened_with(None)
+    }
+
+    fn not_opened_with(blocked: Option<KickRateLimit>) -> Self {
         Self {
             opened: false,
             rotated: None,
+            blocked,
         }
     }
 }
@@ -444,33 +497,38 @@ pub(crate) fn auto_start_kick(
     access_expires_at: Option<i64>,
     activity: Option<&ActivityStore>,
 ) -> KickResult {
-    match kick(access_token) {
+    let first_rl = match kick(access_token) {
         Ok(()) => {
             return KickResult {
                 opened: true,
                 rotated: None,
+                blocked: None,
             };
         }
-        Err(KickError::Status(401)) => {}
+        Err(KickError::Status(401, _)) => None,
         // Rate limit (429): rotate only if the access token is also clock-expired;
         // a still-valid token can't be unstuck by a refresh, so refuse to spend it.
-        Err(KickError::Status(429))
-            if access_expires_at.is_some_and(|exp| now_ms() as i64 >= exp) => {}
+        Err(KickError::Status(429, rl))
+            if access_expires_at.is_some_and(|exp| now_ms() as i64 >= exp) =>
+        {
+            rl
+        }
+        Err(KickError::Status(429, rl)) => return KickResult::not_opened_with(rl),
         Err(_) => return KickResult::not_opened(),
-    }
+    };
 
     let Some(rt) = refresh_token else {
-        return KickResult::not_opened();
+        return KickResult::not_opened_with(first_rl);
     };
     // Pace the recovery before any lock is taken.
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
     // RotationGuard outermost across the HTTP window — acquired with no other
     // lock held (the caller released the usage store before kicking).
     let Ok(rotation_guard) = RotationGuard::acquire(name) else {
-        return KickResult::not_opened();
+        return KickResult::not_opened_with(first_rl);
     };
     if has_live_session(name) {
-        return KickResult::not_opened();
+        return KickResult::not_opened_with(first_rl);
     }
 
     // Refresh spinner during the round trip, then back to Fetching for the retry
@@ -484,7 +542,7 @@ pub(crate) fn auto_start_kick(
     }
     let tok = match refreshed {
         Ok(t) => t,
-        Err(_) => return KickResult::not_opened(),
+        Err(_) => return KickResult::not_opened_with(first_rl),
     };
 
     let access = tok.access_token.clone();
@@ -499,6 +557,7 @@ pub(crate) fn auto_start_kick(
         return KickResult {
             opened: false,
             rotated,
+            blocked: first_rl,
         };
     }
     // Retry kick spends only the access token, so release the rotation lock
@@ -507,9 +566,17 @@ pub(crate) fn auto_start_kick(
 
     // Pace rotate → retry kick, then retry kick → the caller's usage re-fetch.
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
-    let opened = kick(&access).is_ok();
+    let (opened, retry_rl) = match kick(&access) {
+        Ok(()) => (true, None),
+        Err(KickError::Status(429, rl)) => (false, rl),
+        Err(_) => (false, None),
+    };
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
-    KickResult { opened, rotated }
+    KickResult {
+        opened,
+        rotated,
+        blocked: if opened { None } else { retry_rl.or(first_rl) },
+    }
 }
 
 /// Result of [`rotate_one_inner`]. Distinguishes the rotation-lock acquire
@@ -802,15 +869,28 @@ pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &str) ->
         }
     };
 
-    auto_start_kick(
+    let kicked = auto_start_kick(
         config,
         name,
         &access_token,
         refresh_token.as_deref(),
         expires_at,
         None,
-    )
-    .opened
+    );
+    if let Some(rl) = kicked.blocked {
+        let ceiling = rl
+            .until_epoch_secs
+            .map(|u| {
+                let left = u.saturating_sub(crate::usage::now_epoch_secs());
+                format!(", api ceiling in {}", crate::usage::humanize_duration(left))
+            })
+            .unwrap_or_default();
+        logline!(
+            "{name}: 5h window kick rate-limited (rejected: {}){ceiling}",
+            rl.rejected
+        );
+    }
+    kicked.opened
 }
 
 /// Write rotated token fields into an OAuth block. Caller holds the state lock.

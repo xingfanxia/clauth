@@ -12,17 +12,17 @@ pub(crate) use fetch::{
     PlanTier, ScopedWindow, SpendInfo, UsageInfo, UsageWindow, WindowDollars, await_request_slot,
     cli_user_agent, epoch_secs_to_iso, expire_profile_ttl, fetch_account_uuid, five_hour_live,
     http_agent, humanize_duration, ideal_pace_pct, iso_to_epoch_secs, now_epoch_secs, now_ms,
-    parse_retry_after, probe_login_profile, seed_login_anchor, seven_day_live,
-    spent_resume_in_secs, window_avg_pace_per_day, windows_maxed,
+    parse_retry_after, parse_retry_after_at, probe_login_profile, seed_login_anchor,
+    seven_day_live, spent_resume_in_secs, window_avg_pace_per_day, windows_maxed,
 };
 pub(crate) use scheduler::{
-    ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
-    OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks, ProfileActivity, RefetchQueue,
-    StartupReceiver, StartupSender, StartupSignal, StatusStore, StreakCounts,
-    SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
-    UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
-    collect_third_party_entries, collect_tokens, is_idle, is_stuck_rate_limited, is_stuck_streak,
-    mark_activity, spawn_refresher, switch_gate_in_flight,
+    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, OpResult,
+    OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
+    ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
+    StreakCounts, SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore,
+    ThirdPartyUsageStore, TokenList, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
+    clear_activity, collect_third_party_entries, collect_tokens, is_idle, is_stuck_rate_limited,
+    is_stuck_streak, mark_activity, spawn_refresher, switch_gate_in_flight,
 };
 // The active-cap boundary is only referenced by tests (production code reaches it
 // through `is_stuck_rate_limited`); gate the re-export behind `cfg(test)` so it
