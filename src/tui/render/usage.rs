@@ -20,7 +20,7 @@ use crate::format::plan_label;
 use crate::profile::Profile;
 use crate::providers::StatRowKind;
 use crate::usage::{
-    ExtraPeriod, FetchStatus, ProfileActivity, StreakCounts, UsageWindow, WindowDollars,
+    ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, StreakCounts, UsageWindow, WindowDollars,
     ideal_pace_pct, is_stuck_streak, now_epoch_secs, now_ms,
 };
 
@@ -38,6 +38,10 @@ struct HeaderState {
     /// The retry suffix names which retry the countdown leads to, so a deep slot
     /// reads as stuck from the count alone, no judgment label.
     streaks: StreakCounts,
+    /// Live kick-429 block for the shown profile: the messages endpoint is
+    /// rejecting the 5h auto-start kick. Orthogonal to `fetch_status` — `/usage`
+    /// can stay Fresh straight through the outage — so it earns its own pill.
+    kick_block: Option<KickBlock>,
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -58,6 +62,12 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // (400), so it can't be taken while `cfg` is held below.
     let streaks: HashMap<String, StreakCounts> = app
         .poll_streaks
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    // Same discipline as streaks: KickBlockState (230) ranks below CONFIG (400).
+    let kick_blocks: HashMap<String, KickBlock> = app
+        .kick_blocks
         .lock()
         .map(|m| m.clone())
         .unwrap_or_default();
@@ -106,6 +116,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .get(profile.name.as_str())
             .copied()
             .unwrap_or_default(),
+        kick_block: kick_blocks.get(profile.name.as_str()).copied(),
     };
 
     let show_estimates = cfg.state.show_estimates;
@@ -793,6 +804,25 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
                 }
             }
         },
+    }
+    // Kick-429 block pill, additive to whatever the fetch status said: `/usage`
+    // can stay Fresh straight through a messages-limiter outage, so without
+    // this the row looks healthy while the 5h window silently never opens.
+    // Same amber→red escalation as the other streak pills; the suffix names the
+    // limiter's advertised ceiling, an upper bound (it has relented early).
+    if let Some(block) = header.kick_block {
+        spans.extend([
+            Span::styled("[ ", theme::dim()),
+            Span::styled("window blocked", streak_style(block.streak)),
+            Span::styled(" ]", theme::dim()),
+        ]);
+        if let Some(until) = block.until {
+            let left = until.saturating_sub(now_epoch_secs());
+            spans.push(Span::styled(
+                format!("  lifts within {}", crate::usage::humanize_duration(left)),
+                theme::faint(),
+            ));
+        }
     }
     Line::from(spans)
 }

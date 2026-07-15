@@ -208,6 +208,64 @@ fn empty_msg_pending_fetch_loads() {
     assert_eq!(oauth_empty_msg(&profile), "loading");
 }
 
+/// A kick-429 block pins its own `[ window blocked ]` pill on the row, even
+/// while the fetch status reads Fresh — `/usage` stayed 200 through the whole
+/// 2026-07-15 messages-limiter outage, so no fetch-status pill can carry this.
+/// The suffix names the limiter's advertised ceiling when one was given.
+#[test]
+fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
+    use crate::usage::KickBlock;
+
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Fresh);
+    let header = |kick_block: Option<KickBlock>| HeaderState {
+        is_active: false,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block,
+    };
+    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+
+    let clean = text(status_line(&profile, &header(None)));
+    assert!(
+        !clean.contains("window blocked"),
+        "no block → no pill, got {clean:?}"
+    );
+
+    let now = now_epoch_secs();
+    let blocked = text(status_line(
+        &profile,
+        &header(Some(KickBlock {
+            streak: 2,
+            rejected: true,
+            until: Some(now + 3 * 60 * 60),
+            next_retry: now + 30,
+        })),
+    ));
+    assert!(blocked.contains("window blocked"), "got {blocked:?}");
+    assert!(
+        blocked.contains("lifts within"),
+        "an advertised ceiling names itself, got {blocked:?}"
+    );
+
+    let no_ceiling = text(status_line(
+        &profile,
+        &header(Some(KickBlock {
+            streak: 1,
+            rejected: false,
+            until: None,
+            next_retry: now + 10,
+        })),
+    ));
+    assert!(no_ceiling.contains("window blocked"));
+    assert!(
+        !no_ceiling.contains("lifts within"),
+        "no ceiling → no made-up deadline, got {no_ceiling:?}"
+    );
+}
+
 /// The `[ rate limited ]` suffix names which retry the countdown leads to
 /// (`HeaderState.streak`) so a deep slot reads as stuck from the count alone;
 /// a zero streak keeps the bare `retry in` suffix.
@@ -224,6 +282,7 @@ fn rate_limited_suffix_counts_the_retry() {
             rate_limit: streak,
             refresh_fail: 0,
         },
+        kick_block: None,
     };
     let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
 
@@ -254,6 +313,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
             rate_limit: 0,
             refresh_fail,
         },
+        kick_block: None,
     };
     let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
 
@@ -298,6 +358,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
         streaks,
+        kick_block: None,
     };
 
     for (status, axis) in [
@@ -349,6 +410,7 @@ fn spent_skipped_account_names_its_reset() {
         next_refresh_ms: None,
         tick: 0,
         streaks: StreakCounts::default(),
+        kick_block: None,
     };
     let with_window = |util: f64| {
         let mut p = crate::testutil::blank_profile("a");

@@ -16,8 +16,8 @@ pub(crate) use fetch::{
     seven_day_live, spent_resume_in_secs, window_avg_pace_per_day, windows_maxed,
 };
 pub(crate) use scheduler::{
-    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, OpResult,
-    OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
+    ActivityStore, FetchStatus, KickBlock, KickBlocks, LastFetchedAt, NextRefreshPerProfile,
+    OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
     ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     StreakCounts, SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore,
     ThirdPartyUsageStore, TokenList, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
