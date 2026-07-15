@@ -343,6 +343,238 @@ fn oauth_credentials() -> ClaudeCredentials {
     }
 }
 
+/// Out-of-band per-profile thresholds are CLAMPED to the band at load, while the
+/// app-level weekly line RESETS TO DEFAULT (pinned separately by
+/// `weekly_switch_threshold_out_of_band_resets_to_default_at_load`). Two
+/// deliberately different normalizations, one line apart in `docs/internals.md`
+/// and one line apart in the source — exactly the shape a well-meaning "unify
+/// the threshold handling" refactor collapses into one rule, silently moving
+/// every hand-edited config to the wrong value. A garbage `fallback_threshold`
+/// left raw would also drive the auto-switch walk off a nonsense line, so the
+/// clamp is load-bearing rather than cosmetic. Both fields, both directions.
+#[cfg(unix)]
+#[test]
+fn out_of_band_per_profile_thresholds_clamp_to_the_band_at_load() {
+    let _home = HomeSandbox::new();
+    let name = "clamp-test";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+
+    // Hand-edit the per-profile config the way a user would.
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    std::fs::write(
+        &config_path,
+        "fallback_threshold = 250.0\nbell_threshold = -30.0\n",
+    )
+    .expect("write config.toml");
+
+    let loaded = load_profile(name).expect("load_profile");
+    assert_eq!(
+        loaded.fallback_threshold,
+        Some(100.0),
+        "an over-band fallback_threshold clamps to the top of the band, it does not \
+         reset to default and is never left raw",
+    );
+    assert_eq!(
+        loaded.bell_threshold,
+        Some(0.0),
+        "an under-band bell_threshold clamps to the bottom of the band",
+    );
+
+    // In-band values are untouched — the clamp must not round or default them.
+    std::fs::write(
+        &config_path,
+        "fallback_threshold = 73.5\nbell_threshold = 12.0\n",
+    )
+    .expect("rewrite config.toml");
+    let loaded = load_profile(name).expect("load_profile");
+    assert_eq!(loaded.fallback_threshold, Some(73.5));
+    assert_eq!(loaded.bell_threshold, Some(12.0));
+}
+
+// ── crash-durable rotation: the pending sidecar's adopt/discard decision ─────
+//
+// `stage_rotated_credentials` writes a rotated pair to `credentials.json.pending`
+// BEFORE `save_profile`, so a crash between the OAuth response and the commit
+// can't lose a single-use refresh token (`docs/internals.md`, crash-durable
+// rotation). That guarantee reduces to ONE mtime compare in
+// `recover_pending_credentials`, and until now only the sidecar's file *mode* was
+// tested — never the decision. Both ways of getting it wrong are silent and
+// unrecoverable: adopt too eagerly and a clean commit is overwritten by the pair
+// it already superseded (a spent token reinstalled, next refresh 400s), discard
+// too eagerly and a genuinely orphaned rotation is dropped (that pair is gone
+// and the account needs a manual re-login). Each arm below is one of those.
+
+#[cfg(unix)]
+fn pair(access: &str, refresh: &str) -> ClaudeCredentials {
+    ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn refresh_token_of(creds: &Option<ClaudeCredentials>) -> Option<&str> {
+    creds
+        .as_ref()?
+        .claude_ai_oauth
+        .as_ref()?
+        .refresh_token
+        .as_deref()
+}
+
+#[cfg(unix)]
+fn seed_committed(name: &str, creds: &ClaudeCredentials) {
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.credentials = Some(creds.clone());
+    save_profile(&profile).expect("save_profile");
+}
+
+/// Sidecar NEWER than `credentials.json`: the rotation was staged but the commit
+/// never landed, so the staged pair is the only live one — adopt it, write it
+/// through to `credentials.json`, and consume the sidecar.
+#[cfg(unix)]
+#[test]
+fn pending_sidecar_newer_than_the_commit_is_adopted_and_written_through() {
+    let _home = HomeSandbox::new();
+    let name = "pending-adopt-newer";
+    let committed = pair("old-access", "old-refresh");
+    seed_committed(name, &committed);
+
+    let staged = pair("new-access", "new-refresh");
+    stage_rotated_credentials(name, &staged).expect("stage_rotated_credentials");
+
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(&cred_path, now - std::time::Duration::from_secs(60));
+    crate::testutil::set_mtime(&pending_path, now);
+
+    let got = recover_pending_credentials(name, Some(committed.clone()));
+    assert_eq!(
+        refresh_token_of(&got),
+        Some("new-refresh"),
+        "a rotation staged after the last commit is the live pair and must be adopted",
+    );
+
+    // Written through, so the next load sees it even without the sidecar.
+    let on_disk: ClaudeCredentials = read_json_file(&cred_path).expect("re-read credentials.json");
+    assert_eq!(
+        on_disk
+            .claude_ai_oauth
+            .and_then(|o| o.refresh_token)
+            .as_deref(),
+        Some("new-refresh"),
+        "the adopted pair must be committed to credentials.json, not just returned",
+    );
+    assert!(
+        !pending_path.exists(),
+        "the sidecar must be consumed so the next load can't adopt it a second time",
+    );
+}
+
+/// Sidecar OLDER than `credentials.json`: the commit landed cleanly and the
+/// sidecar is its already-superseded predecessor. Adopting it would reinstall a
+/// spent refresh token, so it must be discarded — and still cleaned up.
+#[cfg(unix)]
+#[test]
+fn pending_sidecar_older_than_the_commit_is_discarded_not_reinstalled() {
+    let _home = HomeSandbox::new();
+    let name = "pending-discard-older";
+    let committed = pair("live-access", "live-refresh");
+    seed_committed(name, &committed);
+
+    let superseded = pair("spent-access", "spent-refresh");
+    stage_rotated_credentials(name, &superseded).expect("stage_rotated_credentials");
+
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(&pending_path, now - std::time::Duration::from_secs(60));
+    crate::testutil::set_mtime(&cred_path, now);
+
+    let got = recover_pending_credentials(name, Some(committed.clone()));
+    assert_eq!(
+        refresh_token_of(&got),
+        Some("live-refresh"),
+        "a commit newer than the sidecar already won; reinstalling the sidecar would \
+         resurrect a spent refresh token",
+    );
+
+    let on_disk: ClaudeCredentials = read_json_file(&cred_path).expect("re-read credentials.json");
+    assert_eq!(
+        on_disk
+            .claude_ai_oauth
+            .and_then(|o| o.refresh_token)
+            .as_deref(),
+        Some("live-refresh"),
+        "a discarded sidecar must not touch credentials.json",
+    );
+    assert!(
+        !pending_path.exists(),
+        "even a discarded sidecar is cleaned up, or it is re-evaluated on every load",
+    );
+}
+
+/// The boundary is `>=`, not `>`: equal mtimes adopt. Staging and committing
+/// within one filesystem timestamp tick is the common case on a coarse-grained
+/// mtime, and treating that as "the commit won" would drop a rotation that may
+/// never have landed.
+#[cfg(unix)]
+#[test]
+fn pending_sidecar_with_an_equal_mtime_is_adopted() {
+    let _home = HomeSandbox::new();
+    let name = "pending-adopt-equal";
+    let committed = pair("old-access", "old-refresh");
+    seed_committed(name, &committed);
+
+    let staged = pair("tie-access", "tie-refresh");
+    stage_rotated_credentials(name, &staged).expect("stage_rotated_credentials");
+
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let same = std::time::SystemTime::now();
+    crate::testutil::set_mtime(&cred_path, same);
+    crate::testutil::set_mtime(&pending_path, same);
+
+    assert_eq!(
+        refresh_token_of(&recover_pending_credentials(name, Some(committed))),
+        Some("tie-refresh"),
+        "an equal mtime must adopt: the compare is `pending >= committed`",
+    );
+}
+
+/// No `credentials.json` at all (the crash landed between staging and the first
+/// commit): there is nothing to compare against and the sidecar is the only pair
+/// in existence — adopt unconditionally rather than treating the missing file as
+/// a reason to discard.
+#[cfg(unix)]
+#[test]
+fn pending_sidecar_is_adopted_when_no_commit_exists_at_all() {
+    let _home = HomeSandbox::new();
+    let name = "pending-adopt-absent";
+    // Seed the profile dir without credentials so only the sidecar exists.
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+
+    let staged = pair("only-access", "only-refresh");
+    stage_rotated_credentials(name, &staged).expect("stage_rotated_credentials");
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    assert!(
+        !cred_path.exists(),
+        "precondition: no committed credentials"
+    );
+
+    assert_eq!(
+        refresh_token_of(&recover_pending_credentials(name, None)),
+        Some("only-refresh"),
+        "with no commit to compare against, the staged pair is the only live one",
+    );
+}
+
 /// `scopes_joined` feeds the refresh `scope` field (Claude Code echoes its
 /// credential's granted scopes on refresh). Order must survive and an empty set
 /// must read as `None` so the refresh path falls back instead of sending `""`.
@@ -438,6 +670,22 @@ fn credential_and_cache_files_have_restricted_permissions() {
         0o600,
         "credentials.json.pending mode should be 0o600, got {:#o}",
         pending_mode & 0o777,
+    );
+
+    // profiles.toml goes through the same `atomic_write_600` and names every
+    // account plus the active one; it was the one state file this test never
+    // covered, so a writer swapped back to a plain `fs::write` would land it at
+    // the process umask (world-readable on a default 022) with nothing failing.
+    save_app_state(&AppState::default()).expect("save_app_state");
+    let state_mode = std::fs::metadata(app_state_path().expect("app_state_path"))
+        .expect("profiles.toml metadata")
+        .permissions()
+        .mode();
+    assert_eq!(
+        state_mode & 0o777,
+        0o600,
+        "profiles.toml mode should be 0o600, got {:#o}",
+        state_mode & 0o777,
     );
 }
 

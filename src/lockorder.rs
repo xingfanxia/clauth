@@ -235,3 +235,7 @@ impl<T> DerefMut for RankedGuard<'_, T> {
         &mut self.guard
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/lockorder.rs"]
+mod tests;
