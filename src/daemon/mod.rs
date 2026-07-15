@@ -18,8 +18,9 @@ mod status_json;
 mod tick;
 mod types;
 
-/// The TUI's per-tick "is a daemon alive?" probe (dual-scheduler dedup, #27).
-pub(crate) use probe::daemon_is_live;
+/// The single-fetcher lease + the header dot's daemon presence/health probe
+/// (dual-scheduler dedup, #27).
+pub(crate) use probe::{DaemonHealth, FetchLease, daemon_health};
 /// Small daemon state types + the backoff schedule, re-exported so callers keep
 /// referencing them as `super::…` after the extraction.
 pub(crate) use types::{SwitchBackoff, switch_backoff_ms};
@@ -58,14 +59,26 @@ const TICK: Duration = Duration::from_secs(1);
 const LOG_ROTATE_EVERY_TICKS: u64 = 300;
 const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "clauthd.lock";
+/// The single-fetcher lease file (#27). A peer of [`LOCK_FILE`] in `~/.clauth`,
+/// held for life by whichever instance (daemon or a TUI) is the current usage
+/// fetcher. See [`FetchLease`](probe::FetchLease).
+const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 
 /// Anti-wedge watchdog: abort if no tick completes within this window.
-/// `TICK` is 1s, so ~60 missed ticks. The blocking `StateLock` has no deadline
+/// `TICK` is 1s, so ~30 missed ticks. The blocking `StateLock` has no deadline
 /// and a switch runs a `/usr/bin/security` subprocess inside it, so a stuck
 /// keychain or a wedged flock holder can freeze the single-threaded run loop;
 /// `std::process::abort()` then lets launchd's `KeepAlive{SuccessfulExit=false}`
 /// restart the daemon (boot()'s relink + atomic writes make restart safe).
-const WATCHDOG_DEADLINE: Duration = Duration::from_secs(60);
+///
+/// Tightened 60s→30s for the single-fetcher lease (#27): a wedged-alive daemon
+/// keeps holding `usage-fetch.lock`, so no other instance can fetch until it
+/// dies — 30s frees the lease about as fast as the retired TUI freshness re-arm
+/// did. TENSION: a legit switch's keychain shell-out can block up to its own 20s
+/// kill deadline inside the `StateLock`, leaving only ~10s of slack. If that ever
+/// false-aborts, bound the keychain shell-out (the real fix), do NOT loosen this
+/// deadline — the lease's wedged-daemon recovery depends on it.
+const WATCHDOG_DEADLINE: Duration = Duration::from_secs(30);
 /// How often the watchdog re-checks the tick heartbeat.
 const WATCHDOG_POLL: Duration = Duration::from_secs(10);
 
@@ -324,10 +337,14 @@ impl Daemon {
             Arc::clone(&self.third_party_status),
             suppressed,
             Arc::clone(&self.shutting_down),
-            // NEVER probe from the daemon: its own held singleton flock would
-            // read as "another daemon is live" and stand its own refresher
-            // down permanently (the stand-down is TUI-side only).
-            false,
+            // Single-fetcher lease (#27): the daemon competes for `usage-fetch.lock`
+            // like any instance. It normally boots first (launchd) and wins the
+            // lease for life, but if a TUI is already fetching, the daemon stands
+            // its refresher down and hydrates instead — the main loop still writes
+            // `status.json` every tick regardless of who fetches. A fresh lease per
+            // scheduler; the tick thread's clone keeps the flock held for the
+            // process lifetime.
+            Arc::new(FetchLease::new()),
         );
     }
 

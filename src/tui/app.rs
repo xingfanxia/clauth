@@ -1277,6 +1277,15 @@ pub(crate) struct App {
     /// Manual-refresh signal to the status thread; a `()` triggers a refetch.
     pub(crate) status_refresh: std::sync::mpsc::Sender<()>,
 
+    /// `● daemon` header-dot state: daemon presence + `status.json` health,
+    /// re-probed on a throttled cadence in `on_tick`. UI-thread-only.
+    pub(crate) daemon_health: crate::daemon::DaemonHealth,
+    /// Throttle for the `daemon_health` flock probe.
+    pub(crate) last_daemon_probe: Instant,
+    /// Single-fetcher lease (#27), shared with the scheduler tick. The bootstrap
+    /// switch one-shot runs only if THIS instance holds it.
+    pub(crate) fetch_lease: Arc<crate::daemon::FetchLease>,
+
     /// Plugin tab state; UI-thread-only, recomputed on focus + `r` (no thread).
     pub(crate) plugin: PluginState,
 
@@ -1389,6 +1398,7 @@ struct WorkerHandles {
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
     shutting_down: Arc<AtomicBool>,
+    fetch_lease: Arc<crate::daemon::FetchLease>,
 }
 
 impl WorkerHandles {
@@ -1410,6 +1420,7 @@ impl WorkerHandles {
             third_party_usage_store: Arc::clone(&app.third_party_usage_store),
             third_party_status: Arc::clone(&app.third_party_status),
             shutting_down: Arc::clone(&app.shutting_down),
+            fetch_lease: Arc::clone(&app.fetch_lease),
         }
     }
 }
@@ -1558,6 +1569,9 @@ impl App {
             status: StatusState::default(),
             status_events,
             status_refresh,
+            daemon_health: crate::daemon::DaemonHealth::Absent,
+            last_daemon_probe: Instant::now(),
+            fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
             plugin: PluginState::default(),
             token_stats: None,
             tokens_failed: false,
@@ -1726,10 +1740,13 @@ impl App {
         self.refresh_tokens();
         self.start_scheduler();
         self.apply_usage();
-        // Dual-scheduler dedup (#27): with a live daemon running, the switch decision is the daemon's
-        // alone — a startup one-shot here would race a decision it has already
-        // made (or declined) from the very same cache (switch thrash, #27).
-        if crate::daemon::daemon_is_live() {
+        // Single-fetcher lease (#27): the startup switch one-shot is a switch
+        // DECISION, so it may run only if THIS instance is the fetcher. Acquire
+        // the shared lease now — the scheduler's first tick sleeps a cadence
+        // before its own acquire, so the UI thread wins it here when it's free;
+        // if another instance holds it, that instance owns every switch decision
+        // and a one-shot here would race it (the #27 thrash).
+        if !self.fetch_lease.acquire() {
             return;
         }
         let switched = {
@@ -1798,9 +1815,11 @@ impl App {
             h.third_party_status,
             suppressed_generic,
             h.shutting_down,
-            // Dual-scheduler dedup (#27): the TUI stands its refresher down while a live daemon runs
-            // (probed per tick), re-arming the moment the daemon dies.
-            true,
+            // Single-fetcher lease (#27): the TUI competes for `usage-fetch.lock`
+            // like any instance, standing its refresher down while another holds
+            // it. Shared with `finish_bootstrap` so its startup switch one-shot
+            // only runs when this TUI is the fetcher.
+            h.fetch_lease,
         );
     }
 
@@ -6580,9 +6599,22 @@ pub(crate) fn on_tick(app: &mut App) {
 
     poll_credentials_divergence(app);
     poll_plugin_refresh(app);
+    poll_daemon_health(app);
 
     update_banner(app);
     app.prune_toasts();
+}
+
+/// Re-probe the daemon presence + `status.json` health for the `● daemon`
+/// header dot, at most once a second (a flock try-lock + `status.json` read is
+/// cheap but not free, and the dot changes on a human timescale).
+fn poll_daemon_health(app: &mut App) {
+    const DAEMON_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+    if app.last_daemon_probe.elapsed() < DAEMON_PROBE_INTERVAL {
+        return;
+    }
+    app.last_daemon_probe = Instant::now();
+    app.daemon_health = crate::daemon::daemon_health();
 }
 
 /// Plugin tab live refresh: re-run the cheap local checks (session counts + link

@@ -2127,7 +2127,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
-        standdown_probe: true,
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
     };
 
@@ -2204,7 +2204,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
-        standdown_probe: true,
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
     };
 
@@ -2224,6 +2224,76 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         matches!(a.get("kitty"), Some(ProfileActivity::Refreshing)),
         "an in-flight worker's mark survives (it clears itself on landing)"
     );
+}
+
+/// Single-fetcher lease (#27): when another instance already holds
+/// `usage-fetch.lock`, `tick` must take the stand-down path — hydrate + sweep,
+/// never fetch. Driven through the real `tick` (not `standdown_tick`) so the
+/// lease branch itself is pinned: an external holder forces
+/// `fetch_lease.acquire()` to return `false`, so a bootstrap `Queued` mark is
+/// swept (the stand-down effect) instead of being driven into an HTTP fetch.
+#[test]
+fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::UsageInfo;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // Another instance wins the lease first; its `File` must stay alive so the
+    // flock stays held for the rest of the test.
+    let other = crate::daemon::FetchLease::new();
+    assert!(other.acquire(), "the first instance wins the lease");
+
+    write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    }));
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![token("kitty")])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        // A DIFFERENT lease over the same file → its acquire() is denied while
+        // `other` holds the flock.
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+    };
+
+    // A bootstrap-only `Queued` mark: only the stand-down sweep clears it (a
+    // fetch tick would instead flip it to Fetching), so its removal proves the
+    // stand-down path ran rather than the fetch path.
+    mark_activity(&state.activity, "kitty", ProfileActivity::Queued);
+
+    super::tick(&state);
+
+    assert!(
+        state.activity.lock().unwrap().get("kitty").is_none(),
+        "stood down: the Queued mark is swept, never driven into a fetch"
+    );
+    assert!(
+        state.store.lock().unwrap().contains_key("kitty"),
+        "stood down: the store is hydrated from the shared cache"
+    );
+    assert!(
+        state.standdown_active.load(Ordering::Relaxed),
+        "the stand-down edge is recorded"
+    );
+    drop(other);
 }
 
 // ── active-profile 429 ladder cap ────────────────────────────────────────────
@@ -2432,7 +2502,7 @@ fn completion_order_state() -> super::SchedulerState {
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
-        standdown_probe: false,
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
     }
 }

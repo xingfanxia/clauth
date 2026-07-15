@@ -79,8 +79,11 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "drain_pending_switch_executes",
             "drain_pending_switch_skips",
             "reload_if_changed_fires",
-            // dual-scheduler dedup: the TUI stands down while a daemon runs
+            // single-fetcher lease (#27): exactly one instance fetches; every
+            // other one stands down and hydrates from the shared cache.
             "standdown_",
+            "one_holder_at_a_time",
+            "tick_stands_down_when_another",
             "held_lock_with_fresh_status",
         ],
     ),

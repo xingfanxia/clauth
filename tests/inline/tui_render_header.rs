@@ -274,3 +274,40 @@ fn row2_is_tabs_only() {
         "gauge not on row 2 (it's on row 1)"
     );
 }
+
+// ── `● daemon` header dot (presence + health → color/hidden) ──────────────────
+
+#[test]
+fn daemon_dot_maps_health_to_color_and_hides_when_absent() {
+    use crate::daemon::DaemonHealth;
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+
+    // Absent → no dot, and row 0 omits the label entirely.
+    app.daemon_health = DaemonHealth::Absent;
+    assert!(super::daemon_dot_color(&app).is_none(), "absent → hidden");
+    assert!(
+        !row_content(&app, 100, 0).contains("daemon"),
+        "absent → row 0 omits the daemon label"
+    );
+
+    // Fresh → green, and the label appears on row 0.
+    app.daemon_health = DaemonHealth::Fresh;
+    assert_eq!(
+        super::daemon_dot_color(&app),
+        Some(super::theme::success_color()),
+        "fresh → green"
+    );
+    let row0 = row_content(&app, 100, 0);
+    assert!(
+        row0.contains("● daemon"),
+        "present → row 0 shows `● daemon`"
+    );
+
+    // Stale → amber.
+    app.daemon_health = DaemonHealth::Stale;
+    assert_eq!(
+        super::daemon_dot_color(&app),
+        Some(super::theme::warning_color()),
+        "stale → amber"
+    );
+}

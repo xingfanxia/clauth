@@ -1657,11 +1657,13 @@ pub(crate) struct SchedulerState {
     third_party_status: ThirdPartyStatusStore,
     suppressed_generic: SuppressedGenericStore,
     shutting_down: Arc<AtomicBool>,
-    /// Dual-scheduler dedup (issue #27): probe for a live daemon each tick
-    /// and stand this refresher down while one runs. `true` ONLY for the TUI —
-    /// the daemon must never probe (its own held flock reads as "another
-    /// daemon", a self-stand-down).
-    standdown_probe: bool,
+    /// Single-fetcher lease (issue #27): `acquire()` reports whether THIS
+    /// instance is the current usage fetcher. Won first-come, held for life; a
+    /// non-holder hydrates from the shared disk cache each tick. `Arc`-shared
+    /// with the TUI's bootstrap so its startup switch one-shot runs only for the
+    /// fetcher, and with the tick thread so the flock stays held for the process
+    /// lifetime.
+    fetch_lease: Arc<crate::daemon::FetchLease>,
     /// Whether the previous tick stood down — transition edges get one log
     /// line each way, never a per-tick repeat.
     standdown_active: AtomicBool,
@@ -1674,25 +1676,27 @@ pub(crate) struct SchedulerState {
 fn tick(state: &SchedulerState) {
     let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
 
-    // Dual-scheduler dedup (#27): while a live daemon owns the loop, this
-    // refresher stands down and renders the daemon's work product instead of
-    // competing for it (double HTTP polling drains the per-account usage
-    // quota; a doubled rotation races the single-use refresh chain; a doubled
-    // auto-switch scan is the switch thrash flagged on #27). The probe is
-    // per-tick, so the refresher re-arms within one tick of the daemon dying
-    // (flock released) or wedging (status.json stale).
-    if state.standdown_probe && crate::daemon::daemon_is_live() {
+    // Single-fetcher lease (#27): exactly one instance (the daemon or a TUI)
+    // fetches usage at a time. This tick tries to hold `usage-fetch.lock`;
+    // another holder means we stand down and hydrate from the shared disk cache
+    // instead of competing (double HTTP polling drains the per-account quota, a
+    // doubled rotation races the single-use refresh chain, a doubled auto-switch
+    // scan is the #27 thrash). The lease is retried each tick until won, then
+    // held for life — so a waiter re-arms within one tick of the current holder
+    // exiting (flock auto-released on process death). An unreadable lock stands
+    // down too: an io error is never a licence to dup-fetch.
+    if !state.fetch_lease.acquire() {
         if !state.standdown_active.swap(true, Ordering::Relaxed) {
             standdown_transition_log(
-                "clauth: live daemon detected — standing down the in-app refresher \
-                 (rendering from its feed)",
+                "clauth: another instance holds the usage-fetch lease — standing \
+                 down (rendering from the shared cache)",
             );
         }
         standdown_tick(state, interval_ms);
         return;
     }
     if state.standdown_active.swap(false, Ordering::Relaxed) {
-        standdown_transition_log("clauth: daemon gone — re-arming the in-app refresher");
+        standdown_transition_log("clauth: acquired the usage-fetch lease — fetching");
     }
 
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
@@ -1813,10 +1817,11 @@ fn tick(state: &SchedulerState) {
     );
 }
 
-/// Log a stand-down transition. This probe runs only inside the TUI, whose
-/// stderr IS the ratatui screen — but `logline!` now diverts an interactive
-/// terminal to `~/.clauth/clauth.log`, so the line is recorded without ever
-/// painting over the accounts pane.
+/// Log a stand-down / lease-acquired transition. Either the TUI or the daemon
+/// can stand down now (whichever didn't win the lease). `logline!` routes the
+/// daemon's line to `daemon.log` and an interactive TUI's to
+/// `~/.clauth/clauth.log`, so it is recorded without ever painting over the
+/// accounts pane.
 fn standdown_transition_log(msg: &str) {
     logline!("{msg}");
 }
@@ -1951,7 +1956,7 @@ pub(crate) fn spawn_refresher(
     third_party_status: ThirdPartyStatusStore,
     suppressed_generic: SuppressedGenericStore,
     shutting_down: Arc<AtomicBool>,
-    standdown_probe: bool,
+    fetch_lease: Arc<crate::daemon::FetchLease>,
 ) {
     let state = SchedulerState {
         config,
@@ -1971,7 +1976,7 @@ pub(crate) fn spawn_refresher(
         third_party_status,
         suppressed_generic,
         shutting_down,
-        standdown_probe,
+        fetch_lease,
         standdown_active: AtomicBool::new(false),
     };
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]

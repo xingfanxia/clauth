@@ -211,16 +211,28 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         active_gauge(app)
     };
 
-    // ── Row 0: brand + version ────────────────────────────────────────────
+    // ── Row 0: brand [· ● daemon] ......... version ───────────────────────
     let brand = "clauth";
     let ver = format!("v{VERSION}");
-    let gap = info_width.saturating_sub(brand.len() + ver.len());
-    let title = Line::from(vec![
-        Span::styled(brand, Style::default().fg(theme::text_color()).bold()),
-        Span::styled(" ".repeat(gap), theme::base()),
-        Span::styled(ver, theme::dim()),
-    ]);
-    frame.render_widget(Paragraph::new(title).style(theme::base()), rows[0]);
+    let mut row0: Vec<Span<'static>> = vec![Span::styled(
+        brand,
+        Style::default().fg(theme::text_color()).bold(),
+    )];
+    // `● daemon` health dot, mirroring the row-1 `status.claude.ai` dot. Hidden
+    // when no daemon runs (the TUI self-fetches under its own lease).
+    if let Some(color) = daemon_dot_color(app) {
+        row0.push(Span::raw("  "));
+        row0.push(Span::styled("● ", Style::default().fg(color)));
+        row0.push(Span::styled("daemon", theme::dim()));
+    }
+    let used: usize = row0.iter().map(|s| s.content.chars().count()).sum();
+    let gap = info_width.saturating_sub(used + ver.chars().count());
+    row0.push(Span::styled(" ".repeat(gap), theme::base()));
+    row0.push(Span::styled(ver, theme::dim()));
+    frame.render_widget(
+        Paragraph::new(Line::from(row0)).style(theme::base()),
+        rows[0],
+    );
 
     // ── Row 1: N accounts · [gauge] ... ● status.claude.ai ──────────────
     // The count + gauge are left-aligned together; the status dot is the
@@ -284,6 +296,18 @@ fn status_dot_color(app: &App) -> ratatui::style::Color {
         Impact::Minor => theme::warning_color(),
         Impact::Maintenance => theme::text_dim_color(),
         Impact::None | Impact::Other(_) => theme::success_color(),
+    }
+}
+
+/// `● daemon` header-dot color, or `None` to hide it when no daemon runs.
+/// Mirrors [`status_dot_color`]: green = daemon up + fresh feed, amber = up but
+/// its `status.json` is stale (wedging / pre-abort / just booted).
+fn daemon_dot_color(app: &App) -> Option<ratatui::style::Color> {
+    use crate::daemon::DaemonHealth;
+    match app.daemon_health {
+        DaemonHealth::Absent => None,
+        DaemonHealth::Stale => Some(theme::warning_color()),
+        DaemonHealth::Fresh => Some(theme::success_color()),
     }
 }
 
