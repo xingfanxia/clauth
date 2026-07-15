@@ -977,8 +977,11 @@ fn recover_pending_credentials(
         let pending: ClaudeCredentials = serde_json::from_slice(&bytes).ok()?;
         pending.claude_ai_oauth.as_ref()?; // must carry an oauth block to matter
         let cred_path = profile_credentials_path(name).ok()?;
-        // Clean success → credentials.json at least as new → discard.
-        // Failed/interrupted commit → older or absent → adopt.
+        // Clean success → credentials.json strictly newer → discard.
+        // Failed/interrupted commit → sidecar newer, tied, or no
+        // credentials.json at all → adopt. A tie means staging and committing
+        // landed in one mtime tick; of the two ways to be wrong, dropping a
+        // rotation that may never have landed is the unrecoverable one.
         let adopt = match cred_path.metadata().and_then(|m| m.modified()) {
             Ok(cred_mtime) => pending_meta
                 .modified()

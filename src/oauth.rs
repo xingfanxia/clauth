@@ -172,11 +172,13 @@ fn http_error(status: u16, body: &str) -> anyhow::Error {
 /// only fix) from a *transient* network/429/5xx blip (refuse this one switch,
 /// retry next tick — never quarantine a healthy account on a hiccup).
 pub(crate) enum RefreshError {
-    /// The token endpoint rejected the refresh token — it is revoked or
-    /// invalid. HTTP 400/401, or a 403 whose body confirms `invalid_grant`.
+    /// The endpoint confirmed the refresh token itself is dead — quarantine the
+    /// account (`clauth login` is the only fix). See
+    /// [`refresh_rejection_is_terminal`] for the status/body split.
     Invalid(String),
-    /// Transport failure, 429, 5xx, or an unconfirmed 403 (WAF/geo/challenge
-    /// blocks answer 403 too) — the refresh token may still be good.
+    /// The refresh token may still be good: a transport failure, 429, 5xx, or a
+    /// rejection the endpoint did not confirm as `invalid_grant`. Retry; never
+    /// quarantine.
     Transient(anyhow::Error),
 }
 
