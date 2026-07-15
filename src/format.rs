@@ -47,7 +47,7 @@ pub(crate) fn login_expired(name: &str) -> Message {
     Message {
         head: format!("login for '{name}' has expired"),
         detail: Some(format!(
-            "refresh token revoked or invalid. run clauth login {name}"
+            "refresh token revoked or invalid: run clauth login {name}"
         )),
     }
 }
@@ -57,7 +57,7 @@ pub(crate) fn login_expired(name: &str) -> Message {
 pub(crate) fn refresh_transient(name: &str, err: &str) -> Message {
     Message {
         head: format!("could not refresh '{name}' before switching"),
-        detail: Some(format!("{err}. check your connection and retry")),
+        detail: Some(format!("{err}: check your connection and retry")),
     }
 }
 

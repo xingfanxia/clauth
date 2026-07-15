@@ -1889,7 +1889,7 @@ impl App {
             {
                 if u >= t {
                     if !self.bell_fired.contains_key(&name) {
-                        self.toast(ToastKind::Warning, format!("bell · {name} at {:.0}%", u));
+                        self.toast(ToastKind::Warning, format!("bell: {name} at {:.0}%", u));
                         self.set_tab_activity(Tab::Overview, ToastKind::Warning);
                         self.bell_fired.insert(name, true);
                     }
@@ -6336,7 +6336,7 @@ fn apply_status_incidents(
             };
             if app.tab == Tab::Status {
                 let title = crate::format::truncate(&incident.title, 40);
-                app.toast(severity, format!("new incident · {title}"));
+                app.toast(severity, format!("new incident: {title}"));
             } else {
                 app.set_tab_activity(Tab::Status, severity);
             }

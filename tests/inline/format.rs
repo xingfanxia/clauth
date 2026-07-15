@@ -12,11 +12,11 @@ fn login_expired_shares_one_head_across_line_and_toast() {
     let m = login_expired("work");
     assert_eq!(
         m.line(),
-        "login for 'work' has expired: refresh token revoked or invalid. run clauth login work"
+        "login for 'work' has expired: refresh token revoked or invalid: run clauth login work"
     );
     assert_eq!(
         m.toast(),
-        "login for 'work' has expired\nrefresh token revoked or invalid. run clauth login work"
+        "login for 'work' has expired\nrefresh token revoked or invalid: run clauth login work"
     );
     // The bold toast head is exactly the line() prefix before the separator.
     assert_eq!(
@@ -30,7 +30,7 @@ fn refresh_transient_carries_the_error_in_the_detail() {
     let m = refresh_transient("flaky", "no network");
     assert_eq!(
         m.line(),
-        "could not refresh 'flaky' before switching: no network. check your connection and retry"
+        "could not refresh 'flaky' before switching: no network: check your connection and retry"
     );
     // The head stays fixed-length regardless of the (arbitrary, possibly long)
     // error text, so it can never wrap the toast's bold first line.
@@ -40,7 +40,7 @@ fn refresh_transient_carries_the_error_in_the_detail() {
     );
     assert_eq!(
         m.toast().lines().nth(1).unwrap(),
-        "no network. check your connection and retry"
+        "no network: check your connection and retry"
     );
 }
 
