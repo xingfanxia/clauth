@@ -1318,3 +1318,56 @@ fn kick_beta_is_ccs_full_six_value_list() {
     assert_eq!(KICK_ANTHROPIC_BETA.split(',').count(), 6);
     assert!(KICK_ANTHROPIC_BETA.starts_with("oauth-2025-04-20,"));
 }
+
+// ── ureq's non-2xx default on the token/kick agent ───────────────────────────
+
+/// The sibling of `non_2xx_arrives_as_ok_so_the_status_branches_stay_reachable`
+/// (fetch), for the agent that carries the token endpoint and the window kick.
+/// Both agents need `http_status_as_error(false)` and for the same reason: with
+/// ureq's default, `kick`'s 401 → rotate-and-retry becomes unreachable and
+/// `refresh_result`'s explicit status check never runs, so a dead login is
+/// reported as a transport error and never quarantined. Pinned per-agent because
+/// the config is per-agent — fetch's flag says nothing about this one's.
+#[test]
+fn token_agent_surfaces_non_2xx_as_ok_not_a_transport_error() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let mut tmp = [0u8; 1024];
+        let _ = sock.read(&mut tmp);
+        // The shape the real token endpoint answers a dead refresh token with.
+        let body = br#"{"error": "invalid_grant"}"#;
+        let _ = sock.write_all(
+            format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = sock.write_all(body);
+    });
+
+    let url = format!("http://127.0.0.1:{port}/v1/oauth/token");
+    let got = AGENT.post(&url).send("{}");
+    let _ = server.join();
+
+    let mut response = got.expect(
+        "a 400 must arrive as Ok: refresh_result reads status + body to tell a dead token \
+         (invalid_grant) from a rejected request shape, and neither is possible off an Err",
+    );
+    assert_eq!(response.status().as_u16(), 400);
+    assert!(
+        response
+            .body_mut()
+            .read_to_string()
+            .expect("read body")
+            .contains("invalid_grant"),
+        "the body must be readable too — the terminal-vs-transient split keys on it",
+    );
+}

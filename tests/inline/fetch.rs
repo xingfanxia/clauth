@@ -1112,3 +1112,40 @@ fn get_json_emits_cc_per_client_wire_headers() {
         "profile sends no beta"
     );
 }
+
+// ── ureq's non-2xx default (the flag that keeps the rotate leg reachable) ────
+
+/// ureq 3 answers a non-2xx with `Err(Error::StatusCode)` by DEFAULT, which once
+/// turned every `status >= 400` branch on the `Ok` response into dead code here:
+/// the 401 → rotate leg and the 429 retry-after read never fired, and every HTTP
+/// error collapsed into `Network` (`docs/internals.md`, 2026-06-07). The whole
+/// fix is one builder flag on this agent, and nothing pinned it — dropping the
+/// flag, or rebuilding the agent without it, would strand rotation exactly the
+/// same way while every offline test in the tree kept passing, because no offline
+/// test ever gives this agent a real non-2xx to answer. So this one does.
+#[test]
+fn non_2xx_arrives_as_ok_so_the_status_branches_stay_reachable() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let mut tmp = [0u8; 1024];
+        let _ = sock.read(&mut tmp);
+        let _ = sock.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+    });
+
+    let url = format!("http://127.0.0.1:{port}/unauthorized");
+    let got = AGENT.get(&url).call();
+    let _ = server.join();
+
+    let response = got.expect(
+        "a 401 must arrive as Ok: the rotate leg reads the status off the Ok response, and \
+         ureq's default would collapse it into Err(StatusCode) -> Network",
+    );
+    assert_eq!(response.status().as_u16(), 401);
+}
