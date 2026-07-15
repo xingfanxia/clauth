@@ -81,10 +81,11 @@ pub(crate) mod rank {
         /// post-rotation retry reserves a slot while the rotation flock is held.
         UsageThrottle = 150;
         LastFetched = 200;
-        /// Per-profile consecutive-429 streak driving exponential rate-limit
-        /// backoff in `usage::scheduler`. Leaf — bumped and released before the
+        /// Per-profile poll-health streaks (consecutive 429s, consecutive
+        /// transient token-refresh failures) driving exponential backoff in
+        /// `usage::scheduler`. Leaf — bumped and released before the
         /// `last_fetched`/`status` write in `apply_outcome`.
-        RateLimitStreak = 220;
+        PollStreak = 220;
         Tokens = 250;
         ThirdParty = 260;
         ThirdPartyUsageStore = 270;

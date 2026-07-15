@@ -97,9 +97,24 @@ pub(crate) type TokenList = Arc<RankedMutex<Vec<TokenEntry>, rank::Tokens>>;
 /// Per-profile epoch-ms of the last fetch attempt (cadence gating).
 pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, EpochMs>, rank::LastFetched>>;
 
-/// Per-profile count of consecutive 429s, driving exponential rate-limit backoff
-/// in [`apply_outcome`]. Reset on the next live fetch.
-pub(crate) type RateLimitStreaks = Arc<RankedMutex<HashMap<String, u32>, rank::RateLimitStreak>>;
+/// One profile's consecutive-failure counters. Both ladder off
+/// [`rate_limit_backoff_ms`] and both clear on the next live fetch, but they stay
+/// separate counters because every other reader means only one of them: a 429
+/// streak feeds [`is_stuck_rate_limited`], the auto-switch freshness bypass and
+/// `status.json`'s `stale`, none of which a refresh failure may claim.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct StreakCounts {
+    /// Consecutive 429s from `/usage`.
+    pub(crate) rate_limit: u32,
+    /// Consecutive token refreshes the endpoint rejected WITHOUT confirming the
+    /// token is dead ([`crate::oauth::RefreshError::Transient`]). A confirmed
+    /// dead token quarantines instead and carries its own, wider backoff.
+    pub(crate) refresh_fail: u32,
+}
+
+/// Per-profile poll-health streaks, driving exponential backoff in
+/// [`apply_outcome`] and [`partition_due`]. Reset on the next live fetch.
+pub(crate) type PollStreaks = Arc<RankedMutex<HashMap<String, StreakCounts>, rank::PollStreak>>;
 
 /// Names pushed here after a successful token rotation bypass the cadence on the next tick.
 pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, rank::RefetchQueue>>;
@@ -142,8 +157,9 @@ pub(crate) struct ThirdPartyEntry {
 trait NamedEntry {
     fn name(&self) -> &str;
     /// Widen-only extra deferral added to the fixed cadence at partition time.
-    /// Zero for everything but a quarantined OAuth profile.
-    fn poll_backoff_ms(&self) -> u64 {
+    /// Zero for everything but a quarantined or refresh-failing OAuth profile.
+    fn poll_backoff_ms(&self, streaks: StreakCounts) -> u64 {
+        let _ = streaks;
         0
     }
 }
@@ -153,12 +169,19 @@ impl NamedEntry for TokenEntry {
         &self.name
     }
 
-    fn poll_backoff_ms(&self) -> u64 {
+    fn poll_backoff_ms(&self, streaks: StreakCounts) -> u64 {
         if self.auth_broken {
-            AUTH_BROKEN_BACKOFF_MS
-        } else {
-            0
+            return AUTH_BROKEN_BACKOFF_MS;
         }
+        // A run of transient refresh failures climbs the same curve a 429 run
+        // does, capped at the same ceiling. Without it the one failure mode that
+        // can hit EVERY profile at once — clauth's own request shape drifting,
+        // which never quarantines because the endpoint never confirmed a dead
+        // token — re-hits the token endpoint at full cadence indefinitely.
+        if streaks.refresh_fail == 0 {
+            return 0;
+        }
+        rate_limit_backoff_ms(streaks.refresh_fail).min(MAX_RETRY_AFTER_MS)
     }
 }
 
@@ -655,8 +678,13 @@ fn fetch_with_rotation(
                 // account on this tick; a transient one leaves the flag and
                 // retries. See `refresh_failure_is_terminal`.
                 crate::oauth::mark_auth_broken(config, name, true);
+                return bail_unrotated();
             }
-            return bail_unrotated();
+            // Transient: the chain may still be good, so this account keeps
+            // polling rather than quarantining. Count the failure — the streak
+            // is the only thing that ladders the retry and names the state on
+            // the row (`auth_broken` does neither for a profile it never flags).
+            return bail_unrotated().with_refresh_failed();
         }
     };
     // Persist under the AppConfig mutex + state lock — matches every other rotation site
@@ -708,6 +736,11 @@ struct FetchOutcome {
     /// Server `retry-after` hint from a 429; [`apply_outcome`] turns it into a
     /// deferred next-fetch slot for this profile.
     retry_after: Option<Duration>,
+    /// A token refresh failed WITHOUT the endpoint confirming the token is dead,
+    /// so the chain is not quarantined and this profile keeps polling. Folded
+    /// into the profile's `refresh_fail` streak by [`apply_outcome`], which is
+    /// what ladders the cadence and names the state on the row.
+    refresh_failed: bool,
 }
 
 impl FetchOutcome {
@@ -720,7 +753,16 @@ impl FetchOutcome {
             rotated,
             from_fetch: true,
             retry_after: None,
+            refresh_failed: false,
         }
+    }
+
+    /// Mark this outcome as following a transient refresh failure. A `Fresh`
+    /// outcome is unaffected in practice — [`update_streaks`] clears the streak
+    /// on a live body regardless.
+    fn with_refresh_failed(mut self) -> Self {
+        self.refresh_failed = true;
+        self
     }
 
     /// A disk-cache fallback (`status` downgrades to `Failed` when no cache
@@ -739,6 +781,7 @@ impl FetchOutcome {
             rotated,
             from_fetch: false,
             retry_after,
+            refresh_failed: false,
         }
     }
 }
@@ -780,14 +823,22 @@ fn window_lapsed(store: &UsageStore, name: &str, now_secs: i64) -> bool {
 }
 
 /// Current consecutive-429 streak for `name` (0 when absent or poisoned). Read
-/// alone and released before any higher-ranked lock — RATE_LIMIT_STREAK(220)
+/// alone and released before any higher-ranked lock — POLL_STREAK(220)
 /// sits below USAGE_STORE(300), so it must not be held across `window_lapsed`.
-fn rate_limit_streak(streaks: &RateLimitStreaks, name: &str) -> u32 {
+fn rate_limit_streak(streaks: &PollStreaks, name: &str) -> u32 {
     streaks
         .lock()
         .ok()
         .and_then(|m| m.get(name).copied())
-        .unwrap_or(0)
+        .unwrap_or_default()
+        .rate_limit
+}
+
+/// Every profile's streak counts, copied out under one short lock. Taken at the
+/// call site rather than inside [`partition_due`] so POLL_STREAK(220) is never
+/// held under the `LastFetched`(200)/`Activity` locks that live there.
+fn streak_snapshot(streaks: &PollStreaks) -> HashMap<String, StreakCounts> {
+    streaks.lock().map(|m| m.clone()).unwrap_or_default()
 }
 
 /// Whether `run_fetch` should open the 5h window before fetching: the window has
@@ -810,7 +861,7 @@ fn run_fetch(
     store: &UsageStore,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
-    streaks: &RateLimitStreaks,
+    streaks: &PollStreaks,
 ) -> FetchOutcome {
     // Auto-start leg: open a window before fetching when this profile opted in,
     // its last-known window has lapsed, and we aren't already 429-streaking (see
@@ -930,27 +981,44 @@ fn deadline_spread(name: &str, now: EpochMs, interval_ms: u64) -> IntervalMs {
     IntervalMs::from_millis(h.finish() % span)
 }
 
-/// Update `name`'s consecutive-429 streak from a fetch `status`, returning the
-/// post-update count. `Fresh` clears it (a live body breaks the storm),
-/// `RateLimited` increments it, and a transient `Cached`/`Failed` leaves it as
-/// is — a network blip mid-storm must not reset the ramp. Leaf lock, taken and
-/// released before the caller writes `last_fetched`/`status`.
-fn update_rate_limit_streak(streaks: &RateLimitStreaks, name: &str, status: FetchStatus) -> u32 {
+/// Update `name`'s failure counters from a fetch `status` (plus whether its
+/// refresh leg just failed transiently), returning the post-update counts.
+/// `Fresh` clears both (a live body breaks the storm). Otherwise `RateLimited`
+/// bumps the 429 axis and a transient refresh failure bumps its own; a status
+/// that says nothing about either — a network-blip `Cached`/`Failed` mid-storm —
+/// leaves both as is so the ramp is not reset. Leaf lock, taken and released
+/// before the caller writes `last_fetched`/`status`.
+fn update_streaks(
+    streaks: &PollStreaks,
+    name: &str,
+    status: FetchStatus,
+    refresh_failed: bool,
+) -> StreakCounts {
     let Ok(mut m) = streaks.lock() else {
-        return 0;
+        return StreakCounts::default();
     };
-    match status {
-        FetchStatus::Fresh => {
-            m.remove(name);
-            0
-        }
-        FetchStatus::RateLimited => {
-            let n = m.entry(name.to_string()).or_insert(0);
-            *n = n.saturating_add(1);
-            *n
-        }
-        FetchStatus::Cached | FetchStatus::Failed => m.get(name).copied().unwrap_or(0),
+    // A live body clears BOTH axes: whatever went wrong, this profile is serving
+    // again. That also covers the preemptive-rotation case, where a refresh can
+    // fail while the still-valid access token fetches fine — nothing is degraded
+    // yet, so nothing should ladder or light up the row.
+    if matches!(status, FetchStatus::Fresh) {
+        m.remove(name);
+        return StreakCounts::default();
     }
+    let rate_limited = matches!(status, FetchStatus::RateLimited);
+    if !rate_limited && !refresh_failed {
+        // Says nothing about either axis — leave both counters (and, when this
+        // profile has none, the empty map) untouched.
+        return m.get(name).copied().unwrap_or_default();
+    }
+    let counts = m.entry(name.to_string()).or_default();
+    if rate_limited {
+        counts.rate_limit = counts.rate_limit.saturating_add(1);
+    }
+    if refresh_failed {
+        counts.refresh_fail = counts.refresh_fail.saturating_add(1);
+    }
+    *counts
 }
 
 /// Write one outcome into the shared stores; returns the stamped next-fetch base
@@ -961,7 +1029,7 @@ fn apply_outcome(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
-    streaks: &RateLimitStreaks,
+    streaks: &PollStreaks,
     interval_ms: u64,
     is_active: bool,
 ) -> EpochMs {
@@ -1009,11 +1077,19 @@ fn apply_outcome(
     // the consecutive-429 count; everything else keeps the cadence. Live fetches
     // also get a per-profile spread so two profiles don't fall due on the same tick.
     let rate_limited = matches!(outcome.status, FetchStatus::RateLimited);
-    let streak = update_rate_limit_streak(streaks, &outcome.name, outcome.status);
+    // Only the 429 axis feeds the deferral here; the refresh-fail axis widens at
+    // partition time instead (`TokenEntry::poll_backoff_ms`) so a recovery snaps
+    // the cadence back on the next tick rather than sitting out a baked-in stamp.
+    let counts = update_streaks(
+        streaks,
+        &outcome.name,
+        outcome.status,
+        outcome.refresh_failed,
+    );
     let defer = next_slot_deferral(
         rate_limited,
         outcome.retry_after,
-        streak,
+        counts.rate_limit,
         interval_ms,
         is_active,
     );
@@ -1264,7 +1340,7 @@ fn fetch_oauth_due(state: &SchedulerState, due: Vec<TokenEntry>, interval_ms: u6
             &state.store,
             &state.refetch_queue,
             &state.activity,
-            &state.rate_limit_streaks,
+            &state.poll_streaks,
         )
     });
 }
@@ -1357,7 +1433,7 @@ fn drain_oauth_completions(
             &state.store,
             &state.status,
             &state.last_fetched,
-            &state.rate_limit_streaks,
+            &state.poll_streaks,
             interval_ms,
             is_active,
         );
@@ -1523,6 +1599,7 @@ fn partition_and_merge<T: NamedEntry + Clone>(
         &state.last_fetched,
         &state.activity,
         interval_ms,
+        &streak_snapshot(&state.poll_streaks),
     );
     merge_forced(snapshot, forced, &mut due, &mut next, &state.activity, now);
     (due, next)
@@ -1571,7 +1648,7 @@ pub(crate) struct SchedulerState {
     next_refresh_per_profile: NextRefreshPerProfile,
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
-    rate_limit_streaks: RateLimitStreaks,
+    poll_streaks: PollStreaks,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -1723,7 +1800,7 @@ fn tick(state: &SchedulerState) {
         &state.config,
         &state.store,
         &state.status,
-        &state.rate_limit_streaks,
+        &state.poll_streaks,
         &state.activity,
         &state.pending_switch,
         &state.pending_switch_off,
@@ -1786,12 +1863,14 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     );
 
     let now = now_ms();
+    let streaks = streak_snapshot(&state.poll_streaks);
     let (_, mut oauth_next) = partition_due(
         &oauth_snapshot,
         now,
         &state.last_fetched,
         &state.activity,
         interval_ms,
+        &streaks,
     );
     // Mirror the fetch tick's `refresh_spent_accounts` OFF handling: the daemon
     // skips spent accounts, so their disk cache stops advancing and the derived
@@ -1813,6 +1892,7 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         &state.last_fetched,
         &state.activity,
         interval_ms,
+        &streaks,
     );
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
@@ -1862,7 +1942,7 @@ pub(crate) fn spawn_refresher(
     next_refresh_per_profile: NextRefreshPerProfile,
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
-    rate_limit_streaks: RateLimitStreaks,
+    poll_streaks: PollStreaks,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -1882,7 +1962,7 @@ pub(crate) fn spawn_refresher(
         next_refresh_per_profile,
         activity,
         last_fetched,
-        rate_limit_streaks,
+        poll_streaks,
         pending_switch,
         pending_switch_off,
         refetch_queue,
@@ -1947,14 +2027,22 @@ fn decision_fresh(status: &StatusStore, name: &str) -> bool {
 ///   * `status.json`'s per-profile `stale` flag publishes the same judgment so a
 ///     menu-bar reader renders the reading as distrusted, not current truth.
 pub(crate) fn is_stuck_rate_limited(status: FetchStatus, streak: u32) -> bool {
-    matches!(status, FetchStatus::RateLimited) && streak > ACTIVE_CAP_MAX_STREAK
+    matches!(status, FetchStatus::RateLimited) && is_stuck_streak(streak)
+}
+
+/// Whether a consecutive-failure streak has run deeper than the active row's
+/// retry cap ([`ACTIVE_CAP_MAX_STREAK`]) — the point past which whatever we are
+/// waiting out is not draining on its own. One home for the boundary, so the
+/// daemon's `stale` judgment and the row's red pill can't drift apart.
+pub(crate) fn is_stuck_streak(streak: u32) -> bool {
+    streak > ACTIVE_CAP_MAX_STREAK
 }
 
 fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     status: &StatusStore,
-    streaks: &RateLimitStreaks,
+    streaks: &PollStreaks,
     _activity: &ActivityStore,
     pending_switch: &PendingSwitch,
     pending_switch_off: &PendingSwitchOff,
@@ -2106,6 +2194,7 @@ fn partition_due<T: NamedEntry + Clone>(
     last_fetched: &LastFetchedAt,
     activity: &ActivityStore,
     interval_ms: u64,
+    streaks: &HashMap<String, StreakCounts>,
 ) -> (Vec<T>, HashMap<String, u64>) {
     let now = EpochMs::from_millis(now);
     let Ok(lf) = last_fetched.lock() else {
@@ -2121,9 +2210,10 @@ fn partition_due<T: NamedEntry + Clone>(
             .get(entry.name())
             .copied()
             .unwrap_or(EpochMs::from_millis(0));
+        let backoff = entry.poll_backoff_ms(streaks.get(entry.name()).copied().unwrap_or_default());
         let next = last
             .saturating_add(interval)
-            .saturating_add(IntervalMs::from_millis(entry.poll_backoff_ms()));
+            .saturating_add(IntervalMs::from_millis(backoff));
         per_profile.insert(entry.name().to_string(), next.as_millis());
         let excluded = match act.as_ref() {
             Ok(a) => matches!(

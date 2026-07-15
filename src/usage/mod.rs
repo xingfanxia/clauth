@@ -17,12 +17,12 @@ pub(crate) use fetch::{
 };
 pub(crate) use scheduler::{
     ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, OpResult, OpResultReceiver,
-    OpResultSender, PendingSwitch, PendingSwitchOff, ProfileActivity, RateLimitStreaks,
-    RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
+    OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks, ProfileActivity, RefetchQueue,
+    StartupReceiver, StartupSender, StartupSignal, StatusStore, StreakCounts,
     SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
     UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
-    collect_third_party_entries, collect_tokens, is_idle, is_stuck_rate_limited, mark_activity,
-    spawn_refresher, switch_gate_in_flight,
+    collect_third_party_entries, collect_tokens, is_idle, is_stuck_rate_limited, is_stuck_streak,
+    mark_activity, spawn_refresher, switch_gate_in_flight,
 };
 // The active-cap boundary is only referenced by tests (production code reaches it
 // through `is_stuck_rate_limited`); gate the re-export behind `cfg(test)` so it

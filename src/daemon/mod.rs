@@ -42,7 +42,7 @@ use crate::profile::{
 };
 use crate::usage::{
     ActivityStore, FetchStatus, LastFetchedAt, NextRefreshPerProfile, PendingSwitch,
-    PendingSwitchOff, RateLimitStreaks, RefetchQueue, StatusStore, SuppressedGenericStore,
+    PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore, SuppressedGenericStore,
     ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList, UsageStore,
     bootstrap_fetch, bootstrap_third_party, collect_third_party_entries, collect_tokens,
     spawn_refresher,
@@ -193,7 +193,7 @@ struct Daemon {
     next_refresh_per_profile: NextRefreshPerProfile,
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
-    rate_limit_streaks: RateLimitStreaks,
+    poll_streaks: PollStreaks,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -234,7 +234,7 @@ impl Daemon {
             next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
             activity: Arc::new(RankedMutex::new(HashMap::new())),
             last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
-            rate_limit_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+            poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
             pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
             pending_switch_off: Arc::new(RankedMutex::new(false)),
             refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -315,7 +315,7 @@ impl Daemon {
             Arc::clone(&self.next_refresh_per_profile),
             Arc::clone(&self.activity),
             Arc::clone(&self.last_fetched),
-            Arc::clone(&self.rate_limit_streaks),
+            Arc::clone(&self.poll_streaks),
             Arc::clone(&self.pending_switch),
             Arc::clone(&self.pending_switch_off),
             Arc::clone(&self.refetch_queue),
@@ -426,11 +426,13 @@ impl Daemon {
             .unwrap_or_default();
         // Snapshot the 429 streaks so build_status can publish `stale` (a
         // deep-slot stuck RateLimited). Lower rank than config, like the stores
-        // above — snapshot + release before the config lock.
+        // above — snapshot + release before the config lock. Projected to the 429
+        // axis on purpose: `stale` is contracted as a stuck THROTTLE
+        // (`wiki/daemon.md`), so a refresh-fail streak must not leak into it.
         let streaks_snap: HashMap<String, u32> = self
-            .rate_limit_streaks
+            .poll_streaks
             .lock()
-            .map(|m| m.clone())
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.rate_limit)).collect())
             .unwrap_or_default();
         // The in-flight switch target (accepted, not yet applied), so the UI
         // shows in-flight truth instead of a timing heuristic. Snapshot + release

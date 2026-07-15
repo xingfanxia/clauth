@@ -41,6 +41,7 @@ fn partition_due_uses_fixed_interval() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert_eq!(due.len(), 1, "a never-fetched profile is due");
     assert_eq!(next.get("a").copied(), Some(REFRESH_INTERVAL_MS));
@@ -56,6 +57,7 @@ fn partition_due_uses_fixed_interval() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert!(due.is_empty(), "not due one ms after a fetch");
     assert_eq!(next.get("a").copied(), Some(base + REFRESH_INTERVAL_MS));
@@ -67,6 +69,7 @@ fn partition_due_uses_fixed_interval() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert_eq!(due.len(), 1, "due once the fixed interval has elapsed");
 }
@@ -141,6 +144,7 @@ fn partition_due_excludes_refreshing() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert!(due.is_empty(), "refreshing profiles are excluded from due");
     assert!(
@@ -166,6 +170,7 @@ fn partition_due_excludes_switching() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert!(due.is_empty(), "mid-switch profiles are excluded from due");
     assert!(
@@ -201,6 +206,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert!(due.is_empty(), "flagged profile skips the plain cadence");
     assert_eq!(
@@ -217,6 +223,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert_eq!(
         due.len(),
@@ -232,6 +239,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert_eq!(
         due.len(),
@@ -239,6 +247,132 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
         "an unflagged profile snaps back to the cadence"
     );
     assert_eq!(next["a"], base + REFRESH_INTERVAL_MS);
+}
+
+/// The sibling of the `auth_broken` widen above, for the failure it can NEVER
+/// cover: a refresh the endpoint rejected without confirming the token is dead
+/// (`RefreshError::Transient`) leaves the profile unflagged on purpose, so
+/// `auth_broken`'s backoff never applies. Without a ladder of its own, the one
+/// failure mode that hits every profile at once — clauth's own request shape
+/// drifting — re-hits the token endpoint at the full cadence forever, on every
+/// account, with the row saying only `cached`. Same curve and ceiling as the 429
+/// ladder, and computed live at partition time so a recovery snaps straight back.
+#[test]
+fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), EpochMs::from_millis(base));
+
+    let snapshot = vec![token("a")];
+    let streaks = |refresh_fail: u32| {
+        HashMap::from([(
+            "a".to_string(),
+            super::StreakCounts {
+                rate_limit: 0,
+                refresh_fail,
+            },
+        )])
+    };
+    let next_at = |streaks: &HashMap<String, super::StreakCounts>| {
+        partition_due(
+            &snapshot,
+            base,
+            &last_fetched,
+            &activity,
+            REFRESH_INTERVAL_MS,
+            streaks,
+        )
+        .1["a"]
+    };
+
+    // Streak 0 is the plain cadence — `rate_limit_backoff_ms(0)` returns a full
+    // base step, so an unguarded call would silently defer a healthy profile.
+    assert_eq!(
+        next_at(&streaks(0)),
+        base + REFRESH_INTERVAL_MS,
+        "a profile with no refresh failures must not be deferred at all"
+    );
+
+    // The ladder climbs: 10s, 30s, 90s… on top of the fixed cadence.
+    assert_eq!(next_at(&streaks(1)), base + REFRESH_INTERVAL_MS + 10_000);
+    assert_eq!(next_at(&streaks(2)), base + REFRESH_INTERVAL_MS + 30_000);
+    assert_eq!(next_at(&streaks(3)), base + REFRESH_INTERVAL_MS + 90_000);
+
+    // …and stops at the same 15-minute ceiling the 429 ladder honors, rather
+    // than running away to hours (`rate_limit_backoff_ms` alone is unbounded).
+    assert_eq!(
+        next_at(&streaks(50)),
+        base + REFRESH_INTERVAL_MS + super::MAX_RETRY_AFTER_MS,
+        "a deep refresh-fail streak caps at MAX_RETRY_AFTER_MS",
+    );
+
+    // A quarantined profile keeps the wider `auth_broken` deferral: that flag
+    // means the token is confirmed dead, which outranks "might be a blip".
+    let mut flagged = token("a");
+    flagged.auth_broken = true;
+    let (_, next) = partition_due(
+        &[flagged],
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &streaks(1),
+    );
+    assert_eq!(
+        next["a"],
+        base + REFRESH_INTERVAL_MS + super::AUTH_BROKEN_BACKOFF_MS,
+        "a confirmed-dead token outranks the refresh-fail ladder"
+    );
+}
+
+/// The two streak axes must move independently, because every other reader
+/// means only one of them: `rate_limit` feeds `is_stuck_rate_limited`, the
+/// auto-switch freshness bypass and `status.json`'s `stale` — none of which a
+/// refresh failure may ever claim. A live body clears both.
+#[test]
+fn streak_axes_move_independently_and_a_live_body_clears_both() {
+    use super::FetchStatus;
+
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let update = |status: FetchStatus, refresh_failed: bool| {
+        super::update_streaks(&streaks, "a", status, refresh_failed)
+    };
+
+    // A transient refresh failure bails to `Cached` — it must NOT touch the 429
+    // axis, or a client-side bug would report a stuck throttle and let the
+    // auto-switch rotate the chain away on it.
+    let counts = update(FetchStatus::Cached, true);
+    assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 1));
+    let counts = update(FetchStatus::Cached, true);
+    assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 2));
+
+    // A 429 bumps only its own axis and leaves the refresh count standing.
+    let counts = update(FetchStatus::RateLimited, false);
+    assert_eq!((counts.rate_limit, counts.refresh_fail), (1, 2));
+
+    // A status that says nothing about either axis holds both — and must not
+    // conjure an entry for a profile that has none.
+    let counts = update(FetchStatus::Failed, false);
+    assert_eq!((counts.rate_limit, counts.refresh_fail), (1, 2));
+    assert_eq!(
+        super::update_streaks(&streaks, "never-seen", FetchStatus::Failed, false),
+        super::StreakCounts::default(),
+    );
+    assert!(
+        !streaks.lock().unwrap().contains_key("never-seen"),
+        "a no-op update must not insert an empty entry"
+    );
+
+    // A live body clears both: whatever went wrong, the profile is serving. This
+    // is also the preemptive-rotation case — a refresh can fail while the still
+    // valid access token fetches fine, and nothing is degraded yet.
+    let counts = update(FetchStatus::Fresh, true);
+    assert_eq!((counts.rate_limit, counts.refresh_fail), (0, 0));
+    assert!(!streaks.lock().unwrap().contains_key("a"));
 }
 
 /// Forced (manual `r`) refetches skip a mid-switch profile for the same
@@ -303,7 +437,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let statuses: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
 
     let (status, retry_after) = rotation_bail_context(Some(Some(Duration::from_secs(300))));
     let outcome = FetchOutcome {
@@ -312,6 +446,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         status,
         rotated: None,
         from_fetch: false,
+        refresh_failed: false,
         retry_after,
     };
 
@@ -328,7 +463,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
     let after = now_ms();
 
     assert_eq!(
-        streaks.lock().unwrap().get("u").copied(),
+        streaks.lock().unwrap().get("u").map(|c| c.rate_limit),
         Some(1),
         "the failed unmask still counts toward the 429 streak"
     );
@@ -355,6 +490,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert!(due.is_empty(), "not due before the deferred slot");
     let (due, _) = partition_due(
@@ -363,6 +499,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert_eq!(due.len(), 1, "due once the deferred slot arrives");
 }
@@ -442,7 +579,7 @@ fn cached_fallback_does_not_clobber_store() {
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
 
     let live = UsageInfo {
         five_hour: Some(UsageWindow {
@@ -461,6 +598,7 @@ fn cached_fallback_does_not_clobber_store() {
             status: FetchStatus::RateLimited,
             rotated: None,
             from_fetch: false,
+            refresh_failed: false,
             retry_after: None,
         },
         &store,
@@ -488,6 +626,7 @@ fn cached_fallback_does_not_clobber_store() {
             status: FetchStatus::Cached,
             rotated: None,
             from_fetch: false,
+            refresh_failed: false,
             retry_after: None,
         },
         &store,
@@ -723,7 +862,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
             ("a".to_string(), FetchStatus::RateLimited),
             ("b".to_string(), FetchStatus::Fresh),
         ])));
-        let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+        let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
         let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
         let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
@@ -798,7 +937,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
 #[test]
 fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
     use super::{
-        ACTIVE_CAP_MAX_STREAK, FetchStatus, PendingSwitch, PendingSwitchOff, RateLimitStreaks,
+        ACTIVE_CAP_MAX_STREAK, FetchStatus, PendingSwitch, PendingSwitchOff, PollStreaks,
         StatusStore, scan_auto_switch,
     };
     use crate::profile::{AppConfig, AppState, Profile};
@@ -835,8 +974,13 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
             ("a".to_string(), FetchStatus::RateLimited),
             ("b".to_string(), FetchStatus::Fresh),
         ])));
-        let streaks: RateLimitStreaks =
-            Arc::new(RankedMutex::new(HashMap::from([("a".to_string(), streak)])));
+        let streaks: PollStreaks = Arc::new(RankedMutex::new(HashMap::from([(
+            "a".to_string(),
+            super::StreakCounts {
+                rate_limit: streak,
+                refresh_fail: 0,
+            },
+        )])));
         let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
         let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
@@ -968,13 +1112,14 @@ fn retry_after_defers_next_fetch_slot() {
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
     let outcome = |name: &str, retry_after: Option<Duration>| FetchOutcome {
         name: name.to_string(),
         info: None,
         status: FetchStatus::RateLimited,
         rotated: None,
         from_fetch: false,
+        refresh_failed: false,
         retry_after,
     };
     let stamp = |name: &str| {
@@ -1014,6 +1159,7 @@ fn retry_after_defers_next_fetch_slot() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert!(due.is_empty(), "not due before the deferred slot");
     assert_eq!(
@@ -1027,6 +1173,7 @@ fn retry_after_defers_next_fetch_slot() {
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
+        &HashMap::new(),
     );
     assert_eq!(due.len(), 1, "due once the deferred slot arrives");
 
@@ -1118,9 +1265,10 @@ fn consecutive_rate_limits_back_off_exponentially() {
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
 
     let rate_limited = |from_fetch: bool, status: FetchStatus| FetchOutcome {
+        refresh_failed: false,
         name: "a".to_string(),
         info: None,
         status,
@@ -1207,7 +1355,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
 
     // A constant hint well under the ladder floor — present on every 429, so the
     // escalation below can only come from the streak ladder overriding it.
@@ -1217,6 +1365,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         status: FetchStatus::RateLimited,
         rotated: None,
         from_fetch: false,
+        refresh_failed: false,
         retry_after: Some(Duration::from_secs(5)),
     };
     let stamp = || {
@@ -1263,7 +1412,7 @@ fn transient_errors_preserve_rate_limit_streak() {
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
 
     let outcome = |kind: FetchStatus| FetchOutcome {
         name: "a".to_string(),
@@ -1271,6 +1420,7 @@ fn transient_errors_preserve_rate_limit_streak() {
         status: kind,
         rotated: None,
         from_fetch: false,
+        refresh_failed: false,
         retry_after: None,
     };
     let apply = |kind: FetchStatus| {
@@ -1968,7 +2118,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
         activity: Arc::new(RankedMutex::new(HashMap::new())),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
-        rate_limit_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -2045,7 +2195,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
         activity: Arc::new(RankedMutex::new(HashMap::new())),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
-        rate_limit_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -2185,10 +2335,14 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let statuses: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let streaks: super::RateLimitStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
     // Both profiles arrive at streak 6 (deep, still capped for the active row).
-    streaks.lock().unwrap().insert("act".to_string(), 5);
-    streaks.lock().unwrap().insert("idle".to_string(), 5);
+    let at_five = super::StreakCounts {
+        rate_limit: 5,
+        refresh_fail: 0,
+    };
+    streaks.lock().unwrap().insert("act".to_string(), at_five);
+    streaks.lock().unwrap().insert("idle".to_string(), at_five);
 
     let outcome = |name: &str| FetchOutcome {
         name: name.to_string(),
@@ -2196,6 +2350,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         status: FetchStatus::RateLimited,
         rotated: None,
         from_fetch: false,
+        refresh_failed: false,
         retry_after: None,
     };
 
@@ -2268,7 +2423,7 @@ fn completion_order_state() -> super::SchedulerState {
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
         activity: Arc::new(RankedMutex::new(HashMap::new())),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
-        rate_limit_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -2292,6 +2447,7 @@ fn cached_outcome(name: &str) -> super::FetchOutcome {
         status: super::FetchStatus::Cached,
         rotated: None,
         from_fetch: false,
+        refresh_failed: false,
         retry_after: None,
     }
 }

@@ -220,7 +220,10 @@ fn rate_limited_suffix_counts_the_retry() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
-        streak,
+        streaks: StreakCounts {
+            rate_limit: streak,
+            refresh_fail: 0,
+        },
     };
     let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
 
@@ -231,6 +234,105 @@ fn rate_limited_suffix_counts_the_retry() {
         !bare.contains("th retry"),
         "a zero streak must not invent a retry count"
     );
+}
+
+/// A run of transient refresh failures bails to `Cached` — true, we ARE serving
+/// last-known numbers — so without this the row says `cached` and nothing names
+/// the chain having stopped rotating. `auth failing` claims only what we know:
+/// a confirmed-dead token quarantines instead and shows the `×` marker, so this
+/// pill must never appear for one.
+#[test]
+fn a_failing_refresh_names_itself_on_the_cached_row() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Cached);
+    let header = |refresh_fail: u32| HeaderState {
+        is_active: false,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        streaks: StreakCounts {
+            rate_limit: 0,
+            refresh_fail,
+        },
+    };
+    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+
+    // No failures: the plain cached row, counting down to a usage refresh.
+    let healthy = text(status_line(&profile, &header(0)));
+    assert!(healthy.contains("cached"), "got {healthy:?}");
+    assert!(healthy.contains("refresh in"));
+    assert!(
+        !healthy.contains("auth failing"),
+        "a cached row with a healthy chain must not cry auth"
+    );
+
+    // Failing: the pill names the cause and the countdown becomes a retry
+    // ordinal, since it now leads to the next REFRESH attempt, not a poll.
+    let failing = text(status_line(&profile, &header(3)));
+    assert!(failing.contains("auth failing"), "got {failing:?}");
+    assert!(failing.contains("3rd retry in"), "got {failing:?}");
+    assert!(
+        !failing.contains("cached"),
+        "the pill states the cause, not the symptom"
+    );
+}
+
+/// Red is this app's "not recovering on its own" — what `×` (dead login) and
+/// `failed` mean. Both streak pills earn it only past the bound the daemon
+/// itself stops trusting the reading at (`is_stuck_streak`, the boundary
+/// `status.json`'s `stale` keys on); below it they stay amber, or a wifi blip
+/// borrows the red that means a dead login and trains the user to ignore it.
+#[test]
+fn a_streak_pill_turns_red_only_once_it_is_stuck() {
+    let pill_style = |profile: &Profile, header: &HeaderState| {
+        status_line(profile, header)
+            .spans
+            .iter()
+            .find(|s| s.content.contains("rate limited") || s.content.contains("auth failing"))
+            .map(|s| s.style)
+            .expect("a streak pill")
+    };
+    let header = |streaks: StreakCounts| HeaderState {
+        is_active: false,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        streaks,
+    };
+
+    for (status, axis) in [
+        (
+            FetchStatus::RateLimited,
+            (|n| StreakCounts {
+                rate_limit: n,
+                refresh_fail: 0,
+            }) as fn(u32) -> StreakCounts,
+        ),
+        (FetchStatus::Cached, |n| StreakCounts {
+            rate_limit: 0,
+            refresh_fail: n,
+        }),
+    ] {
+        let mut profile = crate::testutil::blank_profile("a");
+        profile.fetch_status = Some(status);
+
+        // At the cap the reading is still trusted — amber, same as `cached`.
+        assert_eq!(
+            pill_style(&profile, &header(axis(crate::usage::ACTIVE_CAP_MAX_STREAK))).fg,
+            theme::warning().fg,
+            "a streak at the cap is still a staleness cue, not a failure ({status:?})"
+        );
+        // One past it, the daemon distrusts the number; the row must agree.
+        assert_eq!(
+            pill_style(
+                &profile,
+                &header(axis(crate::usage::ACTIVE_CAP_MAX_STREAK + 1))
+            )
+            .fg,
+            theme::danger().fg,
+            "a stuck streak must read as red, matching stale/is_stuck_streak ({status:?})"
+        );
+    }
 }
 
 /// `refresh_spent_accounts` OFF drops a spent account's countdown (no pending
@@ -246,7 +348,7 @@ fn spent_skipped_account_names_its_reset() {
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
-        streak: 0,
+        streaks: StreakCounts::default(),
     };
     let with_window = |util: f64| {
         let mut p = crate::testutil::blank_profile("a");
