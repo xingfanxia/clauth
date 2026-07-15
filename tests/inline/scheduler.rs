@@ -801,7 +801,7 @@ fn kick_suppressed_during_rate_limit_streak() {
 /// passed ceiling (or no block at all) is always due.
 #[test]
 fn kick_block_backoff_decays_toward_the_advertised_ceiling() {
-    use super::{kick_block_after_429, kick_retry_due};
+    use super::{KickBlock, kick_block_after_429, kick_retry_due};
     use crate::oauth::KickRateLimit;
 
     let now = 1_000_000;
@@ -853,6 +853,25 @@ fn kick_block_backoff_decays_toward_the_advertised_ceiling() {
     assert!(!no_hint.rejected);
     assert_eq!(no_hint.until, None);
     assert_eq!(no_hint.next_retry, now + 10);
+
+    // With NO ceiling to clamp to, a deep streak must still cap at the shared
+    // 15min MAX_RETRY_AFTER_MS — an uncapped ladder (~6h at streak 8) would
+    // wedge the window closed for hours after a header-less outage clears.
+    let deep_bare = kick_block_after_429(
+        Some(KickBlock {
+            streak: 8,
+            rejected: false,
+            until: None,
+            next_retry: now,
+        }),
+        &bare,
+        now,
+    );
+    assert!(
+        deep_bare.next_retry <= now + 15 * 60,
+        "ladder must cap at 15min, got +{}s",
+        deep_bare.next_retry - now
+    );
 }
 
 /// Only a switch-grade block moves the fallback chain: the limiter's own

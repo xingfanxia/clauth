@@ -370,9 +370,13 @@ fn kick_rate_limit_at(
     let reset = unified_reset
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|&t| t > now_secs);
+    // Strictly-future only, like `reset` above: `retry-after: 0` mapping to a
+    // now-ceiling would collapse the backoff clamp to "always due" and re-kick
+    // every tick — the trap `next_slot_deferral` already guards on `/usage`.
     let after = retry_after
         .and_then(|v| crate::usage::parse_retry_after_at(v, now_secs))
-        .map(|d| now_secs.saturating_add(i64::try_from(d.as_secs()).unwrap_or(i64::MAX)));
+        .map(|d| now_secs.saturating_add(i64::try_from(d.as_secs()).unwrap_or(i64::MAX)))
+        .filter(|&t| t > now_secs);
     KickRateLimit {
         rejected: unified_status.is_some_and(|s| s.eq_ignore_ascii_case("rejected")),
         until_epoch_secs: reset.max(after),

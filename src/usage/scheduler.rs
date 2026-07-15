@@ -893,7 +893,10 @@ fn kick_block(blocks: &KickBlocks, name: &str) -> Option<KickBlock> {
 /// limiter's advertised ceiling — once that passes, the next tick is always due.
 fn kick_block_after_429(prev: Option<KickBlock>, rl: &KickRateLimit, now_secs: i64) -> KickBlock {
     let streak = prev.map_or(1, |b| b.streak.saturating_add(1));
-    let ladder_secs = (rate_limit_backoff_ms(streak) / 1000).max(1) as i64;
+    // The ladder fn itself is uncapped — every caller applies the shared cap.
+    // Without it a header-less deep streak schedules hours out and wedges the
+    // window closed long after the limiter relents.
+    let ladder_secs = (rate_limit_backoff_ms(streak).min(MAX_RETRY_AFTER_MS) / 1000).max(1) as i64;
     let mut next_retry = now_secs.saturating_add(ladder_secs);
     if let Some(until) = rl.until_epoch_secs {
         next_retry = next_retry.min(until);
@@ -1046,7 +1049,7 @@ fn run_fetch(
                 &entry.name,
                 kicked.opened,
                 kicked.blocked,
-                now_epoch_secs(),
+                now_secs,
             );
             if let Some((access, refresh)) = kicked.rotated.clone() {
                 entry.access_token = access;

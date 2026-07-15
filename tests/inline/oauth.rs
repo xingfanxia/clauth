@@ -1359,6 +1359,17 @@ fn kick_rate_limit_distills_status_reset_and_retry_after() {
     let bare = kick_rate_limit_at(None, None, None, now);
     assert!(!bare.rejected);
     assert_eq!(bare.until_epoch_secs, None);
+
+    // `retry-after: 0` (or any not-in-the-future hint) must yield NO ceiling,
+    // not a ceiling of `now` — a now-ceiling collapses the backoff clamp to
+    // "always due" and re-kicks every tick, the exact trap `next_slot_deferral`
+    // already guards on the /usage side.
+    let zero = kick_rate_limit_at(Some("rejected"), None, Some("0"), now);
+    assert!(zero.rejected);
+    assert_eq!(
+        zero.until_epoch_secs, None,
+        "retry-after: 0 is no usable ceiling"
+    );
 }
 
 /// A live kick 429 carries the limiter's own headers out through `KickError`,
