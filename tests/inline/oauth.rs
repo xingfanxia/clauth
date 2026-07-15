@@ -1339,18 +1339,48 @@ fn token_agent_surfaces_non_2xx_as_ok_not_a_transport_error() {
     let server = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().expect("accept");
         sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        // Drain the ENTIRE request (headers + body) before responding: on Windows
+        // a close() with unread bytes still in the recv buffer emits an abortive
+        // RST (WSAECONNABORTED 10053) and ureq's read of the 400 fails. Linux
+        // closes gracefully, which is why this only bit CI on windows. The GET
+        // sibling never tripped it because a bodyless request drains in one read.
+        let mut req = Vec::new();
         let mut tmp = [0u8; 1024];
-        let _ = sock.read(&mut tmp);
+        loop {
+            match sock.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    req.extend_from_slice(&tmp[..n]);
+                    if let Some(hlen) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let cl = req[..hlen]
+                            .split(|&b| b == b'\n')
+                            .find_map(|line| {
+                                std::str::from_utf8(line)
+                                    .ok()?
+                                    .to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if req.len() >= hlen + 4 + cl {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
         // The shape the real token endpoint answers a dead refresh token with.
         let body = br#"{"error": "invalid_grant"}"#;
         let _ = sock.write_all(
             format!(
-                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n",
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .as_bytes(),
         );
         let _ = sock.write_all(body);
+        let _ = sock.shutdown(std::net::Shutdown::Write);
     });
 
     let url = format!("http://127.0.0.1:{port}/v1/oauth/token");
