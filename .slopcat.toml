@@ -1,0 +1,8 @@
+# clauth prose gate (README, wiki, model/user-facing strings).
+# punct.em-dash stays ON: house prose avoids em-dash asides, and the code +
+# docs were swept to match. Only the two words below are exempted — both read
+# concretely in place ("every desktop platform (Linux, macOS, Windows)",
+# "shell history and process listings"), not the abstract senses the lexicon
+# flags. phrases substring-match case-insensitively.
+[allowlist]
+phrases = ["platform", "process"]
