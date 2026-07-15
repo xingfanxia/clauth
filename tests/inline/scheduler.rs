@@ -2227,11 +2227,22 @@ fn standdown_sweeps_bootstrap_queued_marks() {
 }
 
 /// Single-fetcher lease (#27): when another instance already holds
-/// `usage-fetch.lock`, `tick` must take the stand-down path — hydrate + sweep,
-/// never fetch. Driven through the real `tick` (not `standdown_tick`) so the
-/// lease branch itself is pinned: an external holder forces
-/// `fetch_lease.acquire()` to return `false`, so a bootstrap `Queued` mark is
-/// swept (the stand-down effect) instead of being driven into an HTTP fetch.
+/// `usage-fetch.lock`, `tick` must take the stand-down path. Driven through the
+/// real `tick` (not `standdown_tick`) so the lease branch itself is pinned: an
+/// external holder forces `fetch_lease.acquire()` to return `false`.
+///
+/// `kitty` is stamped NOT due on purpose, which is what makes every assertion
+/// below discriminate between the two branches — and keeps a regression cheap:
+///   * armed + nothing due never calls `fetch_oauth_due`, so a broken lease
+///     fails these asserts instead of firing a live request at the real endpoint
+///     (`tick` hardcodes the real fetcher; there is no seam to inject through it);
+///   * the `Queued` mark survives an armed tick (`clear_orphaned_forced` returns
+///     early on an empty `forced` set, and no worker runs to clear it), while
+///     `standdown_tick` sweeps EVERY `Queued` mark — so the sweep proves the
+///     branch. Were `kitty` due, the armed path would mark-then-clear it too and
+///     the assert would pass either way.
+///   * the store is only seeded by the stand-down hydrate here; an armed tick
+///     with nothing due never reaches `apply_outcome`, so it stays empty.
 #[test]
 fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
     use crate::profile::{AppConfig, AppState};
@@ -2274,9 +2285,17 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         standdown_active: AtomicBool::new(false),
     };
 
-    // A bootstrap-only `Queued` mark: only the stand-down sweep clears it (a
-    // fetch tick would instead flip it to Fetching), so its removal proves the
-    // stand-down path ran rather than the fetch path.
+    // Stamp `kitty` as just-fetched so it is NOT due this tick: an armed tick
+    // would then fetch nothing (no live request on a regression) and leave the
+    // marks/store below untouched, which is what makes each assert discriminate.
+    state
+        .last_fetched
+        .lock()
+        .unwrap()
+        .insert("kitty".to_string(), EpochMs::from_millis(super::now_ms()));
+
+    // A bootstrap-only `Queued` mark: `standdown_tick` sweeps every Queued mark,
+    // while an armed tick with nothing due leaves it in place.
     mark_activity(&state.activity, "kitty", ProfileActivity::Queued);
 
     super::tick(&state);

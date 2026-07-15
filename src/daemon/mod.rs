@@ -78,6 +78,13 @@ const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// kill deadline inside the `StateLock`, leaving only ~10s of slack. If that ever
 /// false-aborts, bound the keychain shell-out (the real fix), do NOT loosen this
 /// deadline — the lease's wedged-daemon recovery depends on it.
+///
+/// SCOPE: `heartbeat` is stamped by the MAIN loop only, so this covers a wedged
+/// main loop. A wedged SCHEDULER thread (which is what actually holds the lease)
+/// keeps the main loop ticking and the feed fresh, so it trips nothing and the
+/// lease is never freed — pre-existing (the retired probe keyed on the same
+/// main-loop freshness), tracked in `docs/todo.md`. Do not read this deadline as
+/// covering the fetch path itself.
 const WATCHDOG_DEADLINE: Duration = Duration::from_secs(30);
 /// How often the watchdog re-checks the tick heartbeat.
 const WATCHDOG_POLL: Duration = Duration::from_secs(10);

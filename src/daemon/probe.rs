@@ -28,7 +28,8 @@ use crate::profile::clauth_dir;
 const DAEMON_STALE_MS: u64 = 30_000;
 
 /// The `● daemon` header dot's three display states, derived from the daemon
-/// singleton flock (presence) + `status.json` mtime (health). Display-only:
+/// singleton flock (presence) + the `generated_at` stamp inside `status.json`
+/// (health — the daemon's own write time, not the file's mtime). Display-only:
 /// nothing here gates fetching — that is [`FetchLease`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DaemonHealth {
