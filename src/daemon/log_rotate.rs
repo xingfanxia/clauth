@@ -109,7 +109,7 @@ fn stderr_file_mode() -> Option<(bool, bool)> {
 pub(crate) fn warn_if_log_cap_defeated() {
     if stderr_file_mode().is_some_and(|(file, append)| log_cap_defeated(file, append)) {
         logline!(
-            "clauth daemon: stderr is a non-append file redirect — the daemon.log size cap \
+            "clauth daemon: stderr is a non-append file redirect: the daemon.log size cap \
              cannot hold and the file will grow unbounded; redirect with `>>` or let launchd's \
              StandardErrorPath open it"
         );

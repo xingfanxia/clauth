@@ -1688,7 +1688,7 @@ fn tick(state: &SchedulerState) {
     if !state.fetch_lease.acquire() {
         if !state.standdown_active.swap(true, Ordering::Relaxed) {
             standdown_transition_log(
-                "clauth: another instance holds the usage-fetch lease — standing \
+                "clauth: another instance holds the usage-fetch lease: standing \
                  down (rendering from the shared cache)",
             );
         }
@@ -1696,7 +1696,7 @@ fn tick(state: &SchedulerState) {
         return;
     }
     if state.standdown_active.swap(false, Ordering::Relaxed) {
-        standdown_transition_log("clauth: acquired the usage-fetch lease — fetching");
+        standdown_transition_log("clauth: acquired the usage-fetch lease: fetching");
     }
 
     // Names pushed by rotation or manual refresh — bypass cadence this tick.

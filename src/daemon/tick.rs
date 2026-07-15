@@ -166,7 +166,10 @@ impl super::Daemon {
             self.fail_switch(
                 target,
                 now,
-                &format!("active '{active}' has unsaved credentials — resolve in the TUI"),
+                &format!(
+                    "active '{active}' has unsaved credentials; {}",
+                    crate::format::RESOLVE_IN_TUI
+                ),
             );
             return;
         }
@@ -184,8 +187,8 @@ impl super::Daemon {
                 // failure (drop, not retry) — clear any backoff for this target.
                 self.last_state_mtime = app_state_mtime();
                 logline!(
-                    "clauth daemon: login for '{0}' revoked — run: clauth login {0}",
-                    target
+                    "clauth daemon: {}",
+                    crate::format::login_expired(&target).line()
                 );
                 self.switch_backoff = None;
                 return;
@@ -291,7 +294,7 @@ impl super::Daemon {
         };
         if active_diverged_unsaved(&active) {
             logline!(
-                "clauth daemon: skipping switch-off — active '{active}' has unsaved credentials"
+                "clauth daemon: skipping switch-off: active '{active}' has unsaved credentials"
             );
             return;
         }
@@ -311,7 +314,7 @@ impl super::Daemon {
             Ok(mtime) => {
                 self.rebuild_tokens();
                 self.last_state_mtime = mtime;
-                logline!("clauth daemon: switched off — all accounts spent");
+                logline!("clauth daemon: switched off: all accounts spent");
             }
             Err(e) => logline!("clauth daemon: switch-off failed: {e}"),
         }

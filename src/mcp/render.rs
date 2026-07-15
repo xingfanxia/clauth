@@ -78,7 +78,7 @@ pub(crate) fn switch_effect(auth: &SessionAuth) -> String {
     match auth {
         SessionAuth::Global => "`switch` repoints the global `~/.claude` credentials THIS \
 session reads; Claude Code reloads them on its next token refresh, so this session would \
-start acting as the switched profile, disruptive mid-session. To use another account \
+start acting as the switched profile mid-task. To use another account \
 without disturbing this one, use the `delegate` tool."
             .to_string(),
         SessionAuth::IsolatedRuntime(name) => format!(

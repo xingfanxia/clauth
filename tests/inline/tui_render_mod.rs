@@ -124,6 +124,46 @@ fn dump(app: &App, w: u16, h: u16) -> String {
 }
 
 #[test]
+fn a_two_line_toast_bolds_the_head_and_dims_the_detail() {
+    use crate::tui::app::ToastKind;
+    use ratatui::style::Modifier;
+
+    // Centralized diagnostics render a `head\ndetail` body: head bold, detail
+    // dim below it. No toast carried a detail line before, so this render path
+    // (`toasts::draw`'s detail loop) was never exercised until now.
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.toast(ToastKind::Danger, "QHEAD\nQNOTE");
+
+    let (w, h) = (80u16, 24u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let out = dump(&app, w, h);
+
+    let modifier_at = |needle: &str| -> Modifier {
+        let (row, line) = out
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` missing from toast:\n{out}"));
+        let col = line.find(needle).unwrap();
+        buf.content[row * (w as usize) + col].modifier
+    };
+
+    assert!(
+        modifier_at("QHEAD").contains(Modifier::BOLD),
+        "toast head is bold:\n{out}"
+    );
+    assert!(
+        !modifier_at("QNOTE").contains(Modifier::BOLD),
+        "toast detail line is dim, not bold:\n{out}"
+    );
+}
+
+#[test]
 fn login_modal_drops_the_url_and_offers_a_retry() {
     use crate::tui::app::{LoginSession, LoginStage, Modal, Tab};
     let mut app = App::new(AppConfig {

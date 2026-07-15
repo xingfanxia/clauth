@@ -161,7 +161,7 @@ pub(crate) fn serve() -> Result<()> {
         .open(dir.join(LOCK_FILE))
         .context("failed to open the clauth daemon lock file")?;
     if lock_file.try_lock().is_err() {
-        logline!("clauth daemon: another instance holds the lock — standing by until it exits");
+        logline!("clauth daemon: another instance holds the lock: standing by until it exits");
         lock_file
             .lock()
             .context("failed to acquire the clauth daemon lock")?;
@@ -408,7 +408,7 @@ impl Daemon {
                         WATCHDOG_DEADLINE.as_millis() as u64,
                         || {
                             logline!(
-                                "clauth daemon: watchdog — no tick within {}s; aborting for a \
+                                "clauth daemon: watchdog: no tick within {}s; aborting for a \
                                  clean launchd restart",
                                 WATCHDOG_DEADLINE.as_secs()
                             );
@@ -421,8 +421,8 @@ impl Daemon {
             // No watchdog = a wedged loop hangs forever with launchd seeing a
             // live process. Say so loudly; the daemon still runs.
             logline!(
-                "clauth daemon: failed to spawn the anti-wedge watchdog: {e} — \
-                 a stalled tick will NOT auto-restart this process"
+                "clauth daemon: failed to spawn the anti-wedge watchdog: {e}. \
+                 A stalled tick will NOT auto-restart this process"
             );
         }
     }

@@ -157,14 +157,13 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     if outgoing.as_deref() != Some(canonical) {
         match oauth::ensure_installable(&config, canonical, oauth::refresh_result) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
-            oauth::AuthGate::Broken => bail!(
-                "login for '{canonical}' has expired (refresh token revoked or invalid). \
-                 run: clauth login {canonical}"
-            ),
-            oauth::AuthGate::Transient(e) => bail!(
-                "could not refresh '{canonical}' before switching ({e}); check your \
-                 connection and retry"
-            ),
+            oauth::AuthGate::Broken => bail!("{}", crate::format::login_expired(canonical).line()),
+            oauth::AuthGate::Transient(e) => {
+                bail!(
+                    "{}",
+                    crate::format::refresh_transient(canonical, &e.to_string()).line()
+                )
+            }
         }
     }
 
@@ -260,14 +259,13 @@ pub(crate) fn switch_profile_noninteractive(
     if previous.as_deref() != Some(target) {
         match oauth::ensure_installable(config, target, refresher) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
-            oauth::AuthGate::Broken => bail!(
-                "login for '{target}' has expired (refresh token revoked or invalid). \
-                 run: clauth login {target}"
-            ),
-            oauth::AuthGate::Transient(e) => bail!(
-                "could not refresh '{target}' before switching ({e}); check your \
-                 connection and retry"
-            ),
+            oauth::AuthGate::Broken => bail!("{}", crate::format::login_expired(target).line()),
+            oauth::AuthGate::Transient(e) => {
+                bail!(
+                    "{}",
+                    crate::format::refresh_transient(target, &e.to_string()).line()
+                )
+            }
         }
     }
 
@@ -287,12 +285,13 @@ pub(crate) fn switch_profile_noninteractive(
             Some(DivergenceChoice::Discard) => switch_profile_discard(config, target)?,
             Some(DivergenceChoice::NewProfile) => bail!(
                 "active profile has a divergent login and the divergence default is \
-                 'save as new profile', which needs an interactive name prompt; \
-                 resolve it in the clauth TUI"
+                 'save as new profile', which needs an interactive name prompt; {}",
+                crate::format::RESOLVE_IN_TUI
             ),
             None => bail!(
                 "active profile has uncaptured credentials in ~/.claude and no \
-                 divergence default is set; resolve it in the clauth TUI"
+                 divergence default is set; {}",
+                crate::format::RESOLVE_IN_TUI
             ),
         }
     } else {

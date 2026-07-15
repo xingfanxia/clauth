@@ -14,7 +14,7 @@ done
 
 # If cargo is available, prefer it (unless --nocargo was passed)
 if [[ "${NOCARGO}" -eq 0 ]] && command -v cargo &>/dev/null; then
-    echo "cargo detected — installing via cargo..."
+    echo "cargo detected, installing via cargo..."
     cargo install clauth
     echo ""
     echo "To uninstall, run: cargo uninstall clauth"
@@ -73,10 +73,10 @@ echo "Verifying checksum..."
 
 if command -v curl &>/dev/null; then
     curl -fsSL "${SUMS_URL}" -o "${TMP_SUMS}" \
-        || { echo "Error: failed to download sha256sums.txt — aborting install" >&2; exit 1; }
+        || { echo "Error: failed to download sha256sums.txt. Aborting install" >&2; exit 1; }
 elif command -v wget &>/dev/null; then
     wget -q "${SUMS_URL}" -O "${TMP_SUMS}" \
-        || { echo "Error: failed to download sha256sums.txt — aborting install" >&2; exit 1; }
+        || { echo "Error: failed to download sha256sums.txt. Aborting install" >&2; exit 1; }
 fi
 
 # Detect portable sha256 tool
@@ -93,7 +93,7 @@ fi
 EXPECTED_HEX=$(grep -E "^[0-9a-f]{64}  ${ASSET}$" "${TMP_SUMS}" | awk '{print $1}')
 
 if [[ -z "${EXPECTED_HEX}" ]]; then
-    echo "Error: ${ASSET} not found in sha256sums.txt — aborting install" >&2
+    echo "Error: ${ASSET} not found in sha256sums.txt. Aborting install" >&2
     exit 1
 fi
 

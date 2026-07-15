@@ -171,7 +171,8 @@ pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
                 let target_bytes = std::fs::read(&target).ok();
                 if live_bytes != target_bytes {
                     anyhow::bail!(
-                        "refusing to replace .credentials.json: live file differs from profile '{name}'; resolve the divergence in the clauth TUI first"
+                        "refusing to replace .credentials.json: live file differs from profile '{name}'; {} first",
+                        crate::format::RESOLVE_IN_TUI
                     );
                 }
             }

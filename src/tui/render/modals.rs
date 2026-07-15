@@ -246,7 +246,7 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
 fn divergence_action_text(action: &DivergenceAction, active: &str) -> String {
     match action {
         DivergenceAction::SwitchToOwner(owner) => {
-            format!("switch to '{owner}' — this login is its account")
+            format!("switch to '{owner}' (this login is its account)")
         }
         DivergenceAction::Choice(DivergenceChoice::Overwrite) => {
             format!("overwrite '{active}' with this login")
