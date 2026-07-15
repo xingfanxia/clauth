@@ -17,10 +17,14 @@ stays the only resolution surface.
   process lifetime. A second `clauth daemon` blocks in standby and takes over
   the moment the holder exits — a dead holder's flock auto-releases, so a
   supervisor (`launchd`/`systemd`) with restart-on-crash keeps exactly one
-  scheduler alive without pidfile bookkeeping.
+  scheduler alive without pidfile bookkeeping. The TUI header's `● daemon` dot
+  reads this lock (presence) plus `status.json` freshness (green = fresh feed,
+  amber = stalling, hidden = no daemon) to show whether one is running.
 - **Watchdog**: the state flock has no deadline and a switch shells out inside
-  it, so a wedged tick can freeze the single-threaded loop. If no tick
-  completes within 60 s the daemon `abort()`s for a clean supervisor restart.
+  it, so a wedged tick can freeze the single-threaded loop. If no tick completes
+  within 30 s the daemon `abort()`s for a clean supervisor restart — tight enough
+  that a wedged fetcher frees the usage lease (below) fast, with a legit ~20 s
+  keychain switch still inside the margin.
 - **Log hygiene**: every daemon-visible stderr line carries an ISO-8601 UTC
   prefix, enabled only in daemon mode. An interactive terminal instead diverts
   its lines to `~/.clauth/clauth.log` so a background thread never paints over
@@ -32,12 +36,17 @@ stays the only resolution surface.
   defeated. The daemon checks its own stderr at boot and warns loudly when it
   is a non-append file, so a defeated cap shows up in the log instead of only
   in this page.
-- **Dual-scheduler dedup (TUI stand-down)**: a TUI opened alongside the daemon
-  probes the singleton lock + feed freshness every tick and stands its own
-  refresher down while the daemon is live — rendering from the daemon's disk
-  caches instead of double-polling the usage API, double-rotating the
-  single-use refresh chain, or re-deciding its switches. It re-arms within one
-  tick of the daemon dying (lock released) or wedging (feed stale).
+- **Single usage fetcher (`usage-fetch.lock` lease)**: every instance — the
+  daemon and each open TUI — runs the same refresher, but only the one holding
+  the `usage-fetch.lock` flock fetches usage, rotates tokens, and decides
+  switches. The rest hydrate from the shared disk caches instead of double-polling
+  the usage API, double-rotating the single-use refresh chain, or re-deciding
+  switches. The lease is first-come and held for the process lifetime — no
+  preemption, so the switch-decider never thrashes between processes; a waiter
+  takes it over within one tick of the holder exiting (flock auto-release). The
+  daemon normally boots first and holds it, but a TUI already fetching keeps the
+  lease until it closes, and the daemon then hydrates while still publishing
+  `status.json` every tick.
 
 ## `~/.clauth/status.json`
 
