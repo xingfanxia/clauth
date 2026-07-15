@@ -53,11 +53,11 @@ pub(crate) fn login_expired(name: &str) -> Message {
 }
 
 /// A refresh that failed for a transient reason (network): this switch is
-/// refused but the login is not quarantined — retry is the fix.
+/// refused but the login is not quarantined. Retry is the fix.
 pub(crate) fn refresh_transient(name: &str, err: &str) -> Message {
     Message {
-        head: format!("could not refresh '{name}' before switching ({err})"),
-        detail: Some("check your connection and retry".to_string()),
+        head: format!("could not refresh '{name}' before switching"),
+        detail: Some(format!("{err}. check your connection and retry")),
     }
 }
 

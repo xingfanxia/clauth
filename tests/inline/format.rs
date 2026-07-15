@@ -26,16 +26,21 @@ fn login_expired_shares_one_head_across_line_and_toast() {
 }
 
 #[test]
-fn refresh_transient_carries_the_error_in_the_head() {
+fn refresh_transient_carries_the_error_in_the_detail() {
     let m = refresh_transient("flaky", "no network");
     assert_eq!(
         m.line(),
-        "could not refresh 'flaky' before switching (no network): check your connection and retry"
+        "could not refresh 'flaky' before switching: no network. check your connection and retry"
     );
-    // The switch-gate toast test greps this substring; keep it in the head.
-    assert!(
-        m.toast()
-            .starts_with("could not refresh 'flaky' before switching (no network)")
+    // The head stays fixed-length regardless of the (arbitrary, possibly long)
+    // error text, so it can never wrap the toast's bold first line.
+    assert_eq!(
+        m.toast().lines().next().unwrap(),
+        "could not refresh 'flaky' before switching"
+    );
+    assert_eq!(
+        m.toast().lines().nth(1).unwrap(),
+        "no network. check your connection and retry"
     );
 }
 
