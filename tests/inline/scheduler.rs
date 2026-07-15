@@ -855,6 +855,57 @@ fn kick_block_backoff_decays_toward_the_advertised_ceiling() {
     assert_eq!(no_hint.next_retry, now + 10);
 }
 
+/// Only a switch-grade block moves the fallback chain: the limiter's own
+/// `rejected` verdict, ≥2 consecutive kicks, ceiling still ahead. Anything
+/// weaker gets the pill + backoff but never rotates accounts.
+#[test]
+fn only_a_switch_grade_kick_block_rotates_the_chain() {
+    use super::{KickBlock, KickBlocks, kick_block_switch_grade, kick_rejected_names};
+
+    let now = 3_000_000;
+    let grade = KickBlock {
+        streak: 2,
+        rejected: true,
+        until: Some(now + 600),
+        next_retry: now + 30,
+    };
+    assert!(kick_block_switch_grade(&grade, now));
+    assert!(
+        !kick_block_switch_grade(&KickBlock { streak: 1, ..grade }, now),
+        "one 429 must not move the chain — flap guard"
+    );
+    assert!(
+        !kick_block_switch_grade(
+            &KickBlock {
+                rejected: false,
+                ..grade
+            },
+            now
+        ),
+        "a burst 429 without the limiter's rejected verdict must not move the chain"
+    );
+    assert!(
+        !kick_block_switch_grade(
+            &KickBlock {
+                until: None,
+                ..grade
+            },
+            now
+        ),
+        "no advertised ceiling → no switch-grade claim"
+    );
+    assert!(
+        !kick_block_switch_grade(&grade, now + 601),
+        "a passed ceiling ends the claim — the next kick re-proves it or clears"
+    );
+
+    let blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::from([
+        ("dead".to_string(), grade),
+        ("blip".to_string(), KickBlock { streak: 1, ..grade }),
+    ])));
+    assert_eq!(kick_rejected_names(&blocks, now), vec!["dead".to_string()]);
+}
+
 /// `note_kick_outcome` lifecycle: a 429 upserts the block and writes the
 /// per-profile cache file; a later successful kick clears both. A no-metadata
 /// failure (transport, 401 path) leaves existing state untouched.
@@ -1012,6 +1063,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &store,
         &status,
         &streaks,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
         &pending,
         &pending_off,
@@ -1029,6 +1081,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &store,
         &status,
         &streaks,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
         &pending,
         &pending_off,
@@ -1130,6 +1183,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
             &store,
             &status,
             &streaks,
+            &Arc::new(RankedMutex::new(HashMap::new())),
             &activity,
             &pending,
             &pending_off,

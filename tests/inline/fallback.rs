@@ -587,8 +587,14 @@ fn find_recovered_returns_first_member_below_threshold() {
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0),
+        find_recovered_member(&members, &store, 98.0, &[]),
         Some("b".to_string()),
+    );
+    assert_eq!(
+        find_recovered_member(&members, &store, 98.0, &["b".to_string()]),
+        None,
+        "a kick-rejected member's idle usage is not recovery — its account \
+         still refuses inference"
     );
 }
 
@@ -607,7 +613,7 @@ fn find_recovered_skips_exhausted_members() {
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
-    assert_eq!(find_recovered_member(&members, &store, 98.0), None);
+    assert_eq!(find_recovered_member(&members, &store, 98.0, &[]), None);
 }
 
 #[test]
@@ -625,7 +631,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
-    assert_eq!(find_recovered_member(&members, &store, 98.0), None);
+    assert_eq!(find_recovered_member(&members, &store, 98.0, &[]), None);
 }
 
 #[test]
@@ -644,7 +650,7 @@ fn find_recovered_uses_threshold_per_member() {
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0),
+        find_recovered_member(&members, &store, 98.0, &[]),
         Some("b".to_string()),
     );
 }
@@ -664,7 +670,7 @@ fn find_recovered_recovers_when_window_expired() {
         usage_info(Some(window(100.0, Some(expired_reset())))),
     )]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0),
+        find_recovered_member(&members, &store, 98.0, &[]),
         Some("a".to_string()),
     );
 }
@@ -680,7 +686,7 @@ fn find_recovered_recovers_when_windowless() {
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0),
+        find_recovered_member(&members, &store, 98.0, &[]),
         Some("a".to_string()),
     );
 }
@@ -696,7 +702,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0),
+        find_recovered_member(&members, &store, 98.0, &[]),
         Some("a".to_string()),
     );
 }
@@ -868,6 +874,65 @@ fn auto_switch_broken_active_walks_away_despite_stale_headroom() {
         next_auto_switch_target(&snap, &store),
         Some(SwitchAction::To("b".into())),
     );
+}
+
+// Kick-rejected active (the messages limiter refusing its inference while
+// `/usage` stays green): idle-looking usage must not hold the chain on it —
+// the walk bypasses the exhaustion gate exactly like `broken` and leaves for
+// the healthy sibling.
+#[test]
+fn auto_switch_kick_rejected_active_walks_away_despite_idle_usage() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.kick_rejected = vec!["a".to_string()];
+    let store = store_with_infos(vec![
+        // The rejected active's live read: an idle, lapsed window — exactly the
+        // shape the 2026-07-15 outage froze uwuclxdy in while healthy siblings
+        // idled with live windows.
+        ("a", usage_info(Some(window(2.0, Some(expired_reset()))))),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".into())),
+    );
+}
+
+// A kick-rejected CANDIDATE is walked around in both passes — headroom and
+// last-resort alike — because its account rejects inference no matter how idle
+// its usage reads.
+#[test]
+fn auto_switch_never_targets_a_kick_rejected_member() {
+    let mut profiles = vec![
+        profile_with_util("a", Some(95.0), None),
+        profile_with_util("b", Some(95.0), None),
+        profile_with_util("c", Some(95.0), None),
+    ];
+    profiles[2].last_resort = true;
+    let config = config_with_chain(profiles, "a");
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.kick_rejected = vec!["b".to_string()];
+    let store = store_with_infos(vec![
+        // Exhausted active, idle-but-rejected b → the walk must land on c.
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(5.0, Some(live_reset()))))),
+        ("c", usage_info(Some(window(20.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".into())),
+    );
+
+    // Same chain with the rejection also covering the last resort: nothing
+    // viable remains and the active stays put (no Off — wrap_off is unset).
+    snap.kick_rejected = vec!["b".to_string(), "c".to_string()];
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
 }
 
 // Broken active with NO viable member: stays put. Wrap-off in particular must
@@ -1320,14 +1385,14 @@ fn weekly_dead_member_never_recovers() {
         "b",
         usage_both(None, Some(window(100.0, Some(live_reset())))),
     )]);
-    assert_eq!(find_recovered_member(&members, &dead, 98.0), None);
+    assert_eq!(find_recovered_member(&members, &dead, 98.0, &[]), None);
     // Same member with the weekly reset in the past HAS recovered.
     let renewed = store_with_infos(vec![(
         "b",
         usage_both(None, Some(window(100.0, Some(expired_reset())))),
     )]);
     assert_eq!(
-        find_recovered_member(&members, &renewed, 98.0),
+        find_recovered_member(&members, &renewed, 98.0, &[]),
         Some("b".to_string())
     );
 }

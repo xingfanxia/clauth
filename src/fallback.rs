@@ -274,6 +274,14 @@ pub(crate) struct ChainSnapshot {
     /// Snapshot of `AppState::weekly_switch_threshold_pct()` — the chain-wide
     /// weekly (7d) exhaustion line both walk directions gate on.
     pub(crate) weekly_pct: f64,
+    /// Members whose 5h auto-start kick the messages limiter is REJECTING
+    /// (switch-grade `KickBlock`s: the limiter's own `rejected` verdict, ≥2
+    /// consecutive kicks, advertised ceiling still ahead). Not config state —
+    /// [`snapshot_chain`] leaves it empty and the scheduler's scan fills it
+    /// from the live kick-block map. A rejected member can't serve inference
+    /// even with idle-looking usage, so it is walked around like `broken`, and
+    /// a rejected ACTIVE bypasses the exhaustion gate the same way.
+    pub(crate) kick_rejected: Vec<String>,
 }
 
 /// Snapshot active profile + chain + per-member thresholds out of `AppConfig`.
@@ -310,6 +318,7 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
         burn_aware: config.state.burn_aware_switching,
         interval_ms: config.state.refresh_interval_ms,
         weekly_pct: config.state.weekly_switch_threshold_pct(),
+        kick_rejected: Vec::new(),
     })
 }
 
@@ -508,6 +517,14 @@ pub(crate) fn next_auto_switch_target(
     // only after a rejected refresh AND a failed live-mirror adopt), and the
     // walk below never consults the broken active's own usage.
     let active_broken = snapshot.broken.iter().any(|b| b == &active.name);
+    // A kick-rejected active is broken's messages-limiter analogue: its usage
+    // can read as idle headroom (`/usage` stays 200 through the outage) while
+    // every inference request is rejected, so exhaustion can't be a
+    // precondition for leaving it either. Unlike `broken` it is transient —
+    // the block clears itself once a kick lands — so only the switch-grade
+    // form (limiter-confirmed `rejected`, ≥2 kicks, ceiling ahead) reaches
+    // this snapshot at all.
+    let active_kick_rejected = snapshot.kick_rejected.iter().any(|k| k == &active.name);
     let active_exhausted = is_exhausted_active_from_store(
         &active.name,
         active.threshold,
@@ -516,13 +533,17 @@ pub(crate) fn next_auto_switch_target(
         store,
         snapshot.weekly_pct,
     );
-    if !active_broken && !active_exhausted {
+    if !active_broken && !active_kick_rejected && !active_exhausted {
         return None;
     }
 
     let skip = |i: usize| {
         snapshot.chain[i].name == active.name
             || snapshot.broken.iter().any(|b| b == &snapshot.chain[i].name)
+            || snapshot
+                .kick_rejected
+                .iter()
+                .any(|k| k == &snapshot.chain[i].name)
     };
     let walk = |accept: &dyn Fn(&ChainMember) -> bool| -> Option<String> {
         let pick = walk_chain(active_idx, len, &skip, &|i| accept(&snapshot.chain[i]));
@@ -570,13 +591,19 @@ pub(crate) fn next_auto_switch_target(
 /// Find the first chain member whose utilization is below its threshold
 /// (has recovered headroom after switch-off-all). Returns the member name.
 /// Safe to call without holding the config lock — reads from [`UsageStore`].
+/// `kick_rejected` members are never "recovered": their idle-looking usage is
+/// exactly the shape a messages-limiter rejection freezes them in.
 pub(crate) fn find_recovered_member(
     chain: &[ChainMember],
     store: &UsageStore,
     weekly_pct: f64,
+    kick_rejected: &[String],
 ) -> Option<String> {
     let now = now_epoch_secs();
     for member in chain {
+        if kick_rejected.iter().any(|k| k == &member.name) {
+            continue;
+        }
         // A fetched entry whose 5h window is absent or past its reset is idle
         // headroom; a live window recovers only below the member's threshold.
         // An absent entry (never fetched) stays undecidable. A weekly-dead

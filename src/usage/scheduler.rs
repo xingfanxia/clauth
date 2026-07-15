@@ -912,6 +912,29 @@ fn kick_retry_due(block: Option<&KickBlock>, now_secs: i64) -> bool {
     block.is_none_or(|b| now_secs >= b.next_retry)
 }
 
+/// Whether a kick block is switch-grade — strong enough to rotate the fallback
+/// chain around its profile: the limiter's own `rejected` verdict, confirmed by
+/// at least two consecutive kicks, with the advertised ceiling still ahead. A
+/// single header-less burst 429 gets the pill and the backoff but never moves
+/// the chain.
+fn kick_block_switch_grade(block: &KickBlock, now_secs: i64) -> bool {
+    block.rejected && block.streak >= 2 && block.until.is_some_and(|u| now_secs < u)
+}
+
+/// Names whose live kick block is switch-grade ([`kick_block_switch_grade`]),
+/// copied out under one short leaf lock for the auto-switch/recovery scans.
+fn kick_rejected_names(blocks: &KickBlocks, now_secs: i64) -> Vec<String> {
+    blocks
+        .lock()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, b)| kick_block_switch_grade(b, now_secs))
+                .map(|(n, _)| n.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Fold a kick's outcome into the block map + its per-profile cache file, and
 /// logline the state TRANSITIONS only (silent while a streak merely grows).
 fn note_kick_outcome(
@@ -1950,6 +1973,7 @@ fn tick(state: &SchedulerState) {
         &state.store,
         &state.status,
         &state.poll_streaks,
+        &state.kick_blocks,
         &state.activity,
         &state.pending_switch,
         &state.pending_switch_off,
@@ -1958,6 +1982,7 @@ fn tick(state: &SchedulerState) {
         &state.config,
         &state.store,
         &state.status,
+        &state.kick_blocks,
         &state.pending_switch,
     );
 }
@@ -2202,11 +2227,13 @@ pub(crate) fn is_stuck_streak(streak: u32) -> bool {
     streak > ACTIVE_CAP_MAX_STREAK
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     status: &StatusStore,
     streaks: &PollStreaks,
+    kick_blocks: &KickBlocks,
     _activity: &ActivityStore,
     pending_switch: &PendingSwitch,
     pending_switch_off: &PendingSwitchOff,
@@ -2236,9 +2263,13 @@ fn scan_auto_switch(
         };
         crate::fallback::snapshot_chain(&cfg)
     };
-    let Some(snapshot) = snapshot else {
+    let Some(mut snapshot) = snapshot else {
         return;
     };
+    // Not config state, so `snapshot_chain` can't fill it: the walk skips
+    // switch-grade kick-rejected members and a rejected ACTIVE bypasses the
+    // exhaustion gate (its usage reads idle while inference is refused).
+    snapshot.kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
 
     // Only act on a confirmed-live read of the active profile — a stale or
     // synthetic store entry would drive a false switch (see `decision_fresh`).
@@ -2287,6 +2318,7 @@ fn scan_recovery(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     status: &StatusStore,
+    kick_blocks: &KickBlocks,
     pending_switch: &PendingSwitch,
 ) {
     // Skip when a previous switch is still pending.
@@ -2337,7 +2369,11 @@ fn scan_recovery(
         .filter(|m| decision_fresh(status, &m.name))
         .collect();
 
-    if let Some(name) = crate::fallback::find_recovered_member(&members, store, weekly_pct)
+    // A switch-grade kick-rejected member is not "recovered" — its idle-looking
+    // usage is exactly what the messages-limiter rejection freezes it in.
+    let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
+    if let Some(name) =
+        crate::fallback::find_recovered_member(&members, store, weekly_pct, &kick_rejected)
         && let Ok(mut p) = pending_switch.lock()
     {
         p.insert(name);
