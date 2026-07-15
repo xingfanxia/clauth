@@ -632,23 +632,43 @@ fn token_parse_error_redacts_the_2xx_body() {
 
 // ── refresh_rejection_is_terminal (the 400/401/403 truth table) ─────────────
 
-/// 400/401 are terminal regardless of body (OAuth2 reports a dead refresh
-/// token as 400 `invalid_grant`; some proxies answer 401). 403 is terminal
-/// ONLY with a confirming `invalid_grant` body — WAF/geo/challenge blocks
-/// answer 403 too, and quarantining on one would take a healthy account out
-/// of rotation until its next successful refresh.
+/// 400/403 are terminal ONLY with a confirming `invalid_grant` body. The token
+/// endpoint answers a dead refresh token with the flat OAuth2 envelope
+/// (`{"error": "invalid_grant", …}`) but answers a request IT can't parse with
+/// Anthropic's nested API envelope (`invalid_request_error`) under the same
+/// 400 — and a WAF/geo/challenge block answers 403 with neither. Quarantining
+/// without the confirmation takes a healthy account out of rotation, and when
+/// the cause is our own request shape it takes EVERY account at once. 401 stays
+/// terminal regardless of body (some proxies answer it for a dead token).
+/// Bodies are real bytes captured from the live endpoint (`docs/wire-parity.md`).
 #[test]
 fn refresh_rejection_terminal_truth_table() {
-    assert!(refresh_rejection_is_terminal(400, "invalid_grant"));
+    // Dead refresh token — the flat OAuth2 envelope.
     assert!(refresh_rejection_is_terminal(
         400,
-        "refresh token not found or invalid"
+        r#"{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}"#
     ));
-    assert!(refresh_rejection_is_terminal(401, "unauthorized"));
     assert!(refresh_rejection_is_terminal(
         403,
         r#"{"error":"invalid_grant"}"#
     ));
+    assert!(refresh_rejection_is_terminal(401, "unauthorized"));
+
+    // Our request shape is wrong, not the token: Anthropic's API envelope under
+    // a 400. Quarantining on these would flag every profile in the chain for a
+    // client-side bug, each recoverable only by a manual re-login.
+    for body in [
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"Client with id 00000000-0000-0000-0000-000000000000 not found"},"request_id":"req_x"}"#,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid request format"},"request_id":"req_x"}"#,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"Unsupported grant_type: not_a_grant"},"request_id":"req_x"}"#,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON body"},"request_id":"req_x"}"#,
+    ] {
+        assert!(
+            !refresh_rejection_is_terminal(400, body),
+            "a request-shape 400 must not quarantine: {body}"
+        );
+    }
+
     assert!(!refresh_rejection_is_terminal(
         403,
         "<html>Access denied by security policy</html>"

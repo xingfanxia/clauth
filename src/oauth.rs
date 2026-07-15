@@ -189,13 +189,6 @@ impl From<RefreshError> for anyhow::Error {
     }
 }
 
-/// [`refresh`] preserving the permanent-vs-transient distinction the AUTH-1 gate
-/// needs. A 400/401 from the token endpoint means the refresh token is
-/// revoked/invalid (quarantine — OAuth2 reports a dead refresh token as a 400
-/// `invalid_grant`; some proxies answer 401). A 403 is terminal only when the
-/// body actually confirms `invalid_grant`: WAF/geo/challenge blocks answer 403
-/// too, and quarantining on one would take a healthy account out of rotation.
-/// A transport error, 429, or 5xx is transient (retry, never quarantine).
 /// The refresh request body CC's axios client posts to the token endpoint.
 /// Pure so the exact wire JSON (field set + canonical `scope` order) is
 /// golden-tested against the captured CC shape (`docs/wire-parity.md`).
@@ -226,6 +219,10 @@ fn exchange_body(
     }))
 }
 
+/// [`refresh`] preserving the permanent-vs-transient distinction the AUTH-1 gate
+/// needs. Terminal (quarantine) only when the endpoint confirms the refresh
+/// token itself is dead; a transport error, 429, or 5xx is transient (retry,
+/// never quarantine). See [`refresh_rejection_is_terminal`] for the split.
 pub(crate) fn refresh_result(
     refresh_token: &str,
     scopes: Option<&str>,
@@ -257,11 +254,25 @@ pub(crate) fn refresh_result(
 }
 
 /// Whether a token-endpoint rejection means the refresh token itself is dead
-/// (quarantine) rather than the request being blocked (retry). Extracted pure
-/// so the truth table is pinned offline
+/// (quarantine) rather than the request being rejected or blocked (retry).
+/// Extracted pure so the truth table is pinned offline
 /// (`refresh_rejection_terminal_truth_table`).
+///
+/// A 400/403 needs the body to confirm `invalid_grant`. The endpoint answers a
+/// dead token with the flat OAuth2 envelope, but reuses the same 400 for any
+/// request it can't parse — with Anthropic's `invalid_request_error` envelope
+/// instead. Quarantining on an unconfirmed 400 would flag every profile in the
+/// chain the moment our own request shape drifts (a `client_id` bump, a scope
+/// re-spelling), each recoverable only by a manual re-login; the same reasoning
+/// already keeps a WAF/geo 403 out of quarantine. 401 stays terminal on status
+/// alone: the endpoint never uses it for a live token, and a proxy that answers
+/// one for a dead token carries no body to confirm.
 fn refresh_rejection_is_terminal(status: u16, body: &str) -> bool {
-    matches!(status, 400 | 401) || (status == 403 && body.contains("invalid_grant"))
+    match status {
+        400 | 403 => body.contains("invalid_grant"),
+        401 => true,
+        _ => false,
+    }
 }
 
 pub(crate) fn refresh(refresh_token: &str, scopes: Option<&str>) -> Result<TokenResponse> {
