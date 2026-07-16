@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -14,8 +14,8 @@ use super::super::app::App;
 use super::super::theme;
 use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
 use super::panes::{
-    draw_profile_selector, empty_state, help_tooltip_lines, key_cell, section_box,
-    section_box_verbatim, selector_width,
+    draw_profile_selector, empty_state, help_tooltip_lines, key_cell, master_detail, section_box,
+    section_box_verbatim,
 };
 use crate::format::plan_label;
 use crate::profile::Profile;
@@ -71,14 +71,11 @@ struct HeaderState {
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let [selector_area, detail_area] = Layout::horizontal([
-        Constraint::Length(selector_width(area.width)),
-        Constraint::Min(20),
-    ])
-    .areas(area);
+    let items = app.config().profiles.len();
+    let (selector, detail) = master_detail(area, items);
 
-    draw_profile_selector(frame, selector_area, app, app.profile_cursor, true);
-    draw_usage_detail(frame, detail_area, app);
+    draw_profile_selector(frame, selector, app, app.profile_cursor, true);
+    draw_usage_detail(frame, detail, app);
 }
 
 fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {

@@ -596,7 +596,7 @@ fn chain_row_switch_hint_rides_the_target_row() {
     let config = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     let cfg = app.config();
-    let row = chain_row(&cfg, "a", 0, 0, 8, 3, None, Some(7200));
+    let row = chain_row(&cfg, "a", 0, 0, 8, GAUGE_W, 3, None, Some(7200));
     let base = row.base_width();
     let line = row.into_line(base + TRAILER_GAP, 60);
     let text = line_text(&line);
@@ -699,6 +699,7 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
         0,
         0,
         8,
+        GAUGE_W,
         3,
         Some(BlockedReason::AuthBroken),
         Some(7200),
@@ -728,6 +729,7 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
             0,
             0,
             8,
+            GAUGE_W,
             3,
             Some(BlockedReason::AuthBroken),
             Some(7200),

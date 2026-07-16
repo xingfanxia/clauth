@@ -8,7 +8,7 @@
 //! a read-only timeline the list descends into with enter; up/down scrolls it.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
@@ -17,9 +17,7 @@ use ratatui::widgets::{Block, Paragraph};
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
 use super::format::{clock_label, relative_age, spinner_frame};
-use super::panes::{
-    draw_scrollbar, empty_state, key_cell, section_box, selector_width, wrap_words,
-};
+use super::panes::{draw_scrollbar, empty_state, key_cell, master_detail, section_box, wrap_words};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase, shorten_component_status};
 
 /// Detail-pane key column width (matches the usage tab's `KEY_W`).
@@ -28,14 +26,11 @@ const KEY_W: usize = 11;
 const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let [list_area, detail_area] = Layout::horizontal([
-        Constraint::Length(selector_width(area.width)),
-        Constraint::Min(20),
-    ])
-    .areas(area);
+    // Each incident renders two rows (title + phase pill) in the list.
+    let (list, detail) = master_detail(area, app.status.incidents.len() * 2);
 
-    draw_incident_list(frame, list_area, app);
-    draw_incident_detail(frame, detail_area, app);
+    draw_incident_list(frame, list, app);
+    draw_incident_detail(frame, detail, app);
 }
 
 // ── Left panel: incident list ─────────────────────────────────────────────────
@@ -345,9 +340,17 @@ fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
     if left_w + dur_str.chars().count() < inner_w {
         let gap = inner_w - left_w - dur_str.chars().count();
         header.push(Span::styled(" ".repeat(gap), Style::default()));
+        header.push(Span::styled(dur_str, theme::faint()));
+        lines.push(Line::from(header));
+    } else {
+        // No room to right-align: the duration drops to its own line instead
+        // of gluing onto the age (`…2026-06-06ongoing`).
+        lines.push(Line::from(header));
+        lines.push(Line::from(Span::styled(
+            format!("  {dur_str}"),
+            theme::faint(),
+        )));
     }
-    header.push(Span::styled(dur_str, theme::faint()));
-    lines.push(Line::from(header));
 
     // started row (the one place the `utc` suffix appears).
     lines.push(Line::from(vec![

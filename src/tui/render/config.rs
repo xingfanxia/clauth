@@ -5,7 +5,7 @@
 //! pane into a create form. No popups.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
@@ -15,8 +15,8 @@ use super::super::app::{
 use super::super::theme;
 use super::panes::{
     bold_when, cycle_option, draw_scrolled_lines, draw_selector_list, head_cols,
-    help_tooltip_lines, highlight_row, key_cell, label_style, name_color, picker_row, section_box,
-    section_box_verbatim, selector_width,
+    help_tooltip_lines, highlight_row, key_cell, label_style, master_detail, name_color,
+    picker_row, section_box, section_box_verbatim,
 };
 
 const KEY_W: usize = 11;
@@ -24,15 +24,13 @@ const KEY_W: usize = 11;
 const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let [selector_area, settings_area] = Layout::horizontal([
-        Constraint::Length(selector_width(area.width)),
-        Constraint::Min(20),
-    ])
-    .areas(area);
+    // +1 for the trailing `+ new` picker row.
+    let items = app.config().profiles.len() + 1;
+    let (selector, settings) = master_detail(area, items);
 
     let profiles_focused = app.config_focus == ConfigFocus::Profiles;
-    draw_selector(frame, selector_area, app, profiles_focused);
-    draw_settings(frame, settings_area, app);
+    draw_selector(frame, selector, app, profiles_focused);
+    draw_settings(frame, settings, app);
 }
 
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {

@@ -93,11 +93,23 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 /// Modal sized to content: snaps to widest line/title, exact line count.
 /// Chrome = rounded border (1) + `Padding::new(2,2,1,1)` = 6 cols, 4 rows.
+///
+/// A line wider than the modal's inner width (only possible on a terminal
+/// too narrow for the content) is pre-split into inner-width rows by
+/// [`chunk_line`], so the height is exact by construction — ratatui's own
+/// word-wrap may use MORE rows than any cheap estimate and silently clip the
+/// tail. On any terminal wide enough for the content nothing splits and the
+/// modal renders exactly as before.
 fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let w = (content_w + 6)
         .max(title.chars().count() as u16 + 4)
         .min(area.width.saturating_sub(4));
+    let inner_w = (w.saturating_sub(6) as usize).max(1);
+    let lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .flat_map(|l| chunk_line(l, inner_w))
+        .collect();
     let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
 
     let rect = centered(area, w, h);
@@ -106,6 +118,56 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+}
+
+/// Split one styled line into `w`-column rows by character, preserving span
+/// styles and the line's alignment/style. A line that already fits returns
+/// itself (owned) untouched. Modal copy is ASCII, so chars ≈ display cells.
+fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
+    let own = |l: &Line<'_>| -> Line<'static> {
+        let mut out = Line::from(
+            l.spans
+                .iter()
+                .map(|s| Span::styled(s.content.to_string(), s.style))
+                .collect::<Vec<_>>(),
+        )
+        .style(l.style);
+        out.alignment = l.alignment;
+        out
+    };
+    if w == 0 || line.width() <= w {
+        return vec![own(&line)];
+    }
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut flush = |cur: &mut Vec<Span<'static>>| {
+        let mut row = Line::from(std::mem::take(cur)).style(line.style);
+        row.alignment = line.alignment;
+        rows.push(row);
+    };
+    for span in &line.spans {
+        let mut buf = String::new();
+        for ch in span.content.chars() {
+            if used == w {
+                if !buf.is_empty() {
+                    cur.push(Span::styled(std::mem::take(&mut buf), span.style));
+                }
+                flush(&mut cur);
+                used = 0;
+            }
+            buf.push(ch);
+            used += 1;
+        }
+        if !buf.is_empty() {
+            cur.push(Span::styled(buf, span.style));
+        }
+    }
+    if !cur.is_empty() {
+        flush(&mut cur);
+    }
+    rows
 }
 
 /// Rounded `ACCENT_2` border, uppercase italic dim title, base `BG` fill.

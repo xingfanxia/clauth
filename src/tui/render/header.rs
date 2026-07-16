@@ -233,11 +233,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The count + gauge are left-aligned together; the status dot is the
     // only thing right-aligned, with an elastic gap in between.
     let row1_width = rows[1].width as usize;
-    let prefix = if gauge.is_some() {
-        format!("{n} account{} · ", plural(n))
-    } else {
-        format!("{n} account{}", plural(n))
-    };
+    let prefix = format!("{n} account{}", plural(n));
     let feed = "status.claude.ai";
     let status_head = "● ";
     let status_w = status_head.chars().count() + feed.chars().count();
@@ -245,17 +241,22 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let mut left_spans: Vec<Span<'static>> = vec![Span::styled(prefix, theme::faint())];
     if let Some(ref g) = gauge {
+        // The ` · ` separator is budgeted here but only rendered when the gauge
+        // survives the fit — a hidden gauge must not leave a dangling dot.
+        let sep = " · ";
         let gauge_budget = row1_width.saturating_sub(
             left_spans
                 .iter()
                 .map(|s| s.content.chars().count())
                 .sum::<usize>()
+                + sep.chars().count()
                 + status_w
                 + reserve,
         );
         let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
         if fit.visible {
             let elapsed = app.started_at.elapsed().as_millis() as u64;
+            left_spans.push(Span::styled(sep.to_string(), theme::faint()));
             left_spans.extend(gauge_spans(fit, &g.name, g.pct, elapsed));
         }
     }
