@@ -665,6 +665,70 @@ fn perform_delete_without_live_session_deletes_immediately() {
     );
 }
 
+/// Rotating a profile a live `clauth start` session owns must not dead-end on a
+/// toast (the old behavior): it arms an acknowledge notice explaining the block,
+/// and confirming is a no-op — the running session owns rotation, and rotating
+/// its already-spent stored token would 400 (`docs/internals.md`, 2026-06-17).
+#[test]
+fn rotate_tokens_with_live_session_arms_acknowledge_modal() {
+    use super::{
+        ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action, run_confirm_action,
+    };
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let _pid_guard = arm_live_session(home.home(), "busy");
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
+    let confirm = app
+        .modals
+        .last()
+        .and_then(|m| match m {
+            Modal::Confirm(s) => Some(s),
+            _ => None,
+        })
+        .expect("a live session arms a confirm modal");
+    assert!(
+        matches!(confirm.on_confirm, ConfirmAction::Acknowledge),
+        "a live-session rotate arms an acknowledge notice, not a rotate action"
+    );
+
+    let action = confirm.on_confirm.clone();
+    run_confirm_action(&mut app, action);
+    assert!(
+        app.config().find("busy").is_some(),
+        "acknowledging the notice leaves the profile untouched"
+    );
+}
+
+/// No live session: the rotate action arms the normal rotate confirm carrying the
+/// per-profile `RotateOne`, not the acknowledge notice.
+#[test]
+fn rotate_tokens_without_live_session_arms_rotate_confirm() {
+    use super::{ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("idle".to_string(), None, None)]);
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
+    let confirm = app
+        .modals
+        .last()
+        .and_then(|m| match m {
+            Modal::Confirm(s) => Some(s),
+            _ => None,
+        })
+        .expect("a rotate arms a confirm modal");
+    assert!(
+        matches!(&confirm.on_confirm, ConfirmAction::RotateOne(n) if n == "idle"),
+        "a non-live rotate carries the RotateOne action for the focused profile"
+    );
+}
+
 /// Minted-credential fixture for the login tests.
 fn login_creds(refresh: &str) -> crate::profile::ClaudeCredentials {
     crate::profile::ClaudeCredentials {

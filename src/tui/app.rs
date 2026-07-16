@@ -410,6 +410,11 @@ pub(crate) enum ConfirmAction {
     /// guard in `delete_profile` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
     DeleteLiveSession(String),
+    /// Info-only modal: an action the user asked for is blocked for a reason
+    /// they should read (e.g. rotating a profile a live session owns, which
+    /// would 400 — see `docs/internals.md`). Confirming just dismisses;
+    /// `run_confirm_action` does nothing.
+    Acknowledge,
 }
 
 #[derive(Debug, Clone)]
@@ -737,8 +742,7 @@ pub(crate) struct Toast {
 }
 
 const ROTATE_ALL_MSG: &str = "Rotate all access tokens?";
-const ROTATE_ALL_DETAIL: &str = "accounts with a live session might be logged out.";
-const ROTATE_ONE_DETAIL: &str = "a live session on this account might be logged out.";
+const ROTATE_ALL_DETAIL: &str = "accounts with a live session are skipped.";
 const TOAST_CAPACITY: usize = 3;
 const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
 const TOAST_TTL_DANGER: Duration = Duration::from_secs(6);
@@ -4462,10 +4466,24 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             None => {}
         },
         ActionMenuAction::RotateTokens => match focused_account(app) {
+            // A live `clauth start` session owns this profile's single-use OAuth
+            // chain and rotates it itself, so our stored token is already spent —
+            // rotating from here would 400 (docs/internals.md, 2026-06-17). Explain
+            // the block in an acknowledge modal instead of a dead-end toast.
+            Some((name, true, _)) if crate::runtime::has_live_session(&name) => {
+                app.modals.push(Modal::Confirm(ConfirmState {
+                    message: format!("'{name}' is in use by a running session"),
+                    detail: Some(
+                        "it manages its own tokens; rotating here would fail.".to_string(),
+                    ),
+                    choice: true,
+                    on_confirm: ConfirmAction::Acknowledge,
+                }));
+            }
             Some((name, true, _)) => {
                 app.modals.push(Modal::Confirm(ConfirmState {
                     message: format!("Rotate access token for '{name}'?"),
-                    detail: Some(ROTATE_ONE_DETAIL.to_string()),
+                    detail: None,
                     choice: false,
                     on_confirm: ConfirmAction::RotateOne(name),
                 }));
@@ -6004,6 +6022,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
         ConfirmAction::DeleteLiveSession(name) => finish_delete(app, &name, true),
+        ConfirmAction::Acknowledge => {}
     }
 }
 

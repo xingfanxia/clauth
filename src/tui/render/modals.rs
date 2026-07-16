@@ -140,6 +140,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::BlankCredentials(_) => "CONFIRM",
         ConfirmAction::RestartLogin(..) => "CONFIRM",
         ConfirmAction::DeleteLiveSession(_) => "CONFIRM",
+        ConfirmAction::Acknowledge => "IN USE",
     };
 
     // Destructive/global ops carry a DANGER cue on their confirm button.
@@ -164,7 +165,13 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         lines.push(Line::from(Span::styled(detail.clone(), theme::dim())));
     }
     lines.push(Line::from(""));
-    lines.push(choice_buttons(state.choice, destructive).alignment(Alignment::Right));
+    // An acknowledge-only notice has nothing to cancel — a single focused `ok`.
+    let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
+        Line::from(modal_button(" ok ", true))
+    } else {
+        choice_buttons(state.choice, destructive)
+    };
+    lines.push(buttons.alignment(Alignment::Right));
 
     draw_modal(frame, area, title, lines);
 }
