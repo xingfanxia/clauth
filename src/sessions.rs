@@ -717,6 +717,148 @@ pub(crate) fn annotate_owners(groups: &mut [WorkspaceGroup]) {
     }
 }
 
+// ── Session rescue: lift an isolated transcript into the global store ─────────
+//
+// An isolated runtime is GC'd along with its throwaway `projects/` store, which
+// would take any session that ran under it. Rescue copies the transcript into
+// the shared global store so it outlives that GC. Data safety is the one hard
+// rule: copy, verify the copy landed intact, only THEN drop the source — a crash
+// at any point leaves at worst a duplicate (source + target), never a loss.
+
+/// Move `src` to `dst` without ever destroying `src` before the copy is proven
+/// intact. Copies into a temp sibling of `dst`, fsyncs it, renames it into place
+/// (atomic on the same filesystem), reads the landed file back to compare it
+/// byte-for-byte, and removes `src` only once that verify passes. A verify
+/// mismatch returns an error with `src` left in place.
+pub(crate) fn rescue_move(src: &Path, dst: &Path) -> std::io::Result<()> {
+    // Same path: nothing to move, and a rename-over-self would destroy the file.
+    if src == dst {
+        return Ok(());
+    }
+
+    // A transcript is a bounded JSONL and rescue is rare, so a full read is cheap
+    // and lets the post-rename verify compare the landed bytes against these.
+    let bytes = std::fs::read(src)?;
+
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let dir = dst.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = dst
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "session".to_string());
+    let tmp = dir.join(format!(".{file_name}.rescue.tmp.{}", std::process::id()));
+    // Clear any stale temp from a crashed prior rescue so `create` lands clean.
+    if tmp.exists() {
+        std::fs::remove_file(&tmp)?;
+    }
+    {
+        // Local import: a module-level `Write` collides with the `Read::by_ref`
+        // the tail reader above relies on.
+        use std::io::Write;
+        let mut f = File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        // Durable before the rename so a crash can't promote a torn temp to dst.
+        f.sync_all()?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, dst) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Verify the copy landed intact before the source is removed. On any
+    // mismatch, return early — `src` is still on disk, so nothing is lost.
+    let landed = std::fs::read(dst)?;
+    if landed != bytes {
+        return Err(std::io::Error::other(format!(
+            "rescue verify failed: {} does not match source {}",
+            dst.display(),
+            src.display()
+        )));
+    }
+
+    std::fs::remove_file(src)?;
+    Ok(())
+}
+
+/// Rescue an isolated session transcript at `src` into the global store,
+/// preserving its `<slug>` subdir so `--resume` run from that workspace still
+/// finds it. Collision-safe on the final `<id>.jsonl`: a byte-identical target
+/// is already-rescued (source dropped, no duplicate); a differing target is a
+/// real id collision with another session and is never overwritten — the rescue
+/// lands beside it as `<id>.rescued-<n>.jsonl`. Returns the final path.
+pub(crate) fn rescue_session_transcript(
+    src: &Path,
+    iso_projects_root: &Path,
+    global_projects_root: &Path,
+) -> std::io::Result<PathBuf> {
+    // The isolated store mirrors the global `<slug>/<id>.jsonl` layout, so the
+    // existing subdir is authoritative — preserve it verbatim rather than
+    // recomputing the (lossy) slug from cwd.
+    let rel = src.strip_prefix(iso_projects_root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not under the isolated projects root {}",
+                src.display(),
+                iso_projects_root.display()
+            ),
+        )
+    })?;
+    let target = global_projects_root.join(rel);
+
+    if !target.exists() {
+        rescue_move(src, &target)?;
+        return Ok(target);
+    }
+    // Target already holds a byte-identical copy: the session is in the global
+    // store already, so drop the source (idempotent) and keep the one copy.
+    if files_equal(src, &target)? {
+        std::fs::remove_file(src)?;
+        return Ok(target);
+    }
+    // A different session already owns this id — never overwrite it. Land beside
+    // it under the first free `<id>.rescued-<n>.jsonl`.
+    let sibling = free_rescued_sibling(&target)?;
+    rescue_move(src, &sibling)?;
+    Ok(sibling)
+}
+
+/// Whether two files hold identical bytes. Length is checked first as a cheap
+/// reject before reading both.
+fn files_equal(a: &Path, b: &Path) -> std::io::Result<bool> {
+    if std::fs::metadata(a)?.len() != std::fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    Ok(std::fs::read(a)? == std::fs::read(b)?)
+}
+
+/// The first free `<stem>.rescued-<n>.<ext>` sibling of `target`, smallest `n`.
+fn free_rescued_sibling(target: &Path) -> std::io::Result<PathBuf> {
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let stem = target.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("target {} has no usable file stem", target.display()),
+        )
+    })?;
+    let ext = target
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jsonl");
+    for n in 0u32..u32::MAX {
+        let candidate = dir.join(format!("{stem}.rescued-{n}.{ext}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free rescued sibling for {}", target.display()),
+    ))
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/sessions.rs"]
 mod tests;

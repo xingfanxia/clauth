@@ -682,3 +682,122 @@ fn annotate_owners_sets_only_known_entries() {
     assert_eq!(find(&groups, "contest").unwrap().last_ran_profile, None);
     assert_eq!(find(&groups, "absent").unwrap().last_ran_profile, None);
 }
+
+// ── Session rescue: move an isolated transcript into the global store ─────────
+
+/// Isolated `<profile>/runtime-isolated/projects` root under the sandbox.
+fn iso_projects(sb: &HomeSandbox) -> PathBuf {
+    sb.home()
+        .join(".clauth/profiles/iso/runtime-isolated/projects")
+}
+
+/// The global `~/.claude/projects` root under the sandbox.
+fn global_projects(sb: &HomeSandbox) -> PathBuf {
+    sb.home().join(".claude/projects")
+}
+
+#[test]
+fn rescue_moves_isolated_session_into_global_store_preserving_slug() {
+    let sb = HomeSandbox::new();
+    let iso_root = iso_projects(&sb);
+    let global_root = global_projects(&sb);
+    let src = iso_root.join("-w-iso/rescueme.jsonl");
+    write_jsonl(&src, &[user_line("rescueme", "/w/iso", "hello from iso")]);
+    let original = fs::read(&src).unwrap();
+
+    let landed = rescue_session_transcript(&src, &iso_root, &global_root).unwrap();
+
+    // Lands at the mirrored `<slug>/<id>.jsonl` in the global store.
+    assert_eq!(landed, global_root.join("-w-iso/rescueme.jsonl"));
+    assert_eq!(
+        fs::read(&landed).unwrap(),
+        original,
+        "landed copy byte-identical"
+    );
+    assert!(!src.exists(), "source removed only after the verified copy");
+}
+
+#[test]
+fn rescue_identical_target_drops_source_without_duplicating() {
+    let sb = HomeSandbox::new();
+    let iso_root = iso_projects(&sb);
+    let global_root = global_projects(&sb);
+    let src = iso_root.join("-w-iso/dup.jsonl");
+    let target = global_root.join("-w-iso/dup.jsonl");
+    let lines = [user_line("dup", "/w/iso", "same bytes both stores")];
+    write_jsonl(&src, &lines);
+    write_jsonl(&target, &lines);
+
+    let landed = rescue_session_transcript(&src, &iso_root, &global_root).unwrap();
+
+    assert_eq!(landed, target, "returns the existing target");
+    assert!(!src.exists(), "source dropped (idempotent)");
+    // No `<id>.rescued-N` sibling was created — the store holds exactly one copy.
+    let siblings: Vec<String> = fs::read_dir(target.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("rescued"))
+        .collect();
+    assert!(siblings.is_empty(), "no duplicate created: {siblings:?}");
+}
+
+#[test]
+fn rescue_differing_target_lands_beside_without_overwriting() {
+    let sb = HomeSandbox::new();
+    let iso_root = iso_projects(&sb);
+    let global_root = global_projects(&sb);
+    let src = iso_root.join("-w-iso/clash.jsonl");
+    let target = global_root.join("-w-iso/clash.jsonl");
+    write_jsonl(&src, &[user_line("clash", "/w/iso", "the rescued session")]);
+    // A DIFFERENT session already holds the same id in the global store.
+    write_jsonl(
+        &target,
+        &[user_line("clash", "/w/other", "a different session")],
+    );
+    let src_bytes = fs::read(&src).unwrap();
+    let target_before = fs::read(&target).unwrap();
+
+    let landed = rescue_session_transcript(&src, &iso_root, &global_root).unwrap();
+
+    // Landed beside the original as `<id>.rescued-0.jsonl`.
+    assert_eq!(landed, global_root.join("-w-iso/clash.rescued-0.jsonl"));
+    assert_eq!(
+        fs::read(&landed).unwrap(),
+        src_bytes,
+        "rescued content preserved"
+    );
+    // The pre-existing target is byte-for-byte untouched — the data-loss guard.
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        target_before,
+        "existing target must never be overwritten"
+    );
+    assert!(!src.exists(), "source removed after the sibling landed");
+}
+
+#[test]
+fn rescue_move_verifies_then_removes_and_noops_same_path() {
+    let sb = HomeSandbox::new();
+    let src = sb.home().join("src/a.jsonl");
+    let dst = sb.home().join("dst/deep/a.jsonl");
+    write_jsonl(&src, &[user_line("a", "/w", "payload")]);
+    let original = fs::read(&src).unwrap();
+
+    rescue_move(&src, &dst).unwrap();
+    assert_eq!(
+        fs::read(&dst).unwrap(),
+        original,
+        "dst matches src's original bytes"
+    );
+    assert!(!src.exists(), "src gone after the verified move");
+
+    // Same-path no-op: the file must survive untouched.
+    rescue_move(&dst, &dst).unwrap();
+    assert_eq!(
+        fs::read(&dst).unwrap(),
+        original,
+        "same-path no-op leaves file intact"
+    );
+    assert!(dst.exists());
+}
