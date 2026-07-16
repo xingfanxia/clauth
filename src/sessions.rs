@@ -31,6 +31,7 @@ use std::time::SystemTime;
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::pricing::PriceTable;
 use crate::profile::claude_dir;
 
 /// Bytes read from a file's head to recover its workspace and first user
@@ -522,6 +523,43 @@ pub(crate) fn build_index() -> Vec<WorkspaceGroup> {
     }
 
     group_by_workspace(by_id.into_values().collect())
+}
+
+/// Annotate one session in place with its token total and API-equivalent cost —
+/// the full-transcript parse [`build_index`] deliberately skips, so a caller pays
+/// it only when it wants these figures. Idempotent; safe to re-run.
+///
+/// `tokens` is input+output summed across models (`ModelTokens::in_out` — the
+/// "tokens used" basis the Tokens tab headlines; cache is excluded so a resume's
+/// carried-forward cache reads don't inflate the figure). It stays `None` — never
+/// `Some(0)` — when the file yields no token-bearing row, so a session with no
+/// usage renders blank rather than a misleading zero.
+///
+/// `cost` follows [`PriceTable::total_cost`]: `Some(usd)` when a table is present
+/// and at least one of the session's models has a matching rate; `None` when no
+/// table is given OR every model is unpriced. The priced/unpriced boundary is read
+/// from the rate table directly, not from `usd > 0`, so a priced but genuinely
+/// zero-cost session is `Some(0.0)` — distinct from an unpriced `None`.
+pub(crate) fn annotate(info: &mut SessionInfo, price: Option<&PriceTable>) {
+    let models = crate::tokens::file_model_tokens(&info.path);
+    // >= 1 token-bearing row ⇒ a real total (possibly 0); no rows ⇒ blank.
+    info.tokens = (!models.is_empty()).then(|| models.iter().map(|m| m.in_out()).sum());
+    info.cost = price.and_then(|p| {
+        let (usd, _unpriced) = p.total_cost(&models);
+        // "At least one model priced" is read off the table, not `usd > 0`, so a
+        // priced zero-cost session reads `Some(0.0)` while all-unpriced reads None.
+        models.iter().any(|m| p.cost(m).is_some()).then_some(usd)
+    });
+}
+
+/// Annotate every session across all groups (the CLI's eager pass; the TUI may
+/// instead call [`annotate`] lazily per visible row).
+pub(crate) fn annotate_all(groups: &mut [WorkspaceGroup], price: Option<&PriceTable>) {
+    for group in groups.iter_mut() {
+        for session in group.sessions.iter_mut() {
+            annotate(session, price);
+        }
+    }
 }
 
 #[cfg(test)]

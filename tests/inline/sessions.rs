@@ -7,6 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::time::{Duration, SystemTime};
@@ -45,6 +46,40 @@ fn tool_result_line(sid: &str) -> String {
     json!({"sessionId": sid,
         "message": {"role": "user", "content": [{"type": "tool_result", "content": "out"}]}})
     .to_string()
+}
+
+/// An assistant usage line: carries a `message.id` (the token dedup key), a
+/// model, and input/output token counts. `parse_file` requires a timestamp, so
+/// one is always stamped.
+fn usage_line(sid: &str, cwd: &str, msg_id: &str, model: &str, input: u64, output: u64) -> String {
+    json!({
+        "sessionId": sid, "cwd": cwd, "timestamp": "2026-06-11T10:30:00+00:00",
+        "message": {
+            "id": msg_id, "role": "assistant", "model": model,
+            "usage": {
+                "input_tokens": input, "output_tokens": output,
+                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0
+            }
+        }
+    })
+    .to_string()
+}
+
+/// A `PriceTable` from `(model_id, input_rate, output_rate)` rows; cache rates 0.
+fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
+    let mut rates = HashMap::new();
+    for &(id, input, output) in rows {
+        rates.insert(
+            id.to_owned(),
+            crate::pricing::ModelRate {
+                input,
+                output,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+        );
+    }
+    crate::pricing::PriceTable::from_rates(rates)
 }
 
 fn find<'a>(groups: &'a [WorkspaceGroup], id: &str) -> Option<&'a SessionInfo> {
@@ -418,4 +453,95 @@ fn build_index_covers_global_and_isolated_and_indexes_corrupt() {
     assert_eq!(bad.workspace, "");
     assert!(bad.first_message.is_none());
     assert!(bad.last_message.is_none());
+}
+
+#[test]
+fn annotate_sums_tokens_and_cost_across_models() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-tok/stok.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            usage_line("stok", "/w/tok", "m1", "claude-opus-4-8", 1000, 500),
+            usage_line("stok", "/w/tok", "m2", "claude-sonnet-4-5", 2000, 1000),
+        ],
+    );
+    // $1 in / $2 out per million for both models.
+    let table = price_table(&[
+        ("claude-opus-4-8", 1e-6, 2e-6),
+        ("claude-sonnet-4-5", 1e-6, 2e-6),
+    ]);
+
+    let mut groups = build_index();
+    annotate_all(&mut groups, Some(&table));
+
+    let info = find(&groups, "stok").expect("session indexed");
+    // in+out across both models: (1000+500) + (2000+1000) = 4500. Cache excluded.
+    assert_eq!(info.tokens, Some(4500));
+    // opus 1000*1e-6 + 500*2e-6 = 0.002; sonnet 2000*1e-6 + 1000*2e-6 = 0.004.
+    let cost = info.cost.expect("priced");
+    assert!((cost - 0.006).abs() < 1e-9, "got {cost}");
+}
+
+#[test]
+fn annotate_leaves_tokenless_session_blank() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-none/snone.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            user_line("snone", "/w/none", "just chatting"),
+            assistant_line("snone", "/w/none", "no usage recorded"),
+        ],
+    );
+    let table = price_table(&[("claude-opus-4-8", 1e-6, 2e-6)]);
+
+    let mut groups = build_index();
+    annotate_all(&mut groups, Some(&table));
+
+    let info = find(&groups, "snone").expect("session indexed");
+    // No usage line ⇒ blank, never Some(0), even with a price table present.
+    assert_eq!(info.tokens, None);
+    assert_eq!(info.cost, None);
+}
+
+#[test]
+fn annotate_unpriced_model_has_tokens_but_no_cost() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-unp/sunp.jsonl");
+    write_jsonl(
+        &path,
+        &[usage_line("sunp", "/w/unp", "u1", "gpt-5", 700, 300)],
+    );
+    // Table prices only opus — gpt-5 has no matching rate.
+    let table = price_table(&[("claude-opus-4-8", 1e-6, 2e-6)]);
+
+    let mut groups = build_index();
+    annotate_all(&mut groups, Some(&table));
+
+    let info = find(&groups, "sunp").expect("session indexed");
+    assert_eq!(info.tokens, Some(1000)); // 700 + 300, tokens still counted
+    assert_eq!(info.cost, None); // model unpriced ⇒ None, not Some(0.0)
+}
+
+#[test]
+fn annotate_dedupes_carried_forward_line_by_tok_key() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-dup/sdupe.jsonl");
+    // Same response (message.id "m1") twice — the shape a resumed or branched
+    // session produces when it copies its parent's history forward. Count ONCE.
+    write_jsonl(
+        &path,
+        &[
+            usage_line("sdupe", "/w/dup", "m1", "claude-opus-4-8", 1000, 500),
+            usage_line("sdupe", "/w/dup", "m1", "claude-opus-4-8", 1000, 500),
+        ],
+    );
+
+    let mut groups = build_index();
+    annotate_all(&mut groups, None);
+
+    let info = find(&groups, "sdupe").expect("session indexed");
+    // Single-counted: 1000 + 500, NOT doubled to 3000.
+    assert_eq!(info.tokens, Some(1500));
 }
