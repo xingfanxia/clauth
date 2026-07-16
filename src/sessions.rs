@@ -29,10 +29,11 @@ use std::sync::LazyLock;
 use std::time::SystemTime;
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use crate::logline::logline;
 use crate::pricing::PriceTable;
-use crate::profile::claude_dir;
+use crate::profile::{atomic_write_600, claude_dir, clauth_dir};
 
 /// Bytes read from a file's head to recover its workspace and first user
 /// message. The session id comes from the filename stem, not the head, so this
@@ -558,6 +559,160 @@ pub(crate) fn annotate_all(groups: &mut [WorkspaceGroup], price: Option<&PriceTa
     for group in groups.iter_mut() {
         for session in group.sessions.iter_mut() {
             annotate(session, price);
+        }
+    }
+}
+
+// ── A3: session → last-ran-profile store ─────────────────────────────────────
+//
+// A single GLOBAL file under `~/.clauth/` keyed by session id (NOT per-profile —
+// a shared-store session is cross-profile, so its owner can't live under any one
+// profile dir). Hand-rolled load/save against `clauth_dir()`, mirroring
+// `pricing.rs` / `token_ledger.rs`, since the crate has no shared global-cache
+// helper.
+
+/// Global store filename under `~/.clauth/`.
+const SESSION_PROFILES_FILE: &str = "session_profiles.json";
+
+/// Which profile a session last ran under. A stored `Contested` is distinct from
+/// absent: two different profiles have both touched the same shared-store
+/// session, so the owner is genuinely unknown and must never resolve to either —
+/// while an absent id is simply unobserved. Both read back as "unknown".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionOwner {
+    Known(String),
+    Contested,
+}
+
+/// The persisted store. A named wrapper (not a bare map) leaves room to add
+/// fields later without breaking the on-disk shape, matching `token_ledger.rs`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SessionProfiles {
+    /// session id → owner stamp.
+    sessions: HashMap<String, SessionOwner>,
+}
+
+/// `~/.clauth/session_profiles.json`; `None` only when the home dir can't be
+/// resolved.
+fn store_path() -> Option<PathBuf> {
+    clauth_dir().ok().map(|d| d.join(SESSION_PROFILES_FILE))
+}
+
+/// Load the store, or an empty one when absent/unreadable/corrupt — a missing
+/// owner renders blank, never fatal.
+fn load_store(path: &Path) -> SessionProfiles {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the store atomically (0o600).
+fn save_store(path: &Path, store: &SessionProfiles) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(store).map_err(std::io::Error::other)?;
+    atomic_write_600(path, &bytes)
+}
+
+/// Fold one observed session id under `profile` into the owner map. Absent or
+/// already `Known(profile)` ⇒ `Known(profile)`; a different owner or a prior
+/// `Contested` ⇒ `Contested`. Two profiles touching one shared session means the
+/// owner can't be attributed, so it stays unknown rather than guessing the last
+/// writer.
+fn fold_owner(map: &mut HashMap<String, SessionOwner>, id: &str, profile: &str) {
+    match map.entry(id.to_owned()) {
+        Entry::Vacant(e) => {
+            e.insert(SessionOwner::Known(profile.to_owned()));
+        }
+        Entry::Occupied(mut e) => {
+            let contest = match e.get() {
+                SessionOwner::Known(p) => p != profile,
+                SessionOwner::Contested => true,
+            };
+            if contest {
+                e.insert(SessionOwner::Contested);
+            }
+            // else: already ours — leave Known(profile) as-is.
+        }
+    }
+}
+
+/// Session ids this run owns: the file stems under `projects_dir`, filtered to
+/// this run's window on a shared (cross-profile) store. An isolated store is
+/// exclusive to the profile, so every file counts regardless of mtime.
+fn run_session_ids(projects_dir: &Path, isolated: bool, run_start: SystemTime) -> Vec<String> {
+    let mut paths = Vec::new();
+    collect_jsonl(projects_dir, WALK_MAX_DEPTH, &mut paths);
+    paths
+        .into_iter()
+        .filter(|p| isolated || touched_since(p, run_start))
+        .filter_map(|p| session_id_from_path(&p))
+        .collect()
+}
+
+/// Whether `path`'s mtime is at or after `since`. Fail-soft: an unreadable mtime
+/// counts as outside the window (not this run's), so it is left unstamped.
+fn touched_since(path: &Path, since: SystemTime) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|mtime| mtime >= since)
+        .unwrap_or(false)
+}
+
+/// Record which sessions a `clauth start` run owned into the global store.
+///
+/// `projects_dir` is where the run's transcripts landed: an isolated runtime's
+/// exclusive `runtime-isolated/projects/` (`isolated = true` — every file maps to
+/// `profile`), or the shared global `~/.claude/projects/` (`isolated = false` —
+/// only files touched at or after `run_start` are attributed, catching new and
+/// resumed-during-this-run sessions without claiming another profile's untouched
+/// ones).
+///
+/// The read-modify-write runs under the state flock so two concurrent
+/// `clauth start` runs fold their stamps in serially instead of clobbering each
+/// other. Best-effort throughout: the session already ran, so any IO error is
+/// logged and swallowed — never propagated to fail `start`.
+pub(crate) fn stamp_run_sessions(
+    profile: &str,
+    projects_dir: &Path,
+    isolated: bool,
+    run_start: SystemTime,
+) {
+    let ids = run_session_ids(projects_dir, isolated, run_start);
+    if ids.is_empty() {
+        return;
+    }
+    let result = crate::lock::with_state_lock(|| {
+        let Some(path) = store_path() else {
+            return Ok(());
+        };
+        let mut store = load_store(&path);
+        for id in &ids {
+            fold_owner(&mut store.sessions, id, profile);
+        }
+        save_store(&path, &store)?;
+        Ok(())
+    });
+    if let Err(e) = result {
+        logline!("clauth: failed to stamp session owners: {e}");
+    }
+}
+
+/// Annotate each session's `last_ran_profile` from the global owner store.
+/// Loads the store once, so a caller can attach owners without paying the
+/// per-session full-transcript parse [`annotate`] costs. Leaves `None` for a
+/// session that is absent or `Contested` (both mean "unknown").
+pub(crate) fn annotate_owners(groups: &mut [WorkspaceGroup]) {
+    let Some(path) = store_path() else {
+        return;
+    };
+    let store = load_store(&path);
+    for group in groups.iter_mut() {
+        for session in group.sessions.iter_mut() {
+            session.last_ran_profile = match store.sessions.get(&session.id) {
+                Some(SessionOwner::Known(p)) => Some(p.clone()),
+                Some(SessionOwner::Contested) | None => None,
+            };
         }
     }
 }

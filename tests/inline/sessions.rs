@@ -89,6 +89,31 @@ fn find<'a>(groups: &'a [WorkspaceGroup], id: &str) -> Option<&'a SessionInfo> {
         .find(|s| s.id == id)
 }
 
+/// Minimal groups carrying only the ids under test — enough to drive
+/// `annotate_owners`, which reads `id` and writes `last_ran_profile` and touches
+/// nothing else. Decouples the owner-store tests from `build_index`/liveness.
+fn groups_of(ids: &[&str]) -> Vec<WorkspaceGroup> {
+    let sessions = ids
+        .iter()
+        .map(|id| SessionInfo {
+            id: (*id).to_owned(),
+            workspace: String::new(),
+            path: std::path::PathBuf::new(),
+            updated: SystemTime::UNIX_EPOCH,
+            first_message: None,
+            last_message: None,
+            source: SessionSource::Global,
+            tokens: None,
+            cost: None,
+            last_ran_profile: None,
+        })
+        .collect();
+    vec![WorkspaceGroup {
+        workspace: String::new(),
+        sessions,
+    }]
+}
+
 #[test]
 fn redact_secrets_masks_secret_shapes_and_keeps_context() {
     // sk- API key — whole token masked, surrounding words survive.
@@ -544,4 +569,116 @@ fn annotate_dedupes_carried_forward_line_by_tok_key() {
     let info = find(&groups, "sdupe").expect("session indexed");
     // Single-counted: 1000 + 500, NOT doubled to 3000.
     assert_eq!(info.tokens, Some(1500));
+}
+
+// ── A3: session → last-ran-profile stamp/read ────────────────────────────────
+
+#[test]
+fn stamp_isolated_owns_all_sessions_ignoring_mtime() {
+    let sb = HomeSandbox::new();
+    // An isolated store is exclusive to the profile: every transcript maps to it
+    // regardless of mtime, so no run window applies.
+    let projects = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated/projects");
+    let a = projects.join("-w-a/isoA.jsonl");
+    let b = projects.join("-w-b/isoB.jsonl");
+    write_jsonl(&a, &[user_line("isoA", "/w/a", "hi")]);
+    write_jsonl(&b, &[user_line("isoB", "/w/b", "yo")]);
+    // Far in the past: proves the mtime window is not consulted for isolated.
+    let ancient = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    set_mtime(&a, ancient);
+    set_mtime(&b, ancient);
+
+    stamp_run_sessions("iso", &projects, true, SystemTime::now());
+
+    let mut groups = groups_of(&["isoA", "isoB"]);
+    annotate_owners(&mut groups);
+    assert_eq!(
+        find(&groups, "isoA").unwrap().last_ran_profile.as_deref(),
+        Some("iso")
+    );
+    assert_eq!(
+        find(&groups, "isoB").unwrap().last_ran_profile.as_deref(),
+        Some("iso")
+    );
+}
+
+#[test]
+fn stamp_shared_respects_run_window() {
+    let sb = HomeSandbox::new();
+    let projects = sb.home().join(".claude/projects");
+    let fresh = projects.join("-w-new/freshS.jsonl");
+    let stale = projects.join("-w-old/staleS.jsonl");
+    write_jsonl(&fresh, &[user_line("freshS", "/w/new", "new")]);
+    write_jsonl(&stale, &[user_line("staleS", "/w/old", "old")]);
+
+    let run_start = SystemTime::now();
+    // `fresh` touched during the run (>= run_start); `stale` predates it and
+    // belongs to some earlier session, not this one.
+    set_mtime(&fresh, run_start + Duration::from_secs(1));
+    set_mtime(&stale, run_start - Duration::from_secs(60));
+
+    stamp_run_sessions("shared", &projects, false, run_start);
+
+    let mut groups = groups_of(&["freshS", "staleS"]);
+    annotate_owners(&mut groups);
+    assert_eq!(
+        find(&groups, "freshS").unwrap().last_ran_profile.as_deref(),
+        Some("shared")
+    );
+    assert_eq!(
+        find(&groups, "staleS").unwrap().last_ran_profile,
+        None,
+        "a pre-window shared session is not this run's"
+    );
+}
+
+#[test]
+fn contested_shared_session_reads_back_unknown() {
+    let sb = HomeSandbox::new();
+    let projects = sb.home().join(".claude/projects");
+    let s = projects.join("-w-c/contested.jsonl");
+    write_jsonl(&s, &[user_line("contested", "/w/c", "shared work")]);
+
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    set_mtime(&s, t0);
+
+    // Two different profiles touch the SAME shared session within their windows.
+    stamp_run_sessions("A", &projects, false, t0);
+    stamp_run_sessions("B", &projects, false, t0);
+
+    let mut groups = groups_of(&["contested"]);
+    annotate_owners(&mut groups);
+    // Genuinely unknown: never resolves to A, never to B.
+    assert_eq!(
+        find(&groups, "contested").unwrap().last_ran_profile,
+        None,
+        "two owners must collapse to unknown, not the last writer"
+    );
+}
+
+#[test]
+fn annotate_owners_sets_only_known_entries() {
+    let _sb = HomeSandbox::new();
+    // Build the store directly: one Known, one Contested; "absent" is never
+    // inserted. `atomic_write_600` creates the 0o700 `.clauth` dir as needed.
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("known".into(), SessionOwner::Known("P".into()));
+    store
+        .sessions
+        .insert("contest".into(), SessionOwner::Contested);
+    save_store(&path, &store).unwrap();
+
+    let mut groups = groups_of(&["known", "contest", "absent"]);
+    annotate_owners(&mut groups);
+    assert_eq!(
+        find(&groups, "known").unwrap().last_ran_profile.as_deref(),
+        Some("P")
+    );
+    assert_eq!(find(&groups, "contest").unwrap().last_ran_profile, None);
+    assert_eq!(find(&groups, "absent").unwrap().last_ran_profile, None);
 }

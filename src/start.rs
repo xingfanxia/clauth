@@ -9,6 +9,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::thread::JoinHandle;
 #[cfg(unix)]
 use std::time::Duration;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 #[cfg(unix)]
@@ -82,6 +83,9 @@ pub(crate) fn run(
     if isolation == Isolation::Isolated {
         command.arg("--strict-mcp-config");
     }
+    // Marks this run's window: on the shared global store, only sessions touched
+    // at or after this instant are attributed to `name` (see stamp below).
+    let run_start = SystemTime::now();
     let mut child = command
         .args(claude_args)
         .spawn()
@@ -95,6 +99,23 @@ pub(crate) fn run(
         status: child.wait().context("failed to wait for claude")?,
         signal: None,
     };
+
+    // Record which sessions ran under this profile before teardown — an isolated
+    // store is discarded on drop, so its stamp must happen while `runtime` lives.
+    // Isolated: the store is exclusive, so every transcript maps to `name`.
+    // Shared: transcripts land in the global store, so only this run's window is.
+    // Best-effort; never fails the completed session.
+    let isolated = isolation == Isolation::Isolated;
+    let projects_dir = if isolated {
+        Some(runtime.config_dir().join("projects"))
+    } else {
+        crate::profile::claude_dir()
+            .ok()
+            .map(|d| d.join("projects"))
+    };
+    if let Some(projects_dir) = projects_dir {
+        crate::sessions::stamp_run_sessions(name, &projects_dir, isolated, run_start);
+    }
 
     // Drop runtime before process::exit so final sync + refcount cleanup runs.
     drop(runtime);
