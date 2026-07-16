@@ -20,11 +20,12 @@ stays the only resolution surface.
   scheduler alive without pidfile bookkeeping. The TUI header's `● daemon` dot
   reads this lock (presence) plus `status.json` freshness (green = fresh feed,
   amber = stalling, hidden = no daemon) to show whether one is running.
-- **Watchdog**: the state flock has no deadline and a switch shells out inside
-  it, so a wedged tick can freeze the single-threaded loop. If no tick completes
-  within 30 s the daemon `abort()`s for a clean supervisor restart, tight enough
-  that a wedged fetcher frees the usage lease (below) fast, with a legit ~20 s
-  keychain switch still inside the margin.
+- **Watchdog**: a wedged tick can freeze the single-threaded loop. The
+  cross-process state flock a tick may block on is capped at 25 s, so a
+  flock-blocked tick times out and retries rather than hanging; if no tick
+  completes in 30 s at all, the daemon `abort()`s for a clean supervisor
+  restart, freeing the usage lease (below). A legit ~20 s keychain switch sits
+  inside both margins.
 - **Log hygiene**: every daemon-visible stderr line carries an ISO-8601 UTC
   prefix, enabled only in daemon mode. An interactive terminal instead diverts
   its lines to `~/.clauth/clauth.log` so a background thread never paints over
