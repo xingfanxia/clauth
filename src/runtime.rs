@@ -97,20 +97,6 @@ impl Isolation {
     }
 }
 
-/// Top-level `~/.claude/` entries omitted from an isolated runtime: operator
-/// memory, plugins, hooks, and the command/agent/style/skill extensions. Account
-/// state (`.claude.json`, `statsig/`, `projects/`, …) still comes across so the
-/// session stays authenticated and non-interactive.
-const ISOLATED_SKIP: &[&str] = &[
-    "CLAUDE.md",
-    "plugins",
-    "hooks",
-    "commands",
-    "agents",
-    "output-styles",
-    "skills",
-];
-
 /// The two runtime flavors a profile can hold concurrently. Liveness and GC
 /// must consider both so a rotation never spends a token an isolated session
 /// still holds.
@@ -629,9 +615,11 @@ fn is_session_alive(pid_file: &Path) -> bool {
 ///   across all profiles by `crate::claude_json`, which propagates every field
 ///   except the account-specific ones (`oauthAccount` + billing caches).
 ///
-/// In [`Isolation::Isolated`] mode the [`ISOLATED_SKIP`] entries (operator
-/// memory/plugins/hooks/commands/agents) are omitted and `settings.json` is
-/// built from an empty base, so an authenticated session inherits no house style.
+/// In [`Isolation::Isolated`] mode NOTHING under `~/.claude/` is linked — the
+/// tree holds only the reconciled credentials, the empty-base `settings.json`,
+/// and the seeded `.claude.json`. A clean session thus shares no operator state
+/// and, critically, no writable store: its CC (empty settings → default
+/// `cleanupPeriodDays`) can never write or clean the operator's `projects/`.
 ///
 /// `active_env_keys` (the live-active profile's custom env) are stripped from
 /// the shared `settings.json` base before this profile's overrides are merged,
@@ -664,11 +652,12 @@ fn build_runtime_dir_with_active_env(
         if file_name == "settings.json" || file_name == ".credentials.json" {
             continue;
         }
-        if isolation == Isolation::Isolated
-            && file_name
-                .to_str()
-                .is_some_and(|n| ISOLATED_SKIP.contains(&n))
-        {
+        // Isolated owns its writable state — link NOTHING from ~/.claude. A clean
+        // session's CC runs with an empty settings.json (default
+        // `cleanupPeriodDays`), so a shared `projects/` symlink would let it delete
+        // the operator's transcripts down to 30 days. CC recreates what it needs in
+        // the throwaway tree; creds/settings/.claude.json are seeded below.
+        if isolation == Isolation::Isolated {
             continue;
         }
         let dst = runtime.join(&file_name);

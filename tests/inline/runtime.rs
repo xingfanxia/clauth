@@ -1593,7 +1593,12 @@ fn build_runtime_dir_isolated_omits_operator_extensions() {
         fs::create_dir_all(claude_home.join("plugins")).expect("mkdir plugins");
         fs::create_dir_all(claude_home.join("hooks")).expect("mkdir hooks");
         fs::create_dir_all(claude_home.join("commands")).expect("mkdir commands");
+        // Writable operator state that MUST NOT be shared: an isolated session's CC
+        // (empty settings → default 30-day cleanupPeriodDays) would otherwise delete
+        // the operator's transcripts through a shared `projects/` symlink.
         fs::write(claude_home.join("history.jsonl"), b"{}").expect("write history");
+        fs::create_dir_all(claude_home.join("projects")).expect("mkdir projects");
+        fs::write(claude_home.join("stats-cache.json"), b"{}").expect("write stats");
         let runtime = tmp.path().join("runtime-isolated");
         fs::create_dir_all(&runtime).expect("mkdir runtime");
         let profile = make_profile("iso");
@@ -1609,16 +1614,21 @@ fn build_runtime_dir_isolated_omits_operator_extensions() {
         )
         .expect("build");
 
-        for omitted in ["CLAUDE.md", "plugins", "hooks", "commands"] {
+        // Skip-all: no operator house style AND no writable store is linked.
+        for omitted in [
+            "CLAUDE.md",
+            "plugins",
+            "hooks",
+            "commands",
+            "history.jsonl",
+            "projects",
+            "stats-cache.json",
+        ] {
             assert!(
                 !runtime.join(omitted).exists(),
-                "isolated runtime must omit operator `{omitted}`"
+                "isolated runtime must omit `{omitted}` (no shared writable state)"
             );
         }
-        assert!(
-            runtime.join("history.jsonl").exists(),
-            "account state still comes across"
-        );
         assert!(
             runtime.join("settings.json").exists(),
             "settings.json still written"
@@ -1634,6 +1644,8 @@ fn build_runtime_dir_shared_keeps_operator_extensions() {
         let claude_home = fake_claude_home(tmp.path());
         fs::write(claude_home.join("CLAUDE.md"), b"# operator memory").expect("write memory");
         fs::create_dir_all(claude_home.join("plugins")).expect("mkdir plugins");
+        fs::create_dir_all(claude_home.join("projects")).expect("mkdir projects");
+        fs::write(claude_home.join("stats-cache.json"), b"{}").expect("write stats");
         let runtime = tmp.path().join("runtime");
         fs::create_dir_all(&runtime).expect("mkdir runtime");
         let profile = make_profile("shared");
@@ -1651,6 +1663,13 @@ fn build_runtime_dir_shared_keeps_operator_extensions() {
 
         assert!(runtime.join("CLAUDE.md").exists(), "shared keeps memory");
         assert!(runtime.join("plugins").exists(), "shared keeps plugins");
+        // The operator's own session shares the global writable store (project
+        // history, aggregate) — the intentional contrast with isolated.
+        assert!(runtime.join("projects").exists(), "shared keeps projects");
+        assert!(
+            runtime.join("stats-cache.json").exists(),
+            "shared keeps stats-cache"
+        );
     });
 }
 
