@@ -22,12 +22,24 @@
 //! each 90s refresh re-reads only transcripts whose mtime advanced — the rest are
 //! re-merged from memory, avoiding a full multi-hundred-MB re-read every cycle.
 //!
+//! # Durable ledger ([`crate::token_ledger`])
+//!
+//! The top-up alone is fragile: it assumes transcripts exist for every day after
+//! `lastComputedDate`, but CC prunes them past `cleanupPeriodDays`, so a day after
+//! a frozen base but before the retention horizon would be counted nowhere. The
+//! ledger closes that: each finalized day's split is written once to
+//! `~/.clauth/token_ledger.json` and folded back on load, and its watermark
+//! becomes the sweep's effective cutoff — so a frozen base can't keep the
+//! cold-start read growing either.
+//!
 //! # Caveat
 //!
 //! `stats-cache.json` reflects **all** Claude Code usage across all profiles and
-//! accounts on this machine (global pool). The top-up reads every JSONL file
-//! reachable via the home directory at load time, which may span all profiles if
-//! they share a home. This is intentional — the tokens tab shows aggregate usage.
+//! accounts on this machine (global pool), as do the shared-runtime transcripts.
+//! An `--isolated` session keeps its own throwaway store, so its usage is NOT
+//! counted here. The top-up reads every JSONL file past the ledger watermark at
+//! load time, which may span all profiles that share a home. This is intentional
+//! — the tokens tab shows aggregate usage.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
