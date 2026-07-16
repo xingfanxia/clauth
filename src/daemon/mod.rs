@@ -196,12 +196,11 @@ pub(crate) fn status_oneshot() -> Result<()> {
 /// and it isn't a first-login adoption — the daemon cannot prompt, so it skips
 /// the switch and leaves the resolution to the operator (TUI Divergence modal).
 ///
-/// Claude Code's logged-out shell (both tokens blanked after its own refresh
-/// died) is exempt: it classifies Diverged, but an empty login is not
-/// "unsaved credentials" — deferring on it wedges every headless switch behind
-/// a TUI decision about nothing while running sessions sit at "Login expired"
-/// (observed 2026-07-15). An unreadable/unparseable live file still defers:
-/// it may be a CC write in progress.
+/// A logged-out shell (see [`live_credentials_are_shell`]) is exempt: an empty
+/// login is not "unsaved credentials", and deferring on it wedges every
+/// headless switch behind a TUI decision about nothing while running sessions
+/// sit at "Login expired" (observed 2026-07-15). An unreadable/torn live file
+/// still defers — it may be a CC write in progress.
 fn active_diverged_unsaved(active: &str) -> bool {
     matches!(
         classify_credentials_link(active).ok(),

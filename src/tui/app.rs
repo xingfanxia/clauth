@@ -3240,10 +3240,8 @@ where
 }
 
 /// True when the live credentials diverge from the stored chain and it's not a
-/// first-login adoption (must be reconciled before clearing/relinking).
-/// Claude Code's logged-out shell (both tokens blanked) is exempt — an empty
-/// login needs no reconciling, and blocking a switch on it would defer the
-/// action behind a Divergence decision about nothing.
+/// first-login adoption (must be reconciled before clearing/relinking). A
+/// logged-out shell is exempt — an empty login needs no reconciling.
 fn active_diverged_unsaved(active: &str) -> bool {
     matches!(
         classify_credentials_link(active).ok(),
@@ -6844,11 +6842,8 @@ fn poll_credentials_divergence(app: &mut App) {
         app.divergence_pending = None; // resolved; a later divergence re-flags
         return;
     }
-    // Claude Code's logged-out shell (both tokens blanked after its own
-    // refresh died) is not an unsaved login: nothing to capture, nothing to
-    // resolve — don't nag, and never let a `default_divergence` Overwrite
-    // "capture" empty tokens over the profile's stored chain. The next switch
-    // replaces the shell wholesale.
+    // A logged-out shell is nothing to resolve: don't nag, and never let a
+    // `default_divergence` Overwrite capture its blank tokens over the stored chain.
     if live_credentials_are_shell() {
         app.divergence_pending = None;
         return;

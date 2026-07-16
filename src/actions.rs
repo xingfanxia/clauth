@@ -84,10 +84,8 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         // switch. (Interactive callers already route a real divergence to the
         // reconcile path, so this branch is only reachable uncaptured via the
         // scheduler — where refusing, not dropping, is the safe outcome.)
-        // Claude Code's logged-out shell (both tokens blanked) is NOT an
-        // uncaptured re-login: there is no login in it to strand, and the
-        // non-force guard would otherwise refuse to replace the empty file,
-        // wedging every switch until a human resolves nothing in the TUI.
+        // A logged-out shell holds no login to strand, so it forfeits the
+        // refuse-guard (which would otherwise wedge the switch on an empty file).
         let uncaptured_relogin = match config.state.active_profile.as_deref() {
             Some(active) => {
                 matches!(classify_credentials_link(active)?, LinkState::Diverged)
@@ -140,10 +138,9 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     let outgoing = config.state.active_profile.clone();
 
     // Diverged link = CC re-logged and wrote a regular file; must reconcile
-    // (capture into outgoing profile) rather than refuse. CC's logged-out
-    // shell (both tokens blanked) is exempt: capturing empty tokens over the
-    // outgoing profile's stored login would destroy it, so the shell takes the
-    // plain switch below and is replaced wholesale.
+    // (capture into outgoing profile) rather than refuse. A logged-out shell is
+    // exempt: capturing its blank tokens would destroy the outgoing profile's
+    // stored login.
     let reconciled = match outgoing.as_deref() {
         Some(active) => {
             matches!(classify_credentials_link(active)?, LinkState::Diverged)
@@ -278,9 +275,8 @@ pub(crate) fn switch_profile_noninteractive(
         }
     }
 
-    // CC's logged-out shell (both tokens blanked) is not a divergence to
-    // resolve: no divergence default is consulted and the plain switch below
-    // replaces the empty file (same exemption as the CLI path above).
+    // A logged-out shell is no divergence to resolve: skip the default and take
+    // the plain switch, which replaces the empty file.
     let diverged = match previous.as_deref() {
         Some(active) => {
             matches!(classify_credentials_link(active)?, LinkState::Diverged)
