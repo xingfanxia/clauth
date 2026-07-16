@@ -58,3 +58,22 @@ fn write_log_line_appends_each_call() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// The log lands in `~/.clauth` and carries whatever an event line names
+/// (profiles, endpoints, failure bodies), so it rides the same owner-only rule
+/// as the rest of the tree.
+#[cfg(unix)]
+#[test]
+fn write_log_line_creates_an_owner_only_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::env::temp_dir().join(format!("clauth-logline-perm-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    write_log_line(&path, "first");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        mode, 0o600,
+        "clauth.log mode should be 0o600, got {mode:#o}"
+    );
+}

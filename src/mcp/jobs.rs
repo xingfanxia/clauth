@@ -77,16 +77,13 @@ fn job_path(job_id: &str) -> Result<PathBuf> {
     Ok(jobs_dir()?.join(format!("{job_id}.json")))
 }
 
-/// Persist a record atomically: write a sibling tmp file, then rename over the
-/// final path (rename is atomic on the same filesystem, so a reader sees either
-/// the old file or the fully-written new one, never a torn write).
+/// Persist a record atomically (tmp + rename, so a reader sees either the old
+/// file or the fully-written new one, never a torn write). Owner-only: a job
+/// file carries the delegate's prompt and the account's full response, and lands
+/// under `~/.clauth`, so it rides the 0o600 dir-0o700 invariant.
 fn write_atomic(record: &JobRecord) -> Result<()> {
-    let dir = jobs_dir()?;
-    std::fs::create_dir_all(&dir)?;
     let bytes = serde_json::to_vec(record)?;
-    let tmp_path = dir.join(format!("{}.json.tmp", record.job_id));
-    std::fs::write(&tmp_path, &bytes)?;
-    std::fs::rename(&tmp_path, dir.join(format!("{}.json", record.job_id)))?;
+    crate::profile::atomic_write_600(&job_path(&record.job_id)?, &bytes)?;
     Ok(())
 }
 

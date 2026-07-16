@@ -995,6 +995,20 @@ pub(crate) fn incident_is_active(incident: &Incident) -> bool {
     incident.is_active()
 }
 
+/// Open a profile's `usage_history.jsonl` for append, creating it 0o600 on Unix.
+/// The log records per-profile utilization samples under `~/.clauth`, so it
+/// rides the owner-only invariant rather than the process umask.
+fn history_append_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 // ── Plugin tab ─────────────────────────────────────────────────────────────────
 
 /// Which Plugin pane has focus. `List`: the checks + profiles selector (↑↓ moves,
@@ -1925,11 +1939,8 @@ impl App {
                 if let Ok(path) = crate::profile::profile_history_path(name)
                     && path
                         .parent()
-                        .is_some_and(|p| std::fs::create_dir_all(p).is_ok())
-                    && let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)
+                        .is_some_and(|p| crate::profile::mkdir_700(p).is_ok())
+                    && let Ok(mut file) = history_append_file(&path)
                 {
                     let ts = now_ms();
                     // Bridge: stamp the old value one ms before the new sample

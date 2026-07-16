@@ -75,7 +75,7 @@ impl Ledger {
     /// optimization for one cycle.
     pub(crate) fn save(&self, clauth_dir: &Path) {
         if let Ok(bytes) = serde_json::to_vec(self) {
-            let _ = crate::profile::atomic_write(&Self::path(clauth_dir), &bytes);
+            let _ = crate::profile::atomic_write_600(&Self::path(clauth_dir), &bytes);
         }
     }
 

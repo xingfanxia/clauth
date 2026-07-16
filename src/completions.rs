@@ -137,9 +137,9 @@ fn detect_shell() -> Result<String> {
 fn install_rc(shell: &str, script: &str, rc_name: &str) -> Result<()> {
     let home = home_dir()?;
     let completions_dir = home.join(".clauth").join("completions");
-    fs::create_dir_all(&completions_dir)?;
+    crate::profile::mkdir_700(&completions_dir)?;
     let script_path = completions_dir.join(format!("clauth.{shell}"));
-    fs::write(&script_path, script)
+    crate::profile::atomic_write_600(&script_path, script)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
 
     let rc_path = home.join(rc_name);
@@ -236,8 +236,8 @@ pub(crate) fn auto_install_once() {
         return; // don't record the sentinel — re-prompt on the next interactive launch
     }
 
-    let _ = fs::create_dir_all(&clauth_dir);
-    let _ = fs::write(&sentinel, "");
+    let _ = crate::profile::mkdir_700(&clauth_dir);
+    let _ = crate::profile::atomic_write_600(&sentinel, "");
 
     if matches!(consent, Consent::Yes)
         && let Err(e) = install(Some(&shell))

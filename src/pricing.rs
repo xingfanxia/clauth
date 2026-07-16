@@ -39,7 +39,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::poll::{first_delay, run_polling_loop};
-use crate::profile::{atomic_write, clauth_dir};
+use crate::profile::{atomic_write_600, clauth_dir};
 use crate::tokens::ModelTokens;
 use crate::usage::now_ms;
 
@@ -316,7 +316,7 @@ fn save_cache(path: &Path, table: &PriceTable) {
         rates: table.rates.clone(),
     };
     if let Ok(json) = serde_json::to_string(&cache) {
-        let _ = atomic_write(path, json);
+        let _ = atomic_write_600(path, json);
     }
 }
 

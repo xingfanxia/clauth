@@ -237,7 +237,7 @@ impl RotationGuard {
     pub(crate) fn acquire(name: &str) -> Result<Self> {
         let path = rotation_lock_path(name)?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            crate::profile::mkdir_700(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let file =
@@ -253,14 +253,11 @@ impl RotationGuard {
 
 /// Open or create a PID file without truncating — used for session liveness
 /// tracking via flock. `O_CREAT` without truncate preserves any existing lock
-/// held by a sibling that raced us to create the file.
+/// held by a sibling that raced us to create the file. Owner-only (0o600) via
+/// [`crate::profile::open_state_file`], the shared opener for every `~/.clauth`
+/// lock (this also covers `rotation.lock`, opened through here).
 pub(crate) fn open_pid_file(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
+    crate::profile::open_state_file(path)
 }
 
 /// Live-session guard. On drop: stops the watchdog, runs a final sync
@@ -310,7 +307,7 @@ impl ProfileRuntime {
         let _rotation_guard = RotationGuard::acquire(name)?;
 
         let (pid_lock, mode) = with_state_lock(|| {
-            std::fs::create_dir_all(&sessions)
+            crate::profile::mkdir_700(&sessions)
                 .with_context(|| format!("failed to create {}", sessions.display()))?;
             let active = prune_stale_sessions(&sessions)?;
             // No live siblings — rebuild from scratch so stale symlinks/copies
@@ -319,7 +316,7 @@ impl ProfileRuntime {
                 std::fs::remove_dir_all(&runtime)
                     .with_context(|| format!("failed to clear {}", runtime.display()))?;
             }
-            std::fs::create_dir_all(&runtime)
+            crate::profile::mkdir_700(&runtime)
                 .with_context(|| format!("failed to create {}", runtime.display()))?;
             let mode = detect_link_mode(&runtime)?;
             build_runtime_dir_with_active_env(
@@ -749,13 +746,35 @@ fn write_merged_settings(
     };
     let merged = build_claude_settings_json(base, profile, active_env_keys)?;
     let settings_dst = runtime.join("settings.json");
-    let needs_write = std::fs::read(&settings_dst)
-        .map(|existing| existing != merged.as_bytes())
-        .unwrap_or(true);
+    // This file carries the api-key profile's `ANTHROPIC_AUTH_TOKEN`, so it must
+    // land 0o600 like every other clauth-owned write. The write gate also fires
+    // when only the mode is wrong (a byte-identical file an older build left at
+    // the umask never self-heals otherwise).
+    let needs_write = match std::fs::read(&settings_dst) {
+        Ok(existing) => existing != merged.as_bytes() || !is_owner_only(&settings_dst),
+        Err(_) => true,
+    };
     if needs_write {
-        atomic_write(&settings_dst, merged).context("failed to write runtime settings.json")?;
+        atomic_write_600(&settings_dst, merged).context("failed to write runtime settings.json")?;
     }
     Ok(())
+}
+
+/// True when `path`'s mode is exactly 0o600 on Unix. Always true on non-Unix
+/// (no POSIX modes), so the settings write-gate keys on bytes there.
+fn is_owner_only(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o777 == 0o600)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
 }
 
 /// Seed this profile's private copy of `~/.claude.json`. Claude Code's big
@@ -774,9 +793,10 @@ fn write_merged_settings(
 ///
 /// Seeds from the global file when this profile has no real copy yet, or
 /// migrates the old shared symlink (pre-per-profile behavior) to a copy.
-/// `atomic_write` renames over the path, replacing a symlink in one step — no
-/// window where a sibling session sees the file missing. Existing real copies
-/// keep their own identity and synced shared fields.
+/// `atomic_write_600` renames over the path, replacing a symlink in one step —
+/// no window where a sibling session sees the file missing — at owner-only mode
+/// (the seed carries the account's `oauthAccount` billing/identity caches).
+/// Existing real copies keep their own identity and synced shared fields.
 fn seed_claude_json(runtime: &Path, claude_home: &Path) -> Result<()> {
     let Some(home) = claude_home.parent() else {
         return Ok(());
@@ -790,7 +810,8 @@ fn seed_claude_json(runtime: &Path, claude_home: &Path) -> Result<()> {
         && let Ok(bytes) = std::fs::read(&global)
     {
         let bytes = strip_oauth_account_on_seed(bytes);
-        atomic_write(&dst, &bytes).with_context(|| format!("failed to seed {}", dst.display()))?;
+        atomic_write_600(&dst, &bytes)
+            .with_context(|| format!("failed to seed {}", dst.display()))?;
     }
     Ok(())
 }

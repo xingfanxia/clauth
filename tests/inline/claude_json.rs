@@ -80,6 +80,57 @@ fn per_profile_fields_never_propagate() {
     assert_eq!(bj["overageCreditGrantCache"], json!({"b": true}));
 }
 
+/// A sync rewrites a member by rename, so the replacement inode takes the
+/// writer's mode, not the old file's: a plain write reverts a runtime copy to
+/// the umask on every tick, whatever the seed wrote. The home file is Claude
+/// Code's own and keeps CC's posture — clauth must not chmod it either way.
+#[cfg(unix)]
+#[test]
+fn sync_writes_runtime_copies_owner_only_and_leaves_the_home_file_alone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let home_file = home.home().join(".claude.json");
+    let winner = home.home().join(".clauth/profiles/p1/runtime/.claude.json");
+    let loser = home.home().join(".clauth/profiles/p2/runtime/.claude.json");
+    for path in [&winner, &loser] {
+        #[allow(clippy::expect_used)]
+        fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir runtime");
+    }
+    write_json(&home_file, &json!({"numStartups": 1}));
+    write_json(&winner, &json!({"numStartups": 9}));
+    write_json(&loser, &json!({"numStartups": 2}));
+    fs::set_permissions(&home_file, fs::Permissions::from_mode(0o644)).expect("chmod home");
+    set_mtime(&home_file, t(5));
+    set_mtime(&winner, t(10));
+    set_mtime(&loser, t(1));
+
+    sync_paths(&[home_file.clone(), winner, loser.clone()]).expect("sync");
+
+    let mode = |p: &Path| fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(
+        read_json(&loser)["numStartups"],
+        json!(9),
+        "precondition: the loser was rewritten by this sync"
+    );
+    assert_eq!(
+        mode(&loser),
+        0o600,
+        "a runtime .claude.json is clauth-owned; mode should be 0o600, got {:#o}",
+        mode(&loser),
+    );
+    assert_eq!(
+        read_json(&home_file)["numStartups"],
+        json!(9),
+        "precondition: the home file was rewritten by this sync"
+    );
+    assert_eq!(
+        mode(&home_file),
+        0o644,
+        "~/.claude.json is Claude Code's own file; the syncer must not restyle its mode"
+    );
+}
+
 #[test]
 fn account_scoped_model_caches_stay_per_profile() {
     let tmp = tempfile::tempdir().expect("tempdir");

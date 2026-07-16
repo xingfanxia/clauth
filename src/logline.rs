@@ -102,11 +102,16 @@ fn append_logfile(rendered: &str) {
 /// coordinate). Best-effort: an unwritable log never propagates back to the
 /// event source.
 fn write_log_line(path: &Path, rendered: &str) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    // 0o600 on create: an event line names profiles, endpoints, and failure
+    // bodies, and the log lives under `~/.clauth` — owner-only like the rest.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(path) {
         let _ = writeln!(f, "{rendered}");
     }
 }

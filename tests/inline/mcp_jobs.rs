@@ -118,3 +118,38 @@ fn gc_caps_retained_to_newest() {
         "newest kept"
     );
 }
+
+/// A job file carries the delegate's prompt and the account's full response, and
+/// the dir naming every background job is as readable as the files in it. Both
+/// ride clauth's owner-only rule for `~/.clauth`.
+#[cfg(unix)]
+#[test]
+fn job_files_and_dir_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    write_done(
+        &id,
+        "work",
+        1000,
+        serde_json::json!({"result": "secret output"}),
+    )
+    .unwrap();
+
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let dir = jobs_dir().unwrap();
+    assert_eq!(
+        mode(&dir),
+        0o700,
+        "jobs dir mode should be 0o700, got {:#o}",
+        mode(&dir)
+    );
+    let file = dir.join(format!("{id}.json"));
+    assert_eq!(
+        mode(&file),
+        0o600,
+        "job file mode should be 0o600, got {:#o}",
+        mode(&file)
+    );
+}

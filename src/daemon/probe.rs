@@ -139,13 +139,7 @@ impl FetchLease {
         // `serve()` already creates it for the daemon; a TUI normally reaches here
         // with the dir already present (profiles live in it).
         let _ = crate::profile::mkdir_700(&dir);
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(super::FETCH_LOCK_FILE))
-        else {
+        let Ok(file) = crate::profile::open_state_file(&dir.join(super::FETCH_LOCK_FILE)) else {
             return false;
         };
         match file.try_lock() {

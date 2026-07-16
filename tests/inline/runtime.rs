@@ -1067,6 +1067,110 @@ fn build_runtime_dir_links_claude_json_from_parent() {
     });
 }
 
+/// `runtime/settings.json` carries the profile's `ANTHROPIC_AUTH_TOKEN` for an
+/// api-key profile, so it is a credential file and must land 0o600 like every
+/// other clauth-owned write. The seeded `.claude.json` rides the same rule.
+#[cfg(unix)]
+#[test]
+fn runtime_settings_and_seed_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(claude_home.join("settings.json"), br#"{}"#).expect("write settings");
+        fs::write(tmp.path().join(".claude.json"), br#"{"numStartups":1}"#).expect("write global");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = crate::profile::Profile::new(
+            "keyed".to_string(),
+            Some("https://api.example.com".to_string()),
+            Some("sk-secret-key".to_string()),
+        );
+
+        build_runtime_dir(
+            &runtime,
+            &claude_home,
+            &profile,
+            &tmp.path().join("creds.json"),
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
+
+        let settings = runtime.join("settings.json");
+        assert!(
+            fs::read_to_string(&settings)
+                .expect("read settings")
+                .contains("sk-secret-key"),
+            "precondition: the api key is in this file"
+        );
+        let mode = fs::metadata(&settings).expect("meta").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "runtime settings.json holds the api key; mode should be 0o600, got {:#o}",
+            mode & 0o777,
+        );
+        let seed_mode = fs::metadata(runtime.join(".claude.json"))
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(
+            seed_mode & 0o777,
+            0o600,
+            "seeded .claude.json mode should be 0o600, got {:#o}",
+            seed_mode & 0o777,
+        );
+    });
+}
+
+/// A settings.json an older build left at 0o644 keeps its bytes forever once
+/// the profile stops changing, so a byte-only write gate would never retighten
+/// it. The gate has to see the mode too.
+#[cfg(unix)]
+#[test]
+fn runtime_settings_retightens_a_loose_file_with_current_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::write(claude_home.join("settings.json"), br#"{}"#).expect("write settings");
+        let runtime = tmp.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        let profile = crate::profile::Profile::new(
+            "keyed".to_string(),
+            Some("https://api.example.com".to_string()),
+            Some("sk-secret-key".to_string()),
+        );
+
+        // Byte-identical to what the merge produces, at the old umask mode.
+        let current =
+            build_claude_settings_json(Some(&claude_home.join("settings.json")), &profile, &[])
+                .expect("build_claude_settings_json");
+        let settings = runtime.join("settings.json");
+        fs::write(&settings, &current).expect("write legacy settings");
+        fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        write_merged_settings(&runtime, &claude_home, &profile, Isolation::Shared, &[])
+            .expect("write_merged_settings");
+
+        let mode = fs::metadata(&settings).expect("meta").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a 0o644 settings.json from an older build must be retightened, got {:#o}",
+            mode & 0o777,
+        );
+        assert_eq!(
+            fs::read_to_string(&settings).expect("read"),
+            current,
+            "content must be unchanged by the mode repair"
+        );
+    });
+}
+
 /// Issue #17 systemic finding: a raw copy is born carrying whichever account
 /// was active at seed time, wrong for every non-active profile. Seeding must
 /// strip it so the fresh runtime starts identity-less and Claude Code

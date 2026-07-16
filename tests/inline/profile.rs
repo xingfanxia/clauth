@@ -736,6 +736,72 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
     );
 }
 
+/// Installs from before the 0o600/0o700 rule carry a umask-moded tree that no
+/// writer ever revisits: bytes that never change keep their mode forever. Every
+/// entry point loads the config, so that is where the tree gets retightened.
+#[cfg(unix)]
+#[test]
+fn load_config_repairs_a_loose_clauth_tree() {
+    use crate::testutil::owner_only_violations;
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    let name = "perm-test-repair";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    save_app_state(&AppState {
+        profiles: vec![name.into()],
+        ..Default::default()
+    })
+    .expect("save_app_state");
+
+    let clauth = clauth_dir().expect("clauth_dir");
+    let profile = profile_dir(name).expect("profile_dir");
+    let runtime = profile.join("runtime");
+    let sessions = profile.join("sessions");
+    std::fs::create_dir_all(&runtime).expect("mkdir runtime");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    std::fs::write(runtime.join("settings.json"), b"{}").expect("write settings");
+    std::fs::write(profile.join("usage_history.jsonl"), b"").expect("write history");
+
+    // What an older build left behind: umask modes top to bottom.
+    for dir in [&clauth, &clauth.join("profiles"), &profile, &runtime] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    }
+    for file in [
+        profile.join("config.toml"),
+        profile.join("usage_history.jsonl"),
+        runtime.join("settings.json"),
+    ] {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod file");
+    }
+
+    // A runtime links into the operator's ~/.claude, and `set_permissions`
+    // resolves links — walking one would chmod a file clauth does not own.
+    let outside = home.home().join("outside.json");
+    std::fs::write(&outside, b"{}").expect("write outside");
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    std::os::unix::fs::symlink(&outside, runtime.join("CLAUDE.md")).expect("symlink");
+
+    load_config().expect("load_config");
+
+    let left = owner_only_violations(&clauth);
+    assert!(
+        left.is_empty(),
+        "load_config must leave the whole ~/.clauth tree owner-only; still loose: {left:#?}"
+    );
+    let outside_mode = std::fs::metadata(&outside)
+        .expect("outside metadata")
+        .permissions()
+        .mode();
+    assert_eq!(
+        outside_mode & 0o777,
+        0o644,
+        "the repair followed a symlink out of the tree and chmodded {:#o} onto a file clauth does not own",
+        outside_mode & 0o777,
+    );
+}
+
 #[test]
 fn profile_config_reads_models_table() {
     let toml = "[models]\n\

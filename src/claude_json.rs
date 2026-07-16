@@ -160,10 +160,27 @@ fn sync_paths(paths: &[PathBuf]) -> Result<()> {
         }
         let bytes = serde_json::to_vec_pretty(&Value::Object(merged))
             .context("failed to serialize merged .claude.json")?;
-        atomic_write(&member.path, &bytes)
+        write_member(&member.path, &bytes)
             .with_context(|| format!("failed to write {}", member.path.display()))?;
     }
     Ok(())
+}
+
+/// Write a synced `.claude.json`. The rename swaps the inode, so the mode is the
+/// writer's, not the file's: a runtime copy (clauth-owned, under `~/.clauth`)
+/// gets 0o600 so the syncer can't silently revert the seed's owner-only mode,
+/// while the operator's own `~/.claude.json` keeps Claude Code's posture (clauth
+/// must not restyle a file it doesn't own). Any path that is not the home file
+/// is treated as clauth-owned, the stricter default.
+fn write_member(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let is_home_file = home_dir()
+        .map(|h| path == h.join(".claude.json"))
+        .unwrap_or(false);
+    if is_home_file {
+        atomic_write(path, bytes)
+    } else {
+        crate::profile::atomic_write_600(path, bytes)
+    }
 }
 
 /// CC's cached account uuid from `~/.claude.json`'s `oauthAccount.accountUuid`,

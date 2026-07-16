@@ -679,7 +679,9 @@ pub(crate) fn prune_usage_history(name: &str) {
     if pruned > 0 {
         let body = kept.join("\n");
         let body = if body.is_empty() { body } else { body + "\n" };
-        if let Err(e) = atomic_write(&path, body) {
+        // 0o600: the rename swaps the inode, so a plain write would revert the
+        // history log (re-created 0o600 by the appender) to the umask.
+        if let Err(e) = atomic_write_600(&path, body) {
             logline!("clauth: failed to prune usage history for {name}: {e}");
         }
     }
@@ -787,6 +789,56 @@ pub(crate) fn mkdir_700(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
+/// Open an owner-only advisory-lock/state file (`read+write`, create without
+/// truncating so a sibling's held lock survives the race) at mode 0o600. Every
+/// `~/.clauth` lock file (`.lock`, `clauthd.lock`, `usage-fetch.lock`, session
+/// PID files, `rotation.lock`) routes through here so no lock is born at the
+/// process umask — the file itself carries nothing secret, but a blanket
+/// owner-only tree is the invariant the perms test can check without an
+/// exceptions list.
+pub(crate) fn open_state_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Retighten an existing `~/.clauth` tree to the owner-only invariant (0o700
+/// dirs, 0o600 files). Installs created before the invariant carry umask modes
+/// no writer revisits once the bytes stop changing, so [`load_config`] runs
+/// this on every entry point. Symlinks are skipped and never traversed: a
+/// shared-mode runtime is full of links into the operator's `~/.claude`, and
+/// following one would chmod a file clauth does not own. Best-effort per entry
+/// — a chmod failure on one path never aborts the walk or the load.
+pub(crate) fn enforce_clauth_perms(root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = root.symlink_metadata() else {
+            return;
+        };
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        let is_dir = meta.is_dir();
+        let want = if is_dir { 0o700 } else { 0o600 };
+        if meta.permissions().mode() & 0o777 != want {
+            let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(want));
+        }
+        if is_dir && let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                enforce_clauth_perms(&entry.path());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+}
+
 pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -819,7 +871,7 @@ fn load_app_state() -> Result<AppState> {
 
 pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
     with_state_lock(|| {
-        std::fs::create_dir_all(clauth_dir()?)?;
+        mkdir_700(&clauth_dir()?)?;
         atomic_write_600(&app_state_path()?, toml::to_string_pretty(state)?)
             .context("failed to write profiles.toml")
     })
@@ -1000,7 +1052,12 @@ fn recover_pending_credentials(
 }
 
 pub(crate) fn load_config() -> Result<AppConfig> {
-    std::fs::create_dir_all(profiles_root()?)?;
+    mkdir_700(&profiles_root()?)?;
+    // Every entry point loads config early, so this is the tree-wide chokepoint
+    // that retightens an install created before the owner-only invariant.
+    if let Ok(dir) = clauth_dir() {
+        enforce_clauth_perms(&dir);
+    }
     let state = load_app_state()?;
     let profiles = state
         .profiles

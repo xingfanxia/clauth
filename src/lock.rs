@@ -14,7 +14,7 @@
 //! executes its closure at a time.
 
 use std::cell::Cell;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
@@ -76,13 +76,8 @@ impl StateLock {
 
         if guard.is_none() {
             let dir = clauth_dir()?;
-            std::fs::create_dir_all(&dir).context("failed to create ~/.clauth")?;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(dir.join(LOCK_FILENAME))
+            crate::profile::mkdir_700(&dir).context("failed to create ~/.clauth")?;
+            let file = crate::profile::open_state_file(&dir.join(LOCK_FILENAME))
                 .context("failed to open clauth state lock file")?;
             file.lock().context("failed to acquire clauth state lock")?;
             *guard = Some(file);

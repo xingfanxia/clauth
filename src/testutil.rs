@@ -98,3 +98,32 @@ pub(crate) fn env_overrides(cmd: &Command) -> HashMap<String, Option<String>> {
         })
         .collect()
 }
+
+/// Every path under `root` breaking the owner-only invariant clauth holds over
+/// `~/.clauth` (0o700 dirs, 0o600 files), rendered as `<mode> <path>` lines.
+/// Symlinks are skipped — a link's own mode is meaningless and its target lives
+/// outside the tree.
+#[cfg(unix)]
+pub(crate) fn owner_only_violations(root: &Path) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut out = Vec::new();
+    let Ok(meta) = root.symlink_metadata() else {
+        return out;
+    };
+    if meta.file_type().is_symlink() {
+        return out;
+    }
+    let is_dir = meta.file_type().is_dir();
+    let mode = meta.permissions().mode() & 0o777;
+    let want = if is_dir { 0o700 } else { 0o600 };
+    if mode != want {
+        out.push(format!("{mode:#o} {} (want {want:#o})", root.display()));
+    }
+    if is_dir && let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            out.extend(owner_only_violations(&entry.path()));
+        }
+    }
+    out
+}

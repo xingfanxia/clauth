@@ -245,7 +245,7 @@ fn load_cache(path: &std::path::Path) -> Option<CacheFile> {
 /// a cache write failing never blocks the live feed.
 fn save_cache(path: &std::path::Path, cache: &CacheFile) {
     if let Ok(json) = serde_json::to_string_pretty(cache) {
-        let _ = crate::profile::atomic_write(path, json);
+        let _ = crate::profile::atomic_write_600(path, json);
     }
 }
 

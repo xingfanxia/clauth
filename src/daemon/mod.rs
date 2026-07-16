@@ -100,34 +100,18 @@ fn watchdog_check(last_tick_ms: u64, now_ms: u64, deadline_ms: u64, on_stall: im
     }
 }
 
-/// Tighten an existing `~/.clauth` tree on boot. `mkdir_700` only
-/// sets the mode on dirs it CREATES; a tree from an older build or created by the
-/// CLI under a permissive umask can be 0o755 (world-traversable → world-readable
-/// `daemon.log`, enumerable account names). Two things are enforced, both
-/// best-effort (a failure must never stop the daemon):
-/// - `~/.clauth` and `~/.clauth/profiles` → 0o700. Tightening the root alone
-///   blocks other-user traversal into every per-profile subdir regardless of the
-///   subdirs' own modes, so they need not be walked.
-/// - `~/.clauth/daemon.log` → 0o600. The daemon does not create this file —
-///   launchd opens it (`StandardErrorPath`) at the process umask (~0o644) before
-///   `exec` — so clauth chmods it here to match the `0o600` SECURITY.md pledges
-///   (it can echo a config-parse error carrying a `config.toml` api_key snippet).
-///   The already-open launchd fd keeps appending to the now-0o600 inode.
-#[cfg(unix)]
+/// Tighten an existing `~/.clauth` tree on boot, before `load_config` runs its
+/// own walk. `mkdir_700` only sets the mode on dirs it CREATES; a tree from an
+/// older build or created under a permissive umask can be 0o755
+/// (world-traversable → world-readable `daemon.log`, enumerable account names).
+/// Delegates to [`crate::profile::enforce_clauth_perms`] for the whole tree
+/// (dirs → 0o700, files → 0o600, symlinks skipped), which also covers the
+/// launchd-created `daemon.log`: launchd opens it (`StandardErrorPath`) at the
+/// umask (~0o644) before `exec`, and the already-open fd keeps appending to the
+/// now-0o600 inode. Best-effort — a chmod failure never stops the daemon.
 fn migrate_clauth_perms_700(dir: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    for d in [dir.to_path_buf(), dir.join("profiles")] {
-        if d.is_dir() {
-            let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700));
-        }
-    }
-    let log = dir.join("daemon.log");
-    if log.is_file() {
-        let _ = std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600));
-    }
+    crate::profile::enforce_clauth_perms(dir);
 }
-#[cfg(not(unix))]
-fn migrate_clauth_perms_700(_dir: &std::path::Path) {}
 
 /// `clauth daemon` — build the shared stores, run the scheduler headless, and
 /// loop executing auto-switches + rewriting `status.json` until killed.
@@ -154,12 +138,7 @@ pub(crate) fn serve() -> Result<()> {
     // `KeepAlive{SuccessfulExit=false}` valid (a clean exit must never have to be
     // restarted). A dead holder's advisory flock auto-releases, so standby is
     // never orphaned.
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join(LOCK_FILE))
+    let lock_file = crate::profile::open_state_file(&dir.join(LOCK_FILE))
         .context("failed to open the clauth daemon lock file")?;
     if lock_file.try_lock().is_err() {
         logline!("clauth daemon: another instance holds the lock: standing by until it exits");
