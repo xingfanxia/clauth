@@ -51,7 +51,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     // When a banner is active, carve one row off the top of the body area.
     let body_area = if let Some(b) = &app.banner {
         let [banner_area, rest] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content_area);
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(content_area);
         banner::draw(frame, banner_area, b);
         rest
     } else {

@@ -460,7 +460,7 @@ const CARD_COL_W: u16 = 56;
 fn dash_rects(area: Rect) -> DashRects {
     if area.width >= TWO_COL_MIN_W && area.height >= TWO_COL_MIN_H {
         let cols: [Rect; 2] =
-            Layout::horizontal([Constraint::Length(CARD_COL_W), Constraint::Min(0)]).areas(area);
+            Layout::horizontal([Constraint::Length(CARD_COL_W), Constraint::Fill(1)]).areas(area);
         let left: [Rect; 5] = Layout::vertical([
             Constraint::Length(6), // today / this week / this month
             Constraint::Length(6), // total
@@ -501,7 +501,7 @@ fn dash_rects(area: Rect) -> DashRects {
     // to 24 + 4 (border + 1-col padding each side) so the graph fills it with
     // no gap; activity takes the rest and shows more history on wide terminals.
     let bot: [Rect; 2] =
-        Layout::horizontal([Constraint::Length(HOUR_BOX_W), Constraint::Min(0)]).areas(rows[3]);
+        Layout::horizontal([Constraint::Length(HOUR_BOX_W), Constraint::Fill(1)]).areas(rows[3]);
     DashRects {
         first: top[0],
         total: top[1],
