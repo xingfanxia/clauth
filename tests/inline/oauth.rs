@@ -11,6 +11,44 @@ use crate::profile::{AppState, ClaudeCredentials, OAuthToken, Profile, profile_d
 use crate::runtime::open_pid_file;
 use crate::usage::is_idle;
 
+/// Read an ENTIRE HTTP request (headers + any `Content-Length` body) off a
+/// loopback socket before the caller writes its response. On Windows a
+/// `close()` with unread bytes still in the recv buffer emits an abortive RST
+/// (WSAECONNABORTED 10053) that truncates the client's read of the response;
+/// Linux closes gracefully, so an un-drained POST body only bites the Windows
+/// CI leg. A bodyless GET drains in one read, which is why only the
+/// POST-driven servers need this.
+fn drain_http_request(sock: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    let mut req = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        match sock.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                req.extend_from_slice(&tmp[..n]);
+                if let Some(hlen) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let cl = req[..hlen]
+                        .split(|&b| b == b'\n')
+                        .find_map(|line| {
+                            std::str::from_utf8(line)
+                                .ok()?
+                                .to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if req.len() >= hlen + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    req
+}
+
 fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
@@ -1242,7 +1280,7 @@ fn kick_header<'a>(req: &'a str, name: &str) -> Option<&'a str> {
 
 #[test]
 fn kick_emits_cc_message_wire_shape() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1250,19 +1288,11 @@ fn kick_emits_cc_message_wire_shape() {
     let server = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 512];
-        while let Ok(n) = sock.read(&mut tmp) {
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-        let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
-        String::from_utf8_lossy(&buf).into_owned()
+        let req = drain_http_request(&mut sock);
+        let _ =
+            sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}");
+        let _ = sock.shutdown(std::net::Shutdown::Write);
+        String::from_utf8_lossy(&req).into_owned()
     });
 
     crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
@@ -1378,7 +1408,7 @@ fn kick_rate_limit_distills_status_reset_and_retry_after() {
 /// the 2026-07-15 incident.
 #[test]
 fn kick_429_surfaces_limiter_metadata() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
 
     let reset = crate::usage::now_epoch_secs() + 100_000;
@@ -1387,25 +1417,17 @@ fn kick_429_surfaces_limiter_metadata() {
     let server = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 512];
-        while let Ok(n) = sock.read(&mut tmp) {
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
+        drain_http_request(&mut sock);
         let response = format!(
             "HTTP/1.1 429 Too Many Requests\r\n\
              retry-after: 120\r\n\
              anthropic-ratelimit-unified-status: rejected\r\n\
              anthropic-ratelimit-unified-reset: {reset}\r\n\
+             connection: close\r\n\
              content-length: 0\r\n\r\n"
         );
         let _ = sock.write_all(response.as_bytes());
+        let _ = sock.shutdown(std::net::Shutdown::Write);
     });
 
     crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
@@ -1441,7 +1463,7 @@ fn kick_429_surfaces_limiter_metadata() {
 /// the config is per-agent — fetch's flag says nothing about this one's.
 #[test]
 fn token_agent_surfaces_non_2xx_as_ok_not_a_transport_error() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::time::Duration;
 
@@ -1450,37 +1472,7 @@ fn token_agent_surfaces_non_2xx_as_ok_not_a_transport_error() {
     let server = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().expect("accept");
         sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
-        // Drain the ENTIRE request (headers + body) before responding: on Windows
-        // a close() with unread bytes still in the recv buffer emits an abortive
-        // RST (WSAECONNABORTED 10053) and ureq's read of the 400 fails. Linux
-        // closes gracefully, which is why this only bit CI on windows. The GET
-        // sibling never tripped it because a bodyless request drains in one read.
-        let mut req = Vec::new();
-        let mut tmp = [0u8; 1024];
-        loop {
-            match sock.read(&mut tmp) {
-                Ok(0) => break,
-                Ok(n) => {
-                    req.extend_from_slice(&tmp[..n]);
-                    if let Some(hlen) = req.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let cl = req[..hlen]
-                            .split(|&b| b == b'\n')
-                            .find_map(|line| {
-                                std::str::from_utf8(line)
-                                    .ok()?
-                                    .to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                            })
-                            .unwrap_or(0);
-                        if req.len() >= hlen + 4 + cl {
-                            break;
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        drain_http_request(&mut sock);
         // The shape the real token endpoint answers a dead refresh token with.
         let body = br#"{"error": "invalid_grant"}"#;
         let _ = sock.write_all(
