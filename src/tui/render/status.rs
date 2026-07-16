@@ -12,7 +12,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
@@ -251,8 +251,7 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
         ));
     }
 
-    Block::default()
-        .borders(Borders::ALL)
+    Block::bordered()
         .border_set(border::ROUNDED)
         .border_style(border_style)
         .title(Line::from(title_spans))

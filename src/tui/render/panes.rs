@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
 use super::super::app::{App, InputState};
 use super::super::theme;
@@ -147,8 +147,7 @@ pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'
         ]),
     ])
     .block(
-        Block::default()
-            .borders(Borders::ALL)
+        Block::bordered()
             .border_set(border::ROUNDED)
             .border_style(Style::default().fg(theme::line_color())),
     )
@@ -381,8 +380,7 @@ fn section_box_impl(
     };
     let mut title_spans = vec![Span::styled(label, title_style)];
     title_spans.extend(suffix);
-    Block::default()
-        .borders(Borders::ALL)
+    Block::bordered()
         .border_set(border::ROUNDED)
         .border_style(border_style)
         .title(Line::from(title_spans))

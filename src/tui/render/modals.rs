@@ -5,7 +5,7 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
+use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 
 use crate::profile::DivergenceChoice;
 
@@ -120,8 +120,7 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
         ),
         Span::raw(" "),
     ]);
-    Block::default()
-        .borders(Borders::ALL)
+    Block::bordered()
         .border_set(border::ROUNDED)
         .border_style(Style::default().fg(theme::accent_2_color()))
         .title(title_line)
