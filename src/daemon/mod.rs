@@ -35,6 +35,7 @@ use anyhow::{Context, Result};
 
 use crate::claude::{
     LinkState, classify_credentials_link, is_first_login, link_profile_credentials,
+    live_credentials_are_shell,
 };
 use crate::lockorder::RankedMutex;
 use crate::logline::logline;
@@ -194,11 +195,19 @@ pub(crate) fn status_oneshot() -> Result<()> {
 /// True when the live credentials diverge from the active profile's stored chain
 /// and it isn't a first-login adoption — the daemon cannot prompt, so it skips
 /// the switch and leaves the resolution to the operator (TUI Divergence modal).
+///
+/// Claude Code's logged-out shell (both tokens blanked after its own refresh
+/// died) is exempt: it classifies Diverged, but an empty login is not
+/// "unsaved credentials" — deferring on it wedges every headless switch behind
+/// a TUI decision about nothing while running sessions sit at "Login expired"
+/// (observed 2026-07-15). An unreadable/unparseable live file still defers:
+/// it may be a CC write in progress.
 fn active_diverged_unsaved(active: &str) -> bool {
     matches!(
         classify_credentials_link(active).ok(),
         Some(LinkState::Diverged)
     ) && !is_first_login(active).unwrap_or(false)
+        && !live_credentials_are_shell()
 }
 
 /// Owns the shared `Arc` stores (cloned into the scheduler) plus main-loop-only
