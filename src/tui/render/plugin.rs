@@ -12,7 +12,7 @@
 //! title spinner only flickers while the cached `claude --version` is probed.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
@@ -25,16 +25,14 @@ use super::panes::{draw_scrollbar, empty_state, section_box, selector_width};
 use crate::format::truncate;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(selector_width(area.width)),
-            Constraint::Min(20),
-        ])
-        .split(area);
+    let [selector_area, detail_area] = Layout::horizontal([
+        Constraint::Length(selector_width(area.width)),
+        Constraint::Min(20),
+    ])
+    .areas(area);
 
-    draw_selector(frame, cols[0], app);
-    draw_detail(frame, cols[1], app);
+    draw_selector(frame, selector_area, app);
+    draw_detail(frame, detail_area, app);
 }
 
 // ── Left panel: checks + profiles selector ──────────────────────────────────────

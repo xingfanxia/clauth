@@ -26,7 +26,7 @@ mod tokens;
 mod usage;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::Block;
 
 use super::app::{App, Tab};
@@ -39,27 +39,23 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
 
     // Content frame's top border doubles as the header/content separator; the
     // header is always 3 rows (brand / count+status / tabs+gauge).
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(header::header_height(app)),
-            Constraint::Min(5),
-            Constraint::Length(1),
-        ])
-        .split(area);
+    let [header_area, content_area, footer_area] = Layout::vertical([
+        Constraint::Length(header::header_height(app)),
+        Constraint::Min(5),
+        Constraint::Length(1),
+    ])
+    .areas(area);
 
-    header::draw(frame, chunks[0], app);
+    header::draw(frame, header_area, app);
 
     // When a banner is active, carve one row off the top of the body area.
     let body_area = if let Some(b) = &app.banner {
-        let body_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(chunks[1]);
-        banner::draw(frame, body_chunks[0], b);
-        body_chunks[1]
+        let [banner_area, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content_area);
+        banner::draw(frame, banner_area, b);
+        rest
     } else {
-        chunks[1]
+        content_area
     };
 
     match app.tab {
@@ -72,7 +68,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         Tab::Status => status::draw(frame, body_area, app),
         Tab::Plugin => plugin::draw(frame, body_area, app),
     }
-    footer::draw(frame, chunks[2], app);
+    footer::draw(frame, footer_area, app);
 
     toasts::draw(frame, area, app);
 

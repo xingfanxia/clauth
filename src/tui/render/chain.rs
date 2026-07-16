@@ -10,7 +10,7 @@
 //! remove arms then confirms. No popups.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -44,17 +44,15 @@ const KEY_GUTTER: usize = 2;
 const ROWS_BEFORE: usize = 5;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(selector_width(area.width)),
-            Constraint::Min(20),
-        ])
-        .split(area);
+    let [selector_area, detail_area] = Layout::horizontal([
+        Constraint::Length(selector_width(area.width)),
+        Constraint::Min(20),
+    ])
+    .areas(area);
 
     let chain_focused = app.fallback_focus == FallbackFocus::Chain;
-    draw_chain_selector(frame, cols[0], app, chain_focused);
-    draw_chain_detail(frame, cols[1], app);
+    draw_chain_selector(frame, selector_area, app, chain_focused);
+    draw_chain_detail(frame, detail_area, app);
 }
 
 fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {

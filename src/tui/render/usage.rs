@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -45,16 +45,14 @@ struct HeaderState {
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(selector_width(area.width)),
-            Constraint::Min(20),
-        ])
-        .split(area);
+    let [selector_area, detail_area] = Layout::horizontal([
+        Constraint::Length(selector_width(area.width)),
+        Constraint::Min(20),
+    ])
+    .areas(area);
 
-    draw_profile_selector(frame, cols[0], app, app.profile_cursor, true);
-    draw_usage_detail(frame, cols[1], app);
+    draw_profile_selector(frame, selector_area, app, app.profile_cursor, true);
+    draw_usage_detail(frame, detail_area, app);
 }
 
 fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {

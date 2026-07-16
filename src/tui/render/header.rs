@@ -7,7 +7,7 @@
 //! before the name.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -190,17 +190,12 @@ pub(super) fn header_height(_app: &App) -> u16 {
 // ── Draw ─────────────────────────────────────────────────────────────────
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(10), Constraint::Min(20)])
-        .split(area);
+    let cols: [Rect; 2] =
+        Layout::horizontal([Constraint::Length(10), Constraint::Min(20)]).areas(area);
 
     draw_logo(frame, cols[0], app);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1); 3])
-        .split(cols[1]);
+    let rows: [Rect; 3] = Layout::vertical([Constraint::Length(1); 3]).areas(cols[1]);
 
     let n = app.config().profiles.len();
     let info_width = rows[0].width as usize;

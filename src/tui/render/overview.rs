@@ -1,7 +1,7 @@
 //! Overview tab: accounts table + fallback flow, inside one content frame.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
@@ -28,13 +28,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let target = if area.height >= 18 { 8 } else { 5 };
     let cap = area.height.saturating_sub(7).max(3);
     let chain_height = target.min(cap);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(7), Constraint::Length(chain_height)])
-        .split(area);
+    let [accounts_area, chain_area] =
+        Layout::vertical([Constraint::Min(7), Constraint::Length(chain_height)]).areas(area);
 
-    draw_overview_accounts(frame, chunks[0], app);
-    draw_fallback_overview(frame, chunks[1], app);
+    draw_overview_accounts(frame, accounts_area, app);
+    draw_fallback_overview(frame, chain_area, app);
 }
 
 fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -49,18 +47,16 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(inner);
+    let [header_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
 
-    let widths = OverviewWidths::new(chunks[1].width, app);
+    let widths = OverviewWidths::new(list_area.width, app);
     let header = overview_header(&widths);
-    frame.render_widget(Paragraph::new(header).style(theme::base()), chunks[0]);
+    frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
 
     let items = app.main_items();
     let sel = app.profile_cursor.min(items.len().saturating_sub(1));
-    let width = chunks[1].width;
+    let width = list_area.width;
     let rows: Vec<ListItem<'_>> = items
         .iter()
         .enumerate()
@@ -77,10 +73,10 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let list = List::new(rows).style(theme::base());
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(sel));
-    frame.render_stateful_widget(list, chunks[1], &mut state);
+    frame.render_stateful_widget(list, list_area, &mut state);
 
-    let viewport = chunks[1].height as usize;
-    draw_scrollbar(frame, chunks[1], total, state.offset(), viewport);
+    let viewport = list_area.height as usize;
+    draw_scrollbar(frame, list_area, total, state.offset(), viewport);
 }
 
 #[derive(Debug, Clone, Copy)]

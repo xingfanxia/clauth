@@ -16,7 +16,7 @@
 //! cards fall back to lifetime (badged) and costs render as `+`-marked floors.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -459,24 +459,19 @@ const CARD_COL_W: u16 = 56;
 /// edge-anchored figures into scattered fragments).
 fn dash_rects(area: Rect) -> DashRects {
     if area.width >= TWO_COL_MIN_W && area.height >= TWO_COL_MIN_H {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(CARD_COL_W), Constraint::Min(0)])
-            .split(area);
-        let left = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(6), // today / this week / this month
-                Constraint::Length(6), // total
-                Constraint::Length(7), // top models
-                Constraint::Length(6), // composition
-                Constraint::Min(5),    // hour of day (grows)
-            ])
-            .split(cols[0]);
-        let right = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(cols[1]);
+        let cols: [Rect; 2] =
+            Layout::horizontal([Constraint::Length(CARD_COL_W), Constraint::Min(0)]).areas(area);
+        let left: [Rect; 5] = Layout::vertical([
+            Constraint::Length(6), // today / this week / this month
+            Constraint::Length(6), // total
+            Constraint::Length(7), // top models
+            Constraint::Length(6), // composition
+            Constraint::Min(5),    // hour of day (grows)
+        ])
+        .areas(cols[0]);
+        let right: [Rect; 2] =
+            Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .areas(cols[1]);
         return DashRects {
             first: left[0],
             total: left[1],
@@ -493,24 +488,20 @@ fn dash_rects(area: Rect) -> DashRects {
     // bottom row (hour + activity) its 4-row floor plus the rest of the height.
     // Falls back to the old 4-row trend on short terminals.
     let trend_h = area.height.saturating_sub(6 + 7 + 4).clamp(4, 10);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(6), // today/this week/this month · total (incl. cost row)
-            Constraint::Length(trend_h), // daily/weekly/monthly trend (growable)
-            Constraint::Length(7), // top models · composition
-            Constraint::Min(4),    // hour · activity (takes the rest)
-        ])
-        .split(area);
+    let rows: [Rect; 4] = Layout::vertical([
+        Constraint::Length(6), // today/this week/this month · total (incl. cost row)
+        Constraint::Length(trend_h), // daily/weekly/monthly trend (growable)
+        Constraint::Length(7), // top models · composition
+        Constraint::Min(4),    // hour · activity (takes the rest)
+    ])
+    .areas(area);
     let top = halves(rows[0], 42);
     let mid = halves(rows[2], 55);
     // Hour graph is a fixed 24-bucket chart (one cell/hour). Pin its box width
     // to 24 + 4 (border + 1-col padding each side) so the graph fills it with
     // no gap; activity takes the rest and shows more history on wide terminals.
-    let bot = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(HOUR_BOX_W), Constraint::Min(0)])
-        .split(rows[3]);
+    let bot: [Rect; 2] =
+        Layout::horizontal([Constraint::Length(HOUR_BOX_W), Constraint::Min(0)]).areas(rows[3]);
     DashRects {
         first: top[0],
         total: top[1],
@@ -729,14 +720,12 @@ fn empty_models_msg(filter: TokenFilter) -> &'static str {
 }
 
 /// Split a row into two columns, the left taking `left_pct` percent.
-fn halves(area: Rect, left_pct: u16) -> std::rc::Rc<[Rect]> {
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(left_pct),
-            Constraint::Percentage(100 - left_pct),
-        ])
-        .split(area)
+fn halves(area: Rect, left_pct: u16) -> [Rect; 2] {
+    Layout::horizontal([
+        Constraint::Percentage(left_pct),
+        Constraint::Percentage(100 - left_pct),
+    ])
+    .areas(area)
 }
 
 /// Draw one bordered card with its lines. `meta` (if any) renders as a
@@ -1214,13 +1203,11 @@ fn kv_accent(label: &str, value: String) -> Line<'static> {
 // ── models master-detail view ──────────────────────────────────────────────
 
 fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(selector_width(area.width)),
-            Constraint::Min(20),
-        ])
-        .split(area);
+    let cols: [Rect; 2] = Layout::horizontal([
+        Constraint::Length(selector_width(area.width)),
+        Constraint::Min(20),
+    ])
+    .areas(area);
 
     let grouped = token_period_models(app);
     let sel = app.token_model_cursor.min(grouped.len().saturating_sub(1));

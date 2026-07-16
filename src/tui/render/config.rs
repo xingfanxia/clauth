@@ -5,7 +5,7 @@
 //! pane into a create form. No popups.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -25,17 +25,15 @@ const KEY_W: usize = 11;
 const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(selector_width(area.width)),
-            Constraint::Min(20),
-        ])
-        .split(area);
+    let [selector_area, settings_area] = Layout::horizontal([
+        Constraint::Length(selector_width(area.width)),
+        Constraint::Min(20),
+    ])
+    .areas(area);
 
     let profiles_focused = app.config_focus == ConfigFocus::Profiles;
-    draw_selector(frame, cols[0], app, profiles_focused);
-    draw_settings(frame, cols[1], app);
+    draw_selector(frame, selector_area, app, profiles_focused);
+    draw_settings(frame, settings_area, app);
 }
 
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
