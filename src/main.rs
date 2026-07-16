@@ -28,6 +28,7 @@ mod spinner;
 mod start;
 mod status;
 mod throughput;
+mod token_ledger;
 mod tokens;
 mod tui;
 mod update;

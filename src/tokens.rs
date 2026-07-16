@@ -1111,9 +1111,17 @@ pub(crate) enum TokensEvent {
 /// cache so each sweep re-reads only changed transcripts. Exits when `refresh_rx`
 /// disconnects (TUI shutdown).
 ///
-/// `claude_dir` must already be resolved by the caller — the worker never
-/// re-resolves `home_dir()`, matching the pattern in `status::spawn`.
-pub(crate) fn spawn(tx: Sender<TokensEvent>, refresh_rx: Receiver<()>, claude_dir: PathBuf) {
+/// `claude_dir` and `clauth_dir` must already be resolved by the caller — the
+/// worker never re-resolves `home_dir()`, matching the pattern in `status::spawn`.
+/// `clauth_dir` is where the durable per-day ledger lives; `None` disables it (the
+/// tab still works off stats-cache + transcripts, just without the aged-day
+/// backfill / cold-start bound).
+pub(crate) fn spawn(
+    tx: Sender<TokensEvent>,
+    refresh_rx: Receiver<()>,
+    claude_dir: PathBuf,
+    clauth_dir: Option<PathBuf>,
+) {
     std::thread::spawn(move || {
         let mut cache = TopUpCache::default();
 
@@ -1122,21 +1130,40 @@ pub(crate) fn spawn(tx: Sender<TokensEvent>, refresh_rx: Receiver<()>, claude_di
                 let _ = tx.send(TokensEvent::Failed);
                 return;
             };
-            // Phase 1 — instant lifetime/model data, no transcript IO.
+            let lcd = base.last_computed_date.clone();
+            // Fold durably-recorded days (past the frozen base, before the
+            // transcript horizon) into the base so they survive transcript pruning.
+            let mut ledger = clauth_dir.as_deref().map(crate::token_ledger::Ledger::load);
+            if let Some(l) = &ledger {
+                l.apply_to_base(&mut base, lcd.as_deref());
+            }
+            // Phase 1 — instant lifetime/model data (stats-cache + ledger), no
+            // transcript IO.
             let _ = tx.send(TokensEvent::Base(Box::new(base.clone())));
             // Phase 2 — refresh the per-file cache (changed files only) and merge.
+            // Sweep only past the ledger watermark, so a frozen `lastComputedDate`
+            // can't keep the cold-start read growing.
             let today = today_date();
-            let lcd = base.last_computed_date.clone();
+            let cutoff = ledger
+                .as_ref()
+                .and_then(|l| l.effective_cutoff(lcd.as_deref()))
+                .or_else(|| lcd.clone());
             // Throttled progress: every 25th file plus the final one, so a
             // several-hundred-file sweep paints a moving count at ~1/25 the
             // per-file send volume (warm cycles still emit; render ignores
             // them — see `App::tokens_progress`).
-            refresh_topup_cache(&claude_dir, lcd.as_deref(), cache, |done, total| {
+            refresh_topup_cache(&claude_dir, cutoff.as_deref(), cache, |done, total| {
                 if done % 25 == 0 || done == total {
                     let _ = tx.send(TokensEvent::Progress { done, total });
                 }
             });
-            merge_topup(&mut base, cache, lcd.as_deref(), &today);
+            merge_topup(&mut base, cache, cutoff.as_deref(), &today);
+            // Persist any newly-finalized days before the transcripts can age out.
+            if let (Some(l), Some(dir)) = (ledger.as_mut(), clauth_dir.as_deref())
+                && l.record(&base, &today)
+            {
+                l.save(dir);
+            }
             let _ = tx.send(TokensEvent::Loaded(Box::new(base)));
         };
 

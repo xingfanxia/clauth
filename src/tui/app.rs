@@ -1507,7 +1507,8 @@ impl App {
         if cfg!(test) {
             drop((tokens_sender, tokens_refresh_rx));
         } else if let Ok(claude_dir) = crate::profile::claude_dir() {
-            crate::tokens::spawn(tokens_sender, tokens_refresh_rx, claude_dir);
+            let clauth_dir = crate::profile::clauth_dir().ok();
+            crate::tokens::spawn(tokens_sender, tokens_refresh_rx, claude_dir, clauth_dir);
         } else {
             drop((tokens_sender, tokens_refresh_rx));
         }
