@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -234,10 +234,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         if i > 0 {
             spans.push(Span::styled("   ", theme::faint()));
         }
-        spans.push(Span::styled(
-            *key,
-            theme::accent().add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(*key, theme::accent().bold()));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(*label, theme::dim()));
     }
@@ -301,7 +298,7 @@ fn draw_login(
             ),
             theme::dim(),
         ),
-        Span::styled(key, theme::accent().add_modifier(Modifier::BOLD)),
+        Span::styled(key, theme::accent().bold()),
         Span::styled(action, theme::dim()),
     ];
     frame.render_widget(

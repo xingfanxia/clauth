@@ -11,7 +11,6 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -74,10 +73,7 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                             .map(|n| n.to_string())
                             .unwrap_or_default();
                         let rail = if selected && focused {
-                            Span::styled(
-                                format!("❯ {:>2}  ", i + 1),
-                                theme::accent().add_modifier(Modifier::BOLD),
-                            )
+                            Span::styled(format!("❯ {:>2}  ", i + 1), theme::accent().bold())
                         } else {
                             Span::styled(format!("  {:>2}  ", i + 1), theme::faint())
                         };
@@ -87,7 +83,7 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                     }
                     ChainItemKind::Add => {
                         let arrow = if selected && focused {
-                            Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
+                            Span::styled("❯ ", theme::accent().bold())
                         } else {
                             Span::raw("  ")
                         };
@@ -342,7 +338,7 @@ fn detail_row(
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent())
     } else if selected {
-        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
+        Span::styled("❯ ", theme::accent().bold())
     } else {
         Span::raw("  ")
     };
@@ -460,7 +456,7 @@ fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {
     for (i, name) in candidates.iter().enumerate() {
         let selected = i == cursor;
         let arrow = if selected {
-            Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
+            Span::styled("❯ ", theme::accent().bold())
         } else {
             Span::raw("  ")
         };

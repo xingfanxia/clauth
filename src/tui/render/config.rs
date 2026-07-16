@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -424,10 +424,7 @@ fn detail_row(
             } else {
                 "delete account".to_string()
             };
-            Line::from(vec![
-                arrow,
-                Span::styled(label, theme::danger().add_modifier(Modifier::BOLD)),
-            ])
+            Line::from(vec![arrow, Span::styled(label, theme::danger().bold())])
         }
         ConfigRow::Create => {
             Line::from(vec![arrow, Span::styled("create account", theme::accent())])
@@ -446,10 +443,9 @@ fn detail_row(
                 Line::from(vec![arrow, Span::styled(label, theme::accent())])
             }
         }
-        ConfigRow::DeleteCreds => Line::from(vec![
-            arrow,
-            Span::styled("log out", theme::danger().add_modifier(Modifier::BOLD)),
-        ]),
+        ConfigRow::DeleteCreds => {
+            Line::from(vec![arrow, Span::styled("log out", theme::danger().bold())])
+        }
     }
 }
 

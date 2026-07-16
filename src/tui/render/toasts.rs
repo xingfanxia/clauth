@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
@@ -47,7 +47,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let title_style = Style::default()
             .fg(theme::text_color())
             .bg(theme::bg_sunken())
-            .add_modifier(Modifier::BOLD);
+            .bold();
         let detail_style = Style::default()
             .fg(theme::text_dim_color())
             .bg(theme::bg_sunken());

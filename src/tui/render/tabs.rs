@@ -25,7 +25,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -83,7 +83,8 @@ fn build_normal(app: &App, _avail: usize) -> Vec<Span<'static>> {
                 label,
                 Style::default()
                     .fg(theme::accent_color())
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    .bold()
+                    .underlined(),
             ));
         } else {
             let color = activity_color(app.tab_activity[tab.index()]);
@@ -110,7 +111,8 @@ fn build_overflow(app: &App) -> Vec<Span<'static>> {
         label,
         Style::default()
             .fg(theme::accent_color())
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            .bold()
+            .underlined(),
     ));
 
     if active_idx < last_idx {

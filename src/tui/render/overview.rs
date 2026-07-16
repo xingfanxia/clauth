@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 
@@ -235,7 +235,7 @@ fn render_overview_row(
     // reads off the timer instead of the bar brackets.
     let cue = fetch_cue_color(profile);
     let cursor = if selected && focused {
-        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
+        Span::styled("❯ ", theme::accent().bold())
     } else {
         Span::raw("  ")
     };
@@ -456,7 +456,7 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
             vec![
                 Span::raw("  "),
                 Span::styled("[ ", theme::dim()),
-                Span::styled("stop", theme::danger().add_modifier(Modifier::BOLD)),
+                Span::styled("stop", theme::danger().bold()),
                 Span::styled(" ]", theme::dim()),
                 Span::styled(" when all spent", theme::faint()),
             ]
@@ -464,7 +464,7 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
             vec![
                 Span::raw("  "),
                 Span::styled("[ ", theme::dim()),
-                Span::styled("stay", theme::dim().add_modifier(Modifier::BOLD)),
+                Span::styled("stay", theme::dim().bold()),
                 Span::styled(" ]", theme::dim()),
                 Span::styled(" on last when all spent", theme::faint()),
             ]

@@ -4,6 +4,8 @@
 //! Plus the overview-row state cues: marker precedence + countdown fetch cue.
 
 use super::*;
+use ratatui::style::Modifier;
+
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName};
 use crate::usage::{FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
 use std::collections::BTreeMap;

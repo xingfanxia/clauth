@@ -2,7 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph};
@@ -68,7 +68,7 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled("r", theme::accent().add_modifier(Modifier::BOLD)),
+                Span::styled("r", theme::accent().bold()),
                 Span::styled("  open the browser again", theme::dim()),
             ]));
         }
@@ -114,9 +114,7 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
         Span::raw(" "),
         Span::styled(
             title.into().to_uppercase(),
-            Style::default()
-                .fg(theme::text_dim_color())
-                .add_modifier(Modifier::ITALIC),
+            Style::default().fg(theme::text_dim_color()).italic(),
         ),
         Span::raw(" "),
     ]);
