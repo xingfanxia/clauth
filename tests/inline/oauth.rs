@@ -1504,3 +1504,25 @@ fn token_agent_surfaces_non_2xx_as_ok_not_a_transport_error() {
         "the body must be readable too — the terminal-vs-transient split keys on it",
     );
 }
+
+/// `describe_kick_failure` is the mapping behind the first-kick diagnostic
+/// `logline!`: a dead ping (e.g. a rejecting 403) has to name its real
+/// status/error so it stops vanishing silently. Pin the shape the log line
+/// carries so a status stays "HTTP {status}" and a transport error keeps its
+/// own text.
+#[test]
+fn describe_kick_failure_names_status_and_error() {
+    assert_eq!(
+        describe_kick_failure(&KickError::Status(403, None)),
+        "HTTP 403",
+    );
+    assert_eq!(
+        describe_kick_failure(&KickError::Status(500, None)),
+        "HTTP 500",
+    );
+    let other = describe_kick_failure(&KickError::Other(anyhow::anyhow!("boom")));
+    assert!(
+        other.contains("boom"),
+        "an Other must surface its transport text, got {other:?}",
+    );
+}

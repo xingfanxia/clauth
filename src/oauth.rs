@@ -344,6 +344,16 @@ impl From<KickError> for anyhow::Error {
     }
 }
 
+/// Human string for a kick failure, for the diagnostic `logline!` when a kick
+/// dies on something the recovery paths don't handle (non-401/429 status,
+/// transport, body encode). Pure so the mapping is unit-testable without HTTP.
+fn describe_kick_failure(err: &KickError) -> String {
+    match err {
+        KickError::Status(status, _) => format!("HTTP {status}"),
+        KickError::Other(e) => e.to_string(),
+    }
+}
+
 /// What the messages limiter said alongside a kick 429. `until_epoch_secs` is
 /// the advertised retry ceiling — the later of
 /// `anthropic-ratelimit-unified-reset` and `retry-after` — and is an UPPER
@@ -518,7 +528,16 @@ pub(crate) fn auto_start_kick(
             rl
         }
         Err(KickError::Status(429, rl)) => return KickResult::not_opened_with(rl),
-        Err(_) => return KickResult::not_opened(),
+        // Every other first-kick failure is terminal for this attempt and used to
+        // vanish here — name the real status/error so a persistently-dead ping
+        // (e.g. a rejecting 403) is diagnosable instead of completely silent.
+        Err(e) => {
+            logline!(
+                "{name}: 5h window kick failed: {}",
+                describe_kick_failure(&e)
+            );
+            return KickResult::not_opened();
+        }
     };
 
     let Some(rt) = refresh_token else {
@@ -573,7 +592,13 @@ pub(crate) fn auto_start_kick(
     let (opened, retry_rl) = match kick(&access) {
         Ok(()) => (true, None),
         Err(KickError::Status(429, rl)) => (false, rl),
-        Err(_) => (false, None),
+        Err(e) => {
+            logline!(
+                "{name}: 5h window retry kick failed after rotation: {}",
+                describe_kick_failure(&e)
+            );
+            (false, None)
+        }
     };
     std::thread::sleep(std::time::Duration::from_millis(ROTATION_STEP_DELAY_MS));
     KickResult {
