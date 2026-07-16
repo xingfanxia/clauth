@@ -2896,3 +2896,214 @@ fn the_identity_memo_never_caches_a_failed_probe() {
         "once it resolves, the answer is cached like any other"
     );
 }
+
+// ── scan_recovery ─────────────────────────────────────────────────────────
+//
+// The auto-recovery leg: after a switch-off-all, scans the fallback chain for
+// a member back under its threshold and queues it. Every fixture below shares
+// one chain member, "b", with a live 5h window under its default (95%)
+// threshold — the shape that IS recoverable — and each test flips exactly one
+// guard so the queue stays empty (or, for the happy path, fires).
+
+use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+fn recoverable_store() -> UsageStore {
+    Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        },
+    )])))
+}
+
+fn recovery_config(
+    active_profile: Option<&str>,
+    fallback_chain: &[&str],
+) -> crate::profile::ConfigHandle {
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: active_profile.map(Into::into),
+            fallback_chain: fallback_chain.iter().map(|s| (*s).into()).collect(),
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("b".to_string(), None, None)],
+    }))
+}
+
+/// A switch already queued means a previous decision (auto-switch or a prior
+/// recovery scan) hasn't been dispatched yet; scanning again on top of it
+/// could queue a second, contradictory switch.
+#[test]
+fn scan_recovery_is_a_no_op_while_a_switch_is_pending() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+
+    let store = recoverable_store();
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::from([
+        "already-queued".to_string()
+    ])));
+
+    scan_recovery(
+        &recovery_config(None, &["b"]),
+        &store,
+        &status,
+        &kick_blocks,
+        &pending,
+    );
+
+    assert_eq!(
+        pending.lock().unwrap().clone(),
+        HashSet::from(["already-queued".to_string()]),
+        "a pending switch must be left untouched, not joined by a second target"
+    );
+}
+
+/// Recovery only applies to the switch-off-all state: an active profile means
+/// there's nothing to relink.
+#[test]
+fn scan_recovery_is_a_no_op_with_an_active_profile_set() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_recovery(
+        &recovery_config(Some("a"), &["b"]),
+        &recoverable_store(),
+        &status,
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a live active profile must never be relinked over by a recovery scan"
+    );
+}
+
+/// A `Cached`/`RateLimited`/absent read may be a rollover or a synthetic
+/// just-kicked 0% — recovery must not relink to it even though its stored
+/// numbers look recovered, matching the auto-switch side's freshness gate.
+#[test]
+fn scan_recovery_ignores_a_stale_or_synthetic_read() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+
+    let store = recoverable_store();
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    for stale in [
+        FetchStatus::Cached,
+        FetchStatus::RateLimited,
+        FetchStatus::Failed,
+    ] {
+        let status: StatusStore =
+            Arc::new(RankedMutex::new(HashMap::from([("b".to_string(), stale)])));
+        let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+        scan_recovery(
+            &recovery_config(None, &["b"]),
+            &store,
+            &status,
+            &kick_blocks,
+            &pending,
+        );
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "a {stale:?} read must not drive a recovery relink"
+        );
+    }
+
+    // No read at all yet — same undecidable treatment.
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    scan_recovery(
+        &recovery_config(None, &["b"]),
+        &store,
+        &status,
+        &kick_blocks,
+        &pending,
+    );
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "an absent read is undecidable, not recovered"
+    );
+}
+
+/// A switch-grade kick-rejected member is frozen by the messages-limiter, not
+/// actually recovered — its idle-looking usage is exactly what the rejection
+/// produces. Recovery must walk past it, never relink to it.
+#[test]
+fn scan_recovery_never_relinks_to_a_switch_grade_kick_rejected_member() {
+    use super::{FetchStatus, KickBlock, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+
+    let store = recoverable_store();
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let now = now_epoch_secs();
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        KickBlock {
+            streak: 2,
+            rejected: true,
+            until: Some(now + 600),
+            next_retry: now + 30,
+        },
+    )])));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_recovery(
+        &recovery_config(None, &["b"]),
+        &store,
+        &status,
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a switch-grade kick rejection must block recovery, not just auto-switch"
+    );
+}
+
+/// The happy path: no pending switch, no active profile, a fresh read on a
+/// chain member whose 5h window sits back under its threshold — queued.
+#[test]
+fn scan_recovery_queues_a_recovered_chain_member() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_recovery(
+        &recovery_config(None, &["b"]),
+        &recoverable_store(),
+        &status,
+        &kick_blocks,
+        &pending,
+    );
+
+    assert_eq!(
+        pending.lock().unwrap().clone(),
+        HashSet::from(["b".to_string()]),
+        "a recovered chain member must be queued for switch"
+    );
+}
