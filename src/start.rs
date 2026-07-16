@@ -74,6 +74,11 @@ pub(crate) fn run(
     command.env("CLAUDE_CONFIG_DIR", runtime.config_dir());
     // Isolated: also suppress global/project MCP servers wired through
     // `.claude.json`, so the only extension surface is what the caller passes.
+    // Deliberately NOT `--safe-mode`. The cross-account leak (the operator's
+    // `~/.claude/plugins`) is already gone under the empty config dir. What
+    // remains is a cwd `.claude/skills/*` plugin: project-local and trust-gated,
+    // loading the same regardless of active account (like project CLAUDE.md).
+    // `--safe-mode` would also nuke cwd CLAUDE.md + skills, so it stays off.
     if isolation == Isolation::Isolated {
         command.arg("--strict-mcp-config");
     }
