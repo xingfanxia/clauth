@@ -12,8 +12,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use crate::profile::{
-    AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, app_state_mtime, claude_dir,
-    clauth_dir, save_app_state, save_profile,
+    AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, claude_dir, clauth_dir,
+    reload_fingerprint, save_app_state, save_profile,
 };
 use crate::testutil::{HomeSandbox, blank_profile, set_mtime};
 use crate::usage::{ProfileActivity, clear_activity, mark_activity, now_ms};
@@ -447,15 +447,15 @@ fn reload_if_changed_fires_on_external_mtime_change() {
         "an external state change with a newer mtime must be reloaded"
     );
     assert_eq!(
-        app_state_mtime(),
-        daemon.last_state_mtime,
-        "reload adopts the on-disk mtime so it won't reload its own read again"
+        reload_fingerprint(),
+        daemon.last_reload_fp,
+        "reload adopts the on-disk fingerprint so it won't reload its own read again"
     );
 }
 
 // ── cross-process RMW atomicity (self-adoption window) ────────────────────────
 
-/// After a switch, the daemon's `last_state_mtime` equals the on-disk mtime — it
+/// After a switch, the daemon's `last_reload_fp` equals the on-disk fingerprint — it
 /// adopted its OWN write (captured while holding the flock), so `reload_if_changed`
 /// is a no-op for the self-write, yet a later external write (newer mtime) still
 /// triggers a reload — the no-self-adoption-window contract.
@@ -478,9 +478,9 @@ fn rmw_switch_adopts_own_write_mtime_then_reloads_external() {
 
     // The daemon adopted its own write's mtime (captured under the flock).
     assert_eq!(
-        daemon.last_state_mtime,
-        app_state_mtime(),
-        "daemon adopts its own switch write's mtime"
+        daemon.last_reload_fp,
+        reload_fingerprint(),
+        "daemon adopts its own switch write's fingerprint"
     );
     // A self-write must not look like an external change — reload is a no-op here.
     daemon.reload_if_changed();

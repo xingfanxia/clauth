@@ -881,3 +881,150 @@ fn weekly_switch_threshold_absent_loads_as_default() {
         DEFAULT_WEEKLY_SWITCH_PCT
     );
 }
+
+// `reload_fingerprint` is the reload trigger for BOTH detectors. These pin the
+// three ways it must shift — the profiles.toml mtime (the pre-existing trigger,
+// unchanged), a per-account config.toml appearing/vanishing (count), and an
+// existing config.toml edited (newest mtime) — plus stability when nothing moved.
+#[test]
+fn reload_fingerprint_is_stable_with_no_change() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    save_app_state(&AppState {
+        profiles: vec!["p".into()],
+        ..Default::default()
+    })
+    .expect("save_app_state");
+    let first = reload_fingerprint();
+    let second = reload_fingerprint();
+    assert_eq!(
+        first, second,
+        "no filesystem change must leave the fingerprint identical"
+    );
+}
+
+#[test]
+fn reload_fingerprint_changes_when_profiles_toml_mtime_bumps() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_app_state(&AppState {
+        profiles: vec![],
+        ..Default::default()
+    })
+    .expect("save_app_state");
+    let before = reload_fingerprint();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    crate::testutil::set_mtime(&app_state_path().expect("state path"), later);
+    let after = reload_fingerprint();
+    assert_ne!(
+        before, after,
+        "a profiles.toml mtime bump must change the fingerprint"
+    );
+}
+
+#[test]
+fn reload_fingerprint_bumps_when_a_config_toml_is_added() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let bare = profiles_root().expect("profiles_root").join("newcomer");
+    std::fs::create_dir_all(&bare).expect("mkdir profile");
+    let before = reload_fingerprint();
+    assert_eq!(
+        before
+            .config_mtimes
+            .iter()
+            .find(|(n, _)| n == "newcomer")
+            .map(|(_, m)| m.is_some()),
+        Some(false),
+        "the dir exists but has no config.toml yet"
+    );
+    std::fs::write(bare.join("config.toml"), b"auto_start = true\n").expect("write config");
+    let after = reload_fingerprint();
+    assert_eq!(
+        after
+            .config_mtimes
+            .iter()
+            .find(|(n, _)| n == "newcomer")
+            .map(|(_, m)| m.is_some()),
+        Some(true),
+        "adding a config.toml gives the entry an mtime"
+    );
+    assert_ne!(before, after);
+}
+
+#[test]
+fn reload_fingerprint_advances_when_a_config_toml_is_edited() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    let cfg = profile_dir("p").expect("profile_dir").join("config.toml");
+    let before = reload_fingerprint();
+    let before_mtime = before
+        .config_mtimes
+        .iter()
+        .find(|(n, _)| n == "p")
+        .and_then(|(_, m)| *m);
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
+    crate::testutil::set_mtime(&cfg, later);
+    let after = reload_fingerprint();
+    let after_mtime = after
+        .config_mtimes
+        .iter()
+        .find(|(n, _)| n == "p")
+        .and_then(|(_, m)| *m);
+    assert!(
+        after_mtime > before_mtime,
+        "editing a config.toml must advance its recorded mtime"
+    );
+    assert_ne!(
+        before, after,
+        "a config.toml edit must change the fingerprint"
+    );
+}
+
+#[test]
+fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    let cfg = profile_dir("p").expect("profile_dir").join("config.toml");
+    let before = reload_fingerprint();
+    assert!(
+        before
+            .config_mtimes
+            .iter()
+            .any(|(n, m)| n == "p" && m.is_some()),
+        "the saved profile has a config.toml"
+    );
+    std::fs::remove_file(&cfg).expect("remove config");
+    let after = reload_fingerprint();
+    assert!(
+        after
+            .config_mtimes
+            .iter()
+            .any(|(n, m)| n == "p" && m.is_none()),
+        "removing the config.toml drops its recorded mtime to None"
+    );
+    assert_ne!(before, after);
+}
+
+/// Regression: an edit to a config.toml that is NOT the newest one — its mtime
+/// stays below another profile's — must still flip the fingerprint. A max-only
+/// fingerprint (count + newest mtime) would miss this (max unchanged, count
+/// unchanged, profiles.toml unchanged), silently reintroducing the very
+/// "config edit not detected" bug this feature exists to fix.
+#[test]
+fn reload_fingerprint_catches_a_non_newest_config_edit() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile("a")).expect("save a");
+    save_profile(&crate::testutil::blank_profile("b")).expect("save b");
+    let cfg_a = profile_dir("a").expect("profile_dir a").join("config.toml");
+    let cfg_b = profile_dir("b").expect("profile_dir b").join("config.toml");
+    let base = std::time::SystemTime::now();
+    // b stays the newest throughout; a is edited but kept below b.
+    crate::testutil::set_mtime(&cfg_b, base + std::time::Duration::from_secs(100));
+    crate::testutil::set_mtime(&cfg_a, base + std::time::Duration::from_secs(10));
+    let before = reload_fingerprint();
+    crate::testutil::set_mtime(&cfg_a, base + std::time::Duration::from_secs(50));
+    let after = reload_fingerprint();
+    assert_ne!(
+        before, after,
+        "an edit to a non-newest config.toml must still flip the fingerprint"
+    );
+}

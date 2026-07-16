@@ -16,7 +16,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -40,8 +40,8 @@ use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
     AppConfig, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
-    MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings, Profile, ThemeName,
-    app_state_mtime, load_config, save_app_state, save_profile,
+    MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings, Profile, ReloadFingerprint,
+    ThemeName, load_config, reload_fingerprint, save_app_state, save_profile,
 };
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
@@ -1342,7 +1342,7 @@ pub(crate) struct App {
     /// Manual-refresh signal to the pricing loader; a `()` triggers a refetch.
     pub(crate) pricing_refresh: std::sync::mpsc::Sender<()>,
 
-    pub(crate) last_state_mtime: Option<SystemTime>,
+    pub(crate) last_reload_fp: ReloadFingerprint,
     pub(crate) started_at: Instant,
     /// Tick counter; advances the activity spinner frame each `on_tick`.
     pub(crate) tick_count: u64,
@@ -1609,7 +1609,7 @@ impl App {
             price_table: None,
             pricing_events,
             pricing_refresh,
-            last_state_mtime: app_state_mtime(),
+            last_reload_fp: reload_fingerprint(),
             started_at: Instant::now(),
             tick_count: 0,
             quit: false,
@@ -1985,13 +1985,13 @@ impl App {
 
     /// Reload config if state mtime changed. Returns true on reload.
     pub(crate) fn reload_if_state_changed(&mut self) -> bool {
-        let current = app_state_mtime();
-        if current == self.last_state_mtime {
+        let current = reload_fingerprint();
+        if current == self.last_reload_fp {
             return false;
         }
         if let Ok(fresh) = load_config() {
             *self.config() = fresh;
-            self.last_state_mtime = current;
+            self.last_reload_fp = current;
             let cfg = self.config();
             #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             {
@@ -3313,7 +3313,7 @@ fn finalize_switch(app: &mut App, name: &str) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            app.last_state_mtime = app_state_mtime();
+            app.last_reload_fp = reload_fingerprint();
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("switch failed\n{e}")),
@@ -3338,7 +3338,7 @@ fn perform_switch_off(app: &mut App) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            app.last_state_mtime = app_state_mtime();
+            app.last_reload_fp = reload_fingerprint();
             app.toast(
                 ToastKind::Warning,
                 "all accounts spent\nswitched off to halt usage".to_string(),
@@ -3516,7 +3516,7 @@ fn cycle_theme(app: &mut App) {
         cfg.state.theme = Some(name);
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
     theme::set_tier(next);
 }
 
@@ -3650,7 +3650,7 @@ fn cycle_divergence_default(app: &mut App) {
         cfg.state.default_divergence = next;
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
 }
 
 fn toggle_wrap_off(app: &mut App) {
@@ -3659,12 +3659,12 @@ fn toggle_wrap_off(app: &mut App) {
         cfg.state.wrap_off = !cfg.state.wrap_off;
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
 }
 
 /// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
 /// `wrap_off`'s persistence shape exactly: mutate the shared `AppConfig`,
-/// `save_app_state`, bump `last_state_mtime` — no separate propagation to the
+/// `save_app_state`, bump `last_reload_fp` — no separate propagation to the
 /// scheduler is needed since both `next_target` and `next_auto_switch_target`
 /// read the flag straight off the same shared `config` (`snapshot_chain`
 /// mirrors `wrap_off`'s copy into `ChainSnapshot`).
@@ -3674,7 +3674,7 @@ fn toggle_burn_aware_switching(app: &mut App) {
         cfg.state.burn_aware_switching = !cfg.state.burn_aware_switching;
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
 }
 
 /// Flip the opt-in preemptive rotation of the ACTIVE profile (rotation
@@ -3687,7 +3687,7 @@ fn toggle_preemptive_rotation(app: &mut App) {
         cfg.state.preemptive_rotation = !cfg.state.preemptive_rotation;
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
 }
 
 /// Flip whether the background fetch polls spent (100%-capped) accounts
@@ -3700,7 +3700,7 @@ fn toggle_refresh_spent_accounts(app: &mut App) {
         cfg.state.refresh_spent_accounts = !cfg.state.refresh_spent_accounts;
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
 }
 
 fn toggle_show_estimates(app: &mut App) {
@@ -3709,7 +3709,7 @@ fn toggle_show_estimates(app: &mut App) {
         cfg.state.show_estimates = !cfg.state.show_estimates;
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
 }
 
 /// Toggle whether the Tokens tab counts cache in its token figures (persisted).
@@ -3719,7 +3719,7 @@ fn toggle_count_cache(app: &mut App) {
         cfg.state.count_cache = !cfg.state.count_cache;
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
 }
 
 fn toggle_show_pace(app: &mut App) {
@@ -3728,7 +3728,7 @@ fn toggle_show_pace(app: &mut App) {
         cfg.state.show_pace = !cfg.state.show_pace;
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
 }
 
 /// Advance the global refresh interval to the next-greater preset, wrapping
@@ -3748,7 +3748,7 @@ fn step_refresh_interval(app: &mut App) {
         cfg.state.refresh_interval_ms = new_interval;
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
 }
 
 /// Open the inline custom-value editor for the global refresh interval, seeded
@@ -3787,7 +3787,7 @@ fn commit_refresh_interval_edit(app: &mut App) {
         cfg.state.refresh_interval_ms = ms;
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
     app.refresh_interval_draft = None;
 }
 
@@ -3817,7 +3817,7 @@ fn step_weekly_threshold(app: &mut App) {
         cfg.state.weekly_switch_threshold = Some(next);
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
 }
 
 /// Open the inline custom-value editor for the weekly line, seeded with the
@@ -3855,7 +3855,7 @@ fn commit_weekly_threshold_edit(app: &mut App) {
         cfg.state.weekly_switch_threshold = Some(pct);
         let _ = save_app_state(&cfg.state);
     }
-    app.last_state_mtime = app_state_mtime();
+    app.last_reload_fp = reload_fingerprint();
     app.weekly_threshold_draft = None;
 }
 
@@ -5594,7 +5594,7 @@ fn commit_rename(app: &mut App) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            app.last_state_mtime = app_state_mtime();
+            app.last_reload_fp = reload_fingerprint();
             if let Some(d) = app.config_draft.as_mut() {
                 d.editing_name = Some(new.clone());
                 d.name = InputState::new(&new);
@@ -5704,7 +5704,7 @@ fn commit_new_account(app: &mut App) {
                 );
             }
             app.refresh_tokens();
-            app.last_state_mtime = app_state_mtime();
+            app.last_reload_fp = reload_fingerprint();
             let new_idx = app
                 .config()
                 .profiles
@@ -5749,7 +5749,7 @@ fn finish_delete(app: &mut App, name: &str, force: bool) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            app.last_state_mtime = app_state_mtime();
+            app.last_reload_fp = reload_fingerprint();
             app.config_focus = ConfigFocus::Profiles;
             app.config_draft = None;
             app.clamp_profile_cursor();
@@ -5859,7 +5859,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
-                    app.last_state_mtime = app_state_mtime();
+                    app.last_reload_fp = reload_fingerprint();
                     app.toast(
                         ToastKind::Success,
                         format!("overwrote '{name}' with the captured login"),
@@ -5884,7 +5884,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
-                    app.last_state_mtime = app_state_mtime();
+                    app.last_reload_fp = reload_fingerprint();
                     app.toast(
                         ToastKind::Success,
                         format!("saved the login into '{name}', now active"),
@@ -5996,7 +5996,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
-                    app.last_state_mtime = app_state_mtime();
+                    app.last_reload_fp = reload_fingerprint();
                     app.toast(ToastKind::Success, format!("logged out of '{name}'"));
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("log out failed\n{e}")),
@@ -6258,7 +6258,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
-                    app.last_state_mtime = app_state_mtime();
+                    app.last_reload_fp = reload_fingerprint();
                     app.toast(ToastKind::Success, format!("captured '{name}'"));
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("capture failed\n{e}")),
@@ -6561,7 +6561,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            app.last_state_mtime = app_state_mtime();
+            app.last_reload_fp = reload_fingerprint();
             app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
@@ -6869,7 +6869,7 @@ fn poll_credentials_divergence(app: &mut App) {
         match result {
             Ok(()) => {
                 app.refresh_tokens();
-                app.last_state_mtime = app_state_mtime();
+                app.last_reload_fp = reload_fingerprint();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));
             }
             Err(e) => app.toast(ToastKind::Danger, format!("adopt failed\n{e}")),

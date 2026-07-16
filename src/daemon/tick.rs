@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 
 use crate::actions::{switch_off, switch_profile};
 use crate::logline::logline;
-use crate::profile::{app_state_mtime, load_config};
+use crate::profile::{load_config, reload_fingerprint};
 use crate::usage::{collect_third_party_entries, collect_tokens, is_idle, now_ms};
 
 use super::{SwitchBackoff, active_diverged_unsaved, switch_backoff_ms};
@@ -55,11 +55,11 @@ impl super::Daemon {
     /// TUI edit). Replaces the shared config and rebuilds token lists so the
     /// scheduler picks up added/removed profiles.
     pub(super) fn reload_if_changed(&mut self) {
-        let current = app_state_mtime();
-        if current == self.last_state_mtime {
+        let current = reload_fingerprint();
+        if current == self.last_reload_fp {
             return;
         }
-        self.last_state_mtime = current;
+        self.last_reload_fp = current;
         match load_config() {
             Ok(new_config) => {
                 self.refresh_interval
@@ -182,10 +182,10 @@ impl super::Daemon {
         {
             crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {}
             crate::oauth::AuthGate::Broken => {
-                // The gate persisted `auth_broken`; adopt that mtime so the next
-                // tick's reload doesn't treat our own write as external. Terminal
-                // failure (drop, not retry) — clear any backoff for this target.
-                self.last_state_mtime = app_state_mtime();
+                // The gate persisted `auth_broken`; adopt that fingerprint so the
+                // next tick's reload doesn't treat our own write as external.
+                // Terminal failure (drop, not retry) — clear any backoff.
+                self.last_reload_fp = reload_fingerprint();
                 logline!(
                     "clauth daemon: {}",
                     crate::format::login_expired(&target).line()
@@ -199,11 +199,11 @@ impl super::Daemon {
             }
         }
 
-        // Hold the state flock across the switch AND the post-write mtime
+        // Hold the state flock across the switch AND the post-write fingerprint
         // read, so an external write can't slip into the save→read window and be
         // adopted as our own (the :354 self-adoption gap). `with_state_lock` is
         // re-entrant, so `switch_profile`'s inner acquisition nests without
-        // deadlock; `app_state_mtime()` is read while we still hold the flock.
+        // deadlock; `reload_fingerprint()` is read while we still hold the flock.
         let result = {
             #[allow(
                 clippy::expect_used,
@@ -212,13 +212,13 @@ impl super::Daemon {
             let mut cfg = self.config.lock().expect("config poisoned");
             crate::lock::with_state_lock(|| {
                 switch_profile(&mut cfg, &target)?;
-                Ok(app_state_mtime())
+                Ok(reload_fingerprint())
             })
         };
         match result {
-            Ok(mtime) => {
+            Ok(fp) => {
                 self.rebuild_tokens();
-                self.last_state_mtime = mtime;
+                self.last_reload_fp = fp;
                 self.switch_backoff = None;
                 logline!("clauth daemon: switched to '{target}'");
             }
@@ -298,7 +298,7 @@ impl super::Daemon {
             );
             return;
         }
-        // Same flock-held mtime capture as `drain_pending_switch`.
+        // Same flock-held fingerprint capture as `drain_pending_switch`.
         let result = {
             #[allow(
                 clippy::expect_used,
@@ -307,13 +307,13 @@ impl super::Daemon {
             let mut cfg = self.config.lock().expect("config poisoned");
             crate::lock::with_state_lock(|| {
                 switch_off(&mut cfg)?;
-                Ok(app_state_mtime())
+                Ok(reload_fingerprint())
             })
         };
         match result {
-            Ok(mtime) => {
+            Ok(fp) => {
                 self.rebuild_tokens();
-                self.last_state_mtime = mtime;
+                self.last_reload_fp = fp;
                 logline!("clauth daemon: switched off: all accounts spent");
             }
             Err(e) => logline!("clauth daemon: switch-off failed: {e}"),
