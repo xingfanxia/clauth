@@ -1,6 +1,12 @@
 //! Pure profile/usage → display-string formatters, plus the cross-surface
 //! diagnostic messages. No UI dependencies, so the TUI, the CLI subcommands
 //! (e.g. `clauth which`), and the headless daemon all share one spelling.
+//!
+//! Deliberately the ratatui-free tier only. Helpers that emit `Span`/`Style`
+//! live in `tui/render/format.rs`; single-screen or domain-local display glue
+//! stays with its owner. Folding those in would force ratatui into this shared
+//! module or mint one-caller abstractions, so the split stands over a single
+//! grab-bag `format.rs` (surveyed 2026-07-16).
 
 use crate::profile::Profile;
 use crate::usage::{PlanInfo, PlanTier};
