@@ -369,16 +369,8 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
         .max(title.chars().count() as u16 + 4)
         .min(area.width.saturating_sub(4));
     let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
-    let rect = {
-        let cw = w.min(area.width.saturating_sub(4));
-        let ch = h.min(area.height.saturating_sub(4));
-        Rect {
-            x: area.x + (area.width.saturating_sub(cw)) / 2,
-            y: area.y + (area.height.saturating_sub(ch)) / 2,
-            width: cw,
-            height: ch,
-        }
-    };
+    // Same geometry as draw_modal so the cursor lands inside the block it draws.
+    let rect = centered(area, w, h);
     // inner = rect + border (1) + padding left/top (2, 1)
     let inner_x = rect.x.saturating_add(3);
     let inner_y = rect.y.saturating_add(2);
