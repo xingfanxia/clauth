@@ -116,6 +116,27 @@ pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
     read_json_file(&path).map(Some)
 }
 
+/// True when the credentials hold NO usable login: no OAuth block, or one whose
+/// access AND refresh tokens are both absent/blank — Claude Code's logged-out
+/// shell (it blanks the tokens and zeroes `expiresAt` when its own refresh
+/// dies, keeping unrelated keys like `mcpOAuth`). A shell still classifies
+/// [`LinkState::Diverged`], but there is no login in it to protect.
+pub(crate) fn live_login_is_empty(creds: &ClaudeCredentials) -> bool {
+    creds.access_token().filter(|t| !t.is_empty()).is_none()
+        && creds.refresh_token().filter(|t| !t.is_empty()).is_none()
+}
+
+/// True when the live `.credentials.json` currently parses to such a logged-out
+/// shell. An unreadable or non-JSON file reads `false` — it may be a Claude
+/// Code write in progress, and "possibly a login" keeps the same protection as
+/// a real one (the divergence guards stay armed).
+pub(crate) fn live_credentials_are_shell() -> bool {
+    matches!(
+        read_claude_credentials(),
+        Ok(Some(live)) if live_login_is_empty(&live)
+    )
+}
+
 /// macOS: mirror a profile's stored OAuth login into the Keychain so Claude Code
 /// (which reads the Keychain, not the file) actually switches account. No-op when
 /// the profile has no stored `credentials.json` (a base_url profile, whose

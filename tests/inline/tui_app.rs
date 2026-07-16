@@ -1274,6 +1274,51 @@ fn divergence_flags_the_banner_and_never_blocks_the_tui() {
     assert!(app.modals.is_empty(), "d is a no-op with no divergence");
 }
 
+/// Claude Code's logged-out shell (both tokens blanked after its own refresh
+/// died) is not an unsaved login: the poll must not flag the banner, and a
+/// configured `default_divergence` must never "capture" the empty tokens over
+/// the profile's stored chain.
+#[test]
+fn divergence_poll_ignores_a_logged_out_shell() {
+    use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    // CC's logged-out shell: both tokens blanked. Still classifies Diverged.
+    write_live_creds(&creds_ra("", ""));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into()],
+            // The most dangerous configuration: an auto-resolving default
+            // that would capture the live file into the profile.
+            default_divergence: Some(DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_none(),
+        "an empty shell is nothing to resolve — no banner"
+    );
+    assert!(app.modals.is_empty(), "and certainly no modal");
+    let stored = crate::profile::profile_dir("work")
+        .expect("work dir")
+        .join("credentials.json");
+    let stored: crate::profile::ClaudeCredentials =
+        crate::profile::read_json_file(&stored).expect("read work store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-work"),
+        "the divergence default must never capture blank tokens over the stored login"
+    );
+}
+
 /// The banner and the resolver both identify the live login's OWNER when it is
 /// a stored sibling — by exact token match here (the half-landed-switch shape)
 /// — and the resolver leads with the "switch to it" action.

@@ -445,3 +445,82 @@ fn build_settings_clears_stale_model_knobs() {
     assert!(v["env"].get("CLAUDE_CODE_SUBAGENT_MODEL").is_none());
     assert_eq!(v["env"]["KEEP"], "1", "unrelated env keys are preserved");
 }
+
+// ── logged-out shell detection ────────────────────────────────────────────────
+//
+// When Claude Code's own token refresh dies it does not delete the live
+// `.credentials.json`: it blanks both tokens and zeroes `expiresAt`, keeping
+// unrelated keys like `mcpOAuth` — a logged-out shell. A shell still
+// classifies Diverged, so without the exemption every guard built on
+// "diverged and unsaved" deferred switches behind a TUI decision about an
+// empty file.
+
+/// Truth table for [`live_login_is_empty`]: only a login with NO usable token
+/// (both absent or blank, or no OAuth block at all) is empty — one live token
+/// on either side keeps the login's protections.
+#[test]
+fn live_login_is_empty_truth_table() {
+    // CC's logged-out shell: both tokens blanked.
+    assert!(live_login_is_empty(&creds("", Some(""))));
+    // Blank access token and no refresh token at all.
+    assert!(live_login_is_empty(&creds("", None)));
+    // No OAuth block (a file holding only foreign keys like mcpOAuth).
+    assert!(live_login_is_empty(&ClaudeCredentials {
+        claude_ai_oauth: None,
+    }));
+    // A live access token alone is a login.
+    assert!(!live_login_is_empty(&creds("at-live", None)));
+    assert!(!live_login_is_empty(&creds("at-live", Some(""))));
+    // A refresh token alone is a login (the access side merely expired).
+    assert!(!live_login_is_empty(&creds("", Some("rt-live"))));
+    // A full pair is a login.
+    assert!(!live_login_is_empty(&creds("at-live", Some("rt-live"))));
+}
+
+/// [`live_credentials_are_shell`] is true only for a PARSED empty login: a
+/// missing file is not a shell, and an unreadable/non-JSON file is not a shell
+/// either (it may be a CC write in progress — "possibly a login" must keep a
+/// real login's protections).
+#[test]
+fn live_credentials_are_shell_requires_a_parsed_empty_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let live = claude_credentials_path().expect("creds path");
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+
+    // Missing file: nothing there to call a shell.
+    assert!(!live_credentials_are_shell());
+
+    // CC's logged-out shell, foreign keys and all.
+    fs::write(
+        &live,
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": "",
+                "expiresAt": 0,
+                "scopes": ["user:inference"],
+                "subscriptionType": "max",
+            },
+            "mcpOAuth": { "some-server": { "accessToken": "mcp-tok" } },
+        })
+        .to_string(),
+    )
+    .expect("write shell");
+    assert!(live_credentials_are_shell());
+
+    // No OAuth block at all is the same shell.
+    fs::write(&live, r#"{"mcpOAuth":{}}"#).expect("write oauth-less file");
+    assert!(live_credentials_are_shell());
+
+    // Torn JSON (a write in progress): NOT a shell — guards stay armed.
+    fs::write(&live, br#"{"claudeAiOauth":{"accessToken":""#).expect("write torn file");
+    assert!(!live_credentials_are_shell());
+
+    // A real login: not a shell.
+    fs::write(
+        &live,
+        serde_json::to_vec(&creds("at-live", Some("rt-live"))).expect("ser live"),
+    )
+    .expect("write live");
+    assert!(!live_credentials_are_shell());
+}

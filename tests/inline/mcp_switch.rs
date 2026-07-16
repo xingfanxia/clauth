@@ -186,6 +186,64 @@ fn divergence_overwrite_captures_relogin_into_outgoing() {
     );
 }
 
+/// A logged-out shell (both tokens blanked) classifies Diverged but holds no
+/// login: even the most dangerous default (`Overwrite`) must NOT capture its
+/// blank tokens over the outgoing profile's stored login — the switch takes the
+/// plain path and replaces the shell wholesale.
+#[test]
+fn divergence_over_a_shell_switches_without_capturing() {
+    let _home = HomeSandbox::new();
+    let shell = creds("", "");
+    let config = handle(seed_diverged(
+        "active",
+        creds("stored-a", "stored-r"),
+        &shell,
+        "target",
+        Some(creds("target-a", "target-r")),
+    ));
+
+    // Positive control: the shell must be on the Diverged path the exemption
+    // bypasses — otherwise this test would pass without exercising it.
+    assert_eq!(
+        classify_credentials_link("active").unwrap(),
+        LinkState::Diverged,
+        "a blank-token shell still classifies Diverged",
+    );
+
+    let (previous, active) = switch_profile_noninteractive(
+        &config,
+        "target",
+        Some(DivergenceChoice::Overwrite),
+        no_network,
+    )
+    .expect("shell switch proceeds");
+    assert_eq!(previous.as_deref(), Some("active"));
+    assert_eq!(active, "target");
+
+    // The shell's blanks were never captured over the outgoing store.
+    let outgoing: ClaudeCredentials =
+        read_json_file(&profile_dir("active").unwrap().join("credentials.json"))
+            .expect("read outgoing creds");
+    assert_eq!(
+        outgoing.refresh_token(),
+        Some("stored-r"),
+        "Overwrite over a shell must not destroy the outgoing profile's stored login",
+    );
+
+    // …and the live link ends pointing at target's stored creds.
+    let live_now: ClaudeCredentials = read_json_file(
+        &crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json"),
+    )
+    .expect("read live creds");
+    assert_eq!(
+        live_now.refresh_token(),
+        Some("target-r"),
+        "the switch replaces the shell with target's stored login",
+    );
+}
+
 #[test]
 fn divergence_discard_drops_relogin_and_relinks_target() {
     let _home = HomeSandbox::new();

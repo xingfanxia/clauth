@@ -211,6 +211,116 @@ fn drain_pending_switch_skips_on_active_divergence() {
     );
 }
 
+/// Claude Code's logged-out SHELL (both tokens blanked, `expiresAt: 0` — what
+/// CC writes when its own refresh dies, keeping unrelated keys like
+/// `mcpOAuth`) still classifies Diverged, but holds no login to protect. The
+/// queued switch must PROCEED over it — deferring wedged every headless
+/// switch behind a TUI decision about an empty file while running sessions
+/// sat at "Login expired" (observed 2026-07-15).
+#[test]
+fn drain_pending_switch_proceeds_over_a_logged_out_shell() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    let dir = claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.claude");
+    let live = dir.join(".credentials.json");
+    std::fs::write(
+        &live,
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": "",
+                "expiresAt": 0,
+                "scopes": ["user:inference"],
+                "subscriptionType": "max",
+            },
+            "mcpOAuth": { "some-server": { "accessToken": "mcp-tok" } },
+        })
+        .to_string(),
+    )
+    .expect("write live shell");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "a token-less shell must not block the switch"
+    );
+    // The shell was replaced by beta's stored login (symlink on unix, copy on
+    // Windows — assert through the content, not the link type).
+    let installed: ClaudeCredentials =
+        crate::profile::read_json_file(&live).expect("read installed live credentials");
+    assert_eq!(
+        installed.access_token(),
+        Some("at-beta"),
+        "the live slot now holds the target's stored login"
+    );
+    // The empty shell was never captured over the outgoing store.
+    let alpha_store = crate::profile::profile_dir("alpha")
+        .expect("alpha dir")
+        .join("credentials.json");
+    let stored: ClaudeCredentials =
+        crate::profile::read_json_file(&alpha_store).expect("read alpha store");
+    assert_eq!(
+        stored.access_token(),
+        Some("at-alpha"),
+        "the shell's blank tokens must never overwrite the outgoing profile's stored login"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the executed switch leaves nothing queued"
+    );
+}
+
+/// A live file that does not PARSE is not a shell — it may be a CC write in
+/// progress, i.e. possibly a login. The divergence deferral stays armed for
+/// it, exactly like a real diverged login.
+#[test]
+fn drain_pending_switch_still_defers_on_a_torn_live_file() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    let dir = claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.claude");
+    std::fs::write(
+        dir.join(".credentials.json"),
+        br#"{"claudeAiOauth":{"accessToken":""#,
+    )
+    .expect("write torn live file");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "an unreadable live file keeps the deferral (mid-write caution)"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["beta".to_string()],
+        "the deferred switch stays queued for retry"
+    );
+}
+
 /// A queued switch whose target no longer resolves (deleted out-of-process
 /// after the enqueue — `clauth delete` can't purge this daemon's in-memory
 /// queue) is DROPPED with a last_error, never attempted. Pre-fix, the drain

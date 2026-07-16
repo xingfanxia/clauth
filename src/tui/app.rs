@@ -32,7 +32,7 @@ use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
     credentials_diverged, detach_credentials_link, force_link_profile_credentials,
     force_snapshot_active_credentials, is_first_login, link_profile_credentials,
-    read_claude_credentials, snapshot_active_credentials,
+    live_credentials_are_shell, read_claude_credentials, snapshot_active_credentials,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, SwitchAction, auto_switch_if_needed, threshold_for};
 use crate::lock::with_state_lock;
@@ -3240,12 +3240,14 @@ where
 }
 
 /// True when the live credentials diverge from the stored chain and it's not a
-/// first-login adoption (must be reconciled before clearing/relinking).
+/// first-login adoption (must be reconciled before clearing/relinking). A
+/// logged-out shell is exempt — an empty login needs no reconciling.
 fn active_diverged_unsaved(active: &str) -> bool {
     matches!(
         classify_credentials_link(active).ok(),
         Some(LinkState::Diverged)
     ) && !is_first_login(active).unwrap_or(false)
+        && !live_credentials_are_shell()
 }
 
 /// Toast and raise the Divergence prompt for `active` (`verb` = blocked action).
@@ -6838,6 +6840,12 @@ fn poll_credentials_divergence(app: &mut App) {
         Some(LinkState::Diverged)
     ) {
         app.divergence_pending = None; // resolved; a later divergence re-flags
+        return;
+    }
+    // A logged-out shell is nothing to resolve: don't nag, and never let a
+    // `default_divergence` Overwrite capture its blank tokens over the stored chain.
+    if live_credentials_are_shell() {
+        app.divergence_pending = None;
         return;
     }
     // First login on a credential-less profile: adopt silently, don't prompt.

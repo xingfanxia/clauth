@@ -11,8 +11,8 @@ use anyhow::{Context, Result, bail};
 use crate::claude::{
     ClaudeEndpoint, LinkState, apply_profile_to_claude_settings, classify_credentials_link,
     clear_claude_credentials, force_link_profile_credentials, force_snapshot_active_credentials,
-    is_first_login, link_profile_credentials, managed_env_key_label, read_claude_credentials,
-    read_claude_endpoint_config, snapshot_active_credentials,
+    is_first_login, link_profile_credentials, live_credentials_are_shell, managed_env_key_label,
+    read_claude_credentials, read_claude_endpoint_config, snapshot_active_credentials,
 };
 use crate::lock::with_state_lock;
 use crate::lockorder::RankedMutex;
@@ -84,10 +84,13 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         // switch. (Interactive callers already route a real divergence to the
         // reconcile path, so this branch is only reachable uncaptured via the
         // scheduler — where refusing, not dropping, is the safe outcome.)
+        // A logged-out shell holds no login to strand, so it forfeits the
+        // refuse-guard (which would otherwise wedge the switch on an empty file).
         let uncaptured_relogin = match config.state.active_profile.as_deref() {
             Some(active) => {
                 matches!(classify_credentials_link(active)?, LinkState::Diverged)
                     && !is_first_login(active)?
+                    && !live_credentials_are_shell()
             }
             None => false,
         };
@@ -135,11 +138,14 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     let outgoing = config.state.active_profile.clone();
 
     // Diverged link = CC re-logged and wrote a regular file; must reconcile
-    // (capture into outgoing profile) rather than refuse.
+    // (capture into outgoing profile) rather than refuse. A logged-out shell is
+    // exempt: capturing its blank tokens would destroy the outgoing profile's
+    // stored login.
     let reconciled = match outgoing.as_deref() {
         Some(active) => {
             matches!(classify_credentials_link(active)?, LinkState::Diverged)
                 && !is_first_login(active)?
+                && !live_credentials_are_shell()
         }
         None => false,
     };
@@ -269,10 +275,13 @@ pub(crate) fn switch_profile_noninteractive(
         }
     }
 
+    // A logged-out shell is no divergence to resolve: skip the default and take
+    // the plain switch, which replaces the empty file.
     let diverged = match previous.as_deref() {
         Some(active) => {
             matches!(classify_credentials_link(active)?, LinkState::Diverged)
                 && !is_first_login(active)?
+                && !live_credentials_are_shell()
         }
         None => false,
     };
