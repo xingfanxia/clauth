@@ -24,6 +24,7 @@ mod profile_cache;
 mod profile_json;
 mod providers;
 mod runtime;
+mod sessions;
 mod spinner;
 mod start;
 mod status;

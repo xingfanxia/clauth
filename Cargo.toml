@@ -33,6 +33,7 @@ getrandom = "0.4.3"
 rpassword = "7"
 rmcp = { version = "2.1.0", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1.52.3", features = ["rt", "io-std"] }
+regex = "1.13.1"
 
 # npm installs `claude` as a `.cmd` shim that Rust's bare `Command::new` can't
 # resolve (no PATHEXT search); `which` finds it. Unix uses a bare lookup.

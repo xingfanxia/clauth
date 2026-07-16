@@ -194,6 +194,44 @@ fn gc_one_runtime(name: &str, isolation: Isolation) -> Result<()> {
     })
 }
 
+/// Every profile with a live isolated session, paired with its own
+/// `runtime-isolated/projects/` dir. An isolated runtime's transcripts live
+/// ONLY in this throwaway tree (never symlinked to the global store) and are
+/// discarded on teardown/GC, so the session index can reach them only while the
+/// session is live. Gated on a live *isolated* session specifically (not
+/// [`has_live_session`], which also counts shared sessions) and on the projects
+/// dir existing, so a shared-only or not-yet-written runtime is skipped.
+/// Fail-soft: an unreadable profiles root or entry is skipped, never an error.
+#[allow(
+    dead_code,
+    reason = "consumed by the session index (src/sessions.rs), wired into a surface in a later phase"
+)]
+pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
+    let Ok(root) = profiles_root_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if live_sessions_in(&name, Isolation::Isolated) == 0 {
+            continue;
+        }
+        let Ok(projects) = runtime_dir(&name, Isolation::Isolated).map(|d| d.join("projects"))
+        else {
+            continue;
+        };
+        if projects.is_dir() {
+            out.push((name, projects));
+        }
+    }
+    out
+}
+
 fn canonical_credentials(name: &str) -> Result<PathBuf> {
     profile_subpath(name, "credentials.json")
 }
