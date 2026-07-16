@@ -18,22 +18,27 @@ auto-updater below; `cargo` installs update with `cargo install clauth`.
 
 ## Data at rest
 
-Per-profile state lives under `~/.clauth/`. Credentials are stored as tightly as the
-OS allows.
+Per-profile state lives under `~/.clauth/`. On Unix the whole tree is owner-only: every
+clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift out of date.
 
 | Path | Contents | Unix mode |
 |------|----------|-----------|
 | `~/.clauth/profiles/<name>/credentials.json` | OAuth token snapshot | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/config.toml` | base URL, API key (endpoint profiles), env block | `0600` |
 | `~/.clauth/profiles/<name>/usage_cache.json` | last-known utilization and plan | `0600` |
-| provider stats cache (`~/.clauth/`) | third-party account state | file `0600`, dir `0700` |
+| `~/.clauth/profiles/<name>/runtime/settings.json` | per-session Claude Code settings (an endpoint profile's API key rides here as `ANTHROPIC_AUTH_TOKEN`) | `0600` |
+| `~/.clauth/jobs/<id>.json` | backgrounded `delegate` prompt + result | file `0600`, dir `0700` |
+| provider stats cache, logs, lock files (`~/.clauth/`) | third-party state, event log, advisory locks | file `0600`, dir `0700` |
 
 - Writes are atomic. The temp file gets mode `0600` at creation, not a chmod
   afterward, so a loose umask never leaves a readable window; it's fsynced, then
   renamed into place. A rotation caught mid-write lands as `credentials.json.pending`
   and is promoted only once it's durable.
-- Modes are enforced on Unix. On Windows, access falls to the default user-profile
-  ACLs, which clauth does not loosen.
+- Modes are enforced on Unix two ways. Each writer creates its file owner-only. Every
+  launch re-tightens the whole tree, so a store from an older build (or a loose umask)
+  is repaired the next time clauth runs. The repair never follows a symlink out of the
+  tree, so it can't touch a file clauth doesn't own. On Windows, access falls to the
+  default user-profile ACLs, which clauth does not loosen.
 - A switch rewrites two things: `~/.claude/.credentials.json` and the `env` block of
   `~/.claude/settings.json`. The rest of `~/.claude/` is left alone.
 
