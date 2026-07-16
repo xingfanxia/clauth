@@ -21,7 +21,7 @@ use ratatui::crossterm::event::{
 };
 use tempfile::TempDir;
 
-use super::{TICK, Term, app, render, restore_terminal, setup_terminal};
+use super::{TICK, app, render};
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::usage::{
     ExtraUsage, FetchStatus, PlanInfo, PlanTier, ProfileActivity, ScopedWindow, SpendInfo,
@@ -184,14 +184,14 @@ fn build_synthetic_history() -> std::collections::HashMap<String, Vec<(u64, Usag
 /// Same as [`super::run`] but with home redirected into a tempdir.
 fn run(config: AppConfig) -> Result<()> {
     let _home = ShowcaseHome::new();
-    let mut terminal = setup_terminal()?;
+    let mut terminal = ratatui::try_init()?;
     let outcome = showcase_loop(&mut terminal, config);
-    let restore = restore_terminal(&mut terminal);
-    outcome.and(restore)
+    ratatui::restore();
+    outcome
 }
 
 /// Real event loop without startup reconciliation — no bootstrap/scheduler spawns.
-fn showcase_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
+fn showcase_loop(terminal: &mut ratatui::DefaultTerminal, config: AppConfig) -> Result<()> {
     let mut application = app::App::new(config);
     seed_usage(&application);
     seed_timers(&application);

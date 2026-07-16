@@ -5,18 +5,12 @@ mod app;
 mod render;
 pub(crate) mod theme;
 
-use std::io;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
 
 use crate::profile::AppConfig;
 
@@ -25,29 +19,15 @@ const TICK: Duration = Duration::from_millis(80);
 
 /// Launch the full-screen TUI. Returns on quit (q/⎋/Ctrl+C) or fatal error.
 pub(crate) fn run(config: AppConfig) -> Result<()> {
-    let mut terminal = setup_terminal()?;
+    // `try_init` owns raw mode + alt screen and installs a restore panic hook,
+    // so a panic mid-draw no longer leaves the terminal corrupted.
+    let mut terminal = ratatui::try_init().context("Failed to initialize the terminal")?;
     let outcome = run_loop(&mut terminal, config);
-    let restore = restore_terminal(&mut terminal);
-    outcome.and(restore)
+    ratatui::restore();
+    outcome
 }
 
-type Term = Terminal<CrosstermBackend<io::Stdout>>;
-
-fn setup_terminal() -> Result<Term> {
-    enable_raw_mode().context("Failed to enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
-    Terminal::new(CrosstermBackend::new(stdout)).context("Failed to construct ratatui terminal")
-}
-
-fn restore_terminal(terminal: &mut Term) -> Result<()> {
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
-    terminal.show_cursor().ok();
-    Ok(())
-}
-
-fn run_loop(terminal: &mut Term, config: AppConfig) -> Result<()> {
+fn run_loop(terminal: &mut DefaultTerminal, config: AppConfig) -> Result<()> {
     let mut application = app::App::new(config);
     // Non-blocking reconcile: fast path runs inline; verdict sequenced via
     // `StartupSignal`. Bootstrap is spawned from `on_tick` once reconcile
