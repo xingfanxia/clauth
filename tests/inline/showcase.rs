@@ -581,18 +581,8 @@ fn headless_showcase_renders() {
     // 120 wide so the overview name column keeps "personal"/"work" un-truncated.
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
 
-    // Flatten the backend buffer to a newline-joined String of cell symbols.
     fn flatten(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
-        let buf = term.backend().buffer().clone();
-        let (w, h) = (buf.area.width as usize, buf.area.height as usize);
-        let mut out = String::with_capacity((w + 1) * h);
-        for y in 0..h {
-            for x in 0..w {
-                out.push_str(buf.content[y * w + x].symbol());
-            }
-            out.push('\n');
-        }
-        out
+        crate::testutil::buffer_rows(term.backend().buffer()).concat()
     }
 
     // Every tab renders without panicking and keeps the header brand.

@@ -72,14 +72,7 @@ fn render_header_rows(app: &App, width: u16) -> Vec<String> {
         super::draw(f, area, app);
     })
     .unwrap();
-    let buf = term.backend().buffer().clone();
-    (0..height)
-        .map(|y| {
-            (0..width)
-                .map(|x| buf.content[(y as usize) * (width as usize) + (x as usize)].symbol())
-                .collect::<String>()
-        })
-        .collect()
+    crate::testutil::buffer_rows(term.backend().buffer())
 }
 
 /// A header row's content past the claude-glyph column (0..10).

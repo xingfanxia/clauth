@@ -23,11 +23,7 @@ fn line_text(line: &Line<'_>) -> String {
 fn render_dashboard(app: &App, w: u16, h: u16) -> String {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| super::draw(f, f.area(), app)).unwrap();
-    let buf = term.backend().buffer().clone();
-    (0..h as usize)
-        .flat_map(|y| (0..w as usize).map(move |x| (x, y)))
-        .map(|(x, y)| buf.content[y * w as usize + x].symbol().to_owned())
-        .collect()
+    crate::testutil::buffer_rows(term.backend().buffer()).concat()
 }
 
 fn populated_stats() -> TokenStats {

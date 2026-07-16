@@ -42,10 +42,7 @@ fn render_tabs(app: &App, width: u16) -> String {
         super::draw(f, area, app);
     })
     .unwrap();
-    let buf = term.backend().buffer().clone();
-    (0..width)
-        .map(|x| buf.content[x as usize].symbol().to_owned())
-        .collect()
+    crate::testutil::buffer_rows(term.backend().buffer()).concat()
 }
 
 /// The tokens dashboard must separate facts by alignment, never a `·` middot,

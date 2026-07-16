@@ -127,3 +127,14 @@ pub(crate) fn owner_only_violations(root: &Path) -> Vec<String> {
     }
     out
 }
+
+/// Flatten a rendered `TestBackend` buffer to one `String` per row (cell symbols
+/// concatenated). Shared by the TUI render tests so each keeps a single copy of
+/// the buffer→text step; callers `.concat()` or `.join("\n")` to taste.
+pub(crate) fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+    let w = buf.area.width as usize;
+    let h = buf.area.height as usize;
+    (0..h)
+        .map(|y| (0..w).map(|x| buf.content[y * w + x].symbol()).collect())
+        .collect()
+}

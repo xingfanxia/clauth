@@ -112,15 +112,10 @@ fn demo_incidents() -> Vec<Incident> {
 fn dump(app: &App, w: u16, h: u16) -> String {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| super::draw(f, app)).unwrap();
-    let buf = term.backend().buffer().clone();
-    let mut out = String::new();
-    for y in 0..h {
-        for x in 0..w {
-            out.push_str(buf.content[(y as usize) * (w as usize) + (x as usize)].symbol());
-        }
-        out.push('\n');
-    }
-    out
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| r + "\n")
+        .collect()
 }
 
 #[test]
