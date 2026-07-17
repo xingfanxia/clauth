@@ -345,6 +345,11 @@ pub(crate) enum BlockedReason {
     /// weekly reset. `resets_in` is seconds to that reset when the window carries
     /// a parseable `resets_at`.
     WeeklySpent { resets_in: Option<i64> },
+    /// The messages limiter refused this member's 5h auto-start kick (switch-grade
+    /// — the same block the walk routes around): clauth can't bring it online
+    /// regardless of its usage headroom. `lifts_in` is seconds to the limiter's
+    /// advertised ceiling (an upper bound it usually undercuts).
+    KickRejected { lifts_in: i64 },
     /// Billing member that is out of free 5h quota AND has spent the
     /// `max_auto_spend` budget the operator allowed it (see [`budget_spent`]) — so
     /// it can neither serve free nor be paid-rescued. With 5h headroom the walk
@@ -374,8 +379,15 @@ fn reset_secs(window: &UsageWindow, now: i64) -> Option<i64> {
 /// The single worst [`BlockedReason`] for `profile`, or `None` when it is a live
 /// member with headroom. Reads the same predicates the walk does — never a
 /// second opinion — so the chip and the behavior cannot drift. See
-/// [`BlockedReason`] for the precedence.
-pub(crate) fn blocked_reason(config: &AppConfig, profile: &Profile) -> Option<BlockedReason> {
+/// [`BlockedReason`] for the precedence. `kick_lift` carries the kick-block
+/// state the walk sees but a `&Profile` can't (it lives on the store twin):
+/// `Some(until)` epoch secs when the member is switch-grade kick-rejected
+/// ([`crate::usage::switch_grade_kick_lifts`]), else `None`.
+pub(crate) fn blocked_reason(
+    config: &AppConfig,
+    profile: &Profile,
+    kick_lift: Option<i64>,
+) -> Option<BlockedReason> {
     if config.is_auth_broken(&profile.name) {
         return Some(BlockedReason::AuthBroken);
     }
@@ -388,6 +400,14 @@ pub(crate) fn blocked_reason(config: &AppConfig, profile: &Profile) -> Option<Bl
             .and_then(|u| u.seven_day.as_ref())
             .and_then(|w| reset_secs(w, now));
         return Some(BlockedReason::WeeklySpent { resets_in });
+    }
+    // Kick-rejected outranks the usage blocks: the limiter won't let clauth start
+    // this member at all, so its free/paid headroom is moot. Below weekly-hard
+    // (days) because the kick block lifts within hours.
+    if let Some(until) = kick_lift {
+        return Some(BlockedReason::KickRejected {
+            lifts_in: (until - now).max(0),
+        });
     }
     // 5h over its rotate threshold = no free quota to serve right now. A spent
     // billing budget only BLOCKS a member in that state: with free 5h quota the

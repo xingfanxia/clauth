@@ -938,6 +938,24 @@ fn kick_rejected_names(blocks: &KickBlocks, now_secs: i64) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Every switch-grade kick block's advertised lift (epoch secs), keyed by profile
+/// name, read under one leaf lock. Same [`kick_block_switch_grade`] rule the
+/// auto-switch walk routes around, so the Fallback tab's blocked-reason chip
+/// flags a kick-rejected member without re-deriving the predicate. Read before
+/// the Config lock (rank order: KickBlockState 230 < Config 400).
+pub(crate) fn switch_grade_kick_lifts(blocks: &KickBlocks) -> HashMap<String, i64> {
+    let now = now_epoch_secs();
+    blocks
+        .lock()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, b)| kick_block_switch_grade(b, now))
+                .filter_map(|(n, b)| b.until.map(|u| (n.clone(), u)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Fold a kick's outcome into the block map + its per-profile cache file, and
 /// logline the state TRANSITIONS only (silent while a streak merely grows).
 fn note_kick_outcome(

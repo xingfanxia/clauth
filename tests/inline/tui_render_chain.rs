@@ -66,11 +66,11 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
     let b = profile("b", 95.0, 100.0, 1800);
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let on_a = member_detail(&cfg, "a", 0, 2, false, 0, false, None, None, 60);
+    let on_a = member_detail(&cfg, "a", 0, 2, false, 0, false, None, None, 60, None);
     let hint_a = resumes_line(&on_a).expect("resumes hint renders while viewing member a");
     assert!(hint_a.contains("resumes: b in ~"), "{hint_a}");
 
-    let on_b = member_detail(&cfg, "b", 1, 2, false, 0, false, None, None, 60);
+    let on_b = member_detail(&cfg, "b", 1, 2, false, 0, false, None, None, 60, None);
     let hint_b = resumes_line(&on_b).expect("resumes hint renders while viewing member b");
     assert!(hint_b.contains("resumes: b in ~"), "{hint_b}");
 }
@@ -82,7 +82,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let lines = member_detail(&cfg, "a", 0, 2, false, 0, false, None, None, 60);
+    let lines = member_detail(&cfg, "a", 0, 2, false, 0, false, None, None, 60, None);
     assert!(
         resumes_line(&lines).is_none(),
         "must not show when the chain isn't fully exhausted"
@@ -100,7 +100,7 @@ fn last_resort_hint_wraps_on_a_narrow_pane() {
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
     // Focused on the `last resort` row (FALLBACK_ROWS[1]) at 28 cols.
-    let lines = member_detail(&cfg, "a", 0, 2, true, 1, false, None, None, 28);
+    let lines = member_detail(&cfg, "a", 0, 2, true, 1, false, None, None, 28, None);
     let texts: Vec<String> = lines.iter().map(line_text).collect();
     let lead = texts
         .iter()
@@ -126,7 +126,7 @@ fn last_resort_hint_names_the_currently_marked_member() {
     b.last_resort = true;
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let lines = member_detail(&cfg, "a", 0, 2, true, 1, false, None, None, 80);
+    let lines = member_detail(&cfg, "a", 0, 2, true, 1, false, None, None, 80, None);
     let hint = lines
         .iter()
         .map(line_text)
@@ -155,7 +155,7 @@ fn value_col(key: &str, rendered: &str) -> usize {
 fn last_resort_value_aligns_with_other_rows() {
     let a = profile("a", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a], Some("a"), vec!["a"]);
-    let texts: Vec<String> = member_detail(&cfg, "a", 0, 1, true, 1, false, None, None, 60)
+    let texts: Vec<String> = member_detail(&cfg, "a", 0, 1, true, 1, false, None, None, 60, None)
         .iter()
         .map(line_text)
         .collect();
@@ -203,7 +203,7 @@ fn last_resort_value_aligns_with_other_rows() {
 fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
     let cfg = config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
     let row = |c: &crate::profile::AppConfig| -> String {
-        member_detail(c, "a", 0, 1, true, 1, false, None, None, 60)
+        member_detail(c, "a", 0, 1, true, 1, false, None, None, 60, None)
             .iter()
             .map(line_text)
             .find(|t| t.contains("max spend"))
@@ -232,16 +232,49 @@ fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
 #[test]
 fn blocked_member_shows_the_worst_reason_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 97.0, 7200)], Some("a"), vec!["a"]);
-    let lines = member_detail(&cfg, "a", 0, 1, false, 0, false, None, None, 60);
+    let lines = member_detail(&cfg, "a", 0, 1, false, 0, false, None, None, 60, None);
     let pill = line_text(&lines[0]);
     assert!(pill.contains('['), "renders as a status pill: {pill:?}");
     assert!(
         pill.contains("5h 97%"),
         "names the 5h block with %: {pill:?}"
     );
+    // Tolerant on the exact bucket: the fixture's `now` and `blocked_reason`'s
+    // `now` can straddle a whole second (7200 → "1h 59m"), so assert only that a
+    // countdown suffix renders, not its value.
     assert!(
-        pill.contains("· 2h"),
+        pill.contains("5h 97% · "),
         "carries the reset countdown: {pill:?}"
+    );
+}
+
+// A switch-grade kick-rejected member — headroom, but the messages limiter won't
+// let clauth start it — shows the `window blocked` pill driven by `kick_lift`.
+#[test]
+fn kick_rejected_member_shows_the_window_blocked_pill() {
+    let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
+    let until = now_epoch_secs() + 7200;
+    let lines = member_detail(
+        &cfg,
+        "a",
+        0,
+        1,
+        false,
+        0,
+        false,
+        None,
+        None,
+        60,
+        Some(until),
+    );
+    let pill = line_text(&lines[0]);
+    // Label + a countdown suffix; the exact bucket stays tolerant since the two
+    // `now` reads (fixture vs `blocked_reason`) can straddle a whole second. The
+    // exact `lifts_in` value is range-checked in the `blocked_reason_kick_*` unit
+    // test instead.
+    assert!(
+        pill.contains("window blocked · "),
+        "renders the kick pill with a lift countdown: {pill:?}"
     );
 }
 
@@ -249,7 +282,7 @@ fn blocked_member_shows_the_worst_reason_pill() {
 #[test]
 fn headroom_member_shows_no_reason_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
-    let lines = member_detail(&cfg, "a", 0, 1, false, 0, false, None, None, 60);
+    let lines = member_detail(&cfg, "a", 0, 1, false, 0, false, None, None, 60, None);
     let first = line_text(&lines[0]);
     assert!(
         !first.contains('['),
@@ -266,7 +299,7 @@ fn headroom_member_shows_no_reason_pill() {
 #[test]
 fn blocked_pill_occupies_pill_lines_above_priority() {
     let cfg = config_with(vec![profile("a", 95.0, 100.0, 7200)], Some("a"), vec!["a"]);
-    let lines = member_detail(&cfg, "a", 0, 1, false, 0, false, None, None, 60);
+    let lines = member_detail(&cfg, "a", 0, 1, false, 0, false, None, None, 60, None);
     let priority_at = lines
         .iter()
         .position(|l| line_text(l).contains("priority"))
@@ -291,7 +324,7 @@ fn max_spend_dims_when_spend_budget_is_off() {
     let mut cfg = config_with(vec![profile("a", 95.0, 40.0, 3600)], Some("a"), vec!["a"]);
     cfg.profiles[0].max_auto_spend = Some(25.0);
 
-    let off = member_detail(&cfg, "a", 0, 1, true, 2, false, None, None, 60);
+    let off = member_detail(&cfg, "a", 0, 1, true, 2, false, None, None, 60, None);
     let off_val = off
         .iter()
         .find_map(|l| span_style(l, "$25.00"))
@@ -303,7 +336,7 @@ fn max_spend_dims_when_spend_budget_is_off() {
     );
 
     cfg.state.spend_budget_switching = true;
-    let on = member_detail(&cfg, "a", 0, 1, true, 2, false, None, None, 60);
+    let on = member_detail(&cfg, "a", 0, 1, true, 2, false, None, None, 60, None);
     let on_val = on
         .iter()
         .find_map(|l| span_style(l, "$25.00"))

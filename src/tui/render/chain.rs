@@ -30,7 +30,7 @@ use crate::fallback::{
     threshold_for,
 };
 use crate::profile::AppConfig;
-use crate::usage::humanize_duration;
+use crate::usage::{humanize_duration, switch_grade_kick_lifts};
 
 /// Wide enough to read a threshold tick.
 const GAUGE_W: usize = 22;
@@ -64,6 +64,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     let items = chain_items(app);
+    // Switch-grade kick blocks the chip flags — read before the Config lock
+    // (rank order: KickBlockState 230 < Config 400).
+    let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
     let cfg = app.config();
     let sel = app.chain_cursor.min(items.len().saturating_sub(1));
     draw_selector_list(frame, area, "chain", focused, sel, |w| {
@@ -90,7 +93,9 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                         // Right-align the 1-cell blocked-reason marker at the
                         // row's last content column (the scrollbar owns the
                         // padding cell beyond it, so they never collide).
-                        if let Some(reason) = cfg.find(&name).and_then(|p| blocked_reason(&cfg, p))
+                        if let Some(reason) = cfg
+                            .find(&name)
+                            .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(&name).copied()))
                         {
                             let used: usize = spans.iter().map(|s| s.width()).sum();
                             let pad = (w as usize).saturating_sub(used + 1);
@@ -129,6 +134,9 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected = items
         .get(app.chain_cursor.min(items.len().saturating_sub(1)))
         .copied();
+    // Switch-grade kick blocks — read before the Config lock (rank order:
+    // KickBlockState 230 < Config 400).
+    let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
 
     // `Add` arm must NOT hold the `config` guard — `add_detail` re-locks it via
     // `chain_candidates`, and the mutex is non-reentrant (deadlock on `+ add` row).
@@ -147,9 +155,10 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .get(i)
                 .map(|n| n.to_string())
                 .unwrap_or_default();
+            let kick_lift = kick_lifts.get(&name).copied();
             let lead = cfg
                 .find(&name)
-                .and_then(|p| blocked_reason(&cfg, p))
+                .and_then(|p| blocked_reason(&cfg, p, kick_lift))
                 .map_or(0, |_| PILL_LINES);
             let lines = member_detail(
                 &cfg,
@@ -162,6 +171,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 app.fallback_threshold_draft.as_ref(),
                 app.fallback_max_spend_draft.as_ref(),
                 inner_w,
+                kick_lift,
             );
             (name, true, lines, lead)
         }
@@ -232,6 +242,7 @@ fn reason_marker(reason: &BlockedReason) -> Span<'static> {
     let (glyph, style) = match reason {
         BlockedReason::AuthBroken => ("×", theme::danger()),
         BlockedReason::WeeklySpent { .. } => ("⊘", theme::danger()),
+        BlockedReason::KickRejected { .. } => ("⧗", theme::warning()),
         BlockedReason::BudgetSpent => ("$", theme::warning()),
         BlockedReason::FiveHour { .. } => ("◔", theme::warning()),
         BlockedReason::WeeklySoft { .. } => ("~", theme::warning()),
@@ -252,6 +263,10 @@ fn reason_pill(reason: &BlockedReason) -> Line<'static> {
                 None => "weekly spent".to_string(),
             },
             theme::danger().bold(),
+        ),
+        BlockedReason::KickRejected { lifts_in } => (
+            format!("window blocked · {}", humanize_duration(*lifts_in)),
+            theme::warning().bold(),
         ),
         BlockedReason::BudgetSpent => ("money spent".to_string(), theme::warning().bold()),
         BlockedReason::FiveHour { pct, resets_in } => (
@@ -288,6 +303,7 @@ fn member_detail(
     editing: Option<&InputState>,
     max_spend_editing: Option<&InputState>,
     width: usize,
+    kick_lift: Option<i64>,
 ) -> Vec<Line<'static>> {
     let Some(profile) = cfg.find(name) else {
         return vec![Line::from(Span::styled(
@@ -310,7 +326,7 @@ fn member_detail(
     // ineligible or distrusted, above everything else on the card. `PILL_LINES`
     // must equal the count pushed here — `draw_chain_detail` adds it to the
     // native-cursor row math.
-    if let Some(reason) = blocked_reason(cfg, profile) {
+    if let Some(reason) = blocked_reason(cfg, profile, kick_lift) {
         lines.push(reason_pill(&reason));
         lines.push(Line::from(""));
     }
