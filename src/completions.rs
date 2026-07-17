@@ -11,9 +11,9 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete which completions" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete which status daemon doctor completions" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--base-url --api-key --model" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--base-url --api-key --model --new" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated" -- "${cur}") )
     elif [ "$prev" = "--isolated" ]; then
@@ -24,8 +24,10 @@ const BASH: &str = r#"_clauth() {
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "which" ] || [ "$prev" = "status" ]; }; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "completions" ]; then
+        COMPREPLY=( $(compgen -W "bash zsh fish install" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y --force" -- "${cur}") )
     fi
@@ -45,7 +47,10 @@ _clauth() {
             'login[log in via browser OAuth or an API key]' \
             'delete[remove a profile and its credentials]' \
             'which[print profile owning the loaded credentials]' \
-            'completions[emit shell completion script]'
+            'status[print the usage / auto-switch snapshot]' \
+            'daemon[run the headless scheduler (no TUI)]' \
+            'doctor[read-only health check of the daemon + macOS wiring]' \
+            'completions[print or install shell completions]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|delete) ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
@@ -55,10 +60,12 @@ _clauth() {
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
-    elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (which|status) ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == completions ]]; then
+        _values 'arg' 'bash' 'zsh' 'fish' 'install[install into the shell rc]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
-        _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--model[set the default model before signing in]'
+        _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--model[set the default model before signing in]' '--new[refuse to touch an existing profile]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]'
     fi
@@ -75,13 +82,18 @@ complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with t
 complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
 complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
-complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
+complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot"
+complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler (no TUI)"
+complete -c clauth -f -n __fish_is_first_token -a doctor -d "Read-only health check of the daemon + macOS wiring"
+complete -c clauth -f -n __fish_is_first_token -a completions -d "Print or install shell completions"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login delete" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
-complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
+complete -c clauth -f -n "__fish_seen_subcommand_from which status" -a --json -d "Emit JSON"
+complete -c clauth -f -n "__fish_seen_subcommand_from completions" -a "bash zsh fish install" -d Shell
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "API base url"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --api-key -d "API key (prompted echo-off if omitted)"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --model -d "Set default model before signing in"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --new -d "Refuse to touch an existing profile"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --force -d "Override the live-session guard"

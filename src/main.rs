@@ -1,9 +1,12 @@
 mod actions;
 mod claude;
 mod claude_json;
+mod codex;
 mod completions;
 mod daemon;
+mod doctor;
 mod fallback;
+mod fallback_config;
 mod format;
 // macOS-only: Claude Code reads its login from the Keychain, not the credentials
 // file, so a switch must also write there. Gated so non-macOS builds stay clean.
@@ -12,6 +15,7 @@ mod keychain;
 mod lock;
 mod lockorder;
 mod logline;
+mod loopback;
 mod mcp;
 mod oauth;
 mod oauth_login;
@@ -23,6 +27,7 @@ mod profile;
 mod profile_cache;
 mod profile_json;
 mod providers;
+mod proxy;
 mod runtime;
 mod spinner;
 mod start;
@@ -38,7 +43,7 @@ mod which;
 #[cfg(test)]
 mod testutil;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 
 use crate::profile::{AppConfig, ThemeName, load_config};
 use crate::runtime::Isolation;
@@ -97,13 +102,19 @@ fn dispatch(args: &[String]) -> Result<()> {
         [cmd, rest @ ..] if cmd == "login" => match parse_login_args(rest) {
             Some(args) => cmd_login(args),
             None => anyhow::bail!(
-                "usage: clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>]"
+                "usage: clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>] [--new] [--codex [--browser]]"
             ),
         },
         [cmd, rest @ ..] if cmd == "delete" => match parse_delete_args(rest) {
             Some((name, yes, force)) => cmd_delete(name, yes, force),
             None => anyhow::bail!("usage: clauth delete <profile> [--yes] [--force]"),
         },
+        [cmd, name] if cmd == "resume" => cmd_resume(name),
+        [cmd, ..] if cmd == "resume" => {
+            anyhow::bail!("usage: clauth resume <codex-profile>");
+        }
+        [cmd, rest @ ..] if cmd == "fallback" => cmd_fallback(rest),
+        [cmd, rest @ ..] if cmd == "proxy" => cmd_proxy(rest),
         [cmd, ..] if cmd == "run" => anyhow::bail!(
             "`clauth run` isn't a command; for a headless delegate use \
              `clauth start <profile> -p \"<prompt>\"` (or the MCP `delegate` tool)"
@@ -113,6 +124,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         // payload on stdin, waits for a background delegate, and wakes the model.
         [cmd] if cmd == "mcp-await-job" => mcp::await_job(),
         [cmd] if cmd == "daemon" => daemon::serve(),
+        [cmd] if cmd == "doctor" => doctor::run(),
         [cmd, flag] if cmd == "status" && flag == "--json" => daemon::status_oneshot(),
         [cmd, ..] if cmd == "status" => {
             anyhow::bail!("usage: clauth status --json");
@@ -120,7 +132,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
         _ => anyhow::bail!(
-            "usage: clauth [profile] | clauth start [--isolated] <profile> [args] | clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>] | clauth delete <profile> [--yes] [--force] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
+            "usage: clauth [profile] | clauth start [--isolated] <profile> [args] | clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>] [--new] [--codex] | clauth delete <profile> [--yes] [--force] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
         ),
     }
 }
@@ -147,29 +159,166 @@ fn peel_theme_flag(args: &[String]) -> (Option<tui::theme::Tier>, &[String]) {
     (None, args)
 }
 
+/// `clauth fallback <op> …` — chain edits over the `fallback_config`
+/// primitives (CDX-4 C1: membership ops route by the profile's harness into
+/// the matching chain, so this one surface edits BOTH chains). The daemon
+/// picks external `profiles.toml` edits up on its mtime watch, exactly like a
+/// hand edit; nothing here needs the socket.
+fn cmd_fallback(rest: &[String]) -> Result<()> {
+    const USAGE: &str = "usage: clauth fallback list | add <profile> | remove <profile> | \
+                         up <profile> | down <profile> | threshold <profile> <pct> | \
+                         last-resort <profile> <on|off>";
+    let mut config = load_config()?;
+    match rest {
+        [sub] if sub == "list" => {
+            let line = |names: &[crate::profile::ProfileName]| {
+                if names.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    names
+                        .iter()
+                        .map(|n| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" → ")
+                }
+            };
+            println!("claude chain: {}", line(&config.state.fallback_chain));
+            println!("codex  chain: {}", line(&config.state.codex_fallback_chain));
+            Ok(())
+        }
+        [sub, name] if sub == "add" => {
+            if fallback_config::add(&mut config, name)? {
+                println!("clauth: added '{name}' to its harness's fallback chain");
+            } else {
+                println!("clauth: '{name}' is already a chain member");
+            }
+            Ok(())
+        }
+        [sub, name] if sub == "remove" => {
+            if fallback_config::remove(&mut config, name)? {
+                println!("clauth: removed '{name}' from its chain");
+            } else {
+                println!("clauth: '{name}' was not a chain member");
+            }
+            Ok(())
+        }
+        [sub, name] if sub == "up" || sub == "down" => {
+            let Some(dir) = fallback_config::MoveDir::parse(sub) else {
+                anyhow::bail!("{USAGE}"); // unreachable: guarded by the match arm
+            };
+            if fallback_config::move_member(&mut config, name, dir)? {
+                println!("clauth: moved '{name}' {sub}");
+            } else {
+                println!("clauth: '{name}' did not move (not a member, or at the boundary)");
+            }
+            Ok(())
+        }
+        [sub, name, pct] if sub == "threshold" => {
+            let value: f64 = pct
+                .parse()
+                .map_err(|_| anyhow::anyhow!("threshold must be a number, got '{pct}'"))?;
+            fallback_config::set_threshold(&mut config, name, value)?;
+            println!("clauth: '{name}' switch threshold set to {value}%");
+            Ok(())
+        }
+        [sub, name, onoff] if sub == "last-resort" => {
+            let on = match onoff.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => anyhow::bail!("{USAGE}"),
+            };
+            fallback_config::set_last_resort(&mut config, name, on)?;
+            println!(
+                "clauth: '{name}' last-resort mark {}",
+                if on { "set" } else { "cleared" }
+            );
+            Ok(())
+        }
+        _ => anyhow::bail!("{USAGE}"),
+    }
+}
+
+/// `clauth proxy [--port N]` — run the CDX-5 localhost injection proxy;
+/// `clauth proxy --print-config [--port N]` — print the `config.toml` block
+/// to paste (clauth never edits the live config). Opt-in; live upstream is
+/// AX-manual acceptance.
+fn cmd_proxy(rest: &[String]) -> Result<()> {
+    let mut port = proxy::DEFAULT_PROXY_PORT;
+    let mut print_only = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--print-config" => {
+                print_only = true;
+                i += 1;
+            }
+            "--port" => {
+                let value = rest
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--port needs a value"))?;
+                port = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid port: {value}"))?;
+                i += 2;
+            }
+            other => anyhow::bail!(
+                "usage: clauth proxy [--port N] | clauth proxy --print-config [--port N] \
+                 (got '{other}')"
+            ),
+        }
+    }
+    if print_only {
+        proxy::print_config(port);
+        Ok(())
+    } else {
+        platform::init();
+        proxy::run(port)
+    }
+}
+
 fn cmd_start(name: &str, rest: &[String], isolation: Isolation) -> Result<()> {
     platform::init();
     runtime::gc_stale_runtimes();
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
+    // CDX-1b: a codex profile starts `codex` against its isolated CODEX_HOME.
+    if config.find(&canonical).is_some_and(|p| p.is_codex()) {
+        if isolation == Isolation::Isolated {
+            anyhow::bail!(
+                "codex starts are always isolated (their own CODEX_HOME) — drop --isolated"
+            );
+        }
+        return start::run_codex(&canonical, rest);
+    }
     start::run(&config, &canonical, rest, isolation)
 }
 
 /// `clauth login`'s parsed args after the `login` token: one profile name plus
 /// any of `--model <id>`, `--base-url <url>`, `--api-key <key>` (each takes the
-/// next token as its value), in any order. Presence of `--base-url` or
-/// `--api-key` selects API-key mode; both absent selects browser OAuth (the
-/// original behaviour). `None` on any other shape (missing profile, a flag with
-/// no value or a `--`-prefixed value, an unrecognized flag, two positional
-/// names) — the caller turns that into one usage bail. Kept as its own pure fn
-/// so the shape is unit-testable without invoking `cmd_login`, which opens a
-/// real browser or reads a key.
+/// next token as its value) and the bare `--new` flag, in any order. Presence
+/// of `--base-url` or `--api-key` selects API-key mode; both absent selects
+/// browser OAuth (the original behaviour). `None` on any other shape (missing
+/// profile, a flag with no value or a `--`-prefixed value, an unrecognized
+/// flag, two positional names) — the caller turns that into one usage bail.
+/// Kept as its own pure fn so the shape is unit-testable without invoking
+/// `cmd_login`, which opens a real browser or reads a key.
 #[derive(Debug, PartialEq)]
 struct LoginArgs<'a> {
     name: &'a str,
     model: Option<&'a str>,
     base_url: Option<&'a str>,
     api_key: Option<&'a str>,
+    /// `--new`: refuse to reauth an existing profile — the race-proof CREATE
+    /// for non-TTY callers (a menu-bar app never sees the confirm prompt).
+    new_only: bool,
+    /// `--codex`: capture the live `~/.codex/auth.json` into a codex-harness
+    /// profile instead of a browser OAuth login (CDX-1 T5). Exclusive with
+    /// the claude-shaped flags (`--model`/`--base-url`/`--api-key`).
+    codex: bool,
+    /// `--browser` (with `--codex`): mint a fresh codex login via the PKCE
+    /// loopback flow into the profile store, never touching the live
+    /// `~/.codex/auth.json` (CDX-3 R5). Meaningless without `--codex`.
+    browser: bool,
 }
 
 impl LoginArgs<'_> {
@@ -184,10 +333,39 @@ fn parse_login_args(rest: &[String]) -> Option<LoginArgs<'_>> {
     let mut model: Option<&str> = None;
     let mut base_url: Option<&str> = None;
     let mut api_key: Option<&str> = None;
+    let mut new_only = false;
+    let mut codex = false;
+    let mut browser = false;
 
     let mut i = 0;
     while i < rest.len() {
         let arg = rest[i].as_str();
+        // `--new` is a bare flag: it takes no value. A duplicate is a typo,
+        // not idempotent emphasis — bail like any other malformed shape.
+        if arg == "--new" {
+            if new_only {
+                return None;
+            }
+            new_only = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--codex" {
+            if codex {
+                return None;
+            }
+            codex = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--browser" {
+            if browser {
+                return None;
+            }
+            browser = true;
+            i += 1;
+            continue;
+        }
         // A known value flag consumes the next token as its value.
         let slot = match arg {
             "--model" => Some(&mut model),
@@ -219,11 +397,25 @@ fn parse_login_args(rest: &[String]) -> Option<LoginArgs<'_>> {
         i += 1;
     }
 
+    // `--codex` captures the live codex login verbatim — the claude-shaped
+    // flags have no meaning there, so their combination is a usage error.
+    if codex && (model.is_some() || base_url.is_some() || api_key.is_some()) {
+        return None;
+    }
+    // `--browser` only modifies a `--codex` login (the claude login is always
+    // a browser flow) — bare `--browser` is a usage error, not a synonym.
+    if browser && !codex {
+        return None;
+    }
+
     Some(LoginArgs {
         name: name?,
         model,
         base_url,
         api_key,
+        new_only,
+        codex,
+        browser,
     })
 }
 
@@ -352,10 +544,14 @@ fn collect_api_endpoint(
 }
 
 /// Run the browser OAuth flow (preamble, authorize-URL paste fallback, minted
-/// tokens, login summary, identity-anchor seed) and wrap it in a capture
+/// tokens, login summary, identity-anchor probe) and wrap it in a capture
 /// snapshot. Shared by `cmd_login`'s new and reauth OAuth arms so the two stay
-/// in lockstep.
-fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
+/// in lockstep. Takes `config` for the CAP-3 sibling-ownership check below.
+fn run_oauth_browser(
+    config: &AppConfig,
+    reauth: bool,
+    target: &str,
+) -> Result<actions::CaptureSnapshot> {
     if reauth {
         println!("clauth: re-authenticating existing profile '{target}', opening a browser…");
     } else {
@@ -372,26 +568,57 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
         "clauth: login complete.\n{}",
         oauth_login::login_summary(&outcome.credentials)
     );
-    // The uuid the login's own verification probe saw rides the snapshot to
-    // whichever action commits it, which is what anchors the profile — so
-    // `oauth::try_adopt_live_rotation` can prove a diverged live login is the
-    // SAME account even after the stored token dies. Seeding it here instead
-    // would anchor an account whose commit may still fail.
+    // Probe the identity anchor for unattended mirror adoption (best-effort —
+    // a probe failure never fails the login): the account uuid+email this
+    // login authenticates as, cached per profile so
+    // `oauth::try_adopt_live_rotation` can verify a diverged live login is the
+    // SAME account even after the stored token dies. The identity rides the
+    // snapshot (CAP-2) so the capture writes it as the anchor — writing it
+    // here first was the 2026-07-12 pollution: the capture re-anchored from
+    // the UNRELATED live login's hint, clobbering this authoritative probe.
+    let probed = outcome
+        .credentials
+        .claude_ai_oauth
+        .as_ref()
+        .map(|o| o.access_token.clone())
+        .and_then(|tok| crate::usage::fetch_account_identity(&tok));
+    // CAP-3: refuse to store an account a SIBLING profile already holds — two
+    // profiles polling one account is a self-inflicted rate-limit pin
+    // (2026-07-12, twice: a blind capture, then a wrong-account re-login).
+    // Nothing has been written yet, so the refusal is side-effect-free; the
+    // freshly minted tokens are simply discarded.
+    if let Some(id) = &probed
+        && let Some(owner) = actions::account_owner(config, id, target)
+    {
+        let who = id.email.as_deref().unwrap_or(&id.uuid);
+        anyhow::bail!(
+            "this browser login is {who}, and profile '{owner}' already holds that \
+             account — storing it twice would make both profiles double-poll it \
+             into a rate limit. Nothing was saved. To refresh that account, run \
+             `clauth login {owner}`; to put a DIFFERENT account into '{target}', \
+             sign claude.com out in the browser, log into that account, and rerun."
+        );
+    }
+    let identity = probed.map_or(
+        actions::CaptureIdentity::Unknown,
+        actions::CaptureIdentity::Known,
+    );
     Ok(actions::CaptureSnapshot {
         credentials: Some(outcome.credentials),
         base_url: None,
         api_key: None,
-        account_uuid: outcome.account_uuid,
+        identity,
     })
 }
 
-/// `clauth login <name> [--base-url <url>] [--api-key <key>] [--model <id>]` —
-/// add a new account or re-authenticate an existing one in place (#7). The auth
-/// method is flag-selected: bare (no `--base-url`/`--api-key`) runs the browser
-/// OAuth flow (`oauth_login`) and writes the minted tokens straight into the
-/// profile's `.credentials.json`, identically on every platform; passing either
-/// endpoint flag switches to API-key mode and captures a base_url + api_key pair
-/// instead, prompting (echo-off for the key) for whatever a flag omitted.
+/// `clauth login <name> [--base-url <url>] [--api-key <key>] [--model <id>]
+/// [--new]` — add a new account or re-authenticate an existing one in place
+/// (#7). The auth method is flag-selected: bare (no `--base-url`/`--api-key`)
+/// runs the browser OAuth flow (`oauth_login`) and writes the minted tokens
+/// straight into the profile's `.credentials.json`, identically on every
+/// platform; passing either endpoint flag switches to API-key mode and captures
+/// a base_url + api_key pair instead, prompting (echo-off for the key) for
+/// whatever a flag omitted.
 ///
 /// A NEW name captures into a fresh profile; an EXISTING name routes through
 /// [`actions::overwrite_captured_profile`] — the fresh credential set (tokens OR
@@ -402,7 +629,8 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
 /// snapshot overwrites all three of credentials/base_url/api_key, so the old
 /// type's leftovers are cleared. Neither path switches to the profile (`clauth
 /// <name>` does that). `--model` is persisted onto the profile after capture.
-/// Tokens are never printed — only a sha256 prefix.
+/// `--new` refuses the reauth route entirely. Tokens are never printed — only
+/// a sha256 prefix.
 fn cmd_login(args: LoginArgs<'_>) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
@@ -417,10 +645,70 @@ fn cmd_login(args: LoginArgs<'_>) -> Result<()> {
     let reauth = matches!(route, LoginRoute::Reauth(_));
     let is_api = args.is_api_mode();
 
+    // CDX-1: harness immutability, reverse direction. Without this guard a
+    // bare `clauth login <codex-profile>` falls into the claude reauth path,
+    // writing claude credentials into a codex profile — a corrupt hybrid that
+    // also re-enters the Anthropic fetch legs (breaking the §0.1 exclusion
+    // invariant). The forward direction (`--codex` at a claude profile) is
+    // guarded inside `codex_capture_into_profile`; the writer-level backstop
+    // lives in `overwrite_captured_profile`.
+    if reauth && !args.codex && config.find(&target).is_some_and(|p| p.is_codex()) {
+        anyhow::bail!(
+            "profile '{target}' is a codex profile — re-auth it with: clauth login {target} --codex"
+        );
+    }
+
+    // `--new` pins the CREATE semantics: refuse to touch an existing profile
+    // instead of routing to the reauth overwrite. This is the race-proof
+    // collision guard for non-TTY callers (a menu-bar app spawning
+    // `clauth login` gets no confirm prompt, and any UI-side pre-check is a
+    // TOCTOU against this process's freshly-loaded config) — the refusal
+    // happens HERE, against current state, so a name minted out-of-band a
+    // moment ago can never be silently re-authenticated.
+    if args.new_only && reauth {
+        anyhow::bail!(
+            "profile '{target}' already exists and --new forbids re-authenticating it. \
+             Rerun without --new to refresh '{target}', or pick a different name."
+        );
+    }
+
     // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
     // declined overwrite must not open a browser or read a secret.
     if reauth && !confirm_reauth(&target, is_api)? {
         println!("clauth: aborted. '{target}' left unchanged.");
+        return Ok(());
+    }
+
+    // CDX-3 R5: `--codex --browser` mints a fresh codex login via the PKCE
+    // loopback flow straight into the profile store — the live
+    // ~/.codex/auth.json and the codex active slot are never touched.
+    if args.codex && args.browser {
+        let bytes = codex::login::browser_login_snapshot(|p| match p {
+            codex::login::CodexLoginProgress::AuthorizeUrl(url) => {
+                println!("clauth: opening the browser for a codex login…");
+                println!("  if it doesn't open, paste this URL yourself:\n  {url}");
+            }
+            codex::login::CodexLoginProgress::ExchangingCode => {
+                println!("clauth: login callback received — exchanging the code…");
+            }
+        })?;
+        actions::codex_store_browser_login(&mut config, &target, &bytes)?;
+        println!(
+            "clauth: stored the new codex login in profile '{target}' (the live codex \
+             login is unchanged). Switch to it with:  clauth {target}"
+        );
+        return Ok(());
+    }
+
+    // CDX-1 T5: `--codex` captures the live ~/.codex/auth.json — no browser,
+    // no prompt collection. The actions layer owns every guard (store mode,
+    // live presence, account dedup, harness immutability).
+    if args.codex {
+        actions::codex_capture_into_profile(&mut config, &target)?;
+        println!(
+            "clauth: captured the live codex login into profile '{target}'. \
+             Switch codex accounts with:  clauth {target}"
+        );
         return Ok(());
     }
 
@@ -431,11 +719,13 @@ fn cmd_login(args: LoginArgs<'_>) -> Result<()> {
                 credentials: None,
                 base_url,
                 api_key,
-                // An api-key login authenticates no Anthropic account.
-                account_uuid: None,
+                // No OAuth identity to anchor: an API-key endpoint carries no
+                // claude.ai account. Unknown drops a stale anchor left by a
+                // previous OAuth incarnation of this profile (CAP-2).
+                identity: actions::CaptureIdentity::Unknown,
             }
         } else {
-            run_oauth_browser(true, &target)?
+            run_oauth_browser(&config, true, &target)?
         };
         actions::overwrite_captured_profile(&mut config, &target, snapshot)?;
         // On a reauth `--model` is an explicit override; without it the
@@ -464,7 +754,7 @@ fn cmd_login(args: LoginArgs<'_>) -> Result<()> {
         )?;
         println!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
-        let snapshot = run_oauth_browser(false, &target)?;
+        let snapshot = run_oauth_browser(&config, false, &target)?;
         actions::capture_into_profile(&mut config, target.clone(), snapshot)?;
         // Apply the requested default model so the captured profile's sessions
         // route there from the first launch.
@@ -545,7 +835,83 @@ fn cmd_switch(name: &str) -> Result<()> {
     platform::init();
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
+    // CDX-1 T5: `clauth <name>` stays THE switch verb — the target's harness
+    // picks the path. The claude path is untouched.
+    if config.find(&canonical).is_some_and(|p| p.is_codex()) {
+        return cmd_switch_codex(config, &canonical);
+    }
     actions::switch_profile_cli(config, &canonical)
+}
+
+/// CLI codex switch: loss-free by default; a FOREIGN live login (matching no
+/// stored codex profile) asks `[y/N]` whether to archive it to quarantine and
+/// continue. Non-TTY refuses with the actionable message instead — a script
+/// must not silently displace a login clauth doesn't own.
+fn cmd_switch_codex(mut config: AppConfig, canonical: &str) -> Result<()> {
+    use std::io::{IsTerminal as _, Write as _};
+
+    let mut policy = actions::ForeignLivePolicy::Refuse;
+    if actions::codex_live_is_foreign(&config)?
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+    {
+        print!(
+            "clauth: the live codex login matches no stored profile. Archive it to \
+             ~/.clauth/quarantine and switch anyway? [y/N] "
+        );
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !reauth_confirmed(&answer) {
+            println!("clauth: aborted. Live codex login left in place.");
+            return Ok(());
+        }
+        policy = actions::ForeignLivePolicy::Archive;
+    }
+
+    let report = actions::codex_switch_profile(&mut config, canonical, policy)?;
+    if let Some(owner) = &report.adopted_back {
+        println!("clauth: adopted the refreshed live login back into '{owner}' first.");
+    }
+    if let Some(path) = &report.archived {
+        println!(
+            "clauth: archived the outgoing live login to {}.",
+            path.display()
+        );
+    }
+    println!("clauth: codex now uses '{canonical}'.");
+    if codex::codex_processes_running() {
+        println!(
+            "clauth: note — running codex sessions keep their current account until they \
+             exit; the switch applies to new sessions."
+        );
+    }
+    Ok(())
+}
+
+/// CDX-1c semi-seamless carryover: switch the live codex login to `name`,
+/// then run `codex resume --last` in this terminal — the most recent
+/// conversation continues under the new account (codex re-reads auth.json
+/// fresh at startup, and `store=false` means the resumed context is resent
+/// whole, so the serving account can change mid-conversation at a session
+/// boundary). The claude side needs no analogue: its live hot-swap already
+/// carries running sessions across.
+fn cmd_resume(name: &str) -> Result<()> {
+    platform::init();
+    let config = load_config()?;
+    let canonical = resolve_or_bail(&config, name)?;
+    if !config.find(&canonical).is_some_and(|p| p.is_codex()) {
+        anyhow::bail!(
+            "'{canonical}' is a claude profile — `clauth resume` is the codex carryover \
+             (a claude switch hot-swaps running sessions already)"
+        );
+    }
+    cmd_switch_codex(config, &canonical)?;
+    let status = std::process::Command::new("codex")
+        .args(["resume", "--last"])
+        .status()
+        .context("failed to launch `codex resume --last` (is codex on PATH?)")?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
@@ -573,22 +939,44 @@ fn print_help() {
          launch claude with that profile's settings in a per-profile\n                                  \
          CLAUDE_CONFIG_DIR; --isolated injects creds but drops operator\n                                  \
          memory/plugins/hooks (run in a clean cwd for a blind session);\n                                  \
-         extra args go to claude\n  \
-           clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>]\n                                  \
+         extra args go to claude. A CODEX profile instead launches\n                                  \
+         `codex` in its own CODEX_HOME (profile chain, isolated\n                                  \
+         history; always isolated — no --isolated flag)\n  \
+           clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>] [--new] [--codex [--browser]]\n                                  \
          add a new account, or re-authenticate an existing one in place\n                                  \
          (neither switches to it). Bare = browser OAuth; pass --base-url\n                                  \
          or --api-key to capture an API-key account instead (a missing\n                                  \
          value is prompted; the key is read echo-off). --model sets its\n                                  \
-         default model (opus/sonnet/haiku/opusplan or a full model id)\n  \
+         default model (opus/sonnet/haiku/opusplan or a full model id);\n                                  \
+         --new refuses to touch an existing profile (race-proof create\n                                  \
+         for non-TTY callers); --codex captures the live ~/.codex\n                                  \
+         login (OpenAI Codex CLI) into a codex profile instead — no\n                                  \
+         browser; add --browser to mint a NEW codex login via the\n                                  \
+         PKCE flow straight into the store (live login untouched);\n                                  \
+         `clauth <profile>` then switches codex accounts too\n  \
            clauth delete <profile> [--yes|-y] [--force]\n                                  \
          remove a profile and all its credentials; --yes (-y) skips the\n                                  \
          confirm, --force overrides the live-session guard\n  \
+           clauth resume <codex-profile>   switch the codex login, then run\n                                  \
+         `codex resume --last` — the latest conversation continues under\n                                  \
+         the new account (semi-seamless carryover)\n  \
+           clauth fallback list | add|remove|up|down <profile> |\n                                  \
+         threshold <profile> <pct> | last-resort <profile> on|off\n                                  \
+         edit the auto-switch chains; membership ops route by the\n                                  \
+         profile's harness (claude chain vs codex chain)\n  \
+           clauth proxy [--port N]         run the codex injection proxy — point codex at\n                                  \
+         it (clauth proxy --print-config) for true in-session codex\n                                  \
+         account fallback: a mid-conversation 429 rotates to the next\n                                  \
+         chain account and replays before codex sees a byte\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
          credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
            clauth daemon                   run the headless scheduler with no TUI: refresh\n                                  \
-         usage, auto-switch on exhaustion, and write ~/.clauth/status.json\n  \
+         usage, auto-switch on exhaustion, and write ~/.clauth/status.json\n                                  \
+         (the read format for the menu-bar app)\n  \
            clauth status --json            print the current usage / auto-switch snapshot\n                                  \
          as JSON (same shape the daemon writes)\n  \
+           clauth doctor                   read-only health check of the daemon + macOS\n                                  \
+         wiring (LaunchAgent, lock, socket, Keychain grant, version skew)\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \
            clauth completions install [shell]\n                                  \
          install completions into the user's shell rc\n  \

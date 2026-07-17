@@ -82,19 +82,15 @@ pub(crate) fn run(
     if isolation == Isolation::Isolated {
         command.arg("--strict-mcp-config");
     }
-    let mut child = command
+    let child = command
         .args(claude_args)
         .spawn()
         .context("failed to spawn claude")?;
 
     #[cfg(unix)]
-    let outcome = wait_for_child(&mut child, signal_watcher.receiver())?;
-
+    let outcome = supervise_child(child, &signal_watcher)?;
     #[cfg(not(unix))]
-    let outcome = ChildOutcome {
-        status: child.wait().context("failed to wait for claude")?,
-        signal: None,
-    };
+    let outcome = supervise_child(child)?;
 
     // Drop runtime before process::exit so final sync + refcount cleanup runs.
     drop(runtime);
@@ -104,6 +100,68 @@ pub(crate) fn run(
         std::process::exit(code);
     }
     Ok(())
+}
+
+/// `clauth start <codex-profile>` (CDX-1b): spawn `codex` against the
+/// profile's isolated `CODEX_HOME` — its own auth.json (the profile chain),
+/// a copied config.toml, isolated session history. The runtime guard owns
+/// the lease + adopt-back watchdog; see [`crate::runtime::CodexRuntime`].
+pub(crate) fn run_codex(name: &str, codex_args: &[String]) -> Result<()> {
+    let runtime = {
+        let _spinner = Spinner::start("clauth: preparing codex runtime");
+        crate::runtime::CodexRuntime::acquire(name)?
+    };
+
+    #[cfg(unix)]
+    let signal_watcher = SignalWatcher::new()?;
+
+    // codex canonicalizes CODEX_HOME and hard-errors on a missing dir —
+    // acquire just created it; canonicalize so a symlinked ~/.clauth works.
+    let home = runtime
+        .codex_home()
+        .canonicalize()
+        .unwrap_or_else(|_| runtime.codex_home().to_path_buf());
+    let mut command = std::process::Command::new("codex");
+    // Scrub an inherited CODEX_HOME (a parent isolated session must never
+    // leak its home into a different profile's session) before pinning ours.
+    command.env_remove("CODEX_HOME");
+    command.env("CODEX_HOME", &home);
+    let child = command
+        .args(codex_args)
+        .spawn()
+        .context("failed to spawn codex — is the codex CLI installed?")?;
+
+    #[cfg(unix)]
+    let outcome = supervise_child(child, &signal_watcher)?;
+    #[cfg(not(unix))]
+    let outcome = supervise_child(child)?;
+
+    // Drop before exit: final adopt-back + lease release + teardown.
+    drop(runtime);
+
+    let code = status_code(outcome.status, outcome.signal);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// Wait a spawned child out (forwarding signals on unix) — the shared tail of
+/// the claude and codex start paths.
+#[cfg(unix)]
+fn supervise_child(
+    mut child: std::process::Child,
+    signal_watcher: &SignalWatcher,
+) -> Result<ChildOutcome> {
+    wait_for_child(&mut child, signal_watcher.receiver())
+}
+
+#[cfg(not(unix))]
+fn supervise_child(mut child: std::process::Child) -> Result<ChildOutcome> {
+    Ok(ChildOutcome {
+        status: child.wait().context("failed to wait for the child")?,
+        signal: None,
+    })
 }
 
 fn status_code(status: ExitStatus, signal: Option<i32>) -> i32 {

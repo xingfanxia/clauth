@@ -9,9 +9,12 @@ use crate::profile::Profile;
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
 use crate::usage::{PlanTier, UsageInfo};
 
-/// Display provider for a profile: a recognised third-party name, else
-/// `anthropic` for an OAuth profile.
+/// Display provider for a profile: `openai` for a codex-harness profile, a
+/// recognised third-party name, else `anthropic` for an OAuth profile.
 pub(crate) fn provider_label(profile: &Profile) -> String {
+    if profile.is_codex() {
+        return "openai".to_string();
+    }
     profile
         .provider
         .map(|p| p.display_name().to_string())
@@ -23,6 +26,14 @@ pub(crate) fn provider_label(profile: &Profile) -> String {
 /// `subscription_type` token (`max`). `None` for third-party/api-key profiles
 /// and when neither a fetched plan nor a token hint is on disk.
 pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
+    // Codex plan tier lives in the stored auth.json's id_token claims, not
+    // the claude usage cache (CDX-1).
+    if profile.is_codex() {
+        let bytes = crate::codex::read_profile_auth(profile.name.as_str())
+            .ok()
+            .flatten()?;
+        return crate::codex::CodexAuthFile::parse(&bytes).ok()?.plan();
+    }
     if profile.is_third_party() {
         return None;
     }

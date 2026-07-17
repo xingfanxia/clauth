@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::lock::with_state_lock;
 use crate::profile::{
-    AppConfig, ClaudeCredentials, Profile, atomic_write, atomic_write_600, claude_dir, profile_dir,
+    AppConfig, ClaudeCredentials, Profile, atomic_write_600, claude_dir, profile_dir,
     read_json_file, save_profile,
 };
 
@@ -45,12 +45,18 @@ pub(crate) fn classify_link_at(link: &Path, expected: &Path) -> Result<LinkState
         Err(e) => return Err(e).context("failed to stat .credentials.json"),
     };
     if !meta.file_type().is_symlink() {
-        // Not our symlink. On macOS, Claude Code rewrites ~/.claude/.credentials.json
-        // as a regular-file mirror of the Keychain after every run, clobbering the
-        // symlink we created. That is NOT divergence when the credential is unchanged
-        // — only a genuine re-login / token rotation (different access token) is.
-        // Compare content instead of trusting symlink identity so an ordinary switch
-        // doesn't falsely prompt to capture credentials that already match the profile.
+        // The live credentials are a regular file, not our symlink. This is
+        // handled the same way on EVERY platform (not gated to macOS): trust
+        // content, not symlink identity, so an ordinary switch doesn't falsely
+        // prompt to capture credentials that already match the profile. macOS is
+        // where it happens on every run — Claude Code rewrites
+        // ~/.claude/.credentials.json as a regular-file mirror of the Keychain,
+        // clobbering our symlink — but the same regular-file state can arise on
+        // Linux/Windows if anything replaces the symlink, and the correct answer
+        // is identical: equal access token ⇒ LinkedTo, otherwise a genuine
+        // re-login / rotation ⇒ Diverged. (Gating this to macOS would make a
+        // non-symlink file on other platforms fall through to `read_link` below
+        // and error.)
         return Ok(
             match (
                 read_json_file::<ClaudeCredentials>(link),
@@ -84,6 +90,30 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
 /// True when the profile has no stored credentials but the live path is a regular
 /// file with a completed OAuth login — first login after blank profile creation.
 /// clauth adopts this rather than treating it as divergence.
+/// SipHash of the live access token — a cheap identity for "which login sits
+/// in `~/.claude/.credentials.json` right now". It changes on every re-login
+/// and every refresh, so memos keyed to it release exactly when the creds
+/// change. `None` when no readable OAuth login is present. Shared by the
+/// TUI's divergence banner and the daemon's follow/refusal memos.
+pub(crate) fn live_credentials_fingerprint() -> Option<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let creds = read_claude_credentials().ok().flatten()?;
+    let token = creds.access_token().filter(|t| !t.is_empty())?;
+    let mut hasher = DefaultHasher::new();
+    token.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// True when the live credentials hold NO usable login: no OAuth block, or one
+/// whose access AND refresh tokens are both absent/blank — Claude Code's
+/// logged-out shell (it blanks the tokens and zeroes `expiresAt` when its own
+/// refresh dies, keeping unrelated keys like `mcpOAuth`). A shell still
+/// classifies [`LinkState::Diverged`], but there is no login in it to protect.
+pub(crate) fn live_login_is_empty(creds: &ClaudeCredentials) -> bool {
+    creds.access_token().filter(|t| !t.is_empty()).is_none()
+        && creds.refresh_token().filter(|t| !t.is_empty()).is_none()
+}
+
 pub(crate) fn is_first_login(active: &str) -> Result<bool> {
     let link = claude_credentials_path()?;
     let expected = profile_dir(active)?.join("credentials.json");
@@ -116,14 +146,88 @@ pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
     read_json_file(&path).map(Some)
 }
 
-/// True when the credentials hold NO usable login: no OAuth block, or one whose
-/// access AND refresh tokens are both absent/blank — Claude Code's logged-out
-/// shell (it blanks the tokens and zeroes `expiresAt` when its own refresh
-/// dies, keeping unrelated keys like `mcpOAuth`). A shell still classifies
-/// [`LinkState::Diverged`], but there is no login in it to protect.
-pub(crate) fn live_login_is_empty(creds: &ClaudeCredentials) -> bool {
-    creds.access_token().filter(|t| !t.is_empty()).is_none()
-        && creds.refresh_token().filter(|t| !t.is_empty()).is_none()
+/// Outcome of [`write_live_oauth_pair`]: written, or benignly superseded by a
+/// concurrent actor (nothing lost, nothing to recover).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveWriteBack {
+    Written,
+    /// The live slot changed hands between the caller's judgment and this
+    /// write — a fresh CC login landed, or a profile's own store took the
+    /// slot (symlink). The rotated pair continued a lineage that fresh login
+    /// just superseded; discarding it loses nothing.
+    Superseded,
+}
+
+/// Surgically update the LIVE `.credentials.json`'s `claudeAiOauth` block with
+/// a freshly rotated pair, preserving every other top-level key (Claude Code
+/// also parks e.g. `mcpOAuth` entries in this file — a struct round-trip would
+/// silently drop them). Used by the daemon's dead-login rescue (RESCUE-1) when
+/// its confirm-dead refresh probe SUCCEEDED: the probe consumed the file's
+/// single-use refresh token, so the fresh pair MUST land back in the file or
+/// the live session's chain is destroyed.
+///
+/// RESCUE-2c: the authoritative guards live INSIDE the state flock,
+/// immediately before the mutation — a symlinked live path (a profile's own
+/// store took the slot; writing an unowned pair through it would corrupt that
+/// profile) and a fingerprint that no longer matches `expected_fingerprint`
+/// (a fresh CC login landed) both return [`LiveWriteBack::Superseded`]
+/// instead of clobbering.
+pub(crate) fn write_live_oauth_pair(
+    tokens: &crate::oauth::TokenResponse,
+    expected_fingerprint: Option<u64>,
+) -> Result<LiveWriteBack> {
+    with_state_lock(|| {
+        let path = claude_credentials_path()?;
+        let meta = path
+            .symlink_metadata()
+            .context("live .credentials.json vanished mid-rescue")?;
+        if meta.file_type().is_symlink() || live_credentials_fingerprint() != expected_fingerprint {
+            return Ok(LiveWriteBack::Superseded);
+        }
+        let bytes = std::fs::read(&path).context("failed to read live .credentials.json")?;
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&bytes).context("live .credentials.json is not JSON")?;
+        let obj = root
+            .as_object_mut()
+            .context("live .credentials.json is not a JSON object")?;
+        let oauth = obj
+            .entry("claudeAiOauth")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let oauth = oauth
+            .as_object_mut()
+            .context("live claudeAiOauth is not a JSON object")?;
+        oauth.insert("accessToken".into(), tokens.access_token.clone().into());
+        oauth.insert("refreshToken".into(), tokens.refresh_token.clone().into());
+        // CC stores epoch-ms; `expires_in` is seconds-from-now.
+        let expires_at = crate::usage::now_ms().saturating_add(tokens.expires_in * 1000);
+        oauth.insert("expiresAt".into(), expires_at.into());
+        if let Some(scope) = tokens.scope.as_deref().filter(|s| !s.trim().is_empty()) {
+            let scopes: Vec<serde_json::Value> =
+                scope.split_whitespace().map(|s| s.into()).collect();
+            oauth.insert("scopes".into(), scopes.into());
+        }
+        let out = serde_json::to_vec(&root).context("failed to serialize live credentials")?;
+        atomic_write_600(&path, out).context("failed to write live .credentials.json")?;
+        Ok(LiveWriteBack::Written)
+    })
+}
+
+/// [`force_link_profile_credentials`] with the caller's judgment re-verified
+/// INSIDE the state flock, immediately before the mutation (RESCUE-2c). The
+/// reclaim's `still_unchanged` re-check used to run outside the lock, leaving
+/// a syscall-wide window in which a concurrently landed CC login could be
+/// destroyed by the unconditional relink. Returns `false` (no-op) when the
+/// re-check fails — the caller treats that as "superseded, start over".
+pub(crate) fn force_link_profile_credentials_if(
+    name: &str,
+    still_unchanged: &dyn Fn() -> bool,
+) -> Result<bool> {
+    with_state_lock(|| {
+        if !still_unchanged() {
+            return Ok(false);
+        }
+        force_link_profile_credentials(name).map(|()| true)
+    })
 }
 
 /// True when the live `.credentials.json` currently parses to such a logged-out
@@ -320,7 +424,10 @@ fn apply_profile_to_claude_settings_inner(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    atomic_write(&path, content).context("failed to write settings.json")
+    // TECH-9 #16: settings.json can embed a third-party api_key (as
+    // ANTHROPIC_AUTH_TOKEN) — 0o600, never the umask-default 0o644 this wrote before
+    // in a world-traversable ~/.claude.
+    atomic_write_600(&path, content).context("failed to write settings.json")
 }
 
 /// Build the merged settings.json content. `prev_env_keys` are stripped before
@@ -419,32 +526,98 @@ pub(crate) fn build_claude_settings_json(
 /// (would silently overwrite stored identity); divergence is resolved via
 /// `force_snapshot_active_credentials` after user confirmation. First-login
 /// on a credential-less profile is adopted instead.
+///
+/// CAP-1: the decision and the write share ONE read of the live file. The old
+/// shape classified the link, then re-read the file to capture — a foreign
+/// login landing between the two (a running `claude`'s own refresh writes back
+/// whatever chain it holds, Keychain first, mirror file next) was captured
+/// into a profile it does not belong to (2026-07-12: 'ax-backup' held
+/// 'ax-main''s chain this way and the pair double-polled one account into a
+/// rate-limit pin). Deciding on exactly the bytes that get written closes the
+/// window: an equal-token live refreshes the store with those same bytes, a
+/// differing one is the divergence case (never captured unattended —
+/// same-account rotations are the identity-guarded adopt leg's job), and only
+/// a completed first login adopts the bytes it examined.
 pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
     with_state_lock(|| {
         let Some(active) = config.state.active_profile.clone() else {
             return Ok(());
         };
-        if matches!(classify_credentials_link(&active)?, LinkState::Diverged) {
-            if is_first_login(&active)? {
-                adopt_first_login(config, &active)?;
+        let live = match read_claude_credentials() {
+            Ok(live) => live,
+            // Unreadable/partial live file — never capture what we can't parse.
+            Err(_) => return Ok(()),
+        };
+        let Some(live) = live else {
+            // No live login at all: the snapshot records "nothing is live",
+            // matching the pre-CAP-1 Missing behavior.
+            return save_live_credentials(config, &active, None);
+        };
+        let stored_path = profile_dir(&active)?.join("credentials.json");
+        if !stored_path.exists() {
+            // First login on a credential-less profile: adopt only a COMPLETED
+            // login (a partial write adopts nothing), using these bytes.
+            if live.claude_ai_oauth.is_some() {
+                return adopt_first_login_bytes(config, &active, live);
             }
             return Ok(());
         }
-        snapshot_active_credentials_unchecked(config, &active)
+        let same_token = read_json_file::<ClaudeCredentials>(&stored_path)
+            .ok()
+            .is_some_and(|stored| {
+                stored.access_token().is_some_and(|t| !t.is_empty())
+                    && stored.access_token() == live.access_token()
+            });
+        if same_token {
+            // Same access token ⇒ same rotation state: refresh the store with
+            // the bytes just read (CC rewrites the mirror with identical
+            // tokens but sometimes fresher metadata).
+            return save_live_credentials(config, &active, Some(live));
+        }
+        // Diverged (or an unparseable store): keep the stored identity.
+        Ok(())
     })
 }
 
 /// Store the live `.credentials.json` into the profile then replace it with a
-/// symlink. Must only be called after `is_first_login` returns true.
+/// symlink. Must only be called after `is_first_login` returns true; the gate
+/// is re-verified here on the same read that gets written (CAP-1), so a live
+/// file that changed since the caller's check adopts nothing wrong.
 pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &str) -> Result<()> {
     with_state_lock(|| {
-        snapshot_active_credentials_unchecked(config, active)?;
-        force_link_profile_credentials(active)
+        let Ok(Some(live)) = read_claude_credentials() else {
+            return Ok(());
+        };
+        if live.claude_ai_oauth.is_none() || profile_dir(active)?.join("credentials.json").exists()
+        {
+            return Ok(()); // partial write, or no longer a first login
+        }
+        adopt_first_login_bytes(config, active, live)
     })
 }
 
-fn snapshot_active_credentials_unchecked(config: &mut AppConfig, active: &str) -> Result<()> {
-    let credentials = read_claude_credentials()?;
+/// Adopt an already-read-and-verified first login: save exactly those bytes,
+/// relink, and anchor the profile's identity to the login just captured.
+fn adopt_first_login_bytes(
+    config: &mut AppConfig,
+    active: &str,
+    live: ClaudeCredentials,
+) -> Result<()> {
+    save_live_credentials(config, active, Some(live))?;
+    force_link_profile_credentials(active)?;
+    // CAP-1: a capture is an identity event — the anchor moves with the store.
+    crate::profile_cache::refresh_account_anchor(active);
+    Ok(())
+}
+
+/// Write pre-read live credentials into `active`'s store (`None` clears it).
+/// Callers decide WHAT to write; this never re-reads the live file, so the
+/// bytes written are the bytes the caller's checks saw.
+fn save_live_credentials(
+    config: &mut AppConfig,
+    active: &str,
+    credentials: Option<ClaudeCredentials>,
+) -> Result<()> {
     if let Some(profile) = config.find_mut(active) {
         profile.credentials = credentials;
         save_profile(profile)?;
@@ -453,12 +626,26 @@ fn snapshot_active_credentials_unchecked(config: &mut AppConfig, active: &str) -
 }
 
 /// Snapshot the live `.credentials.json` into the active profile unconditionally.
+/// The caller has confirmed the capture (the CLI `[Y/n]`, the TUI divergence
+/// Overwrite action, or an MCP Overwrite default) — so this may change which
+/// ACCOUNT the profile holds. CAP-1: the identity anchor moves with the store
+/// (or is dropped when no local identity hint exists), so the identity-guarded
+/// adopt/follow paths never consult an anchor describing the pre-capture
+/// account.
 pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
     with_state_lock(|| {
         let Some(active) = config.state.active_profile.clone() else {
             return Ok(());
         };
-        snapshot_active_credentials_unchecked(config, &active)
+        let live = read_claude_credentials()?;
+        let captured_login = live.is_some();
+        save_live_credentials(config, &active, live)?;
+        if captured_login {
+            crate::profile_cache::refresh_account_anchor(&active);
+        } else {
+            crate::profile_cache::drop_account_anchor(&active);
+        }
+        Ok(())
     })
 }
 
@@ -482,6 +669,62 @@ pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
             }
         }
         Ok(())
+    })
+}
+
+/// RESCUE-2: preserve a diverged live login before a user-ordered switch
+/// discards it. Copies the regular-file live credentials into
+/// `~/.clauth/quarantine/<epoch-ms>-<seq>-<active>.credentials.json` (0600)
+/// so the forced switch is loss-free — a login clauth doesn't own stays
+/// recoverable by hand instead of being destroyed. The newest 20 archives are
+/// kept; older ones are pruned. Refuses a symlinked live path: a symlink is a
+/// profile's own store, so there is nothing unsaved to archive (the
+/// divergence resolved between the caller's check and this call).
+pub(crate) fn archive_live_credentials(active: &str) -> Result<PathBuf> {
+    with_state_lock(|| {
+        let path = claude_credentials_path()?;
+        let meta = path
+            .symlink_metadata()
+            .context("live .credentials.json vanished before archive")?;
+        anyhow::ensure!(
+            !meta.file_type().is_symlink(),
+            "live .credentials.json is a profile's symlink — nothing unsaved to archive"
+        );
+        let bytes = std::fs::read(&path).context("failed to read live .credentials.json")?;
+        let dir = crate::profile::clauth_dir()?.join("quarantine");
+        std::fs::create_dir_all(&dir).context("failed to create quarantine dir")?;
+        // The per-process sequence breaks same-millisecond collisions (two
+        // archives in one ms would otherwise silently overwrite each other —
+        // the exact loss the archive exists to prevent). Zero-padded so the
+        // filename stays chronologically sortable past the epoch-ms prefix.
+        static ARCHIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = ARCHIVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dest = dir.join(format!(
+            "{}-{seq:04}-{active}.credentials.json",
+            crate::usage::now_ms()
+        ));
+        atomic_write_600(&dest, bytes).context("failed to write quarantine copy")?;
+        // Retention: an archive, not a landfill — keep the newest
+        // QUARANTINE_KEEP copies (names sort chronologically), best-effort
+        // prune the rest. Pruning failure never fails the switch.
+        const QUARANTINE_KEEP: usize = 20;
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut archived: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(".credentials.json"))
+                })
+                .collect();
+            archived.sort();
+            if archived.len() > QUARANTINE_KEEP {
+                for old in &archived[..archived.len() - QUARANTINE_KEEP] {
+                    let _ = std::fs::remove_file(old);
+                }
+            }
+        }
+        Ok(dest)
     })
 }
 
