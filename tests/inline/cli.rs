@@ -17,7 +17,83 @@ fn login_args<'a>(
         model,
         base_url,
         api_key,
+        new_only: false,
+        codex: false,
+        browser: false,
     })
+}
+
+// ---- CDX-1 T5: `--codex` flag shape ----
+
+#[test]
+fn parse_login_args_accepts_codex_browser_flag() {
+    let args = [
+        "cdx-a".to_string(),
+        "--codex".to_string(),
+        "--browser".to_string(),
+    ];
+    let parsed = parse_login_args(&args).expect("valid shape");
+    assert!(parsed.codex && parsed.browser);
+}
+
+// `--browser` without `--codex` is a usage error — the claude login is
+// always a browser flow, so a bare flag would only mask a typo.
+#[test]
+fn parse_login_args_rejects_bare_browser_flag() {
+    let args = ["acme".to_string(), "--browser".to_string()];
+    assert_eq!(parse_login_args(&args), None);
+    let dup = [
+        "cdx-a".to_string(),
+        "--codex".to_string(),
+        "--browser".to_string(),
+        "--browser".to_string(),
+    ];
+    assert_eq!(parse_login_args(&dup), None);
+}
+
+#[test]
+fn parse_login_args_accepts_codex_flag() {
+    let args = ["cdx-a".to_string(), "--codex".to_string()];
+    let parsed = parse_login_args(&args).expect("valid shape");
+    assert!(parsed.codex);
+    assert_eq!(parsed.name, "cdx-a");
+    assert!(!parsed.is_api_mode());
+}
+
+// The claude-shaped flags have no meaning for a codex capture — combining
+// them is a usage error, not a silent ignore.
+#[test]
+fn parse_login_args_rejects_codex_with_claude_flags() {
+    for extra in [
+        vec!["--model".to_string(), "opus".to_string()],
+        vec!["--base-url".to_string(), "https://x".to_string()],
+        vec!["--api-key".to_string(), "sk-x".to_string()],
+    ] {
+        let mut args = vec!["cdx-a".to_string(), "--codex".to_string()];
+        args.extend(extra);
+        assert_eq!(parse_login_args(&args), None, "args: {args:?}");
+    }
+}
+
+#[test]
+fn parse_login_args_codex_composes_with_new() {
+    let args = [
+        "cdx-a".to_string(),
+        "--new".to_string(),
+        "--codex".to_string(),
+    ];
+    let parsed = parse_login_args(&args).expect("valid shape");
+    assert!(parsed.codex && parsed.new_only);
+}
+
+#[test]
+fn parse_login_args_rejects_duplicate_codex() {
+    let args = [
+        "cdx-a".to_string(),
+        "--codex".to_string(),
+        "--codex".to_string(),
+    ];
+    assert_eq!(parse_login_args(&args), None);
 }
 
 #[test]
@@ -350,4 +426,45 @@ fn reauth_confirmed_only_on_explicit_yes() {
     for no in ["", "  ", "n", "no", "nope", "\n", "yeah", "ok"] {
         assert!(!reauth_confirmed(no), "{no:?} should decline");
     }
+}
+
+#[test]
+fn parse_login_args_accepts_new_flag_in_any_position() {
+    let new_args = |model: Option<&'static str>| {
+        login_args("acme", model, None, None).map(|a| LoginArgs {
+            new_only: true,
+            ..a
+        })
+    };
+    let tail = ["acme".to_string(), "--new".to_string()];
+    assert_eq!(parse_login_args(&tail), new_args(None));
+    let head = ["--new".to_string(), "acme".to_string()];
+    assert_eq!(parse_login_args(&head), new_args(None));
+    let with_model = [
+        "acme".to_string(),
+        "--new".to_string(),
+        "--model".to_string(),
+        "opus".to_string(),
+    ];
+    assert_eq!(parse_login_args(&with_model), new_args(Some("opus")));
+}
+
+#[test]
+fn parse_login_args_rejects_duplicate_new_and_bare_new() {
+    let dup = ["acme".to_string(), "--new".to_string(), "--new".to_string()];
+    assert_eq!(parse_login_args(&dup), None);
+    // `--new` with no profile name is a usage error, not a profile "--new".
+    assert_eq!(parse_login_args(&["--new".to_string()]), None);
+}
+
+#[test]
+fn parse_login_args_rejects_flag_shaped_model_value() {
+    // `clauth login acme --model --new` forgot the model value — usage bail,
+    // never a model literally named "--new".
+    let args = [
+        "acme".to_string(),
+        "--model".to_string(),
+        "--new".to_string(),
+    ];
+    assert_eq!(parse_login_args(&args), None);
 }

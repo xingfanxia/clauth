@@ -2612,7 +2612,7 @@ fn capture_name_collision_opens_overwrite_confirm_instead_of_erroring() {
         credentials: None,
         base_url: Some("https://new.example.com".to_string()),
         api_key: Some("new-key".to_string()),
-        account_uuid: None,
+        identity: crate::actions::CaptureIdentity::LiveLogin,
     };
     app.modals
         .push(super::Modal::CaptureName(super::CaptureNameForm {
@@ -2666,7 +2666,7 @@ fn capture_overwrite_cancel_changes_nothing() {
         credentials: None,
         base_url: Some("https://new.example.com".to_string()),
         api_key: Some("new-key".to_string()),
-        account_uuid: None,
+        identity: crate::actions::CaptureIdentity::LiveLogin,
     };
     app.modals.push(super::Modal::Confirm(super::ConfirmState {
         message: "Profile 'acme' already exists.".to_string(),
@@ -3201,18 +3201,158 @@ fn tokens_topping_up_tracks_the_load_lifecycle() {
     assert_eq!(app.tokens_progress, None, "Failed clears the sweep counts");
 }
 
-/// Pins `parse_weekly_pct`'s band edges: both bounds accepted verbatim,
-/// anything past them (or non-finite) rejected — the commit path and the
-/// Config card's inline check both ride this one predicate.
+/// A quarantined login must be VISIBLE without a switch attempt: the row's
+/// fetch state shows the dead login's 429/cached mask, so the one system
+/// banner names it (danger) — outranking the divergence banner, yielding to
+/// the no-active danger. Clears the moment the flag lifts.
 #[test]
-fn parse_weekly_pct_pins_the_band_edges() {
-    use super::parse_weekly_pct;
-    assert_eq!(parse_weekly_pct("50"), Some(50.0), "lower bound accepted");
-    assert_eq!(parse_weekly_pct("100"), Some(100.0), "upper bound accepted");
-    assert_eq!(parse_weekly_pct("97.5"), Some(97.5), "decimals accepted");
-    assert_eq!(parse_weekly_pct("49.99"), None, "below the band");
-    assert_eq!(parse_weekly_pct("100.1"), None, "above the band");
-    assert_eq!(parse_weekly_pct("NaN"), None, "non-finite rejected");
-    assert_eq!(parse_weekly_pct("inf"), None, "non-finite rejected");
-    assert_eq!(parse_weekly_pct(""), None, "empty rejected");
+fn auth_broken_member_raises_the_system_banner() {
+    use super::{BannerSeverity, update_banner};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let work = Profile::new("work".to_string(), None, None);
+    save_profile(&work).expect("save work");
+    let broken = Profile::new("dead".to_string(), None, None);
+    save_profile(&broken).expect("save dead");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["work".into(), "dead".into()],
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles: vec![work, broken],
+    };
+    config.set_auth_broken("dead", true);
+    let mut app = App::new(config);
+
+    update_banner(&mut app);
+    let banner = app
+        .banner
+        .clone()
+        .expect("a broken member raises the banner");
+    assert_eq!(banner.severity, BannerSeverity::Danger);
+    assert!(
+        banner.message.contains("clauth login dead"),
+        "the banner names the recovery: {}",
+        banner.message
+    );
+
+    app.config().set_auth_broken("dead", false);
+    update_banner(&mut app);
+    assert!(
+        app.banner.is_none(),
+        "the banner clears with the flag: {:?}",
+        app.banner
+    );
+}
+
+// CDX-1 T8: `perform_switch` dispatches a codex target to the codex path —
+// the codex slot flips, the claude slot never moves, and the OAuth switch
+// gate is never consulted (local file work only).
+#[test]
+fn tui_switch_dispatches_codex_targets_to_the_codex_slot() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    fn auth(access: &str, acct: &str) -> Vec<u8> {
+        serde_json::json!({
+            "tokens": {
+                "access_token": access,
+                "refresh_token": format!("rt-{access}"),
+                "account_id": acct,
+            },
+        })
+        .to_string()
+        .into_bytes()
+    }
+    let mut cdx_a = crate::testutil::blank_profile("cdx-a");
+    cdx_a.harness = crate::profile::Harness::Codex;
+    let mut cdx_b = crate::testutil::blank_profile("cdx-b");
+    cdx_b.harness = crate::profile::Harness::Codex;
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile("claude-a"),
+        cdx_a,
+        cdx_b,
+    ]);
+    {
+        let mut cfg = app.config();
+        cfg.state.active_profile = Some("claude-a".into());
+        cfg.state.active_codex_profile = Some("cdx-b".into());
+        cfg.state.profiles = vec!["claude-a".into(), "cdx-a".into(), "cdx-b".into()];
+        // Persist: the switch's wholesale state re-sync reloads from disk
+        // (disk is the cross-process truth), so unpersisted in-memory state
+        // would be — correctly — dropped.
+        crate::profile::save_app_state(&cfg.state).unwrap();
+    }
+    crate::codex::write_profile_auth("cdx-a", &auth("at-a", "acct-a")).unwrap();
+    crate::codex::write_profile_auth("cdx-b", &auth("at-b", "acct-b")).unwrap();
+    crate::codex::write_live(&auth("at-b", "acct-b")).unwrap();
+
+    super::perform_switch(&mut app, "cdx-a");
+
+    let cfg = app.config();
+    assert_eq!(cfg.state.active_codex_profile.as_deref(), Some("cdx-a"));
+    assert_eq!(
+        cfg.state.active_profile.as_deref(),
+        Some("claude-a"),
+        "the claude slot must never move on a codex switch"
+    );
+    drop(cfg);
+    let live = crate::codex::read_live().unwrap().expect("live");
+    assert!(String::from_utf8_lossy(&live).contains("at-a"));
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Success && t.body.contains("codex now uses 'cdx-a'")),
+        "the switch is surfaced"
+    );
+}
+
+// CDX-1/2: a codex profile's Setup rows carry NO claude-shaped settings —
+// no endpoint (edit_profile_endpoint refuses codex targets; the UI must not
+// offer the dead end), no auto-start, no model overrides, no env. It keeps
+// Name / Login (re-capture) / DeleteCreds (with a stored login) / Delete.
+#[test]
+fn config_rows_for_a_codex_profile_hide_claude_settings() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut cdx = crate::testutil::blank_profile("cdx-a");
+    cdx.harness = crate::profile::Harness::Codex;
+    let mut app = super::App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![cdx],
+    });
+    app.config_draft = None;
+    app.profile_cursor = 0;
+
+    let rows = super::config_rows(&app);
+    for banned in [
+        super::ConfigRow::BaseUrl,
+        super::ConfigRow::ApiKey,
+        super::ConfigRow::AutoStart,
+        super::ConfigRow::Model,
+        super::ConfigRow::ModelOverrideAdd,
+        super::ConfigRow::EnvAdd,
+    ] {
+        assert!(!rows.contains(&banned), "codex must not offer {banned:?}");
+    }
+    assert!(
+        rows.contains(&super::ConfigRow::Login),
+        "re-capture stays offered"
+    );
+    assert!(
+        !rows.contains(&super::ConfigRow::DeleteCreds),
+        "no stored login yet → no log-out row"
+    );
+
+    crate::codex::write_profile_auth(
+        "cdx-a",
+        br#"{"tokens":{"access_token":"at-a","account_id":"acct-a"}}"#,
+    )
+    .unwrap();
+    let rows = super::config_rows(&app);
+    assert!(
+        rows.contains(&super::ConfigRow::DeleteCreds),
+        "a stored codex login makes log-out reachable"
+    );
 }

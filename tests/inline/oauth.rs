@@ -52,6 +52,7 @@ fn drain_http_request(sock: &mut std::net::TcpStream) -> Vec<u8> {
 fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -84,6 +85,48 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
 }
 
 use crate::testutil::HomeSandbox;
+
+/// `mark_auth_broken` persists its ONE delta against the latest disk state.
+/// A blind whole-state save from this process's snapshot would clobber a flag
+/// a CONCURRENT process minted in between (the daemon marking one profile
+/// while a CLI reauth clears another) — the TECH-7 lost-update surface.
+#[test]
+fn mark_auth_broken_merges_with_disk_instead_of_clobbering() {
+    let _home = HomeSandbox::new();
+
+    // Another process already quarantined "other" on disk; this process's
+    // in-memory snapshot predates that and doesn't know.
+    crate::profile::update_app_state(|s| s.auth_broken.push("other".into()))
+        .expect("seed disk state");
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        }));
+
+    mark_auth_broken(&handle, "mine", true);
+
+    let disk = crate::profile::load_config().expect("reload").state;
+    assert!(
+        disk.auth_broken.iter().any(|n| n.as_str() == "mine"),
+        "this process's mark lands"
+    );
+    assert!(
+        disk.auth_broken.iter().any(|n| n.as_str() == "other"),
+        "the concurrent writer's flag survives — no blind whole-state clobber"
+    );
+
+    mark_auth_broken(&handle, "mine", false);
+    let disk = crate::profile::load_config().expect("reload").state;
+    assert!(
+        !disk.auth_broken.iter().any(|n| n.as_str() == "mine"),
+        "the clear lands as a delta too"
+    );
+    assert!(
+        disk.auth_broken.iter().any(|n| n.as_str() == "other"),
+        "and still leaves the concurrent flag alone"
+    );
+}
 
 #[test]
 fn no_live_session_included_with_force_false() {
@@ -164,6 +207,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
 
     let _home = HomeSandbox::new();
     let profile = Profile {
+        harness: Default::default(),
         name: "test-rotate-one-no-rt".into(),
         base_url: None,
         api_key: None,
@@ -227,6 +271,7 @@ fn rotate_one_inner_skips_live_session() {
     file.lock().expect("lock pid file");
 
     let profile = Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -282,6 +327,7 @@ fn rotate_one_inner_skips_live_session() {
 fn profile_without_refresh_token_excluded() {
     use std::collections::BTreeMap;
     let profile = Profile {
+        harness: Default::default(),
         name: "test-oauth-no-rt".into(),
         base_url: None,
         api_key: None,
@@ -367,6 +413,7 @@ fn future_expiry() -> i64 {
 fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -401,6 +448,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
 fn third_party_config(name: &str) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: Some("https://api.deepseek.com/anthropic".to_string()),
         api_key: Some("sk-fixture".to_string()),
@@ -629,6 +677,8 @@ fn gate_flagged_profile_with_a_dead_chain_stays_broken() {
         "a dead chain keeps the quarantine"
     );
 }
+
+// ── TECH-9 #14: 2xx token-body redaction ──────────────────────────────────────
 
 /// A 2xx token-endpoint body that fails to deserialize still holds the live
 /// access+refresh tokens, so `token_parse_error` must surface only the serde
@@ -954,6 +1004,7 @@ mod adopt_live_rotation {
         // cached anchor exists. Identity unprovable ⇒ refuse.
         let handle = setup(name, past_expiry(), future_expiry());
         let adopted = try_adopt_live_rotation(&handle, name, &guard(name), &|tok| {
+            // The dead stored token yields nothing; the mirror answers fine.
             (tok == "at-mirror").then(|| "uuid-1".into())
         });
         assert_eq!(adopted, None);
@@ -1045,8 +1096,8 @@ mod adopt_live_rotation {
 // decisions can only come from state read under the guard. These pin that
 // boundary directly.
 
-/// The rotation lock the guard leg demands proof of (production callers hold
-/// it across the whole refresh window).
+/// The rotation lock the guard leg demands proof of (production callers hold it
+/// across the whole refresh window).
 fn gate_guard(name: &str) -> crate::runtime::RotationGuard {
     crate::runtime::RotationGuard::acquire(name).expect("rotation guard")
 }
@@ -1114,20 +1165,20 @@ fn gate_under_guard_spends_the_currently_stored_refresh_token() {
     ));
 }
 
-/// A cross-process peer rotated and persisted while this process held a stale
-/// in-memory config snapshot (the CLI and MCP load config from disk once and
-/// never reload): under the guard the DISK pair is authoritative. A live disk
-/// pair installs as-is — the stale in-memory token is never spent (the
-/// refresher panics if called) — and the handle carries the adopted pair.
+/// A cross-process peer rotated + persisted a fresher pair to disk while this
+/// caller held a stale in-memory snapshot; the guard leg adopts the disk pair
+/// (now non-expiring) and installs it as-is instead of refreshing the dead
+/// in-memory token.
 #[test]
 fn gate_under_guard_adopts_a_cross_process_rotation_from_disk() {
     let _home = HomeSandbox::new();
-    let name = "test-gate-disk-adopt";
+    let name = "test-gate-adopt-disk";
     let handle = Arc::new(RankedMutex::new(oauth_config(
         name,
         Some("rt-stale"),
         Some(past_expiry()),
     )));
+    // The peer's persisted, still-live pair.
     save_disk_profile(name, "rt-peer", Some(future_expiry()));
     assert!(matches!(
         gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
@@ -1136,17 +1187,16 @@ fn gate_under_guard_adopts_a_cross_process_rotation_from_disk() {
     assert_eq!(
         handle.lock().unwrap().find(name).unwrap().refresh_token(),
         Some("rt-peer"),
-        "the adopted disk pair must replace the stale in-memory snapshot"
+        "the in-memory profile adopts the peer's persisted refresh token"
     );
 }
 
-/// Peer-rotated pair that is ITSELF already expiring again: the refresher must
-/// be fed the disk refresh token — spending the stale in-memory one would 400
-/// (already spent by the peer) and wrongly quarantine a healthy login.
+/// The adopted disk pair is itself expiring → the guard leg refreshes from the
+/// ADOPTED token (`rt-peer`), never the stale in-memory `rt-stale`.
 #[test]
 fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
     let _home = HomeSandbox::new();
-    let name = "test-gate-disk-spend";
+    let name = "test-gate-adopt-then-spend";
     let handle = Arc::new(RankedMutex::new(oauth_config(
         name,
         Some("rt-stale"),
@@ -1156,7 +1206,7 @@ fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
     let refresher = |rt: &str, _scopes: Option<&str>| {
         assert_eq!(rt, "rt-peer", "must spend the disk pair, not the snapshot");
         Ok(TokenResponse {
-            access_token: "at-new".to_string(),
+            access_token: "at-next".to_string(),
             refresh_token: "rt-next".to_string(),
             expires_in: 3600,
             scope: None,
@@ -1168,14 +1218,12 @@ fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
     ));
 }
 
-/// A differing disk pair proves the chain is alive, so a standing in-memory
-/// quarantine is stale and lifts (same rationale as the scheduler's
-/// `carry_external_rotation`): the gate proceeds from the adopted pair
-/// instead of refusing a recovered login.
+/// Adopting an alive disk pair lifts a stale `auth_broken` quarantine — the
+/// chain is alive under a peer's advance (mirrors `carry_external_rotation`).
 #[test]
 fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
     let _home = HomeSandbox::new();
-    let name = "test-gate-disk-quarantine";
+    let name = "test-gate-adopt-lifts-quarantine";
     let handle = Arc::new(RankedMutex::new(oauth_config(
         name,
         Some("rt-stale"),
@@ -1189,7 +1237,7 @@ fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
     ));
     assert!(
         !handle.lock().unwrap().is_auth_broken(name),
-        "an adopted (alive) chain lifts a stale quarantine"
+        "an adopted (alive) disk pair lifts the stale quarantine"
     );
 }
 

@@ -219,6 +219,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.fetch_status = Some(FetchStatus::Fresh);
     let header = |kick_block: Option<KickBlock>| HeaderState {
+        account_email: None,
         is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
@@ -274,6 +275,7 @@ fn rate_limited_suffix_counts_the_retry() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.fetch_status = Some(FetchStatus::RateLimited);
     let header = |streak: u32| HeaderState {
+        account_email: None,
         is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
@@ -305,6 +307,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.fetch_status = Some(FetchStatus::Cached);
     let header = |refresh_fail: u32| HeaderState {
+        account_email: None,
         is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
@@ -353,6 +356,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
             .expect("a streak pill")
     };
     let header = |streaks: StreakCounts| HeaderState {
+        account_email: None,
         is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
@@ -405,6 +409,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
 fn spent_skipped_account_names_its_reset() {
     let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
     let header = HeaderState {
+        account_email: None,
         is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
@@ -482,6 +487,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
             window_dollars: Vec::new(),
             extra_usage: extra,
             spend,
+            codex_rate_limit_reached: None,
         });
         collect_stats(&profile)
     };
@@ -515,4 +521,54 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
     let bar = legacy.iter().find(|s| s.label == "extra").unwrap();
     assert_eq!(bar.trailing, "$4.87 / $50.00");
     assert!(bar.amount.is_empty());
+}
+
+// ── account row in the usage header (CAP-3) ───────────────────────────────────
+//
+// The Setup tab's `account` row has a sibling here: which login this profile
+// actually holds, between `plan` and `status`. Rendered purely from
+// `HeaderState.account_email` (gathered by the caller), so no disk IO in the
+// line builder — absent email, absent row.
+
+#[test]
+fn usage_header_names_the_linked_account() {
+    let profile = crate::testutil::blank_profile("a");
+    let header = |email: Option<&str>| HeaderState {
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        is_active: false,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        account_email: email.map(str::to_string),
+    };
+    let text = |lines: &[Line<'static>]| -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    };
+
+    let with = text(&header_lines(
+        &profile,
+        60,
+        &header(Some("x@computelabs.ai")),
+    ));
+    let account = with
+        .iter()
+        .find(|l| l.starts_with("account"))
+        .expect("account row renders when the email is cached");
+    assert!(account.contains("x@computelabs.ai"), "{account}");
+    let account_idx = with.iter().position(|l| l.starts_with("account")).unwrap();
+    let status_idx = with.iter().position(|l| l.starts_with("status")).unwrap();
+    assert!(
+        account_idx < status_idx,
+        "account sits between plan and status: {with:?}"
+    );
+
+    let without = text(&header_lines(&profile, 60, &header(None)));
+    assert!(
+        !without.iter().any(|l| l.starts_with("account")),
+        "no cached email → no account row: {without:?}"
+    );
 }

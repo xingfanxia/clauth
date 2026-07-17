@@ -181,6 +181,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
         total: None,
     };
     Profile {
+        harness: Default::default(),
         name: "tp".into(),
         base_url: Some("https://api.example.com".into()),
         api_key: Some("k".into()),
@@ -212,6 +213,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
 /// in `reset_secs`.
 fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -315,6 +317,197 @@ fn healthy_chain_hides_resumes_hint() {
     assert!(resumes_line(&lines).is_none());
 }
 
+// ── account-email column (CAP-3) ─────────────────────────────────────────────
+//
+// The `email` column is carved purely from the width LEFT OVER once every
+// other column is at full size — layouts without it must be pixel-identical,
+// and it must never shrink an upstream column. The em-dash placeholder means
+// "OAuth, anchor not seeded yet"; api-key/provider rows render a blank cell.
+
+/// Two-profile roster used by every test in this section: an OAuth profile
+/// and an api-key profile (index 1), so placeholder gating is exercised on
+/// both row kinds.
+fn email_fixture() -> App {
+    let oauth = profile("ax-main", 95.0, 10.0, 3600);
+    let mut api = profile("relay", 95.0, 0.0, 3600);
+    api.base_url = Some("https://api.example.com".into());
+    api.api_key = Some("sk-test".into());
+    api.usage = None;
+    let config = config_with(vec![oauth, api], Some("ax-main"), vec![]);
+    App::new(config)
+}
+
+/// Layout invariants across widths. The 5-tuple equality is a regression
+/// tripwire (today's implementation computes the upstream columns before it
+/// reads `has_email`, so it cannot fail; it exists to catch a refactor that
+/// lets the carve feed back into column sizing). The live protections are the
+/// no-clip bound — REAL row content including the TIMER_SLOT that
+/// `fixed_overview_width` omits — checked against BOTH the width model and
+/// the actually-rendered line, and gap parity on ungranted layouts.
+#[test]
+fn email_column_never_disturbs_the_upstream_columns() {
+    let app = email_fixture();
+    let long = "a-very-long-account-email@example-domain.com";
+    for width in [30u16, 48, 53, 58, 64, 81, 93, 102, 110, 124, 140, 200] {
+        let plain = OverviewWidths::new(width, &app, false);
+        let with = OverviewWidths::new(width, &app, true);
+        assert_eq!(plain.account, 0, "no emails → no column at {width}");
+        assert_eq!(
+            (
+                plain.name,
+                plain.kind,
+                plain.five_hour,
+                plain.seven_day,
+                plain.route
+            ),
+            (
+                with.name,
+                with.kind,
+                with.five_hour,
+                with.seven_day,
+                with.route
+            ),
+            "regression tripwire: carve fed back into column sizing at {width}"
+        );
+        if with.account > 0 {
+            let used = fixed_overview_width(
+                with.name,
+                with.kind,
+                with.five_hour,
+                with.seven_day,
+                with.route,
+                with.gap,
+            ) + TIMER_SLOT
+                + ACCOUNT_GAP
+                + with.account;
+            assert!(
+                used <= width as usize,
+                "granted layout clips the 5h column at width {width}: used {used}"
+            );
+            // Model ↔ renderer: the actually-rendered row must fit too, with
+            // the widest possible email in the cell.
+            let rendered = line_text(&render_overview_row(
+                &app,
+                0,
+                &with,
+                false,
+                true,
+                Some(long),
+            ));
+            assert!(
+                rendered.chars().count() <= width as usize,
+                "rendered row overflows at width {width}: {rendered:?}"
+            );
+        } else {
+            // No column → the gap must not depend on has_email at all.
+            assert_eq!(plain.gap, with.gap, "gap drifted with no column at {width}");
+        }
+        // Gap widening works from real spare in BOTH branches: whenever the
+        // columns fit at all (upstream deliberately overflows-and-clips below
+        // ~33 cols), the widened layout must still fit — the upstream bug was
+        // gap widening from the TIMER_SLOT-undercounted figure clipping the
+        // 5h column's `%` at narrow widths.
+        let plain_min = fixed_overview_width(
+            plain.name,
+            plain.kind,
+            plain.five_hour,
+            plain.seven_day,
+            plain.route,
+            2,
+        ) + TIMER_SLOT;
+        if plain_min <= width as usize {
+            let plain_used = fixed_overview_width(
+                plain.name,
+                plain.kind,
+                plain.five_hour,
+                plain.seven_day,
+                plain.route,
+                plain.gap,
+            ) + TIMER_SLOT;
+            assert!(
+                plain_used <= width as usize,
+                "gap widening overflows the plain layout at width {width}: used {plain_used}"
+            );
+        }
+    }
+}
+
+/// The exact grant boundary and the cap. For this roster (max name 7 →
+/// clamped to the 8 floor; narrow bands: kind 6 / 5h 12 / no 7d / no route)
+/// the real row costs `base 33 + TIMER_SLOT 5`, so the column needs
+/// `38 + ACCOUNT_GAP + ACCOUNT_MIN = 52` columns: one short of that gets
+/// nothing, 52 gets exactly ACCOUNT_MIN. A very wide terminal caps the column
+/// at ACCOUNT_MAX and flows the excess into the elastic gaps (clamped at 8).
+#[test]
+fn email_column_grant_boundary_and_cap() {
+    let app = email_fixture();
+    assert_eq!(OverviewWidths::new(51, &app, true).account, 0);
+    assert_eq!(OverviewWidths::new(52, &app, true).account, ACCOUNT_MIN);
+    let wide = OverviewWidths::new(300, &app, true);
+    assert_eq!(wide.account, ACCOUNT_MAX);
+    assert_eq!(wide.gap, 8, "excess spare beyond the cap widens gaps");
+}
+
+/// Cell semantics, pinned via em-dash DELTAS against the no-column layout of
+/// the same row (the route and 7d columns legitimately render their own
+/// em-dashes, so a bare `contains('—')` would be tautological):
+/// - OAuth + cached email → the address renders (truncated to the column).
+/// - OAuth + no email → exactly ONE extra em-dash (the pending placeholder).
+/// - api-key profile → blank cell, ZERO extra em-dashes (not applicable is
+///   not the same as pending — every other surface omits the field).
+/// - column not granted → no cell at all.
+#[test]
+fn email_cell_semantics_by_profile_kind() {
+    let app = email_fixture();
+    let granted = OverviewWidths::new(160, &app, true);
+    let plain = OverviewWidths::new(160, &app, false);
+    assert!(granted.account >= ACCOUNT_MIN);
+
+    let header = line_text(&overview_header(&granted));
+    assert!(
+        header.contains("email"),
+        "header names the column: {header}"
+    );
+
+    let row = |widths: &OverviewWidths, idx: usize, email: Option<&str>| {
+        line_text(&render_overview_row(&app, idx, widths, false, true, email))
+    };
+    let dashes = |s: &str| s.matches('—').count();
+
+    // OAuth with an email: the address renders truncated, no added em-dash.
+    let long = "a-very-long-account-email@example-domain.com";
+    let with = row(&granted, 0, Some(long));
+    let shown: String = long.chars().take(granted.account - 1).collect();
+    assert!(
+        with.contains(&format!("{shown}…")),
+        "long email truncates with an ellipsis: {with}"
+    );
+    assert_eq!(dashes(&with), dashes(&row(&plain, 0, None)));
+
+    // OAuth, anchor not seeded: exactly one extra em-dash — the placeholder.
+    assert_eq!(
+        dashes(&row(&granted, 0, None)),
+        dashes(&row(&plain, 0, None)) + 1,
+        "unseeded OAuth row must carry the pending placeholder"
+    );
+
+    // Api-key profile: blank cell — no placeholder for a profile kind that
+    // categorically has no account email.
+    assert_eq!(
+        dashes(&row(&granted, 1, None)),
+        dashes(&row(&plain, 1, None)),
+        "api-key row must not render a placeholder"
+    );
+
+    // Column not granted (too narrow for even ACCOUNT_MIN) → no cell at all.
+    let narrow = OverviewWidths::new(40, &app, true);
+    assert_eq!(narrow.account, 0);
+    assert!(
+        !row(&narrow, 0, Some(long)).contains('@'),
+        "no email cell without the column"
+    );
+}
+
 // ── overview row state cues ──────────────────────────────────────────────
 
 /// Marker column: a broken login (×) outranks both the bell (!) and the
@@ -326,8 +519,8 @@ fn broken_login_marker_outranks_bell_and_active() {
     config.state.auth_broken.push("a".into());
     let mut app = App::new(config);
     app.bell_fired.insert("a".into(), true);
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let text = line_text(&line);
     assert!(text.contains('×'), "broken login renders ×: {text}");
     assert!(!text.contains('!'), "bell yields to ×: {text}");
@@ -342,8 +535,8 @@ fn bell_marker_shows_when_login_is_fine() {
     let config = config_with(vec![a], None, vec![]);
     let mut app = App::new(config);
     app.bell_fired.insert("a".into(), true);
-    let widths = OverviewWidths::new(80, &app);
-    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(80, &app, false);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
     assert!(text.contains('!'), "{text}");
     assert!(!text.contains('×'), "{text}");
 }
@@ -360,8 +553,8 @@ fn cached_row_colors_countdown_amber_and_underlines_nothing() {
         .lock()
         .unwrap()
         .insert("a".to_string(), now_ms() + 30_000);
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     assert!(
         line.spans
             .iter()
@@ -392,8 +585,8 @@ fn failed_row_colors_countdown_red() {
         .lock()
         .unwrap()
         .insert("a".to_string(), now_ms() + 30_000);
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let bracket = line
         .spans
         .iter()
@@ -424,12 +617,12 @@ fn reset_suffixes(line: &Line<'static>) -> Vec<Span<'static>> {
 fn third_party_row_drain_colors_both_countdowns() {
     let config = config_with(vec![third_party_profile(60.0, 30.0)], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(200, &app);
+    let widths = OverviewWidths::new(200, &app, false);
     assert!(
         widths.five_hour >= 26 && widths.seven_day >= 26,
         "test needs both columns wide enough to render a (reset) suffix",
     );
-    let suffixes = reset_suffixes(&render_overview_row(&app, 0, &widths, false, true));
+    let suffixes = reset_suffixes(&render_overview_row(&app, 0, &widths, false, true, None));
     assert_eq!(suffixes.len(), 2, "both windows render a (reset) suffix");
     for s in suffixes {
         assert_ne!(
@@ -452,8 +645,8 @@ fn oauth_row_drain_colors_the_seven_day_countdown() {
     });
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(200, &app);
-    let suffixes = reset_suffixes(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(200, &app, false);
+    let suffixes = reset_suffixes(&render_overview_row(&app, 0, &widths, false, true, None));
     assert_eq!(suffixes.len(), 2);
     assert_eq!(
         suffixes[0].style.fg,
@@ -472,7 +665,8 @@ fn oauth_row_drain_colors_the_seven_day_countdown() {
 /// undercounted figure overflows the row at narrow widths, clipping the tail
 /// of the 5h column (observed at a 50-column pane: `[░░░░░]  0` with the `%`
 /// pushed off-screen). Whenever the columns fit at all at minimum gaps, the
-/// gap-widened layout must still fit.
+/// gap-widened layout must still fit. (Upstream's sweep, on the ungranted
+/// no-email layout; the email tests above pin the granted-layout bound.)
 #[test]
 fn gap_widening_never_clips_the_row() {
     let a = profile("ax-main", 95.0, 10.0, 3600);
@@ -480,7 +674,7 @@ fn gap_widening_never_clips_the_row() {
     let config = config_with(vec![a, b], Some("ax-main"), vec![]);
     let app = App::new(config);
     for width in 34u16..=200 {
-        let w = OverviewWidths::new(width, &app);
+        let w = OverviewWidths::new(width, &app, false);
         let min =
             fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.route, 2) + TIMER_SLOT;
         if min > width as usize {
@@ -503,6 +697,7 @@ fn gap_widening_never_clips_the_row() {
 /// `PlanTier::from_subscription_type(..).display()`.
 fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -537,13 +732,13 @@ fn credentialed_long_label_clamps_to_kind_width() {
     let a = credentialed_profile("acct", "enterprise");
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(60, &app);
+    let widths = OverviewWidths::new(60, &app, false);
     assert_eq!(
         widths.kind, 6,
         "test assumes a 6-wide kind column at this pane width"
     );
 
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let chars: Vec<char> = line_text(&line).chars().collect();
 
     // 2 = cursor slot, 2 = marker slot (both always exactly 2 chars).
@@ -558,4 +753,23 @@ fn credentialed_long_label_clamps_to_kind_width() {
         ' ',
         "type column must not bleed into the following gap/timer columns"
     );
+}
+
+// CDX-2 acceptance: a codex profile with published passive usage renders the
+// harness tag, the codex-slot active dot, and real usage bars — asserted on
+// the rendered line, not eyeballed.
+#[test]
+fn codex_row_renders_harness_tag_and_usage_bars() {
+    let mut cdx = profile("cdx-a", 95.0, 62.0, 3600);
+    cdx.harness = crate::profile::Harness::Codex;
+    let mut config = config_with(vec![cdx], None, vec![]);
+    config.state.active_codex_profile = Some("cdx-a".into());
+    let app = App::new(config);
+    let widths = OverviewWidths::new(100, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
+    let text = line_text(&line);
+    assert!(text.contains("Codex"), "harness tag renders: {text}");
+    assert!(text.contains('█'), "usage bar renders: {text}");
+    assert!(text.contains('●'), "codex-slot active dot renders: {text}");
+    assert!(text.contains("62"), "utilization figure renders: {text}");
 }

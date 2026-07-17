@@ -616,6 +616,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
     let creds = oauth_credentials();
 
     let profile = Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -733,6 +734,51 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
         0o600,
         "usage_cache.json mode should be 0o600, got {:#o}",
         cache_mode & 0o777,
+    );
+}
+
+/// config.toml can carry a third-party `api_key`, so BOTH writers that touch it
+/// must land it `0o600` — `save_profile` on the normal path AND the drift-rewrite
+/// path (`maybe_rewrite_config_toml`), which historically used the umask-default
+/// `atomic_write` and could leave a world-readable `0o644` API key (TECH-9 #15).
+#[cfg(unix)]
+#[test]
+fn config_toml_is_0600_including_the_drift_rewrite_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let name = "perm-test-config-toml";
+
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.base_url = Some("https://api.deepseek.com/anthropic".into());
+    profile.api_key = Some("sk-secret-must-be-0600".into());
+
+    // Normal path: save_profile writes config.toml at 0o600.
+    save_profile(&profile).expect("save_profile");
+    let cfg = profile_subpath(name, "config.toml").expect("config path");
+    let mode = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "save_profile config.toml mode, got {mode:#o}");
+
+    // Drift-rewrite path: `maybe_rewrite_config_toml` only writes when
+    // `render_config_toml` produces un-parseable TOML (its Err branch) — every
+    // value that round-trips is a no-op. A NaN threshold is the deterministic
+    // lever: it renders `fallback_threshold = NaN`, which TOML rejects (it spells
+    // NaN `nan`), so the branch fires and rewrites. We loosen the mode first and
+    // assert the rewrite re-tightens to 0o600 — the regression guard against this
+    // path drifting back to the umask-default `atomic_write` (TECH-9 #15).
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o644)).unwrap();
+    profile.fallback_threshold = Some(f64::NAN);
+    let raw = std::fs::read_to_string(&cfg).unwrap();
+    maybe_rewrite_config_toml(&cfg, &raw, &profile);
+    let after = std::fs::read_to_string(&cfg).unwrap();
+    assert_ne!(
+        after, raw,
+        "drift-rewrite must have fired (content changed)"
+    );
+    let mode2 = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode2, 0o600,
+        "drift-rewrite config.toml mode, got {mode2:#o}"
     );
 }
 
@@ -880,4 +926,118 @@ fn weekly_switch_threshold_absent_loads_as_default() {
         state.weekly_switch_threshold_pct(),
         DEFAULT_WEEKLY_SWITCH_PCT
     );
+}
+
+// ---- CDX-1 T1: harness axis ----
+
+// Every config.toml written before the harness field existed must load as
+// Claude — absent = Claude, zero migration.
+#[test]
+fn profile_config_harness_defaults_to_claude() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.harness, Harness::Claude);
+}
+
+#[test]
+fn profile_config_reads_harness_codex() {
+    let cfg: ProfileConfig = toml::from_str("harness = \"codex\"\n").expect("parse codex config");
+    assert_eq!(cfg.harness, Harness::Codex);
+}
+
+#[test]
+fn harness_round_trips_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.harness = Harness::Codex;
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.harness, Harness::Codex);
+}
+
+// A Claude profile's render must not emit an uncommented harness line: parsed
+// back it stays Claude, so `maybe_rewrite_config_toml`'s semantic compare
+// never rewrites a pre-CDX config.toml just because the field now exists.
+#[test]
+fn claude_render_keeps_harness_commented() {
+    let profile = Profile::new("p".to_string(), None, None);
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.harness, Harness::Claude);
+}
+
+// Old profiles.toml (no codex fields) loads with defaults, and a claude-only
+// state keeps serializing WITHOUT the codex keys — byte stability for every
+// existing install.
+#[test]
+fn app_state_codex_fields_default_and_stay_omitted() {
+    let state: AppState =
+        toml::from_str("active_profile = \"a\"\nprofiles = [\"a\"]\n").expect("parse old state");
+    assert!(state.active_codex_profile.is_none());
+    assert!(state.codex_fallback_chain.is_empty());
+    let rendered = toml::to_string_pretty(&state).expect("render state");
+    assert!(!rendered.contains("active_codex_profile"));
+    assert!(!rendered.contains("codex_fallback_chain"));
+}
+
+#[test]
+fn app_state_codex_fields_round_trip() {
+    let state = AppState {
+        active_codex_profile: Some("cdx".into()),
+        codex_fallback_chain: vec!["cdx".into(), "cdx2".into()],
+        ..AppState::default()
+    };
+    let rendered = toml::to_string_pretty(&state).expect("render state");
+    let back: AppState = toml::from_str(&rendered).expect("parse state");
+    assert_eq!(back.active_codex_profile.as_deref(), Some("cdx"));
+    assert_eq!(back.codex_fallback_chain.len(), 2);
+}
+
+// The codex active slot is independent of the claude one: activating a claude
+// profile never makes it codex-active and vice versa.
+#[test]
+fn is_active_codex_tracks_the_codex_slot_only() {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            crate::testutil::blank_profile("a"),
+            crate::testutil::blank_profile("b"),
+        ],
+    };
+    config.state.active_profile = Some("a".into());
+    config.state.active_codex_profile = Some("b".into());
+    assert!(config.is_active("a") && !config.is_active("b"));
+    assert!(config.is_active_codex("b") && !config.is_active_codex("a"));
+}
+
+// remove() must clear every codex slot the departing profile occupies,
+// mirroring the claude-side guarantees (chain membership + active marker).
+#[test]
+fn remove_clears_codex_membership_and_active_slot() {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            crate::testutil::blank_profile("cdx"),
+            crate::testutil::blank_profile("cdx2"),
+        ],
+    };
+    config.state.profiles = vec!["cdx".into(), "cdx2".into()];
+    config.state.active_codex_profile = Some("cdx".into());
+    config.state.codex_fallback_chain = vec!["cdx".into(), "cdx2".into()];
+    config.remove("cdx");
+    assert!(config.state.active_codex_profile.is_none());
+    assert_eq!(config.state.codex_fallback_chain.len(), 1);
+    assert_eq!(config.state.codex_fallback_chain[0].as_str(), "cdx2");
+}
+
+#[test]
+fn rename_updates_codex_slots() {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![crate::testutil::blank_profile("old")],
+    };
+    config.state.profiles = vec!["old".into()];
+    config.state.active_codex_profile = Some("old".into());
+    config.state.codex_fallback_chain = vec!["old".into()];
+    config.rename_all_occurrences("old", "new");
+    assert_eq!(config.state.active_codex_profile.as_deref(), Some("new"));
+    assert_eq!(config.state.codex_fallback_chain[0].as_str(), "new");
 }
