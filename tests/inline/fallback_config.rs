@@ -189,7 +189,7 @@ fn return_flags_whether_profiles_toml_was_written() {
     let _h = HomeSandbox::new();
     let mut c = config(&["a", "b", "c"], &["a", "b"]);
     // State-changing edits report true; no-ops and threshold-only report false —
-    // this is what gates the daemon's last_state_mtime bump.
+    // this is what gates the daemon's last_reload_fp adoption.
     assert!(add(&mut c, "c").unwrap(), "add new member writes state");
     assert!(!add(&mut c, "c").unwrap(), "re-add is a no-op");
     assert!(

@@ -15,8 +15,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use crate::profile::{
-    AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, app_state_mtime, claude_dir,
-    clauth_dir, load_config, save_app_state, save_profile,
+    AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, claude_dir, clauth_dir,
+    load_config, reload_fingerprint, save_app_state, save_profile,
 };
 use crate::testutil::{HomeSandbox, blank_profile, set_mtime};
 use crate::usage::{
@@ -581,11 +581,11 @@ fn user_switch_clears_queued_scheduler() {
     );
 }
 
-// ── drain_config_ops: mtime-suppression contract ──────────────────────────────
+// ── drain_config_ops: fingerprint-suppression contract ────────────────────────
 
 /// A threshold edit touches only the profile's `config.toml` and returns
-/// `Ok(false)`, so `drain_config_ops` must NOT advance `last_state_mtime` — an
-/// external `profiles.toml` write that landed the same tick still triggers a
+/// `Ok(false)`, so `drain_config_ops` must NOT adopt a fresh `last_reload_fp` —
+/// an external `profiles.toml` write that landed the same tick still triggers a
 /// reload. Pins the exact regression the ledger caught by eyeball.
 #[test]
 fn drain_config_ops_threshold_does_not_suppress_external_reload() {
@@ -611,7 +611,7 @@ fn drain_config_ops_threshold_does_not_suppress_external_reload() {
     let state_path = clauth_dir().unwrap().join("profiles.toml");
     set_mtime(&state_path, SystemTime::now() + Duration::from_secs(5));
 
-    // A threshold edit (Ok(false)) must leave last_state_mtime untouched.
+    // A threshold edit (Ok(false)) must leave last_reload_fp untouched.
     daemon
         .pending_config_ops
         .lock()
@@ -619,7 +619,7 @@ fn drain_config_ops_threshold_does_not_suppress_external_reload() {
         .push(ConfigOp::SetThreshold("alpha".into(), 50.0));
     daemon.drain_config_ops();
 
-    // Because the threshold edit did not adopt the external mtime, the reload fires.
+    // Because the threshold edit did not adopt a fresh fingerprint, the reload fires.
     daemon.reload_if_changed();
     assert_eq!(
         daemon.refresh_interval.load(Ordering::Relaxed),
@@ -660,9 +660,9 @@ fn reload_if_changed_fires_on_external_mtime_change() {
         "an external state change with a newer mtime must be reloaded"
     );
     assert_eq!(
-        app_state_mtime(),
-        daemon.last_state_mtime,
-        "reload adopts the on-disk mtime so it won't reload its own read again"
+        reload_fingerprint(),
+        daemon.last_reload_fp,
+        "reload adopts the on-disk fingerprint so it won't reload its own read again"
     );
 }
 
@@ -730,7 +730,7 @@ fn lost_update_switch_preserves_externally_added_profile() {
     );
 }
 
-/// After a switch, the daemon's `last_state_mtime` equals the on-disk mtime — it
+/// After a switch, the daemon's `last_reload_fp` equals the on-disk fingerprint — it
 /// adopted its OWN write (captured while holding the flock), so `reload_if_changed`
 /// is a no-op for the self-write, yet a later external write (newer mtime) still
 /// triggers a reload. This is the no-self-adoption-window contract (finding #1,
@@ -754,9 +754,9 @@ fn rmw_switch_adopts_own_write_mtime_then_reloads_external() {
 
     // The daemon adopted its own write's mtime (captured under the flock).
     assert_eq!(
-        daemon.last_state_mtime,
-        app_state_mtime(),
-        "daemon adopts its own switch write's mtime"
+        daemon.last_reload_fp,
+        reload_fingerprint(),
+        "daemon adopts its own switch write's fingerprint"
     );
     // A self-write must not look like an external change — reload is a no-op here.
     daemon.reload_if_changed();

@@ -681,6 +681,49 @@ pub(crate) fn app_state_mtime() -> Option<SystemTime> {
     std::fs::metadata(&path).ok()?.modified().ok()
 }
 
+/// Everything a full config reload depends on, so an edit to a per-account
+/// `config.toml` (which never touches `profiles.toml`) is still detected. Every
+/// profile dir contributes `(name, its config.toml mtime or None)`; folding
+/// EVERY mtime — not just the newest — means an edit to any config.toml flips the
+/// fingerprint even when its mtime doesn't advance the max (a clock step back, an
+/// mtime-preserving restore, two edits within one coarse mtime tick). The
+/// `(name, None)` entries make a config.toml appearing/vanishing, or a whole
+/// profile dir being added/removed, shift it too.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct ReloadFingerprint {
+    profiles_toml_mtime: Option<SystemTime>,
+    /// `(profile dir name, config.toml mtime if present)`, sorted by name so
+    /// readdir order can't spuriously flip equality.
+    config_mtimes: Vec<(String, Option<SystemTime>)>,
+}
+
+/// Pure filesystem stat of the reload triggers. Holds NO locks — `config` sits
+/// high in the rank hierarchy, so this must stay lock-free — and fails soft: a
+/// readdir/stat error contributes the empty value instead of erroring.
+pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
+    let profiles_toml_mtime = app_state_mtime();
+    let mut config_mtimes: Vec<(String, Option<SystemTime>)> = Vec::new();
+    if let Ok(root) = profiles_root()
+        && let Ok(entries) = std::fs::read_dir(&root)
+    {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let mtime = std::fs::metadata(entry.path().join("config.toml"))
+                .and_then(|m| m.modified())
+                .ok();
+            config_mtimes.push((name, mtime));
+        }
+    }
+    config_mtimes.sort();
+    ReloadFingerprint {
+        profiles_toml_mtime,
+        config_mtimes,
+    }
+}
+
 fn profiles_root() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("profiles"))
 }

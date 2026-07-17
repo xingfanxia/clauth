@@ -101,3 +101,47 @@ fn poison_recovery_after_panicking_closure() {
     let again = with_state_lock(|| with_state_lock(|| Ok(8u32)));
     assert_eq!(again.unwrap(), 8, "reentrancy still works post-recovery");
 }
+
+/// The cross-process flock wait is bounded. With `~/.clauth/.lock` already held
+/// (here by a second, independent open file description — `flock(2)` locks are
+/// per-description, so this conflicts exactly as a second process would), an
+/// acquisition times out with a [`StateLockTimeout`] instead of hanging; once the
+/// holder releases, the next acquisition runs its closure. Both directions of the
+/// #35 wedge fix.
+#[test]
+fn held_flock_times_out_then_recovers_on_release() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir ~/.clauth");
+    let lock_path = dir.join(LOCK_FILENAME);
+
+    // Stand in for a second process holding the state lock.
+    let holder = crate::profile::open_state_file(&lock_path).expect("open holder handle");
+    holder.lock().expect("hold the flock");
+
+    // Direction 1: a held flock times out at the deadline, never hangs.
+    let deadline = std::time::Duration::from_millis(300);
+    let start = Instant::now();
+    let err = match StateLock::acquire_with_timeout(deadline) {
+        Ok(_) => panic!("acquisition must time out while the flock is held"),
+        Err(e) => e,
+    };
+    let waited = start.elapsed();
+    assert!(
+        err.downcast_ref::<StateLockTimeout>().is_some(),
+        "a held flock must surface as StateLockTimeout, got: {err:#}"
+    );
+    assert!(
+        waited >= deadline,
+        "must wait the full deadline before timing out, waited {waited:?}"
+    );
+    assert!(
+        waited < deadline * 10,
+        "must return at the deadline, not hang, waited {waited:?}"
+    );
+
+    // Direction 2: once the holder releases, the next acquisition succeeds.
+    drop(holder);
+    let ran = with_state_lock(|| Ok(1234u32)).expect("acquire after the holder releases");
+    assert_eq!(ran, 1234, "closure runs once the flock is free");
+}

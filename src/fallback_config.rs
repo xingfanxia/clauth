@@ -39,7 +39,7 @@ impl MoveDir {
 /// the persisted app state (chain membership/order, wrap-off) — and `Ok(false)`
 /// when it made no such write (a no-op, or a threshold edit that touches only the
 /// profile's own `config.toml`). The daemon uses this to bump its
-/// `last_state_mtime` *only* after a real `profiles.toml` write, so an unrelated
+/// `last_reload_fp` *only* after a real `profiles.toml` write, so an unrelated
 /// external edit in the same tick isn't silently skipped. Every edit is also
 /// transactional against its own write: on a save failure the in-memory mutation
 /// is rolled back, so `AppConfig` never diverges from disk.

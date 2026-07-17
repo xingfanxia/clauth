@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -56,8 +56,8 @@ use crate::claude::{
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{
-    AppConfig, ConfigHandle, app_state_mtime, atomic_write_600_fast, clauth_dir, load_config,
-    mkdir_700,
+    AppConfig, ConfigHandle, ReloadFingerprint, atomic_write_600_fast, clauth_dir, load_config,
+    mkdir_700, reload_fingerprint,
 };
 use crate::usage::{
     ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, PendingSwitch,
@@ -235,10 +235,11 @@ struct Daemon {
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
     shutting_down: Arc<AtomicBool>,
-    /// Last-seen `profiles.toml` mtime — drives external-change reload. Bumped to
+    /// Last-seen reload fingerprint (`profiles.toml` mtime + per-account
+    /// config.toml count/newest-mtime) — drives external-change reload. Bumped to
     /// the post-write value after every self-initiated switch so the daemon never
     /// reloads its own write.
-    last_state_mtime: Option<SystemTime>,
+    last_reload_fp: ReloadFingerprint,
     /// Epoch-ms of the last completed main-loop tick — the watchdog's liveness
     /// signal (TECH-3). `0` until the first tick completes.
     heartbeat: Arc<AtomicU64>,
@@ -358,7 +359,7 @@ impl Daemon {
             // exit). The flag exists for `spawn_refresher`'s contract — its
             // real writer is the TUI's quit path.
             shutting_down: Arc::new(AtomicBool::new(false)),
-            last_state_mtime: app_state_mtime(),
+            last_reload_fp: reload_fingerprint(),
             heartbeat: Arc::new(AtomicU64::new(0)),
             last_error: None,
             last_switch: None,

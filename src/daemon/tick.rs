@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use crate::actions::{switch_off, switch_profile};
 use crate::fallback_config;
 use crate::logline::logline;
-use crate::profile::{app_state_mtime, load_config};
+use crate::profile::{load_config, reload_fingerprint};
 use crate::usage::{
     Origin, PendingSwitchEntry, collect_third_party_entries, collect_tokens, is_idle, now_ms,
 };
@@ -182,7 +182,7 @@ impl super::Daemon {
             Owned {
                 owner: String,
                 adopted: bool,
-                synced_mtime: Option<Option<std::time::SystemTime>>,
+                synced_fp: Option<crate::profile::ReloadFingerprint>,
             },
             /// Live must be left alone; log once per distinct state.
             LeaveAlone { key: u64, why: String },
@@ -248,24 +248,24 @@ impl super::Daemon {
             // Sync the marker while still under the flock, and hand the fresh
             // profiles.toml mtime out so the next reload_if_changed doesn't
             // treat our own write as an external edit.
-            let synced_mtime = if !cfg.is_active_codex(&owner) {
+            let synced_fp = if !cfg.is_active_codex(&owner) {
                 let target = owner.clone();
                 // Wholesale re-sync (mirrors the claude follow at its
                 // marker write): `merged` is the freshest on-disk state plus
-                // our delta, and we adopt this write's mtime below — copying
-                // one field back would drop a same-tick external edit until
-                // an unrelated later write re-triggered the reload.
+                // our delta, and we adopt this write's fingerprint below —
+                // copying one field back would drop a same-tick external edit
+                // until an unrelated later write re-triggered the reload.
                 cfg.state = crate::profile::update_app_state(move |s| {
                     s.active_codex_profile = Some(target.as_str().into());
                 })?;
-                Some(app_state_mtime())
+                Some(reload_fingerprint())
             } else {
                 None
             };
             Ok(Step::Owned {
                 owner,
                 adopted,
-                synced_mtime,
+                synced_fp,
             })
         });
         drop(cfg);
@@ -275,14 +275,14 @@ impl super::Daemon {
             Ok(Step::Owned {
                 owner,
                 adopted,
-                synced_mtime,
+                synced_fp,
             }) => {
                 self.codex_follow_memo = None;
                 if adopted {
                     logline!("clauth daemon: adopted codex's refreshed login back into '{owner}'");
                 }
-                if let Some(mtime) = synced_mtime {
-                    self.last_state_mtime = mtime;
+                if let Some(fp) = synced_fp {
+                    self.last_reload_fp = fp;
                     logline!(
                         "clauth daemon: the live codex login belongs to '{owner}' — marking \
                          it codex-active"
@@ -622,9 +622,9 @@ impl super::Daemon {
         };
         match result {
             Ok(()) => {
-                // Adopt our own write's mtime so the next tick doesn't treat
-                // it as an external change.
-                self.last_state_mtime = app_state_mtime();
+                // Adopt our own write's fingerprint so the next tick doesn't
+                // treat it as an external change.
+                self.last_reload_fp = reload_fingerprint();
                 self.rebuild_tokens();
                 self.follow_memo = None;
                 self.follow_retry_at = 0;
@@ -924,11 +924,11 @@ impl super::Daemon {
     /// TUI edit). Replaces the shared config and rebuilds token lists so the
     /// scheduler picks up added/removed profiles.
     pub(super) fn reload_if_changed(&mut self) {
-        let current = app_state_mtime();
-        if current == self.last_state_mtime {
+        let current = reload_fingerprint();
+        if current == self.last_reload_fp {
             return;
         }
-        self.last_state_mtime = current;
+        self.last_reload_fp = current;
         match load_config() {
             Ok(new_config) => {
                 self.refresh_interval
@@ -1102,10 +1102,11 @@ impl super::Daemon {
         ) {
             crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {}
             crate::oauth::AuthGate::Broken => {
-                // The gate persisted `auth_broken`; adopt that mtime so the next
-                // tick's reload doesn't treat our own write as external. Terminal
-                // failure (drop, not retry) — clear any backoff for this target.
-                self.last_state_mtime = app_state_mtime();
+                // The gate persisted `auth_broken`; adopt that fingerprint so the
+                // next tick's reload doesn't treat our own write as external.
+                // Terminal failure (drop, not retry) — clear any backoff for this
+                // target.
+                self.last_reload_fp = reload_fingerprint();
                 let msg = crate::format::login_expired(&winner.target).line();
                 logline!("clauth daemon: {msg}");
                 self.set_last_error(now, msg);
@@ -1118,11 +1119,12 @@ impl super::Daemon {
             }
         }
 
-        // TECH-7: hold the state flock across the switch AND the post-write mtime
+        // TECH-7: hold the state flock across the switch AND the post-write
+        // fingerprint
         // read, so an external write can't slip into the save→read window and be
         // adopted as our own (the :354 self-adoption gap). `with_state_lock` is
         // re-entrant, so `switch_profile`'s inner acquisition nests without
-        // deadlock; `app_state_mtime()` is read while we still hold the flock.
+        // deadlock; `reload_fingerprint()` is read while we still hold the flock.
         let result = {
             #[allow(
                 clippy::expect_used,
@@ -1146,13 +1148,13 @@ impl super::Daemon {
                 } else {
                     switch_profile(&mut cfg, &winner.target)?;
                 }
-                Ok(app_state_mtime())
+                Ok(reload_fingerprint())
             })
         };
         match result {
-            Ok(mtime) => {
+            Ok(fp) => {
                 self.rebuild_tokens();
-                self.last_state_mtime = mtime;
+                self.last_reload_fp = fp;
                 // TECH-8: record the hero event; clear any failure backoff/dedup.
                 self.last_switch = Some(LastSwitch {
                     from: outgoing.clone(),
@@ -1196,12 +1198,12 @@ impl super::Daemon {
             crate::lock::with_state_lock(|| {
                 let report =
                     crate::actions::codex_switch_profile(&mut cfg, &winner.target, policy)?;
-                Ok((report, app_state_mtime()))
+                Ok((report, reload_fingerprint()))
             })
         };
         match result {
-            Ok((report, mtime)) => {
-                self.last_state_mtime = mtime;
+            Ok((report, fp)) => {
+                self.last_reload_fp = fp;
                 if let Some(owner) = &report.adopted_back {
                     logline!(
                         "clauth daemon: adopted codex's refreshed login back into '{owner}' first"
@@ -1322,7 +1324,7 @@ impl super::Daemon {
             );
             return;
         }
-        // TECH-7: same flock-held mtime capture as `drain_pending_switch`.
+        // TECH-7: same flock-held fingerprint capture as `drain_pending_switch`.
         let result = {
             #[allow(
                 clippy::expect_used,
@@ -1331,13 +1333,13 @@ impl super::Daemon {
             let mut cfg = self.config.lock().expect("config poisoned");
             crate::lock::with_state_lock(|| {
                 switch_off(&mut cfg)?;
-                Ok(app_state_mtime())
+                Ok(reload_fingerprint())
             })
         };
         match result {
-            Ok(mtime) => {
+            Ok(fp) => {
                 self.rebuild_tokens();
-                self.last_state_mtime = mtime;
+                self.last_reload_fp = fp;
                 // TECH-8: a wrap-off is an executed switch (to = none).
                 self.last_switch = Some(LastSwitch {
                     from: Some(active.clone()),
@@ -1354,13 +1356,16 @@ impl super::Daemon {
     /// Apply fallback-config edits the socket queued (add/remove/reorder chain
     /// members, per-member threshold, wrap-off). Each edit mutates + persists via
     /// the shared [`fallback_config`] primitives (transactional against their own
-    /// writes). We bump `last_state_mtime` only when an edit actually (re)wrote
-    /// `profiles.toml` (the primitive returned `Ok(true)`), so the next tick's
-    /// `reload_if_changed` skips *our* write but still catches an unrelated
+    /// writes). We adopt a fresh reload fingerprint only when an edit actually
+    /// (re)wrote `profiles.toml` (the primitive returned `Ok(true)`), so the next
+    /// tick's `reload_if_changed` skips *our* write but still catches an unrelated
     /// external edit that landed the same tick. A threshold edit touches only the
-    /// profile's `config.toml` (`Ok(false)`), so it never suppresses a reload.
-    /// The token lists are untouched by chain/threshold/wrap-off edits, so no
-    /// `rebuild_tokens` is needed (unlike a switch).
+    /// profile's `config.toml` (`Ok(false)`) and deliberately does NOT adopt: the
+    /// fingerprint covers config.toml mtimes too (0.12.0+), so our own write
+    /// triggers one redundant self-reload next tick — harmless (disk already
+    /// equals memory) and the price of never swallowing a same-tick external
+    /// edit. The token lists are untouched by chain/threshold/wrap-off edits, so
+    /// no `rebuild_tokens` is needed (unlike a switch).
     ///
     /// Lock order: drain the queue (rank `PendingConfigOps`) into a `Vec` and
     /// release it *before* taking `config` (rank `Config`, lower/outer), matching
@@ -1408,7 +1413,7 @@ impl super::Daemon {
             }
         }
         if wrote_state {
-            self.last_state_mtime = app_state_mtime();
+            self.last_reload_fp = reload_fingerprint();
         }
     }
 }
