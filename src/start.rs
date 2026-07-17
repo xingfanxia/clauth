@@ -2,6 +2,7 @@
 //! runtime directory. See [`crate::runtime`] for the shared-runtime design;
 //! this module is just the thin wrapper that owns the lifetime guard.
 
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 #[cfg(unix)]
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
@@ -36,6 +37,7 @@ pub(crate) fn run(
     name: &str,
     claude_args: &[String],
     isolation: Isolation,
+    workspace: Option<&Path>,
 ) -> Result<()> {
     let profile = config.find(name).context("profile not found")?;
 
@@ -65,12 +67,14 @@ pub(crate) fn run(
     // the parent process env. The target's runtime settings.json re-supplies
     // whichever it defines. Mirrors the delegate path (run_delegate).
     crate::runtime::scrub_profile_env(&mut command, &active_env_keys);
-    // `claude` inherits this process's cwd (no `.current_dir()` call here); if
-    // that's the real `$HOME`, its project-tier settings lookup would hit the
-    // real `~/.claude/settings.json` and re-leak the globally active profile's
-    // env, this time outranking the runtime settings.json below.
-    if let Ok(cwd) = std::env::current_dir() {
-        crate::runtime::guard_home_project_settings(&mut command, &cwd);
+    // A resume pins `claude` to the session's workspace; a normal start inherits
+    // this process's cwd. Either way the resolved dir feeds the home-project
+    // settings guard: when it is the real `$HOME`, its project-tier settings
+    // lookup would hit the real `~/.claude/settings.json` and re-leak the
+    // globally active profile's env, outranking the runtime settings.json below.
+    let spawn_cwd = apply_spawn_cwd(&mut command, workspace);
+    if let Some(cwd) = spawn_cwd.as_deref() {
+        crate::runtime::guard_home_project_settings(&mut command, cwd);
     }
     command.env("CLAUDE_CONFIG_DIR", runtime.config_dir());
     // Isolated: also suppress global/project MCP servers wired through
@@ -125,6 +129,25 @@ pub(crate) fn run(
         std::process::exit(code);
     }
     Ok(())
+}
+
+/// Resolve the directory the spawned `claude` runs in and pin `command` to it.
+/// `Some(dir)` sets the child's cwd to that workspace (a resume); `None` leaves
+/// `command` inheriting this process's cwd (a normal start), so the `None` path
+/// is byte-for-byte the pre-resume behavior. Returns the resolved dir so the
+/// caller feeds the same path to the home-project settings guard, whose lookup
+/// is cwd-based.
+fn apply_spawn_cwd(
+    command: &mut std::process::Command,
+    workspace: Option<&Path>,
+) -> Option<PathBuf> {
+    match workspace {
+        Some(dir) => {
+            command.current_dir(dir);
+            Some(dir.to_path_buf())
+        }
+        None => std::env::current_dir().ok(),
+    }
 }
 
 fn status_code(status: ExitStatus, signal: Option<i32>) -> i32 {

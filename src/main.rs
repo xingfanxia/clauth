@@ -25,6 +25,7 @@ mod profile_json;
 mod providers;
 mod runtime;
 mod sessions;
+mod sessions_cli;
 mod spinner;
 mod start;
 mod status;
@@ -51,9 +52,46 @@ fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<String> {
     })
 }
 
-fn main() -> Result<()> {
+fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    dispatch(&args)
+    std::process::exit(exit_code(dispatch(&args)));
+}
+
+/// A usage error (bad flag/args) for the sessions-surface commands. Distinct
+/// from a runtime failure so [`exit_code`] can map it to process exit 2, while a
+/// genuine error (including "no sessions found") stays exit 1.
+#[derive(Debug)]
+pub(crate) struct UsageError(pub(crate) String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+/// Build a [`UsageError`] as an `anyhow::Error` for a dispatch arm to return.
+fn usage_error(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(UsageError(msg.into()))
+}
+
+/// Map a dispatch outcome to a process exit code: 0 on success, 2 for a
+/// [`UsageError`] (bad flag/args), 1 for any other failure. Prints the error
+/// exactly as anyhow's `Result` `Termination` did (`Error: {:?}`), so the
+/// message surface is unchanged now that `main` maps the code itself.
+pub(crate) fn exit_code(result: Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            if e.downcast_ref::<UsageError>().is_some() {
+                2
+            } else {
+                1
+            }
+        }
+    }
 }
 
 fn dispatch(args: &[String]) -> Result<()> {
@@ -113,6 +151,18 @@ fn dispatch(args: &[String]) -> Result<()> {
         // Hidden: the bundled PostToolUse `asyncRewake` hook body. Reads the hook
         // payload on stdin, waits for a background delegate, and wakes the model.
         [cmd] if cmd == "mcp-await-job" => mcp::await_job(),
+        [cmd] if cmd == "sessions" => sessions_cli::run_sessions(false),
+        [cmd, flag] if cmd == "sessions" && flag == "--json" => sessions_cli::run_sessions(true),
+        [cmd, ..] if cmd == "sessions" => Err(usage_error("usage: clauth sessions [--json]")),
+        [cmd, target] if cmd == "resume" => sessions_cli::run_resume(target, None),
+        [cmd, target, flag, value] if cmd == "resume" && flag == "--profile" => {
+            sessions_cli::run_resume(target, Some(value))
+        }
+        [cmd, ..] if cmd == "resume" => Err(usage_error(
+            "usage: clauth resume <id|latest> [--profile <name>]",
+        )),
+        [cmd, target] if cmd == "info" => sessions_cli::run_info(target),
+        [cmd, ..] if cmd == "info" => Err(usage_error("usage: clauth info <id|latest>")),
         [cmd] if cmd == "daemon" => daemon::serve(),
         [cmd, flag] if cmd == "status" && flag == "--json" => daemon::status_oneshot(),
         [cmd, ..] if cmd == "status" => {
@@ -153,7 +203,7 @@ fn cmd_start(name: &str, rest: &[String], isolation: Isolation) -> Result<()> {
     runtime::gc_stale_runtimes();
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
-    start::run(&config, &canonical, rest, isolation)
+    start::run(&config, &canonical, rest, isolation, None)
 }
 
 /// `clauth login`'s parsed args after the `login` token: one profile name plus
@@ -586,6 +636,13 @@ fn print_help() {
          confirm, --force overrides the live-session guard\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
          credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
+           clauth sessions [--json]        list Claude Code sessions as a table; --json\n                                  \
+         emits a stable newest-first array (exit 0/1/2)\n  \
+           clauth resume <id|latest> [--profile <name>]\n                                  \
+         resume a session under a chosen profile (prompts on a TTY,\n                                  \
+         defaulting to the session's last-ran profile; --profile forces)\n  \
+           clauth info <id|latest>         print the resume command, workspace, and\n                                  \
+         on-disk storage path for a session (never launches)\n  \
            clauth daemon                   run the headless scheduler with no TUI: refresh\n                                  \
          usage, auto-switch on exhaustion, and write ~/.clauth/status.json\n  \
            clauth status --json            print the current usage / auto-switch snapshot\n                                  \

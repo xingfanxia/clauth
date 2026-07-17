@@ -103,6 +103,15 @@ pub(crate) struct SessionInfo {
     pub(crate) last_ran_profile: Option<String>,
 }
 
+impl SessionInfo {
+    /// The transcript's on-disk path — the storage line `clauth info` prints.
+    /// An accessor keeps the field module-private (consumers still key off `id`
+    /// for dedup) while exposing it for display.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// Sessions that share one workspace (`cwd`), newest-first within the group.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceGroup {

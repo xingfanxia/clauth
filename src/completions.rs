@@ -11,12 +11,12 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete which completions" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete which sessions resume info completions" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--base-url --api-key --model" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated" -- "${cur}") )
-    elif [ "$prev" = "--isolated" ]; then
+    elif [ "$prev" = "--isolated" ] || [ "$prev" = "--profile" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
@@ -26,6 +26,10 @@ const BASH: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
+        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y --force" -- "${cur}") )
     fi
@@ -45,6 +49,9 @@ _clauth() {
             'login[log in via browser OAuth or an API key]' \
             'delete[remove a profile and its credentials]' \
             'which[print profile owning the loaded credentials]' \
+            'sessions[list Claude Code sessions (add --json)]' \
+            'resume[resume a session under a chosen profile]' \
+            'info[print resume command + storage path for a session]' \
             'completions[emit shell completion script]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|delete) ]]; then
         local -a profiles
@@ -55,8 +62,16 @@ _clauth() {
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
+    elif (( CURRENT == 4 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
+        local -a profiles
+        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
+        _values 'flag' '--json[emit the stable machine-readable array]'
+    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
+        _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
         _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--model[set the default model before signing in]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
@@ -75,10 +90,15 @@ complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with t
 complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
 complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
+complete -c clauth -f -n __fish_is_first_token -a sessions -d "List Claude Code sessions"
+complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session under a chosen profile"
+complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
 complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login delete" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
+complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
+complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "API base url"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --api-key -d "API key (prompted echo-off if omitted)"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --model -d "Set default model before signing in"
