@@ -25,8 +25,8 @@ use super::super::app::{App, TokenFilter, TokenPeriod, TokenView, token_period_m
 use super::super::theme;
 use super::format::{fixed, spinner_frame};
 use super::panes::{
-    draw_selector_list, picker_row, section_box, section_box_loading, section_box_verbatim,
-    selector_width,
+    draw_selector_list, master_detail, picker_row, section_box, section_box_loading,
+    section_box_verbatim,
 };
 use crate::pricing::PriceTable;
 use crate::tokens::{
@@ -458,6 +458,32 @@ const CARD_COL_W: u16 = 56;
 /// `DASH_MAX_W` band (past it the percentage-split cards stretch their
 /// edge-anchored figures into scattered fragments).
 fn dash_rects(area: Rect) -> DashRects {
+    // Phone width: every card pair stacks — a 45-col terminal has no room for
+    // side-by-side cards (the TODAY card alone needs ~20 content cells). Rows
+    // are the abundant resource there; a short terminal clips the trailing
+    // charts (hour/activity) rather than crushing every card.
+    if super::panes::narrow(area.width) {
+        let rows: [Rect; 7] = Layout::vertical([
+            Constraint::Length(6), // today / this week / this month
+            Constraint::Length(6), // total
+            Constraint::Length(4), // trend (compact)
+            Constraint::Length(7), // top models
+            Constraint::Length(6), // composition
+            Constraint::Length(9), // hour of day (24 buckets fit 45 cols)
+            Constraint::Min(0),    // activity takes whatever is left
+        ])
+        .areas(area);
+        return DashRects {
+            first: rows[0],
+            total: rows[1],
+            trend: rows[2],
+            models: rows[3],
+            comp: rows[4],
+            hour: rows[5],
+            activity: rows[6],
+        };
+    }
+
     if area.width >= TWO_COL_MIN_W && area.height >= TWO_COL_MIN_H {
         let cols: [Rect; 2] =
             Layout::horizontal([Constraint::Length(CARD_COL_W), Constraint::Fill(1)]).areas(area);
@@ -1203,13 +1229,13 @@ fn kv_accent(label: &str, value: String) -> Line<'static> {
 // ── models master-detail view ──────────────────────────────────────────────
 
 fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let cols: [Rect; 2] = Layout::horizontal([
-        Constraint::Length(selector_width(area.width)),
-        Constraint::Min(20),
-    ])
-    .areas(area);
-
     let grouped = token_period_models(app);
+    // The master-detail split lives in `master_detail`: its desktop branch is
+    // the upstream `selector_width(area.width) | Min(20)` horizontal split, and
+    // it adds the fork's narrow (phone-width) stacked variant. Passing
+    // `grouped.len()` lets the narrow selector size to its row count.
+    let (selector, detail) = master_detail(area, grouped.len());
+    let cols = [selector, detail];
     let sel = app.token_model_cursor.min(grouped.len().saturating_sub(1));
 
     // The selector title carries the active lenses so the narrowed list reads

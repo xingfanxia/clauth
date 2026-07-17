@@ -17,6 +17,47 @@ pub(super) fn selector_width(body_w: u16) -> u16 {
     (body_w.saturating_mul(3) / 10).clamp(20, 40)
 }
 
+/// Phone-width threshold: below this, layouts that place panes side-by-side
+/// stack them vertically instead — at Moshi's ~45 columns the horizontal
+/// master-detail split leaves the detail pane ~13 usable cells. At or above
+/// it every layout is byte-identical to the desktop rendering.
+pub(super) const NARROW_BODY_W: u16 = 60;
+
+/// True when `w` is under the phone-width threshold.
+pub(super) fn narrow(w: u16) -> bool {
+    w < NARROW_BODY_W
+}
+
+/// The master-detail pane split shared by the Usage/Setup/Fallback/Status/
+/// Plugin tabs. Desktop: the house horizontal selector|detail. Narrow: stacked
+/// selector-above-detail — the selector takes its `items` rows (+ box chrome)
+/// up to 40% of the body, the detail the rest, so both panes keep full-width
+/// lines on a phone. Rows, not columns, are the abundant resource there.
+pub(super) fn master_detail(area: Rect, items: usize) -> (Rect, Rect) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    if narrow(area.width) {
+        let max_sel = (area.height.saturating_mul(2) / 5).max(5);
+        let want = u16::try_from(items.saturating_add(3)).unwrap_or(u16::MAX);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(want.clamp(5, max_sel)),
+                Constraint::Min(8),
+            ])
+            .split(area);
+        (rows[0], rows[1])
+    } else {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(selector_width(area.width)),
+                Constraint::Min(20),
+            ])
+            .split(area);
+        (cols[0], cols[1])
+    }
+}
+
 /// Display columns occupied by the text before the caret in `input`.
 /// `InputState::cursor` is a byte offset; every edited field is ASCII-only in
 /// practice, so the char count of the pre-caret slice equals display columns.

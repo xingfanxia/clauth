@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -14,7 +14,7 @@ use super::super::app::App;
 use super::super::theme;
 use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
 use super::panes::{
-    active_pill, draw_profile_selector, key_cell, section_box, section_box_verbatim, selector_width,
+    active_pill, draw_profile_selector, key_cell, master_detail, section_box, section_box_verbatim,
 };
 use crate::format::plan_label;
 use crate::profile::Profile;
@@ -34,6 +34,10 @@ struct HeaderState {
     activity: ProfileActivity,
     next_refresh_ms: Option<u64>,
     tick: u64,
+    /// The stored login's email (the identity anchor's readable half),
+    /// mirroring the Setup tab's `account` row. OAuth-only; `None` until a
+    /// login or the /profile fetch seeds it.
+    account_email: Option<String>,
     /// Consecutive-failure counts for the shown profile (zeroed when absent).
     /// The retry suffix names which retry the countdown leads to, so a deep slot
     /// reads as stuck from the count alone, no judgment label.
@@ -45,14 +49,11 @@ struct HeaderState {
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let [selector_area, detail_area] = Layout::horizontal([
-        Constraint::Length(selector_width(area.width)),
-        Constraint::Min(20),
-    ])
-    .areas(area);
+    let items = app.config().profiles.len();
+    let (selector, detail) = master_detail(area, items);
 
-    draw_profile_selector(frame, selector_area, app, app.profile_cursor, true);
-    draw_usage_detail(frame, detail_area, app);
+    draw_profile_selector(frame, selector, app, app.profile_cursor, true);
+    draw_usage_detail(frame, detail, app);
 }
 
 fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -110,6 +111,17 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .ok()
             .and_then(|m| m.get(profile.name.as_str()).copied()),
         tick: app.tick_count,
+        // One tiny cached-file read, cursor profile only — the same per-frame
+        // page-cache read the Setup tab's `account` row makes.
+        account_email: profile
+            .is_oauth()
+            .then(|| {
+                crate::profile_cache::load_profile_cache::<String>(
+                    profile.name.as_str(),
+                    crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
+                )
+            })
+            .flatten(),
         streaks: streaks
             .get(profile.name.as_str())
             .copied()
@@ -692,6 +704,14 @@ fn header_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Li
     }
 
     let mut lines = vec![Line::from(plan_spans)];
+    // Account row — which login this profile actually holds, so
+    // which-account-is-this never needs forensics (Setup tab's sibling).
+    if let Some(email) = header.account_email.as_deref() {
+        lines.push(Line::from(vec![
+            key_span("account"),
+            Span::styled(email.to_string(), theme::dim()),
+        ]));
+    }
     lines.push(status_line(profile, header));
     lines
 }

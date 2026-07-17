@@ -10,7 +10,7 @@
 //! remove arms then confirms. No popups.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -21,8 +21,8 @@ use super::super::app::{
 use super::super::theme;
 use super::panes::{
     active_pill, bold_when, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
-    invalid_tooltip_lines, key_cell, label_style, name_color, section_box, section_box_verbatim,
-    select_line, selector_width, wrap_words,
+    invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, section_box,
+    section_box_verbatim, select_line, wrap_words,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, soonest_resume, threshold_for};
 use crate::profile::AppConfig;
@@ -43,15 +43,15 @@ const KEY_GUTTER: usize = 2;
 const ROWS_BEFORE: usize = 5;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let [selector_area, detail_area] = Layout::horizontal([
-        Constraint::Length(selector_width(area.width)),
-        Constraint::Min(20),
-    ])
-    .areas(area);
+    // `master_detail` is the fork's responsive split: on desktop it is the
+    // upstream `selector_width(area.width) | Min(20)` horizontal layout, and on
+    // phone widths it stacks selector-above-detail (narrow-TUI). Keeping the
+    // helper preserves both upstream's desktop split and the fork's narrow mode.
+    let (selector, detail) = master_detail(area, chain_items(app).len());
 
     let chain_focused = app.fallback_focus == FallbackFocus::Chain;
-    draw_chain_selector(frame, selector_area, app, chain_focused);
-    draw_chain_detail(frame, detail_area, app);
+    draw_chain_selector(frame, selector, app, chain_focused);
+    draw_chain_detail(frame, detail, app);
 }
 
 fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {

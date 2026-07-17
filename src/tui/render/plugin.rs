@@ -12,7 +12,7 @@
 //! title spinner only flickers while the cached `claude --version` is probed.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
@@ -21,18 +21,18 @@ use ratatui::widgets::{Block, Paragraph};
 use super::super::app::{App, Health, PluginFocus};
 use super::super::theme;
 use super::format::spinner_frame;
-use super::panes::{draw_scrollbar, empty_state, section_box, selector_width};
+use super::panes::{draw_scrollbar, empty_state, master_detail, section_box};
 use crate::format::truncate;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let [selector_area, detail_area] = Layout::horizontal([
-        Constraint::Length(selector_width(area.width)),
-        Constraint::Min(20),
-    ])
-    .areas(area);
+    // `master_detail` owns the selector|detail split: desktop uses upstream's
+    // house contract (`selector_width` + `Min(20)`), narrow terminals stack the
+    // panes instead of shrinking the detail to ~13 cells. Delegating keeps the
+    // 0.12.0 layout intent while preserving the fork's phone adaptation.
+    let (selector, detail) = master_detail(area, app.plugin.row_count());
 
-    draw_selector(frame, selector_area, app);
-    draw_detail(frame, detail_area, app);
+    draw_selector(frame, selector, app);
+    draw_detail(frame, detail, app);
 }
 
 // ── Left panel: checks + profiles selector ──────────────────────────────────────

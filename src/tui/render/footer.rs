@@ -229,6 +229,29 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         hints.push(("q", q_label));
     }
 
+    // Measured degradation for narrow terminals: while the row overflows, drop
+    // the rightmost non-essential hint. Navigation (`←→`), discoverability
+    // (`? help`), exits (`q`/`esc`) and armed confirms always survive; on a
+    // desktop-width terminal everything fits and nothing changes.
+    let row_width = |hints: &[(&str, &str)]| -> usize {
+        let cells: usize = hints
+            .iter()
+            .map(|(k, l)| k.chars().count() + 1 + l.chars().count())
+            .sum();
+        cells + hints.len().saturating_sub(1) * 3
+    };
+    let essential = |(key, label): &(&str, &str)| {
+        matches!(*key, "←→" | "?" | "q" | "esc") || label.starts_with("confirm")
+    };
+    while row_width(&hints) > area.width as usize {
+        match hints.iter().rposition(|h| !essential(h)) {
+            Some(i) => {
+                hints.remove(i);
+            }
+            None => break,
+        }
+    }
+
     let mut spans: Vec<Span<'_>> = Vec::new();
     for (i, (key, label)) in hints.iter().enumerate() {
         if i > 0 {

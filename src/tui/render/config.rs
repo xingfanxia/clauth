@@ -5,7 +5,7 @@
 //! pane into a create form. No popups.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -16,8 +16,8 @@ use super::super::app::{
 use super::super::theme;
 use super::panes::{
     active_pill, cycle_option, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
-    key_cell, label_style, name_color, picker_row, section_box, section_box_verbatim,
-    selector_width,
+    key_cell, label_style, master_detail, name_color, picker_row, section_box,
+    section_box_verbatim,
 };
 
 const KEY_W: usize = 11;
@@ -25,15 +25,15 @@ const KEY_W: usize = 11;
 const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let [selector_area, settings_area] = Layout::horizontal([
-        Constraint::Length(selector_width(area.width)),
-        Constraint::Min(20),
-    ])
-    .areas(area);
+    // +1 for the trailing `+ new` picker row. `master_detail` keeps upstream's
+    // desktop selector|detail split (`selector_width` + `Constraint::Min(20)`)
+    // and adds the fork's narrow-terminal (phone) stacking on top.
+    let items = app.config().profiles.len() + 1;
+    let (selector, settings) = master_detail(area, items);
 
     let profiles_focused = app.config_focus == ConfigFocus::Profiles;
-    draw_selector(frame, selector_area, app, profiles_focused);
-    draw_settings(frame, settings_area, app);
+    draw_selector(frame, selector, app, profiles_focused);
+    draw_settings(frame, settings, app);
 }
 
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
@@ -96,6 +96,10 @@ struct Snap {
     captured: bool,
     /// Recognised third-party provider display name, if any.
     provider: Option<&'static str>,
+    /// The account email this profile's login last authenticated as (identity
+    /// anchor's email half) — shows WHICH account the stored credentials
+    /// belong to, so a wrong-account capture is visible at a glance.
+    account_email: Option<String>,
 }
 
 impl Snap {
@@ -118,6 +122,7 @@ impl Snap {
             login_is_oauth: true,
             captured: false,
             provider: None,
+            account_email: None,
         }
     }
 }
@@ -171,6 +176,12 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             login_is_oauth: p.login_is_oauth(),
             captured: false,
             provider: p.provider.map(|p| p.display_name()),
+            // One tiny cached-file read, cursor profile only — login/daemon
+            // keep it current; the OS page cache makes the per-frame cost nil.
+            account_email: crate::profile_cache::load_profile_cache::<String>(
+                p.name.as_str(),
+                crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
+            ),
         },
         None => Snap::blank("settings"),
     }
@@ -247,11 +258,28 @@ fn draw_settings_rows(
         ]));
     }
 
+    // Account row — the email the stored OAuth login belongs to (the identity
+    // anchor's readable half), so which-account-is-this never needs forensics.
+    // OAuth-only; absent until a login or the /profile fetch seeds it.
+    let account_email = if is_api {
+        None
+    } else {
+        snap.account_email.as_deref()
+    };
+    if let Some(email) = account_email {
+        lines.push(Line::from(vec![
+            Span::styled(format!("account{}", " ".repeat(KEY_W - 7)), theme::label()),
+            Span::styled(email.to_string(), theme::dim()),
+        ]));
+    }
+
     lines.push(Line::from(""));
     // Tracks the absolute line index + buffer + row of the active edit row for
-    // cursor placement after rendering. `lines` starts with [type (, provider), blank].
+    // cursor placement after rendering. `lines` starts with
+    // [type (, provider) (, account), blank].
     let mut edit_caret: Option<(u16, InputState, ConfigRow)> = None;
-    let mut line_idx: u16 = if provider_label.is_some() { 3 } else { 2 };
+    let mut line_idx: u16 =
+        2 + u16::from(provider_label.is_some()) + u16::from(account_email.is_some());
 
     for (i, row) in rows.iter().enumerate() {
         let selected = actions_focused && i == cursor;
