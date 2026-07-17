@@ -1174,6 +1174,67 @@ fn spend_room_refuses_when_used_is_unknown() {
     assert_eq!(spend_room(&unknown, 20.0), None);
 }
 
+// Two members with budget must not ping-pong. Once the chain is paying on one,
+// every free-quota member has already been passed over, so hopping to the other
+// paying member buys nothing and relinks live credentials every tick. Same loop
+// guard `last_resort` carries, for the same reason.
+#[test]
+fn next_target_does_not_hop_between_two_spend_armed_members() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+            spend_member("c", 20.0, 0.0, Some(50.0)),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "b is paying and still within budget: hopping to c gains nothing"
+    );
+
+    // A member with FREE quota still wins, though — the guard must not strand
+    // the chain on a paying account when someone can serve for nothing.
+    config.profiles[2] = profile_with_util("c", Some(95.0), Some(10.0));
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string())),
+        "free quota always beats staying on a paying active"
+    );
+}
+
+#[test]
+fn auto_switch_does_not_hop_between_two_spend_armed_members() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+            spend_member("c", 20.0, 0.0, Some(50.0)),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "the scheduler must hold the same loop guard as the UI twin"
+    );
+}
+
 // ── spend budget: the ceiling is a CAP, not just an entry gate ──────────────
 
 // The walk skips the ACTIVE member in every pass, so nothing re-checks a

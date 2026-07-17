@@ -588,6 +588,24 @@ pub(crate) fn next_target(
     // those stop work outright, and an operator who set a ceiling asked to keep
     // working. Opt-in twice over (see `spend_armed`), so stock chains skip this.
     let spend_budget = config.state.spend_budget_switching;
+
+    // An active that is ITSELF still within budget stays put — the same loop
+    // guard `last_resort` needs, for the same reason: hopping between two paying
+    // members buys nothing and relinks live credentials every tick. Everything
+    // with free quota was already passed over above, so the choice here is only
+    // "which account to pay", and the one already installed wins. An OVER-budget
+    // active isn't armed, so it falls through to the halt gate below instead of
+    // parking here.
+    let active_is_spend_armed = config.find(active).is_some_and(|p| {
+        spend_armed(
+            p.usage.as_ref(),
+            spend_budget,
+            p.max_auto_spend.unwrap_or(0.0),
+        )
+    });
+    if active_is_spend_armed {
+        return None;
+    }
     if let Some(name) = walk(&|p| {
         spend_armed(
             p.usage.as_ref(),
@@ -736,6 +754,15 @@ pub(crate) fn next_auto_switch_target(
 
     // Spend-armed pass, lockstep with [`next_target`]: pre-last-resort, and the
     // spend block rides the store's `UsageInfo` exactly like utilization does.
+    // Same loop guard — an active still within budget stays put rather than
+    // ping-ponging between two paying members.
+    let active_is_spend_armed = store
+        .lock()
+        .ok()
+        .is_some_and(|s| spend_armed(s.get(&active.name), snapshot.spend_budget, active.max_spend));
+    if active_is_spend_armed {
+        return None;
+    }
     if let Some(name) = walk(&|m| {
         store
             .lock()
