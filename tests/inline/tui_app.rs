@@ -2509,6 +2509,100 @@ fn fallback_threshold_plus_minus_still_nudge_both_ways() {
     );
 }
 
+// ── fallback max auto-spend (real money) ────────────────────────────────────
+
+/// Read the row's position rather than hardcoding it, so inserting a row above
+/// it can't silently point these tests at a different field.
+fn max_spend_row() -> usize {
+    super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::MaxSpend)
+        .expect("max spend row exists")
+}
+
+// `inf` and `nan` parse as perfectly good `f64`s, so a ceiling editor that only
+// checked `>= 0.0` would accept "inf" and hand the chain an unbounded budget
+// (`fallback::spend_room`). The typed editor is one of the two ways a ceiling
+// reaches disk, so it refuses them at the keyboard, exactly like the config
+// loader does for a hand-edited file.
+#[test]
+fn parse_max_spend_refuses_non_finite_and_negative() {
+    assert_eq!(super::parse_max_spend("12.5"), Some(12.5));
+    assert_eq!(super::parse_max_spend("0"), Some(0.0));
+    assert_eq!(super::parse_max_spend("inf"), None);
+    assert_eq!(super::parse_max_spend("-inf"), None);
+    assert_eq!(super::parse_max_spend("NaN"), None);
+    assert_eq!(super::parse_max_spend("-5"), None);
+    assert_eq!(super::parse_max_spend("free"), None);
+}
+
+#[test]
+fn fallback_max_spend_editor_types_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = max_spend_row();
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.max_auto_spend),
+        None,
+        "unset is the never-spend default"
+    );
+
+    // ⏎ opens the editor seeded with the current ceiling.
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_max_spend_draft.is_some(), "⏎ opens the field");
+
+    // The field opens seeded with the current ceiling ("0.00"), so clear it
+    // before typing or the digits append to it.
+    for _ in 0..4 {
+        super::handle_key(&mut app, key(KeyCode::Backspace));
+    }
+    for c in ['2', '5'] {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_max_spend_draft.is_none(), "⏎ closes the field");
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.max_auto_spend),
+        Some(25.0),
+        "the typed ceiling persists"
+    );
+}
+
+// A rejected value keeps the field open rather than toasting — the same
+// no-toast treatment `rotate at` uses — so the inline invalid styling stays on
+// screen until corrected, and nothing is written.
+#[test]
+fn fallback_max_spend_editor_refuses_an_infinite_ceiling() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = max_spend_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    // Seeded with "0.00"; clear it, then type the trap.
+    for _ in 0..4 {
+        super::handle_key(&mut app, key(KeyCode::Backspace));
+    }
+    for c in ['i', 'n', 'f'] {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.fallback_max_spend_draft.is_some(),
+        "an invalid ceiling keeps the field open"
+    );
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.max_auto_spend),
+        None,
+        "an infinite ceiling must never reach disk"
+    );
+}
+
 // ── fallback last-resort toggle (issue #8 follow-up) ─────────────────────────
 //
 // Space/⏎ on the `last resort` row flips `Profile::last_resort` and persists

@@ -16,7 +16,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ChainItemKind, FALLBACK_ROWS, FallbackFocus, FallbackRow, InputState, chain_candidates,
-    chain_items, parse_threshold,
+    chain_items, parse_max_spend, parse_threshold,
 };
 use super::super::theme;
 use super::panes::{
@@ -132,6 +132,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 app.fallback_detail_cursor,
                 app.fallback_armed_remove,
                 app.fallback_threshold_draft.as_ref(),
+                app.fallback_max_spend_draft.as_ref(),
                 inner_w,
             );
             (name, true, lines)
@@ -182,6 +183,7 @@ fn member_detail(
     row_cursor: usize,
     armed_remove: bool,
     editing: Option<&InputState>,
+    max_spend_editing: Option<&InputState>,
     width: usize,
 ) -> Vec<Line<'static>> {
     let Some(profile) = cfg.find(name) else {
@@ -236,16 +238,17 @@ fn member_detail(
 
     for (i, row) in FALLBACK_ROWS.iter().enumerate() {
         let selected = focused && i == cursor;
-        let row_editing = if *row == FallbackRow::Threshold {
-            editing
-        } else {
-            None
+        let row_editing = match *row {
+            FallbackRow::Threshold => editing,
+            FallbackRow::MaxSpend => max_spend_editing,
+            _ => None,
         };
         let line = detail_row(
             *row,
             selected,
             threshold,
             profile.last_resort,
+            profile.max_auto_spend.unwrap_or(0.0),
             armed_remove,
             row_editing,
         );
@@ -272,6 +275,21 @@ fn member_detail(
                 &last_resort_hint(cfg, name, profile.last_resort),
                 width,
             ));
+        }
+        // `max spend` mirrors `rotate at`: a range tooltip while typing, else a
+        // hint naming the state the current value produces. The hint calls out
+        // the OTHER half of the opt-in when it is the one holding spending
+        // back — a ceiling with the chain toggle off does nothing, and silently
+        // doing nothing is exactly what an operator would misread as armed.
+        if *row == FallbackRow::MaxSpend {
+            match row_editing {
+                Some(input) => lines.extend(max_spend_range_tooltip(input, width)),
+                None if selected => lines.extend(help_tooltip_lines(
+                    &max_spend_hint(cfg, profile.max_auto_spend.unwrap_or(0.0)),
+                    width,
+                )),
+                None => {}
+            }
         }
     }
 
@@ -318,11 +336,40 @@ fn threshold_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
     }
 }
 
+/// Sub-line under the `max spend` field while typing — the ceiling twin of
+/// [`threshold_range_tooltip`]. `inf` parses as a float, so the rejection is a
+/// money guard, not input hygiene (see `app::parse_max_spend`).
+fn max_spend_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
+    let range = "dollars, 0 = off";
+    if parse_max_spend(input.trimmed()).is_none() {
+        invalid_tooltip_lines(range, width)
+    } else {
+        help_tooltip_lines(range, width)
+    }
+}
+
+/// Hint under the `max spend` field, naming whichever half of the opt-in is
+/// currently holding spending back. Both are required, so a ceiling alone reads
+/// as armed while doing nothing — that is the reading this line exists to stop.
+fn max_spend_hint(cfg: &AppConfig, ceiling: f64) -> String {
+    match (cfg.state.spend_budget_switching, ceiling > 0.0) {
+        (true, true) => {
+            format!("may spend up to ${ceiling:.2} here once every account is spent")
+        }
+        (false, true) => {
+            "ignored: turn on `spend budget` in the config tab to allow spending".to_string()
+        }
+        (true, false) => "never spends here; type a ceiling to allow it".to_string(),
+        (false, false) => "never spends here".to_string(),
+    }
+}
+
 fn detail_row(
     row: FallbackRow,
     selected: bool,
     threshold: f64,
     last_resort: bool,
+    max_spend: f64,
     armed_remove: bool,
     editing: Option<&InputState>,
 ) -> Line<'static> {
@@ -384,6 +431,39 @@ fn detail_row(
                 ),
                 Span::styled(value, style),
             ])
+        }
+        FallbackRow::MaxSpend => {
+            let mut spans = vec![
+                arrow,
+                Span::styled(
+                    key_cell("max spend", KEY_W, KEY_GUTTER),
+                    label_style(selected),
+                ),
+            ];
+            match editing {
+                Some(input) => {
+                    let invalid = parse_max_spend(input.trimmed()).is_none();
+                    // `$` leads the field here rather than trailing as a unit —
+                    // the caret parks at the buffer end, so a trailing symbol
+                    // would sit behind it.
+                    spans.push(Span::styled(
+                        "$",
+                        if invalid {
+                            theme::danger()
+                        } else {
+                            theme::faint()
+                        },
+                    ));
+                    spans.extend(value_caret(input, invalid));
+                }
+                None if max_spend > 0.0 => {
+                    spans.push(Span::styled(format!("${max_spend:.2}"), theme::accent()));
+                }
+                // $0 is the never-spend default, so it reads as off rather than
+                // as a number the operator chose.
+                None => spans.push(Span::styled("off", theme::faint())),
+            }
+            Line::from(spans)
         }
         FallbackRow::Remove => {
             let label = if armed_remove {

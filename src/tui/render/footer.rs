@@ -197,6 +197,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ("a", "actions"),
                 ("?", "help"),
             ],
+            FallbackHint::DetailMaxSpend => &[
+                ("↑↓", "row"),
+                ("↵", "type"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
+            FallbackHint::DetailMaxSpendEdit => {
+                &[("↵", "save"), ("←→", "caret"), ("esc", "cancel")]
+            }
             FallbackHint::DetailRemove => &[
                 ("↑↓", "row"),
                 ("↵", "remove"),
@@ -211,13 +220,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     // Suppress the trailing `q` hint only where `q` is fully captured by the
-    // screen (threshold edit / armed-remove / refresh-interval edit own the
-    // keyboard entirely). Every other sub-focus shows `q back` via `q_label`
-    // per the cloudy-tui contract.
+    // screen (threshold edit / max-spend edit / armed-remove / refresh-interval
+    // edit own the keyboard entirely). Every other sub-focus shows `q back` via
+    // `q_label` per the cloudy-tui contract.
     let show_q = !((app.tab == Tab::Fallback
         && matches!(
             fallback_hint(app),
-            FallbackHint::DetailThresholdEdit | FallbackHint::DetailRemoveArmed
+            FallbackHint::DetailThresholdEdit
+                | FallbackHint::DetailMaxSpendEdit
+                | FallbackHint::DetailRemoveArmed
         ))
         || (app.tab == Tab::Config && app.refresh_interval_draft.is_some()));
 

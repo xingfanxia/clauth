@@ -166,6 +166,11 @@ impl InputState {
 pub(crate) enum FallbackRow {
     Threshold,
     LastResort,
+    /// Dollar ceiling on what the chain may spend of this member's
+    /// pay-as-you-go budget unattended (`Profile::max_auto_spend`, $0 default).
+    /// Inert unless `AppState::spend_budget_switching` is also on — see
+    /// `fallback::spend_room`. ⏎ opens an inline editor.
+    MaxSpend,
     Remove,
 }
 
@@ -584,6 +589,7 @@ pub(crate) enum ActionMenuAction {
     // Fallback detail
     EditThreshold,
     ToggleLastResort,
+    EditMaxSpend,
     RemoveMember,
     // Config detail actions (proxied through run_config_row)
     ToggleAutoStart,
@@ -688,6 +694,7 @@ impl ActionMenuAction {
             Self::ReorderDown => "reorder down",
             Self::EditThreshold => "edit threshold",
             Self::ToggleLastResort => "toggle last resort",
+            Self::EditMaxSpend => "edit max auto-spend",
             Self::RemoveMember => "remove member",
             Self::ToggleAutoStart => "toggle auto-start",
             Self::DeleteProfile => "delete profile",
@@ -1265,6 +1272,9 @@ pub(crate) struct App {
     /// `Some` while the threshold field is open (⏎ opens, owns keyboard).
     /// `+`/`-` still step the value when `None`.
     pub(crate) fallback_threshold_draft: Option<InputState>,
+    /// In-flight value for the member's `max auto-spend` field (`None` = not
+    /// editing). Same lifecycle as `fallback_threshold_draft`.
+    pub(crate) fallback_max_spend_draft: Option<InputState>,
     /// Cursor into [`GLOBAL_CONFIG_ROWS`] on the program-wide Config tab.
     pub(crate) global_config_cursor: usize,
     /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
@@ -1585,6 +1595,7 @@ impl App {
             fallback_detail_cursor: 0,
             fallback_armed_remove: false,
             fallback_threshold_draft: None,
+            fallback_max_spend_draft: None,
             global_config_cursor: 0,
             refresh_interval_draft: None,
             weekly_threshold_draft: None,
@@ -2267,6 +2278,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         && app.fallback_threshold_draft.is_some()
     {
         handle_fallback_threshold_edit_key(app, key);
+        return;
+    }
+
+    // Same for the `max auto-spend` editor.
+    if app.tab == Tab::Fallback
+        && app.fallback_focus == FallbackFocus::Detail
+        && app.fallback_max_spend_draft.is_some()
+    {
+        handle_fallback_max_spend_edit_key(app, key);
         return;
     }
 
@@ -3437,9 +3457,10 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
 }
 
 /// Detail rows for a chain member: threshold stepper, last-resort toggle, remove.
-pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 4] = [
     FallbackRow::Threshold,
     FallbackRow::LastResort,
+    FallbackRow::MaxSpend,
     FallbackRow::Remove,
 ];
 
@@ -3542,6 +3563,8 @@ pub(crate) enum FallbackHint {
     DetailThreshold,
     DetailThresholdEdit,
     DetailLastResort,
+    DetailMaxSpend,
+    DetailMaxSpendEdit,
     DetailRemove,
     DetailRemoveArmed,
     DetailAdd,
@@ -3564,10 +3587,14 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
             if app.fallback_threshold_draft.is_some() {
                 return FallbackHint::DetailThresholdEdit;
             }
+            if app.fallback_max_spend_draft.is_some() {
+                return FallbackHint::DetailMaxSpendEdit;
+            }
             let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
             match FALLBACK_ROWS[cursor] {
                 FallbackRow::Threshold => FallbackHint::DetailThreshold,
                 FallbackRow::LastResort => FallbackHint::DetailLastResort,
+                FallbackRow::MaxSpend => FallbackHint::DetailMaxSpend,
                 FallbackRow::Remove if app.fallback_armed_remove => FallbackHint::DetailRemoveArmed,
                 FallbackRow::Remove => FallbackHint::DetailRemove,
             }
@@ -4048,6 +4075,11 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
             }
         }
         FallbackRow::LastResort => toggle_last_resort(app),
+        FallbackRow::MaxSpend => {
+            if let Some(current) = selected_max_spend(app) {
+                app.fallback_max_spend_draft = Some(InputState::new(&format!("{current:.2}")));
+            }
+        }
         FallbackRow::Remove => {
             if app.fallback_armed_remove {
                 remove_chain_member(app);
@@ -4091,6 +4123,75 @@ pub(crate) fn parse_threshold(raw: &str) -> Option<f64> {
     raw.parse::<f64>()
         .ok()
         .filter(|v| (0.0..=100.0).contains(v))
+}
+
+/// Keystrokes while the `max auto-spend` field is open: ⏎ saves, ⎋ discards.
+fn handle_fallback_max_spend_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.fallback_max_spend_draft = None,
+        KeyCode::Enter => commit_max_spend_edit(app),
+        _ => {
+            if let Some(input) = app.fallback_max_spend_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// Parse and persist the typed ceiling. Invalid input keeps the draft open, the
+/// same no-toast treatment the threshold editor uses.
+fn commit_max_spend_edit(app: &mut App) {
+    let Some(raw) = app.fallback_max_spend_draft.as_ref().map(|i| i.trimmed()) else {
+        return;
+    };
+    let Some(value) = parse_max_spend(raw) else {
+        return;
+    };
+    write_max_spend(app, value);
+    app.fallback_max_spend_draft = None;
+}
+
+/// A typed ceiling is valid only as a finite, non-negative number of dollars.
+/// `is_finite` is the load-bearing half: `"inf"` parses as a perfectly good
+/// `f64`, and an infinite ceiling means unbounded unattended spending
+/// (`fallback::spend_room`). Shared by the commit path and the detail card's
+/// inline Invalid-input check.
+pub(crate) fn parse_max_spend(raw: &str) -> Option<f64> {
+    raw.parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// This member's ceiling in dollars, or `None` on `+ add`. Unset reads as $0 —
+/// the never-spend default.
+fn selected_max_spend(app: &App) -> Option<f64> {
+    let pos = selected_chain_member(app)?;
+    let cfg = app.config();
+    let name = cfg.state.fallback_chain.get(pos)?;
+    Some(cfg.find(name).and_then(|p| p.max_auto_spend).unwrap_or(0.0))
+}
+
+/// Write the ceiling for the selected member and persist.
+fn write_max_spend(app: &mut App, value: f64) {
+    let Some(pos) = selected_chain_member(app) else {
+        return;
+    };
+    let save_err = {
+        let mut cfg = app.config();
+        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
+            return;
+        };
+        match cfg.find_mut(&name) {
+            Some(profile) => {
+                profile.max_auto_spend = Some(value);
+                save_profile(profile).err()
+            }
+            None => None,
+        }
+    };
+    if let Some(e) = save_err {
+        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+    }
 }
 
 /// Effective threshold for the selected member, or `None` on `+ add`.
@@ -4383,6 +4484,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                     match row {
                         FallbackRow::Threshold => actions.push(EditThreshold),
                         FallbackRow::LastResort => actions.push(ToggleLastResort),
+                        FallbackRow::MaxSpend => actions.push(EditMaxSpend),
                         FallbackRow::Remove => actions.push(RemoveMember),
                     }
                 }
@@ -4527,6 +4629,9 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         }
         ActionMenuAction::ToggleLastResort => {
             run_fallback_row(app, FallbackRow::LastResort);
+        }
+        ActionMenuAction::EditMaxSpend => {
+            run_fallback_row(app, FallbackRow::MaxSpend);
         }
         ActionMenuAction::RemoveMember => {
             run_fallback_row(app, FallbackRow::Remove);
