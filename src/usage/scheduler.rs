@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -146,9 +146,121 @@ pub(crate) type KickBlocks = Arc<RankedMutex<HashMap<String, KickBlock>, rank::K
 /// Names pushed here after a successful token rotation bypass the cadence on the next tick.
 pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, rank::RefetchQueue>>;
 
-/// Auto-switch targets posted by the scheduler when the active profile crosses its threshold.
-/// Set (not Vec) so duplicate enqueues collapse. Drained by `on_tick`, which dispatches a switch worker.
-pub(crate) type PendingSwitch = Arc<RankedMutex<HashSet<String>, rank::PendingSwitch>>;
+/// Who queued a pending switch. Determines drain precedence: an operator's
+/// explicit `User` choice outranks the scheduler's `Scheduler` auto-switch and
+/// clears any queued auto-target — the user's tap must never be silently
+/// overridden by a same-tick threshold crossing (TECH-6, finding #4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    User,
+    Scheduler,
+}
+
+/// One queued switch request. Ordered (FIFO) in the [`PendingSwitch`] queue with
+/// a per-entry retry deadline: a request that can't execute yet (target mid-fetch,
+/// active diverged-unsaved, transient refresh failure) is RE-QUEUED until it lands
+/// or `retry_until` passes — not dropped after one attempt (TECH-6, finding #4:
+/// a user switch during a fetch window used to evaporate after the `{ok:true}` ack).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingSwitchEntry {
+    pub(crate) target: String,
+    pub(crate) origin: Origin,
+    /// The target's harness at enqueue time (CDX-4 §0.15). The queue's gates
+    /// are HARNESS-SCOPED — the two active slots are independent (§0.1), so a
+    /// stuck claude switch must never block a codex rotation or vice versa:
+    /// enqueue precedence, the scans' skip-while-pending, and the drain's
+    /// winner selection each consider only same-harness entries.
+    pub(crate) harness: crate::profile::Harness,
+    /// Epoch-ms after which a still-unexecutable entry is dropped (with a
+    /// `last_error`) instead of retried forever. Set once at first enqueue and
+    /// preserved across re-queues, so the retry window is bounded from the ack.
+    pub(crate) retry_until: u64,
+}
+
+/// Retry window for a queued switch that can't execute yet. Generous enough to
+/// outlast a slow usage fetch (the common "target busy" cause), bounded so a
+/// permanently-stuck target can't linger as a zombie retry forever.
+pub(crate) const PENDING_SWITCH_RETRY_TTL_MS: u64 = 120_000;
+
+/// Auto-switch / user-switch targets, drained by the daemon's `tick` (or the TUI's
+/// `on_tick`). Ordered `VecDeque` (not a `Set`) so drain order is deterministic and
+/// last-writer-wins is well-defined; [`enqueue_pending_switch`] enforces Origin
+/// precedence and dedup on the way in.
+pub(crate) type PendingSwitch = Arc<RankedMutex<VecDeque<PendingSwitchEntry>, rank::PendingSwitch>>;
+
+/// Enqueue `target` with `origin`, honoring Origin precedence and deduping —
+/// all HARNESS-SCOPED (CDX-4 §0.15: the two slots are independent):
+/// - A `User` request supersedes the operator's prior intent AND any queued
+///   `Scheduler` target OF THE SAME HARNESS — those entries are cleared first
+///   (last-writer-wins), so a tap always wins a race with a same-tick
+///   auto-switch, while the other harness's queued intent survives.
+/// - A `Scheduler` request is a no-op when a same-harness entry is queued
+///   (the level-triggered scan re-fires; it never stacks behind a choice).
+/// - Either way, a target already queued is not doubled.
+pub(crate) fn enqueue_pending_switch(
+    queue: &mut VecDeque<PendingSwitchEntry>,
+    target: String,
+    harness: crate::profile::Harness,
+    origin: Origin,
+    now_ms: u64,
+) {
+    match origin {
+        Origin::User => queue.retain(|e| e.harness != harness),
+        Origin::Scheduler => {
+            if queue.iter().any(|e| e.harness == harness) {
+                return;
+            }
+        }
+    }
+    if queue.iter().any(|e| e.target == target) {
+        return;
+    }
+    queue.push_back(PendingSwitchEntry {
+        target,
+        origin,
+        harness,
+        retry_until: now_ms.saturating_add(PENDING_SWITCH_RETRY_TTL_MS),
+    });
+}
+
+/// Pick the single target to attempt from a drained queue: `User` outranks
+/// `Scheduler`, and within an origin class the LAST enqueued wins (last-writer-
+/// wins). Every other entry is superseded. `None` when the queue was empty. Pure
+/// so the precedence is unit-testable without a live daemon. (Queue-wide — the
+/// status.json `pending_switch` peek; the drain uses the per-harness form.)
+pub(crate) fn select_switch_winner(
+    entries: &VecDeque<PendingSwitchEntry>,
+) -> Option<PendingSwitchEntry> {
+    entries
+        .iter()
+        .rfind(|e| e.origin == Origin::User)
+        .or_else(|| entries.iter().rfind(|e| e.origin == Origin::Scheduler))
+        .cloned()
+}
+
+/// [`select_switch_winner`] restricted to one harness's entries — the drain
+/// services (at most) one winner PER HARNESS per round, so a deferred claude
+/// switch and a codex rotation proceed independently (CDX-4 §0.15).
+pub(crate) fn select_switch_winner_for(
+    entries: &VecDeque<PendingSwitchEntry>,
+    harness: crate::profile::Harness,
+) -> Option<PendingSwitchEntry> {
+    let scoped: VecDeque<PendingSwitchEntry> = entries
+        .iter()
+        .filter(|e| e.harness == harness)
+        .cloned()
+        .collect();
+    select_switch_winner(&scoped)
+}
+
+/// Whether any queued entry targets `harness` — the scans' skip-while-pending
+/// gate, harness-scoped so one slot's pending decision never wedges the other.
+pub(crate) fn pending_for_harness(
+    entries: &VecDeque<PendingSwitchEntry>,
+    harness: crate::profile::Harness,
+) -> bool {
+    entries.iter().any(|e| e.harness == harness)
+}
 
 /// Set true when wrap-off mode finds the entire chain exhausted (no sink below 100%).
 /// Drained by `on_tick` to turn off all accounts. Bool because switch-off is a global act.
@@ -439,9 +551,18 @@ fn rotation_bail_context(unmask_429: Option<Option<Duration>>) -> (FetchStatus, 
     }
 }
 
-/// Floor (ms) for [`active_rotate_lead_ms`] — even on a very short refresh
-/// interval, leave a couple of minutes of margin.
-const ACTIVE_ROTATE_LEAD_FLOOR_MS: i64 = 180_000;
+/// Floor (ms) for [`active_rotate_lead_ms`]: 15 minutes — deliberately larger
+/// than upstream's 3 (fork divergence). Claude Code refreshes with its OWN
+/// ahead-of-expiry margin (~5 min observed), so a lead inside that margin
+/// still loses the race: on 2026-07-11T17:07Z the 4.5-min lead (interval*3 at
+/// 90 s) fired inside CC's window, spent an already-superseded refresh token,
+/// 400d with the store unchanged, and correctly-but-fatally quarantined the
+/// active account — whose fresh chain then lived only in the unreadable
+/// Keychain and was orphaned by the walk-away switch (= the "re-login every
+/// other day" complaint). At 15 min clauth rotates decisively first and stays
+/// the chain's last writer; adoption still backstops a CC that someday
+/// refreshes even earlier.
+const ACTIVE_ROTATE_LEAD_FLOOR_MS: i64 = 900_000;
 
 /// How early the poller rotates the ACTIVE, Keychain-installed profile ahead
 /// of its clock expiry — only with the opt-in `preemptive_rotation` toggle
@@ -466,14 +587,18 @@ fn active_rotate_lead_ms(interval_ms: u64) -> i64 {
 /// 401: only with the opt-in `preemptive_rotation` toggle (`enabled`, off by
 /// default — stock behavior stays strictly lazy; adoption + mirror-on-rotate
 /// carry the correctness, this is an optimization), only for the ACTIVE
-/// profile, only while the Keychain mirror is live (elsewhere the live
-/// credential IS the profile file via the symlink, so there is no second
-/// chain to race), and only inside the lead window. An unknown expiry never
-/// rotates proactively (never spend a single-use refresh on a token whose
-/// expiry we can't prove).
+/// profile, only while its live login has NOT diverged (RESCUE-2c — the same
+/// skip `oauth::rotation_candidates` applies: a preemptive spend is never
+/// forced by a dead token, and rotating under divergence just leaks a refresh
+/// chain nobody installs), only while the Keychain mirror is live (elsewhere
+/// the live credential IS the profile file via the symlink, so there is no
+/// second chain to race), and only inside the lead window. An unknown expiry
+/// never rotates proactively (never spend a single-use refresh on a token
+/// whose expiry we can't prove).
 fn proactive_rotation_due(
     enabled: bool,
     active: bool,
+    active_diverged: bool,
     keychain_live: bool,
     access_expires_at: Option<i64>,
     now_ms: i64,
@@ -481,6 +606,7 @@ fn proactive_rotation_due(
 ) -> bool {
     enabled
         && active
+        && !active_diverged
         && keychain_live
         && access_expires_at.is_some_and(|exp| now_ms + active_rotate_lead_ms(interval_ms) >= exp)
 }
@@ -563,9 +689,17 @@ fn fetch_with_rotation(
             )
         })
         .unwrap_or((false, None, 90_000, false));
+    // The divergence input is resolved outside the config-lock window — it
+    // stats the live symlink, and the poll must never hold the lock.
+    let active_diverged = is_active
+        && matches!(
+            crate::claude::classify_credentials_link(name).ok(),
+            Some(crate::claude::LinkState::Diverged)
+        );
     let proactive = proactive_rotation_due(
         preemptive,
         is_active,
+        active_diverged,
         keychain_live(),
         access_expires_at,
         now_ms() as i64,
@@ -1439,6 +1573,12 @@ pub(crate) fn collect_third_party_entries(
     profiles
         .iter()
         .filter_map(|p| {
+            // CDX-1 invariant: codex profiles never enter an Anthropic fetch
+            // leg, even if one somehow carries an api_key (see the inline
+            // regression test).
+            if p.is_codex() {
+                return None;
+            }
             let api_key = p.api_key.clone()?;
             let target = if let Some(provider) = p.provider {
                 crate::providers::ThirdPartyTarget::Known(provider)
@@ -1465,6 +1605,12 @@ pub(crate) fn collect_tokens(config: &crate::profile::AppConfig) -> Vec<TokenEnt
         .profiles
         .iter()
         .filter_map(|p| {
+            // CDX-1 invariant: codex profiles never enter the OAuth fetch leg
+            // (their usage source is passive — CDX-2), even if one somehow
+            // carries claude-shaped credentials.
+            if p.is_codex() {
+                return None;
+            }
             let oauth = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
             Some(TokenEntry {
                 name: p.name.to_string(),
@@ -1838,6 +1984,23 @@ pub(crate) struct SchedulerState {
     /// Whether the previous tick stood down — transition edges get one log
     /// line each way, never a per-tick repeat.
     standdown_active: AtomicBool,
+    /// CDX-3 standby pacing: next full-scan stamp + per-profile transient
+    /// retry widening. Tick-thread-only state; a plain leaf mutex acquired
+    /// while holding nothing else (never nested — outside `lockorder` ranks).
+    codex_standby: std::sync::Mutex<CodexStandbyPacing>,
+}
+
+/// Pacing state for the CDX-3 standby scan — cheap in-memory throttles so the
+/// scan re-reads stored auth files at most every [`CODEX_STANDBY_SCAN_GAP_MS`]
+/// and a transiently-failing profile widens to [`CODEX_STANDBY_RETRY_MS`]
+/// instead of retrying every scan. Deliberately NOT persisted: the due
+/// predicate itself (`standby_due`, driven by the stored file's own exp +
+/// last_refresh) is the durable truth; losing pacing on restart costs one
+/// extra scan.
+#[derive(Default)]
+pub(super) struct CodexStandbyPacing {
+    next_scan_ms: u64,
+    retry_after_ms: HashMap<String, u64>,
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
@@ -1937,6 +2100,31 @@ fn tick(state: &SchedulerState) {
     let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
+    // CDX-2: the passive codex leg — a bounded local read of codex's own
+    // session logs for the ACTIVE codex profile, publishing through the same
+    // cache/store/status channels as a fetch outcome. No HTTP, no rotation,
+    // no streaks (a local read cannot 429). Lease-holder only, like the legs
+    // above; the standdown side hydrates from the cache this writes.
+    codex_passive_tick(
+        &state.config,
+        &state.store,
+        &state.status,
+        &state.last_fetched,
+        &forced,
+        interval_ms,
+    );
+
+    // CDX-3: standby keep-alive for parked codex chains (lease-holder only,
+    // like the legs above). Self-paced — the scan gate + due predicate make
+    // this a no-op on almost every tick.
+    codex_standby_tick(
+        &state.config,
+        &state.activity,
+        &state.codex_standby,
+        now_ms(),
+        &crate::codex::oauth::refresh,
+    );
+
     // Names actually scheduled this tick across both legs. A forced name absent
     // from both (e.g. a profile whose creds were removed between the UI `r` and
     // this tick) was marked Queued by `enqueue_refetch` but no worker owns it, so
@@ -1988,6 +2176,61 @@ fn tick(state: &SchedulerState) {
         &state.kick_blocks,
         &state.pending_switch,
     );
+
+    // CDX-4: the codex chain scan — session-boundary auto-switch off the
+    // passive signal. Harness-scoped queue gates keep it independent of the
+    // claude scans above (§0.15).
+    scan_codex_auto_switch(&state.config, &state.store, &state.pending_switch);
+}
+
+/// CDX-4 codex chain scan (PLAN.md §0.15): when the ACTIVE codex profile is
+/// exhausted (percent shape or the limiter's own verdict), enqueue a
+/// Scheduler-origin switch to the next viable codex chain member —
+/// `drain_codex_switch` applies it with Refuse-foreign + backoff semantics.
+/// The lease/loginless member facts are IO-derived, so they're filled AFTER
+/// the config lock drops (the `kick_rejected` pattern).
+pub(super) fn scan_codex_auto_switch(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    pending_switch: &PendingSwitch,
+) {
+    {
+        // Skip while a CODEX decision is pending — a queued claude switch
+        // must never wedge this scan (harness-scoped independence, §0.1).
+        let Ok(p) = pending_switch.lock() else { return };
+        if pending_for_harness(&p, crate::profile::Harness::Codex) {
+            return;
+        }
+    }
+    let snapshot = {
+        let cfg = match config.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        crate::fallback::snapshot_codex_chain(&cfg)
+    };
+    let Some(mut snapshot) = snapshot else {
+        return;
+    };
+    for m in &snapshot.chain {
+        if crate::runtime::has_live_codex_session(&m.name) {
+            snapshot.leased.push(m.name.clone());
+        }
+        if !matches!(crate::codex::read_profile_auth(&m.name), Ok(Some(_))) {
+            snapshot.loginless.push(m.name.clone());
+        }
+    }
+    if let Some(name) = crate::fallback::next_codex_auto_switch_target(&snapshot, store)
+        && let Ok(mut p) = pending_switch.lock()
+    {
+        enqueue_pending_switch(
+            &mut p,
+            name,
+            crate::profile::Harness::Codex,
+            Origin::Scheduler,
+            now_ms(),
+        );
+    }
 }
 
 /// Log a stand-down / lease-acquired transition. Either the TUI or the daemon
@@ -1999,7 +2242,323 @@ fn standdown_transition_log(msg: &str) {
     logline!("{msg}");
 }
 
-/// One scheduler tick while a live daemon owns the loop. The daemon
+/// CDX-2 passive codex leg. Reads the newest rate-limit snapshot from codex's
+/// session logs and publishes it for the ACTIVE codex profile exactly like
+/// `apply_outcome` publishes a fetch body: usage cache + store + status +
+/// `last_fetched` cadence stamp — so TUI bars, status.json windows, and the
+/// standdown hydrate light up with no extra plumbing. Inactive codex profiles
+/// keep their last cached numbers (their logs stop moving the moment they
+/// leave the live slot; `resets_at` lapse is the same display/walk logic the
+/// claude side already applies).
+///
+/// Attribution (PLAN.md §0.8.2): a snapshot publishes only when its event
+/// timestamp is not older than the live auth.json mtime — events from before
+/// the last account change are never attributed to the current profile. The
+/// snapshot is read BEFORE the mtime, so a concurrent switch can only reject
+/// a valid event (conservative miss), never attribute a pre-switch one.
+/// Known residual (accepted): an out-of-band `codex login` to a different
+/// account can skew one interval's attribution until the daemon's follow
+/// tick re-syncs the marker — inherent to identity-less session logs, and
+/// self-healing within a tick.
+pub(super) fn codex_passive_tick(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &StatusStore,
+    last_fetched: &LastFetchedAt,
+    forced: &HashSet<String>,
+    interval_ms: u64,
+) {
+    let active = {
+        let Ok(cfg) = config.lock() else { return };
+        let Some(name) = cfg.state.active_codex_profile.as_deref() else {
+            return;
+        };
+        // The marker names a claude/deleted profile only on hand-edited
+        // state; treat that as "no active codex profile" rather than reading
+        // logs on its behalf.
+        if !cfg.find(name).is_some_and(|p| p.is_codex()) {
+            return;
+        }
+        name.to_string()
+    };
+
+    // CDX-5 §1.7: while the proxy is actively serving, ITS per-account header
+    // feed is the sole codex usage writer — the identity-less JSONL leg would
+    // misattribute a post-rotation account's counters to the active profile.
+    // Stand down until the heartbeat goes stale (proxy stopped).
+    if crate::proxy::proxy_active(interval_ms) {
+        return;
+    }
+
+    let now = EpochMs::from_millis(now_ms());
+    let due = forced.contains(&active)
+        || last_fetched
+            .lock()
+            .ok()
+            .is_none_or(|lf| lf.get(&active).is_none_or(|t| now >= *t));
+    if !due {
+        return;
+    }
+
+    match crate::codex::usage::read_latest_snapshot() {
+        crate::codex::usage::SnapshotOutcome::Snapshot(snap)
+            if crate::codex::usage::attributable(
+                snap.snapshot_at_ms,
+                crate::codex::usage::live_auth_mtime_ms(),
+            ) =>
+        {
+            write_profile_cache(&active, USAGE_CACHE_FILE, &snap.info);
+            if let Ok(mut s) = store.lock() {
+                s.insert(active.clone(), snap.info);
+            }
+            if let Ok(mut lf) = last_fetched.lock() {
+                lf.insert(
+                    active.clone(),
+                    now.saturating_add(IntervalMs::from_millis(interval_ms)),
+                );
+                if let Ok(mut st) = status.lock() {
+                    st.insert(active.clone(), FetchStatus::Fresh);
+                }
+            }
+        }
+        outcome => {
+            // Missing/NoData/unattributable/error: keep whatever the cache
+            // holds and retry next interval. Only a real IO error is worth a
+            // line (a machine without codex sessions is a quiet state).
+            if let crate::codex::usage::SnapshotOutcome::Error(e) = outcome {
+                logline!("clauth: codex passive usage read failed: {e}");
+            }
+            if let Ok(mut lf) = last_fetched.lock() {
+                lf.insert(
+                    active.clone(),
+                    now.saturating_add(IntervalMs::from_millis(interval_ms)),
+                );
+            }
+        }
+    }
+}
+
+/// How often the CDX-3 standby scan re-reads stored codex auth files. The
+/// real cadence is the due predicate (`standby_due` — ~weekly per profile);
+/// this only bounds the file re-reads between events.
+const CODEX_STANDBY_SCAN_GAP_MS: u64 = 10 * 60 * 1000;
+/// Widening after a transient refresh failure — retry in hours, not per scan
+/// (the deadline pressure is days away; hammering a flaky endpoint buys
+/// nothing).
+const CODEX_STANDBY_RETRY_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// CDX-3 standby keep-alive: refresh parked codex chains clauth exclusively
+/// holds, so an inactive profile's refresh token never ages out server-side
+/// (PLAN.md §0.9–0.12). Runs on the lease-holder tick only, like every other
+/// leg. Sequential by design — standby refreshes are ~weekly per profile, so
+/// fan-out buys nothing and one-at-a-time keeps the guard story simple.
+///
+/// `refresh_fn` is injected (production: `crate::codex::oauth::refresh`) so
+/// the orchestration — candidates → due → guard → re-check → spend → apply —
+/// is testable offline; only the injected closure ever touches the network.
+pub(super) fn codex_standby_tick(
+    config: &crate::profile::ConfigHandle,
+    activity: &ActivityStore,
+    pacing: &std::sync::Mutex<CodexStandbyPacing>,
+    now: u64,
+    refresh_fn: &dyn Fn(
+        &str,
+    ) -> std::result::Result<
+        crate::codex::oauth::CodexRefreshResponse,
+        crate::codex::oauth::CodexRefreshError,
+    >,
+) {
+    {
+        let Ok(mut p) = pacing.lock() else { return };
+        if now < p.next_scan_ms {
+            return;
+        }
+        p.next_scan_ms = now + CODEX_STANDBY_SCAN_GAP_MS;
+    }
+    let candidates = {
+        let Ok(cfg) = config.lock() else { return };
+        crate::actions::codex_standby_candidates(&cfg)
+    };
+    for (name, bytes) in candidates {
+        let widened = pacing
+            .lock()
+            .ok()
+            .and_then(|p| p.retry_after_ms.get(&name).copied())
+            .is_some_and(|at| now < at);
+        if widened {
+            continue;
+        }
+        let due = crate::codex::CodexAuthFile::parse(&bytes)
+            .is_ok_and(|a| crate::codex::oauth::standby_due(&a, now));
+        if !due {
+            continue;
+        }
+        match codex_standby_refresh_one(config, activity, &name, refresh_fn) {
+            CodexStandbyOutcome::Refreshed => {
+                logline!("clauth: standby-refreshed codex profile '{name}'");
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms.remove(&name);
+                }
+            }
+            CodexStandbyOutcome::Skipped => {}
+            CodexStandbyOutcome::Permanent => {
+                // mark_auth_broken already logged the transition; broken
+                // profiles drop out of the candidate set until re-login.
+            }
+            CodexStandbyOutcome::Transient(e) => {
+                logline!("clauth: codex standby refresh for '{name}' failed (will retry): {e}");
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms
+                        .insert(name.clone(), now + CODEX_STANDBY_RETRY_MS);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) enum CodexStandbyOutcome {
+    Refreshed,
+    /// The in-guard re-check disqualified the profile (became live owner /
+    /// leased / logged out / no longer due) or the apply-time chain check
+    /// found the store moved under us — nothing spent or nothing persisted,
+    /// both quiet.
+    Skipped,
+    Permanent,
+    Transient(anyhow::Error),
+}
+
+/// Daemon standby refresh: the UI-spinner wrapper around the shared guarded
+/// core. Marks the row `Refreshing` for the HTTP window, then delegates.
+fn codex_standby_refresh_one(
+    config: &crate::profile::ConfigHandle,
+    activity: &ActivityStore,
+    name: &str,
+    refresh_fn: &dyn Fn(
+        &str,
+    ) -> std::result::Result<
+        crate::codex::oauth::CodexRefreshResponse,
+        crate::codex::oauth::CodexRefreshError,
+    >,
+) -> CodexStandbyOutcome {
+    codex_refresh_parked(config, name, Some(activity), refresh_fn)
+}
+
+/// Refresh ONE parked codex chain clauth exclusively holds, holding the
+/// per-profile `RotationGuard` across the whole spend window (the claude
+/// `rotate_one_inner` discipline). THE single-writer entry point — both the
+/// daemon standby scan and the CDX-5 proxy call this, so a parked chain is
+/// never double-spent (the review-confirmed CRIT was a second, guardless
+/// implementation in the proxy; there is now exactly one).
+///
+/// Discipline (each step load-bearing):
+/// 1. **Adopt-back first** (`gc_one_codex_runtime`): a SIGKILLed isolated
+///    `clauth start` session may have left a chain in its `codex-home` up to
+///    60 s fresher than the store; without adopting it back first we would
+///    read the store's STALE token and spend it — but codex already rotated
+///    past it in the isolated home, so the server would reuse-kill the chain
+///    (review MED). Adopting first makes the store the freshest truth, so
+///    `standby_due` then reads a fresh token and skips.
+/// 2. **Re-derive eligibility INSIDE the guard** (`codex_standby_candidates` +
+///    `standby_due`): a switch/capture/adopt that landed since the caller's
+///    snapshot flips the answer; grab the CURRENT token, not a pre-guard one.
+/// 3. Spend via `refresh_fn`.
+/// 4. **Re-check the stored chain before persisting**: if its refresh token is
+///    no longer the one we spent (a concurrent capture/adopt-back installed a
+///    fresh independent chain during the HTTP window), discard — the store's
+///    newer chain is the truth, ours is a dead branch (review CRIT + MED).
+pub(crate) fn codex_refresh_parked(
+    config: &crate::profile::ConfigHandle,
+    name: &str,
+    activity: Option<&ActivityStore>,
+    refresh_fn: &dyn Fn(
+        &str,
+    ) -> std::result::Result<
+        crate::codex::oauth::CodexRefreshResponse,
+        crate::codex::oauth::CodexRefreshError,
+    >,
+) -> CodexStandbyOutcome {
+    // (1) Adopt back a crashed isolated session's fresher chain BEFORE the
+    // guard, so the in-guard read below sees the freshest truth.
+    crate::runtime::gc_one_codex_runtime_public(name);
+
+    let Ok(_rotation_guard) = crate::runtime::RotationGuard::acquire(name) else {
+        return CodexStandbyOutcome::Transient(anyhow::anyhow!(
+            "failed to acquire the rotation lock"
+        ));
+    };
+    // (2) In-guard re-check + token grab. Config mutex (400) then state flock
+    // (500) — the rotate_one_inner order; both dropped before HTTP.
+    let spent: Option<String> = {
+        let Ok(cfg) = config.lock() else {
+            return CodexStandbyOutcome::Skipped;
+        };
+        crate::lock::with_state_lock(|| {
+            let still = crate::actions::codex_standby_candidates(&cfg)
+                .into_iter()
+                .find(|(n, _)| n == name);
+            let Some((_, bytes)) = still else {
+                return Ok::<_, anyhow::Error>(None);
+            };
+            let auth = crate::codex::CodexAuthFile::parse(&bytes)?;
+            if !crate::codex::oauth::standby_due(&auth, crate::usage::now_ms()) {
+                return Ok(None);
+            }
+            let rt = auth.refresh_token().map(str::to_string);
+            if rt.is_some()
+                && let Some(activity) = activity
+            {
+                mark_activity(activity, name, ProfileActivity::Refreshing);
+            }
+            Ok(rt)
+        })
+        .ok()
+        .flatten()
+    };
+    let Some(spent) = spent else {
+        return CodexStandbyOutcome::Skipped;
+    };
+
+    // (3) Spend.
+    let outcome = refresh_fn(&spent);
+
+    let result = match outcome {
+        Ok(resp) => {
+            // (4) Re-read + token identity check before writing.
+            let applied = crate::lock::with_state_lock(|| {
+                let Some(bytes) = crate::codex::read_profile_auth(name)? else {
+                    return Ok::<_, anyhow::Error>(false); // logged out mid-flight
+                };
+                let auth = crate::codex::CodexAuthFile::parse(&bytes)?;
+                if auth.refresh_token() != Some(spent.as_str()) {
+                    return Ok(false); // chain moved under us — discard
+                }
+                let now_iso = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs());
+                let updated = crate::codex::oauth::apply_refresh(&bytes, &resp, &now_iso)?;
+                crate::codex::write_profile_auth(name, &updated)?;
+                Ok(true)
+            });
+            match applied {
+                Ok(true) => CodexStandbyOutcome::Refreshed,
+                Ok(false) => CodexStandbyOutcome::Skipped,
+                Err(e) => CodexStandbyOutcome::Transient(e),
+            }
+        }
+        Err(crate::codex::oauth::CodexRefreshError::Permanent(msg)) => {
+            logline!("clauth: codex standby refresh for '{name}' rejected permanently: {msg}");
+            crate::oauth::mark_auth_broken(config, name, true);
+            CodexStandbyOutcome::Permanent
+        }
+        Err(crate::codex::oauth::CodexRefreshError::Transient(e)) => {
+            CodexStandbyOutcome::Transient(e)
+        }
+    };
+    if let Some(activity) = activity {
+        clear_activity(activity, name);
+    }
+    result
+}
+
+/// One scheduler tick while a live daemon owns the loop (R3). The daemon
 /// fetches, rotates, and decides switches; this side only re-reads its work
 /// product so the UI stays current:
 ///   * re-seed the usage / third-party stores from the disk caches the daemon
@@ -2083,9 +2642,9 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     // ones. The bootstrap pre-marks cache-due profiles Queued so the first
     // paint shows a spinner instead of a stale countdown, expecting the first
     // tick's worker to take over and clear it; standing down, nothing ever
-    // does, and the row would spin forever where the daemon-fed countdown
-    // belongs. Fetching/Refreshing/Switching stay — a worker from the last
-    // armed tick may genuinely still be in flight and clears itself.
+    // does (observed 2026-07-12: a perpetual spinner where the daemon-fed
+    // timer belongs). Fetching/Refreshing/Switching stay — a worker from the
+    // last armed tick may genuinely still be in flight and clears itself.
     if let Ok(mut a) = state.activity.lock() {
         a.retain(|_, act| !matches!(act, ProfileActivity::Queued));
     }
@@ -2157,6 +2716,7 @@ pub(crate) fn spawn_refresher(
         shutting_down,
         fetch_lease,
         standdown_active: AtomicBool::new(false),
+        codex_standby: std::sync::Mutex::new(CodexStandbyPacing::default()),
     };
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
     std::thread::Builder::new()
@@ -2241,11 +2801,13 @@ fn scan_auto_switch(
     pending_switch: &PendingSwitch,
     pending_switch_off: &PendingSwitchOff,
 ) {
-    // Skip when a previous decision is still pending. Each lock is acquired
-    // and dropped before the next — never two leaf mutexes at once.
+    // Skip when a previous CLAUDE decision is still pending — harness-scoped
+    // (CDX-4 §0.15): a queued codex rotation must not wedge this scan. Each
+    // lock is acquired and dropped before the next — never two leaf mutexes
+    // at once.
     {
         let Ok(p) = pending_switch.lock() else { return };
-        if !p.is_empty() {
+        if pending_for_harness(&p, crate::profile::Harness::Claude) {
             return;
         }
     }
@@ -2299,7 +2861,13 @@ fn scan_auto_switch(
     match crate::fallback::next_auto_switch_target(&snapshot, store) {
         Some(crate::fallback::SwitchAction::To(name)) => {
             if let Ok(mut p) = pending_switch.lock() {
-                p.insert(name);
+                enqueue_pending_switch(
+                    &mut p,
+                    name,
+                    crate::profile::Harness::Claude,
+                    Origin::Scheduler,
+                    now_ms(),
+                );
             }
         }
         Some(crate::fallback::SwitchAction::Off) => {
@@ -2324,9 +2892,9 @@ fn scan_recovery(
     kick_blocks: &KickBlocks,
     pending_switch: &PendingSwitch,
 ) {
-    // Skip when a previous switch is still pending.
+    // Skip when a previous CLAUDE switch is still pending (harness-scoped).
     if let Ok(p) = pending_switch.lock()
-        && !p.is_empty()
+        && pending_for_harness(&p, crate::profile::Harness::Claude)
     {
         return;
     }
@@ -2351,6 +2919,8 @@ fn scan_recovery(
             .state
             .fallback_chain
             .iter()
+            // AUTH-1: never recover into an auth-broken member (dead token).
+            .filter(|name| !cfg.is_auth_broken(name))
             .map(|name| {
                 let profile = cfg.find(name);
                 crate::fallback::ChainMember {
@@ -2379,7 +2949,13 @@ fn scan_recovery(
         crate::fallback::find_recovered_member(&members, store, weekly_pct, &kick_rejected)
         && let Ok(mut p) = pending_switch.lock()
     {
-        p.insert(name);
+        enqueue_pending_switch(
+            &mut p,
+            name,
+            crate::profile::Harness::Claude,
+            Origin::Scheduler,
+            now_ms(),
+        );
     }
 }
 
