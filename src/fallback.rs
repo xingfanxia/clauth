@@ -329,6 +329,111 @@ pub(crate) fn soonest_resume(config: &AppConfig) -> Option<(String, i64)> {
     Some((name.to_string(), (resets_at - now).max(0)))
 }
 
+/// Why a chain member is currently ineligible or distrusted, worst first. The
+/// Fallback tab renders it as a per-row marker (selector) plus a status pill
+/// (detail card); render-only, no walk consumes it. Policy lives here beside the
+/// walk predicates so a chip can never claim a block the walk doesn't act on.
+///
+/// Precedence is "dead first": a login that can't serve at all outranks one that
+/// serves but won't be picked. [`blocked_reason`] returns the first matching arm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum BlockedReason {
+    /// OAuth refresh revoked/invalid (AUTH-1): needs re-login before anything
+    /// else about this member matters.
+    AuthBroken,
+    /// 7d window at/over the hard cap ([`WEEKLY_HARD_BLOCK_PCT`]) — dead until the
+    /// weekly reset. `resets_in` is seconds to that reset when the window carries
+    /// a parseable `resets_at`.
+    WeeklySpent { resets_in: Option<i64> },
+    /// Billing member that is out of free 5h quota AND has spent the
+    /// `max_auto_spend` budget the operator allowed it (see [`budget_spent`]) — so
+    /// it can neither serve free nor be paid-rescued. With 5h headroom the walk
+    /// prefers it and budget is moot, so this never fires there.
+    BudgetSpent,
+    /// 5h window at/over the member's rotate threshold: exhausted for now, resets
+    /// within hours. `pct` is the current utilization.
+    FiveHour { pct: f64, resets_in: Option<i64> },
+    /// 7d window over the soft switch line but under the hard cap: still serves
+    /// every request, just won't be picked. `pct` is the current utilization.
+    WeeklySoft { pct: f64 },
+    /// Last read wasn't live (cached / endpoint-429): the numbers are old, so the
+    /// chain distrusts this member's apparent headroom.
+    Stale,
+}
+
+/// Seconds until `window` resets, clamped at 0, or `None` when it carries no
+/// parseable `resets_at`. Mirrors the arithmetic `soonest_resume` uses.
+fn reset_secs(window: &UsageWindow, now: i64) -> Option<i64> {
+    window
+        .resets_at
+        .as_deref()
+        .and_then(iso_to_epoch_secs)
+        .map(|t| (t - now).max(0))
+}
+
+/// The single worst [`BlockedReason`] for `profile`, or `None` when it is a live
+/// member with headroom. Reads the same predicates the walk does — never a
+/// second opinion — so the chip and the behavior cannot drift. See
+/// [`BlockedReason`] for the precedence.
+pub(crate) fn blocked_reason(config: &AppConfig, profile: &Profile) -> Option<BlockedReason> {
+    if config.is_auth_broken(&profile.name) {
+        return Some(BlockedReason::AuthBroken);
+    }
+    let now = now_epoch_secs();
+    // Weekly HARD cap first: dead for days regardless of the 5h window.
+    if weekly_blocked(profile, WEEKLY_HARD_BLOCK_PCT) {
+        let resets_in = profile
+            .usage
+            .as_ref()
+            .and_then(|u| u.seven_day.as_ref())
+            .and_then(|w| reset_secs(w, now));
+        return Some(BlockedReason::WeeklySpent { resets_in });
+    }
+    // 5h over its rotate threshold = no free quota to serve right now. A spent
+    // billing budget only BLOCKS a member in that state: with free 5h quota the
+    // member serves for free, the walk PREFERS it (headroom pass, `!is_exhausted`)
+    // and never consults `budget_spent` for it — so flagging it there would claim
+    // a block the walk doesn't act on. Gating on 5h-maxed also excludes the
+    // last-resort serving sink, which by definition still has 5h headroom.
+    let five_hour_over =
+        live_five_hour(profile).filter(|w| w.utilization >= threshold_for(profile));
+    if five_hour_over.is_some() {
+        let ceiling = profile.max_auto_spend.unwrap_or(0.0);
+        if budget_spent(
+            profile.usage.as_ref(),
+            config.state.spend_budget_switching,
+            ceiling,
+        ) {
+            return Some(BlockedReason::BudgetSpent);
+        }
+    }
+    if let Some(window) = five_hour_over {
+        return Some(BlockedReason::FiveHour {
+            pct: window.utilization,
+            resets_in: reset_secs(window, now),
+        });
+    }
+    // The hard cap already returned above, so a soft hit here is strictly the
+    // [soft, 100) band — a member that still serves.
+    let soft = config.state.weekly_switch_threshold_pct();
+    if weekly_blocked(profile, soft) {
+        let pct = profile
+            .usage
+            .as_ref()
+            .and_then(|u| u.seven_day.as_ref())
+            .map(|w| w.utilization)
+            .unwrap_or(soft);
+        return Some(BlockedReason::WeeklySoft { pct });
+    }
+    if matches!(
+        profile.fetch_status,
+        Some(FetchStatus::Cached | FetchStatus::RateLimited)
+    ) {
+        return Some(BlockedReason::Stale);
+    }
+    None
+}
+
 /// One chain member as observed when a `ChainSnapshot` was built. Holds enough
 /// to evaluate the fallback decision without re-locking `AppConfig` — caller
 /// snapshots once under the config mutex then reads `UsageStore` separately,

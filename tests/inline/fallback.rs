@@ -2450,3 +2450,170 @@ fn weekly_accessor_pins_the_band_and_resets_garbage_to_default() {
     s.weekly_switch_threshold = Some(f64::NAN);
     assert_eq!(s.weekly_switch_threshold_pct(), 98.0);
 }
+
+// ── blocked_reason: the Fallback tab's per-member chip (render-only) ──────────
+//
+// Dead-first precedence: auth broken › weekly hard (7d ≥ 100) › budget spent ›
+// 5h over threshold › weekly soft (soft ≤ 7d < 100) › stale. Each reason gets a
+// positive test plus, where two can hold at once, a precedence test proving the
+// worse one wins. Assertions match on the variant (not float `==`) so a wrong
+// pct/countdown reds without tripping the float-cmp lint.
+
+/// UsageInfo carrying only a live 7d window at `util`.
+fn weekly_usage(util: f64) -> UsageInfo {
+    UsageInfo {
+        seven_day: Some(window(util, Some(live_reset()))),
+        ..UsageInfo::default()
+    }
+}
+
+/// UsageInfo with both a live 5h window at `five` and a live 7d at `seven`.
+fn both_windows(five: f64, seven: f64) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(five, Some(live_reset()))),
+        seven_day: Some(window(seven, Some(live_reset()))),
+        ..UsageInfo::default()
+    }
+}
+
+#[test]
+fn blocked_reason_none_for_a_live_member_with_headroom() {
+    let p = mark_fresh(profile_with_util("a", Some(95.0), Some(40.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    assert_eq!(blocked_reason(&cfg, &cfg.profiles[0]), None);
+}
+
+#[test]
+fn blocked_reason_auth_broken_outranks_every_other_block() {
+    // 7d at the hard cap AND 5h over threshold — auth still wins.
+    let p = profile_with_usage("a", Some(95.0), Some(both_windows(100.0, 100.0)));
+    let mut cfg = config_with_chain(vec![p], "a");
+    cfg.state.auth_broken.push("a".into());
+    assert_eq!(
+        blocked_reason(&cfg, &cfg.profiles[0]),
+        Some(BlockedReason::AuthBroken)
+    );
+}
+
+#[test]
+fn blocked_reason_weekly_hard_carries_the_7d_reset_countdown() {
+    let p = profile_with_usage("a", Some(95.0), Some(weekly_usage(100.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(
+        matches!(
+            blocked_reason(&cfg, &cfg.profiles[0]),
+            Some(BlockedReason::WeeklySpent { resets_in: Some(secs) })
+                if (3500..=3600).contains(&secs)
+        ),
+        "got {:?}",
+        blocked_reason(&cfg, &cfg.profiles[0])
+    );
+}
+
+#[test]
+fn blocked_reason_weekly_hard_outranks_a_5h_block() {
+    // 7d at the hard cap AND 5h over threshold — weekly (dead for days) wins.
+    let p = profile_with_usage("a", Some(95.0), Some(both_windows(99.0, 100.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0]),
+        Some(BlockedReason::WeeklySpent { .. })
+    ));
+}
+
+#[test]
+fn blocked_reason_budget_spent_when_billing_and_over_ceiling() {
+    // spend_member is 5h-spent + billing; ceiling 10, used 20 → over. Budget is
+    // checked before the 5h block, so this also proves budget › 5h.
+    let p = spend_member("a", 10.0, 20.0, None);
+    let mut cfg = config_with_chain(vec![p], "a");
+    cfg.state.spend_budget_switching = true;
+    assert_eq!(
+        blocked_reason(&cfg, &cfg.profiles[0]),
+        Some(BlockedReason::BudgetSpent)
+    );
+}
+
+#[test]
+fn blocked_reason_budget_spent_is_moot_with_free_5h_quota() {
+    // Billing budget spent but 5h has headroom → the member serves for free and
+    // the walk PREFERS it (headroom pass). No chip may claim a block here — the
+    // invariant this whole fn promises. Reds against an ungated budget arm.
+    let mut p = spend_member("a", 10.0, 20.0, None); // over ceiling → budget spent
+    if let Some(u) = p.usage.as_mut() {
+        u.five_hour = Some(window(30.0, Some(live_reset()))); // free 5h quota
+    }
+    let mut cfg = config_with_chain(vec![p], "a");
+    cfg.state.spend_budget_switching = true;
+    assert_eq!(blocked_reason(&cfg, &cfg.profiles[0]), None);
+}
+
+#[test]
+fn blocked_reason_five_hour_reports_utilization_and_reset() {
+    let p = profile_with_util("a", Some(95.0), Some(97.0));
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(
+        matches!(
+            blocked_reason(&cfg, &cfg.profiles[0]),
+            Some(BlockedReason::FiveHour { pct, resets_in: Some(secs) })
+                if (pct - 97.0).abs() < f64::EPSILON && (3500..=3600).contains(&secs)
+        ),
+        "got {:?}",
+        blocked_reason(&cfg, &cfg.profiles[0])
+    );
+}
+
+#[test]
+fn blocked_reason_weekly_soft_below_the_hard_cap_still_shows() {
+    // 7d at 99 (≥ default soft 98, < 100) with 5h headroom → soft weekly block.
+    let p = profile_with_usage("a", Some(95.0), Some(both_windows(40.0, 99.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0]),
+        Some(BlockedReason::WeeklySoft { pct }) if (pct - 99.0).abs() < f64::EPSILON
+    ));
+}
+
+#[test]
+fn blocked_reason_five_hour_outranks_a_soft_weekly_block() {
+    // Both hold: 5h fully stopped now beats the soft week (still serving).
+    let p = profile_with_usage("a", Some(95.0), Some(both_windows(97.0, 99.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0]),
+        Some(BlockedReason::FiveHour { .. })
+    ));
+}
+
+#[test]
+fn blocked_reason_stale_when_the_last_read_was_cached() {
+    let mut p = profile_with_util("a", Some(95.0), Some(40.0));
+    p.fetch_status = Some(FetchStatus::Cached);
+    let cfg = config_with_chain(vec![p], "a");
+    assert_eq!(
+        blocked_reason(&cfg, &cfg.profiles[0]),
+        Some(BlockedReason::Stale)
+    );
+}
+
+#[test]
+fn blocked_reason_a_real_block_outranks_stale_data() {
+    // 5h over threshold AND cached — the block wins, stale is only the fallback.
+    let mut p = profile_with_util("a", Some(95.0), Some(97.0));
+    p.fetch_status = Some(FetchStatus::Cached);
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0]),
+        Some(BlockedReason::FiveHour { .. })
+    ));
+}
+
+#[test]
+fn blocked_reason_failed_fetch_is_not_flagged_stale() {
+    // `Failed` = no data at all (the card already says "no data"); only cached /
+    // rate-limited numbers count as stale.
+    let mut p = profile_with_util("a", Some(95.0), Some(40.0));
+    p.fetch_status = Some(FetchStatus::Failed);
+    let cfg = config_with_chain(vec![p], "a");
+    assert_eq!(blocked_reason(&cfg, &cfg.profiles[0]), None);
+}

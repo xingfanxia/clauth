@@ -641,3 +641,88 @@ fn tokens_models_view_empty_filter_names_the_filter() {
         "must not fall back to the accounts empty state:\n{out}"
     );
 }
+
+// ── Fallback tab blocked-reason chip (weekly-fallback §4) ────────────────────
+
+/// Bare OAuth profile with no usage snapshot — `blocked_reason` then keys purely
+/// off `auth_broken`, so the chip tests need no live windows.
+fn bare(name: &str) -> Profile {
+    Profile {
+        name: name.into(),
+        base_url: None,
+        api_key: None,
+        auto_start: false,
+        env: BTreeMap::new(),
+        models: Default::default(),
+        fallback_threshold: Some(95.0),
+        last_resort: false,
+        max_auto_spend: None,
+        bell_threshold: None,
+        credentials: None,
+        usage: None,
+        fetch_status: None,
+        provider: None,
+        third_party_usage: None,
+    }
+}
+
+fn fallback_config(auth_broken: &[&str]) -> AppConfig {
+    let names: Vec<ProfileName> = ["a", "b"].iter().map(|n| (*n).into()).collect();
+    AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: names.clone(),
+            fallback_chain: names,
+            auth_broken: auth_broken.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles: vec![bare("a"), bare("b")],
+    }
+}
+
+// An auth-broken chain member carries its `×` marker in the selector list, so
+// every ineligible member reads at a glance without opening its card. A chain
+// with nothing blocked carries none.
+#[test]
+fn fallback_selector_marks_a_blocked_member() {
+    let mut blocked = App::new(fallback_config(&["b"]));
+    blocked.tab = Tab::Fallback;
+    let out = dump(&blocked, 90, 20);
+    assert!(
+        out.contains('×'),
+        "auth-broken b shows the × marker:\n{out}"
+    );
+
+    let mut healthy = App::new(fallback_config(&[]));
+    healthy.tab = Tab::Fallback;
+    let clean = dump(&healthy, 90, 20);
+    assert!(
+        !clean.contains('×'),
+        "no marker when nothing is blocked:\n{clean}"
+    );
+}
+
+// A typed threshold on a BLOCKED member must still place the native caret on the
+// `rotate at` row: the blocked-reason pill shifts every card row down by 2 (pill
+// + blank), and the cursor math has to follow. Compare against an unblocked edit.
+#[test]
+fn fallback_edit_caret_follows_the_blocked_reason_pill() {
+    let caret_y = |auth_broken: &[&str]| -> u16 {
+        let mut app = App::new(fallback_config(auth_broken));
+        app.tab = Tab::Fallback;
+        app.chain_cursor = 0; // member a
+        app.fallback_focus = crate::tui::app::FallbackFocus::Detail;
+        app.fallback_detail_cursor = 0; // FallbackRow::Threshold
+        app.fallback_threshold_draft = Some(crate::tui::app::InputState::new("90"));
+        let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        term.get_cursor_position().unwrap().y
+    };
+    let unblocked = caret_y(&[]);
+    let blocked = caret_y(&["a"]);
+    assert_eq!(
+        blocked,
+        unblocked + 2,
+        "the blocked-reason pill (2 rows) shifts the edit caret down (unblocked={unblocked}, blocked={blocked})"
+    );
+}

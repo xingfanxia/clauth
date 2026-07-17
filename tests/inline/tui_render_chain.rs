@@ -224,3 +224,52 @@ fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
         row(&armed)
     );
 }
+
+// ── blocked-reason pill (detail card, weekly-fallback §4) ────────────────────
+
+// A member over its 5h threshold shows the worst-reason pill at the very top of
+// the card, naming the block with its utilization % and reset countdown.
+#[test]
+fn blocked_member_shows_the_worst_reason_pill() {
+    let cfg = config_with(vec![profile("a", 95.0, 97.0, 7200)], Some("a"), vec!["a"]);
+    let lines = member_detail(&cfg, "a", 0, 1, false, 0, false, None, None, 60);
+    let pill = line_text(&lines[0]);
+    assert!(pill.contains('['), "renders as a status pill: {pill:?}");
+    assert!(
+        pill.contains("5h 97%"),
+        "names the 5h block with %: {pill:?}"
+    );
+    assert!(
+        pill.contains("· 2h"),
+        "carries the reset countdown: {pill:?}"
+    );
+}
+
+// A member with headroom shows no pill — the card opens straight on `priority`.
+#[test]
+fn headroom_member_shows_no_reason_pill() {
+    let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
+    let lines = member_detail(&cfg, "a", 0, 1, false, 0, false, None, None, 60);
+    let first = line_text(&lines[0]);
+    assert!(
+        !first.contains('['),
+        "no pill for a member with headroom: {first:?}"
+    );
+    assert!(
+        first.contains("priority"),
+        "card opens on priority: {first:?}"
+    );
+}
+
+// The pill occupies exactly `PILL_LINES` rows (pill + blank) above `priority` —
+// the count `draw_chain_detail` folds into the native-cursor row math.
+#[test]
+fn blocked_pill_occupies_pill_lines_above_priority() {
+    let cfg = config_with(vec![profile("a", 95.0, 100.0, 7200)], Some("a"), vec!["a"]);
+    let lines = member_detail(&cfg, "a", 0, 1, false, 0, false, None, None, 60);
+    let priority_at = lines
+        .iter()
+        .position(|l| line_text(l).contains("priority"))
+        .expect("priority row renders");
+    assert_eq!(priority_at, PILL_LINES, "pill + blank precede priority");
+}
