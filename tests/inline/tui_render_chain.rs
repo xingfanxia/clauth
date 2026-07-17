@@ -273,3 +273,44 @@ fn blocked_pill_occupies_pill_lines_above_priority() {
         .expect("priority row renders");
     assert_eq!(priority_at, PILL_LINES, "pill + blank precede priority");
 }
+
+// ── `max spend` dims while inert (spend budget off) ──────────────────────────
+
+fn span_style(line: &Line<'static>, needle: &str) -> Option<ratatui::style::Style> {
+    line.spans
+        .iter()
+        .find(|s| s.content.contains(needle))
+        .map(|s| s.style)
+}
+
+// A set ceiling with the chain-wide `spend budget` OFF spends nothing, so it must
+// not read as armed: render the value faint. Flip spend budget on and the same
+// ceiling renders in ACCENT.
+#[test]
+fn max_spend_dims_when_spend_budget_is_off() {
+    let mut cfg = config_with(vec![profile("a", 95.0, 40.0, 3600)], Some("a"), vec!["a"]);
+    cfg.profiles[0].max_auto_spend = Some(25.0);
+
+    let off = member_detail(&cfg, "a", 0, 1, true, 2, false, None, None, 60);
+    let off_val = off
+        .iter()
+        .find_map(|l| span_style(l, "$25.00"))
+        .expect("max spend ceiling renders");
+    assert_eq!(
+        off_val.fg,
+        crate::tui::theme::faint().fg,
+        "an inert ceiling (spend budget off) renders faint"
+    );
+
+    cfg.state.spend_budget_switching = true;
+    let on = member_detail(&cfg, "a", 0, 1, true, 2, false, None, None, 60);
+    let on_val = on
+        .iter()
+        .find_map(|l| span_style(l, "$25.00"))
+        .expect("max spend ceiling renders");
+    assert_eq!(
+        on_val.fg,
+        crate::tui::theme::accent().fg,
+        "an armed ceiling (spend budget on) renders in accent"
+    );
+}

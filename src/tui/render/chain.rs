@@ -361,6 +361,7 @@ fn member_detail(
             threshold,
             profile.last_resort,
             profile.max_auto_spend.unwrap_or(0.0),
+            cfg.state.spend_budget_switching,
             armed_remove,
             row_editing,
         );
@@ -483,12 +484,14 @@ fn max_spend_hint(cfg: &AppConfig, ceiling: f64) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn detail_row(
     row: FallbackRow,
     selected: bool,
     threshold: f64,
     last_resort: bool,
     max_spend: f64,
+    spend_budget: bool,
     armed_remove: bool,
     editing: Option<&InputState>,
 ) -> Line<'static> {
@@ -552,12 +555,19 @@ fn detail_row(
             ])
         }
         FallbackRow::MaxSpend => {
+            // Inert until the chain-wide `spend budget` is on: dim the key + value
+            // then (cloudy-tui disabled row) so a ceiling never reads as armed
+            // while nothing can spend. The `max_spend_hint` names the holding half;
+            // the row stays editable so a ceiling can be pre-set.
+            let dimmed = !spend_budget && editing.is_none();
+            let key_style = if dimmed {
+                theme::faint()
+            } else {
+                label_style(selected)
+            };
             let mut spans = vec![
                 arrow,
-                Span::styled(
-                    key_cell("max spend", KEY_W, KEY_GUTTER),
-                    label_style(selected),
-                ),
+                Span::styled(key_cell("max spend", KEY_W, KEY_GUTTER), key_style),
             ];
             match editing {
                 Some(input) => {
@@ -576,7 +586,12 @@ fn detail_row(
                     spans.extend(value_caret(input, invalid));
                 }
                 None if max_spend > 0.0 => {
-                    spans.push(Span::styled(format!("${max_spend:.2}"), theme::accent()));
+                    let value_style = if dimmed {
+                        theme::faint()
+                    } else {
+                        theme::accent()
+                    };
+                    spans.push(Span::styled(format!("${max_spend:.2}"), value_style));
                 }
                 // $0 is the never-spend default, so it reads as off rather than
                 // as a number the operator chose.

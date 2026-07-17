@@ -191,3 +191,52 @@ fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
         "must not render the cycle on-option: {off_line}"
     );
 }
+
+// ── `money spent` dims while inert (spend budget off) ────────────────────────
+
+/// With `spend budget` off nothing spends, so `money spent` decides no halt.
+/// It renders as a cloudy-tui disabled row (whole content faint) so it never
+/// reads as an armed setting; flip the toggle on and it becomes a live cycle.
+#[test]
+fn money_spent_dims_when_spend_budget_is_off() {
+    let dimmed = detail_row(
+        GlobalConfigRow::SwitchOffWhenBudgetSpent,
+        false,
+        toggles(), // spend_budget: false
+        60_000,
+        95.0,
+        None,
+        None,
+    );
+    assert!(
+        dimmed
+            .spans
+            .iter()
+            .all(|s| s.content.trim().is_empty() || s.style.fg == theme::faint().fg),
+        "every content span must be faint while inert: {:?}",
+        dimmed.spans,
+    );
+
+    let mut on = toggles();
+    on.spend_budget = true;
+    let live = line_text(&detail_row(
+        GlobalConfigRow::SwitchOffWhenBudgetSpent,
+        true,
+        on,
+        60_000,
+        95.0,
+        None,
+        None,
+    ));
+    assert!(
+        live.contains('['),
+        "spend budget on: live + focused brackets the active option: {live}"
+    );
+}
+
+#[test]
+fn money_spent_hint_explains_inertness_when_spend_off() {
+    let hint = row_hint(GlobalConfigRow::SwitchOffWhenBudgetSpent, None, toggles())
+        .expect("an inert money-spent row still carries its reason");
+    assert!(hint.contains("inert until spend budget"), "{hint}");
+}

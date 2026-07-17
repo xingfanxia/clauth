@@ -177,7 +177,10 @@ fn row_hint(
             }
         }
         GlobalConfigRow::SwitchOffWhenBudgetSpent => {
-            if toggles.switch_off_when_budget_spent {
+            if !toggles.spend_budget {
+                "inert until spend budget is on; decides the halt once a billing account's budget \
+                 runs out"
+            } else if toggles.switch_off_when_budget_spent {
                 "once an account's spend budget runs out, switch everything off"
             } else {
                 "once an account's spend budget runs out, stay on it and keep billing"
@@ -285,15 +288,20 @@ fn detail_row(
         ),
         // Same two values as `quota spent` on purpose: the pairing is the point.
         // Only the default differs — staying is free there and costs money here.
-        GlobalConfigRow::SwitchOffWhenBudgetSpent => cycle_row(
-            arrow,
-            "money spent",
-            &[
+        // Inert until `spend budget` is on (nothing spends, so nothing halts on a
+        // spent budget): render it dimmed then, but still editable so a value can
+        // be pre-set before arming spending.
+        GlobalConfigRow::SwitchOffWhenBudgetSpent => {
+            let options = [
                 ("stay on last", !toggles.switch_off_when_budget_spent),
                 ("switch off all", toggles.switch_off_when_budget_spent),
-            ],
-            selected,
-        ),
+            ];
+            if toggles.spend_budget {
+                cycle_row(arrow, "money spent", &options, selected)
+            } else {
+                dimmed_cycle_row("money spent", &options, selected)
+            }
+        }
         GlobalConfigRow::PreemptiveRotation => cycle_row(
             arrow,
             "rotation",
@@ -472,6 +480,30 @@ fn cycle_row(
         spans.push(cycle_option(label, *active, row_selected));
     }
     Line::from(spans)
+}
+
+/// A cloudy-tui Disabled row for a cycle setting another toggle makes inert: the
+/// key + current value render `TEXT_FAINT` (no bracket highlight, just the
+/// current value). The focus caret stays `ACCENT` so focus is still visible; the
+/// faint content is what reads as inert. The `draw` loop still tints + shows the
+/// `└` reason on focus, and (house call) the row stays editable so a value can be
+/// pre-set before the gating toggle is armed.
+fn dimmed_cycle_row(key: &str, options: &[(&str, bool)], selected: bool) -> Line<'static> {
+    let arrow = if selected {
+        Span::styled("❯ ", theme::accent())
+    } else {
+        Span::raw("  ")
+    };
+    let value = options
+        .iter()
+        .find(|(_, active)| *active)
+        .map(|(label, _)| *label)
+        .unwrap_or("");
+    Line::from(vec![
+        arrow,
+        Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::faint()),
+        Span::styled(value.to_string(), theme::faint()),
+    ])
 }
 
 /// A cloudy-tui toggle row: `key  ─●` / `key  ○─`. A pure on/off boolean is a
