@@ -1982,6 +1982,42 @@ fn money_spent_is_inert_while_spend_budget_is_off() {
     );
 }
 
+// Same inert guard, but entered through the REAL top-level router (`handle_key`
+// → tab dispatch), the layer a keystroke actually hits. A sub-handler-only test
+// stays green if the inert check ever moves above `handle_global_config_key`.
+#[test]
+fn money_spent_is_inert_through_the_top_level_router() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SwitchOffWhenBudgetSpent)
+        .unwrap();
+    let before = app.config().state.switch_off_when_budget_spent;
+
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.switch_off_when_budget_spent,
+        before,
+        "space through handle_key must not cycle an inert row"
+    );
+
+    // Positive control: arm spend budget and the SAME key path must now cycle the
+    // row — proves `handle_key` actually routes space here, so the inert "no
+    // change" above is the guard doing its job, not a router that never arrives.
+    {
+        let mut cfg = app.config();
+        cfg.state.spend_budget_switching = true;
+    }
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_ne!(
+        app.config().state.switch_off_when_budget_spent,
+        before,
+        "space through handle_key cycles the row once spend budget is armed"
+    );
+}
+
 // ── preemptive rotation (rotation coherence #1) ─────────────────────────────
 
 #[test]
