@@ -1157,3 +1157,23 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   the complete compilable+tested fork codex support on 0.12.0. Supersedes #49
   (narrow-tui overlaps in the render files). Upstream has no codex sub → can't
   test codex; claude-side is byte-identical.
+
+## 2026-07-17 — post-0.12.0 upstream catch-up (merge 2497a36)
+
+- **Why PRs went CONFLICTING**: uwuclxdy pushed 4 commits to `mommy` AFTER our
+  0.12.0 sync — reload fingerprinting (c4faec0: config.toml edits hot-reload
+  without restart), bounded state-lock acquisition (26b1e3e), auto-start window
+  kick fix (1470147), wiki note (63d8f21). Merged them in (5 conflicts:
+  tick.rs ×7 hunks, mod.rs, daemon_mod/profile tests, wiki modify/delete).
+- **Fingerprint conversion**: every fork-only `last_state_mtime` site (codex
+  follow/switch, claude follow, drain_config_ops, 2 TUI sites upstream never
+  touched — auto-merged but referencing the dead field) converted to
+  `last_reload_fp`/`reload_fingerprint()`. `drain_config_ops` keeps the fork's
+  pinned contract: config.toml-only edit (Ok(false)) does NOT adopt — one
+  harmless self-reload next tick beats swallowing a same-tick external edit.
+- **wiki/daemon.md restored** to upstream's copy — the fork had deleted `wiki/`
+  long ago, so every upstream wiki edit re-conflicted with our deletion; keeping
+  the file kills that conflict class permanently and cleans the PR diff.
+- Suite **1262 green** (+8 upstream tests), clippy/fmt clean. PR #51 back to
+  MERGEABLE; #49 got a supersession comment (offer to rebuild standalone if
+  uwuclxdy wants narrow-tui alone). Local daemon reinstalled + respawned.
