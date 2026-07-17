@@ -2273,6 +2273,17 @@ fn scan_auto_switch(
     // switch-grade kick-rejected members and a rejected ACTIVE bypasses the
     // exhaustion gate (its usage reads idle while inference is refused).
     snapshot.kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
+    // Same reason: freshness lives in the `StatusStore`, not in config, and
+    // `Profile.fetch_status` (what the UI twin reads) is written only by the UI
+    // thread. Filled from the same source that gates the ACTIVE below, so both
+    // twins prefer the same members. A PREFERENCE for the headroom walk, never a
+    // gate — see `ChainSnapshot::fresh`.
+    snapshot.fresh = snapshot
+        .chain
+        .iter()
+        .filter(|m| decision_fresh(status, &m.name))
+        .map(|m| m.name.clone())
+        .collect();
 
     // Only act on a confirmed-live read of the active profile — a stale or
     // synthetic store entry would drive a false switch (see `decision_fresh`).

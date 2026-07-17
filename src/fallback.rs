@@ -4,7 +4,8 @@ use crate::actions::{switch_off, switch_profile};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{
-    UsageStore, UsageWindow, five_hour_live, iso_to_epoch_secs, now_epoch_secs, seven_day_live,
+    FetchStatus, UsageStore, UsageWindow, five_hour_live, iso_to_epoch_secs, now_epoch_secs,
+    seven_day_live,
 };
 
 /// What the auto-switch evaluator decided when the active profile crossed its
@@ -282,6 +283,15 @@ pub(crate) struct ChainSnapshot {
     /// even with idle-looking usage, so it is walked around like `broken`, and
     /// a rejected ACTIVE bypasses the exhaustion gate the same way.
     pub(crate) kick_rejected: Vec<String>,
+    /// Members whose last store read was live (`FetchStatus::Fresh`) — the same
+    /// freshness `decision_fresh` gates the ACTIVE on. Not config state:
+    /// [`snapshot_chain`] leaves it empty and the scheduler's scan fills it from
+    /// the `StatusStore` (like `kick_rejected`). Drives the headroom walk's
+    /// fresh-PREFERENCE first pass — a PREFERENCE, never a gate: when no fresh
+    /// member has headroom the walk still accepts a stale-but-unexhausted one,
+    /// so an exhausted active never loses its escape (2026-06-28 target
+    /// asymmetry: the walk gates only the ACTIVE, never the target).
+    pub(crate) fresh: Vec<String>,
 }
 
 /// Snapshot active profile + chain + per-member thresholds out of `AppConfig`.
@@ -319,6 +329,7 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
         interval_ms: config.state.refresh_interval_ms,
         weekly_pct: config.state.weekly_switch_threshold_pct(),
         kick_rejected: Vec::new(),
+        fresh: Vec::new(),
     })
 }
 
@@ -449,6 +460,16 @@ pub(crate) fn next_target(
         pick.map(|i| chain[i].to_string())
     };
 
+    // Two-pass headroom PREFERENCE (not a gate): pass 1a prefers a candidate
+    // whose usage read we TRUST (`fetch_status == Fresh`); pass 1b, run only
+    // when 1a finds nothing, is the verbatim old accept — any-freshness
+    // headroom. Pass 1b MUST always run so an exhausted active still escapes to
+    // a stale-but-viable member: freshness is a preference here, never a gate
+    // (2026-06-28 asymmetry — the target walk is never gated, only the ACTIVE).
+    let is_fresh = |p: &Profile| p.fetch_status == Some(FetchStatus::Fresh);
+    if let Some(name) = walk(&|p| !is_exhausted(p, weekly_pct) && is_fresh(p)) {
+        return Some(SwitchAction::To(name));
+    }
     if let Some(name) = walk(&|p| !is_exhausted(p, weekly_pct)) {
         return Some(SwitchAction::To(name));
     }
@@ -550,6 +571,19 @@ pub(crate) fn next_auto_switch_target(
         pick.map(|i| snapshot.chain[i].name.clone())
     };
 
+    // Two-pass headroom PREFERENCE, lockstep with [`next_target`] (not a gate):
+    // pass 1a prefers a member whose last store read was live — carried on
+    // `snapshot.fresh`, since the `UsageStore` value (`UsageInfo`) holds no
+    // status; the freshness comes from the same `StatusStore` `decision_fresh`
+    // gates the ACTIVE on. Pass 1b, run only when 1a is empty, is today's
+    // any-freshness accept verbatim, so an exhausted active keeps its
+    // stale-but-viable escape (2026-06-28 target asymmetry).
+    let is_fresh = |m: &ChainMember| snapshot.fresh.iter().any(|n| n == &m.name);
+    if let Some(name) = walk(&|m| {
+        !is_exhausted_from_store(&m.name, m.threshold, store, snapshot.weekly_pct) && is_fresh(m)
+    }) {
+        return Some(SwitchAction::To(name));
+    }
     if let Some(name) =
         walk(&|m| !is_exhausted_from_store(&m.name, m.threshold, store, snapshot.weekly_pct))
     {

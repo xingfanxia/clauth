@@ -79,6 +79,13 @@ fn mark_last_resort(mut p: Profile) -> Profile {
     p
 }
 
+/// Marks a profile's last usage read as live — the UI twin's freshness input.
+/// The snapshot twin carries the same judgment on `ChainSnapshot::fresh`.
+fn mark_fresh(mut p: Profile) -> Profile {
+    p.fetch_status = Some(FetchStatus::Fresh);
+    p
+}
+
 fn config_with_chain(profiles: Vec<Profile>, active: &str) -> AppConfig {
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     AppConfig {
@@ -933,6 +940,91 @@ fn auto_switch_never_targets_a_kick_rejected_member() {
     // viable remains and the active stays put (no Off — wrap_off is unset).
     snap.kick_rejected = vec!["b".to_string(), "c".to_string()];
     assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+// Fresh-PREFERENCE walk, asserted on both twins in each direction. The UI twin
+// reads `Profile.fetch_status`, the snapshot twin reads `ChainSnapshot::fresh`
+// (filled by the scheduler's scan from the same `StatusStore` the ACTIVE gate
+// consults), so a drift between them fails here.
+
+// Two members have headroom and the one the walk reaches FIRST is stale: the
+// fresh member wins anyway, since pass 1a outranks walk order.
+#[test]
+fn next_target_prefers_fresh_member_over_earlier_stale_one() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+            mark_fresh(profile_with_util("c", Some(95.0), Some(20.0))),
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string())),
+        "b is reached first but its read is stale — the trusted c must win"
+    );
+}
+
+#[test]
+fn auto_switch_prefers_fresh_member_over_earlier_stale_one() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = vec!["c".to_string()];
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 20.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "b is reached first but is absent from `fresh` — the trusted c must win"
+    );
+}
+
+// The not-a-gate guard: with the only headroom candidate stale, pass 1b still
+// accepts it. Freshness may reorder the walk, never veto it — an exhausted
+// active must keep its escape (2026-06-28 target asymmetry).
+#[test]
+fn next_target_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".to_string())),
+        "freshness is a preference, not a gate: the stale escape must stay open"
+    );
+}
+
+#[test]
+fn auto_switch_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert!(
+        snap.fresh.is_empty(),
+        "snapshot_chain cannot know freshness"
+    );
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "freshness is a preference, not a gate: the stale escape must stay open"
+    );
 }
 
 // Broken active with NO viable member: stays put. Wrap-off in particular must

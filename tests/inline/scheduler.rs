@@ -1111,6 +1111,70 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
     );
 }
 
+/// The scan fills `ChainSnapshot::fresh`, which `snapshot_chain` cannot: config
+/// carries no freshness and `Profile.fetch_status` is written by the UI thread
+/// only, so the daemon reads it stale. Without this fill the store twin's
+/// fresh-preference pass matches nothing and silently degrades to walk order.
+#[test]
+fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
+    use super::{FetchStatus, PendingSwitch, StatusStore, scan_auto_switch};
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let live = |utilization: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    // Spent active; both siblings read as headroom, but only c's read is live.
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), live(100.0)),
+        ("b".to_string(), live(10.0)),
+        ("c".to_string(), live(20.0)),
+    ])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), FetchStatus::Fresh),
+        ("b".to_string(), FetchStatus::Cached),
+        ("c".to_string(), FetchStatus::Fresh),
+    ])));
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into(), "c".into()],
+            fallback_chain: vec!["a".into(), "b".into(), "c".into()],
+            ..AppState::default()
+        },
+        profiles: vec![
+            Profile::new("a".to_string(), None, None),
+            Profile::new("b".to_string(), None, None),
+            Profile::new("c".to_string(), None, None),
+        ],
+    }));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    scan_auto_switch(
+        &config,
+        &store,
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &pending,
+        &Arc::new(RankedMutex::new(false)),
+    );
+    let queued = pending.lock().unwrap();
+    assert!(
+        queued.contains("c"),
+        "the scan must fill `fresh` so the walk prefers c's trusted read; queued: {:?}",
+        *queued
+    );
+    assert!(
+        !queued.contains("b"),
+        "b is reached first but its read is Cached — walk order must not win"
+    );
+}
+
 /// RLS-1 (the RateLimited analogue of AUTH-4): a **deep-slot stuck RateLimited**
 /// active bypasses the freshness gate so the daemon stops wedging on a
 /// rate-limited account — but, unlike auth-broken, the switch still faces the
