@@ -20,7 +20,7 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    active_pill, bold_when, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
+    bold_when, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
     invalid_tooltip_lines, key_cell, label_style, name_color, section_box, section_box_verbatim,
     select_line, selector_width, wrap_words,
 };
@@ -169,7 +169,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-/// Priority + `[ active ]` pill, 5h gauge with threshold tick, headroom figure, and the
+/// Priority, 5h gauge with threshold tick, headroom figure, and the
 /// inline `rotate at` threshold stepper/editor + `last resort` toggle + `remove` rows.
 /// Caret only when focused.
 #[allow(clippy::too_many_arguments)]
@@ -197,25 +197,16 @@ fn member_detail(
         .as_ref()
         .and_then(|u| u.five_hour.as_ref())
         .map(|w| w.utilization);
-    let active = cfg.is_active(name);
     let cursor = row_cursor.min(FALLBACK_ROWS.len() - 1);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // `priority` — position in the chain (order = priority).
     let value = format!("#{} of {chain_len}", index + 1);
-    let mut priority_spans = vec![
+    lines.push(Line::from(vec![
         Span::styled(key_cell("priority", KEY_W, KEY_GUTTER), theme::label()),
-        Span::styled(value.clone(), theme::body()),
-    ];
-    if active {
-        let left_w = KEY_W + KEY_GUTTER + value.chars().count();
-        let indicator_w = "[ active ]".chars().count(); // 10
-        let pad = width.saturating_sub(left_w).saturating_sub(indicator_w);
-        priority_spans.push(Span::raw(" ".repeat(pad)));
-        priority_spans.extend(active_pill());
-    }
-    lines.push(Line::from(priority_spans));
+        Span::styled(value, theme::body()),
+    ]));
     lines.push(Line::from(""));
 
     // `5h usage` — gauge lives on the kv key row (matching `priority` / `rotate

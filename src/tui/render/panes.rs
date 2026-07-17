@@ -96,24 +96,16 @@ pub(super) fn select_line(
     }
 }
 
-/// Orange for the active profile, plain text otherwise.
+/// Orange for the active profile, plain text otherwise. This is the app's only
+/// active-account marker: cloudy-tui takes the `ACCENT_2` name and the
+/// `[ active ]` pill as two spellings of one signal, so the detail panes carry
+/// neither, and the selector's orange name speaks for the whole screen.
 pub(super) fn name_color(active: bool) -> Style {
     if active {
         Style::default().fg(theme::accent_2_color())
     } else {
         Style::default().fg(theme::text_color())
     }
-}
-
-/// `[ active ]` status pill: the active-account marker shared by usage, setup,
-/// and fallback detail panes (cloudy-tui status pill — brackets dim, label
-/// accent + bold).
-pub(super) fn active_pill() -> Vec<Span<'static>> {
-    vec![
-        Span::styled("[ ", theme::dim()),
-        Span::styled("active", theme::accent().add_modifier(Modifier::BOLD)),
-        Span::styled(" ]", theme::dim()),
-    ]
 }
 
 pub(super) fn picker_row(

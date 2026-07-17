@@ -208,7 +208,7 @@ fn empty_msg_pending_fetch_loads() {
     assert_eq!(oauth_empty_msg(&profile), "loading");
 }
 
-/// A kick-429 block pins its own `[ window blocked ]` pill on the row, even
+/// A kick-429 block pins its own `[ blocked ]` pill on the row, even
 /// while the fetch status reads Fresh — `/usage` stayed 200 through the whole
 /// 2026-07-15 messages-limiter outage, so no fetch-status pill can carry this.
 /// The suffix names the limiter's advertised ceiling when one was given.
@@ -219,23 +219,32 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.fetch_status = Some(FetchStatus::Fresh);
     let header = |kick_block: Option<KickBlock>| HeaderState {
-        is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block,
     };
-    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
-    let clean = text(status_line(&profile, &header(None)));
+    let clean = text(status_lines(&profile, &header(None)));
     assert!(
-        !clean.contains("window blocked"),
+        !clean.contains("blocked"),
         "no block → no pill, got {clean:?}"
     );
 
     let now = now_epoch_secs();
-    let blocked = text(status_line(
+    let blocked = text(status_lines(
         &profile,
         &header(Some(KickBlock {
             streak: 2,
@@ -244,13 +253,13 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
             next_retry: now + 30,
         })),
     ));
-    assert!(blocked.contains("window blocked"), "got {blocked:?}");
+    assert!(blocked.contains("[ blocked ]"), "got {blocked:?}");
     assert!(
         blocked.contains("lifts within"),
         "an advertised ceiling names itself, got {blocked:?}"
     );
 
-    let no_ceiling = text(status_line(
+    let no_ceiling = text(status_lines(
         &profile,
         &header(Some(KickBlock {
             streak: 1,
@@ -259,11 +268,82 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
             next_retry: now + 10,
         })),
     ));
-    assert!(no_ceiling.contains("window blocked"));
+    assert!(no_ceiling.contains("[ blocked ]"));
     assert!(
         !no_ceiling.contains("lifts within"),
         "no ceiling → no made-up deadline, got {no_ceiling:?}"
     );
+}
+
+/// The block owns the top line and the fetch state drops below it, indented to
+/// the value column. Both halves shipped broken behind `contains` assertions:
+/// the pill appended straight onto the countdown (`refresh in 14s[ window
+/// blocked ]`) because the separator lived inside each suffix's own format
+/// string, and at full spread the one-line row ran 83 cells against a detail
+/// pane that clears 80 only past a ~123-column terminal, clipping the ceiling
+/// off with no wrap. Assert the shape, not just the words.
+#[test]
+fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
+    use crate::usage::KickBlock;
+
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::RateLimited);
+    let now = now_epoch_secs();
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 14_000),
+            tick: 0,
+            streaks: StreakCounts {
+                rate_limit: 3,
+                refresh_fail: 0,
+            },
+            kick_block: Some(KickBlock {
+                streak: 2,
+                rejected: true,
+                until: Some(now + 4 * 60 * 60),
+                next_retry: now + 30,
+            }),
+        },
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    assert_eq!(lines.len(), 2, "block + fetch state, got {lines:?}");
+    assert!(
+        lines[0].starts_with("status") && lines[0].contains("[ blocked ]"),
+        "the block leads, keyed: {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with(&" ".repeat(KEY_W + KEY_GUTTER)),
+        "the fetch line indents to the value column: {:?}",
+        lines[1]
+    );
+    assert!(
+        lines[1].trim_start().starts_with("[ rate limited ]"),
+        "the fetch pill opens its own line: {:?}",
+        lines[1]
+    );
+
+    // The glue this file could not see before: no segment may touch its
+    // neighbour. Every `]` and every countdown is followed by a real gap.
+    for l in &lines {
+        assert!(!l.contains("]["), "pills must not abut each other: {l:?}");
+        assert!(!l.contains("s["), "a countdown must not abut a pill: {l:?}");
+    }
+
+    // Each line has to survive the narrowest pane the layout builds: an 80-col
+    // terminal yields a 24-cell selector, leaving 52 inner cells here.
+    for l in &lines {
+        assert!(
+            l.chars().count() <= 52,
+            "line clips at 80 cols ({} cells): {l:?}",
+            l.chars().count()
+        );
+    }
 }
 
 /// The `[ rate limited ]` suffix names which retry the countdown leads to
@@ -274,7 +354,6 @@ fn rate_limited_suffix_counts_the_retry() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.fetch_status = Some(FetchStatus::RateLimited);
     let header = |streak: u32| HeaderState {
-        is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -284,10 +363,20 @@ fn rate_limited_suffix_counts_the_retry() {
         },
         kick_block: None,
     };
-    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
-    assert!(text(status_line(&profile, &header(7))).contains("7th retry in"));
-    let bare = text(status_line(&profile, &header(0)));
+    assert!(text(status_lines(&profile, &header(7))).contains("7th retry in"));
+    let bare = text(status_lines(&profile, &header(0)));
     assert!(bare.contains("retry in"));
     assert!(
         !bare.contains("th retry"),
@@ -305,7 +394,6 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.fetch_status = Some(FetchStatus::Cached);
     let header = |refresh_fail: u32| HeaderState {
-        is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -315,10 +403,20 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
         },
         kick_block: None,
     };
-    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
     // No failures: the plain cached row, counting down to a usage refresh.
-    let healthy = text(status_line(&profile, &header(0)));
+    let healthy = text(status_lines(&profile, &header(0)));
     assert!(healthy.contains("cached"), "got {healthy:?}");
     assert!(healthy.contains("refresh in"));
     assert!(
@@ -328,7 +426,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
 
     // Failing: the pill names the cause and the countdown becomes a retry
     // ordinal, since it now leads to the next REFRESH attempt, not a poll.
-    let failing = text(status_line(&profile, &header(3)));
+    let failing = text(status_lines(&profile, &header(3)));
     assert!(failing.contains("auth failing"), "got {failing:?}");
     assert!(failing.contains("3rd retry in"), "got {failing:?}");
     assert!(
@@ -345,15 +443,14 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
 #[test]
 fn a_streak_pill_turns_red_only_once_it_is_stuck() {
     let pill_style = |profile: &Profile, header: &HeaderState| {
-        status_line(profile, header)
-            .spans
+        status_lines(profile, header)
             .iter()
+            .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains("rate limited") || s.content.contains("auth failing"))
             .map(|s| s.style)
             .expect("a streak pill")
     };
     let header = |streaks: StreakCounts| HeaderState {
-        is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -403,9 +500,18 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
 /// "up to date".
 #[test]
 fn spent_skipped_account_names_its_reset() {
-    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let header = HeaderState {
-        is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -425,7 +531,7 @@ fn spent_skipped_account_names_its_reset() {
         p
     };
 
-    let spent = text(status_line(&with_window(100.0), &header));
+    let spent = text(status_lines(&with_window(100.0), &header));
     assert!(
         spent.contains("[ spent ]") && spent.contains("resets in"),
         "a spent skipped account renders a pill naming its reset: {spent}"
@@ -435,7 +541,7 @@ fn spent_skipped_account_names_its_reset() {
         "must not freeze at a stale 0s: {spent}"
     );
 
-    let below = text(status_line(&with_window(50.0), &header));
+    let below = text(status_lines(&with_window(50.0), &header));
     assert!(
         below.contains("up to date"),
         "a below-cap idle account with no scheduled refresh is up to date: {below}"

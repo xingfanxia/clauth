@@ -14,7 +14,7 @@ use super::super::app::App;
 use super::super::theme;
 use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
 use super::panes::{
-    active_pill, draw_profile_selector, key_cell, section_box, section_box_verbatim, selector_width,
+    draw_profile_selector, key_cell, section_box, section_box_verbatim, selector_width,
 };
 use crate::format::plan_label;
 use crate::profile::Profile;
@@ -30,7 +30,6 @@ const KEY_GUTTER: usize = 2;
 
 /// Runtime state gathered once under locks; keeps line builders lock-free.
 struct HeaderState {
-    is_active: bool,
     activity: ProfileActivity,
     next_refresh_ms: Option<u64>,
     tick: u64,
@@ -97,7 +96,6 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // `config` (via `cfg`) is outer of activity/refresh-timer in lock order.
     let header = HeaderState {
-        is_active: cfg.is_active(&profile.name),
         activity: app
             .activity
             .lock()
@@ -139,7 +137,7 @@ fn build_usage_lines(
     show_pace: bool,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.extend(header_lines(profile, inner_w, header));
+    lines.extend(header_lines(profile, header));
     lines.push(Line::from(""));
 
     // Api-key/provider accounts (recognised or generic) render via the third-party
@@ -660,7 +658,7 @@ fn bar_spans(
     spans
 }
 
-fn header_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Line<'static>> {
+fn header_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
     let plan = profile
         .third_party_usage
         .as_ref()
@@ -679,33 +677,52 @@ fn header_lines(profile: &Profile, inner_w: u16, header: &HeaderState) -> Vec<Li
                 "api".to_string()
             }
         });
-    let mut plan_spans = vec![key_span("plan"), Span::styled(plan.clone(), theme::body())];
-    if header.is_active {
-        // "[ active ]" = 10 chars; left side = key block + plan chars; pad the gap.
-        let left_w = KEY_W + KEY_GUTTER + plan.chars().count();
-        let indicator_w = "[ active ]".chars().count(); // 10
-        let pad = (inner_w as usize)
-            .saturating_sub(left_w)
-            .saturating_sub(indicator_w);
-        plan_spans.push(Span::raw(" ".repeat(pad)));
-        plan_spans.extend(active_pill());
-    }
-
-    let mut lines = vec![Line::from(plan_spans)];
-    lines.push(status_line(profile, header));
+    let mut lines = vec![Line::from(vec![
+        key_span("plan"),
+        Span::styled(plan, theme::body()),
+    ])];
+    lines.extend(status_lines(profile, header));
     lines
 }
 
-fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
-    let key = key_span("status");
-
+/// The `status` row: a kick-429 block line on top when one is live, then the
+/// fetch state / refresh countdown. Two lines, because at full spread
+/// (`[ rate limited ]  3rd retry in 14s  [ blocked ]  lifts within 4h 37m`) one
+/// line runs 78 cells — the detail pane clears that only past a ~116-column
+/// terminal, and this `Paragraph` has no wrap, so the ceiling silently clipped
+/// off.
+fn status_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
     if !matches!(header.activity, ProfileActivity::Idle) {
         let frame = spinner_frame(header.tick);
         let verb = activity_verb(header.activity);
-        return Line::from(vec![
-            key,
+        return vec![Line::from(vec![
+            key_span("status"),
             Span::styled(format!("{frame} {verb}"), spinner_style(header.activity)),
-        ]);
+        ])];
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Kick-429 block leads, and is additive to whatever the fetch state says:
+    // `/usage` can stay Fresh straight through a messages-limiter outage, so the
+    // fetch line below reads healthy while the 5h window silently never opens.
+    // Same amber→red escalation as the other streak pills; the suffix names the
+    // limiter's advertised ceiling, an upper bound (it has relented early).
+    if let Some(block) = header.kick_block {
+        let mut spans = vec![
+            key_span("status"),
+            Span::styled("[ ", theme::dim()),
+            Span::styled("blocked", streak_style(block.streak)),
+            Span::styled(" ]", theme::dim()),
+        ];
+        if let Some(until) = block.until {
+            let left = until.saturating_sub(now_epoch_secs());
+            spans.push(Span::styled(
+                format!("  lifts within {}", crate::usage::humanize_duration(left)),
+                theme::faint(),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     let countdown = header.next_refresh_ms.map(|next| {
@@ -713,7 +730,11 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
         format!("{secs}s")
     });
 
-    let mut spans = vec![key];
+    // The fetch line takes the key cell only when no block line claimed it.
+    let mut spans = vec![match lines.is_empty() {
+        true => key_span("status"),
+        false => Span::raw(" ".repeat(KEY_W + KEY_GUTTER)),
+    }];
     match profile.fetch_status {
         Some(FetchStatus::Failed) => {
             spans.extend([
@@ -776,7 +797,12 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
             }
         }
         _ => match countdown {
-            Some(c) => spans.push(Span::styled(format!("↻ refresh in {c}"), theme::faint())),
+            // A scheduled refresh is work lined up — the cloudy-tui `queued`
+            // dot (`◌` in ACCENT), not a spinner: nothing is running yet.
+            Some(c) => spans.extend([
+                Span::styled("◌ ", theme::accent()),
+                Span::styled(format!("refresh in {c}"), theme::dim()),
+            ]),
             None => {
                 // No scheduled refresh means `refresh_spent_accounts` is OFF and
                 // this account is spent — skipped until its window resets. Render
@@ -798,31 +824,19 @@ fn status_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
                             theme::faint(),
                         ),
                     ]),
-                    None => spans.push(Span::styled("↻ up to date", theme::faint())),
+                    // Nothing pending and nothing maxed — the `idle` dot, which
+                    // differs from `queued` above by color alone, so the label
+                    // carries the meaning on a monochrome read.
+                    None => spans.extend([
+                        Span::styled("◌ ", theme::dim()),
+                        Span::styled("up to date", theme::dim()),
+                    ]),
                 }
             }
         },
     }
-    // Kick-429 block pill, additive to whatever the fetch status said: `/usage`
-    // can stay Fresh straight through a messages-limiter outage, so without
-    // this the row looks healthy while the 5h window silently never opens.
-    // Same amber→red escalation as the other streak pills; the suffix names the
-    // limiter's advertised ceiling, an upper bound (it has relented early).
-    if let Some(block) = header.kick_block {
-        spans.extend([
-            Span::styled("[ ", theme::dim()),
-            Span::styled("window blocked", streak_style(block.streak)),
-            Span::styled(" ]", theme::dim()),
-        ]);
-        if let Some(until) = block.until {
-            let left = until.saturating_sub(now_epoch_secs());
-            spans.push(Span::styled(
-                format!("  lifts within {}", crate::usage::humanize_duration(left)),
-                theme::faint(),
-            ));
-        }
-    }
-    Line::from(spans)
+    lines.push(Line::from(spans));
+    lines
 }
 
 /// Pill style for a consecutive-failure streak. Amber while it may still be a

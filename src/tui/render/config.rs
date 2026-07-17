@@ -15,9 +15,8 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    active_pill, cycle_option, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
-    key_cell, label_style, name_color, picker_row, section_box, section_box_verbatim,
-    selector_width,
+    cycle_option, draw_selector_list, head_cols, help_tooltip_lines, highlight_row, key_cell,
+    label_style, name_color, picker_row, section_box, section_box_verbatim, selector_width,
 };
 
 const KEY_W: usize = 11;
@@ -82,7 +81,6 @@ struct Snap {
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
     auto_start: bool,
-    is_active: bool,
     /// Whether the profile holds a stored credential — the OAuth token or, for an
     /// API account, the api key. Drives the `Login` row's re-login vs first-login
     /// label and the `DeleteCreds` row's presence.
@@ -113,7 +111,6 @@ impl Snap {
             subagent: String::new(),
             env: Vec::new(),
             auto_start: false,
-            is_active: false,
             logged_in: false,
             login_is_oauth: true,
             captured: false,
@@ -143,7 +140,6 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
     }
     match cfg.profiles.get(app.profile_cursor) {
         Some(p) => Snap {
-            is_active: cfg.is_active(&p.name),
             title: p.name.to_string(),
             name: if with_text {
                 p.name.to_string()
@@ -221,21 +217,10 @@ fn draw_settings_rows(
         ("OAuth", theme::accent())
     };
 
-    let mut type_spans = vec![
+    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
         Span::styled(key_cell("type", KEY_W, KEY_GUTTER), theme::label()),
         Span::styled(type_value, type_style),
-    ];
-    if snap.is_active {
-        // "[ active ]" = 10 chars; left side = key block + type_value chars; pad the gap.
-        let left_w = KEY_W + KEY_GUTTER + type_value.chars().count();
-        let indicator_w = "[ active ]".chars().count(); // 10
-        let pad = (inner.width as usize)
-            .saturating_sub(left_w)
-            .saturating_sub(indicator_w);
-        type_spans.push(Span::raw(" ".repeat(pad)));
-        type_spans.extend(active_pill());
-    }
-    let mut lines: Vec<Line<'static>> = vec![Line::from(type_spans)];
+    ])];
 
     // Provider row — only for recognised third-party providers. Hidden while a
     // draft empties the base-url buffer (`is_api` tracks the draft live).
