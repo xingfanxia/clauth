@@ -471,16 +471,17 @@ fn max_spend_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
 /// Hint under the `max spend` field, naming whichever half of the opt-in is
 /// currently holding spending back. Both are required, so a ceiling alone reads
 /// as armed while doing nothing — that is the reading this line exists to stop.
+/// Spend budget off makes the row inert (dimmed) whatever the ceiling, so that
+/// case names the gate regardless of the ceiling value.
 fn max_spend_hint(cfg: &AppConfig, ceiling: f64) -> String {
-    match (cfg.state.spend_budget_switching, ceiling > 0.0) {
-        (true, true) => {
-            format!("may spend up to ${ceiling:.2} here once every account is spent")
-        }
-        (false, true) => {
-            "ignored: turn on `spend budget` in the config tab to allow spending".to_string()
-        }
-        (true, false) => "never spends here; type a ceiling to allow it".to_string(),
-        (false, false) => "never spends here".to_string(),
+    if !cfg.state.spend_budget_switching {
+        return "inert until spend budget is on (config); then a ceiling caps spending here"
+            .to_string();
+    }
+    if ceiling > 0.0 {
+        format!("may spend up to ${ceiling:.2} here once every account is spent")
+    } else {
+        "never spends here; type a ceiling to allow it".to_string()
     }
 }
 
@@ -555,11 +556,16 @@ fn detail_row(
             ])
         }
         FallbackRow::MaxSpend => {
-            // Inert until the chain-wide `spend budget` is on: dim the key + value
-            // then (cloudy-tui disabled row) so a ceiling never reads as armed
-            // while nothing can spend. The `max_spend_hint` names the holding half;
-            // the row stays editable so a ceiling can be pre-set.
+            // Inert until the chain-wide `spend budget` is on: render the whole row
+            // faint (cloudy-tui disabled row) so a ceiling never reads as armed
+            // while nothing can spend, and the key handler no-ops it. The
+            // `max_spend_hint` names the holding half.
             let dimmed = !spend_budget && editing.is_none();
+            let arrow = if dimmed && selected {
+                Span::styled("❯ ", theme::faint())
+            } else {
+                arrow
+            };
             let key_style = if dimmed {
                 theme::faint()
             } else {

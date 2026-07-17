@@ -148,11 +148,11 @@ fn row_hint(
             }
         },
         GlobalConfigRow::RefreshInterval => {
-            "how often usage is refreshed for every account. default 90s"
+            "how often usage is refreshed for every account (default 90s)"
         }
         GlobalConfigRow::WeeklyThreshold => {
-            "soft switch-early line on the 7d window: a member past it is handed off but still \
-             serves (100% = only at the hard cap). default 98%"
+            "soft switch-early line on the 7d window (default 98%): a member past it is handed off \
+             but still serves; 100% = only at the hard cap"
         }
         GlobalConfigRow::SwitchOffWhenSpent => {
             if toggles.switch_off_when_spent {
@@ -483,14 +483,13 @@ fn cycle_row(
 }
 
 /// A cloudy-tui Disabled row for a cycle setting another toggle makes inert: the
-/// key + current value render `TEXT_FAINT` (no bracket highlight, just the
-/// current value). The focus caret stays `ACCENT` so focus is still visible; the
-/// faint content is what reads as inert. The `draw` loop still tints + shows the
-/// `└` reason on focus, and (house call) the row stays editable so a value can be
-/// pre-set before the gating toggle is armed.
+/// whole row (caret, key, current value) renders `TEXT_FAINT`, no bracket
+/// highlight — just the current value. Focusable but inert (the key handler
+/// no-ops it), so `TEXT_FAINT` keeps meaning "can't touch this". The `draw` loop
+/// still tints + shows the `└` reason on focus.
 fn dimmed_cycle_row(key: &str, options: &[(&str, bool)], selected: bool) -> Line<'static> {
     let arrow = if selected {
-        Span::styled("❯ ", theme::accent())
+        Span::styled("❯ ", theme::faint())
     } else {
         Span::raw("  ")
     };

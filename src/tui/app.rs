@@ -3541,7 +3541,13 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
         GlobalConfigRow::SpendBudget => toggle_spend_budget_switching(app),
-        GlobalConfigRow::SwitchOffWhenBudgetSpent => toggle_budget_wrap_off(app),
+        // Inert while spend budget is off (rendered dimmed): decides no halt when
+        // nothing spends, so it stays a true disabled row — the key is a no-op.
+        GlobalConfigRow::SwitchOffWhenBudgetSpent => {
+            if app.config().state.spend_budget_switching {
+                toggle_budget_wrap_off(app);
+            }
+        }
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
     }
@@ -4101,7 +4107,10 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
         }
         FallbackRow::LastResort => toggle_last_resort(app),
         FallbackRow::MaxSpend => {
-            if let Some(current) = selected_max_spend(app) {
+            // Inert while spend budget is off (rendered dimmed): opening the editor
+            // would let a ceiling be typed that does nothing, so no-op.
+            let armed = app.config().state.spend_budget_switching;
+            if armed && let Some(current) = selected_max_spend(app) {
                 app.fallback_max_spend_draft = Some(InputState::new(&format!("{current:.2}")));
             }
         }

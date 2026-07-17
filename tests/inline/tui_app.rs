@@ -1923,6 +1923,12 @@ fn budget_wrap_off_space_toggles_and_persists() {
         "...while `quota spent` defaults the other way, since staying is free there"
     );
 
+    // `money spent` is inert (dimmed) until spend budget is armed — arm it first,
+    // then space toggles it.
+    {
+        let mut cfg = app.config();
+        cfg.state.spend_budget_switching = true;
+    }
     super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
     assert!(
         !app.config().state.switch_off_when_budget_spent,
@@ -1941,6 +1947,38 @@ fn budget_wrap_off_space_toggles_and_persists() {
     assert!(
         !reloaded.switch_off_when_budget_spent,
         "toggle persists to disk"
+    );
+}
+
+// `money spent` decides no halt while spend budget is off (nothing spends), so
+// it renders dimmed AND is a true disabled row: space/⏎ must no-op, or `faint`
+// would stop meaning "inert".
+#[test]
+fn money_spent_is_inert_while_spend_budget_is_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    assert!(
+        !app.config().state.spend_budget_switching,
+        "spend budget off by default — the money-spent row is inert"
+    );
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SwitchOffWhenBudgetSpent)
+        .unwrap();
+    let before = app.config().state.switch_off_when_budget_spent;
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.switch_off_when_budget_spent,
+        before,
+        "space must not cycle an inert row"
+    );
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config().state.switch_off_when_budget_spent,
+        before,
+        "enter must not cycle an inert row either"
     );
 }
 
@@ -2586,6 +2624,8 @@ fn fallback_max_spend_editor_types_and_persists() {
     app.fallback_focus = super::FallbackFocus::Detail;
     app.chain_cursor = 0;
     app.fallback_detail_cursor = max_spend_row();
+    // The ceiling is inert (editor won't open) until spend budget is armed.
+    app.config().state.spend_budget_switching = true;
     assert_eq!(
         app.config().find("a").and_then(|p| p.max_auto_spend),
         None,
@@ -2613,6 +2653,28 @@ fn fallback_max_spend_editor_types_and_persists() {
     );
 }
 
+// The ceiling is inert (dimmed) while spend budget is off — a typed value would
+// do nothing, so ⏎ must not open the editor.
+#[test]
+fn fallback_max_spend_editor_is_inert_while_spend_budget_is_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = max_spend_row();
+    assert!(
+        !app.config().state.spend_budget_switching,
+        "spend budget off by default — the ceiling row is inert"
+    );
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.fallback_max_spend_draft.is_none(),
+        "⏎ must not open the editor while the row is inert"
+    );
+}
+
 // A rejected value keeps the field open rather than toasting — the same
 // no-toast treatment `rotate at` uses — so the inline invalid styling stays on
 // screen until corrected, and nothing is written.
@@ -2624,6 +2686,7 @@ fn fallback_max_spend_editor_refuses_an_infinite_ceiling() {
     app.fallback_focus = super::FallbackFocus::Detail;
     app.chain_cursor = 0;
     app.fallback_detail_cursor = max_spend_row();
+    app.config().state.spend_budget_switching = true;
 
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
     // Seeded with "0.00"; clear it, then type the trap.
