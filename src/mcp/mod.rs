@@ -183,7 +183,14 @@ past `delegate` calls; \
                 };
                 serde_json::json!({
                     "name": name,
-                    "active": config.is_active(name),
+                    // Per-slot truth (CDX-1): a codex profile reports the
+                    // codex slot, a claude profile the claude slot.
+                    "active": if p.is_codex() {
+                        config.is_active_codex(name)
+                    } else {
+                        config.is_active(name)
+                    },
+                    "harness": if p.is_codex() { "codex" } else { "claude" },
                     "provider": provider_label(p),
                     "base_url": p.base_url,
                     "tier": tier_label(p),
