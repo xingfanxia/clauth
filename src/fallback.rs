@@ -55,6 +55,55 @@ fn live_five_hour(profile: &Profile) -> Option<&UsageWindow> {
 /// a member is spent while that member still serves requests.
 pub(crate) const WEEKLY_HARD_BLOCK_PCT: f64 = 100.0;
 
+/// Fraction of the binding spend cap a member may reach and still be picked for
+/// spend reasons. The 10% slack is poll drift insurance: utilization is sampled
+/// on a cadence, not streamed, so a member picked AT its cap would overshoot it
+/// before the next read lands. Real money, so the margin errs low.
+const SPEND_ARM_FRACTION: f64 = 0.90;
+
+/// Dollars this member may still spend automatically, or `None` when it may not
+/// spend at all. Both halves of the opt-in must be set (`budget_on` chain-wide,
+/// a `ceiling > 0` on the member) AND the account must actually be billing
+/// pay-as-you-go.
+///
+/// `enabled` is the honest field here, NOT [`crate::usage::SpendInfo::is_visible`]:
+/// that one answers "is a spend bar worth rendering" and is true for an account
+/// carrying a stale limit with billing switched OFF (observed live 2026-07-17).
+/// Arming on it would hop the chain into an account that refuses the request,
+/// with money attached.
+///
+/// The cap is whichever binds first — the account's own limit or the member's
+/// ceiling. An account with billing on but no declared limit is bounded by the
+/// ceiling alone; that is the point of the ceiling.
+fn spend_room(spend: &crate::usage::SpendInfo, ceiling: f64) -> Option<f64> {
+    // `is_finite` is load-bearing, not decoration: `max_auto_spend = inf` is
+    // valid TOML, and an infinite ceiling with no account cap yields infinite
+    // room — unlimited unattended spending. NaN would slip a plain `<= 0.0`
+    // (every NaN comparison is false) and then `f64::min(NaN, cap)` returns the
+    // cap, arming at the account's full limit. The load boundary normalizes
+    // both away; this refuses them again for any other construction path.
+    if !spend.enabled || !ceiling.is_finite() || ceiling <= 0.0 {
+        return None;
+    }
+    let cap = match spend.limit {
+        Some(limit) => limit.min(ceiling),
+        None => ceiling,
+    };
+    let room = SPEND_ARM_FRACTION * cap - spend.used.unwrap_or(0.0);
+    (room > 0.0).then_some(room)
+}
+
+/// [`spend_room`] over a member's usage snapshot: true when the chain may pick
+/// it purely to spend money. Never consulted until every subscription member
+/// with free quota has been passed over — see [`next_target`].
+fn spend_armed(usage: Option<&crate::usage::UsageInfo>, budget_on: bool, ceiling: f64) -> bool {
+    budget_on
+        && usage
+            .and_then(|u| u.spend.as_ref())
+            .and_then(|s| spend_room(s, ceiling))
+            .is_some()
+}
+
 /// Whether `info`'s live weekly window is past `weekly_pct` — treated as
 /// spent until the weekly reset regardless of anything the 5h window says.
 /// The line is a SOFT one below the API's 100% refusal cap, gating BOTH
@@ -247,6 +296,9 @@ pub(crate) struct ChainMember {
     /// decoupled from `threshold` (issue #8 follow-up: a threshold no longer
     /// doubles as a sink marker).
     pub(crate) last_resort: bool,
+    /// Mirrors `Profile::max_auto_spend` in dollars, `0` when unset — the
+    /// member's own ceiling on unattended pay-as-you-go spending.
+    pub(crate) max_spend: f64,
 }
 
 /// In-memory snapshot of the fields `next_auto_switch_target` needs: active
@@ -275,6 +327,10 @@ pub(crate) struct ChainSnapshot {
     /// Snapshot of `AppState::weekly_switch_threshold_pct()` — the chain-wide
     /// weekly (7d) exhaustion line both walk directions gate on.
     pub(crate) weekly_pct: f64,
+    /// Snapshot of `AppState::spend_budget_switching` — the master half of the
+    /// real-money opt-in. Off (the default) makes the spend pass inert whatever
+    /// any member's ceiling says.
+    pub(crate) spend_budget: bool,
     /// Members whose 5h auto-start kick the messages limiter is REJECTING
     /// (switch-grade `KickBlock`s: the limiter's own `rejected` verdict, ≥2
     /// consecutive kicks, advertised ceiling still ahead). Not config state —
@@ -312,6 +368,7 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
                 name: name.to_string(),
                 threshold: profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD),
                 last_resort: profile.is_some_and(|p| p.last_resort),
+                max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
             }
         })
         .collect();
@@ -328,6 +385,7 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
         burn_aware: config.state.burn_aware_switching,
         interval_ms: config.state.refresh_interval_ms,
         weekly_pct: config.state.weekly_switch_threshold_pct(),
+        spend_budget: config.state.spend_budget_switching,
         kick_rejected: Vec::new(),
         fresh: Vec::new(),
     })
@@ -474,6 +532,22 @@ pub(crate) fn next_target(
         return Some(SwitchAction::To(name));
     }
 
+    // Spend-armed members rank PRE-last-resort: every member above still had
+    // free subscription quota, so reaching here means paying is the only way
+    // forward. Ranked above `last_resort` parking and wrap-off because both of
+    // those stop work outright, and an operator who set a ceiling asked to keep
+    // working. Opt-in twice over (see `spend_armed`), so stock chains skip this.
+    let spend_budget = config.state.spend_budget_switching;
+    if let Some(name) = walk(&|p| {
+        spend_armed(
+            p.usage.as_ref(),
+            spend_budget,
+            p.max_auto_spend.unwrap_or(0.0),
+        )
+    }) {
+        return Some(SwitchAction::To(name));
+    }
+
     // Only fall back to a `last_resort` member when the active profile is NOT
     // itself marked `last_resort`. Two last-resort members switching to each
     // other indefinitely gains nothing — one migration is fine, but the next
@@ -587,6 +661,17 @@ pub(crate) fn next_auto_switch_target(
     if let Some(name) =
         walk(&|m| !is_exhausted_from_store(&m.name, m.threshold, store, snapshot.weekly_pct))
     {
+        return Some(SwitchAction::To(name));
+    }
+
+    // Spend-armed pass, lockstep with [`next_target`]: pre-last-resort, and the
+    // spend block rides the store's `UsageInfo` exactly like utilization does.
+    if let Some(name) = walk(&|m| {
+        store
+            .lock()
+            .ok()
+            .is_some_and(|s| spend_armed(s.get(&m.name), snapshot.spend_budget, m.max_spend))
+    }) {
         return Some(SwitchAction::To(name));
     }
 

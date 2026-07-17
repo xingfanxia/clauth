@@ -163,6 +163,12 @@ pub(crate) struct Profile {
     /// headroom (issue #8 follow-up: a threshold no longer doubles as a sink
     /// marker).
     pub(crate) last_resort: bool,
+    /// Ceiling in US dollars on what the auto-switch chain may spend of this
+    /// account's pay-as-you-go budget on its own (fallback chain only, and only
+    /// while `AppState::spend_budget_switching` is on). `None`/`0` — the
+    /// default — means the chain never picks this member for spend reasons, so
+    /// stock behavior costs nothing. See `fallback::spend_armed`.
+    pub(crate) max_auto_spend: Option<f64>,
     /// Utilization % at/above which a bell toast fires in the overview tab.
     /// None = no bell for this profile.
     pub(crate) bell_threshold: Option<f64>,
@@ -187,6 +193,7 @@ impl Profile {
             models: ModelSettings::default(),
             fallback_threshold: None,
             last_resort: false,
+            max_auto_spend: None,
             bell_threshold: None,
             credentials: None,
             usage: None,
@@ -272,6 +279,15 @@ pub(crate) struct AppState {
     /// either way — see `fallback::is_exhausted_active`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) burn_aware_switching: bool,
+    /// Opt-in master switch for spending real money: when on, the auto-switch
+    /// chain may pick a member whose subscription windows are spent but whose
+    /// account still has pay-as-you-go budget, bounded by that member's
+    /// `Profile::max_auto_spend` ceiling. Off by default, and every ceiling
+    /// defaults to `$0`, so BOTH halves must be set before a cent is spent
+    /// unattended. Spend-armed members rank below every subscription member
+    /// with free quota — see `fallback::next_target`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) spend_budget_switching: bool,
     /// Opt-in: rotate the ACTIVE, Keychain-installed profile ahead of its
     /// access-token expiry instead of waiting for a 401 (rotation coherence,
     /// #1). Off by default — stock clauth stays strictly lazy. Adoption plus
@@ -402,6 +418,7 @@ impl Default for AppState {
             wrap_off: false,
             auth_broken: Vec::new(),
             burn_aware_switching: false,
+            spend_budget_switching: false,
             preemptive_rotation: false,
             auto_rescue: false,
             refresh_spent_accounts: true,
@@ -568,6 +585,8 @@ struct ProfileConfig {
     fallback_threshold: Option<f64>,
     #[serde(default)]
     last_resort: bool,
+    #[serde(default)]
+    max_auto_spend: Option<f64>,
     #[serde(default)]
     bell_threshold: Option<f64>,
 }
@@ -974,6 +993,14 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
         models: config.models,
         fallback_threshold: config.fallback_threshold.map(|v| v.clamp(0.0, 100.0)),
         last_resort: config.last_resort,
+        // Normalize at the LOAD boundary so the on-disk value is never a live
+        // trap for a direct reader (the 2026-07-14 weekly-line lesson). `inf`
+        // and `nan` are both valid TOML floats, and an infinite ceiling means
+        // unlimited unattended spending — so anything non-finite reads as $0,
+        // the never-spend default.
+        max_auto_spend: config
+            .max_auto_spend
+            .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 }),
         bell_threshold: config.bell_threshold.map(|v| v.clamp(0.0, 100.0)),
         credentials,
         usage: None,
@@ -1003,6 +1030,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 models: profile.models.clone(),
                 fallback_threshold: profile.fallback_threshold,
                 last_resort: profile.last_resort,
+                max_auto_spend: profile.max_auto_spend,
                 bell_threshold: profile.bell_threshold,
             };
             canonical != on_disk
@@ -1171,6 +1199,17 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("last_resort = true\n");
     } else {
         out.push_str("# last_resort = true\n");
+    }
+    out.push('\n');
+
+    out.push_str("# Ceiling in US dollars on what the fallback chain may spend of this\n");
+    out.push_str("# account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n");
+    out.push_str("# on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n");
+    out.push_str("# default) never spends. The chain stops at 90% of this or the account's\n");
+    out.push_str("# own cap, whichever is lower.\n");
+    match profile.max_auto_spend {
+        Some(v) => out.push_str(&format!("max_auto_spend = {v}\n")),
+        None => out.push_str("# max_auto_spend = 5.0\n"),
     }
     out.push('\n');
 

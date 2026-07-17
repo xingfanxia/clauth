@@ -189,6 +189,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,
@@ -220,6 +221,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         models: Default::default(),
         fallback_threshold: Some(threshold),
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {
@@ -511,6 +513,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {

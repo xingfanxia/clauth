@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
-use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+use crate::usage::{
+    SpendInfo, UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs,
+};
 
 /// ISO reset an hour ahead — a live 5h window.
 fn live_reset() -> String {
@@ -51,6 +53,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         models: Default::default(),
         fallback_threshold: threshold,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage,
@@ -83,6 +86,38 @@ fn mark_last_resort(mut p: Profile) -> Profile {
 /// The snapshot twin carries the same judgment on `ChainSnapshot::fresh`.
 fn mark_fresh(mut p: Profile) -> Profile {
     p.fetch_status = Some(FetchStatus::Fresh);
+    p
+}
+
+fn spend_block(enabled: bool, used: f64, limit: Option<f64>) -> SpendInfo {
+    SpendInfo {
+        enabled,
+        used: Some(used),
+        limit,
+        percent: None,
+        currency: None,
+    }
+}
+
+/// A spent 5h window plus a pay-as-you-go block — the shape a member must have
+/// before the spend pass can pick it (every earlier pass needs it exhausted).
+fn usage_spent_with_spend(spend: SpendInfo) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(100.0, Some(live_reset()))),
+        spend: Some(spend),
+        ..UsageInfo::default()
+    }
+}
+
+/// Member whose windows are spent but whose account is billing, with `ceiling`
+/// dollars allowed unattended.
+fn spend_member(name: &str, ceiling: f64, used: f64, limit: Option<f64>) -> Profile {
+    let mut p = profile_with_usage(
+        name,
+        Some(95.0),
+        Some(usage_spent_with_spend(spend_block(true, used, limit))),
+    );
+    p.max_auto_spend = Some(ceiling);
     p
 }
 
@@ -585,11 +620,13 @@ fn find_recovered_returns_first_member_below_threshold() {
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
+            max_spend: 0.0,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            max_spend: 0.0,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
@@ -612,11 +649,13 @@ fn find_recovered_skips_exhausted_members() {
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
+            max_spend: 0.0,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            max_spend: 0.0,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
@@ -630,11 +669,13 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
+            max_spend: 0.0,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            max_spend: 0.0,
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
@@ -648,11 +689,13 @@ fn find_recovered_uses_threshold_per_member() {
             name: "a".into(),
             threshold: 90.0,
             last_resort: false,
+            max_spend: 0.0,
         }, // 95% util ≥ 90 → exhausted
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            max_spend: 0.0,
         }, // 94% util < 95 → recovered
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
@@ -671,6 +714,7 @@ fn find_recovered_recovers_when_window_expired() {
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
+        max_spend: 0.0,
     }];
     let store = store_with_infos(vec![(
         "a",
@@ -690,6 +734,7 @@ fn find_recovered_recovers_when_windowless() {
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
+        max_spend: 0.0,
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
@@ -706,6 +751,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
+        max_spend: 0.0,
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
@@ -1025,6 +1071,289 @@ fn auto_switch_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
         Some(SwitchAction::To("b".to_string())),
         "freshness is a preference, not a gate: the stale escape must stay open"
     );
+}
+
+// ── spend budget: the money math (`spend_room`) ────────────────────────────
+// Pure, and shared by both twins, so the dollar rules are pinned once here and
+// the walk tests below only cover ordering.
+
+// The load-bearing one: `is_visible()` is TRUE for an account carrying a stale
+// limit with billing switched OFF (kerry, observed live 2026-07-17). Arming on
+// it would hop the chain into an account that refuses the request, with money
+// attached. Both halves are asserted so the contrast can't rot: if a later
+// change makes `is_visible` mean "will bill", this test says so out loud.
+#[test]
+fn spend_room_needs_billing_actually_on_not_merely_visible() {
+    // kerry's live shape, verbatim: billing off, a $50 limit still on file,
+    // $31.07 spent under it. The ceiling is deliberately $50 so that arming on
+    // `is_visible` would find real room ($45 - $31.07) and hop — a fixture
+    // whose spend already exceeded the room would pass for the wrong reason.
+    let billing_off = spend_block(false, 31.07, Some(50.0));
+    assert!(
+        billing_off.is_visible(),
+        "precondition: this shape renders a bar — that is exactly the trap"
+    );
+    assert_eq!(spend_room(&billing_off, 50.0), None);
+
+    // Flip billing on and the very same numbers do arm, proving the refusal
+    // above came from `enabled` alone and not from the dollar math.
+    let billing_on = spend_block(true, 31.07, Some(50.0));
+    assert!(spend_room(&billing_on, 50.0).is_some());
+}
+
+// A $0 ceiling can never be entered for spend reasons, whatever the account
+// allows — the "both defaults off = today's behavior" guarantee.
+#[test]
+fn spend_room_zero_or_negative_ceiling_never_arms() {
+    let billing_on = spend_block(true, 0.0, Some(500.0));
+    assert_eq!(spend_room(&billing_on, 0.0), None);
+    assert_eq!(spend_room(&billing_on, -5.0), None);
+}
+
+// A non-finite ceiling is refused rather than treated as "no limit". Both are
+// valid TOML floats: `inf` with no account cap yields infinite room (unlimited
+// unattended spending), and NaN slips every `<= 0.0` test while `f64::min`
+// silently drops it, arming at the account's full limit.
+#[test]
+fn spend_room_non_finite_ceiling_never_arms() {
+    let uncapped = spend_block(true, 0.0, None);
+    assert_eq!(spend_room(&uncapped, f64::INFINITY), None);
+    assert_eq!(spend_room(&uncapped, f64::NAN), None);
+
+    let capped = spend_block(true, 0.0, Some(500.0));
+    assert_eq!(spend_room(&capped, f64::INFINITY), None);
+    assert_eq!(
+        spend_room(&capped, f64::NAN),
+        None,
+        "f64::min(NAN, cap) is the cap — a NaN ceiling must never inherit it"
+    );
+}
+
+// Whichever cap binds first wins: the account's own limit can be lower than the
+// member's ceiling, and then it — not the ceiling — sets the room.
+#[test]
+fn spend_room_binds_on_the_lower_of_account_cap_and_ceiling() {
+    // Account cap $10 under a $100 ceiling → 90% of $10, less $4 spent.
+    assert_eq!(
+        spend_room(&spend_block(true, 4.0, Some(10.0)), 100.0),
+        Some(5.0)
+    );
+    // Ceiling $10 under a $100 account cap → same room, other side binding.
+    assert_eq!(
+        spend_room(&spend_block(true, 4.0, Some(100.0)), 10.0),
+        Some(5.0)
+    );
+    // Billing on with no declared account cap → the ceiling alone bounds it.
+    assert_eq!(spend_room(&spend_block(true, 4.0, None), 10.0), Some(5.0));
+}
+
+// The 10% margin is a hard stop, not a hint: at or past it the member is done.
+// The exact leftover a cent under the line is float noise, so only its sign is
+// asserted; the line itself lands exactly (`0.9 * 10.0 == 9.0` in f64), so the
+// at-the-margin and past-it cases pin an exact `None`.
+#[test]
+fn spend_room_stops_at_the_ninety_percent_margin() {
+    assert!(spend_room(&spend_block(true, 8.99, Some(10.0)), 10.0).is_some());
+    assert_eq!(spend_room(&spend_block(true, 9.0, Some(10.0)), 10.0), None);
+    assert_eq!(spend_room(&spend_block(true, 50.0, Some(10.0)), 10.0), None);
+}
+
+// ── spend budget: walk ordering ─────────────────────────────────────────────
+
+// Everything is spent and one member is billing with room → the chain pays
+// rather than parking.
+#[test]
+fn next_target_picks_a_spend_armed_member_when_the_chain_is_spent() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+// The bit-identical guard: the SAME fixture with the master toggle off must
+// behave exactly like today — nothing viable, so the walk stays put.
+#[test]
+fn next_target_spend_budget_off_never_spends() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    assert!(!config.state.spend_budget_switching, "default must be off");
+    assert_eq!(next_target(&config, None), None);
+}
+
+// Toggle on, ceiling $0 → identical to the toggle being off. Both halves of the
+// opt-in are required before a cent is spent.
+#[test]
+fn next_target_zero_ceiling_never_spends_even_with_the_toggle_on() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 0.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(next_target(&config, None), None);
+}
+
+// Free quota always beats paying, whatever the walk order says: c has headroom
+// and is reached LAST, b is spend-armed and reached first.
+#[test]
+fn next_target_subscription_headroom_beats_a_spend_armed_member() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string())),
+        "a member with free quota must always win over one that costs money"
+    );
+}
+
+// Pre-last-resort: paying to keep working outranks parking on a spent sink.
+#[test]
+fn next_target_spend_armed_member_outranks_last_resort_parking() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            mark_last_resort(profile_with_util("b", Some(95.0), Some(100.0))),
+            spend_member("c", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string()))
+    );
+
+    // Same chain, toggle off → the sink parks it, exactly like today.
+    config.state.spend_budget_switching = false;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+// ...and outranks wrap-off's halt: an operator who set a ceiling asked to keep
+// working, and Off stops every running claude.
+#[test]
+fn next_target_spend_armed_member_outranks_wrap_off() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.wrap_off = true;
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".to_string()))
+    );
+
+    // Toggle off → wrap-off halts, exactly like today.
+    config.state.spend_budget_switching = false;
+    assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
+}
+
+// The store twin, in lockstep: same ordering, but the ceiling rides
+// `ChainMember::max_spend` and the spend block rides the `UsageStore`.
+#[test]
+fn auto_switch_picks_a_spend_armed_member_when_the_chain_is_spent() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert_eq!(snap.chain[1].max_spend, 20.0, "ceiling must reach the walk");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+
+    // Toggle off → the same store is inert, exactly like today.
+    config.state.spend_budget_switching = false;
+    let snap_off = snapshot_chain(&config).expect("snapshot");
+    assert_eq!(next_auto_switch_target(&snap_off, &store), None);
+}
+
+#[test]
+fn auto_switch_subscription_headroom_beats_a_spend_armed_member() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+        ("c", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "free quota must win over money on the store walk too"
+    );
+}
+
+#[test]
+fn auto_switch_zero_ceiling_never_spends_even_with_the_toggle_on() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 0.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
 }
 
 // Broken active with NO viable member: stays put. Wrap-off in particular must
@@ -1472,6 +1801,7 @@ fn weekly_dead_member_never_recovers() {
         name: "b".into(),
         threshold: 95.0,
         last_resort: false,
+        max_spend: 0.0,
     }];
     let dead = store_with_infos(vec![(
         "b",

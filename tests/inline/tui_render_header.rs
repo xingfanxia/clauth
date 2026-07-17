@@ -16,6 +16,7 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {
@@ -41,6 +42,7 @@ fn provider_profile(name: &str) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,

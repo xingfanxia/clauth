@@ -418,6 +418,44 @@ fn out_of_band_per_profile_thresholds_clamp_to_the_band_at_load() {
     assert_eq!(loaded.bell_threshold, Some(12.0));
 }
 
+/// `max_auto_spend` is a dollar ceiling on unattended spending, so its load
+/// normalization is a money guard, not a tidy-up. `inf` and `nan` are both
+/// valid TOML floats: left raw, an infinite ceiling means an account with no
+/// declared cap has infinite room (`fallback::spend_room`), i.e. unbounded
+/// spending from one hand-edited word. Anything non-finite reads as the
+/// never-spend default instead.
+#[cfg(unix)]
+#[test]
+fn non_finite_max_auto_spend_reads_as_zero_at_load() {
+    let _home = HomeSandbox::new();
+    let name = "spend-ceiling-test";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+
+    for raw in ["max_auto_spend = inf\n", "max_auto_spend = nan\n"] {
+        std::fs::write(&config_path, raw).expect("write config.toml");
+        assert_eq!(
+            load_profile(name).expect("load_profile").max_auto_spend,
+            Some(0.0),
+            "{raw:?} must not survive the load boundary as a spendable ceiling"
+        );
+    }
+
+    // A negative ceiling floors at $0 rather than staying raw...
+    std::fs::write(&config_path, "max_auto_spend = -5.0\n").expect("write config.toml");
+    assert_eq!(
+        load_profile(name).expect("load_profile").max_auto_spend,
+        Some(0.0)
+    );
+
+    // ...and an ordinary ceiling is passed through untouched.
+    std::fs::write(&config_path, "max_auto_spend = 12.5\n").expect("write config.toml");
+    assert_eq!(
+        load_profile(name).expect("load_profile").max_auto_spend,
+        Some(12.5)
+    );
+}
+
 // ── crash-durable rotation: the pending sidecar's adopt/discard decision ─────
 //
 // `stage_rotated_credentials` writes a rotated pair to `credentials.json.pending`
@@ -651,6 +689,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(creds.clone()),
         usage: None,

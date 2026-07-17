@@ -60,6 +60,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -172,6 +173,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -235,6 +237,7 @@ fn rotate_one_inner_skips_live_session() {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -290,6 +293,7 @@ fn profile_without_refresh_token_excluded() {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -375,6 +379,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -409,6 +414,7 @@ fn third_party_config(name: &str) -> AppConfig {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,

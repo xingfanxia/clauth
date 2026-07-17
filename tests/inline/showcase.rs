@@ -291,6 +291,7 @@ fn oauth_profile(
         models: Default::default(),
         fallback_threshold,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {
@@ -322,6 +323,7 @@ fn api_profile(name: &str) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,
@@ -341,6 +343,7 @@ fn failed_profile(name: &str) -> Profile {
         models: Default::default(),
         fallback_threshold: Some(90.0),
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,

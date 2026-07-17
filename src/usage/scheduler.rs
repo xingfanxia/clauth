@@ -2370,6 +2370,7 @@ fn scan_recovery(
                         .map(crate::fallback::threshold_for)
                         .unwrap_or(crate::fallback::DEFAULT_THRESHOLD),
                     last_resort: profile.is_some_and(|p| p.last_resort),
+                    max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
                 }
             })
             .collect();

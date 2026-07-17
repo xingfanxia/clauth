@@ -68,6 +68,7 @@ fn cue_profile(status: Option<FetchStatus>) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,

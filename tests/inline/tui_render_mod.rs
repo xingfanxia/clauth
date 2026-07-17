@@ -17,6 +17,7 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         models: Default::default(),
         fallback_threshold: Some(80.0),
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {
