@@ -764,35 +764,97 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
     );
 }
 
-/// The auto-start kick only fires on a lapsed window when no 429 streak is in
-/// flight. Mid-streak the kick is suppressed so it can't re-hit (and prolong) a
-/// throttled endpoint on every due slot; a live `/usage` body clears the streak
-/// and the next lapsed tick opens cleanly.
+/// The auto-start kick's firing rules: never mid-`/usage`-429-streak; a lapsed
+/// window opens on the kick's backoff cadence; a live window re-tests a standing
+/// block on the poll cadence (recovery may be imminent). Mid-streak the kick is
+/// suppressed so it can't re-hit (and prolong) a throttled endpoint every slot; a
+/// live `/usage` body clears the streak and the next due tick kicks cleanly.
 #[test]
 fn kick_suppressed_during_rate_limit_streak() {
     use super::should_open_window;
 
+    // args: (streak, window_lapsed, kick_due, has_block)
     assert!(
-        should_open_window(0, true, true),
+        should_open_window(0, true, true, false),
         "lapsed + no streak → open"
     );
     assert!(
-        !should_open_window(1, true, true),
+        !should_open_window(1, true, true, false),
         "lapsed but 429-streaking → suppress the kick"
     );
     assert!(
-        !should_open_window(5, true, true),
+        !should_open_window(5, true, true, false),
         "deep streak → still suppressed"
     );
     assert!(
-        !should_open_window(0, false, true),
-        "a live window never kicks, streak or not"
+        !should_open_window(0, false, true, false),
+        "a live window with no block never kicks"
     );
     assert!(
-        !should_open_window(0, true, false),
-        "a kick-429 block whose retry isn't due suppresses the kick even with \
-         a clean /usage streak — the messages limiter can reject while /usage \
-         stays 200"
+        should_open_window(0, false, true, true),
+        "a live window WITH a standing block re-tests it — the window can be a \
+         Claude-web open while Claude Code stays 429'd, so only a landed kick \
+         proves the block is gone"
+    );
+    assert!(
+        should_open_window(0, false, false, true),
+        "a live-window block re-tests on the POLL cadence, not the deep kick \
+         backoff — the window reopened (maybe via web), so recovery may be \
+         imminent and we must not wait out the ~15min ladder"
+    );
+    assert!(
+        !should_open_window(1, false, false, true),
+        "but a /usage 429-streak still suppresses even the live-window re-test"
+    );
+    assert!(
+        !should_open_window(0, true, false, true),
+        "a LAPSED-window kick-429 block whose retry isn't due still waits its \
+         backoff — no reopened-window signal, so don't re-hit a dead endpoint"
+    );
+}
+
+// The `run_fetch` wiring seam: a LIVE 5h window with a standing block must
+// re-test (the fix), a healthy live window stays quiet. Guards the
+// `block.is_some()` → `has_block` plumbing `should_open_window`'s own test can't
+// reach, since `run_fetch` is HTTP-bound.
+#[test]
+fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
+    use super::{KickBlock, KickBlocks, PollStreaks, auto_start_should_kick};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso};
+
+    let now = 3_000_000;
+    let streaks: PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let live_store = || -> UsageStore {
+        Arc::new(RankedMutex::new(HashMap::from([(
+            "a".to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: 5.0,
+                    resets_at: Some(epoch_secs_to_iso(now + 3600)),
+                }),
+                ..Default::default()
+            },
+        )])))
+    };
+
+    let blocked: KickBlocks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        KickBlock {
+            streak: 3,
+            rejected: true,
+            until: Some(now + 900),
+            next_retry: now + 600,
+        },
+    )])));
+    assert!(
+        auto_start_should_kick(&streaks, &live_store(), &blocked, "a", now),
+        "a live window with a standing block re-tests it — the fix"
+    );
+
+    let clean: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    assert!(
+        !auto_start_should_kick(&streaks, &live_store(), &clean, "a", now),
+        "a healthy live window with no block must not kick"
     );
 }
 

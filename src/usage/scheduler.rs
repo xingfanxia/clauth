@@ -868,18 +868,47 @@ fn streak_snapshot(streaks: &PollStreaks) -> HashMap<String, StreakCounts> {
     streaks.lock().map(|m| m.clone()).unwrap_or_default()
 }
 
-/// Whether `run_fetch` should open the 5h window before fetching: the window has
-/// lapsed AND we are not mid-429-streak AND the kick's own block (if any) says a
-/// retry is due. A streak means the endpoint is already throttling us, and a
-/// kick on a still-valid access token can neither rotate nor open anything (see
-/// `auto_start_kick`) — re-hitting it every due slot only adds load and can
-/// prolong the limit. The `/usage` retry detects recovery; once a live body
-/// resets the streak, the next lapsed tick opens cleanly. `kick_due` is the
-/// messages-limiter analogue ([`kick_retry_due`]): `/usage` can stay 200 while
-/// `/v1/messages` rejects every kick (observed 2026-07-15), so that block
-/// carries its own decaying retry clock instead of riding the streak.
-fn should_open_window(streak: u32, window_lapsed: bool, kick_due: bool) -> bool {
-    window_lapsed && streak == 0 && kick_due
+/// Whether `run_fetch` should fire the auto-start kick. Never mid-`/usage`
+/// 429-streak (`streak == 0`): the endpoint is already throttling and a kick on a
+/// still-valid token can neither rotate nor open anything (see `auto_start_kick`).
+/// Two firing modes:
+///   * LAPSED window → open it, paced by the kick's own decaying retry clock
+///     (`kick_due`, [`kick_retry_due`]) so a still-dead endpoint isn't re-hit
+///     every due slot.
+///   * LIVE window + a standing block → RE-TEST it, on the POLL cadence (ignoring
+///     the deep `kick_due` backoff). Load-bearing: a live 5h window can be a
+///     Claude-web open while Claude Code's `/v1/messages` stays 429'd for this
+///     account, so window liveness does NOT clear the block — only a landed kick
+///     does (`note_kick_outcome` `opened`). The lapsed-window backoff can ladder
+///     to ~15min; honoring it here would leave the chain refusing to switch back
+///     in long after the account recovered, so a reopened window re-tests every
+///     poll (~one refresh interval) until a kick lands or 429s afresh.
+fn should_open_window(streak: u32, window_lapsed: bool, kick_due: bool, has_block: bool) -> bool {
+    if streak != 0 {
+        return false;
+    }
+    if window_lapsed { kick_due } else { has_block }
+}
+
+/// The auto-start firing decision for `run_fetch`, factored out so it has a test
+/// seam (`run_fetch` itself is HTTP-bound). Reads the streak, window, and kick
+/// block for `name` and applies [`should_open_window`] — the `has_block` wiring
+/// (`block.is_some()`) is the live-window re-test's load-bearing plumbing. Locks
+/// are taken one at a time (never nested), so no rank-order constraint applies.
+fn auto_start_should_kick(
+    streaks: &PollStreaks,
+    store: &UsageStore,
+    kick_blocks: &KickBlocks,
+    name: &str,
+    now_secs: i64,
+) -> bool {
+    let block = kick_block(kick_blocks, name);
+    should_open_window(
+        rate_limit_streak(streaks, name),
+        window_lapsed(store, name, now_secs),
+        kick_retry_due(block.as_ref(), now_secs),
+        block.is_some(),
+    )
 }
 
 /// Copy of `name`'s kick block (`None` when absent or poisoned). Read alone and
@@ -1025,9 +1054,11 @@ fn sync_kick_blocks_from_cache(blocks: &KickBlocks, names: &[String]) {
 }
 
 /// Fetch one profile's usage on the periodic tick. When the profile opted into
-/// auto-start, open its 5h window first if the last-known window lapsed AND no
-/// 429 streak is in flight — kick (rotating once on 401 OR 429), mark the window
-/// open on success, then fetch with the possibly-rotated token.
+/// auto-start, fire the kick first whenever `should_open_window` says to — to OPEN
+/// a lapsed window, or to RE-TEST a standing kick block on a now-live window (it
+/// may have reopened via the web app while Claude Code stays 429'd) — rotating
+/// once on 401 OR 429, mark the window open on success, then fetch with the
+/// possibly-rotated token.
 fn run_fetch(
     config: &crate::profile::ConfigHandle,
     mut entry: TokenEntry,
@@ -1037,23 +1068,17 @@ fn run_fetch(
     streaks: &PollStreaks,
     kick_blocks: &KickBlocks,
 ) -> FetchOutcome {
-    // Auto-start leg: open a window before fetching when this profile opted in,
-    // its last-known window has lapsed, we aren't already 429-streaking, and the
-    // kick's own 429 block (if any) says a retry is due (see
-    // `should_open_window`). The kick may rotate the chain (401 OR 429 in this
+    // Auto-start leg: fire the kick before fetching when this profile opted in and
+    // `should_open_window` says to — to open a lapsed window, or to re-test a
+    // standing kick block on a live window (its two modes), as long as no 429
+    // streak is in flight. The kick may rotate the chain (401 OR 429 in this
     // branch only); fold its rotated pair into both the local entry (so the
     // fetch below uses the fresh token, never re-spending) and the returned
     // outcome (so the tick syncs it into the live snapshot).
     let mut kick_rotated: Option<RotatedTokens> = None;
     if entry.auto_start {
-        let streak = rate_limit_streak(streaks, &entry.name);
         let now_secs = now_epoch_secs();
-        let block = kick_block(kick_blocks, &entry.name);
-        if should_open_window(
-            streak,
-            window_lapsed(store, &entry.name, now_secs),
-            kick_retry_due(block.as_ref(), now_secs),
-        ) {
+        if auto_start_should_kick(streaks, store, kick_blocks, &entry.name, now_secs) {
             let kicked = crate::oauth::auto_start_kick(
                 config,
                 &entry.name,
