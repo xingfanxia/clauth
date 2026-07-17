@@ -35,7 +35,7 @@ fn toggles() -> ToggleState {
 
 #[test]
 fn key_cell_is_uniform_width() {
-    for key in ["theme", "weekly limit", "on mismatch", "poll spent"] {
+    for key in ["theme", "weekly limit", "on mismatch", "refresh spent"] {
         assert_eq!(
             key_cell(key, KEY_W, KEY_GUTTER).chars().count(),
             KEY_W + KEY_GUTTER,
@@ -120,13 +120,16 @@ fn focus_wraps_the_active_option_in_brackets() {
 #[test]
 fn cycle_row_renders_the_contract_shape() {
     let options = [("off", true), ("basic", false), ("strict", false)];
+    // Key column is `arrow (2) + KEY_W + KEY_GUTTER` wide; derive the pad so the
+    // shape assertion tracks KEY_W instead of rebreaking on a width change.
+    let pad = " ".repeat(KEY_W + KEY_GUTTER - "verify".len());
     assert_eq!(
         row("verify", &options, false),
-        "  verify        off  basic  strict",
+        format!("  verify{pad}off  basic  strict"),
     );
     assert_eq!(
         row("verify", &options, true),
-        "  verify        [off]  basic  strict",
+        format!("  verify{pad}[off]  basic  strict"),
     );
 }
 
@@ -149,10 +152,10 @@ fn edit_line_buffer_starts_at_the_value_column() {
     }
 }
 
-/// `poll spent` is a pure on/off boolean — a cloudy-tui toggle (`─●` / `○─`),
+/// `refresh spent` is a pure on/off boolean — a cloudy-tui toggle (`─●` / `○─`),
 /// not a 2-option cycle row (`[on]  off`).
 #[test]
-fn poll_spent_renders_as_a_toggle_not_a_cycle() {
+fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
     let on = line_text(&detail_row(
         GlobalConfigRow::RefreshSpentAccounts,
         false,

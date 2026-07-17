@@ -1,13 +1,13 @@
 //! Program-wide Config tab — a single panel of global settings, distinct from
-//! the per-account Setup tab. Rows back real persisted state in `AppState`:
-//! the theme tier (`[theme]`), the divergence default, the refresh interval, the
-//! spent-account poll toggle, the chain-wide `when spent` default, the weekly
-//! exhaustion line, the opt-in burn-aware auto-switch mode (issue #8 follow-up
-//! b), the opt-in spend budget plus its own `budget spent` default (real money —
-//! see `docs/internals.md`), and the opt-in preemptive rotation of the active
-//! account (rotation coherence #1). ↑↓ walks the rows; space cycles a row's value in place; ⏎
-//! opens the refresh-interval and weekly-threshold custom-value editors and
-//! otherwise mirrors space. No left selector, no popups — settings are global.
+//! the per-account Setup tab. Rows back real persisted state in `AppState`,
+//! grouped by concern: appearance (`theme`), login (`on mismatch`), background
+//! timing (`refresh` cadence, `refresh spent` toggle, `rotation`), fallback
+//! detection (`weekly limit`, `rotate mode` = burn-aware, issue #8 follow-up b),
+//! fallback halt (`quota spent`), then the spend block (`spend budget` opt-in +
+//! its own `money spent` halt default — real money, see `docs/internals.md`).
+//! ↑↓ walks the rows; space cycles a row's value in place; ⏎ opens the
+//! refresh-interval and weekly-threshold custom-value editors and otherwise
+//! mirrors space. No left selector, no popups — settings are global.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -26,10 +26,10 @@ use super::panes::{
     label_style, section_box,
 };
 
-/// Width of the key column: the longest key (`weekly limit`). Keys pad to it,
-/// then [`KEY_GUTTER`] separates them from the value — so every row's value
+/// Width of the key column: the longest key (`refresh spent`, 13). Keys pad to
+/// it, then [`KEY_GUTTER`] separates them from the value — so every row's value
 /// starts at the same column (the Config tab is a cloudy-tui tight chip group).
-const KEY_W: usize = 12;
+const KEY_W: usize = 13;
 /// Fixed gap between the padded key and the value column.
 const KEY_GUTTER: usize = 2;
 
@@ -147,9 +147,12 @@ fn row_hint(
                 "restore the previous credentials and drop the new login"
             }
         },
-        GlobalConfigRow::RefreshInterval => "how often usage is refetched for every account",
+        GlobalConfigRow::RefreshInterval => {
+            "how often usage is refreshed for every account. default 90s"
+        }
         GlobalConfigRow::WeeklyThreshold => {
-            "auto-switch treats an account past this share of its weekly (7d) window as spent"
+            "soft switch-early line on the 7d window: a member past it is handed off but still \
+             serves (100% = only at the hard cap). default 98%"
         }
         GlobalConfigRow::SwitchOffWhenSpent => {
             if toggles.switch_off_when_spent {
@@ -160,9 +163,10 @@ fn row_hint(
         }
         GlobalConfigRow::BurnAware => {
             if toggles.burn_aware {
-                "switch away once the burn rate projects 100% before the next poll"
+                "switch the active account away once its burn rate projects 100% before the next \
+                 refresh"
             } else {
-                "switch away once usage crosses the account's threshold"
+                "switch the active account away once its usage crosses its threshold"
             }
         }
         GlobalConfigRow::SpendBudget => {
@@ -181,16 +185,16 @@ fn row_hint(
         }
         GlobalConfigRow::PreemptiveRotation => {
             if toggles.preemptive {
-                "refresh the active account's login ahead of expiry (macos keychain)"
+                "rotate the active account's login ahead of expiry (macos keychain)"
             } else {
-                "refresh the active account's login only when a request rejects it"
+                "rotate the active account's login only when a request rejects it"
             }
         }
         GlobalConfigRow::RefreshSpentAccounts => {
             if toggles.refresh_spent {
-                "keep refetching usage for spent accounts every interval"
+                "keep refreshing usage for spent (100%) accounts every interval"
             } else {
-                "skip refetching a spent account until its window resets"
+                "skip refreshing a spent account until its window resets"
             }
         }
     };
@@ -254,7 +258,7 @@ fn detail_row(
         ),
         GlobalConfigRow::SwitchOffWhenSpent => cycle_row(
             arrow,
-            "when spent",
+            "quota spent",
             &[
                 ("stay on last", !toggles.switch_off_when_spent),
                 ("switch off all", toggles.switch_off_when_spent),
@@ -263,7 +267,7 @@ fn detail_row(
         ),
         GlobalConfigRow::BurnAware => cycle_row(
             arrow,
-            "switching",
+            "rotate mode",
             &[
                 ("static", !toggles.burn_aware),
                 ("burn-aware", toggles.burn_aware),
@@ -279,11 +283,11 @@ fn detail_row(
             ],
             selected,
         ),
-        // Same two words as `when spent` on purpose: the pairing is the point.
+        // Same two values as `quota spent` on purpose: the pairing is the point.
         // Only the default differs — staying is free there and costs money here.
         GlobalConfigRow::SwitchOffWhenBudgetSpent => cycle_row(
             arrow,
-            "budget spent",
+            "money spent",
             &[
                 ("stay on last", !toggles.switch_off_when_budget_spent),
                 ("switch off all", toggles.switch_off_when_budget_spent),
@@ -300,7 +304,7 @@ fn detail_row(
             selected,
         ),
         GlobalConfigRow::RefreshSpentAccounts => {
-            toggle_row(arrow, "poll spent", toggles.refresh_spent, selected)
+            toggle_row(arrow, "refresh spent", toggles.refresh_spent, selected)
         }
     }
 }

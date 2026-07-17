@@ -3471,17 +3471,22 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 4] = [
 ];
 
 /// Rows on the program-wide Config tab, in display order.
+// Grouped by concern (top→bottom): appearance, login, background timing
+// (refresh cadence, spent-account refresh, token rotation), fallback detection
+// (weekly line, rotate mode), fallback halt (quota spent), then the spend block
+// (arm + money-spent halt). Related knobs sit together instead of interleaving
+// halt above detection.
 pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 10] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
-    GlobalConfigRow::SwitchOffWhenSpent,
+    GlobalConfigRow::PreemptiveRotation,
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
+    GlobalConfigRow::SwitchOffWhenSpent,
     GlobalConfigRow::SpendBudget,
     GlobalConfigRow::SwitchOffWhenBudgetSpent,
-    GlobalConfigRow::PreemptiveRotation,
 ];
 
 /// Config tab keymap (enumerated rows only, per the unified value-row grammar):

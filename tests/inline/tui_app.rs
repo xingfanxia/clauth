@@ -1902,7 +1902,7 @@ fn spend_budget_space_toggles_and_persists() {
     );
 }
 
-// `budget spent` is its own row, not an alias of `when spent`: staying is free
+// `money spent` is its own row, not an alias of `quota spent`: staying is free
 // when quota runs out and costs money when a budget does, so the two must be
 // settable in opposite directions.
 #[test]
@@ -1920,7 +1920,7 @@ fn budget_wrap_off_space_toggles_and_persists() {
     );
     assert!(
         !app.config().state.switch_off_when_spent,
-        "...while `when spent` defaults the other way, since staying is free there"
+        "...while `quota spent` defaults the other way, since staying is free there"
     );
 
     super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
@@ -1930,7 +1930,7 @@ fn budget_wrap_off_space_toggles_and_persists() {
     );
     assert!(
         !app.config().state.switch_off_when_spent,
-        "flipping the budget row must not touch `when spent`"
+        "flipping the budget row must not touch `quota spent`"
     );
 
     let reloaded: crate::profile::AppState = toml::from_str(

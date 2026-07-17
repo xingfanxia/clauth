@@ -253,7 +253,7 @@ fn reason_pill(reason: &BlockedReason) -> Line<'static> {
             },
             theme::danger().bold(),
         ),
-        BlockedReason::BudgetSpent => ("budget spent".to_string(), theme::warning().bold()),
+        BlockedReason::BudgetSpent => ("money spent".to_string(), theme::warning().bold()),
         BlockedReason::FiveHour { pct, resets_in } => (
             match resets_in {
                 Some(s) => format!("5h {pct:.0}% · {}", humanize_duration(*s)),
@@ -401,7 +401,7 @@ fn member_detail(
                 // it is the one state where the ceiling does not bound the bill,
                 // so it must not hide until someone arrows onto the field.
                 None if spend_is_uncapped(cfg, ceiling) => lines.extend(invalid_tooltip_lines(
-                    "no cap: `budget spent` is stay-on-last and no last resort to park on",
+                    "no cap: `money spent` is stay-on-last and no last resort to park on",
                     width,
                 )),
                 None if selected => {
