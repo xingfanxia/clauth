@@ -1081,6 +1081,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &config_handle(true),
         &store,
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -1099,6 +1100,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &config_handle(false),
         &store,
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -1160,6 +1162,7 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &pending,
         &Arc::new(RankedMutex::new(false)),
     );
@@ -1172,6 +1175,43 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
     assert!(
         !queued.contains("b"),
         "b is reached first but its read is Cached — walk order must not win"
+    );
+}
+
+/// `decision_fresh_any` unions BOTH status stores. Before the fix the scheduler
+/// twin read only the OAuth `StatusStore`, so a fresh third-party member looked
+/// stale to its fresh-preference/recovery gate while the UI twin (reading
+/// `Profile.fetch_status`, filled from both in `apply_usage`) saw it — the twins
+/// disagreed on a mixed OAuth+third-party chain (2026-07-17).
+#[test]
+fn decision_fresh_any_reads_both_the_oauth_and_third_party_stores() {
+    use super::{FetchStatus, StatusStore, ThirdPartyStatusStore, decision_fresh_any};
+
+    let oauth: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), FetchStatus::Fresh),
+        ("stale".to_string(), FetchStatus::Cached),
+    ])));
+    let tp: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("b".to_string(), FetchStatus::Fresh),
+        ("tp-stale".to_string(), FetchStatus::Cached),
+    ])));
+
+    assert!(decision_fresh_any(&oauth, &tp, "a"), "OAuth-fresh counts");
+    assert!(
+        decision_fresh_any(&oauth, &tp, "b"),
+        "third-party-fresh must count too — the whole point of the fix"
+    );
+    assert!(
+        !decision_fresh_any(&oauth, &tp, "stale"),
+        "OAuth Cached is not fresh"
+    );
+    assert!(
+        !decision_fresh_any(&oauth, &tp, "tp-stale"),
+        "third-party Cached is not fresh"
+    );
+    assert!(
+        !decision_fresh_any(&oauth, &tp, "unknown"),
+        "absent in both stores is not fresh"
     );
 }
 
@@ -1265,6 +1305,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
             &config_handle(),
             &store,
             &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
             &streaks,
             &Arc::new(RankedMutex::new(HashMap::new())),
             &activity,
@@ -3021,6 +3062,7 @@ fn scan_recovery_is_a_no_op_while_a_switch_is_pending() {
         &recovery_config(None, &["b"]),
         &store,
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
     );
@@ -3049,6 +3091,7 @@ fn scan_recovery_is_a_no_op_with_an_active_profile_set() {
         &recovery_config(Some("a"), &["b"]),
         &recoverable_store(),
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
     );
@@ -3081,6 +3124,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
             &recovery_config(None, &["b"]),
             &store,
             &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
             &kick_blocks,
             &pending,
         );
@@ -3097,6 +3141,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
         &recovery_config(None, &["b"]),
         &store,
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
     );
@@ -3134,6 +3179,7 @@ fn scan_recovery_never_relinks_to_a_switch_grade_kick_rejected_member() {
         &recovery_config(None, &["b"]),
         &store,
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
     );
@@ -3161,6 +3207,7 @@ fn scan_recovery_queues_a_recovered_chain_member() {
         &recovery_config(None, &["b"]),
         &recoverable_store(),
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
     );

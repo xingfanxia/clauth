@@ -1975,6 +1975,7 @@ fn tick(state: &SchedulerState) {
         &state.config,
         &state.store,
         &state.status,
+        &state.third_party_status,
         &state.poll_streaks,
         &state.kick_blocks,
         &state.activity,
@@ -1985,6 +1986,7 @@ fn tick(state: &SchedulerState) {
         &state.config,
         &state.store,
         &state.status,
+        &state.third_party_status,
         &state.kick_blocks,
         &state.pending_switch,
     );
@@ -2195,11 +2197,29 @@ pub(crate) fn spawn_refresher(
 /// false switch-away) and a `RateLimited` one may be the synthetic just-kicked
 /// 0% placeholder (which would never switch away, or switch toward a spent
 /// account) — the startup one-shot gates on `Fresh` for the same reason.
-fn decision_fresh(status: &StatusStore, name: &str) -> bool {
+fn decision_fresh<R: crate::lockorder::Rank>(
+    status: &Arc<RankedMutex<HashMap<String, FetchStatus>, R>>,
+    name: &str,
+) -> bool {
     matches!(
         status.lock().ok().and_then(|m| m.get(name).copied()),
         Some(FetchStatus::Fresh)
     )
+}
+
+/// [`decision_fresh`] against EITHER store — the OAuth `StatusStore` or the
+/// third-party one. `Profile.fetch_status` (the UI twin's freshness input) is
+/// filled from both in `App::apply_usage`, so the scheduler twin must read both
+/// too or a fresh third-party member looks stale to it alone, inverting the
+/// fresh-preference on a mixed OAuth+third-party chain (2026-07-17). Consulted
+/// by both `scan_auto_switch` (the walk's fresh-preference) and `scan_recovery`
+/// (the relink gate) so both stay in lockstep with the UI twin.
+fn decision_fresh_any(
+    status: &StatusStore,
+    third_party_status: &ThirdPartyStatusStore,
+    name: &str,
+) -> bool {
+    decision_fresh(status, name) || decision_fresh(third_party_status, name)
 }
 
 /// True when `name`'s last reading is a **deep-slot stuck** `RateLimited`: the
@@ -2235,6 +2255,7 @@ fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     status: &StatusStore,
+    third_party_status: &ThirdPartyStatusStore,
     streaks: &PollStreaks,
     kick_blocks: &KickBlocks,
     _activity: &ActivityStore,
@@ -2273,15 +2294,16 @@ fn scan_auto_switch(
     // switch-grade kick-rejected members and a rejected ACTIVE bypasses the
     // exhaustion gate (its usage reads idle while inference is refused).
     snapshot.kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
-    // Same reason: freshness lives in the `StatusStore`, not in config, and
+    // Same reason: freshness lives in the status stores, not in config, and
     // `Profile.fetch_status` (what the UI twin reads) is written only by the UI
-    // thread. Filled from the same source that gates the ACTIVE below, so both
-    // twins prefer the same members. A PREFERENCE for the headroom walk, never a
-    // gate — see `ChainSnapshot::fresh`.
+    // thread. Unions BOTH stores (OAuth + third-party) via `decision_fresh_any`,
+    // exactly as the UI twin's `apply_usage` fills `fetch_status`, so a fresh
+    // third-party member isn't invisible to this walk alone. A PREFERENCE for
+    // the headroom walk, never a gate — see `ChainSnapshot::fresh`.
     snapshot.fresh = snapshot
         .chain
         .iter()
-        .filter(|m| decision_fresh(status, &m.name))
+        .filter(|m| decision_fresh_any(status, third_party_status, &m.name))
         .map(|m| m.name.clone())
         .collect();
 
@@ -2332,6 +2354,7 @@ fn scan_recovery(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     status: &StatusStore,
+    third_party_status: &ThirdPartyStatusStore,
     kick_blocks: &KickBlocks,
     pending_switch: &PendingSwitch,
 ) {
@@ -2377,11 +2400,13 @@ fn scan_recovery(
         (members, weekly_pct)
     };
 
-    // Relink only to a member with a confirmed-live read; a synthetic/stale 0%
-    // entry would relink to an unverified placeholder (see `decision_fresh`).
+    // Relink only to a member with a confirmed-live read in EITHER store; a
+    // synthetic/stale 0% entry would relink to an unverified placeholder (see
+    // `decision_fresh`). Third-party-fresh members count too, so a third-party
+    // fallback is recoverable after switch-off-all instead of frozen out.
     let members: Vec<crate::fallback::ChainMember> = members
         .into_iter()
-        .filter(|m| decision_fresh(status, &m.name))
+        .filter(|m| decision_fresh_any(status, third_party_status, &m.name))
         .collect();
 
     // A switch-grade kick-rejected member is not "recovered" — its idle-looking
