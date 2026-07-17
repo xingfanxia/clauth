@@ -151,6 +151,7 @@ pub(crate) fn serve() -> Result<()> {
     let _lock = lock_file;
 
     let config = load_config()?;
+    warn_if_spend_is_uncapped(&config);
     let mut daemon = Daemon::new(config, dir.join(STATUS_FILE));
     daemon.boot();
     logline!(
@@ -159,6 +160,32 @@ pub(crate) fn serve() -> Result<()> {
     );
     daemon.run();
     Ok(())
+}
+
+/// Say so at boot when a chain member is armed to spend with nothing to stop it:
+/// billing enabled is the operator's to know, but "the ceiling you set only
+/// gates when spending STARTS" is not something a headless run would ever
+/// discover. The TUI warns on the member card; nobody is watching that here.
+///
+/// Names each member rather than counting them — the operator has to know which
+/// account to go fix.
+fn warn_if_spend_is_uncapped(config: &crate::profile::AppConfig) {
+    let uncapped: Vec<&str> = config
+        .state
+        .fallback_chain
+        .iter()
+        .filter_map(|name| config.find(name))
+        .filter(|p| crate::fallback::spend_is_uncapped(config, p.max_auto_spend.unwrap_or(0.0)))
+        .map(|p| p.name.as_str())
+        .collect();
+    if !uncapped.is_empty() {
+        logline!(
+            "clauth daemon: {} armed to spend with no cap: `budget spent` is stay-on-last and \
+             the chain has no last resort to park on, so max auto-spend only gates when billing \
+             STARTS, never when it stops",
+            uncapped.join(", ")
+        );
+    }
 }
 
 /// `clauth status --json` — single-shot serializer. Reads the on-disk caches and

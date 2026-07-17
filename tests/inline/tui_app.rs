@@ -1902,6 +1902,45 @@ fn spend_budget_space_toggles_and_persists() {
     );
 }
 
+// `budget spent` is its own row, not an alias of `when spent`: staying is free
+// when quota runs out and costs money when a budget does, so the two must be
+// settable in opposite directions.
+#[test]
+fn budget_wrap_off_space_toggles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::BudgetWrapOff)
+        .unwrap();
+    assert!(
+        app.config().state.budget_wrap_off,
+        "a spent budget stops spending unless told otherwise: on by default"
+    );
+    assert!(
+        !app.config().state.wrap_off,
+        "...while `when spent` defaults the other way, since staying is free there"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.budget_wrap_off,
+        "space flips it to stay-on-last"
+    );
+    assert!(
+        !app.config().state.wrap_off,
+        "flipping the budget row must not touch `when spent`"
+    );
+
+    let reloaded: crate::profile::AppState = toml::from_str(
+        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+            .expect("read profiles.toml"),
+    )
+    .expect("parse profiles.toml");
+    assert!(!reloaded.budget_wrap_off, "toggle persists to disk");
+}
+
 // ── preemptive rotation (rotation coherence #1) ─────────────────────────────
 
 #[test]

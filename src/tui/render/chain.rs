@@ -2,12 +2,13 @@
 //! chain (plus a trailing `+ add` row), cursor = `❯`, active member name in
 //! orange. Right: the selected member's rotation card — labeled
 //! key:value rows (`priority`, `5h usage` gauge with a threshold tick, `rotate at`
-//! threshold stepper, `last resort` toggle, `remove`) — or, on `+ add`, a
-//! candidate picker. Order = priority (reorder with ⇧↑↓). The chain-global
-//! wrap-off setting lives on the Config tab, not here. Editing happens in
-//! place: ⏎ on the left drops focus into the right pane, `+` / `-` step the
-//! threshold (or ⏎ on it to type a value), space/⏎ flips `last resort`, ⏎ on
-//! remove arms then confirms. No popups.
+//! threshold stepper, `last resort` toggle, `max spend` ceiling, `remove`) — or,
+//! on `+ add`, a candidate picker. Order = priority (reorder with ⇧↑↓). The
+//! chain-global wrap-off and spend-budget settings live on the Config tab, not
+//! here. Editing happens in place: ⏎ on the left drops focus into the right
+//! pane, `+` / `-` step the threshold (or ⏎ on it to type a value), space/⏎
+//! flips `last resort`, ⏎ types a `max spend` ceiling, ⏎ on remove arms then
+//! confirms. No popups.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -24,7 +25,7 @@ use super::panes::{
     invalid_tooltip_lines, key_cell, label_style, name_color, section_box, section_box_verbatim,
     select_line, selector_width, wrap_words,
 };
-use crate::fallback::{DEFAULT_THRESHOLD, soonest_resume, threshold_for};
+use crate::fallback::{DEFAULT_THRESHOLD, soonest_resume, spend_is_uncapped, threshold_for};
 use crate::profile::AppConfig;
 use crate::usage::humanize_duration;
 
@@ -154,18 +155,41 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 
-    // Position the native terminal cursor when the threshold field is being typed,
-    // matching the post-draw cursor path the other edit screens use. The `rotate at`
-    // row is FALLBACK_ROWS[0]; member_detail pushes exactly `ROWS_BEFORE` fixed
-    // lines before the loop (priority, blank, gauge, figure, blank).
+    // Position the native terminal cursor for whichever field is being typed,
+    // matching the post-draw cursor path the other edit screens use. This is not
+    // decoration: `value_caret` renders the buffer with uniform styling and
+    // leaves the caret glyph entirely to the cursor set here, so a field that
+    // skips this has no visible caret at all.
+    //
+    // `member_detail` pushes exactly `ROWS_BEFORE` fixed lines before the row
+    // loop (priority, blank, gauge, figure, blank), and only the row being typed
+    // is selected — so no earlier row contributes a tooltip line and the row's
+    // index in FALLBACK_ROWS is its offset.
+    let typing = [
+        (
+            FallbackRow::Threshold,
+            app.fallback_threshold_draft.as_ref(),
+            0usize,
+        ),
+        // `+ 1` for the leading `$`, which sits before the buffer.
+        (
+            FallbackRow::MaxSpend,
+            app.fallback_max_spend_draft.as_ref(),
+            1usize,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(row, draft, unit_cols)| draft.map(|d| (row, d, unit_cols)));
+
     if detail_focused
         && let Some(ChainItemKind::Member(_)) = selected
-        && let Some(draft) = &app.fallback_threshold_draft
+        && let Some((row, draft, unit_cols)) = typing
+        && let Some(row_idx) = FALLBACK_ROWS.iter().position(|r| *r == row)
     {
-        // x = "❯ " (2) + "rotate at" key block (KEY_W + KEY_GUTTER cols) + cols before caret.
-        let prefix_cols = 2 + KEY_W + KEY_GUTTER + head_cols(draft);
+        // x = "❯ " (2) + key block (KEY_W + KEY_GUTTER cols) + unit + cols before caret.
+        let prefix_cols = 2 + KEY_W + KEY_GUTTER + unit_cols + head_cols(draft);
         let cx = inner.x.saturating_add(prefix_cols as u16);
-        let cy = inner.y.saturating_add(ROWS_BEFORE as u16);
+        let cy = inner.y.saturating_add((ROWS_BEFORE + row_idx) as u16);
         frame.set_cursor_position((cx, cy));
     }
 }
@@ -282,12 +306,19 @@ fn member_detail(
         // back — a ceiling with the chain toggle off does nothing, and silently
         // doing nothing is exactly what an operator would misread as armed.
         if *row == FallbackRow::MaxSpend {
+            let ceiling = profile.max_auto_spend.unwrap_or(0.0);
             match row_editing {
                 Some(input) => lines.extend(max_spend_range_tooltip(input, width)),
-                None if selected => lines.extend(help_tooltip_lines(
-                    &max_spend_hint(cfg, profile.max_auto_spend.unwrap_or(0.0)),
+                // An uncapped config warns whether or not the row is selected:
+                // it is the one state where the ceiling does not bound the bill,
+                // so it must not hide until someone arrows onto the field.
+                None if spend_is_uncapped(cfg, ceiling) => lines.extend(invalid_tooltip_lines(
+                    "no cap: `budget spent` is stay-on-last and no last resort to park on",
                     width,
                 )),
+                None if selected => {
+                    lines.extend(help_tooltip_lines(&max_spend_hint(cfg, ceiling), width))
+                }
                 None => {}
             }
         }

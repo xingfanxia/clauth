@@ -27,6 +27,7 @@ fn toggles() -> ToggleState {
         wrap_off: false,
         burn_aware: false,
         spend_budget: false,
+        budget_wrap_off: true,
         preemptive: false,
         refresh_spent: true,
     }

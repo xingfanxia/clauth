@@ -43,6 +43,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             wrap_off: state.wrap_off,
             burn_aware: state.burn_aware_switching,
             spend_budget: state.spend_budget_switching,
+            budget_wrap_off: state.budget_wrap_off,
             preemptive: state.preemptive_rotation,
             refresh_spent: state.refresh_spent_accounts,
         }
@@ -121,6 +122,7 @@ struct ToggleState {
     wrap_off: bool,
     burn_aware: bool,
     spend_budget: bool,
+    budget_wrap_off: bool,
     preemptive: bool,
     refresh_spent: bool,
 }
@@ -167,6 +169,13 @@ fn row_hint(
                 "spent accounts may fall back to pay-as-you-go, up to each max auto-spend"
             } else {
                 "never spend money automatically; a spent chain parks or switches off"
+            }
+        }
+        GlobalConfigRow::BudgetWrapOff => {
+            if toggles.budget_wrap_off {
+                "once an account's spend budget runs out, switch everything off"
+            } else {
+                "once an account's spend budget runs out, stay on it and keep billing"
             }
         }
         GlobalConfigRow::PreemptiveRotation => {
@@ -266,6 +275,17 @@ fn detail_row(
             &[
                 ("off", !toggles.spend_budget),
                 ("pay-as-you-go", toggles.spend_budget),
+            ],
+            selected,
+        ),
+        // Same two words as `when spent` on purpose: the pairing is the point.
+        // Only the default differs — staying is free there and costs money here.
+        GlobalConfigRow::BudgetWrapOff => cycle_row(
+            arrow,
+            "budget spent",
+            &[
+                ("stay on last", !toggles.budget_wrap_off),
+                ("switch off all", toggles.budget_wrap_off),
             ],
             selected,
         ),

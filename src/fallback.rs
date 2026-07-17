@@ -122,6 +122,23 @@ fn budget_spent(usage: Option<&crate::usage::UsageInfo>, budget_on: bool, ceilin
     })
 }
 
+/// Whether this member's live config can bill with nothing stopping it: armed to
+/// spend, but told to stay on the account once the budget runs out, and no free
+/// parking spot to be sent to instead. `max_auto_spend` then bounds only when
+/// the chain STARTS paying, never when it stops.
+///
+/// ONE predicate, two consumers, so the warning and the behavior cannot drift:
+/// the Fallback card renders it as a DANGER tooltip under the ceiling it
+/// describes, and the daemon says it at boot for the headless case where nobody
+/// is watching that card. Policy, not presentation — which is why it lives here
+/// beside the rules it is reading, not in `tui::render`.
+pub(crate) fn spend_is_uncapped(config: &AppConfig, ceiling: f64) -> bool {
+    config.state.spend_budget_switching
+        && ceiling > 0.0
+        && !config.state.budget_wrap_off
+        && !config.profiles.iter().any(|p| p.last_resort)
+}
+
 /// [`spend_room`] over a member's usage snapshot: true when the chain may pick
 /// it purely to spend money. Never consulted until every subscription member
 /// with free quota has been passed over — see [`next_target`].

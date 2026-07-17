@@ -1317,6 +1317,51 @@ fn budget_spent_never_fires_on_a_subscription_account() {
     );
 }
 
+// The uncapped-config predicate behind both the Fallback card's DANGER tooltip
+// and the daemon's boot warning. "Uncapped" is precisely: armed to spend, told
+// to stay once the budget runs out, and no sink to be parked on instead —
+// remove any one of those and something stops the billing.
+#[test]
+fn spend_is_uncapped_only_when_nothing_can_stop_the_billing() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 5.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    config.state.budget_wrap_off = false;
+    assert!(
+        spend_is_uncapped(&config, 5.0),
+        "armed + stay-on-last + no sink = the ceiling never stops anything"
+    );
+
+    // Each of the three, alone, caps it again.
+    config.state.budget_wrap_off = true;
+    assert!(
+        !spend_is_uncapped(&config, 5.0),
+        "halting stops the billing"
+    );
+
+    config.state.budget_wrap_off = false;
+    config.profiles[0].last_resort = true;
+    assert!(
+        !spend_is_uncapped(&config, 5.0),
+        "a sink to park on stops the billing without halting"
+    );
+
+    config.profiles[0].last_resort = false;
+    config.state.spend_budget_switching = false;
+    assert!(!spend_is_uncapped(&config, 5.0), "never armed at all");
+
+    config.state.spend_budget_switching = true;
+    assert!(
+        !spend_is_uncapped(&config, 0.0),
+        "a $0 ceiling never spends"
+    );
+}
+
 // ── spend budget: walk ordering ─────────────────────────────────────────────
 
 // Everything is spent and one member is billing with room → the chain pays

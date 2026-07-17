@@ -270,6 +270,12 @@ pub(crate) enum GlobalConfigRow {
     /// (Fallback tab, $0 by default). BOTH halves are needed, so flipping this
     /// alone still spends nothing.
     SpendBudget,
+    /// What happens once a billing account has spent its `max auto-spend`
+    /// budget (`AppState.budget_wrap_off`, default switch-off). Deliberately
+    /// NOT `WrapOff`: that row answers "the chain is out of free quota", where
+    /// staying costs nothing, and this one answers "the money ran out", where
+    /// staying is the spending.
+    BudgetWrapOff,
     /// Opt-in preemptive rotation (`AppState.preemptive_rotation`, rotation
     /// coherence #1) — off by default (stock stays strictly lazy: rotate only
     /// on 401). Rotates the ACTIVE Keychain-installed profile ahead of token
@@ -3465,7 +3471,7 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 4] = [
 ];
 
 /// Rows on the program-wide Config tab, in display order.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 9] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 10] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
@@ -3474,6 +3480,7 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 9] = [
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
     GlobalConfigRow::SpendBudget,
+    GlobalConfigRow::BudgetWrapOff,
     GlobalConfigRow::PreemptiveRotation,
 ];
 
@@ -3529,6 +3536,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
         GlobalConfigRow::SpendBudget => toggle_spend_budget_switching(app),
+        GlobalConfigRow::BudgetWrapOff => toggle_budget_wrap_off(app),
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
     }
@@ -3727,6 +3735,18 @@ fn toggle_spend_budget_switching(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.spend_budget_switching = !cfg.state.spend_budget_switching;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Flip what happens once a billing account has spent its budget
+/// (`AppState.budget_wrap_off`). Same persistence shape as
+/// `toggle_spend_budget_switching`.
+fn toggle_budget_wrap_off(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.budget_wrap_off = !cfg.state.budget_wrap_off;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();
