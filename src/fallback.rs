@@ -582,11 +582,40 @@ pub(crate) fn next_target(
         return Some(SwitchAction::To(name));
     }
 
-    // Spend-armed members rank PRE-last-resort: every member above still had
-    // free subscription quota, so reaching here means paying is the only way
-    // forward. Ranked above `last_resort` parking and wrap-off because both of
-    // those stop work outright, and an operator who set a ceiling asked to keep
-    // working. Opt-in twice over (see `spend_armed`), so stock chains skip this.
+    // A `last_resort` sink that still SERVES for free outranks paying. The
+    // headroom passes gate on the SOFT weekly line, so a sink riding 98-99.99%
+    // of its week reads "exhausted" to them yet still answers every request its
+    // live 5h window allows — parking there keeps work going at zero cost, which
+    // beats spending real money. Only a sink that can no longer serve (weekly at
+    // the HARD cap, or 5h maxed) ranks BELOW spend, via the unconditional
+    // `last_resort` walk further down.
+    //
+    // `active_is_last_resort` is hoisted here for this pass and the dead-sink
+    // guard below. Active is a still-serving sink → already parked free, stay
+    // put (the sink ping-pong guard, hard-cap flavored). A serving SIBLING sink
+    // is chased only when the active is NOT itself a sink, preserving the
+    // existing "once on a sink, don't hop to another" rule (a DEAD sink active
+    // keeps its stay-put-or-spend behavior below).
+    let active_is_last_resort = config.find(active).is_some_and(|p| p.last_resort);
+    if active_is_last_resort
+        && config
+            .find(active)
+            .is_some_and(|p| !is_exhausted(p, WEEKLY_HARD_BLOCK_PCT))
+    {
+        return None;
+    }
+    if !active_is_last_resort
+        && let Some(name) = walk(&|p| p.last_resort && !is_exhausted(p, WEEKLY_HARD_BLOCK_PCT))
+    {
+        return Some(SwitchAction::To(name));
+    }
+
+    // Spend-armed members rank between a still-serving sink (above) and a DEAD
+    // `last_resort` sink / wrap-off (below): every free-quota member and every
+    // sink still serving for free was already passed over, so reaching here
+    // paying is the only way to keep working — which an operator who set a
+    // ceiling asked for. Opt-in twice over (see `spend_armed`), so stock chains
+    // skip this.
     let spend_budget = config.state.spend_budget_switching;
 
     // An active that is ITSELF still within budget stays put — the same loop
@@ -616,11 +645,10 @@ pub(crate) fn next_target(
         return Some(SwitchAction::To(name));
     }
 
-    // Only fall back to a `last_resort` member when the active profile is NOT
-    // itself marked `last_resort`. Two last-resort members switching to each
-    // other indefinitely gains nothing — one migration is fine, but the next
-    // tick must stay put.
-    let active_is_last_resort = config.find(active).is_some_and(|p| p.last_resort);
+    // Fall back to a DEAD `last_resort` sink only when the active profile is NOT
+    // itself a sink. Two sinks switching to each other indefinitely gains
+    // nothing — one migration is fine, but the next tick must stay put.
+    // (`active_is_last_resort` hoisted above the serving-sink pass.)
     if active_is_last_resort {
         return None;
     }
@@ -752,10 +780,33 @@ pub(crate) fn next_auto_switch_target(
         return Some(SwitchAction::To(name));
     }
 
-    // Spend-armed pass, lockstep with [`next_target`]: pre-last-resort, and the
-    // spend block rides the store's `UsageInfo` exactly like utilization does.
-    // Same loop guard — an active still within budget stays put rather than
-    // ping-ponging between two paying members.
+    // Serving-sink pass, lockstep with [`next_target`]: a `last_resort` sink
+    // with real headroom at the HARD weekly cap still serves every request for
+    // free, so it outranks paying. The soft-line headroom passes above miss it.
+    // Active being such a sink → already parked free, stay put; a serving
+    // sibling sink is chased only when the active isn't itself a sink (the
+    // "don't hop between sinks" rule — a DEAD sink active keeps its
+    // stay-put-or-spend behavior below).
+    let active_is_last_resort = active.last_resort;
+    if active_is_last_resort
+        && !is_exhausted_from_store(&active.name, active.threshold, store, WEEKLY_HARD_BLOCK_PCT)
+    {
+        return None;
+    }
+    if !active_is_last_resort
+        && let Some(name) = walk(&|m| {
+            m.last_resort
+                && !is_exhausted_from_store(&m.name, m.threshold, store, WEEKLY_HARD_BLOCK_PCT)
+        })
+    {
+        return Some(SwitchAction::To(name));
+    }
+
+    // Spend-armed pass, lockstep with [`next_target`]: between a serving sink
+    // (above) and a DEAD sink / wrap-off (below), and the spend block rides the
+    // store's `UsageInfo` exactly like utilization does. Same loop guard — an
+    // active still within budget stays put rather than ping-ponging between two
+    // paying members.
     let active_is_spend_armed = store
         .lock()
         .ok()
@@ -772,7 +823,8 @@ pub(crate) fn next_auto_switch_target(
         return Some(SwitchAction::To(name));
     }
 
-    let active_is_last_resort = active.last_resort;
+    // Dead-sink fallback (`active_is_last_resort` hoisted above the serving-sink
+    // pass): a sink active stays put, else the first sink anywhere parks it.
     if active_is_last_resort {
         return None;
     }

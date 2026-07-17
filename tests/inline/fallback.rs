@@ -1541,6 +1541,118 @@ fn next_target_spend_armed_member_outranks_wrap_off() {
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
+// ── finding (2026-07-17): a still-SERVING sink outranks spending real money ──
+//
+// The two `*_outranks_*` tests above use a 5h-MAXED sink (dead — it can't
+// serve), which still ranks below spend. A sink only SOFT-blocked past the
+// weekly line answers every request its live 5h window allows, for free, so it
+// must win over paying. `weekly_soft_profile` is exactly that shape (7d 98.5%,
+// 5h 40%): the soft-line headroom passes skip it, the serving-sink pass catches
+// it before spend.
+
+#[test]
+fn next_target_serving_last_resort_sink_outranks_a_spend_armed_member() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            mark_last_resort(weekly_soft_profile("b")),
+            spend_member("c", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".to_string())),
+        "a sink still serving for free must beat spending money"
+    );
+}
+
+// The active-side facet: a serving-sink active is already parked free, so it
+// stays put rather than hopping to a billing sibling.
+#[test]
+fn next_target_serving_last_resort_active_stays_put_instead_of_paying() {
+    let mut config = config_with_chain(
+        vec![
+            mark_last_resort(weekly_soft_profile("a")),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "a serving-sink active never pays a sibling — it already serves free"
+    );
+}
+
+// Store twin, lockstep: the sink's soft-blocked-but-serving reading rides the
+// `UsageStore`, `ChainMember::last_resort` comes from the marked profile.
+#[test]
+fn auto_switch_serving_last_resort_sink_outranks_a_spend_armed_member() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            mark_last_resort(profile_with_util("b", Some(95.0), None)),
+            spend_member("c", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_both(
+                Some(window(40.0, Some(live_reset()))),
+                Some(window(98.5, Some(live_reset()))),
+            ),
+        ),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "the store twin must also park on a serving sink before paying"
+    );
+}
+
+#[test]
+fn auto_switch_serving_last_resort_active_stays_put_instead_of_paying() {
+    let mut config = config_with_chain(
+        vec![
+            mark_last_resort(profile_with_util("a", Some(95.0), None)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_both(
+                Some(window(40.0, Some(live_reset()))),
+                Some(window(98.5, Some(live_reset()))),
+            ),
+        ),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a serving-sink active stays parked free in the store twin too"
+    );
+}
+
 // The store twin, in lockstep: same ordering, but the ceiling rides
 // `ChainMember::max_spend` and the spend block rides the `UsageStore`.
 #[test]
