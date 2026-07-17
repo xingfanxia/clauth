@@ -1123,3 +1123,37 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
 - Upstream is now 12 ahead of the fork's merge-base (v0.12.0: owner-only
   perms fix 7f2d4db, durable token ledger c8de3fe) — candidates for the next
   upstream-sync pass.
+
+## 2026-07-16 (later) — CDX-5 real-backend proof · GET /models fix · 0.12.0 sync + history squash · upstream codex PR
+
+- **CDX-5 proxy PROVEN against the LIVE backend** (feasibility.md §"Real-backend
+  confirmed"; deploy-shape memory updated). Shipped `clauth proxy` binary built
+  on an isolated throwaway host, run under an isolated `$HOME` (pool = a real
+  paid `ax-codex-cl` Plus profile, `codex-auth.json` scp'd in + deleted after),
+  isolated-`CODEX_HOME` real `codex exec` → real `chatgpt.com/backend-api/codex`
+  → real model answer (`PROXY_OK 42`, 15,856 tokens). **OpenAI honors the
+  proxy-injected `Authorization`+`ChatGPT-Account-ID`.** The host's own live
+  codex session (different account) untouched (sha256 identical). Probe kept:
+  `scripts/codex-sim/proxy-client-integration.sh` (client-integration half; commit
+  0fd4e20). Still not exercised: a real forced-429 rotation (unit-proven only).
+- **GET /models fix** (commit 906ff8e): the real run showed the proxy 405'd
+  codex's `GET /backend-api/codex/models` refresh (POST-only gate). Now admits
+  GET too and forwards with the request's own method (generic ureq header helper
+  serves both body typestates). Tests: GET /models forwarded + method preserved
+  + identity injected; DELETE still 405s.
+- **Synced fork to upstream 0.12.0** (merge 4f930e0 → then squashed): 19-file
+  conflict merge (ratatui refactors + owner-only perms vs fork TUI/profile),
+  resolved via a parallel resolver workflow + hand-resolution of scheduler.rs
+  (kept upstream's scan_recovery tests, adapted to the fork's VecDeque
+  PendingSwitchEntry API) + a tokens::spawn arity fix (0.12.0 added the
+  durable-ledger `clauth_dir` arg). Suite **1254 green**, clippy/fmt clean.
+- **History squash** (force-pushed 57917d9): collapsed ~192 fork commits into
+  **8 subsystem commits** on 0.12.0 (codex+proxy / usage-scheduler / daemon /
+  tui / tests / docs / core / meta) so future upstream rebases replay 8, not
+  192. Tree byte-identical to the verified merge (`git diff` empty — safety
+  gate). NOT feature-pure (shared files interleave codex/narrow-tui/keychain —
+  can't file-split); coherent-by-subsystem was AX's chosen granularity.
+- **Upstream codex PR**: uwuclxdy/clauth **#51** (`xingfanxia:main` → `mommy`),
+  the complete compilable+tested fork codex support on 0.12.0. Supersedes #49
+  (narrow-tui overlaps in the render files). Upstream has no codex sub → can't
+  test codex; claude-side is byte-identical.
