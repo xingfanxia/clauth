@@ -258,6 +258,13 @@ pub(crate) enum GlobalConfigRow {
     /// follow-up b) — off by default, projects the ACTIVE profile's
     /// utilization ahead of the next poll instead of the static threshold.
     BurnAware,
+    /// Opt-in master switch for real-money fallback
+    /// (`AppState.spend_budget_switching`) — off by default. On, the chain may
+    /// hop to a member whose subscription is spent but whose account still has
+    /// pay-as-you-go budget, bounded by that member's `max auto-spend` ceiling
+    /// (Fallback tab, $0 by default). BOTH halves are needed, so flipping this
+    /// alone still spends nothing.
+    SpendBudget,
     /// Opt-in preemptive rotation (`AppState.preemptive_rotation`, rotation
     /// coherence #1) — off by default (stock stays strictly lazy: rotate only
     /// on 401). Rotates the ACTIVE Keychain-installed profile ahead of token
@@ -3437,7 +3444,7 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
 ];
 
 /// Rows on the program-wide Config tab, in display order.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 8] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 9] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
@@ -3445,6 +3452,7 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 8] = [
     GlobalConfigRow::WrapOff,
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
+    GlobalConfigRow::SpendBudget,
     GlobalConfigRow::PreemptiveRotation,
 ];
 
@@ -3499,6 +3507,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
+        GlobalConfigRow::SpendBudget => toggle_spend_budget_switching(app),
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
     }
@@ -3676,6 +3685,21 @@ fn toggle_burn_aware_switching(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.burn_aware_switching = !cfg.state.burn_aware_switching;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Flip the master half of the real-money opt-in
+/// (`AppState.spend_budget_switching`). Same persistence shape as
+/// `toggle_burn_aware_switching`; both walk twins read the flag off the shared
+/// config (the UI twin directly, the scheduler's through `snapshot_chain`), so
+/// no separate propagation is needed. Flipping this on alone still spends
+/// nothing — every member's ceiling defaults to $0.
+fn toggle_spend_budget_switching(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.spend_budget_switching = !cfg.state.spend_budget_switching;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();

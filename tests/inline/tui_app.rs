@@ -1869,6 +1869,39 @@ fn burn_aware_space_toggles_and_persists() {
     );
 }
 
+// ── spend budget (real money) ───────────────────────────────────────────────
+
+#[test]
+fn spend_budget_space_toggles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SpendBudget)
+        .unwrap();
+    assert!(
+        !app.config().state.spend_budget_switching,
+        "money is never spent unless asked for: off by default"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(app.config().state.spend_budget_switching, "space arms it");
+
+    let reloaded: crate::profile::AppState = toml::from_str(
+        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+            .expect("read profiles.toml"),
+    )
+    .expect("parse profiles.toml");
+    assert!(reloaded.spend_budget_switching, "toggle persists to disk");
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.spend_budget_switching,
+        "space toggles it back off"
+    );
+}
+
 // ── preemptive rotation (rotation coherence #1) ─────────────────────────────
 
 #[test]

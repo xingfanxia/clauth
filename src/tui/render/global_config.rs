@@ -42,6 +42,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ToggleState {
             wrap_off: state.wrap_off,
             burn_aware: state.burn_aware_switching,
+            spend_budget: state.spend_budget_switching,
             preemptive: state.preemptive_rotation,
             refresh_spent: state.refresh_spent_accounts,
         }
@@ -119,6 +120,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 struct ToggleState {
     wrap_off: bool,
     burn_aware: bool,
+    spend_budget: bool,
     preemptive: bool,
     refresh_spent: bool,
 }
@@ -158,6 +160,13 @@ fn row_hint(
                 "switch away once the burn rate projects 100% before the next poll"
             } else {
                 "switch away once usage crosses the account's threshold"
+            }
+        }
+        GlobalConfigRow::SpendBudget => {
+            if toggles.spend_budget {
+                "spent accounts may fall back to pay-as-you-go, up to each max auto-spend"
+            } else {
+                "never spend money automatically; a spent chain parks or switches off"
             }
         }
         GlobalConfigRow::PreemptiveRotation => {
@@ -248,6 +257,15 @@ fn detail_row(
             &[
                 ("static", !toggles.burn_aware),
                 ("burn-aware", toggles.burn_aware),
+            ],
+            selected,
+        ),
+        GlobalConfigRow::SpendBudget => cycle_row(
+            arrow,
+            "spend budget",
+            &[
+                ("off", !toggles.spend_budget),
+                ("pay-as-you-go", toggles.spend_budget),
             ],
             selected,
         ),
