@@ -288,9 +288,9 @@ fn detail_row(
         ),
         // Same two values as `quota spent` on purpose: the pairing is the point.
         // Only the default differs — staying is free there and costs money here.
-        // Inert until `spend budget` is on (nothing spends, so nothing halts on a
-        // spent budget): render it dimmed then, but still editable so a value can
-        // be pre-set before arming spending.
+        // Inert until `spend budget` is on: nothing spends, so nothing halts on a
+        // spent budget. Rendered dimmed AND the key no-ops (a true disabled row),
+        // so `faint` never decouples from "not editable".
         GlobalConfigRow::SwitchOffWhenBudgetSpent => {
             let options = [
                 ("stay on last", !toggles.switch_off_when_budget_spent),
