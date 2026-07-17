@@ -288,6 +288,18 @@ pub(crate) struct AppState {
     /// with free quota — see `fallback::next_target`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) spend_budget_switching: bool,
+    /// What to do once a billing account has spent its `max_auto_spend` budget:
+    /// `true` (the default) switches everything off, `false` stays on it.
+    ///
+    /// Separate from `wrap_off` on purpose. That one answers "the chain ran out
+    /// of SUBSCRIPTION quota", where staying costs nothing but rate-limit
+    /// errors. Here staying IS the spending, so the same words mean opposite
+    /// things and an operator can legitimately want opposite answers: stay on
+    /// last when the quota runs out, switch off when the money does. Defaults to
+    /// switching off so `max auto-spend` is a real cap rather than an entry
+    /// gate. See `fallback::budget_spent`.
+    #[serde(default = "default_budget_wrap_off", skip_serializing_if = "is_true")]
+    pub(crate) budget_wrap_off: bool,
     /// Opt-in: rotate the ACTIVE, Keychain-installed profile ahead of its
     /// access-token expiry instead of waiting for a 401 (rotation coherence,
     /// #1). Off by default — stock clauth stays strictly lazy. Adoption plus
@@ -370,6 +382,13 @@ fn default_refresh_spent() -> bool {
     true
 }
 
+/// A spent budget stops spending unless the operator says otherwise, so this
+/// defaults ON — unlike `wrap_off`, whose default keeps you signed in because
+/// staying costs nothing there.
+fn default_budget_wrap_off() -> bool {
+    true
+}
+
 fn is_true(b: &bool) -> bool {
     *b
 }
@@ -419,6 +438,7 @@ impl Default for AppState {
             auth_broken: Vec::new(),
             burn_aware_switching: false,
             spend_budget_switching: false,
+            budget_wrap_off: default_budget_wrap_off(),
             preemptive_rotation: false,
             auto_rescue: false,
             refresh_spent_accounts: true,
@@ -1205,8 +1225,10 @@ fn render_config_toml(profile: &Profile) -> String {
     out.push_str("# Ceiling in US dollars on what the fallback chain may spend of this\n");
     out.push_str("# account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n");
     out.push_str("# on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n");
-    out.push_str("# default) never spends. The chain stops at 90% of this or the account's\n");
-    out.push_str("# own cap, whichever is lower.\n");
+    out.push_str("# default) never spends. The chain stops using this account once its\n");
+    out.push_str("# spend reaches 90% of this or of the account's own cap, whichever is\n");
+    out.push_str("# lower — parking on a `last_resort` member if the chain has one, else\n");
+    out.push_str("# per `budget_wrap_off`.\n");
     match profile.max_auto_spend {
         Some(v) => out.push_str(&format!("max_auto_spend = {v}\n")),
         None => out.push_str("# max_auto_spend = 5.0\n"),

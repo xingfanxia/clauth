@@ -1158,6 +1158,165 @@ fn spend_room_stops_at_the_ninety_percent_margin() {
     assert_eq!(spend_room(&spend_block(true, 50.0, Some(10.0)), 10.0), None);
 }
 
+// Unknown spend must refuse, not read as $0 spent. `RawMoney::to_dollars`
+// returns `None` whenever `amount_minor` is absent or renamed, and `used` is the
+// only input that bounds spending — so a wire rename defaulting it to 0 would
+// hand back the full cap on an account that may already be maxed.
+#[test]
+fn spend_room_refuses_when_used_is_unknown() {
+    let unknown = SpendInfo {
+        enabled: true,
+        used: None,
+        limit: Some(50.0),
+        percent: None,
+        currency: None,
+    };
+    assert_eq!(spend_room(&unknown, 20.0), None);
+}
+
+// ── spend budget: the ceiling is a CAP, not just an entry gate ──────────────
+
+// The walk skips the ACTIVE member in every pass, so nothing re-checks a
+// spend-armed member once the chain has landed on it. Without a budget-aware
+// halt it settles there and bills to the ACCOUNT's cap — `max_auto_spend` would
+// silently mean "may start paying below this" rather than the ceiling it is
+// named for. Asserted at the steady state (the armed member IS active), which
+// is the tick the entry-side tests never reach.
+#[test]
+fn next_target_over_budget_active_switches_off_by_default() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            // $4.60 spent against a $5 ceiling: past 90% of it, so the budget is
+            // gone even though the ACCOUNT would happily bill to $50.
+            spend_member("b", 5.0, 4.6, Some(50.0)),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    assert!(
+        config.state.budget_wrap_off,
+        "a spent budget halts by default"
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::Off),
+        "the ceiling must stop the spending, not merely gate entry to it"
+    );
+
+    // Still inside the budget → keeps working, which is the point of the knob.
+    config.profiles[1].usage = Some(usage_spent_with_spend(spend_block(true, 1.0, Some(50.0))));
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "under budget, stay and bill"
+    );
+}
+
+// `budget_wrap_off` is its own decision, not `wrap_off`'s: staying costs
+// nothing when free quota runs out and costs money when a budget does, so an
+// operator may want stay-on-last for one and switch-off for the other.
+#[test]
+fn next_target_over_budget_active_can_be_told_to_keep_billing() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 5.0, 4.6, Some(50.0)),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    config.state.budget_wrap_off = false;
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "explicitly told to stay on a spent budget: keeps billing"
+    );
+
+    // ...and `wrap_off` must not answer for it in either direction: on, it
+    // halts a chain out of QUOTA, and this chain is out of MONEY.
+    config.state.wrap_off = true;
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "wrap_off must not halt an over-budget active that was told to stay"
+    );
+}
+
+// A free parking spot beats halting: moving to the sink stops the billing
+// without signing anyone out, so the halt is the last resort, not the first.
+#[test]
+fn next_target_over_budget_active_parks_on_a_sink_before_halting() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 5.0, 4.6, Some(50.0)),
+            mark_last_resort(profile_with_util("c", Some(95.0), Some(100.0))),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string())),
+        "park on the sink to stop billing rather than halting outright"
+    );
+}
+
+// The bit-identical guarantee at the halt gate: with the master toggle off, a
+// billing account over any ceiling must read `wrap_off` exactly like before.
+#[test]
+fn next_target_over_budget_halt_is_inert_with_the_toggle_off() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 5.0, 4.6, Some(50.0)),
+        ],
+        "b",
+    );
+    assert!(!config.state.spend_budget_switching, "default is off");
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "wrap_off off + toggle off → stay, exactly like before the budget existed"
+    );
+
+    config.state.wrap_off = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::Off),
+        "wrap_off on → Off, decided by wrap_off alone"
+    );
+}
+
+// A plain subscription active must never reach the budget halt: `budget_spent`
+// is what separates "out of money" from "out of quota", and reading it wrong
+// would halt ordinary accounts that were only ever told to stay on last.
+#[test]
+fn budget_spent_never_fires_on_a_subscription_account() {
+    let plain = usage_info(Some(window(100.0, Some(live_reset()))));
+    assert!(
+        !budget_spent(Some(&plain), true, 5.0),
+        "no spend block at all"
+    );
+
+    let billing_off = usage_spent_with_spend(spend_block(false, 99.0, Some(50.0)));
+    assert!(
+        !budget_spent(Some(&billing_off), true, 5.0),
+        "billing switched off: spending is not what is happening here"
+    );
+
+    let no_ceiling = usage_spent_with_spend(spend_block(true, 99.0, Some(50.0)));
+    assert!(
+        !budget_spent(Some(&no_ceiling), true, 0.0),
+        "a $0 ceiling never opted in, so it can never be over budget"
+    );
+    assert!(
+        !budget_spent(Some(&no_ceiling), false, 5.0),
+        "master toggle off: the whole feature is inert"
+    );
+}
+
 // ── spend budget: walk ordering ─────────────────────────────────────────────
 
 // Everything is spent and one member is billing with room → the chain pays
@@ -1332,6 +1491,44 @@ fn auto_switch_subscription_headroom_beats_a_spend_armed_member() {
         next_auto_switch_target(&snap, &store),
         Some(SwitchAction::To("c".to_string())),
         "free quota must win over money on the store walk too"
+    );
+}
+
+// The store twin's steady state, in lockstep with `next_target`: an over-budget
+// active halts on `budget_wrap_off`, and `wrap_off` does not answer for it.
+#[test]
+fn auto_switch_over_budget_active_switches_off_by_default() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 5.0, 4.6, Some(50.0)),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 4.6, Some(50.0))),
+        ),
+    ]);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert!(snap.budget_wrap_off, "a spent budget halts by default");
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::Off),
+        "the scheduler must cap the spend exactly like the UI twin"
+    );
+
+    // Told to stay → keeps billing, and `wrap_off` must not override that.
+    config.state.budget_wrap_off = false;
+    config.state.wrap_off = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "wrap_off must not halt an over-budget active that was told to stay"
     );
 }
 

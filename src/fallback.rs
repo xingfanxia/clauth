@@ -89,8 +89,37 @@ fn spend_room(spend: &crate::usage::SpendInfo, ceiling: f64) -> Option<f64> {
         Some(limit) => limit.min(ceiling),
         None => ceiling,
     };
-    let room = SPEND_ARM_FRACTION * cap - spend.used.unwrap_or(0.0);
+    // Unknown spend REFUSES rather than reading as $0 spent. `used` is the only
+    // input bounding what gets spent, and `RawMoney::to_dollars` returns `None`
+    // whenever `amount_minor` is absent or renamed — so defaulting it to 0 hands
+    // back the full cap on any wire drift, which is the most permissive possible
+    // answer to "how much has this already cost?". Fail closed on money.
+    let used = spend.used?;
+    let room = SPEND_ARM_FRACTION * cap - used;
     (room > 0.0).then_some(room)
+}
+
+/// True when the ACTIVE profile is billing pay-as-you-go and has spent the
+/// budget the operator allowed it — the moment `max_auto_spend` has to stop
+/// being an entry gate and start being a cap.
+///
+/// Deliberately narrow, because acting on it HALTS accounts: it needs the
+/// chain-wide opt-in, a real ceiling on this member, and the account to actually
+/// be billing. Anything else (a normal subscription account, a $0 ceiling, the
+/// toggle off) is `false`, so the halt path stays bit-identical to pre-2026-07-17
+/// for every chain that never opted in.
+///
+/// Only meaningful once the member's subscription windows are spent — an account
+/// with quota left is not billing, so callers check exhaustion first (an
+/// unexhausted member never reaches the halt decision anyway).
+fn budget_spent(usage: Option<&crate::usage::UsageInfo>, budget_on: bool, ceiling: f64) -> bool {
+    usage.and_then(|u| u.spend.as_ref()).is_some_and(|spend| {
+        budget_on
+            && spend.enabled
+            && ceiling.is_finite()
+            && ceiling > 0.0
+            && spend_room(spend, ceiling).is_none()
+    })
 }
 
 /// [`spend_room`] over a member's usage snapshot: true when the chain may pick
@@ -331,6 +360,9 @@ pub(crate) struct ChainSnapshot {
     /// real-money opt-in. Off (the default) makes the spend pass inert whatever
     /// any member's ceiling says.
     pub(crate) spend_budget: bool,
+    /// Snapshot of `AppState::budget_wrap_off` — `wrap_off`'s twin for the case
+    /// where what ran out is money rather than quota.
+    pub(crate) budget_wrap_off: bool,
     /// Members whose 5h auto-start kick the messages limiter is REJECTING
     /// (switch-grade `KickBlock`s: the limiter's own `rejected` verdict, ≥2
     /// consecutive kicks, advertised ceiling still ahead). Not config state —
@@ -386,6 +418,7 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
         interval_ms: config.state.refresh_interval_ms,
         weekly_pct: config.state.weekly_switch_threshold_pct(),
         spend_budget: config.state.spend_budget_switching,
+        budget_wrap_off: config.state.budget_wrap_off,
         kick_rejected: Vec::new(),
         fresh: Vec::new(),
     })
@@ -569,7 +602,27 @@ pub(crate) fn next_target(
     // HARD cap ([`WEEKLY_HARD_BLOCK_PCT`]), not the soft line: a soft-blocked
     // active with real weekly room left stays put instead of signing every
     // running claude out over the tail it could still spend.
-    if config.state.wrap_off
+    //
+    // Which flag answers that depends on WHAT ran out. An active that spent its
+    // pay-as-you-go budget reads `budget_wrap_off` instead of `wrap_off`: `wrap
+    // off` means "the chain is out of free quota", where staying costs nothing
+    // but rate-limit errors, and this is the case where staying IS the spending.
+    // Note the `last_resort` walk above already ran, so an over-budget active
+    // parks on a sink when one exists — stopping the billing without signing
+    // anyone out — and only reaches this halt with nowhere free to go.
+    let halt_flag = if budget_spent(
+        config.find(active).and_then(|p| p.usage.as_ref()),
+        config.state.spend_budget_switching,
+        config
+            .find(active)
+            .and_then(|p| p.max_auto_spend)
+            .unwrap_or(0.0),
+    ) {
+        config.state.budget_wrap_off
+    } else {
+        config.state.wrap_off
+    };
+    if halt_flag
         && config.find(active).is_some_and(|p| {
             is_exhausted_active(
                 p,
@@ -692,7 +745,18 @@ pub(crate) fn next_auto_switch_target(
     // soft line, but Off re-checks at the HARD cap
     // ([`WEEKLY_HARD_BLOCK_PCT`]) — a soft-blocked active with real weekly
     // room left stays put rather than signing everything out over the tail.
-    if snapshot.wrap_off
+    // Budget-aware halt flag, lockstep with [`next_target`]: an active that
+    // spent its pay-as-you-go budget reads `budget_wrap_off`, since staying on
+    // it keeps costing money rather than merely erroring.
+    let active_budget_spent = store.lock().ok().is_some_and(|s| {
+        budget_spent(s.get(&active.name), snapshot.spend_budget, active.max_spend)
+    });
+    let halt_flag = if active_budget_spent {
+        snapshot.budget_wrap_off
+    } else {
+        snapshot.wrap_off
+    };
+    if halt_flag
         && is_exhausted_active_from_store(
             &active.name,
             active.threshold,
