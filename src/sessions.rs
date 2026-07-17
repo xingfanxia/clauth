@@ -834,6 +834,25 @@ pub(crate) fn rescue_session_transcript(
     Ok(sibling)
 }
 
+/// Rescue every `*.jsonl` under an isolated run's `iso_projects` into the global
+/// `global_projects` store, returning the count moved. Fail-soft per file: a
+/// rescue error is logged and skipped so one bad transcript never blocks the
+/// rest — the isolated store is discarded right after this call, so a skipped
+/// file is at worst a lost rescue, never corruption. Each move is collision- and
+/// crash-safe (see [`rescue_session_transcript`]).
+pub(crate) fn rescue_isolated_store(iso_projects: &Path, global_projects: &Path) -> usize {
+    let mut paths = Vec::new();
+    collect_jsonl(iso_projects, WALK_MAX_DEPTH, &mut paths);
+    let mut moved = 0usize;
+    for src in paths {
+        match rescue_session_transcript(&src, iso_projects, global_projects) {
+            Ok(_) => moved += 1,
+            Err(e) => logline!("clauth: failed to rescue {}: {e}", src.display()),
+        }
+    }
+    moved
+}
+
 /// Whether two files hold identical bytes. Length is checked first as a cheap
 /// reject before reading both.
 fn files_equal(a: &Path, b: &Path) -> std::io::Result<bool> {

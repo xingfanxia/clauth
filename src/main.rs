@@ -123,16 +123,13 @@ fn dispatch(args: &[String]) -> Result<()> {
         [cmd, _, ..] if cmd == "which" => {
             anyhow::bail!("usage: clauth which [--json]");
         }
-        [cmd] if cmd == "start" => {
-            anyhow::bail!("usage: clauth start [--isolated] <profile> [claude args...]");
-        }
-        [cmd, flag] if cmd == "start" && flag == "--isolated" => {
-            anyhow::bail!("usage: clauth start --isolated <profile> [claude args...]");
-        }
-        [cmd, flag, name, rest @ ..] if cmd == "start" && flag == "--isolated" => {
-            cmd_start(name, rest, Isolation::Isolated)
-        }
-        [cmd, name, rest @ ..] if cmd == "start" => cmd_start(name, rest, Isolation::Shared),
+        [cmd, rest @ ..] if cmd == "start" => match parse_start_args(rest) {
+            Some(a) => cmd_start(a.name, a.claude_args, a.isolation, a.rescue_override),
+            None => anyhow::bail!(
+                "usage: clauth start [--isolated] [--rescue|--no-rescue] <profile> [claude args...]\n\
+                 (--rescue/--no-rescue require --isolated)"
+            ),
+        },
         [cmd, rest @ ..] if cmd == "login" => match parse_login_args(rest) {
             Some(args) => cmd_login(args),
             None => anyhow::bail!(
@@ -198,12 +195,67 @@ fn peel_theme_flag(args: &[String]) -> (Option<tui::theme::Tier>, &[String]) {
     (None, args)
 }
 
-fn cmd_start(name: &str, rest: &[String], isolation: Isolation) -> Result<()> {
+fn cmd_start(
+    name: &str,
+    rest: &[String],
+    isolation: Isolation,
+    rescue_override: Option<bool>,
+) -> Result<()> {
     platform::init();
     runtime::gc_stale_runtimes();
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
-    start::run(&config, &canonical, rest, isolation, None)
+    start::run(&config, &canonical, rest, isolation, None, rescue_override)
+}
+
+/// `clauth start`'s parsed args after the `start` token: leading clauth flags
+/// (`--isolated`, and — only under `--isolated` — `--rescue`/`--no-rescue`), the
+/// profile name, then any trailing tokens passed straight through to `claude`.
+/// The clauth flags must precede the name; the first non-flag token is the name
+/// and everything after it is `claude`'s, so a passthrough `--resume`/`-p` is
+/// never mistaken for a clauth flag. `None` on a missing name, or a
+/// `--rescue`/`--no-rescue` without `--isolated` — the caller maps that to one
+/// usage bail. Pure, so the shape is unit-testable without spawning `claude`.
+#[derive(Debug, PartialEq)]
+struct StartArgs<'a> {
+    name: &'a str,
+    isolation: Isolation,
+    rescue_override: Option<bool>,
+    claude_args: &'a [String],
+}
+
+fn parse_start_args(rest: &[String]) -> Option<StartArgs<'_>> {
+    let mut isolated = false;
+    let mut rescue_override: Option<bool> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--isolated" => isolated = true,
+            "--rescue" => rescue_override = Some(true),
+            "--no-rescue" => rescue_override = Some(false),
+            // First non-clauth-flag token is the profile name; everything after
+            // it belongs to `claude`.
+            _ => break,
+        }
+        i += 1;
+    }
+    let name = rest.get(i)?.as_str();
+    // Rescue lifts a throwaway isolated store into the global one; a shared start
+    // already writes there, so the flags without `--isolated` are a user error,
+    // rejected rather than silently no-op'd.
+    if rescue_override.is_some() && !isolated {
+        return None;
+    }
+    Some(StartArgs {
+        name,
+        isolation: if isolated {
+            Isolation::Isolated
+        } else {
+            Isolation::Shared
+        },
+        rescue_override,
+        claude_args: &rest[i + 1..],
+    })
 }
 
 /// `clauth login`'s parsed args after the `login` token: one profile name plus
@@ -620,10 +672,12 @@ fn print_help() {
          Usage:\n  \
            clauth [--theme=full|compatible] launch the TUI\n  \
            clauth <profile>                switch to profile by name and exit\n  \
-           clauth start [--isolated] <profile> [args]\n                                  \
+           clauth start [--isolated] [--rescue|--no-rescue] <profile> [args]\n                                  \
          launch claude with that profile's settings in a per-profile\n                                  \
          CLAUDE_CONFIG_DIR; --isolated injects creds but drops operator\n                                  \
          memory/plugins/hooks (run in a clean cwd for a blind session);\n                                  \
+         --rescue/--no-rescue (isolated only) override the auto_rescue\n                                  \
+         setting, lifting the run's transcripts into the global store;\n                                  \
          extra args go to claude\n  \
            clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>]\n                                  \
          add a new account, or re-authenticate an existing one in place\n                                  \

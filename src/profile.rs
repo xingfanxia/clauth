@@ -280,6 +280,14 @@ pub(crate) struct AppState {
     /// See `usage::scheduler::proactive_rotation_due`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) preemptive_rotation: bool,
+    /// Opt-in: on an `--isolated` `clauth start`, lift the run's transcripts out
+    /// of the throwaway `runtime-isolated/projects/` store into the global
+    /// `~/.claude/projects/` before the runtime is GC'd — so the session stays
+    /// resumable and its tokens count in the Tokens tab. Off by default: stock
+    /// clauth discards an isolated store on teardown, byte-for-byte. A per-run
+    /// `--rescue`/`--no-rescue` flag overrides this toggle. See `start::run`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) auto_rescue: bool,
     /// When false, the background usage fetch skips accounts already pinned at
     /// their 100% window cap (spent) until the window resets — a spent window
     /// can't change until then, so re-polling only burns quota + poll load.
@@ -395,6 +403,7 @@ impl Default for AppState {
             auth_broken: Vec::new(),
             burn_aware_switching: false,
             preemptive_rotation: false,
+            auto_rescue: false,
             refresh_spent_accounts: true,
             theme: None,
             show_estimates: true,

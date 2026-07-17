@@ -18,7 +18,6 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
-#[cfg(unix)]
 use crate::logline::logline;
 use crate::profile::AppConfig;
 use crate::runtime::{Isolation, ProfileRuntime};
@@ -32,12 +31,22 @@ struct ChildOutcome {
     signal: Option<i32>,
 }
 
+/// Whether an isolated run's transcripts get lifted into the global store on
+/// teardown. A per-run `--rescue`/`--no-rescue` override (`Some`) beats the
+/// persisted `auto_rescue` toggle; with no override the toggle decides. The
+/// caller still gates this on `isolation == Isolated` — a shared start never
+/// rescues, since its transcripts already live in the global store.
+pub(crate) fn rescue_effective(rescue_override: Option<bool>, auto_rescue: bool) -> bool {
+    rescue_override.unwrap_or(auto_rescue)
+}
+
 pub(crate) fn run(
     config: &AppConfig,
     name: &str,
     claude_args: &[String],
     isolation: Isolation,
     workspace: Option<&Path>,
+    rescue_override: Option<bool>,
 ) -> Result<()> {
     let profile = config.find(name).context("profile not found")?;
 
@@ -119,6 +128,26 @@ pub(crate) fn run(
     };
     if let Some(projects_dir) = projects_dir {
         crate::sessions::stamp_run_sessions(name, &projects_dir, isolated, run_start);
+    }
+
+    // Auto-rescue (isolated only, opt-in): the throwaway isolated store is
+    // discarded on `drop(runtime)`, taking its transcripts with it. When enabled
+    // lift them into the global store first, so the session stays resumable and
+    // its tokens count. OFF is a no-op, leaving teardown byte-for-byte the stock
+    // discard path. Best-effort: a rescue error is logged, never fails the run.
+    // Sidecars (todos/shell-snapshots/file-history) are a follow-up — only the
+    // transcripts (`projects/**/*.jsonl`) are rescued here.
+    if isolated
+        && rescue_effective(rescue_override, config.state.auto_rescue)
+        && let Ok(global_projects) = crate::profile::claude_dir().map(|d| d.join("projects"))
+    {
+        let iso_projects = runtime.config_dir().join("projects");
+        let moved = crate::sessions::rescue_isolated_store(&iso_projects, &global_projects);
+        if moved > 0 {
+            logline!(
+                "clauth: rescued {moved} isolated session transcript(s) into the global store"
+            );
+        }
     }
 
     // Drop runtime before process::exit so final sync + refcount cleanup runs.

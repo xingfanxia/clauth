@@ -123,6 +123,33 @@ fn preemptive_rotation_defaults_false_and_round_trips() {
     );
 }
 
+// `auto_rescue` (isolated-transcript rescue) shares `preemptive_rotation`'s
+// serde contract exactly: absent from old state files → false (stock discards
+// an isolated store on teardown), on renders explicitly, off is omitted.
+#[test]
+fn auto_rescue_defaults_false_and_round_trips() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(!state.auto_rescue);
+
+    let on = AppState {
+        auto_rescue: true,
+        ..AppState::default()
+    };
+    let rendered_on = toml::to_string_pretty(&on).expect("render on state");
+    assert!(
+        rendered_on.contains("auto_rescue = true"),
+        "on must render explicitly, got:\n{rendered_on}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_on).expect("reparse on state");
+    assert!(reparsed.auto_rescue);
+
+    let rendered_off = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_off.contains("auto_rescue"),
+        "off (default) must be omitted, got:\n{rendered_off}"
+    );
+}
+
 // `refresh_spent_accounts` defaults to TRUE (poll every account — today's
 // behavior) so pre-field profiles.toml files load unchanged; only an explicit
 // `false` opt-out renders, and the default is omitted (the inverse serde shape

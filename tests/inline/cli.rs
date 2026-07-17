@@ -351,3 +351,61 @@ fn reauth_confirmed_only_on_explicit_yes() {
         assert!(!reauth_confirmed(no), "{no:?} should decline");
     }
 }
+
+// ── parse_start_args ──
+
+fn sv(args: &[&str]) -> Vec<String> {
+    args.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn parse_start_args_bare_name_is_shared_no_override() {
+    let args = sv(&["acme"]);
+    let a = parse_start_args(&args).expect("bare name parses");
+    assert_eq!(a.name, "acme");
+    assert_eq!(a.isolation, Isolation::Shared);
+    assert_eq!(a.rescue_override, None);
+    assert!(a.claude_args.is_empty());
+}
+
+#[test]
+fn parse_start_args_isolated_flag_precedes_name() {
+    let args = sv(&["--isolated", "acme", "-p", "hi"]);
+    let a = parse_start_args(&args).expect("isolated + name parses");
+    assert_eq!(a.name, "acme");
+    assert_eq!(a.isolation, Isolation::Isolated);
+    assert_eq!(a.rescue_override, None);
+    // Everything after the name is `claude`'s — a passthrough `-p` is not a
+    // clauth flag.
+    assert_eq!(a.claude_args, ["-p".to_string(), "hi".to_string()]);
+}
+
+#[test]
+fn parse_start_args_rescue_flags_override_in_any_order() {
+    let on = sv(&["--rescue", "--isolated", "acme"]);
+    let a = parse_start_args(&on).expect("--rescue before --isolated parses");
+    assert_eq!(a.rescue_override, Some(true));
+    assert_eq!(a.isolation, Isolation::Isolated);
+
+    let off = sv(&["--isolated", "--no-rescue", "acme"]);
+    let b = parse_start_args(&off).expect("--no-rescue after --isolated parses");
+    assert_eq!(b.rescue_override, Some(false));
+}
+
+#[test]
+fn parse_start_args_rescue_requires_isolated() {
+    // A rescue flag on a shared start is a user error, not a silent no-op.
+    assert_eq!(parse_start_args(&sv(&["--rescue", "acme"])), None);
+    assert_eq!(parse_start_args(&sv(&["--no-rescue", "acme"])), None);
+}
+
+#[test]
+fn parse_start_args_requires_a_name() {
+    assert_eq!(parse_start_args(&[]), None);
+    assert_eq!(parse_start_args(&sv(&["--isolated"])), None);
+    assert_eq!(
+        parse_start_args(&sv(&["--isolated", "--rescue"])),
+        None,
+        "flags without a name must bail"
+    );
+}
