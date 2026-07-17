@@ -211,7 +211,9 @@ fallback_chain = ["work"]
     );
 
     // Byte-for-byte equality with a String-typed control — no format migration.
-    // Field order and serde attrs mirror `AppState` exactly.
+    // Field order and serde attrs mirror `AppState`'s ON-DISK shape exactly, so
+    // this field is spelled `wrap_off` (the published key) rather than
+    // `switch_off_when_spent` (the Rust name behind `serde(rename)`).
     #[derive(serde::Serialize, Default)]
     struct BareState {
         active_profile: Option<String>,
@@ -416,6 +418,38 @@ fn out_of_band_per_profile_thresholds_clamp_to_the_band_at_load() {
     let loaded = load_profile(name).expect("load_profile");
     assert_eq!(loaded.fallback_threshold, Some(73.5));
     assert_eq!(loaded.bell_threshold, Some(12.0));
+}
+
+/// The Rust field is `switch_off_when_spent`; the ON-DISK key must stay
+/// `wrap_off`. Nothing else pins this: `status.json`'s contract test covers its
+/// own key, and every round-trip test goes through serde in both directions, so
+/// a rename of the serde name passes them all while silently resetting the
+/// setting to `false` in every profiles.toml already on disk. A blind
+/// find-and-replace across the field name did exactly that (2026-07-17), which
+/// is what this test exists to catch.
+#[test]
+fn switch_off_when_spent_keeps_its_wrap_off_key_on_disk() {
+    let from_disk: AppState = toml::from_str("profiles = []\nwrap_off = true\n")
+        .expect("the legacy key must still parse");
+    assert!(
+        from_disk.switch_off_when_spent,
+        "an existing profiles.toml's `wrap_off = true` must survive the rename"
+    );
+
+    let rendered = toml::to_string(&AppState {
+        switch_off_when_spent: true,
+        ..AppState::default()
+    })
+    .expect("serialize");
+    assert!(
+        rendered.contains("wrap_off = true"),
+        "writes must keep the published key, else an older clauth reads the file \
+         and silently loses the setting: {rendered}"
+    );
+    assert!(
+        !rendered.contains("switch_off_when_spent"),
+        "the Rust name must not reach disk: {rendered}"
+    );
 }
 
 /// `max_auto_spend` is a dollar ceiling on unattended spending, so its load

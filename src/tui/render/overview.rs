@@ -452,7 +452,7 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
 
     // Caption only if it fits; wrap-off replaces wrap caption.
     if lines.len() < cap {
-        let caption = if cfg.state.wrap_off {
+        let caption = if cfg.state.switch_off_when_spent {
             vec![
                 Span::raw("  "),
                 Span::styled("[ ", theme::dim()),

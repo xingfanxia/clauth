@@ -247,9 +247,9 @@ pub(crate) enum GlobalConfigRow {
     /// Color-depth tier: `full` (truecolor) / `compatible` (xterm-256).
     /// Persists to `[theme]` and live-swaps the active palette.
     Theme,
-    /// Chain-wide "when spent" behavior (`AppState.wrap_off`) — surfaced here as
+    /// Chain-wide "when spent" behavior (`AppState.switch_off_when_spent`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.
-    WrapOff,
+    SwitchOffWhenSpent,
     /// Chain-wide weekly (7d) exhaustion line
     /// (`AppState.weekly_switch_threshold`, default 98) — space steps presets,
     /// ⏎ opens the custom-value editor (50–100, decimals allowed).
@@ -271,11 +271,11 @@ pub(crate) enum GlobalConfigRow {
     /// alone still spends nothing.
     SpendBudget,
     /// What happens once a billing account has spent its `max auto-spend`
-    /// budget (`AppState.budget_wrap_off`, default switch-off). Deliberately
-    /// NOT `WrapOff`: that row answers "the chain is out of free quota", where
+    /// budget (`AppState.switch_off_when_budget_spent`, default switch-off). Deliberately
+    /// NOT `SwitchOffWhenSpent`: that row answers "the chain is out of free quota", where
     /// staying costs nothing, and this one answers "the money ran out", where
     /// staying is the spending.
-    BudgetWrapOff,
+    SwitchOffWhenBudgetSpent,
     /// Opt-in preemptive rotation (`AppState.preemptive_rotation`, rotation
     /// coherence #1) — off by default (stock stays strictly lazy: rotate only
     /// on 401). Rotates the ACTIVE Keychain-installed profile ahead of token
@@ -3476,11 +3476,11 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 10] = [
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
-    GlobalConfigRow::WrapOff,
+    GlobalConfigRow::SwitchOffWhenSpent,
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
     GlobalConfigRow::SpendBudget,
-    GlobalConfigRow::BudgetWrapOff,
+    GlobalConfigRow::SwitchOffWhenBudgetSpent,
     GlobalConfigRow::PreemptiveRotation,
 ];
 
@@ -3531,12 +3531,12 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
     match row {
         GlobalConfigRow::Theme => cycle_theme(app),
         GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
-        GlobalConfigRow::WrapOff => toggle_wrap_off(app),
+        GlobalConfigRow::SwitchOffWhenSpent => toggle_wrap_off(app),
         GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
         GlobalConfigRow::SpendBudget => toggle_spend_budget_switching(app),
-        GlobalConfigRow::BudgetWrapOff => toggle_budget_wrap_off(app),
+        GlobalConfigRow::SwitchOffWhenBudgetSpent => toggle_budget_wrap_off(app),
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
     }
@@ -3704,18 +3704,18 @@ fn cycle_divergence_default(app: &mut App) {
 fn toggle_wrap_off(app: &mut App) {
     {
         let mut cfg = app.config();
-        cfg.state.wrap_off = !cfg.state.wrap_off;
+        cfg.state.switch_off_when_spent = !cfg.state.switch_off_when_spent;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();
 }
 
 /// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
-/// `wrap_off`'s persistence shape exactly: mutate the shared `AppConfig`,
+/// `switch_off_when_spent`'s persistence shape exactly: mutate the shared `AppConfig`,
 /// `save_app_state`, bump `last_reload_fp` — no separate propagation to the
 /// scheduler is needed since both `next_target` and `next_auto_switch_target`
 /// read the flag straight off the same shared `config` (`snapshot_chain`
-/// mirrors `wrap_off`'s copy into `ChainSnapshot`).
+/// mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
 fn toggle_burn_aware_switching(app: &mut App) {
     {
         let mut cfg = app.config();
@@ -3741,12 +3741,12 @@ fn toggle_spend_budget_switching(app: &mut App) {
 }
 
 /// Flip what happens once a billing account has spent its budget
-/// (`AppState.budget_wrap_off`). Same persistence shape as
+/// (`AppState.switch_off_when_budget_spent`). Same persistence shape as
 /// `toggle_spend_budget_switching`.
 fn toggle_budget_wrap_off(app: &mut App) {
     {
         let mut cfg = app.config();
-        cfg.state.budget_wrap_off = !cfg.state.budget_wrap_off;
+        cfg.state.switch_off_when_budget_spent = !cfg.state.switch_off_when_budget_spent;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();

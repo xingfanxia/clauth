@@ -213,7 +213,7 @@ fn no_sink_available_returns_none() {
 
 // ── issue #8 follow-up: threshold no longer implies last_resort ─────────────
 
-// A threshold of 100 alone must NOT act as a sink anymore. With wrap_off on
+// A threshold of 100 alone must NOT act as a sink anymore. With switch_off_when_spent on
 // and NEITHER member marked last_resort, switch-off-all still fires even
 // though the active sits at an unmarked 100% threshold. The OLD
 // `threshold >= 100.0` sentinel treated the active as a sink here and
@@ -227,7 +227,7 @@ fn unmarked_hundred_threshold_active_no_longer_acts_as_sink() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
@@ -244,7 +244,7 @@ fn wrap_off_switches_off_when_unmarked_hundred_threshold_member_present() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
@@ -362,7 +362,7 @@ fn auto_switch_unmarked_hundred_threshold_member_is_not_a_sink() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     let snap = snapshot_chain(&config).expect("snapshot");
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
     assert_eq!(
@@ -410,7 +410,7 @@ fn auto_switch_missing_util_is_not_exhausted() {
 // When no member is marked last_resort and the whole chain is exhausted,
 // wrap-off turns off all accounts instead of staying put.
 
-// next_target: wrap_off on, no last_resort member, all exhausted → Off.
+// next_target: switch_off_when_spent on, no last_resort member, all exhausted → Off.
 #[test]
 fn wrap_off_switches_off_when_chain_spent() {
     let mut config = config_with_chain(
@@ -420,11 +420,11 @@ fn wrap_off_switches_off_when_chain_spent() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
-// next_target: wrap_off on but a last_resort member exists (at an 80%
+// next_target: switch_off_when_spent on but a last_resort member exists (at an 80%
 // threshold, not 100) → migrate there, not Off.
 #[test]
 fn wrap_off_prefers_sink_over_off() {
@@ -435,14 +435,14 @@ fn wrap_off_prefers_sink_over_off() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(
         next_target(&config, None),
         Some(SwitchAction::To("b".to_string()))
     );
 }
 
-// next_target: wrap_off on but active still has headroom → no Off.
+// next_target: switch_off_when_spent on but active still has headroom → no Off.
 #[test]
 fn wrap_off_skips_off_when_active_has_headroom() {
     let mut config = config_with_chain(
@@ -452,12 +452,12 @@ fn wrap_off_skips_off_when_active_has_headroom() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     // a at 50% < 95% → not exhausted → stay
     assert_eq!(next_target(&config, None), None);
 }
 
-// next_target: same spent chain, wrap_off off → legacy None.
+// next_target: same spent chain, switch_off_when_spent off → legacy None.
 #[test]
 fn wrap_off_disabled_stays_put() {
     let config = config_with_chain(
@@ -598,9 +598,9 @@ fn auto_switch_wrap_off_switches_off_when_chain_spent() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     let snap = snapshot_chain(&config).expect("snapshot");
-    assert!(snap.wrap_off);
+    assert!(snap.switch_off_when_spent);
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]); // both over 95% threshold, no sink → Off
     assert_eq!(
         next_auto_switch_target(&snap, &store),
@@ -799,7 +799,7 @@ fn next_target_accepts_member_with_expired_window() {
     );
 }
 
-// next_auto_switch_target: wrap_off off, spent chain → legacy None.
+// next_auto_switch_target: switch_off_when_spent off, spent chain → legacy None.
 #[test]
 fn auto_switch_wrap_off_disabled_stays_put() {
     let config = config_with_chain(
@@ -888,7 +888,7 @@ fn next_target_broken_sink_wrap_off_switches_off() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     config.set_auth_broken("b", true);
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
@@ -983,7 +983,7 @@ fn auto_switch_never_targets_a_kick_rejected_member() {
     );
 
     // Same chain with the rejection also covering the last resort: nothing
-    // viable remains and the active stays put (no Off — wrap_off is unset).
+    // viable remains and the active stays put (no Off — switch_off_when_spent is unset).
     snap.kick_rejected = vec!["b".to_string(), "c".to_string()];
     assert_eq!(next_auto_switch_target(&snap, &store), None);
 }
@@ -1195,7 +1195,7 @@ fn next_target_over_budget_active_switches_off_by_default() {
     );
     config.state.spend_budget_switching = true;
     assert!(
-        config.state.budget_wrap_off,
+        config.state.switch_off_when_budget_spent,
         "a spent budget halts by default"
     );
     assert_eq!(
@@ -1213,7 +1213,7 @@ fn next_target_over_budget_active_switches_off_by_default() {
     );
 }
 
-// `budget_wrap_off` is its own decision, not `wrap_off`'s: staying costs
+// `switch_off_when_budget_spent` is its own decision, not `switch_off_when_spent`'s: staying costs
 // nothing when free quota runs out and costs money when a budget does, so an
 // operator may want stay-on-last for one and switch-off for the other.
 #[test]
@@ -1226,20 +1226,20 @@ fn next_target_over_budget_active_can_be_told_to_keep_billing() {
         "b",
     );
     config.state.spend_budget_switching = true;
-    config.state.budget_wrap_off = false;
+    config.state.switch_off_when_budget_spent = false;
     assert_eq!(
         next_target(&config, None),
         None,
         "explicitly told to stay on a spent budget: keeps billing"
     );
 
-    // ...and `wrap_off` must not answer for it in either direction: on, it
+    // ...and `switch_off_when_spent` must not answer for it in either direction: on, it
     // halts a chain out of QUOTA, and this chain is out of MONEY.
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(
         next_target(&config, None),
         None,
-        "wrap_off must not halt an over-budget active that was told to stay"
+        "switch_off_when_spent must not halt an over-budget active that was told to stay"
     );
 }
 
@@ -1264,7 +1264,7 @@ fn next_target_over_budget_active_parks_on_a_sink_before_halting() {
 }
 
 // The bit-identical guarantee at the halt gate: with the master toggle off, a
-// billing account over any ceiling must read `wrap_off` exactly like before.
+// billing account over any ceiling must read `switch_off_when_spent` exactly like before.
 #[test]
 fn next_target_over_budget_halt_is_inert_with_the_toggle_off() {
     let mut config = config_with_chain(
@@ -1278,14 +1278,14 @@ fn next_target_over_budget_halt_is_inert_with_the_toggle_off() {
     assert_eq!(
         next_target(&config, None),
         None,
-        "wrap_off off + toggle off → stay, exactly like before the budget existed"
+        "switch_off_when_spent off + toggle off → stay, exactly like before the budget existed"
     );
 
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(
         next_target(&config, None),
         Some(SwitchAction::Off),
-        "wrap_off on → Off, decided by wrap_off alone"
+        "switch_off_when_spent on → Off, decided by switch_off_when_spent alone"
     );
 }
 
@@ -1331,20 +1331,20 @@ fn spend_is_uncapped_only_when_nothing_can_stop_the_billing() {
         "a",
     );
     config.state.spend_budget_switching = true;
-    config.state.budget_wrap_off = false;
+    config.state.switch_off_when_budget_spent = false;
     assert!(
         spend_is_uncapped(&config, 5.0),
         "armed + stay-on-last + no sink = the ceiling never stops anything"
     );
 
     // Each of the three, alone, caps it again.
-    config.state.budget_wrap_off = true;
+    config.state.switch_off_when_budget_spent = true;
     assert!(
         !spend_is_uncapped(&config, 5.0),
         "halting stops the billing"
     );
 
-    config.state.budget_wrap_off = false;
+    config.state.switch_off_when_budget_spent = false;
     config.profiles[0].last_resort = true;
     assert!(
         !spend_is_uncapped(&config, 5.0),
@@ -1468,7 +1468,7 @@ fn next_target_spend_armed_member_outranks_wrap_off() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     config.state.spend_budget_switching = true;
     assert_eq!(
         next_target(&config, None),
@@ -1540,7 +1540,7 @@ fn auto_switch_subscription_headroom_beats_a_spend_armed_member() {
 }
 
 // The store twin's steady state, in lockstep with `next_target`: an over-budget
-// active halts on `budget_wrap_off`, and `wrap_off` does not answer for it.
+// active halts on `switch_off_when_budget_spent`, and `switch_off_when_spent` does not answer for it.
 #[test]
 fn auto_switch_over_budget_active_switches_off_by_default() {
     let mut config = config_with_chain(
@@ -1559,21 +1559,24 @@ fn auto_switch_over_budget_active_switches_off_by_default() {
         ),
     ]);
     let snap = snapshot_chain(&config).expect("snapshot");
-    assert!(snap.budget_wrap_off, "a spent budget halts by default");
+    assert!(
+        snap.switch_off_when_budget_spent,
+        "a spent budget halts by default"
+    );
     assert_eq!(
         next_auto_switch_target(&snap, &store),
         Some(SwitchAction::Off),
         "the scheduler must cap the spend exactly like the UI twin"
     );
 
-    // Told to stay → keeps billing, and `wrap_off` must not override that.
-    config.state.budget_wrap_off = false;
-    config.state.wrap_off = true;
+    // Told to stay → keeps billing, and `switch_off_when_spent` must not override that.
+    config.state.switch_off_when_budget_spent = false;
+    config.state.switch_off_when_spent = true;
     let snap = snapshot_chain(&config).expect("snapshot");
     assert_eq!(
         next_auto_switch_target(&snap, &store),
         None,
-        "wrap_off must not halt an over-budget active that was told to stay"
+        "switch_off_when_spent must not halt an over-budget active that was told to stay"
     );
 }
 
@@ -1610,7 +1613,7 @@ fn auto_switch_broken_active_without_viable_member_never_wraps_off() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     config.set_auth_broken("a", true);
     config.set_auth_broken("b", true); // the only sibling is dead too
     let snap = snapshot_chain(&config).expect("snapshot");
@@ -1632,7 +1635,7 @@ fn auto_switch_broken_and_exhausted_active_still_wraps_off() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     config.set_auth_broken("a", true);
     config.set_auth_broken("b", true);
     let snap = snapshot_chain(&config).expect("snapshot");
@@ -1751,7 +1754,7 @@ fn next_target_burn_aware_none_rate_falls_back_to_static_threshold() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     config.state.burn_aware_switching = true;
     assert_eq!(
         next_target(&config, None),
@@ -1819,7 +1822,7 @@ fn burn_aware_heavy_burn_flips_wrap_off_decision_on_both_walks() {
         ],
         "a",
     );
-    static_config.state.wrap_off = true;
+    static_config.state.switch_off_when_spent = true;
     assert_eq!(
         next_target(&static_config, None),
         None,
@@ -1844,7 +1847,7 @@ fn burn_aware_heavy_burn_flips_wrap_off_decision_on_both_walks() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     config.state.burn_aware_switching = true;
     config.state.refresh_interval_ms = 90_000;
     assert_eq!(
@@ -1854,7 +1857,7 @@ fn burn_aware_heavy_burn_flips_wrap_off_decision_on_both_walks() {
     );
 
     let snap = snapshot_chain(&config).expect("snapshot");
-    assert!(snap.wrap_off);
+    assert!(snap.switch_off_when_spent);
     assert!(snap.burn_aware);
     assert_eq!(snap.interval_ms, 90_000);
     let store = store_with_utils(&[("a", 90.0), ("b", 100.0)]);
@@ -2154,7 +2157,7 @@ fn wrap_off_keys_on_the_weekly_hard_cap_not_the_soft_line() {
         vec![weekly_soft_profile("a"), weekly_soft_profile("b")],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(
         next_target(&config, None),
         None,
@@ -2171,7 +2174,7 @@ fn wrap_off_keys_on_the_weekly_hard_cap_not_the_soft_line() {
         )),
     );
     let mut config = config_with_chain(vec![dead, weekly_soft_profile("b")], "a");
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
@@ -2194,7 +2197,7 @@ fn wrap_off_keys_on_the_hard_cap_in_the_store_walk_too() {
         )
     };
     let mut config = mk();
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     let snapshot = snapshot_chain(&config).expect("snapshot");
     let store = store_with_infos(vec![("a", soft()), ("b", soft())]);
     assert_eq!(

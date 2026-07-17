@@ -257,10 +257,18 @@ pub(crate) struct AppState {
     pub(crate) profiles: Vec<ProfileName>,
     #[serde(default)]
     pub(crate) fallback_chain: Vec<ProfileName>,
-    /// When true and the whole chain is exhausted, auto-switch clears live
-    /// credentials and unsets the active profile instead of staying put.
-    #[serde(default)]
-    pub(crate) wrap_off: bool,
+    /// When true and the whole chain is exhausted of SUBSCRIPTION quota,
+    /// auto-switch clears live credentials and unsets the active profile
+    /// instead of staying put. Its money twin is
+    /// [`AppState::switch_off_when_budget_spent`] — see that field for why the
+    /// two are separate.
+    ///
+    /// The on-disk key stays `switch_off_when_spent`: it is also a `status.json` field
+    /// (schema 1, `wiki/daemon.md`), so renaming it would break a published read
+    /// contract and every existing profiles.toml. The Rust name says what it
+    /// does; the serde name is the compatibility surface. Don't "align" them.
+    #[serde(rename = "wrap_off", default)]
+    pub(crate) switch_off_when_spent: bool,
     /// Profiles quarantined after a *permanent* OAuth refresh rejection (AUTH-1 /
     /// Incident C) — a transient network/5xx blip never lands here. Excluded from
     /// the fallback chain walk and refused as a switch target so a dead token is
@@ -291,15 +299,21 @@ pub(crate) struct AppState {
     /// What to do once a billing account has spent its `max_auto_spend` budget:
     /// `true` (the default) switches everything off, `false` stays on it.
     ///
-    /// Separate from `wrap_off` on purpose. That one answers "the chain ran out
-    /// of SUBSCRIPTION quota", where staying costs nothing but rate-limit
-    /// errors. Here staying IS the spending, so the same words mean opposite
-    /// things and an operator can legitimately want opposite answers: stay on
-    /// last when the quota runs out, switch off when the money does. Defaults to
-    /// switching off so `max auto-spend` is a real cap rather than an entry
-    /// gate. See `fallback::budget_spent`.
-    #[serde(default = "default_budget_wrap_off", skip_serializing_if = "is_true")]
-    pub(crate) budget_wrap_off: bool,
+    /// Separate from [`AppState::switch_off_when_spent`] on purpose. That one
+    /// answers "the chain ran out of SUBSCRIPTION quota", where staying costs
+    /// nothing but rate-limit errors. Here staying IS the spending, so the same
+    /// words mean opposite things and an operator can legitimately want opposite
+    /// answers: stay on last when the quota runs out, switch off when the money
+    /// does. Defaults to switching off so `max auto-spend` is a real cap rather
+    /// than an entry gate. See `fallback::budget_spent`.
+    /// Unlike its `wrap_off` twin this key needs no compatibility spelling: it
+    /// has never shipped, so the on-disk name is just the field name. That is
+    /// why the pair looks lopsided in profiles.toml.
+    #[serde(
+        default = "default_switch_off_when_budget_spent",
+        skip_serializing_if = "is_true"
+    )]
+    pub(crate) switch_off_when_budget_spent: bool,
     /// Opt-in: rotate the ACTIVE, Keychain-installed profile ahead of its
     /// access-token expiry instead of waiting for a 401 (rotation coherence,
     /// #1). Off by default — stock clauth stays strictly lazy. Adoption plus
@@ -383,9 +397,9 @@ fn default_refresh_spent() -> bool {
 }
 
 /// A spent budget stops spending unless the operator says otherwise, so this
-/// defaults ON — unlike `wrap_off`, whose default keeps you signed in because
+/// defaults ON — unlike `switch_off_when_spent`, whose default keeps you signed in because
 /// staying costs nothing there.
-fn default_budget_wrap_off() -> bool {
+fn default_switch_off_when_budget_spent() -> bool {
     true
 }
 
@@ -434,11 +448,11 @@ impl Default for AppState {
             active_profile: None,
             profiles: Vec::new(),
             fallback_chain: Vec::new(),
-            wrap_off: false,
+            switch_off_when_spent: false,
             auth_broken: Vec::new(),
             burn_aware_switching: false,
             spend_budget_switching: false,
-            budget_wrap_off: default_budget_wrap_off(),
+            switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: false,
             auto_rescue: false,
             refresh_spent_accounts: true,
@@ -1228,7 +1242,7 @@ fn render_config_toml(profile: &Profile) -> String {
     out.push_str("# default) never spends. The chain stops using this account once its\n");
     out.push_str("# spend reaches 90% of this or of the account's own cap, whichever is\n");
     out.push_str("# lower — parking on a `last_resort` member if the chain has one, else\n");
-    out.push_str("# per `budget_wrap_off`.\n");
+    out.push_str("# per `switch_off_when_budget_spent`.\n");
     match profile.max_auto_spend {
         Some(v) => out.push_str(&format!("max_auto_spend = {v}\n")),
         None => out.push_str("# max_auto_spend = 5.0\n"),

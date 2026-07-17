@@ -225,7 +225,7 @@ pub(crate) fn build_status(
         "generated_at": iso_from_ms(now),
         "active_profile": config.state.active_profile.as_deref(),
         "pending_switch": live.and_then(|s| s.pending_switch),
-        "wrap_off": config.state.wrap_off,
+        "wrap_off": config.state.switch_off_when_spent,
         "refresh_interval_ms": interval_ms,
         "profiles": profiles,
     })

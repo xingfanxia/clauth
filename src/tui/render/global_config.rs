@@ -1,10 +1,11 @@
 //! Program-wide Config tab — a single panel of global settings, distinct from
 //! the per-account Setup tab. Rows back real persisted state in `AppState`:
 //! the theme tier (`[theme]`), the divergence default, the refresh interval, the
-//! spent-account poll toggle, the chain-wide wrap-off default, the weekly
+//! spent-account poll toggle, the chain-wide `when spent` default, the weekly
 //! exhaustion line, the opt-in burn-aware auto-switch mode (issue #8 follow-up
-//! b), and the opt-in preemptive rotation of the active account (rotation
-//! coherence #1). ↑↓ walks the rows; space cycles a row's value in place; ⏎
+//! b), the opt-in spend budget plus its own `budget spent` default (real money —
+//! see `docs/internals.md`), and the opt-in preemptive rotation of the active
+//! account (rotation coherence #1). ↑↓ walks the rows; space cycles a row's value in place; ⏎
 //! opens the refresh-interval and weekly-threshold custom-value editors and
 //! otherwise mirrors space. No left selector, no popups — settings are global.
 
@@ -40,10 +41,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let toggles = {
         let state = &app.config().state;
         ToggleState {
-            wrap_off: state.wrap_off,
+            switch_off_when_spent: state.switch_off_when_spent,
             burn_aware: state.burn_aware_switching,
             spend_budget: state.spend_budget_switching,
-            budget_wrap_off: state.budget_wrap_off,
+            switch_off_when_budget_spent: state.switch_off_when_budget_spent,
             preemptive: state.preemptive_rotation,
             refresh_spent: state.refresh_spent_accounts,
         }
@@ -119,10 +120,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// `row_hint` stay within clippy's argument budget as rows accumulate.
 #[derive(Clone, Copy)]
 struct ToggleState {
-    wrap_off: bool,
+    switch_off_when_spent: bool,
     burn_aware: bool,
     spend_budget: bool,
-    budget_wrap_off: bool,
+    switch_off_when_budget_spent: bool,
     preemptive: bool,
     refresh_spent: bool,
 }
@@ -150,8 +151,8 @@ fn row_hint(
         GlobalConfigRow::WeeklyThreshold => {
             "auto-switch treats an account past this share of its weekly (7d) window as spent"
         }
-        GlobalConfigRow::WrapOff => {
-            if toggles.wrap_off {
+        GlobalConfigRow::SwitchOffWhenSpent => {
+            if toggles.switch_off_when_spent {
                 "once every account is spent, switch everything off until one recovers"
             } else {
                 "once every account is spent, stay on the last one until one recovers"
@@ -171,8 +172,8 @@ fn row_hint(
                 "never spend money automatically; a spent chain parks or switches off"
             }
         }
-        GlobalConfigRow::BudgetWrapOff => {
-            if toggles.budget_wrap_off {
+        GlobalConfigRow::SwitchOffWhenBudgetSpent => {
+            if toggles.switch_off_when_budget_spent {
                 "once an account's spend budget runs out, switch everything off"
             } else {
                 "once an account's spend budget runs out, stay on it and keep billing"
@@ -251,12 +252,12 @@ fn detail_row(
             ],
             selected,
         ),
-        GlobalConfigRow::WrapOff => cycle_row(
+        GlobalConfigRow::SwitchOffWhenSpent => cycle_row(
             arrow,
             "when spent",
             &[
-                ("stay on last", !toggles.wrap_off),
-                ("switch off all", toggles.wrap_off),
+                ("stay on last", !toggles.switch_off_when_spent),
+                ("switch off all", toggles.switch_off_when_spent),
             ],
             selected,
         ),
@@ -280,12 +281,12 @@ fn detail_row(
         ),
         // Same two words as `when spent` on purpose: the pairing is the point.
         // Only the default differs — staying is free there and costs money here.
-        GlobalConfigRow::BudgetWrapOff => cycle_row(
+        GlobalConfigRow::SwitchOffWhenBudgetSpent => cycle_row(
             arrow,
             "budget spent",
             &[
-                ("stay on last", !toggles.budget_wrap_off),
-                ("switch off all", toggles.budget_wrap_off),
+                ("stay on last", !toggles.switch_off_when_budget_spent),
+                ("switch off all", toggles.switch_off_when_budget_spent),
             ],
             selected,
         ),

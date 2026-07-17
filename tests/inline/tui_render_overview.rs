@@ -283,7 +283,7 @@ fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
     let a = profile("a", 95.0, 100.0, 900);
     let b = profile("b", 95.0, 100.0, 3600);
     let mut config = config_with(vec![a, b], None, vec!["a", "b"]);
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     let app = App::new(config);
     let lines = fallback_flow_lines(&app, 60, 20);
     let hint = resumes_line(&lines)

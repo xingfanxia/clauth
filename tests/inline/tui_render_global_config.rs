@@ -24,10 +24,10 @@ fn value_col(key: &str, rendered: &str) -> usize {
 
 fn toggles() -> ToggleState {
     ToggleState {
-        wrap_off: false,
+        switch_off_when_spent: false,
         burn_aware: false,
         spend_budget: false,
-        budget_wrap_off: true,
+        switch_off_when_budget_spent: true,
         preemptive: false,
         refresh_spent: true,
     }

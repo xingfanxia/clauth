@@ -1912,24 +1912,24 @@ fn budget_wrap_off_space_toggles_and_persists() {
     app.tab = Tab::Config;
     app.global_config_cursor = GLOBAL_CONFIG_ROWS
         .iter()
-        .position(|r| *r == GlobalConfigRow::BudgetWrapOff)
+        .position(|r| *r == GlobalConfigRow::SwitchOffWhenBudgetSpent)
         .unwrap();
     assert!(
-        app.config().state.budget_wrap_off,
+        app.config().state.switch_off_when_budget_spent,
         "a spent budget stops spending unless told otherwise: on by default"
     );
     assert!(
-        !app.config().state.wrap_off,
+        !app.config().state.switch_off_when_spent,
         "...while `when spent` defaults the other way, since staying is free there"
     );
 
     super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
     assert!(
-        !app.config().state.budget_wrap_off,
+        !app.config().state.switch_off_when_budget_spent,
         "space flips it to stay-on-last"
     );
     assert!(
-        !app.config().state.wrap_off,
+        !app.config().state.switch_off_when_spent,
         "flipping the budget row must not touch `when spent`"
     );
 
@@ -1938,7 +1938,10 @@ fn budget_wrap_off_space_toggles_and_persists() {
             .expect("read profiles.toml"),
     )
     .expect("parse profiles.toml");
-    assert!(!reloaded.budget_wrap_off, "toggle persists to disk");
+    assert!(
+        !reloaded.switch_off_when_budget_spent,
+        "toggle persists to disk"
+    );
 }
 
 // ── preemptive rotation (rotation coherence #1) ─────────────────────────────
