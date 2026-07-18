@@ -1276,7 +1276,7 @@ fn next_target_over_budget_active_switches_off_by_default() {
 
 // `switch_off_when_budget_spent` is its own decision, not `switch_off_when_spent`'s: staying costs
 // nothing when free quota runs out and costs money when a budget does, so an
-// operator may want stay-on-last for one and switch-off for the other.
+// operator may want stay-on-active for one and switch-off-all for the other.
 #[test]
 fn next_target_over_budget_active_can_be_told_to_keep_billing() {
     let mut config = config_with_chain(
@@ -1352,7 +1352,7 @@ fn next_target_over_budget_halt_is_inert_with_the_toggle_off() {
 
 // A plain subscription active must never reach the budget halt: `budget_spent`
 // is what separates "out of money" from "out of quota", and reading it wrong
-// would halt ordinary accounts that were only ever told to stay on last.
+// would halt ordinary accounts that were only ever told to stay on active.
 #[test]
 fn budget_spent_never_fires_on_a_subscription_account() {
     let plain = usage_info(Some(window(100.0, Some(live_reset()))));
@@ -1395,7 +1395,7 @@ fn spend_is_uncapped_only_when_nothing_can_stop_the_billing() {
     config.state.switch_off_when_budget_spent = false;
     assert!(
         spend_is_uncapped(&config, 5.0),
-        "armed + stay-on-last + no sink = the ceiling never stops anything"
+        "armed + stay-on-active + no sink = the ceiling never stops anything"
     );
 
     // Each of the three, alone, caps it again.
