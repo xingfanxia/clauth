@@ -720,8 +720,8 @@ impl ActionMenuAction {
             Self::EditMaxSpend => "edit max auto-spend",
             Self::RemoveMember => "remove member",
             Self::ToggleAutoStart => "toggle auto-start",
-            Self::DeleteProfile => "delete profile",
-            Self::CreateProfile => "create profile",
+            Self::DeleteProfile => "delete account",
+            Self::CreateProfile => "create account",
             Self::LoginAccount => "log in",
             Self::ClearCredentials => "log out",
             Self::EditField => "edit field",
@@ -778,7 +778,7 @@ pub(crate) struct Toast {
     pub(crate) born: Instant,
 }
 
-const ROTATE_ALL_MSG: &str = "Rotate all access tokens?";
+const ROTATE_ALL_MSG: &str = "rotate all access tokens?";
 const ROTATE_ALL_DETAIL: &str = "accounts with a live session are skipped.";
 const TOAST_CAPACITY: usize = 3;
 const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
@@ -2753,9 +2753,9 @@ fn apply_plugin_fix(app: &mut App) {
         PluginFix::WireMcpServers => {
             app.disarm_quit();
             app.modals.push(Modal::Confirm(ConfirmState {
-                message: "Wire clauth into Claude Code's mcpServers?".to_string(),
+                message: "wire clauth into claude code's mcpServers?".to_string(),
                 detail: Some(
-                    "Writes the clauth entry into ~/.claude.json; other fields are preserved."
+                    "writes the clauth entry into ~/.claude.json; other fields are preserved."
                         .to_string(),
                 ),
                 choice: false,
@@ -2769,9 +2769,9 @@ fn apply_plugin_fix(app: &mut App) {
         PluginFix::RelinkCredentials(name) => {
             app.disarm_quit();
             app.modals.push(Modal::Confirm(ConfirmState {
-                message: format!("Relink ~/.claude credentials to '{name}'?"),
+                message: format!("relink ~/.claude credentials to '{name}'?"),
                 detail: Some(
-                    "Re-points .credentials.json at the profile's own stored tokens; spends nothing.".to_string(),
+                    "re-points .credentials.json at the account's own stored tokens; spends nothing.".to_string(),
                 ),
                 choice: false,
                 on_confirm: ConfirmAction::RelinkCredentials(name),
@@ -3216,7 +3216,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
     }
     drop(cfg);
     app.modals.push(Modal::Confirm(ConfirmState {
-        message: format!("Switch to '{name}'?"),
+        message: format!("switch to '{name}'?"),
         detail: None,
         choice: true,
         on_confirm: ConfirmAction::Switch(name),
@@ -3419,10 +3419,14 @@ fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
         .as_ref()
         .is_some_and(|c| c.claude_ai_oauth.is_some());
     if !has_oauth && snapshot.base_url.is_none() && snapshot.api_key.is_none() {
-        app.toast(
-            ToastKind::Danger,
-            "no live login found\nnothing to capture (macOS keychain isn't supported yet)",
-        );
+        // The Keychain caveat only makes sense on macOS, where a live login can
+        // hide in the Keychain clauth doesn't read; elsewhere it's noise.
+        let msg = if cfg!(target_os = "macos") {
+            "no live login found\nnothing to capture (macos keychain isn't supported yet)"
+        } else {
+            "no live login found\nnothing to capture"
+        };
+        app.toast(ToastKind::Danger, msg);
         return None;
     }
     Some(snapshot)
@@ -3438,8 +3442,8 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
     };
     if let Some(existing) = existing_match {
         app.modals.push(Modal::Confirm(ConfirmState {
-            message: format!("These credentials already belong to '{existing}'."),
-            detail: Some("Capture anyway?".to_string()),
+            message: format!("these credentials already belong to '{existing}'."),
+            detail: Some("capture anyway?".to_string()),
             choice: false,
             on_confirm: ConfirmAction::CaptureConflict(Box::new(snapshot), from_divergence),
         }));
@@ -4738,7 +4742,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             }
             Some((name, true, _)) => {
                 app.modals.push(Modal::Confirm(ConfirmState {
-                    message: format!("Rotate access token for '{name}'?"),
+                    message: format!("rotate access token for '{name}'?"),
                     detail: None,
                     choice: false,
                     on_confirm: ConfirmAction::RotateOne(name),
@@ -5073,7 +5077,7 @@ fn leave_config_detail(app: &mut App) {
     if mint_dropped {
         app.toast(
             ToastKind::Warning,
-            "the captured login was dropped with the form",
+            "closing the form dropped the login you just captured",
         );
     }
 }
@@ -5186,11 +5190,8 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                     .is_some_and(|d| d.captured_login.is_some());
                 if has_stash {
                     app.modals.push(Modal::Confirm(ConfirmState {
-                        message: "Replace the captured login?".to_string(),
-                        detail: Some(
-                            "A fresh browser login replaces the one already captured for this account. The stashed tokens are dropped."
-                                .to_string(),
-                        ),
+                        message: "replace the captured login?".to_string(),
+                        detail: Some("the login you already captured will be dropped".to_string()),
                         choice: false,
                         on_confirm: ConfirmAction::RestartLogin(name, is_new),
                     }));
@@ -5208,12 +5209,12 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                         .unwrap_or(false)
                 };
                 let detail = if is_api {
-                    "Blanks the api key; keeps the base url, model, and env. Re-login any time."
+                    "blanks the api key; keeps the base url, model, and env. re-login any time."
                 } else {
-                    "Blanks the login; keeps the profile, model, env, and chain slot. Re-login any time."
+                    "blanks the login; keeps the account, model, env, and chain slot. re-login any time."
                 };
                 app.modals.push(Modal::Confirm(ConfirmState {
-                    message: format!("Log out of '{name}'?"),
+                    message: format!("log out of '{name}'?"),
                     detail: Some(detail.to_string()),
                     choice: false,
                     on_confirm: ConfirmAction::BlankCredentials(name),
@@ -6004,9 +6005,9 @@ fn perform_delete(app: &mut App, name: &str) {
     // the unforced delete first.
     if crate::runtime::has_live_session(name) {
         app.modals.push(Modal::Confirm(ConfirmState {
-            message: format!("Delete '{name}' anyway?"),
+            message: format!("delete '{name}' anyway?"),
             detail: Some(
-                "This profile has a live `clauth start` session; deleting it may log that \
+                "this account has a live clauth start session; deleting it may log that \
                  session out."
                     .to_string(),
             ),
@@ -6067,7 +6068,7 @@ fn toggle_auto_start(app: &mut App, name: &str) {
         Outcome::Missing => {}
         Outcome::NotOAuth => app.toast(
             ToastKind::Warning,
-            "auto-start usage only applies to OAuth profiles",
+            "auto-start only works on oauth accounts",
         ),
         Outcome::Saved(_now_on) => {
             // Rebuild the scheduler's token snapshot so the new `auto_start` flag
@@ -6324,10 +6325,10 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                         return;
                     };
                     app.modals.push(Modal::Confirm(ConfirmState {
-                        message: format!("Switch to '{owner}'? The live login is its account."),
+                        message: format!("switch to '{owner}'? the live login is its account."),
                         detail: Some(format!(
-                            "The login is saved into '{owner}' and '{owner}' becomes the active \
-                             account. The running claude is untouched."
+                            "the login is saved into '{owner}' and '{owner}' becomes the active \
+                             account. the running claude is untouched."
                         )),
                         choice: false,
                         on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), owner),
@@ -6364,9 +6365,9 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
         DivergenceChoice::NewProfile => open_divergence_target_picker(app),
         DivergenceChoice::Discard => {
             app.modals.push(Modal::Confirm(ConfirmState {
-                message: format!("Discard the new login and restore '{active}'?"),
+                message: format!("discard the new login and restore '{active}'?"),
                 detail: Some(
-                    "Claude Code's freshly written credentials will be overwritten with the profile's stored tokens.".to_string(),
+                    "claude code's freshly written credentials will be overwritten with the account's stored tokens.".to_string(),
                 ),
                 choice: false,
                 on_confirm: ConfirmAction::DiscardDivergence(active.to_string()),
@@ -6460,9 +6461,9 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                 return;
             };
             app.modals.push(Modal::Confirm(ConfirmState {
-                message: format!("Save the live login into '{target}'?"),
+                message: format!("save the live login into '{target}'?"),
                 detail: Some(format!(
-                    "'{target}' becomes the active account; its old credentials are replaced. Usage history, env, and model settings are kept."
+                    "'{target}' becomes the active account; its old credentials are replaced. usage history, env, and model settings are kept."
                 )),
                 choice: false,
                 on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), target),
@@ -6507,9 +6508,9 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 // with an error. Route to the same confirm-modal machinery as
                 // every other destructive action instead of a picker/new modal.
                 app.modals.push(Modal::Confirm(ConfirmState {
-                    message: format!("Profile '{existing}' already exists."),
+                    message: format!("account '{existing}' already exists."),
                     detail: Some(
-                        "Overwrite its credentials with the captured login? Usage history, env, and model settings are kept.".to_string(),
+                        "overwrite its credentials with the captured login? usage history, env, and model settings are kept.".to_string(),
                     ),
                     choice: false,
                     on_confirm: ConfirmAction::CaptureOverwrite(
@@ -6822,9 +6823,9 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         );
     if !apply_now {
         app.modals.push(Modal::Confirm(ConfirmState {
-            message: format!("Replace the stored credentials for '{}'?", session.name),
+            message: format!("replace the stored credentials for '{}'?", session.name),
             detail: Some(
-                "A fresh browser login finished for this account. The old tokens are dropped; chain slot, env, and model settings stay."
+                "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, and model settings stay."
                     .to_string(),
             ),
             choice: false,
@@ -6860,7 +6861,7 @@ pub(crate) fn on_tick(app: &mut App) {
             UpdateEvent::Available(v) => {
                 app.toast(
                     ToastKind::Info,
-                    format!("update available: v{v}\nrun `cargo install clauth`"),
+                    format!("update available: v{v}\nreinstall with cargo install clauth"),
                 );
             }
         }
@@ -6967,9 +6968,9 @@ fn update_banner(app: &mut App) {
 
     app.banner = if no_active {
         let message = if any_spent {
-            "all accounts spent · switch to a profile to resume"
+            "all accounts spent · switch to an account to resume"
         } else {
-            "no active profile · select one to resume"
+            "no active account · select one to resume"
         };
         Some(Banner {
             severity: BannerSeverity::Danger,

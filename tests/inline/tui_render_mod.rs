@@ -582,7 +582,7 @@ fn banner_renders() {
     let mut app = App::new(config);
     app.banner = Some(Banner {
         severity: BannerSeverity::Danger,
-        message: "all accounts spent · switch to a profile to resume".to_string(),
+        message: "all accounts spent · switch to an account to resume".to_string(),
     });
 
     let screen = dump(&app, 90, 20);

@@ -412,8 +412,8 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         ))];
         lines.extend(
             wrap_words(
-                "fallback tab adds accounts that rotate automatically when a 5h \
-                 window crosses its threshold.",
+                "add accounts on the fallback tab and clauth switches between them \
+                 as each runs out.",
                 width,
             )
             .into_iter()
@@ -489,7 +489,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             Span::styled("[ ", theme::dim()),
             Span::styled("stay", theme::dim().bold()),
             Span::styled(" ]", theme::dim()),
-            Span::styled(" on last when all spent", theme::faint()),
+            Span::styled(" on the active account when all spent", theme::faint()),
         ]
     };
     lines.push(Line::from(caption));
@@ -499,7 +499,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!("stops all in ~{}", humanize_duration(*secs)),
+                format!("signs everything out in ~{}", humanize_duration(*secs)),
                 theme::faint(),
             ),
         ]));

@@ -1932,7 +1932,7 @@ fn budget_wrap_off_space_toggles_and_persists() {
     super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
     assert!(
         !app.config().state.switch_off_when_budget_spent,
-        "space flips it to stay-on-last"
+        "space flips it to stay on active"
     );
     assert!(
         !app.config().state.switch_off_when_spent,
@@ -2531,7 +2531,7 @@ fn no_active_banner_without_spent_evidence() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "no active profile · select one to resume"
+        "no active account · select one to resume"
     );
 }
 
@@ -2551,7 +2551,7 @@ fn all_spent_banner_needs_live_spent_window() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "all accounts spent · switch to a profile to resume"
+        "all accounts spent · switch to an account to resume"
     );
 }
 
@@ -2575,7 +2575,7 @@ fn all_spent_banner_ignores_a_soft_blocked_member_that_still_serves() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "no active profile · select one to resume",
+        "no active account · select one to resume",
         "soft-blocked is not spent — the banner must not claim it is"
     );
 }
@@ -2597,7 +2597,7 @@ fn all_spent_banner_fires_at_the_weekly_hard_cap() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "all accounts spent · switch to a profile to resume"
+        "all accounts spent · switch to an account to resume"
     );
 }
 
@@ -3010,7 +3010,7 @@ fn capture_overwrite_cancel_changes_nothing() {
         account_uuid: None,
     };
     app.modals.push(super::Modal::Confirm(super::ConfirmState {
-        message: "Profile 'acme' already exists.".to_string(),
+        message: "account 'acme' already exists.".to_string(),
         detail: None,
         choice: false, // cancel is the default-focused, safe choice
         on_confirm: super::ConfirmAction::CaptureOverwrite(
