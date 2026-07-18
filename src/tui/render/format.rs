@@ -206,17 +206,6 @@ pub(super) fn clock_label(epoch_ms: u64, utc: bool) -> String {
     format!("{mon} {day}, {hm}{suffix}")
 }
 
-/// Green/yellow/red headroom against a member's threshold (crossing = rotate).
-pub(super) fn health_color(pct: f64, threshold: f64) -> ratatui::style::Color {
-    if pct >= threshold {
-        theme::danger_color()
-    } else if pct >= threshold * 0.8 {
-        theme::warning_color()
-    } else {
-        theme::success_color()
-    }
-}
-
 use crate::spinner::SPINNER_FRAMES;
 
 pub(super) fn spinner_frame(tick: u64) -> &'static str {

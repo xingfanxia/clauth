@@ -4,35 +4,63 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, Paragraph};
 
 use super::super::app::{App, MainItemKind};
 use super::super::theme;
+use super::chain::reason_marker;
 use super::format::{
-    account_type_label, cue_style, fetch_cue_color, fixed, fixed_split, health_color,
-    spinner_frame, spinner_style, window_summary_spans_bracketed,
+    account_type_label, cue_style, fetch_cue_color, fixed, fixed_split, spinner_frame,
+    spinner_style, window_summary_spans_bracketed,
 };
 use super::header::pulse_name_spans;
-use super::panes::{bold_when, draw_scrollbar, empty_state, name_color, section_box, select_line};
+use super::panes::{
+    bold_when, draw_scrollbar, empty_state, name_color, section_box, select_line, wrap_words,
+};
 use super::usage::{eta_left_secs, window_rate_unit};
-use crate::fallback::{SwitchAction, next_target, soonest_resume, threshold_for};
+use crate::fallback::{
+    BlockedReason, SwitchAction, blocked_reason, next_target, soonest_resume, threshold_for,
+};
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{
     LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
+    switch_grade_kick_lifts,
 };
 
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
 const TIMER_SLOT: usize = 5;
+/// Rows the accounts table keeps before the chain panel may claim any space —
+/// it is the scrollable, interactive list, so it wins the vertical budget.
+const ACCOUNTS_MIN: u16 = 7;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let target = if area.height >= 18 { 8 } else { 5 };
-    let cap = area.height.saturating_sub(7).max(3);
-    let chain_height = target.min(cap);
-    let [accounts_area, chain_area] =
-        Layout::vertical([Constraint::Min(7), Constraint::Length(chain_height)]).areas(area);
+    // The chain panel's inner width is independent of the vertical split (both
+    // panels span the full body width), so build its lines first and size the
+    // panel to fit them — no clipped members, no wasted rows.
+    let probe = Rect { height: 3, ..area };
+    let chain_inner_w = section_box("", false, false).inner(probe).width as usize;
+    let chain_lines = fallback_flow_lines(app, chain_inner_w);
+    let chain_height = chain_panel_height(chain_lines.len(), area.height);
+
+    let [accounts_area, chain_area] = Layout::vertical([
+        Constraint::Min(ACCOUNTS_MIN),
+        Constraint::Length(chain_height),
+    ])
+    .areas(area);
 
     draw_overview_accounts(frame, accounts_area, app);
-    draw_fallback_overview(frame, chain_area, app);
+    draw_fallback_overview(frame, chain_area, chain_lines);
+}
+
+/// Height for the fallback chain panel: sized to its content (`content_rows`
+/// plus the 2 border rows), capped so the accounts table keeps [`ACCOUNTS_MIN`]
+/// rows whenever `area_height >= ACCOUNTS_MIN + 3`. Below that the 3-row floor
+/// (border + one row) wins instead and accounts gives way — a terminal too
+/// short for both shrinks the accounts table, not the chain.
+fn chain_panel_height(content_rows: usize, area_height: u16) -> u16 {
+    let desired = (content_rows as u16).saturating_add(2);
+    let max_chain = area_height.saturating_sub(ACCOUNTS_MIN);
+    desired.min(max_chain).max(3)
 }
 
 fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -85,7 +113,6 @@ struct OverviewWidths {
     kind: usize,
     five_hour: usize,
     seven_day: usize,
-    route: usize,
     gap: usize,
 }
 
@@ -124,19 +151,9 @@ impl OverviewWidths {
         } else {
             0
         };
-        let mut route = if total >= 88 {
-            13
-        } else if total >= 68 {
-            9
-        } else {
-            0
-        };
-
         let gap_min = 2;
-        while fixed_overview_width(name, kind, five_hour, seven_day, route, gap_min) > total {
-            if route > 0 {
-                route = 0;
-            } else if seven_day >= 17 {
+        while fixed_overview_width(name, kind, five_hour, seven_day, gap_min) > total {
+            if seven_day >= 17 {
                 seven_day = 5;
             } else if seven_day > 0 {
                 seven_day = 0;
@@ -153,8 +170,8 @@ impl OverviewWidths {
             }
         }
 
-        let base = fixed_overview_width(name, kind, five_hour, seven_day, route, gap_min);
-        let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
+        let base = fixed_overview_width(name, kind, five_hour, seven_day, gap_min);
+        let column_count = 3 + usize::from(seven_day > 0);
         let gap_slots = column_count.saturating_sub(1).max(1);
         // `fixed_overview_width` omits the TIMER_SLOT the row always renders;
         // widening gaps from that undercounted figure overflows the row at
@@ -167,7 +184,6 @@ impl OverviewWidths {
             kind,
             five_hour,
             seven_day,
-            route,
             gap,
         }
     }
@@ -178,15 +194,14 @@ fn fixed_overview_width(
     kind: usize,
     five_hour: usize,
     seven_day: usize,
-    route: usize,
     gap: usize,
 ) -> usize {
-    let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
+    let column_count = 3 + usize::from(seven_day > 0);
     // 2 = cursor prefix. Timer slot is in the gap before 5h, not a column.
     // kind→timer gap is 4 chars narrower than standard (min 1).
     let narrow = gap.saturating_sub(4).max(1);
     let standard_gaps = column_count.saturating_sub(2);
-    4 + name + kind + five_hour + seven_day + route + standard_gaps * gap + narrow
+    4 + name + kind + five_hour + seven_day + standard_gaps * gap + narrow
 }
 
 fn overview_header(widths: &OverviewWidths) -> Line<'static> {
@@ -208,10 +223,6 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
             fixed(LABEL_7D, widths.seven_day),
             theme::label(),
         ));
-    }
-    if widths.route > 0 {
-        spans.push(gap(widths));
-        spans.push(Span::styled(fixed("route", widths.route), theme::label()));
     }
     Line::from(spans)
 }
@@ -343,11 +354,6 @@ fn render_overview_row(
         spans.extend(seven_spans);
         spans.push(Span::raw(" ".repeat(seven_pad)));
     }
-    if widths.route > 0 {
-        spans.push(gap(widths));
-        let (chain, chain_style) = chain_summary(&cfg, profile);
-        spans.push(Span::styled(fixed(&chain, widths.route), chain_style));
-    }
 
     Line::from(spans)
 }
@@ -382,54 +388,38 @@ fn narrow_gap(widths: &OverviewWidths) -> Span<'static> {
     Span::raw(" ".repeat(widths.gap.saturating_sub(4).max(1)))
 }
 
-fn chain_summary(cfg: &AppConfig, profile: &Profile) -> (String, Style) {
-    let Some(position) = cfg
-        .state
-        .fallback_chain
-        .iter()
-        .position(|n| n == &profile.name)
-    else {
-        return ("—".to_string(), theme::faint());
-    };
-    let threshold = threshold_for(profile);
-    let pct = profile
-        .usage
-        .as_ref()
-        .and_then(|u| u.five_hour.as_ref())
-        .map(|w| w.utilization)
-        .unwrap_or(0.0);
-    let color = chain_state_style(Some(profile), pct, threshold);
-    (format!("#{} @ {threshold:.0}%", position + 1), color)
-}
-
-fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'static>>) {
     // Read-only detail pane — focus never descends here from the overview screen.
     let block = section_box("fallback chain", false, false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    let lines = fallback_flow_lines(app, inner.width, inner.height);
-    let para = Paragraph::new(lines)
-        .style(theme::base())
-        .wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
+    // No `Wrap`: the chain rows are tabular (they pad to `inner.width`, so they
+    // never wrap), and the empty-state prose is pre-wrapped into its own lines.
+    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
 const GAUGE_W: usize = 12;
 
-fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>> {
+fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    // Switch-grade kick blocks feed the blocked-reason markers; read BEFORE the
+    // Config lock (rank order: KickBlockState 230 < Config 400).
+    let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
     let cfg = app.config();
     if cfg.state.fallback_chain.is_empty() {
-        return vec![
-            Line::from(Span::styled("no fallback chain yet", theme::dim())),
-            Line::from(vec![
-                Span::styled("fallback", theme::accent()),
-                Span::styled(
-                    " tab adds accounts that rotate automatically when a 5h window crosses its threshold.",
-                    theme::dim(),
-                ),
-            ]),
-        ];
+        let mut lines = vec![Line::from(Span::styled(
+            "no fallback chain yet",
+            theme::dim(),
+        ))];
+        lines.extend(
+            wrap_words(
+                "fallback tab adds accounts that rotate automatically when a 5h \
+                 window crosses its threshold.",
+                width,
+            )
+            .into_iter()
+            .map(|seg| Line::from(Span::styled(seg, theme::dim()))),
+        );
+        return lines;
     }
 
     let chain = &cfg.state.fallback_chain;
@@ -440,90 +430,67 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
         .unwrap_or(8)
         .clamp(6, 18);
     let last = chain.len() - 1;
-    let cap = height as usize;
+
+    // Project the active profile's next switch once, up front: a `To(target)`
+    // renders inline on the target member's row (right side); `Off` has no
+    // single target row, so it stays a caption below.
+    let projection = projected_switch(app, &cfg);
+    let switch_to = match &projection {
+        Some((SwitchAction::To(target), secs)) => Some((target.clone(), *secs)),
+        _ => None,
+    };
 
     let mut lines = Vec::new();
     for (i, name) in chain.iter().enumerate() {
-        if lines.len() >= cap {
-            break;
-        }
-        lines.push(chain_row(&cfg, name, i, last, name_w));
+        let reason = cfg
+            .find(name)
+            .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(name.as_str()).copied()));
+        let switch_eta = switch_to
+            .as_ref()
+            .filter(|(target, _)| target.as_str() == name.as_str())
+            .map(|(_, secs)| *secs);
+        lines.push(chain_row(
+            &cfg, name, i, last, name_w, width, reason, switch_eta,
+        ));
     }
 
-    // Caption only if it fits; wrap-off replaces wrap caption.
-    if lines.len() < cap {
-        let caption = if cfg.state.switch_off_when_spent {
-            vec![
-                Span::raw("  "),
-                Span::styled("[ ", theme::dim()),
-                Span::styled("stop", theme::danger().bold()),
-                Span::styled(" ]", theme::dim()),
-                Span::styled(" when all spent", theme::faint()),
-            ]
-        } else {
-            vec![
-                Span::raw("  "),
-                Span::styled("[ ", theme::dim()),
-                Span::styled("stay", theme::dim().bold()),
-                Span::styled(" ]", theme::dim()),
-                Span::styled(" on last when all spent", theme::faint()),
-            ]
-        };
-        lines.push(Line::from(caption));
+    // All-spent caption: wrap-off `stop` vs wrap-mode `stay`.
+    let caption = if cfg.state.switch_off_when_spent {
+        vec![
+            Span::raw("  "),
+            Span::styled("[ ", theme::dim()),
+            Span::styled("stop", theme::danger().bold()),
+            Span::styled(" ]", theme::dim()),
+            Span::styled(" when all spent", theme::faint()),
+        ]
+    } else {
+        vec![
+            Span::raw("  "),
+            Span::styled("[ ", theme::dim()),
+            Span::styled("stay", theme::dim().bold()),
+            Span::styled(" ]", theme::dim()),
+            Span::styled(" on last when all spent", theme::faint()),
+        ]
+    };
+    lines.push(Line::from(caption));
+
+    // `Off` projection: chain-wide, no target row to sit on — keep it a caption.
+    if let Some((SwitchAction::Off, secs)) = &projection {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("stops all in ~{}", humanize_duration(*secs)),
+                theme::faint(),
+            ),
+        ]));
     }
 
-    if lines.len() < cap
-        && chain.len() > 1
-        && let Some(active_name) = cfg.state.active_profile.as_deref()
-        && let Some(profile) = cfg.find(active_name)
-        && let Some(usage_info) = profile.usage.as_ref()
-        && let Some(usage) = usage_info.five_hour.as_ref()
-    {
-        let threshold = threshold_for(profile);
-        // In-memory rate (`app.history_cache`) — no disk read while `cfg` (the
-        // config guard) is held. Shared by the ETA line below and the
-        // burn-aware projection passed into `next_target`.
-        let active_rate = app.active_burn_rate(active_name, usage_info);
-        let eta_secs = burn_rate_eta(active_rate, usage.utilization, threshold);
-        let reset_secs = super::format::reset_in_secs(usage);
-        // Only project a switch when the account crosses its threshold BEFORE the
-        // 5h window resets — past the reset the window refills and no switch fires.
-        if let Some(secs) = eta_secs
-            && reset_secs.is_none_or(|reset| secs < reset)
-        {
-            match next_target(&cfg, active_rate) {
-                Some(SwitchAction::To(target)) => {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(
-                            format!("switching to {target} in ~{}", humanize_duration(secs)),
-                            theme::faint(),
-                        ),
-                    ]));
-                }
-                Some(SwitchAction::Off) => {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(
-                            format!("stops all in ~{}", humanize_duration(secs)),
-                            theme::faint(),
-                        ),
-                    ]));
-                }
-                None => {}
-            }
-        }
-    }
-
-    // All-exhausted sibling of the projection above: when EVERY chain member
-    // is currently maxed (wrap-off's active-cleared state, or wrap mode's
-    // stalled-active equivalent), name whichever one resumes first instead of
-    // leaving the recovery implicit. Mutually exclusive with the projection
-    // block above — `burn_rate_eta` already returns `None` once the active
-    // crosses its own threshold, which is a precondition here.
-    if lines.len() < cap
-        && let Some((name, eta)) = soonest_resume(&cfg)
-    {
+    // All-exhausted sibling of the projection: when EVERY chain member is maxed
+    // (wrap-off's active-cleared state, or wrap mode's stalled-active
+    // equivalent), name whichever one resumes first. Mutually exclusive with the
+    // projection — `burn_rate_eta` returns `None` once the active crosses its
+    // own threshold, which is a precondition for `soonest_resume` to return.
+    if let Some((name, eta)) = soonest_resume(&cfg) {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
@@ -535,12 +502,40 @@ fn fallback_flow_lines(app: &App, _width: u16, height: u16) -> Vec<Line<'static>
     lines
 }
 
+/// The active profile's projected next switch (action + eta secs), or `None`
+/// when none is imminent. Guards the projection the same way the old inline line
+/// did: only when the active crosses its threshold BEFORE its 5h window resets
+/// (past the reset the window refills and no switch fires). Shared by the inline
+/// `To` hint (on the target's row) and the `Off` caption.
+fn projected_switch(app: &App, cfg: &AppConfig) -> Option<(SwitchAction, i64)> {
+    if cfg.state.fallback_chain.len() <= 1 {
+        return None;
+    }
+    let active_name = cfg.state.active_profile.as_deref()?;
+    let profile = cfg.find(active_name)?;
+    let usage_info = profile.usage.as_ref()?;
+    let usage = usage_info.five_hour.as_ref()?;
+    let threshold = threshold_for(profile);
+    // In-memory rate (`app.history_cache`) — no disk read while `cfg` is held.
+    let active_rate = app.active_burn_rate(active_name, usage_info);
+    let eta_secs = burn_rate_eta(active_rate, usage.utilization, threshold)?;
+    let reset_secs = super::format::reset_in_secs(usage);
+    if reset_secs.is_some_and(|reset| eta_secs >= reset) {
+        return None;
+    }
+    next_target(cfg, active_rate).map(|action| (action, eta_secs))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn chain_row(
     cfg: &AppConfig,
     name: &str,
     index: usize,
     last: usize,
     name_w: usize,
+    width: usize,
+    reason: Option<BlockedReason>,
+    switch_eta: Option<i64>,
 ) -> Line<'static> {
     let active = cfg.is_active(name);
     let rail = if index == 0 && last == 0 {
@@ -587,6 +582,35 @@ fn chain_row(
             spans.push(Span::styled(format!(" / {threshold:.0}%"), theme::faint()));
         }
     }
+
+    // Right-aligned trailer. A projected-switch target carries the `↩ ~eta`
+    // hint; a blocked member carries its 1-cell reason marker. BOTH can apply to
+    // one row: `next_target`'s headroom walk only prefers a fresh member and
+    // falls through to a stale-but-unexhausted one (`is_exhausted` ignores
+    // `fetch_status`), so a `To` target can also be `Stale`. Render both then
+    // (hint, then marker outermost) instead of dropping the imminent-switch
+    // projection. Too narrow for the pair → keep the marker (the persistent
+    // signal) and drop the hint; too narrow for even that → drop both. Each
+    // guard's strict `<` leaves >= 1 pad cell so the group never abuts the
+    // figure.
+    let base_used: usize = spans.iter().map(|s| s.width()).sum();
+    let hint = switch_eta
+        .map(|secs| Span::styled(format!("↩ ~{}", humanize_duration(secs)), theme::faint()));
+    let marker = reason.as_ref().map(reason_marker);
+    let trailer: Vec<Span<'static>> = match (hint, marker) {
+        (Some(h), Some(m)) if base_used + h.width() + 1 + m.width() < width => {
+            vec![h, Span::raw(" "), m]
+        }
+        (Some(_), Some(m)) if base_used + m.width() < width => vec![m],
+        (Some(h), None) if base_used + h.width() < width => vec![h],
+        (None, Some(m)) if base_used + m.width() < width => vec![m],
+        _ => Vec::new(),
+    };
+    if !trailer.is_empty() {
+        let tw: usize = trailer.iter().map(|s| s.width()).sum();
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(base_used + tw))));
+        spans.extend(trailer);
+    }
     Line::from(spans)
 }
 
@@ -616,13 +640,6 @@ fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
             }
         })
         .collect()
-}
-
-fn chain_state_style(profile: Option<&Profile>, pct: f64, threshold: f64) -> Style {
-    match profile {
-        None => theme::danger(),
-        Some(_) => Style::default().fg(health_color(pct, threshold)),
-    }
 }
 
 /// Seconds until `current` crosses `threshold` at the given 5h-window burn

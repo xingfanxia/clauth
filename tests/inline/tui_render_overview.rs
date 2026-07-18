@@ -6,6 +6,7 @@
 use super::*;
 use ratatui::style::Modifier;
 
+use crate::fallback::BlockedReason;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName};
 use crate::usage::{FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
 use std::collections::BTreeMap;
@@ -267,7 +268,7 @@ fn all_exhausted_wrap_mode_shows_resumes_hint() {
     let b = profile("b", 95.0, 100.0, 1800);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60, 20);
+    let lines = fallback_flow_lines(&app, 60);
     let hint =
         resumes_line(&lines).expect("resumes hint must render when the whole chain is exhausted");
     assert!(
@@ -285,7 +286,7 @@ fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
     let mut config = config_with(vec![a, b], None, vec!["a", "b"]);
     config.state.switch_off_when_spent = true;
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60, 20);
+    let lines = fallback_flow_lines(&app, 60);
     let hint = resumes_line(&lines)
         .expect("resumes hint must render even with no active profile (wrap-off cleared it)");
     assert!(hint.contains("resumes: a in ~"), "{hint}");
@@ -299,7 +300,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 20.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60, 20);
+    let lines = fallback_flow_lines(&app, 60);
     assert!(
         resumes_line(&lines).is_none(),
         "must not show when the chain isn't fully exhausted"
@@ -313,7 +314,7 @@ fn healthy_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 5.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60, 20);
+    let lines = fallback_flow_lines(&app, 60);
     assert!(resumes_line(&lines).is_none());
 }
 
@@ -483,15 +484,14 @@ fn gap_widening_never_clips_the_row() {
     let app = App::new(config);
     for width in 34u16..=200 {
         let w = OverviewWidths::new(width, &app);
-        let min =
-            fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.route, 2) + TIMER_SLOT;
+        let min = fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, 2) + TIMER_SLOT;
         if min > width as usize {
             // Below this the shrink loop has already bottomed out and the row
             // deliberately overflows-and-clips; gap widening isn't the cause.
             continue;
         }
-        let used = fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.route, w.gap)
-            + TIMER_SLOT;
+        let used =
+            fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.gap) + TIMER_SLOT;
         assert!(
             used <= width as usize,
             "row overflows at width {width}: used {used} (gap {})",
@@ -560,5 +560,138 @@ fn credentialed_long_label_clamps_to_kind_width() {
         chars[start + widths.kind],
         ' ',
         "type column must not bleed into the following gap/timer columns"
+    );
+}
+
+// ── fallback chain panel: auto-sizing + row trailers ─────────────────────
+
+/// Content that fits gets exactly its own height (rows + 2 border), leaving the
+/// rest to the accounts table.
+#[test]
+fn chain_panel_height_fits_its_content() {
+    assert_eq!(chain_panel_height(6, 20), 8, "6 rows + 2 border");
+}
+
+/// A long chain is capped so the accounts table keeps its `ACCOUNTS_MIN` rows —
+/// accounts wins the vertical budget.
+#[test]
+fn chain_panel_height_caps_so_accounts_keeps_minimum() {
+    assert_eq!(chain_panel_height(30, 20), 20 - ACCOUNTS_MIN);
+}
+
+/// A terminal too short for both floors the chain at 3 and never panics on the
+/// clamp (max_chain saturates to 0 below the accounts minimum).
+#[test]
+fn chain_panel_height_floors_at_three_without_panicking() {
+    assert_eq!(chain_panel_height(5, 6), 3);
+    assert_eq!(chain_panel_height(0, 0), 3);
+}
+
+/// The projected switch target carries the compact `↩ ~eta` hint on the right of
+/// its OWN row (not a trailing caption), padded out to the panel's right edge.
+#[test]
+fn chain_row_switch_hint_rides_the_target_row() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let app = App::new(config);
+    let cfg = app.config();
+    let line = chain_row(&cfg, "a", 0, 0, 8, 60, None, Some(7200));
+    assert!(
+        line_text(&line).contains("↩ ~"),
+        "target row carries the inline switch hint: {}",
+        line_text(&line),
+    );
+    assert_eq!(
+        line.width(),
+        60,
+        "the hint is right-aligned (row padded to the panel width)",
+    );
+}
+
+/// A row can be BOTH the projected switch target and blocked: `next_target`'s
+/// headroom walk only prefers a fresh candidate and falls through to a
+/// stale-but-unexhausted one (`is_exhausted` ignores `fetch_status`), so a
+/// stale/soft-blocked member can still be `To`'s pick. With room for both, the
+/// row shows the hint AND the marker rather than silently dropping the
+/// imminent-switch projection.
+#[test]
+fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let app = App::new(config);
+    let cfg = app.config();
+    let line = chain_row(
+        &cfg,
+        "a",
+        0,
+        0,
+        8,
+        60,
+        Some(BlockedReason::AuthBroken),
+        Some(7200),
+    );
+    let text = line_text(&line);
+    assert!(text.contains('×'), "auth-broken shows the × marker: {text}");
+    assert!(text.contains("↩ ~"), "and the switch hint: {text}");
+}
+
+/// Too narrow for the pair: the marker (the persistent block signal) survives
+/// and the hint drops rather than the row overflowing or the marker vanishing.
+/// Derives the width thresholds from the row's own natural content width
+/// (`chain_row` with no trailer skips padding entirely, so its `.width()` is
+/// exactly the base row) instead of hand-counting cells, which is brittle
+/// against gauge/figure formatting changes.
+#[test]
+fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let app = App::new(config);
+    let cfg = app.config();
+
+    let base = chain_row(&cfg, "a", 0, 0, 8, 0, None, None).width();
+    let marker_w = reason_marker(&BlockedReason::AuthBroken).width();
+    let hint_w = Span::raw(format!("↩ ~{}", humanize_duration(7200))).width();
+
+    // Room for the marker alone plus its 1-cell pad, but not the hint (+1 sep)
+    // beside it.
+    let width = base + marker_w + 1;
+    assert!(
+        width < base + hint_w + 1 + marker_w + 1,
+        "test width must sit strictly below the pair's requirement"
+    );
+    let line = chain_row(
+        &cfg,
+        "a",
+        0,
+        0,
+        8,
+        width,
+        Some(BlockedReason::AuthBroken),
+        Some(7200),
+    );
+    let text = line_text(&line);
+    assert!(
+        text.contains('×'),
+        "marker survives at narrow width: {text}"
+    );
+    assert!(!text.contains('↩'), "hint drops first: {text}");
+}
+
+/// End to end: an auth-broken chain member surfaces its × marker in the overview
+/// fallback panel — exercises the kick-lift read + `blocked_reason` wiring.
+#[test]
+fn fallback_panel_marks_a_blocked_member() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let mut config = config_with(vec![a], Some("a"), vec!["a"]);
+    config.state.auth_broken.push("a".into());
+    let app = App::new(config);
+    let joined = fallback_flow_lines(&app, 60)
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains('×'),
+        "blocked member shows × in the panel:\n{joined}"
     );
 }
