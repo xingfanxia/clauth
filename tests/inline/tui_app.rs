@@ -2021,7 +2021,7 @@ fn money_spent_is_inert_through_the_top_level_router() {
 // ── preemptive rotation (rotation coherence #1) ─────────────────────────────
 
 #[test]
-fn preemptive_rotation_space_toggles_and_persists() {
+fn preemptive_rotation_space_toggles_on_macos_inert_elsewhere() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = Tab::Config;
@@ -2035,25 +2035,34 @@ fn preemptive_rotation_space_toggles_and_persists() {
     );
 
     super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
-    assert!(
-        app.config().state.preemptive_rotation,
-        "space toggles the mode on"
-    );
 
-    // Persisted to profiles.toml — the scheduler reads the flag off the
-    // shared config, but a relaunch must pick it up from disk too.
-    let reloaded: crate::profile::AppState = toml::from_str(
-        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
-            .expect("read profiles.toml"),
-    )
-    .expect("parse profiles.toml");
-    assert!(reloaded.preemptive_rotation, "toggle persists to disk");
+    // Off macOS the Keychain mirror is never live, so preemptive rotation can't
+    // fire and the row is a disabled no-op; on macOS the toggle works + persists.
+    if cfg!(target_os = "macos") {
+        assert!(
+            app.config().state.preemptive_rotation,
+            "space toggles the mode on"
+        );
+        // Persisted to profiles.toml — the scheduler reads the flag off the
+        // shared config, but a relaunch must pick it up from disk too.
+        let reloaded: crate::profile::AppState = toml::from_str(
+            &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+                .expect("read profiles.toml"),
+        )
+        .expect("parse profiles.toml");
+        assert!(reloaded.preemptive_rotation, "toggle persists to disk");
 
-    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
-    assert!(
-        !app.config().state.preemptive_rotation,
-        "space toggles the mode back off"
-    );
+        super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(
+            !app.config().state.preemptive_rotation,
+            "space toggles the mode back off"
+        );
+    } else {
+        assert!(
+            !app.config().state.preemptive_rotation,
+            "inert off macOS — space must not toggle a row that can't fire"
+        );
+    }
 }
 
 // ── refresh interval custom value ──────────────────────────────────────────

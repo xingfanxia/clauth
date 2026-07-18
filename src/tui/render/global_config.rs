@@ -249,10 +249,12 @@ fn row_hint(
                 "once an account's extra usage runs out, stay on it and keep billing"
             })
         }
-        GlobalConfigRow::PreemptiveRotation => String::from(if toggles.preemptive {
-            "rotate the active account's login ahead of expiry (macos keychain)"
+        GlobalConfigRow::PreemptiveRotation => String::from(if !cfg!(target_os = "macos") {
+            "only rotates the login ahead of expiry on macos"
+        } else if toggles.preemptive {
+            "rotate the login before it expires"
         } else {
-            "rotate the active account's login only when a request rejects it"
+            "rotate the login only when a request rejects it"
         }),
         GlobalConfigRow::RefreshSpentAccounts => String::from(if toggles.refresh_spent {
             "keep checking accounts that are already at 100%"
@@ -370,15 +372,21 @@ fn detail_row(
                 dimmed_cycle_row("extra usage spent", &options, selected)
             }
         }
-        GlobalConfigRow::PreemptiveRotation => cycle_row(
-            arrow,
-            "rotation",
-            &[
+        GlobalConfigRow::PreemptiveRotation => {
+            // Preemptive rotation only fires while the macOS Keychain mirror is
+            // live (`scheduler::keychain_live`); off macOS the toggle can do
+            // nothing, so it renders as a disabled row (and its key no-ops),
+            // mirroring the burn tunables.
+            let options = [
                 ("lazy", !toggles.preemptive),
                 ("preemptive", toggles.preemptive),
-            ],
-            selected,
-        ),
+            ];
+            if cfg!(target_os = "macos") {
+                cycle_row(arrow, "rotation", &options, selected)
+            } else {
+                dimmed_cycle_row("rotation", &options, selected)
+            }
+        }
         GlobalConfigRow::RefreshSpentAccounts => {
             toggle_row(arrow, "refresh spent", toggles.refresh_spent, selected)
         }

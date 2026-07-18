@@ -3600,7 +3600,14 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
                 toggle_budget_wrap_off(app);
             }
         }
-        GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
+        // Inert off macOS (rendered dimmed): preemptive rotation only fires
+        // while the Keychain mirror is live (`scheduler::keychain_live`), which
+        // is macOS-only, so the key is a no-op elsewhere.
+        GlobalConfigRow::PreemptiveRotation => {
+            if cfg!(target_os = "macos") {
+                toggle_preemptive_rotation(app);
+            }
+        }
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
     }
 }

@@ -370,6 +370,47 @@ fn burn_tunables_dim_when_burn_aware_is_off() {
     }
 }
 
+// ── preemptive rotation dims where it can't fire (off macOS) ──────────────────
+
+/// Preemptive rotation only fires while the macOS Keychain mirror is live
+/// (`scheduler::keychain_live`), so off macOS the `rotation` row renders as a
+/// cloudy-tui disabled row and its hint names the platform reason — it can't do
+/// anything there.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn rotation_dims_off_macos() {
+    let dimmed = detail_row(
+        GlobalConfigRow::PreemptiveRotation,
+        false,
+        toggles(),
+        60_000,
+        95.0,
+        98.0,
+        60_000,
+        None,
+        None,
+    );
+    assert!(
+        dimmed
+            .spans
+            .iter()
+            .all(|s| s.content.trim().is_empty() || s.style.fg == theme::faint().fg),
+        "rotation must render fully faint off macOS: {:?}",
+        dimmed.spans,
+    );
+    let hint = row_hint(
+        GlobalConfigRow::PreemptiveRotation,
+        None,
+        toggles(),
+        90_000,
+        98.0,
+        98.0,
+        60_000,
+    )
+    .expect("the dimmed rotation row carries a reason");
+    assert!(hint.contains("macos"), "names the platform reason: {hint}");
+}
+
 // ── concern bands + their eyebrow headers ────────────────────────────────────
 
 /// The renderer opens a band the first time it sees a new one, so a band whose
