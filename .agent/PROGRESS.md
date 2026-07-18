@@ -1331,3 +1331,15 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   truncated daemon reply now surfaces as connectedNoReply instead of
   misreading as unreachable → CLI double-apply. Verified SAFE: proxy client
   socket, daemon socket, doctor, lock chain 25s/20s/30s, oauth AGENT, ccu.
+
+## 2026-07-18 (SCW-1 upstreamed) — issue #54 + PR #55
+
+- `feat/scoped-weekly-walk` (36affbe) off current upstream/mommy (f524a8a).
+  Adaptation: upstream's candidate walk already carries a FRESHNESS
+  preference pass — composed as a 4-tier stack (scoped-clear+fresh →
+  scoped-clear → fresh → any; scoped-clear outranks freshness: known
+  model-block > stale-read uncertainty). Upstream ChainMember grew
+  `max_spend` (spend-budget feature) — test initializers updated. proxy/
+  sse.rs hunk dropped from the pick (fork-only). 1114 tests green, clippy
+  clean. NOTE: upstream mommy moved again (3 TUI/docs commits post-2497a36)
+  — PRs #51/#53 may need another conflict check.
