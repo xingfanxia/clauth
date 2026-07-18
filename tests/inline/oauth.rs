@@ -1574,3 +1574,36 @@ fn describe_kick_failure_names_status_and_error() {
         "an Other must surface its transport text, got {other:?}",
     );
 }
+
+/// CLA-SPLIT: a session-token profile installs its static token as-is — even a
+/// standing `auth_broken` quarantine (which now describes the USAGE chain)
+/// must not bench the account or spend a refresh.
+#[test]
+fn gate_session_token_ready_even_when_auth_broken() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-session-token";
+    let mut config = oauth_config(name, Some("rt-dead"), Some(past_expiry()));
+    config.set_auth_broken(name, true);
+    // Materialize the profile dir, then the session token beside it.
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "oat-static".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("write session token");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+}

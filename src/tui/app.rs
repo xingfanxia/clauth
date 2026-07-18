@@ -3048,8 +3048,8 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         let missing = matches!(link, Some(LinkState::Missing));
         // A `missing` link is repairable only when the profile still holds stored
         // creds to relink to; with none it needs a fresh login, not a relink.
-        let stored_creds = crate::profile::profile_dir(&snap.name)
-            .map(|dir| dir.join("credentials.json").exists())
+        let stored_creds = crate::claude::install_source_path(&snap.name)
+            .map(|p| p.exists())
             .unwrap_or(false);
 
         active_link = if link_err {
