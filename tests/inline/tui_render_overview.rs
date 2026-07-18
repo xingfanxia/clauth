@@ -587,24 +587,97 @@ fn chain_panel_height_floors_at_three_without_panicking() {
     assert_eq!(chain_panel_height(0, 0), 3);
 }
 
-/// The projected switch target carries the compact `↩ ~eta` hint on the right of
-/// its OWN row (not a trailing caption), padded out to the panel's right edge.
+/// The projected switch target carries the compact `↩ ~eta` hint on its OWN row
+/// (not a trailing caption), parked at the shared trailer column just past the
+/// content — NOT flung out to the panel's right edge.
 #[test]
 fn chain_row_switch_hint_rides_the_target_row() {
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     let cfg = app.config();
-    let line = chain_row(&cfg, "a", 0, 0, 8, 60, None, Some(7200));
-    assert!(
-        line_text(&line).contains("↩ ~"),
-        "target row carries the inline switch hint: {}",
-        line_text(&line),
-    );
+    let row = chain_row(&cfg, "a", 0, 0, 8, 3, None, Some(7200));
+    let base = row.base_width();
+    let line = row.into_line(base + TRAILER_GAP, 60);
+    let text = line_text(&line);
+    assert!(text.contains("↩ ~"), "target row carries the hint: {text}");
+    let hint_w = Span::raw(format!("↩ ~{}", humanize_duration(7200))).width();
     assert_eq!(
         line.width(),
-        60,
-        "the hint is right-aligned (row padded to the panel width)",
+        base + TRAILER_GAP + hint_w,
+        "the hint sits at the trailer column, not the panel edge: {text}",
+    );
+    assert!(
+        line.width() < 60,
+        "a 60-wide panel must leave slack past the hint: {text}",
+    );
+}
+
+/// Every trailer in the panel lands in ONE column, and that column tracks the
+/// widest row's content rather than the panel width. The regression this pins:
+/// padding each row out to `width` stranded the markers at the far right edge of
+/// a wide panel, cells away from the data they mark.
+#[test]
+fn fallback_panel_parks_trailers_next_to_the_content() {
+    // `ghost` sits in the chain with no profile behind it, so its row renders
+    // the short `missing` arm. Leading with it proves the column is measured off
+    // the WIDEST row rather than whichever one happens to come first.
+    let short = profile("ab", 100.0, 10.0, 3600);
+    let long = profile("a-much-longer-name", 100.0, 10.0, 3600);
+    let mut config = config_with(
+        vec![short, long],
+        Some("ab"),
+        vec!["ghost", "ab", "a-much-longer-name"],
+    );
+    config.state.auth_broken.push("ab".into());
+    let app = App::new(config);
+
+    let wide = 120;
+    let lines = fallback_flow_lines(&app, wide);
+    let marked = lines
+        .iter()
+        .find(|l| line_text(l).contains('×'))
+        .expect("the auth-broken member shows its marker");
+    assert!(
+        marked.width() < wide / 2,
+        "the marker parks by the content, not the panel edge: {:?} in a {wide}-wide panel",
+        line_text(marked),
+    );
+    // The marked row carries the SHORTER name, so its marker can only sit past
+    // its own content if the column came from the longer row.
+    let unmarked = lines
+        .iter()
+        .find(|l| line_text(l).contains("a-much-longer-name"))
+        .expect("the longer member renders");
+    let marker_w = reason_marker(&BlockedReason::AuthBroken).width();
+    assert_eq!(
+        marked.width(),
+        unmarked.width() + TRAILER_GAP + marker_w,
+        "the trailer column is measured off the WIDEST row's content:\n{:?}\n{:?}",
+        line_text(marked),
+        line_text(unmarked),
+    );
+}
+
+/// Thresholds of differing digit counts left-pad so the `%` signs stack
+/// (cloudy-tui numeric-column alignment), instead of leaving a ragged edge
+/// between a `95%` row and a `100%` row.
+#[test]
+fn chain_rows_align_the_threshold_percent_column() {
+    let ninety_five = profile("a", 95.0, 10.0, 3600);
+    let hundred = profile("b", 100.0, 10.0, 3600);
+    let config = config_with(vec![ninety_five, hundred], Some("a"), vec!["a", "b"]);
+    let app = App::new(config);
+    let texts: Vec<String> = fallback_flow_lines(&app, 60)
+        .iter()
+        .map(line_text)
+        .collect();
+    let a = texts.iter().find(|t| t.contains(" 95%")).expect("95% row");
+    let b = texts.iter().find(|t| t.contains("100%")).expect("100% row");
+    assert_eq!(
+        a.find(" 95%").map(|i| i + 4),
+        b.find("100%").map(|i| i + 4),
+        "the two rows' `%` signs must land in the same column:\n{a}\n{b}",
     );
 }
 
@@ -620,17 +693,18 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
     let config = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     let cfg = app.config();
-    let line = chain_row(
+    let row = chain_row(
         &cfg,
         "a",
         0,
         0,
         8,
-        60,
+        3,
         Some(BlockedReason::AuthBroken),
         Some(7200),
     );
-    let text = line_text(&line);
+    let col = row.base_width() + TRAILER_GAP;
+    let text = line_text(&row.into_line(col, 60));
     assert!(text.contains('×'), "auth-broken shows the × marker: {text}");
     assert!(text.contains("↩ ~"), "and the switch hint: {text}");
 }
@@ -638,9 +712,8 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
 /// Too narrow for the pair: the marker (the persistent block signal) survives
 /// and the hint drops rather than the row overflowing or the marker vanishing.
 /// Derives the width thresholds from the row's own natural content width
-/// (`chain_row` with no trailer skips padding entirely, so its `.width()` is
-/// exactly the base row) instead of hand-counting cells, which is brittle
-/// against gauge/figure formatting changes.
+/// (`base_width`) instead of hand-counting cells, which is brittle against
+/// gauge/figure formatting changes.
 #[test]
 fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
     let a = profile("a", 95.0, 10.0, 3600);
@@ -648,28 +721,30 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
     let app = App::new(config);
     let cfg = app.config();
 
-    let base = chain_row(&cfg, "a", 0, 0, 8, 0, None, None).width();
+    let build = || {
+        chain_row(
+            &cfg,
+            "a",
+            0,
+            0,
+            8,
+            3,
+            Some(BlockedReason::AuthBroken),
+            Some(7200),
+        )
+    };
+    let col = build().base_width() + TRAILER_GAP;
     let marker_w = reason_marker(&BlockedReason::AuthBroken).width();
     let hint_w = Span::raw(format!("↩ ~{}", humanize_duration(7200))).width();
 
-    // Room for the marker alone plus its 1-cell pad, but not the hint (+1 sep)
+    // Room for the marker alone at the trailer column, but not the hint (+1 sep)
     // beside it.
-    let width = base + marker_w + 1;
+    let width = col + marker_w;
     assert!(
-        width < base + hint_w + 1 + marker_w + 1,
+        width < col + hint_w + 1 + marker_w,
         "test width must sit strictly below the pair's requirement"
     );
-    let line = chain_row(
-        &cfg,
-        "a",
-        0,
-        0,
-        8,
-        width,
-        Some(BlockedReason::AuthBroken),
-        Some(7200),
-    );
-    let text = line_text(&line);
+    let text = line_text(&build().into_line(col, width));
     assert!(
         text.contains('×'),
         "marker survives at narrow width: {text}"
