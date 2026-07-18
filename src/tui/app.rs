@@ -2819,7 +2819,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         None => {
             about_detail.push("path: not on PATH".to_string());
             about_detail.push(
-                "Claude Code spawns `clauth mcp` by name, so the server won't start".to_string(),
+                "claude code spawns clauth mcp by name, so the server won't start".to_string(),
             );
             about_detail.push("install clauth so its bin directory is on PATH".to_string());
         }
@@ -2828,8 +2828,8 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         Some(version) => about_detail.push(format!("claude: {version}")),
         None => {
             about_detail.push("claude: not found".to_string());
-            about_detail.push("`claude --version` failed or claude is not on PATH".to_string());
-            about_detail.push("install Claude Code so the `claude` binary resolves".to_string());
+            about_detail.push("claude --version failed or claude is not on PATH".to_string());
+            about_detail.push("install claude code so the claude binary resolves".to_string());
         }
     }
     checks.push(Check {
@@ -2998,7 +2998,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             detail.push(format!("marketplace: {repo}"));
         }
         detail.push(String::new());
-        detail.push("install (run in Claude Code):".to_string());
+        detail.push("install (run in claude code):".to_string());
         detail.push("  /plugin marketplace add uwuclxdy/clauth".to_string());
         detail.push("  /plugin install clauth@clauth".to_string());
         Check {
@@ -3320,7 +3320,7 @@ fn active_diverged_unsaved(active: &str) -> bool {
 fn prompt_divergence(app: &mut App, active: String, verb: &str) {
     app.toast(
         ToastKind::Warning,
-        format!("'{active}' has unsaved Claude Code credentials\nresolve before {verb}"),
+        format!("'{active}' has unsaved claude code credentials\nresolve before {verb}"),
     );
     open_divergence_modal(app, &active);
 }

@@ -246,7 +246,7 @@ fn divergence_action_text(action: &DivergenceAction, active: &str) -> String {
             format!("overwrite '{active}' with this login")
         }
         DivergenceAction::Choice(DivergenceChoice::NewProfile) => {
-            "save this login to another profile…".to_string()
+            "save this login to another account…".to_string()
         }
         DivergenceAction::Choice(DivergenceChoice::Discard) => {
             format!("discard this login and restore '{active}'")
@@ -276,7 +276,7 @@ fn draw_divergence_target(frame: &mut Frame<'_>, area: Rect, form: &DivergenceTa
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled("where to save the login?", theme::dim())),
         Line::from(""),
-        option_line(cursor == 0, "+ new profile".to_string()),
+        option_line(cursor == 0, "+ new account".to_string()),
     ];
     for (i, name) in form.targets.iter().enumerate() {
         lines.push(option_line(cursor == i + 1, format!("overwrite '{name}'")));
@@ -349,7 +349,7 @@ fn env_collision_option_text(
 fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
     let lines = vec![
         Line::from(Span::styled(
-            "stores the live ~/.claude/.credentials.json under this profile.",
+            "stores the live ~/.claude/.credentials.json under this account.",
             theme::dim(),
         )),
         Line::from(""),
