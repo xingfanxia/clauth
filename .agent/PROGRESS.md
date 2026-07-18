@@ -1226,3 +1226,17 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   fleet hosts' mints — first probe false-401'd by quoted-value parsing, fixed);
   binary installed, daemon restarted. Split arms per profile at its NEXT
   switch (live slot still holds the old OAuth until then). 1266 tests green.
+
+## 2026-07-18 (later) — CLA-SPLIT upstreamed + docs
+
+- Upstream contribution: issue **uwuclxdy/clauth#52** (root-cause writeup) +
+  PR **#53** (`feat/session-token-split` cherry-picked onto CURRENT mommy,
+  re-adapted to upstream's pre-CAP-1 snapshot/adopt idioms — no fork private
+  refactors dragged along; 1111 tests green, clippy/fmt clean). Claude-side,
+  so upstream can test it himself (unlike codex PR #51).
+- Feature doc: `docs/claude-split/README.md` (problem, split table,
+  semantics incl. per-profile arming + auth_broken="usage broken", ops
+  runbook: fill shape, yearly re-mint ~2027-06-28, quoted-env gotcha).
+- Mac state: all 3 profiles filled; ax-backup armed (live slot = its
+  session token, verified symlink + no-refresh-token); ax-main/ax-cl arm at
+  their next switch; all 3 usage legs Fresh after AX's re-logins.
