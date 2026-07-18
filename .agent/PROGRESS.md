@@ -1177,3 +1177,18 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
 - Suite **1262 green** (+8 upstream tests), clippy/fmt clean. PR #51 back to
   MERGEABLE; #49 got a supersession comment (offer to rebuild standalone if
   uwuclxdy wants narrow-tui alone). Local daemon reinstalled + respawned.
+
+## 2026-07-17 (later) — CDX-5 proxy deployed on AX's Mac (AX-approved)
+
+- **Trigger**: ccsbar switch to ax-codex-cl looked "broken" — running codex had
+  the old (limit-hit) auth cached in memory; on-disk switch was fine. Diagnosis
+  chain: JWT-claim compare (live == cl profile), fresh `codex exec` turn OK.
+- **Deploy shape**: LaunchAgent `com.clauth.proxy` (KeepAlive-on-crash, port
+  4517, `~/.clauth/proxy.log`) + global `model_provider = "clauth"` in
+  `~/.codex/config.toml`; `codex --profile direct` = bypass; pre-change backup
+  kept. Live-verified: PROXY_OK (profile), GLOBAL_PROXY_OK (default),
+  DIRECT_OK (escape hatch).
+- **Codex ≥0.144 gotcha**: `[profiles.x]` in config.toml is now a hard error —
+  profiles moved to `~/.codex/<name>.config.toml` overlay files.
+- **`codex exec` stdin gotcha**: blocks in `resolve_root_prompt` until stdin
+  EOF — a backgrounded shell's held-open pipe hangs it forever; `< /dev/null`.
