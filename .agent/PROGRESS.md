@@ -1240,3 +1240,37 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
 - Mac state: all 3 profiles filled; ax-backup armed (live slot = its
   session token, verified symlink + no-refresh-token); ax-main/ax-cl arm at
   their next switch; all 3 usage legs Fresh after AX's re-logins.
+
+## 2026-07-18 (PROX-1) — proxy stream-death incident: root-caused + fixed
+
+- **Incident**: overnight codex sessions (xhigh, 20M+ ctx) died repeatedly
+  with "stream disconnected before completion: stream closed before
+  response.completed", reconnect-looping with no visible progress; proxy.log
+  was 211/215 lines of unstamped "connection error" noise. NOT an OpenAI
+  outage — three interlocking proxy defects:
+  1. `PROXY_AGENT` `timeout_global(15min)` truncated ACTIVE streams (ureq's
+     global timeout covers the body read and fires even while bytes flow) —
+     real xhigh reasoning requests exceed 15 min; each kill made codex replay
+     the turn from scratch (no server-side resume) → "半天看不到 update".
+  2. Upstream holds the SSE stream open past `response.completed` (keepalives;
+     codex closes first) → relay lingered per turn until dead-client write or
+     backstop → spurious error per SUCCESSFUL turn + thread pile-up toward
+     the 64-conn cap (over-cap = 503s).
+  3. No timestamps, no per-request summaries → forensics near-impossible.
+- **Fix** (src/proxy/sse.rs NEW + mod.rs relay rewrite + oauth.rs):
+  `TerminalSniffer` — prefix-classifies SSE lines (terminal data line is one
+  100s-of-KB line; classifying at its newline never matches — sniffer bug #1
+  caught live), ARMS on `event:`/`data:` terminal forms, FIRES at the event's
+  blank-line terminator (firing on the prefix truncated the completed event —
+  sniffer bug #2, caught live within minutes). timeout_global 15min → 2h pure
+  leak backstop. `enable_timestamps()` + one summary logline per request
+  (account/method/path/status/bytes/secs/end-shape).
+- **Method**: real wire captured via scratchpad TCP tee (codex → tee → proxy):
+  `event: <name>` + `data: {"type":"<name>",...}` + blank line; terminal data
+  line carries the whole response object on ONE line. Fixture gap that hid it:
+  test SSE bodies had Content-Length + short lines.
+- **Validated**: 1277 tests green (9 new sniffer units + lingering-upstream
+  e2e asserting FULL-event relay + ureq active-stream-truncation semantics
+  pin); live `codex exec` turn → log `POST /responses → 200 · 91KB in 1s ·
+  completed`, clean close, no spurious errors. Proxy + daemon restarted on
+  the new binary.

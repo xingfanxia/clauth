@@ -166,14 +166,22 @@ pub(crate) static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
 /// The CDX-5 proxy's upstream agent — the token AGENT's config plus a global
 /// timeout so a blackholed upstream that sends the response head then goes
 /// TCP-silent mid-SSE-stream can't park a connection thread forever (review
-/// MED: the streaming body read is otherwise unbounded). 15 min is longer than
-/// any single codex turn's stream, so it never truncates a live one, and it
-/// bounds a stuck connection's leak to that ceiling instead of infinity.
+/// MED: the streaming body read is otherwise unbounded).
+///
+/// The global timeout is a LEAK BACKSTOP, not turn-end detection: ureq's
+/// `timeout_global` fires even while bytes are actively flowing (pinned by
+/// `ureq_global_timeout_truncates_an_actively_streaming_body`), so any value
+/// a live stream can reach truncates that turn mid-flight. The 2026-07-18
+/// incident: 15 min sat BELOW real xhigh-reasoning streams — every long turn
+/// died with codex's "stream closed before response.completed" and replayed
+/// from scratch. Turn-end comes from the relay's terminal-event sniffer
+/// (`proxy::sse`); this ceiling only bounds a genuinely wedged connection,
+/// and must stay far above any legitimate single-request stream.
 pub(crate) static PROXY_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
-        .timeout_global(Some(Duration::from_secs(15 * 60)))
+        .timeout_global(Some(Duration::from_secs(2 * 60 * 60)))
         .http_status_as_error(false)
         .build()
         .into()

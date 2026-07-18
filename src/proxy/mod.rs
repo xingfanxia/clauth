@@ -15,12 +15,13 @@
 
 pub(crate) mod http;
 pub(crate) mod pool;
+pub(crate) mod sse;
 
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -108,6 +109,10 @@ pub(crate) fn run(port: u16) -> Result<()> {
     println!("clauth proxy listening on http://127.0.0.1:{port}{EXPECTED_PREFIX}");
     println!("  point codex at it with:  clauth proxy --print-config --port {port}");
     println!("  (loopback only, no client auth — any local process can use the pool)");
+    // Stamp log lines like the daemon does: the proxy is a supervised process
+    // whose stderr lands in `proxy.log`, and the 2026-07-18 incident had to be
+    // reconstructed from an unstamped error flood.
+    crate::logline::enable_timestamps();
     logline!("clauth proxy: listening on 127.0.0.1:{port}");
     touch_heartbeat(port);
 
@@ -354,22 +359,90 @@ fn forward_once(
     }
 
     // Commit: write the status line + relayed headers, then stream the body.
-    write_response_head(client, status, &response)?;
-    let mut body_reader = response.into_body().into_reader();
-    let mut buf = [0u8; 16 * 1024];
-    loop {
-        let n = body_reader
-            .read(&mut buf)
-            .context("read upstream response body")?;
-        if n == 0 {
-            break;
-        }
-        // Once a byte is written, we are committed — a mid-stream error
-        // propagates as a truncated stream, never a replay (pre-commit rule).
-        client.write_all(&buf[..n]).context("write to client")?;
+    // Once a byte is written we are committed — every end shape below closes
+    // this connection (truncated or complete), never replays (pre-commit rule).
+    let started = Instant::now();
+    let path = &head.target[EXPECTED_PREFIX.len()..];
+    if let Err(e) = write_response_head(client, status, &response) {
+        logline!(
+            "clauth proxy: {account} {} {path} → {status} · client closed before head relay ({e})",
+            head.method
+        );
+        return Ok(ForwardOutcome::Streamed);
     }
+    let mut body_reader = response.into_body().into_reader();
+    let mut sniffer = sse::TerminalSniffer::default();
+    let mut relayed: u64 = 0;
+    let mut buf = [0u8; 16 * 1024];
+    let end = loop {
+        let n = match body_reader.read(&mut buf) {
+            Ok(0) => break RelayEnd::UpstreamEof,
+            Ok(n) => n,
+            Err(e) => break RelayEnd::UpstreamError(e),
+        };
+        // Sniff BEFORE write so the chunk carrying the terminal event is still
+        // relayed, then the stream closes on our side — the upstream holds SSE
+        // streams open past `response.completed` (see `proxy::sse`), so EOF
+        // alone would leak this thread until the backstop timeout.
+        let terminal = sniffer.feed(&buf[..n]);
+        if let Err(e) = client.write_all(&buf[..n]) {
+            break RelayEnd::ClientClosed(e);
+        }
+        relayed += n as u64;
+        if terminal {
+            break RelayEnd::Terminal;
+        }
+    };
     client.flush().ok();
+    let secs = started.elapsed().as_secs();
+    match end {
+        // Normal ends — one summary line per request, stamped, greppable.
+        RelayEnd::Terminal => {
+            logline!(
+                "clauth proxy: {account} {} {path} → {status} · {relayed}B in {secs}s · completed",
+                head.method
+            );
+        }
+        RelayEnd::UpstreamEof => {
+            logline!(
+                "clauth proxy: {account} {} {path} → {status} · {relayed}B in {secs}s · upstream EOF",
+                head.method
+            );
+        }
+        // The client bailed mid-relay (user interrupt, codex gave up) — its
+        // decision, not a proxy fault; log as an end shape, not an error.
+        RelayEnd::ClientClosed(e) => {
+            logline!(
+                "clauth proxy: {account} {} {path} → {status} · {relayed}B in {secs}s · client closed ({e})",
+                head.method
+            );
+        }
+        // The genuine anomaly: upstream died (or the backstop fired — the
+        // elapsed seconds make that distinction readable) mid-stream, and the
+        // client sees a truncated stream.
+        RelayEnd::UpstreamError(e) => {
+            logline!(
+                "clauth proxy: {account} {} {path} → {status} · TRUNCATED after {relayed}B in {secs}s · upstream error: {e}",
+                head.method
+            );
+        }
+    }
     Ok(ForwardOutcome::Streamed)
+}
+
+/// How the committed relay of one response body ended.
+enum RelayEnd {
+    /// The sniffer saw a terminal SSE event (`response.completed` / `.failed`
+    /// / `.incomplete` / `[DONE]`) — the turn is over; close without waiting
+    /// for an upstream EOF that never comes.
+    Terminal,
+    /// Upstream finished the body (Content-Length'd responses, or a server
+    /// that does close).
+    UpstreamEof,
+    /// The client hung up mid-relay.
+    ClientClosed(std::io::Error),
+    /// The upstream read failed mid-stream — the client sees truncation.
+    UpstreamError(std::io::Error),
 }
 
 /// Write the committed response's status line + relayed headers (minus

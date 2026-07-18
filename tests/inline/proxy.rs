@@ -364,6 +364,146 @@ fn e2e_unknown_path_is_404_without_forwarding() {
     );
 }
 
+/// A stub matching the REAL backend's SSE shape (2026-07-18 incident): no
+/// Content-Length, and the connection is HELD OPEN after `response.completed`
+/// with periodic keepalives — the server never closes; the client is expected
+/// to. Returns the port; the stub thread ends when its socket errors or the
+/// hold expires.
+fn spawn_lingering_sse_stub(hold: std::time::Duration) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = read_request_recording(&mut stream);
+        let head = "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/event-stream\r\n\
+             x-codex-primary-used-percent: 7.0\r\n\r\n";
+        // The live wire shape (captured 2026-07-18): `event:` name line +
+        // `data:` payload line per event, and the terminal data line carries
+        // the whole response object on ONE line, far past any small buffer.
+        let body = format!(
+            "event: response.output_text.delta\n\
+             data: {{\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}}\n\n\
+             event: response.completed\n\
+             data: {{\"type\":\"response.completed\",\"response\":{{\"output\":\"{}\"}}}}\n\n",
+            "x".repeat(200_000)
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.flush();
+        // Linger: keepalives every 100ms until the proxy closes us or `hold`
+        // expires. A correct relay never sees any of these bytes.
+        let deadline = std::time::Instant::now() + hold;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if stream.write_all(b": ping\n\n").is_err() || stream.flush().is_err() {
+                return;
+            }
+        }
+    });
+    port
+}
+
+#[test]
+fn e2e_relay_closes_promptly_on_response_completed_while_upstream_lingers() {
+    // 2026-07-18 incident regression: the upstream holds the SSE stream open
+    // after `response.completed` (close-delimited, keepalives forever). The
+    // relay must close the client right after relaying the terminal event —
+    // NOT wait for upstream EOF (which never comes) until a dead-client write
+    // or the agent backstop timeout, leaking a thread per turn and logging a
+    // spurious connection error on every successful turn.
+    let _home = HomeSandbox::new();
+    let config = two_profile_config();
+    crate::codex::write_profile_auth("cdx-a", &codex_auth("at-a", "acct-a")).unwrap();
+
+    let port = spawn_lingering_sse_stub(std::time::Duration::from_secs(10));
+    let base = format!("http://127.0.0.1:{port}");
+    let started = std::time::Instant::now();
+    let resp = drive_request(config, base, &responses_request());
+    let elapsed = started.elapsed();
+    let text = String::from_utf8_lossy(&resp);
+
+    assert!(text.starts_with("HTTP/1.1 200"), "relayed status: {text}");
+    // The WHOLE terminal event must be relayed before the close — closing on
+    // the prefix truncated the (huge, single-line) completed event and
+    // reintroduced codex's "stream closed before response.completed".
+    assert!(
+        resp.ends_with(b"\"}}\n\n"),
+        "terminal event relayed through its blank-line terminator (tail: {:?})",
+        &text[text.len().saturating_sub(40)..]
+    );
+    assert!(
+        resp.len() > 200_000,
+        "full huge completed payload relayed ({}B)",
+        resp.len()
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "client must see EOF right after response.completed, not after the \
+         upstream hold/backstop ({elapsed:?})"
+    );
+}
+
+#[test]
+fn ureq_global_timeout_truncates_an_actively_streaming_body() {
+    // Documents the ureq semantics behind the 2026-07-18 incident: an agent
+    // `timeout_global` bounds the WHOLE call including the body read, and it
+    // fires even while bytes are actively flowing. This is why the proxy's
+    // backstop must sit far above any live turn's stream (xhigh reasoning
+    // turns exceeded the old 15-minute value) and why turn-end must come from
+    // the terminal-event sniffer, never from a timeout.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut drain = [0u8; 1024];
+        let _ = stream.read(&mut drain);
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");
+        // Stream actively: a chunk every 100ms for 3s — never idle.
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if stream.write_all(b"data: tick\n\n").is_err() {
+                return;
+            }
+            let _ = stream.flush();
+        }
+    });
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_millis(500)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let response = agent
+        .get(format!("http://127.0.0.1:{port}/"))
+        .call()
+        .unwrap();
+    let mut reader = response.into_body().into_reader();
+    let mut total = 0usize;
+    let mut buf = [0u8; 1024];
+    let failed = loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break false,
+            Ok(n) => total += n,
+            Err(_) => break true,
+        }
+    };
+    assert!(
+        failed,
+        "global timeout must kill the ACTIVE stream mid-flight (read {total}B without error — \
+         if this starts passing, ureq changed timeout semantics and the backstop can tighten)"
+    );
+    // It died early — well before the ~30 chunks the stub would deliver.
+    assert!(
+        total < 30 * 12,
+        "died mid-stream, not at stream end ({total}B)"
+    );
+}
+
 #[test]
 fn e2e_no_pool_answers_503() {
     let _home = HomeSandbox::new();
