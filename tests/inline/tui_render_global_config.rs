@@ -4,6 +4,7 @@
 //! an on/off boolean renders as a toggle, not a 2-option cycle.
 
 use super::*;
+use ratatui::style::Modifier;
 
 fn line_text(line: &Line<'static>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -267,7 +268,7 @@ fn money_spent_hint_explains_inertness_when_spend_off() {
 // ── burn floor / horizon dim while inert (burn-aware off) ─────────────────────
 
 /// Both burn-aware tunables gate a projection that never runs under static
-/// rotate mode, so they render as cloudy-tui disabled rows (whole content faint)
+/// switch mode, so they render as cloudy-tui disabled rows (whole content faint)
 /// while burn-aware is off, and become live cycles once it is on.
 #[test]
 fn burn_tunables_dim_when_burn_aware_is_off() {
@@ -292,4 +293,64 @@ fn burn_tunables_dim_when_burn_aware_is_off() {
             "{r:?} burn-aware on: live + focused brackets the active preset: {live}"
         );
     }
+}
+
+// ── concern bands + their eyebrow headers ────────────────────────────────────
+
+/// The renderer opens a band the first time it sees a new one, so a band whose
+/// rows are split by an unrelated row would print its header twice and read as
+/// two sections. Pins the contiguity `GLOBAL_CONFIG_ROWS` relies on.
+#[test]
+fn config_bands_stay_contiguous() {
+    let mut seen: Vec<&str> = Vec::new();
+    for row in GLOBAL_CONFIG_ROWS {
+        if seen.last() != Some(&row.band()) {
+            assert!(
+                !seen.contains(&row.band()),
+                "band {:?} reopens after another band: {seen:?}",
+                row.band(),
+            );
+            seen.push(row.band());
+        }
+    }
+    assert_eq!(
+        seen,
+        ["appearance", "scheduler", "auto-switch", "extra usage"],
+        "the band order is the display order",
+    );
+}
+
+/// The header is a fixed `TEXT_DIM + bold` eyebrow whatever the cursor does; the
+/// underline is the only thing focus moves. Rendering the focused band brighter,
+/// or underlining a band with no row focused, is the bug this pins.
+#[test]
+fn band_header_underlines_only_the_focused_band() {
+    let blurred = band_header("auto-switch", false);
+    let focused = band_header("auto-switch", true);
+    for line in [&blurred, &focused] {
+        assert_eq!(line_text(line), "AUTO-SWITCH", "eyebrows render uppercase");
+        assert_eq!(
+            line.spans[0].style.fg,
+            theme::label().fg,
+            "the tier never changes with focus"
+        );
+        assert!(
+            line.spans[0].style.add_modifier.contains(Modifier::BOLD),
+            "the eyebrow bold is a fixed label treatment, not a focus cue"
+        );
+    }
+    assert!(
+        !blurred.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "no underline while focus is elsewhere"
+    );
+    assert!(
+        focused.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "the underline is the active-section cue"
+    );
 }

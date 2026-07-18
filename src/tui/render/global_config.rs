@@ -1,11 +1,12 @@
 //! Program-wide Config tab — a single panel of global settings, distinct from
-//! the per-account Setup tab. Rows back real persisted state in `AppState`,
-//! grouped by concern: appearance (`theme`), login (`on mismatch`), background
-//! timing (`refresh` cadence, `refresh spent` toggle, `rotation`), fallback
-//! detection (`weekly limit`, `rotate mode` = burn-aware, plus the burn-aware
-//! `burn floor`/`burn horizon` tunables it gates, issue #8 follow-up b),
-//! fallback halt (`quota spent`), then the spend block (`allow extra usage` opt-in +
-//! its own `extra usage spent` halt default — real money, see `docs/internals.md`).
+//! the per-account Setup tab. Rows back real persisted state in `AppState` and
+//! run in the concern bands `GlobalConfigRow::band` names, each opened by an
+//! eyebrow header: appearance (`theme`), scheduler (`on mismatch`, `refresh`
+//! cadence, `refresh spent` toggle, `rotation`), auto-switch (`weekly limit`,
+//! `switch mode` = burn-aware, the burn-aware `burn floor`/`burn horizon`
+//! tunables it gates (issue #8 follow-up b), then the `quota spent` halt), then
+//! extra usage (`allow extra usage` opt-in + its own `extra usage spent` halt
+//! default — real money, see `docs/internals.md`).
 //! ↑↓ walks the rows; space cycles a row's value in place; ⏎ opens the
 //! refresh-interval and weekly-threshold custom-value editors and otherwise
 //! mirrors space. No left selector, no popups — settings are global.
@@ -13,7 +14,6 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 
 use crate::profile::{DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTERVAL_MS};
 
@@ -23,8 +23,8 @@ use super::super::app::{
 };
 use super::super::theme::{self, Tier};
 use super::panes::{
-    cycle_option, head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell,
-    label_style, section_box,
+    cycle_option, draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row,
+    invalid_tooltip_lines, key_cell, label_style, section_box,
 };
 
 /// Width of the key column: the longest keys (`allow extra usage` /
@@ -64,10 +64,28 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let editing = app.refresh_interval_draft.as_ref();
     let weekly_editing = app.weekly_threshold_draft.as_ref();
 
+    let focused_band = GLOBAL_CONFIG_ROWS[cursor].band();
+
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut caret: Option<(u16, u16)> = None;
+    let mut caret: Option<(u16, usize)> = None;
+    // Start + end of the focused row's block (row plus its tooltip lines), so a
+    // wrapped hint can't scroll off the bottom while its row stays visible.
+    let mut focus = (0usize, 1usize);
+    let mut band: Option<&str> = None;
     for (i, row) in GLOBAL_CONFIG_ROWS.iter().enumerate() {
         let selected = i == cursor;
+        // Eyebrow header opening each concern band, preceded by a blank spacer
+        // from the second band on so the groups read as separate sections.
+        if band != Some(row.band()) {
+            if band.is_some() {
+                lines.push(Line::default());
+            }
+            band = Some(row.band());
+            lines.push(band_header(row.band(), row.band() == focused_band));
+        }
+        if selected {
+            focus.0 = lines.len();
+        }
         let row_editing = match row {
             GlobalConfigRow::RefreshInterval => editing,
             GlobalConfigRow::WeeklyThreshold => weekly_editing,
@@ -92,8 +110,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 let cx = inner
                     .x
                     .saturating_add((2 + KEY_W + KEY_GUTTER + head_cols(input)) as u16);
-                let cy = inner.y.saturating_add(lines.len() as u16);
-                caret = Some((cx, cy));
+                caret = Some((cx, lines.len()));
                 lines.push(line);
                 lines.extend(if *row == GlobalConfigRow::WeeklyThreshold {
                     weekly_range_tooltip(input, inner.width as usize)
@@ -112,12 +129,30 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 }
             }
         }
+        if selected {
+            focus.1 = lines.len();
+        }
     }
 
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
-    if let Some((cx, cy)) = caret {
-        frame.set_cursor_position((cx, cy));
+    let offset = draw_scrolled_lines(frame, inner, lines, focus);
+    // A caret scrolled off the top has no cell to sit in; leaving the cursor
+    // unset is better than parking it on an unrelated row.
+    if let Some((cx, row)) = caret
+        && let Some(visible) = row
+            .checked_sub(offset)
+            .filter(|v| *v < inner.height as usize)
+    {
+        frame.set_cursor_position((cx, inner.y.saturating_add(visible as u16)));
     }
+}
+
+/// Eyebrow header opening a concern band: UPPERCASE, `TEXT_DIM + bold` at all
+/// times (a fixed label treatment, not a focus cue), gaining an underline while
+/// the cursor sits on one of its rows — the contract's section-header form.
+fn band_header(label: &str, focused: bool) -> Line<'static> {
+    let style = theme::label();
+    let style = if focused { style.underlined() } else { style };
+    Line::from(Span::styled(label.to_uppercase(), style))
 }
 
 /// Inline help for rows whose value doesn't self-describe. Phrased for the
@@ -177,7 +212,7 @@ fn row_hint(
         }
         GlobalConfigRow::BurnFloor => {
             if !toggles.burn_aware {
-                "inert until rotate mode is burn-aware: the lowest usage % a projected switch may \
+                "inert until switch mode is burn-aware: the lowest usage % a projected switch may \
                  fire at"
             } else {
                 "burn-aware never switches below this %, so it can't waste more than 100 minus it \
@@ -186,7 +221,7 @@ fn row_hint(
         }
         GlobalConfigRow::BurnHorizon => {
             if !toggles.burn_aware {
-                "inert until rotate mode is burn-aware: how far ahead the burn projection looks"
+                "inert until switch mode is burn-aware: how far ahead the burn projection looks"
             } else {
                 "project burn at most this far ahead (also capped by refresh); shorter switches \
                  nearer 100 (default 60s)"
@@ -296,7 +331,7 @@ fn detail_row(
         ),
         GlobalConfigRow::BurnAware => cycle_row(
             arrow,
-            "rotate mode",
+            "switch mode",
             &[
                 ("static", !toggles.burn_aware),
                 ("burn-aware", toggles.burn_aware),

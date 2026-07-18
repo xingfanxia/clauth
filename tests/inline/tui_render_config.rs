@@ -1,8 +1,10 @@
 //! The Setup-tab `model` row is a segmented alias cycle sharing the Config-tab
 //! contract: bare labels when blurred, the active option bracketed only on focus
 //! (the row widens by 2 on focus — the bracket pair is the only width change).
+//! Plus the pane's action rows, which take the `+ new`-row focus promotion.
 
 use super::*;
+use ratatui::style::Modifier;
 
 fn line_text(line: &Line<'static>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -54,4 +56,55 @@ fn model_cycle_appends_a_custom_id_without_brackets() {
         !focused.contains("[claude-fable-5]"),
         "a custom id is appended, not bracketed: {focused}"
     );
+}
+
+/// The pane's color-identity action rows take the `+ new`-row promotion: bold
+/// when the cursor is on it, and the accent (or success) color held throughout,
+/// since the color is the row's identity and never promotes to `TEXT`. Before
+/// this they were bare labels that looked identical focused and blurred, leaving
+/// only the row tint to carry focus. `delete account` / `log out` are NOT in
+/// this set: their always-bold `DANGER` is a fixed destructive cue that must
+/// persist whether or not the row is focused.
+#[test]
+fn action_rows_bold_on_select_and_keep_their_color() {
+    let mut snap = Snap::blank("+ new account");
+    let input = InputState::new("");
+    // (row, the style the label holds in both states)
+    let cases: [(ConfigRow, Style); 4] = [
+        (ConfigRow::EnvAdd, theme::accent()),
+        (ConfigRow::ModelOverrideAdd, theme::accent()),
+        (ConfigRow::Create, theme::accent()),
+        (ConfigRow::Login, theme::accent()),
+    ];
+    for (row, want) in cases {
+        let blurred = detail_row(row, false, false, false, &snap, &input);
+        let focused = detail_row(row, true, false, false, &snap, &input);
+        let (b, f) = (&blurred.spans[1], &focused.spans[1]);
+        assert_eq!(
+            b.content, f.content,
+            "{row:?}: focus must not change the label text"
+        );
+        assert!(
+            !b.style.add_modifier.contains(Modifier::BOLD),
+            "{row:?}: a blurred action row must not be bold"
+        );
+        assert!(
+            f.style.add_modifier.contains(Modifier::BOLD),
+            "{row:?}: a selected action row promotes to bold"
+        );
+        assert_eq!(b.style.fg, want.fg, "{row:?}: blurred keeps its color");
+        assert_eq!(
+            f.style.fg, want.fg,
+            "{row:?}: the color is the row's identity, so focus never recolors it"
+        );
+    }
+
+    // The `✓ logged in` state is the same row in SUCCESS — same promotion rule.
+    snap.captured = true;
+    let blurred = detail_row(ConfigRow::Login, false, false, false, &snap, &input);
+    let focused = detail_row(ConfigRow::Login, true, false, false, &snap, &input);
+    assert!(line_text(&focused).contains("✓ logged in"));
+    assert!(!blurred.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    assert!(focused.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(focused.spans[1].style.fg, theme::success().fg);
 }

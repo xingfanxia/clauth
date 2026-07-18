@@ -8,15 +8,15 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigDraft, ConfigFocus, ConfigRow, InputState, MODEL_PRESETS, config_rows,
 };
 use super::super::theme;
 use super::panes::{
-    cycle_option, draw_selector_list, head_cols, help_tooltip_lines, highlight_row, key_cell,
-    label_style, name_color, picker_row, section_box, section_box_verbatim, selector_width,
+    bold_when, cycle_option, draw_scrolled_lines, draw_selector_list, head_cols,
+    help_tooltip_lines, highlight_row, key_cell, label_style, name_color, picker_row, section_box,
+    section_box_verbatim, selector_width,
 };
 
 const KEY_W: usize = 11;
@@ -238,6 +238,9 @@ fn draw_settings_rows(
     let mut edit_caret: Option<(u16, InputState, ConfigRow)> = None;
     let mut line_idx: u16 = if provider_label.is_some() { 3 } else { 2 };
 
+    // Start + end of the focused row's block (row plus its tooltip lines), so a
+    // wrapped hint can't scroll off the bottom while its row stays visible.
+    let mut focus = (0usize, 1usize);
     for (i, row) in rows.iter().enumerate() {
         let selected = actions_focused && i == cursor;
         let is_editing = editing == Some(*row);
@@ -245,6 +248,9 @@ fn draw_settings_rows(
         let line = detail_row(*row, selected, is_editing, armed_delete, snap, &input);
         if is_editing {
             edit_caret = Some((line_idx, input, *row));
+        }
+        if selected || is_editing {
+            focus.0 = line_idx as usize;
         }
         lines.push(if selected {
             highlight_row(line, inner.width as usize)
@@ -260,16 +266,25 @@ fn draw_settings_rows(
             line_idx += hint.len() as u16;
             lines.extend(hint);
         }
+        if selected || is_editing {
+            focus.1 = line_idx as usize;
+        }
     }
 
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+    // The row list outgrows a short terminal (env entries + model overrides are
+    // unbounded), so it scrolls to the focused row rather than clipping its tail.
+    let offset = draw_scrolled_lines(frame, inner, lines, focus);
 
     // Position the native terminal cursor at the caret when a text/model field is active.
-    if let Some((ly, input, row)) = edit_caret {
+    if let Some((ly, input, row)) = edit_caret
+        && let Some(visible) = (ly as usize)
+            .checked_sub(offset)
+            .filter(|v| *v < inner.height as usize)
+    {
         // x = "❯ " (2) + label block (row_label_cols: KEY_W+gutter, or key+gutter for a long env key) + caret cols
         let prefix_cols = 2 + row_label_cols(row, snap) + head_cols(&input);
         let cx = inner.x.saturating_add(prefix_cols as u16);
-        let cy = inner.y.saturating_add(ly);
+        let cy = inner.y.saturating_add(visible as u16);
         frame.set_cursor_position((cx, cy));
     }
 }
@@ -390,10 +405,13 @@ fn detail_row(
         }
         // While editing, the typed text is the new key; at rest, the add chip.
         ConfigRow::EnvAdd if editing => kv_field(arrow, "key", input, editing, selected, false),
-        ConfigRow::EnvAdd => Line::from(vec![arrow, Span::styled("+ add env", theme::accent())]),
+        ConfigRow::EnvAdd => Line::from(vec![
+            arrow,
+            Span::styled("+ add env", bold_when(theme::accent(), selected)),
+        ]),
         ConfigRow::ModelOverrideAdd => Line::from(vec![
             arrow,
-            Span::styled("+ model override", theme::accent()),
+            Span::styled("+ model override", bold_when(theme::accent(), selected)),
         ]),
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
@@ -411,21 +429,28 @@ fn detail_row(
             };
             Line::from(vec![arrow, Span::styled(label, theme::danger().bold())])
         }
-        ConfigRow::Create => {
-            Line::from(vec![arrow, Span::styled("create account", theme::accent())])
-        }
+        ConfigRow::Create => Line::from(vec![
+            arrow,
+            Span::styled("create account", bold_when(theme::accent(), selected)),
+        ]),
         ConfigRow::Login => {
             // A draft-held mint renders the done state; ⏎ re-runs the login but
             // confirms first before replacing the stash.
             if snap.captured {
-                Line::from(vec![arrow, Span::styled("✓ logged in", theme::success())])
+                Line::from(vec![
+                    arrow,
+                    Span::styled("✓ logged in", bold_when(theme::success(), selected)),
+                ])
             } else {
                 let label = if snap.logged_in {
                     "re-login"
                 } else {
                     "+ login"
                 };
-                Line::from(vec![arrow, Span::styled(label, theme::accent())])
+                Line::from(vec![
+                    arrow,
+                    Span::styled(label, bold_when(theme::accent(), selected)),
+                ])
             }
         }
         ConfigRow::DeleteCreds => {

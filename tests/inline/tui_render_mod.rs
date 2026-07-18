@@ -726,3 +726,153 @@ fn fallback_edit_caret_follows_the_blocked_reason_pill() {
         "the blocked-reason pill (2 rows) shifts the edit caret down (unblocked={unblocked}, blocked={blocked})"
     );
 }
+
+/// The Config and Setup panes rebuild their whole row list every frame into a
+/// fixed-height `Paragraph`. Before they scrolled, anything past the viewport
+/// vanished with no scrollbar and no clue — the last settings row and its hint
+/// were simply absent at 24 rows. Both panes must keep the FOCUSED row (and its
+/// tooltip) on screen at the smallest size the app renders at.
+#[test]
+fn form_panes_keep_the_focused_row_on_screen_when_they_overflow() {
+    use crate::tui::app::{ConfigFocus, GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+
+    // Cursor on the last row: it and its two-line hint sit past an 18-line
+    // viewport, so only a scroll can reveal them.
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS.len() - 1;
+    let bottom = dump(&app, 90, 24);
+    assert!(
+        bottom.contains("extra usage spent"),
+        "the focused last row must not clip:\n{bottom}"
+    );
+    assert!(
+        bottom.contains("inert until extra usage"),
+        "its hint tooltip must not clip either:\n{bottom}"
+    );
+    assert!(
+        bottom.contains('\u{2503}'),
+        "an overflowing pane shows its scrollbar thumb:\n{bottom}"
+    );
+
+    // Cursor back near the top with a hinted row (so the pane still overflows):
+    // the offset really tracks the cursor both ways — the first band header is
+    // back AND the bottom row has gone off screen.
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::DivergenceDefault)
+        .unwrap();
+    let top = dump(&app, 90, 24);
+    assert!(
+        top.contains("APPEARANCE"),
+        "the first band header is back on screen at the top:\n{top}"
+    );
+    assert!(
+        !top.contains("extra usage spent"),
+        "the offset really moved: the bottom row is off screen now:\n{top}"
+    );
+
+    // Setup's detail pane grows with a profile's env entries, so it overflows
+    // the same way — its last row (`delete account`) must stay reachable.
+    let mut p = oauth("uwuclxdy", 10.0, 10.0, false);
+    for i in 0..8 {
+        p.env.insert(format!("CUSTOM_VAR_{i}"), "value".into());
+    }
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    });
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    app.config_action_cursor = usize::MAX; // clamped to the last row by `draw_settings`
+    let setup = dump(&app, 90, 24);
+    assert!(
+        setup.contains("delete account"),
+        "Setup's focused last row must not clip:\n{setup}"
+    );
+}
+
+/// Each concern band is separated from the previous one by a blank row, so the
+/// groups read as sections instead of one 12-row wall. The FIRST band opens the
+/// pane, so it must not carry a leading spacer.
+#[test]
+fn config_bands_are_separated_by_one_blank_row() {
+    use crate::tui::app::Tab;
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = 0;
+    let screen = dump(&app, 90, 50);
+    let lines: Vec<&str> = screen.lines().collect();
+    let header = |label: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(label))
+            .unwrap_or_else(|| panic!("{label} renders:\n{screen}"))
+    };
+
+    for label in ["SCHEDULER", "AUTO-SWITCH", "EXTRA USAGE"] {
+        let above = lines[header(label) - 1];
+        assert!(
+            !above.chars().any(char::is_alphanumeric),
+            "{label} opens on a blank spacer row, got {above:?}:\n{screen}"
+        );
+    }
+    let above_first = lines[header("APPEARANCE") - 1];
+    assert!(
+        above_first.contains("SETTINGS"),
+        "the first band sits right under the panel title, no leading spacer: \
+         {above_first:?}\n{screen}"
+    );
+}
+
+/// A row's help tooltip wraps to the pane width, so a narrow pane turns a
+/// one-line hint into four. Scrolling to the focused ROW is not enough — the
+/// scroll has to clear the whole focused BLOCK, or the hint clips off the bottom
+/// while the row it explains sits comfortably on screen.
+#[test]
+fn a_wrapped_hint_scrolls_into_view_with_its_row() {
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    // `allow extra usage` carries a long hint and sits mid-pane, so the tail of
+    // its wrapped block lands past the viewport without pulling the whole pane
+    // to the end the way the last row would.
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SpendBudget)
+        .unwrap();
+
+    let screen = dump(&app, 34, 24);
+    assert!(
+        screen.contains("allow extra"),
+        "the focused row renders:\n{screen}"
+    );
+    // The hint wraps to four lines ending in a lone `off`. That last line is
+    // present only if the scroll cleared the block's tail, not just its row.
+    assert!(
+        screen.contains("chain parks or switches"),
+        "the hint's third line renders:\n{screen}"
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.trim_matches(['│', '┊', '┃', ' ']) == "off"),
+        "the hint's final wrapped line must not clip:\n{screen}"
+    );
+}

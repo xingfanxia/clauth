@@ -3487,12 +3487,9 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 4] = [
     FallbackRow::Remove,
 ];
 
-/// Rows on the program-wide Config tab, in display order.
-// Grouped by concern (top→bottom): appearance, login, background timing
-// (refresh cadence, spent-account refresh, token rotation), fallback detection
-// (weekly line, rotate mode), fallback halt (quota spent), then the spend block
-// (arm + money-spent halt). Related knobs sit together instead of interleaving
-// halt above detection.
+/// Rows on the program-wide Config tab, in display order. Related knobs sit
+/// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
+/// names each run, and the renderer turns a band change into an eyebrow header.
 pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 12] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::DivergenceDefault,
@@ -3507,6 +3504,30 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 12] = [
     GlobalConfigRow::SpendBudget,
     GlobalConfigRow::SwitchOffWhenBudgetSpent,
 ];
+
+impl GlobalConfigRow {
+    /// The concern this row belongs to. Rows sharing a band are contiguous in
+    /// [`GLOBAL_CONFIG_ROWS`]; the Config renderer opens each run with an eyebrow
+    /// header, so a band that stops being contiguous would render twice — which
+    /// is what `config_bands_stay_contiguous` pins.
+    pub(crate) fn band(self) -> &'static str {
+        match self {
+            GlobalConfigRow::Theme => "appearance",
+            GlobalConfigRow::DivergenceDefault
+            | GlobalConfigRow::RefreshInterval
+            | GlobalConfigRow::RefreshSpentAccounts
+            | GlobalConfigRow::PreemptiveRotation => "scheduler",
+            GlobalConfigRow::WeeklyThreshold
+            | GlobalConfigRow::BurnAware
+            | GlobalConfigRow::BurnFloor
+            | GlobalConfigRow::BurnHorizon
+            | GlobalConfigRow::SwitchOffWhenSpent => "auto-switch",
+            GlobalConfigRow::SpendBudget | GlobalConfigRow::SwitchOffWhenBudgetSpent => {
+                "extra usage"
+            }
+        }
+    }
+}
 
 /// Config tab keymap (enumerated rows only, per the unified value-row grammar):
 /// ↑↓ walks rows; space cycles every row's value forward, wrapping the top

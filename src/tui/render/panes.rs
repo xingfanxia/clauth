@@ -160,7 +160,7 @@ pub(super) fn draw_scrollbar(
     offset: usize,
     viewport: usize,
 ) {
-    if total <= viewport || viewport == 0 || inner.height == 0 {
+    if total <= viewport || viewport == 0 || inner.height == 0 || inner.width == 0 {
         return;
     }
     // Right-padding column: one cell to the right of the content rect.
@@ -188,6 +188,59 @@ pub(super) fn draw_scrollbar(
             }
         }
     }
+}
+
+/// Rows of context the form scroll keeps past the focused line while content
+/// remains (cloudy-tui: the cursor never rests against the viewport edge).
+const SCROLL_PAD: usize = 3;
+
+/// Render a form pane's assembled lines into `inner`, scrolled so the focused
+/// block `focus.0..focus.1` stays on screen, plus the overflow scrollbar.
+/// Returns the applied offset so a caller placing the native terminal cursor can
+/// shift its row by it.
+///
+/// These panes rebuild one `Vec<Line>` per frame and hold no offset in `App`, so
+/// the scroll is derived from the focused block each draw. Without it a pane
+/// taller than its viewport silently drops its bottom rows — no scrollbar, no
+/// clue anything is missing, which is how a hint tooltip and a whole settings
+/// row went missing on a 24-row terminal.
+pub(super) fn draw_scrolled_lines(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    lines: Vec<Line<'static>>,
+    focus: (usize, usize),
+) -> usize {
+    let total = lines.len();
+    let viewport = inner.height as usize;
+    let offset = scroll_offset(total, viewport, focus);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((offset as u16, 0)),
+        inner,
+    );
+    draw_scrollbar(frame, inner, total, offset, viewport);
+    offset
+}
+
+/// Smallest offset that keeps the focused block (`focus.0` inclusive, `focus.1`
+/// exclusive) plus a [`SCROLL_PAD`] band on screen, clamped to the content.
+///
+/// The block, not just its first line: a row's help tooltip wraps to the pane
+/// width, so a narrow pane can push a 4-line hint past the viewport while the
+/// row it explains sits comfortably on screen. Capping at `focus.0` keeps the
+/// row itself visible when its block is taller than the whole viewport. The
+/// focus alone determines the offset, so no cross-frame state is needed and the
+/// view can never drift out of sync with the cursor.
+pub(super) fn scroll_offset(total: usize, viewport: usize, focus: (usize, usize)) -> usize {
+    if viewport == 0 || total <= viewport {
+        return 0;
+    }
+    let pad = SCROLL_PAD.min(viewport.saturating_sub(1) / 2);
+    (focus.1 + pad)
+        .saturating_sub(viewport)
+        .min(focus.0)
+        .min(total - viewport)
 }
 
 /// Bordered selector list; `build_rows` receives the inner width for the selection bar.
