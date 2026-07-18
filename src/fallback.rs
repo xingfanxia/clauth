@@ -70,10 +70,11 @@ pub(crate) const WEEKLY_HARD_BLOCK_PCT: f64 = 100.0;
 /// `weekly_pct` is chain-global (`AppState::weekly_switch_threshold_pct`,
 /// default 98), not a per-member knob like the 5h threshold: the line
 /// protects the CHAIN (a wrong hop strands days, not hours), not one member's
-/// taste. Only `seven_day` gates here — a per-model `weekly_scoped` limit at
-/// 100 (e.g. "7d fable" spent while 7d has room) blocks just that model, and
-/// the walk cannot know which model the next session will drive. Store-side
-/// twin logic inlines this same shape (see `is_exhausted_from_store`).
+/// taste. Only `seven_day` gates HERE — per-model `weekly_scoped` limits
+/// (e.g. "7d fable") have their own softer treatment: they never count as
+/// full exhaustion, but the walk PREFERS members clear of them (SCW-1 —
+/// see [`scoped_weekly_blocked_info`]). Store-side twin logic inlines this
+/// same shape (see `is_exhausted_from_store`).
 fn weekly_blocked_info(info: &crate::usage::UsageInfo, now_secs: i64, weekly_pct: f64) -> bool {
     seven_day_live(info, now_secs)
         && info
@@ -88,6 +89,57 @@ fn weekly_blocked(profile: &Profile, weekly_pct: f64) -> bool {
         .usage
         .as_ref()
         .is_some_and(|u| weekly_blocked_info(u, now_epoch_secs(), weekly_pct))
+}
+
+/// Whether one window carries a parseable reset still in the future — the
+/// per-window liveness primitive [`scoped_weekly_blocked_info`] applies to
+/// each `weekly_scoped` entry (mirroring `seven_day_live` for the aggregate).
+fn window_live(w: &UsageWindow, now_secs: i64) -> bool {
+    w.resets_at
+        .as_deref()
+        .and_then(iso_to_epoch_secs)
+        .is_some_and(|resets_at| now_secs < resets_at)
+}
+
+/// SCW-1: whether any LIVE per-model weekly window (`weekly_scoped`, e.g.
+/// "7d fable") is past the weekly line. Distinct from [`weekly_blocked_info`]
+/// (the aggregate 7d cap): a model-scoped window at 100 blocks ONLY that
+/// model, so it must never count as full exhaustion (wrap-off `Off`,
+/// `soonest_resume`, recovery gates all stay on the aggregate) — but the
+/// chain walk PREFERS members clear of it, because the walk cannot know
+/// which model the next session will drive and landing a session of the
+/// capped model on such a member strands it (observed live 2026-07-18:
+/// "7d fable" 100% while the aggregate 7d showed 65% — the old
+/// aggregate-only walk called that member the healthiest target).
+pub(crate) fn scoped_weekly_blocked_info(
+    info: &crate::usage::UsageInfo,
+    now_secs: i64,
+    weekly_pct: f64,
+) -> bool {
+    info.weekly_scoped
+        .iter()
+        .any(|s| window_live(&s.window, now_secs) && s.window.utilization >= weekly_pct)
+}
+
+/// [`scoped_weekly_blocked_info`] over a profile's own usage snapshot.
+fn scoped_weekly_blocked(profile: &Profile, weekly_pct: f64) -> bool {
+    profile
+        .usage
+        .as_ref()
+        .is_some_and(|u| scoped_weekly_blocked_info(u, now_epoch_secs(), weekly_pct))
+}
+
+/// Scheduler-side [`scoped_weekly_blocked`]: reads from the shared
+/// `UsageStore`. A poisoned lock or absent entry fails safe to "not blocked"
+/// (the member is then judged by the aggregate gates alone, as before SCW-1).
+fn scoped_blocked_from_store(name: &str, store: &UsageStore, weekly_pct: f64) -> bool {
+    let now = now_epoch_secs();
+    match store.lock() {
+        Ok(s) => s
+            .get(name)
+            .is_some_and(|info| scoped_weekly_blocked_info(info, now, weekly_pct)),
+        Err(_) => false,
+    }
 }
 
 /// True when the profile's 5h utilization has crossed its own threshold. Also
@@ -459,6 +511,18 @@ pub(crate) fn next_target(
         pick.map(|i| chain[i].to_string())
     };
 
+    // SCW-1 tier 1: prefer members clear on EVERY weekly line — the aggregate
+    // AND each per-model window. A "7d fable" at 100 strands a fable session
+    // even while the aggregate 7d shows room, and the walk cannot know which
+    // model the next session will drive — so clear-everywhere wins.
+    if let Some(name) =
+        walk(&|p| !is_exhausted(p, weekly_pct) && !scoped_weekly_blocked(p, weekly_pct))
+    {
+        return Some(SwitchAction::To(name));
+    }
+    // Tier 2 (the pre-SCW-1 acceptance): aggregate-clear members — reached
+    // only when no fully-clear member exists, so a chain whose every member
+    // is model-blocked still rotates for the other models instead of halting.
     if let Some(name) = walk(&|p| !is_exhausted(p, weekly_pct)) {
         return Some(SwitchAction::To(name));
     }
@@ -543,9 +607,6 @@ pub(crate) fn next_auto_switch_target(
         store,
         snapshot.weekly_pct,
     );
-    if !active_broken && !active_kick_rejected && !active_exhausted {
-        return None;
-    }
 
     // Skip the active slot and any auth-broken member (AUTH-1) — the broken
     // exclusion covers the headroom pass AND the 100%-sink pass below.
@@ -561,7 +622,30 @@ pub(crate) fn next_auto_switch_target(
         let pick = walk_chain(active_idx, len, &skip, &|i| accept(&snapshot.chain[i]));
         pick.map(|i| snapshot.chain[i].name.clone())
     };
+    // SCW-1 tier-1 acceptance: clear on the aggregate gates AND every
+    // per-model weekly window (see `scoped_weekly_blocked_info`).
+    let fully_clear = |m: &ChainMember| {
+        !is_exhausted_from_store(&m.name, m.threshold, store, snapshot.weekly_pct)
+            && !scoped_blocked_from_store(&m.name, store, snapshot.weekly_pct)
+    };
 
+    if !active_broken && !active_kick_rejected && !active_exhausted {
+        // SCW-1 active trigger: a per-model weekly line crossed on an
+        // otherwise-healthy active hops ONLY when a fully-clear member
+        // exists. When every sibling is equally model-blocked the hop buys
+        // nothing and the chain would ping-pong — stay put instead.
+        if scoped_blocked_from_store(&active.name, store, snapshot.weekly_pct)
+            && let Some(name) = walk(&fully_clear)
+        {
+            return Some(SwitchAction::To(name));
+        }
+        return None;
+    }
+
+    if let Some(name) = walk(&fully_clear) {
+        return Some(SwitchAction::To(name));
+    }
+    // Tier 2 (the pre-SCW-1 acceptance) — see `next_target`'s twin comment.
     if let Some(name) =
         walk(&|m| !is_exhausted_from_store(&m.name, m.threshold, store, snapshot.weekly_pct))
     {
@@ -599,6 +683,26 @@ pub(crate) fn next_auto_switch_target(
     None
 }
 
+/// SCW-1: the tier-1-only walk for the ACTIVE-side per-model trigger — the
+/// first non-active, non-broken member clear on the aggregate gates AND every
+/// per-model weekly window. Deliberately NOT `next_target` (whose tier-2 pass
+/// accepts model-blocked members): when the hop's whole reason is a scoped
+/// window, an equally scoped-blocked target is no target.
+fn fully_clear_target(config: &AppConfig, weekly_pct: f64) -> Option<String> {
+    let active = config.state.active_profile.as_deref()?;
+    let chain = &config.state.fallback_chain;
+    let active_idx = chain.iter().position(|n| n == active)?;
+    let skip = |i: usize| {
+        chain[i] == active || config.find(&chain[i]).is_none() || config.is_auth_broken(&chain[i])
+    };
+    let pick = walk_chain(active_idx, chain.len(), &skip, &|i| {
+        config
+            .find(&chain[i])
+            .is_some_and(|p| !is_exhausted(p, weekly_pct) && !scoped_weekly_blocked(p, weekly_pct))
+    });
+    pick.map(|i| chain[i].to_string())
+}
+
 /// Find the first chain member whose utilization is below its threshold
 /// (has recovered headroom after switch-off-all). Returns the member name.
 /// Safe to call without holding the config lock — reads from [`UsageStore`].
@@ -611,18 +715,19 @@ pub(crate) fn find_recovered_member(
     kick_rejected: &[String],
 ) -> Option<String> {
     let now = now_epoch_secs();
-    for member in chain {
+    let recovered = |member: &ChainMember, require_scoped_clear: bool| -> Option<bool> {
         if kick_rejected.iter().any(|k| k == &member.name) {
-            continue;
+            return Some(false);
         }
         // A fetched entry whose 5h window is absent or past its reset is idle
         // headroom; a live window recovers only below the member's threshold.
         // An absent entry (never fetched) stays undecidable. A weekly-dead
         // member NEVER recovers — its 5h window lapsing every few hours is
         // exactly what made it look reborn while the 7d cap still blocks it.
-        let recovered = match store.lock() {
+        match store.lock() {
             Ok(s) => s.get(&member.name).map(|info| {
                 !weekly_blocked_info(info, now, weekly_pct)
+                    && (!require_scoped_clear || !scoped_weekly_blocked_info(info, now, weekly_pct))
                     && (!five_hour_live(info, now)
                         || info
                             .five_hour
@@ -630,8 +735,18 @@ pub(crate) fn find_recovered_member(
                             .is_none_or(|w| w.utilization < member.threshold))
             }),
             Err(_) => None,
-        };
-        if recovered == Some(true) {
+        }
+    };
+    // SCW-1: prefer a member clear of every per-model weekly window, then
+    // fall back to the aggregate-only recovery — relinking onto a
+    // model-blocked member beats staying off, but only as a last pick.
+    for member in chain {
+        if recovered(member, true) == Some(true) {
+            return Some(member.name.clone());
+        }
+    }
+    for member in chain {
+        if recovered(member, false) == Some(true) {
             return Some(member.name.clone());
         }
     }
@@ -662,15 +777,26 @@ pub(crate) fn auto_switch_if_needed(
         // AUTH-4 parity with the scheduler-side walk: an auth-broken active's
         // usage is frozen-stale (its fetches can't succeed), so exhaustion
         // cannot be a precondition for leaving it.
+        let weekly_pct = config.state.weekly_switch_threshold_pct();
         if !config.is_auth_broken(active_name)
             && !is_exhausted_active(
                 active,
                 config.state.burn_aware_switching,
                 config.state.refresh_interval_ms,
                 active_burn_pct_per_hour,
-                config.state.weekly_switch_threshold_pct(),
+                weekly_pct,
             )
         {
+            // SCW-1 active trigger (parity with `next_auto_switch_target`): a
+            // per-model weekly line crossed on an otherwise-healthy active
+            // hops ONLY onto a fully-clear member — never a tier-2 pick,
+            // which would ping-pong between equally model-blocked members.
+            if scoped_weekly_blocked(active, weekly_pct)
+                && let Some(target) = fully_clear_target(config, weekly_pct)
+            {
+                switch_profile(config, &target)?;
+                return Ok(Some(SwitchAction::To(target)));
+            }
             return Ok(None);
         }
 

@@ -1835,3 +1835,277 @@ fn snapshot_codex_chain_rejects_degenerate_markers() {
         vec!["x", "y"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// SCW-1: per-model weekly windows ("7d fable") in the chain walk.
+// Live shape that motivated it (2026-07-18): a member at 7d 65% / 5h 0% but
+// "7d fable" 100% — the aggregate-only walk called it the healthiest target
+// and stranded every fable session landed on it.
+// ---------------------------------------------------------------------------
+
+/// A weekly reset days ahead — live for both 7d and per-model windows.
+fn week_reset() -> String {
+    epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)
+}
+
+fn scoped_window(
+    label: &str,
+    utilization: f64,
+    resets_at: Option<String>,
+) -> crate::usage::ScopedWindow {
+    crate::usage::ScopedWindow {
+        label: label.to_string(),
+        window: window(utilization, resets_at),
+    }
+}
+
+/// UsageInfo with a live 5h window, a live aggregate 7d window, and the given
+/// per-model weekly windows.
+fn usage_with_scoped(
+    five_hour_pct: f64,
+    seven_day_pct: f64,
+    scoped: Vec<crate::usage::ScopedWindow>,
+) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(five_hour_pct, Some(live_reset()))),
+        seven_day: Some(window(seven_day_pct, Some(week_reset()))),
+        weekly_scoped: scoped,
+        ..UsageInfo::default()
+    }
+}
+
+#[test]
+fn auto_switch_prefers_member_clear_of_every_weekly_window() {
+    // Active maxed. B is the ax-cl shape (agg clear, fable 100). C is clear
+    // everywhere. Chain order favors B — the tier-1 pass must still pick C.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                65.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        (
+            "c",
+            usage_with_scoped(
+                10.0,
+                18.0,
+                vec![scoped_window("7d fable", 12.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "fully-clear member beats an earlier model-blocked one"
+    );
+}
+
+#[test]
+fn auto_switch_falls_back_to_model_blocked_member_when_none_fully_clear() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                65.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "a model-blocked member still beats staying on a spent active"
+    );
+}
+
+#[test]
+fn auto_switch_scoped_blocked_active_hops_to_fully_clear_member() {
+    // Active is healthy by every aggregate gate but its fable window crossed
+    // the line — with a fully-clear sibling, hop.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_with_scoped(
+                20.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        (
+            "b",
+            usage_with_scoped(
+                5.0,
+                30.0,
+                vec![scoped_window("7d fable", 10.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+    );
+}
+
+#[test]
+fn auto_switch_scoped_blocked_active_stays_put_when_no_fully_clear_member() {
+    // Every sibling is equally model-blocked: hopping buys nothing and would
+    // ping-pong — stay put.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_with_scoped(
+                20.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        (
+            "b",
+            usage_with_scoped(
+                5.0,
+                30.0,
+                vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+#[test]
+fn lapsed_scoped_window_never_blocks() {
+    // A fable window at 100 whose reset has PASSED is stale — no hop.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_with_scoped(
+                20.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(expired_reset()))],
+            ),
+        ),
+        ("b", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+#[test]
+fn next_target_prefers_fully_clear_member() {
+    // UI-side twin of the tier-1 preference: B model-blocked, C clear.
+    let mk = |name: &str, info: UsageInfo| profile_with_usage(name, Some(95.0), Some(info));
+    let config = config_with_chain(
+        vec![
+            mk("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+            mk(
+                "b",
+                usage_with_scoped(
+                    0.0,
+                    65.0,
+                    vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+                ),
+            ),
+            mk("c", usage_with_scoped(10.0, 18.0, vec![])),
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string())),
+    );
+}
+
+#[test]
+fn find_recovered_prefers_member_clear_of_scoped_windows() {
+    let chain = vec![
+        ChainMember {
+            name: "b".into(),
+            threshold: 95.0,
+            last_resort: false,
+        },
+        ChainMember {
+            name: "c".into(),
+            threshold: 95.0,
+            last_resort: false,
+        },
+    ];
+    let store = store_with_infos(vec![
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        ("c", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        find_recovered_member(&chain, &store, 98.0, &[]),
+        Some("c".to_string()),
+        "recovery relinks the fully-clear member first"
+    );
+    // With ONLY the model-blocked member recovered, it is still taken.
+    let store = store_with_infos(vec![(
+        "b",
+        usage_with_scoped(
+            0.0,
+            40.0,
+            vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+        ),
+    )]);
+    let chain_b = vec![ChainMember {
+        name: "b".into(),
+        threshold: 95.0,
+        last_resort: false,
+    }];
+    assert_eq!(
+        find_recovered_member(&chain_b, &store, 98.0, &[]),
+        Some("b".to_string()),
+    );
+}

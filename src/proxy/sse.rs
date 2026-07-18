@@ -118,7 +118,7 @@ fn strip_cr(line: &[u8]) -> &[u8] {
 }
 
 fn line_is_terminal(line: &[u8]) -> bool {
-    TERMINAL_EVENT_LINES.iter().any(|p| *p == line)
+    TERMINAL_EVENT_LINES.contains(&line)
         || TERMINAL_DATA_PREFIXES.iter().any(|p| line.starts_with(p))
 }
 
