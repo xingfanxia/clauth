@@ -718,12 +718,12 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
 }
 
 /// `refresh_spent_accounts` OFF drops a spent account's countdown (no pending
-/// refresh, `next_refresh_ms` None): the status line renders a `[ spent ]` pill
-/// naming the binding reset instead of the stale "0s" the frozen countdown
-/// showed, while a below-cap idle account with no scheduled refresh still reads
-/// "up to date".
+/// refresh, `next_refresh_ms` None): the status line renders a bare `[ spent ]`
+/// pill instead of the stale "0s" the frozen countdown showed, leaving the reset
+/// to the maxed window's own bar line, while a below-cap idle account with no
+/// scheduled refresh still reads "up to date".
 #[test]
-fn spent_skipped_account_names_its_reset() {
+fn spent_skipped_account_pill_is_bare() {
     let text = |ls: Vec<Line<'_>>| -> String {
         ls.iter()
             .map(|l| {
@@ -758,8 +758,12 @@ fn spent_skipped_account_names_its_reset() {
 
     let spent = text(status_lines(&with_window(100.0), &header, 120));
     assert!(
-        spent.contains("[ spent ]") && spent.contains("resets in"),
-        "a spent skipped account renders a pill naming its reset: {spent}"
+        spent.contains("[ spent ]"),
+        "a spent skipped account renders the pill: {spent}"
+    );
+    assert!(
+        !spent.contains("resets in"),
+        "the reset belongs to the bar line, not the pill: {spent}"
     );
     assert!(
         !spent.contains("0s"),

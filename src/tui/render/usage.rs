@@ -914,24 +914,21 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
             None => {
                 // No scheduled refresh means `refresh_spent_accounts` is OFF and
                 // this account is spent — skipped until its window resets. Render
-                // it as a status pill like the fetch states above, naming the
-                // binding reset (weekly dominates 5h) so the blank overview timer
-                // reads as intent; a genuinely quiet account with no maxed window
-                // falls through to "up to date".
+                // it as a status pill like the fetch states above so the blank
+                // overview timer reads as intent; the binding reset is already on
+                // the maxed window's own bar line, so the pill stays bare. A
+                // genuinely quiet account with no maxed window falls through to
+                // "up to date".
                 let resumes = profile
                     .usage
                     .as_ref()
                     .and_then(|u| crate::usage::spent_resume_in_secs(u, now));
                 match resumes {
-                    Some(secs) => {
+                    Some(_) => {
                         spans.extend([
                             Span::styled("[ ", theme::dim()),
                             Span::styled("spent", theme::warning().add_modifier(Modifier::BOLD)),
                             Span::styled(" ]", theme::dim()),
-                            Span::styled(
-                                format!("  resets in {}", crate::usage::humanize_duration(secs)),
-                                theme::faint(),
-                            ),
                         ]);
                         // Only the weekly cap earns the teach — the domain fact
                         // that a live-looking 5h window can't serve while the week
