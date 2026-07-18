@@ -75,7 +75,7 @@ const SPEND_ARM_FRACTION: f64 = 0.90;
 /// The cap is whichever binds first — the account's own limit or the member's
 /// ceiling. An account with billing on but no declared limit is bounded by the
 /// ceiling alone; that is the point of the ceiling.
-fn spend_room(spend: &crate::usage::SpendInfo, ceiling: f64) -> Option<f64> {
+pub(crate) fn spend_room(spend: &crate::usage::SpendInfo, ceiling: f64) -> Option<f64> {
     // `is_finite` is load-bearing, not decoration: `max_auto_spend = inf` is
     // valid TOML, and an infinite ceiling with no account cap yields infinite
     // room — unlimited unattended spending. NaN would slip a plain `<= 0.0`

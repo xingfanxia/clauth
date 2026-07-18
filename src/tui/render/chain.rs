@@ -27,7 +27,7 @@ use super::panes::{
 };
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, soonest_resume, spend_is_uncapped,
-    threshold_for,
+    spend_room, threshold_for,
 };
 use crate::profile::AppConfig;
 use crate::usage::{humanize_duration, switch_grade_kick_lifts};
@@ -265,7 +265,7 @@ fn reason_pill(reason: &BlockedReason) -> Line<'static> {
             theme::danger().bold(),
         ),
         BlockedReason::KickRejected { lifts_in } => (
-            format!("window blocked · {}", humanize_duration(*lifts_in)),
+            format!("claude code blocked · {}", humanize_duration(*lifts_in)),
             theme::warning().bold(),
         ),
         BlockedReason::BudgetSpent => ("extra usage spent".to_string(), theme::warning().bold()),
@@ -276,9 +276,10 @@ fn reason_pill(reason: &BlockedReason) -> Line<'static> {
             },
             theme::warning().bold(),
         ),
-        BlockedReason::WeeklySoft { pct } => {
-            (format!("weekly soft · {pct:.0}%"), theme::warning().bold())
-        }
+        BlockedReason::WeeklySoft { pct } => (
+            format!("weekly {pct:.0}% · still serving"),
+            theme::warning().bold(),
+        ),
         BlockedReason::Stale => ("stale data".to_string(), theme::dim().bold()),
     };
     Line::from(vec![
@@ -418,12 +419,14 @@ fn member_detail(
                 // it is the one state where the ceiling does not bound the bill,
                 // so it must not hide until someone arrows onto the field.
                 None if spend_is_uncapped(cfg, ceiling) => lines.extend(invalid_tooltip_lines(
-                    "no cap: `extra usage spent` is stay-on-last and no last resort to park on",
+                    "nothing stops the spending: set extra usage spent to switch off all, or mark \
+                     an account last resort",
                     width,
                 )),
-                None if selected => {
-                    lines.extend(help_tooltip_lines(&max_spend_hint(cfg, ceiling), width))
-                }
+                None if selected => lines.extend(help_tooltip_lines(
+                    &max_spend_hint(cfg, name, ceiling),
+                    width,
+                )),
                 None => {}
             }
         }
@@ -448,15 +451,18 @@ fn member_detail(
 /// on does, naming the member the (exclusive) mark would move away from.
 fn last_resort_hint(cfg: &AppConfig, name: &str, on: bool) -> String {
     if on {
-        return "the chain parks here once every account is spent".to_string();
+        return "this account keeps working once every other one is spent".to_string();
     }
     match cfg
         .profiles
         .iter()
         .find(|p| p.last_resort && p.name != *name)
     {
-        Some(marked) => format!("move the chain's parking spot here from '{}'", marked.name),
-        None => "park the chain here once every account is spent".to_string(),
+        Some(marked) => format!(
+            "make this the fallback of last resort instead of '{}'",
+            marked.name
+        ),
+        None => "keep using this account once every other one is spent".to_string(),
     }
 }
 
@@ -476,7 +482,7 @@ fn threshold_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
 /// [`threshold_range_tooltip`]. `inf` parses as a float, so the rejection is a
 /// money guard, not input hygiene (see `app::parse_max_spend`).
 fn max_spend_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
-    let range = "dollars, 0 = off";
+    let range = "dollars · 0 turns it off";
     if parse_max_spend(input.trimmed()).is_none() {
         invalid_tooltip_lines(range, width)
     } else {
@@ -485,19 +491,32 @@ fn max_spend_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
 }
 
 /// Hint under the `max spend` field, naming whichever half of the opt-in is
-/// currently holding spending back. Both are required, so a ceiling alone reads
-/// as armed while doing nothing — that is the reading this line exists to stop.
-/// Spend budget off makes the row inert (dimmed) whatever the ceiling, so that
-/// case names the gate regardless of the ceiling value.
-fn max_spend_hint(cfg: &AppConfig, ceiling: f64) -> String {
+/// currently holding spending back and showing the REAL armed room when both are
+/// set. Both halves are required, so a ceiling alone reads as armed while doing
+/// nothing — that is the reading this line exists to stop. `spend_room` fails
+/// closed on money (unknown spend never reads as $0), so each of its refusals
+/// gets its own copy instead of one $0-implying fallback.
+fn max_spend_hint(cfg: &AppConfig, name: &str, ceiling: f64) -> String {
     if !cfg.state.spend_budget_switching {
-        return "inert until extra usage is allowed (config); then a ceiling caps spending here"
-            .to_string();
+        return "turn on allow extra usage in config before this does anything".to_string();
     }
-    if ceiling > 0.0 {
-        format!("may spend up to ${ceiling:.2} here once every account is spent")
-    } else {
-        "never spends here; type a ceiling to allow it".to_string()
+    if ceiling <= 0.0 {
+        return "never spends here; type a ceiling to allow it".to_string();
+    }
+    let spend = cfg
+        .find(name)
+        .and_then(|p| p.usage.as_ref())
+        .and_then(|u| u.spend.as_ref());
+    match spend {
+        Some(spend) if !spend.enabled => "this account isn't set up for paid usage".to_string(),
+        // A live figure only when spend is known AND some room remains; unknown
+        // spend or a spent-out budget both fall back to the ceiling statement,
+        // which stays true either way rather than inventing a $0 room.
+        Some(spend) => match spend_room(spend, ceiling) {
+            Some(room) => format!("${room:.2} left to spend here before it stops"),
+            None => format!("spends at most ${ceiling:.2} here once every account is spent"),
+        },
+        None => format!("spends at most ${ceiling:.2} here once every account is spent"),
     }
 }
 
@@ -656,8 +675,7 @@ fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {
     ];
     lines.extend(
         wrap_words(
-            "when an account's 5h usage crosses its threshold, clauth hands the \
-             session to the next account in the chain.",
+            "when an account runs out, clauth points claude code at the next one.",
             width,
         )
         .into_iter()

@@ -134,7 +134,50 @@ fn last_resort_hint_names_the_currently_marked_member() {
         .map(line_text)
         .find(|t| t.contains("└"))
         .expect("hint renders");
-    assert!(hint.contains("from 'b'"), "{hint}");
+    assert!(hint.contains("instead of 'b'"), "{hint}");
+}
+
+// The `max spend` hint names whichever half of the opt-in is holding spending
+// back, and shows the REAL armed room when both are set. Five distinct copies,
+// one per spend state — `spend_room` fails closed on money, so an unknown spend
+// never reads as a $0 figure.
+#[test]
+fn max_spend_hint_covers_every_spend_state() {
+    use crate::usage::SpendInfo;
+    let hint = |budget_on: bool, ceiling: Option<f64>, spend: Option<SpendInfo>| -> String {
+        let mut a = profile("a", 95.0, 40.0, 7200);
+        a.max_auto_spend = ceiling;
+        a.usage.as_mut().unwrap().spend = spend;
+        let mut cfg = config_with(vec![a], Some("a"), vec!["a"]);
+        cfg.state.spend_budget_switching = budget_on;
+        max_spend_hint(&cfg, "a", cfg.profiles[0].max_auto_spend.unwrap_or(0.0))
+    };
+    let billing = |enabled: bool, used: Option<f64>| SpendInfo {
+        enabled,
+        used,
+        limit: Some(20.0),
+        percent: None,
+        currency: None,
+    };
+
+    // 1. chain toggle off
+    assert!(
+        hint(false, Some(10.0), Some(billing(true, Some(1.0))))
+            .contains("turn on allow extra usage")
+    );
+    // 2. no ceiling
+    assert!(hint(true, None, Some(billing(true, Some(1.0)))).contains("type a ceiling"));
+    // 3. account not billing
+    assert!(
+        hint(true, Some(10.0), Some(billing(false, Some(1.0))))
+            .contains("isn't set up for paid usage")
+    );
+    // 4. spend unknown → the ceiling statement, never an invented $0 room
+    let unknown = hint(true, Some(10.0), Some(billing(true, None)));
+    assert!(unknown.contains("spends at most $10.00"), "{unknown}");
+    // 5. armed → the real room: 0.9 * min(20, 10) - 1 = $8.00
+    let armed = hint(true, Some(10.0), Some(billing(true, Some(1.0))));
+    assert!(armed.contains("$8.00 left to spend"), "{armed}");
 }
 
 // ── key-column alignment ────────────────────────────────────────────────────
@@ -251,9 +294,9 @@ fn blocked_member_shows_the_worst_reason_pill() {
 }
 
 // A switch-grade kick-rejected member — headroom, but the messages limiter won't
-// let clauth start it — shows the `window blocked` pill driven by `kick_lift`.
+// let clauth start it — shows the `claude code blocked` pill driven by `kick_lift`.
 #[test]
-fn kick_rejected_member_shows_the_window_blocked_pill() {
+fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
     let until = now_epoch_secs() + 7200;
     let lines = member_detail(
@@ -275,7 +318,7 @@ fn kick_rejected_member_shows_the_window_blocked_pill() {
     // exact `lifts_in` value is range-checked in the `blocked_reason_kick_*` unit
     // test instead.
     assert!(
-        pill.contains("window blocked · "),
+        pill.contains("claude code blocked · "),
         "renders the kick pill with a lift countdown: {pill:?}"
     );
 }
