@@ -54,6 +54,11 @@ fn fires_for_failed_incomplete_and_done_forms() {
         &b"data: [DONE]\n\n"[..],
         &b"event: response.failed\ndata: {\"x\":1}\n\n"[..],
         &b"event: response.incomplete\ndata: {\"x\":1}\n\n"[..],
+        // The top-level stream error (post-200 rate-limit/server error) —
+        // review finding 2026-07-18: it ends the turn like the response.*
+        // terminals do.
+        &b"event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\"}\n\n"[..],
+        &b"data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\"}\n\n"[..],
     ] {
         let mut s = TerminalSniffer::default();
         assert!(s.feed(terminal), "should terminate on {terminal:?}");

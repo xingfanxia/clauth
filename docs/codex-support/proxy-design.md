@@ -131,12 +131,17 @@ reader, and ureq 3 for upstream (`send(&[u8])` for the buffered body, streaming
 `body_mut().as_reader()` copied chunkwise to the client socket for SSE). Request bodies
 are buffered in full anyway for replay (§1.5); responses stream through with a small
 copy buffer. Timeouts: 30 s connect-idle on the client read, upstream connect timeout
-10 s, and a 2 h `timeout_global` on the upstream call as a pure LEAK BACKSTOP — ureq's
-global timeout fires even while bytes are actively flowing, so any value a live stream
-can reach truncates that turn (2026-07-18 incident: the original 15 min sat below real
-xhigh-reasoning streams; every long turn died with codex's "stream closed before
-response.completed" and replayed from scratch). Turn-end is detected by the relay
-itself, never by a timeout — see the terminal-sniffer paragraph below.
+10 s, and a 2 h `timeout_global` on the upstream call as a pure LEAK BACKSTOP. Two
+ureq-3 semantics are pinned by tests because each one caused (or would cause) a
+stream-truncation incident: `timeout_global` fires even while bytes are actively
+flowing, and `timeout_recv_response` keeps running through the BODY read — it is NOT
+a headers-only bound. The 2026-07-18 incident's assassin was a 30 s
+`timeout_recv_response`: every model turn whose stream outlived 30 s was truncated
+mid-body (`TRUNCATED … timeout: receive response` at 29 s once the relay summaries
+existed), which codex reports as "stream closed before response.completed" and
+replays from scratch — hence PROXY_AGENT sets NO recv-response timeout at all.
+Turn-end is detected by the relay itself, never by a timeout — see the
+terminal-sniffer paragraph below.
 
 **Request-read contract:** request line + headers + `Content-Length`-sized body.
 `Transfer-Encoding: chunked` requests are answered `411 Length Required` (codex/reqwest

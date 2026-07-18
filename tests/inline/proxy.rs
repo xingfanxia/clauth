@@ -505,6 +505,62 @@ fn ureq_global_timeout_truncates_an_actively_streaming_body() {
 }
 
 #[test]
+fn ureq_recv_response_timeout_kills_the_streaming_body() {
+    // Documents WHY `PROXY_AGENT` sets no `timeout_recv_response`: in ureq 3
+    // that deadline keeps running through the BODY read — it is not a
+    // headers-only bound. The 2026-07-18 incident's actual assassin was a
+    // 30 s value here: every turn whose SSE stream outlived 30 s was
+    // TRUNCATED mid-body ("timeout: receive response" at 29 s in the relay
+    // summaries) and codex replayed the whole turn from scratch. If this
+    // test ever starts failing, ureq made the deadline headers-only and a
+    // recv_response bound can return.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut drain = [0u8; 1024];
+        let _ = stream.read(&mut drain);
+        // Headers arrive IMMEDIATELY — only the body outlives the deadline.
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");
+        let _ = stream.flush();
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if stream.write_all(b"data: tick\n\n").is_err() {
+                return;
+            }
+            let _ = stream.flush();
+        }
+    });
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_recv_response(Some(std::time::Duration::from_millis(500)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let response = agent
+        .get(format!("http://127.0.0.1:{port}/"))
+        .call()
+        .unwrap();
+    let mut reader = response.into_body().into_reader();
+    let mut total = 0usize;
+    let mut buf = [0u8; 1024];
+    let failed = loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break false,
+            Ok(n) => total += n,
+            Err(_) => break true,
+        }
+    };
+    assert!(
+        failed,
+        "recv_response deadline must kill the streaming body (read {total}B without error — \
+         ureq made it headers-only; a recv_response bound on PROXY_AGENT is safe again)"
+    );
+}
+
+#[test]
 fn e2e_no_pool_answers_503() {
     let _home = HomeSandbox::new();
     // Codex profiles exist but NONE has a stored login → empty pool.

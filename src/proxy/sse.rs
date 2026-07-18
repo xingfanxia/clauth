@@ -39,6 +39,10 @@ const TERMINAL_EVENT_LINES: &[&[u8]] = &[
     b"event: response.completed",
     b"event: response.failed",
     b"event: response.incomplete",
+    // The Responses API's top-level stream error (rate-limit/server error
+    // surfaced AFTER the 200 head) also ends the turn — review finding
+    // 2026-07-18: without it an errored turn lingers to the backstop.
+    b"event: error",
 ];
 
 /// `data:` payload prefixes of terminal events. Prefix matches — the closing
@@ -48,6 +52,7 @@ const TERMINAL_DATA_PREFIXES: &[&[u8]] = &[
     b"data: {\"type\":\"response.completed\"",
     b"data: {\"type\":\"response.failed\"",
     b"data: {\"type\":\"response.incomplete\"",
+    b"data: {\"type\":\"error\"",
     b"data: [DONE]",
 ];
 

@@ -171,16 +171,25 @@ pub(crate) static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
 /// The global timeout is a LEAK BACKSTOP, not turn-end detection: ureq's
 /// `timeout_global` fires even while bytes are actively flowing (pinned by
 /// `ureq_global_timeout_truncates_an_actively_streaming_body`), so any value
-/// a live stream can reach truncates that turn mid-flight. The 2026-07-18
-/// incident: 15 min sat BELOW real xhigh-reasoning streams — every long turn
-/// died with codex's "stream closed before response.completed" and replayed
-/// from scratch. Turn-end comes from the relay's terminal-event sniffer
-/// (`proxy::sse`); this ceiling only bounds a genuinely wedged connection,
-/// and must stay far above any legitimate single-request stream.
+/// a live stream can reach truncates that turn mid-flight. Turn-end comes
+/// from the relay's terminal-event sniffer (`proxy::sse`); this ceiling only
+/// bounds a genuinely wedged connection, and must stay far above any
+/// legitimate single-request stream.
+///
+/// `timeout_recv_response` is deliberately ABSENT: in ureq 3 that deadline
+/// keeps running through the BODY read, not just the headers (pinned by
+/// `ureq_recv_response_timeout_kills_the_streaming_body`). The 2026-07-18
+/// incident's actual assassin was a 30 s value here — every model turn whose
+/// stream outlived 30 s died as `TRUNCATED … timeout: receive response`,
+/// which codex reports as "stream closed before response.completed" and
+/// replays from scratch (the first-pass diagnosis blamed the then-15-minute
+/// global; the timestamped relay summaries this incident added showed the
+/// kills at 29 s). SSE headers arrive immediately on a 200, so an
+/// headers-only bound has nothing real to protect anyway — connect +
+/// global cover the wedge cases.
 pub(crate) static PROXY_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_response(Some(Duration::from_secs(30)))
         .timeout_global(Some(Duration::from_secs(2 * 60 * 60)))
         .http_status_as_error(false)
         .build()

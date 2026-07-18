@@ -1274,3 +1274,26 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   pin); live `codex exec` turn → log `POST /responses → 200 · 91KB in 1s ·
   completed`, clean close, no spurious errors. Proxy + daemon restarted on
   the new binary.
+
+## 2026-07-18 (PROX-2) — the ACTUAL assassin was timeout_recv_response(30s)
+
+- PROX-1's timestamped summaries immediately exposed the deeper truth: live
+  turns died `TRUNCATED after …B in 29s · upstream error: timeout: receive
+  response`. In ureq 3, `timeout_recv_response` keeps running through the
+  BODY read (pinned: `ureq_recv_response_timeout_kills_the_streaming_body`)
+  — the 30s value killed EVERY >30s stream all along; the 15min global was
+  likely never the binding constraint. PROXY_AGENT now sets NO recv-response
+  timeout (connect 10s + global 2h backstop only).
+- Review findings folded in: sniffer also terminates on the Responses API
+  top-level `error` stream event (`event: error` / `data: {"type":"error"`);
+  residual format-drift 2h-linger documented as accepted tradeoff.
+- Live-proved: 48s / 793KB single stream → `completed` clean close (old
+  binary died at 29s).
+- **Config battleground discovered**: AX rolled `~/.codex/config.toml` back
+  to `.bak-pre-proxy` (05:02, direct mode), and when we re-appended the
+  `[model_providers.clauth]` DEFINITION block for session resume, zylos
+  (the codex agent managing that file) commented it out within a minute.
+  Do NOT edit config.toml for proxy routing — created
+  `~/.codex/proxy.config.toml` overlay instead (`codex --profile proxy`),
+  sibling of direct.config.toml. Global re-enable needs AX to arbitrate
+  with zylos.
