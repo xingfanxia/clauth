@@ -1297,3 +1297,20 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   `~/.codex/proxy.config.toml` overlay instead (`codex --profile proxy`),
   sibling of direct.config.toml. Global re-enable needs AX to arbitrate
   with zylos.
+
+## 2026-07-18 (SCW-1) — per-model weekly windows join the claude chain walk
+
+- Trigger: Anthropic's "7d fable" per-model weekly window (~half the
+  aggregate weekly). Live shape: ax-cl at 7d 65% / 5h 0% but fable 100% —
+  the aggregate-only walk scored it healthiest and stranded fable sessions.
+- Shipped (797bff8): two-tier walk, no new config. Tier 1 = clear on
+  aggregate gates AND every live scoped window; tier 2 (old acceptance) only
+  when no fully-clear member exists. Healthy-but-scoped-blocked active hops
+  only to a fully-clear member (no ping-pong). find_recovered_member prefers
+  fully-clear. Scoped windows NEVER count as full exhaustion — wrap-off Off /
+  soonest_resume / recovery premise stay on the aggregate cap. 7 new tests.
+- ccsbar PROXY-1 (98fe1e6): codex-page "Proxy mode" toggle — flips the
+  top-level model_provider line in ~/.codex/config.toml (definition block
+  always kept for session resume), bootstraps the proxy LaunchAgent, caption
+  warns routed-but-not-serving; state re-read per panel open so a zylos
+  revert is visible. Pure transforms unit-tested.
