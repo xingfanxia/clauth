@@ -128,19 +128,9 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
 
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let title = match state.on_confirm {
-        ConfirmAction::CaptureConflict(..) => "CONFIRM",
-        ConfirmAction::CaptureOverwrite(..) => "CONFIRM",
-        ConfirmAction::AdoptDivergence(..) => "CONFIRM",
-        ConfirmAction::Switch(_) => "CONFIRM",
-        ConfirmAction::DiscardDivergence(_) => "CONFIRM",
-        ConfirmAction::RotateAll => "CONFIRM",
-        ConfirmAction::RotateOne(_) => "CONFIRM",
-        ConfirmAction::WireMcpServers => "CONFIRM",
-        ConfirmAction::RelinkCredentials(_) => "CONFIRM",
-        ConfirmAction::BlankCredentials(_) => "CONFIRM",
-        ConfirmAction::RestartLogin(..) => "CONFIRM",
-        ConfirmAction::DeleteLiveSession(_) => "CONFIRM",
+        // The one non-confirm modal: an in-use account can't be acted on.
         ConfirmAction::Acknowledge => "IN USE",
+        _ => "CONFIRM",
     };
 
     // Destructive/global ops carry a DANGER cue on their confirm button.
@@ -444,7 +434,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("space", "cycle the focused setting"),
                 (
                     "\u{21b5}",
-                    "same as space · custom value on refresh interval",
+                    "same as space · type a value on refresh or weekly limit",
                 ),
             ][..],
         )],
@@ -471,13 +461,13 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
             "fallback chain",
             &[
                 ("\u{2191}\u{2193}", "move cursor / detail row"),
-                ("shift \u{2191}\u{2193}", "reorder member = priority"),
+                ("shift \u{2191}\u{2193}", "reorder to set priority"),
                 (
                     "\u{21b5}",
-                    "open \u{00b7} edit threshold \u{00b7} toggle last resort \u{00b7} remove \u{00b7} add",
+                    "open \u{00b7} edit threshold \u{00b7} edit max spend \u{00b7} toggle last resort \u{00b7} remove \u{00b7} add",
                 ),
                 ("+ / -", "step threshold by 5"),
-                ("\u{21b5}", "type a threshold, \u{21b5} saves"),
+                ("\u{21b5} on rotate at", "type a value, \u{21b5} saves"),
                 ("esc", "back / cancel edit"),
             ][..],
         )],
