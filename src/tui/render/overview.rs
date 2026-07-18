@@ -404,6 +404,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // Switch-grade kick blocks feed the blocked-reason markers; read BEFORE the
     // Config lock (rank order: KickBlockState 230 < Config 400).
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
+    let narrow = super::panes::narrow(width as u16);
     let cfg = app.config();
     if cfg.state.fallback_chain.is_empty() {
         let mut lines = vec![Line::from(Span::styled(
@@ -423,12 +424,14 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     }
 
     let chain = &cfg.state.fallback_chain;
+    // Narrow: tighter name clamp + a gauge sized from what's left, so a chain
+    // row fits a phone line instead of hard-wrapping its trailing figures.
     let name_w = chain
         .iter()
         .map(|n| n.chars().count())
         .max()
         .unwrap_or(8)
-        .clamp(6, 18);
+        .clamp(6, if narrow { 12 } else { 18 });
     // Threshold digits vary across members (`95%` vs `100%`), so left-pad them to
     // the widest so the `%` signs line up (cloudy-tui numeric-column alignment).
     // It also makes every row's content the same width, which is what lets the
@@ -440,6 +443,18 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(3);
     let last = chain.len() - 1;
+    let gauge_w = if narrow {
+        // Exact-fit budget against chain_row's spans: ` ╭ `(3) + `N `(digits+1)
+        // + name(name_w+2) + figure `  100`(5) + ` / 100%`(7, 3-digit worst).
+        // Trailers (hint/marker) only render when the base leaves room, so a
+        // narrow line keeps its figures on one row instead of hard-wrapping.
+        let idx_w = (last + 1).to_string().chars().count() + 1;
+        width
+            .saturating_sub(3 + idx_w + name_w + 2 + 5 + 7)
+            .clamp(4, GAUGE_W)
+    } else {
+        GAUGE_W
+    };
 
     // Project the active profile's next switch once, up front: a `To(target)`
     // renders inline on the target member's row (right side); `Off` has no
@@ -464,7 +479,9 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 .as_ref()
                 .filter(|(target, _)| target.as_str() == name.as_str())
                 .map(|(_, secs)| *secs);
-            chain_row(&cfg, name, i, last, name_w, thr_w, reason, switch_eta)
+            chain_row(
+                &cfg, name, i, last, name_w, gauge_w, thr_w, reason, switch_eta,
+            )
         })
         .collect();
     let trailer_col = rows.iter().map(ChainRow::base_width).max().unwrap_or(0) + TRAILER_GAP;
@@ -601,6 +618,7 @@ fn chain_row(
     index: usize,
     last: usize,
     name_w: usize,
+    gauge_w: usize,
     thr_w: usize,
     reason: Option<BlockedReason>,
     switch_eta: Option<i64>,
@@ -638,7 +656,7 @@ fn chain_row(
                 .as_ref()
                 .and_then(|u| u.five_hour.as_ref())
                 .map(|w| w.utilization);
-            spans.extend(gauge_spans(pct, threshold));
+            spans.extend(gauge_spans(pct, threshold, gauge_w));
             let (figure, figure_style) = match pct {
                 Some(v) => (
                     format!("  {v:>3.0}"),
@@ -662,8 +680,9 @@ fn chain_row(
     }
 }
 
-/// `GAUGE_W`-cell bar relative to the member's threshold (full = rotate off).
-fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
+/// `gauge_w`-cell bar relative to the member's threshold (full = rotate off).
+/// `GAUGE_W` on desktop; narrow rows pass what their line has left.
+fn gauge_spans(pct: Option<f64>, threshold: f64, gauge_w: usize) -> Vec<Span<'static>> {
     let fill = pct
         .map(|v| {
             let frac = if threshold > 0.0 {
@@ -671,15 +690,15 @@ fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
             } else {
                 1.0
             };
-            (frac * GAUGE_W as f64).round() as usize
+            (frac * gauge_w as f64).round() as usize
         })
         .unwrap_or(0)
-        .min(GAUGE_W);
+        .min(gauge_w);
     let fill_color = pct
         .map(theme::util_color)
         .unwrap_or(theme::text_faint_color());
 
-    (0..GAUGE_W)
+    (0..gauge_w)
         .map(|i| {
             if i < fill {
                 Span::styled("▰", Style::default().fg(fill_color))

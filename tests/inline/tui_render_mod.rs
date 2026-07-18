@@ -552,6 +552,219 @@ fn status_selected_row_tint_spans_both_lines() {
     );
 }
 
+// ── Narrow (phone-width) mode ────────────────────────────────────────────────
+// A Moshi-class terminal is ~45 columns. These tests pin the two halves of the
+// narrow contract: information survives at 45 cols (no truncation loss), and
+// the narrow paths are width-gated (desktop renders keep their side-by-side
+// shape). `╮╭` is the top-row junction two side-by-side boxes produce.
+
+/// A loaded app for the narrow sweeps: profiles + chain + incidents + tokens.
+fn narrow_app() -> App {
+    use crate::tokens::{ModelTokens, TokenStats};
+
+    let profiles = vec![
+        oauth("uwuclxdy", 42.0, 18.0, true),
+        oauth("work-account", 12.0, 3.0, false),
+    ];
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: names,
+            fallback_chain: vec!["uwuclxdy".into(), "work-account".into()],
+            ..AppState::default()
+        },
+        profiles,
+    };
+    let mut app = App::new(config);
+    app.status.incidents = demo_incidents();
+    app.token_stats = Some(TokenStats {
+        models: vec![
+            ModelTokens {
+                model: "claude-opus-4-8".to_string(),
+                input: 10_000_000,
+                output: 800_000,
+                ..Default::default()
+            },
+            ModelTokens {
+                model: "claude-sonnet-5".to_string(),
+                input: 4_000_000,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    app
+}
+
+#[test]
+fn narrow_master_detail_stacks_wide_stays_side_by_side() {
+    let mut app = narrow_app();
+    for tab in [
+        Tab::Usage,
+        Tab::Setup,
+        Tab::Fallback,
+        Tab::Status,
+        Tab::Plugin,
+        Tab::Tokens,
+    ] {
+        app.tab = tab;
+        let narrow = dump(&app, 45, 38);
+        assert!(
+            !narrow.contains("╮╭"),
+            "{tab:?} still renders side-by-side boxes at 45 cols:\n{narrow}"
+        );
+        let wide = dump(&app, 100, 30);
+        assert!(
+            wide.contains("╮╭"),
+            "{tab:?} lost its desktop side-by-side layout at 100 cols:\n{wide}"
+        );
+    }
+}
+
+#[test]
+fn narrow_tokens_dashboard_keeps_card_text_whole() {
+    let mut app = narrow_app();
+    app.tab = Tab::Tokens;
+    let out = dump(&app, 45, 44);
+    for needle in [
+        "idle so far today",
+        "cache hit",
+        "COMPOSITION",
+        "cache read",
+    ] {
+        assert!(
+            out.contains(needle),
+            "`{needle}` truncated away at 45 cols:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
+    let mut app = narrow_app();
+    app.tab = Tab::Overview;
+    let out = dump(&app, 45, 38);
+    let row = out
+        .lines()
+        .find(|l| l.contains("1 uwuclxdy"))
+        .unwrap_or_else(|| panic!("chain row missing:\n{out}"));
+    assert!(
+        row.contains("42") && row.contains("/ 80%"),
+        "chain figures wrapped off the row at 45 cols:\n{out}"
+    );
+
+    // Wide keeps the full 12-cell gauge; narrow shrinks it instead of wrapping.
+    let gauge_cells = |line: &str| line.chars().filter(|c| *c == '▰' || *c == '▱').count();
+    assert_eq!(
+        gauge_cells(row),
+        10,
+        "narrow gauge sized from leftover width"
+    );
+    let wide = dump(&app, 90, 24);
+    let wide_row = wide
+        .lines()
+        .find(|l| l.contains("1 uwuclxdy"))
+        .unwrap_or_else(|| panic!("wide chain row missing:\n{wide}"));
+    assert_eq!(gauge_cells(wide_row), 12, "desktop gauge untouched");
+
+    // The 3-digit worst case (a 100% last-resort member) is exactly the row
+    // the old figure(4) budget overflowed by one column.
+    let mut maxed = narrow_app();
+    {
+        let mut cfg = maxed.config();
+        for p in cfg.profiles.iter_mut() {
+            p.fallback_threshold = Some(100.0);
+        }
+    }
+    maxed.tab = Tab::Overview;
+    let out = dump(&maxed, 45, 38);
+    let row = out
+        .lines()
+        .find(|l| l.contains("1 uwuclxdy"))
+        .unwrap_or_else(|| panic!("100%-threshold chain row missing:\n{out}"));
+    assert!(
+        row.contains("/ 100%"),
+        "3-digit threshold wrapped off the row at 45 cols:\n{out}"
+    );
+}
+
+#[test]
+fn narrow_footer_degrades_to_essential_hints() {
+    let mut app = narrow_app();
+    app.tab = Tab::Usage;
+    let out = dump(&app, 45, 38);
+    for needle in ["←→ tabs", "? help", "q quit"] {
+        assert!(
+            out.contains(needle),
+            "essential hint `{needle}` missing at 45 cols:\n{out}"
+        );
+    }
+    assert!(
+        !out.contains("refresh account"),
+        "non-essential hint should be dropped at 45 cols:\n{out}"
+    );
+    let wide = dump(&app, 120, 30);
+    assert!(
+        wide.contains("refresh account"),
+        "desktop keeps the full hint set:\n{wide}"
+    );
+}
+
+#[test]
+fn narrow_header_hides_the_gauge_without_a_dangling_separator() {
+    let mut app = narrow_app();
+    app.tab = Tab::Usage;
+    let narrow = dump(&app, 45, 38);
+    let row = narrow
+        .lines()
+        .find(|l| l.contains("accounts"))
+        .unwrap_or_else(|| panic!("header count row missing:\n{narrow}"));
+    assert!(
+        !row.contains('·'),
+        "hidden gauge left a dangling separator:\n{row}"
+    );
+    let wide = dump(&app, 120, 30);
+    let wide_row = wide
+        .lines()
+        .find(|l| l.contains("accounts"))
+        .unwrap_or_else(|| panic!("wide header count row missing:\n{wide}"));
+    assert!(
+        wide_row.contains('·'),
+        "desktop separator + gauge unchanged:\n{wide_row}"
+    );
+}
+
+#[test]
+fn narrow_status_detail_duration_drops_to_its_own_line() {
+    let mut app = narrow_app();
+    app.tab = Tab::Status;
+    let out = dump(&app, 45, 38);
+    // The duration must sit on its OWN line (bordered, otherwise empty), not
+    // glued to the age at the end of the pill row.
+    assert!(
+        out.lines().any(|l| l.trim_matches([' ', '│']) == "ongoing"),
+        "duration is not on its own line at 45 cols:\n{out}"
+    );
+}
+
+#[test]
+fn narrow_modal_body_wraps_instead_of_clipping() {
+    use crate::tui::app::{ConfirmAction, ConfirmState, Modal};
+    let mut app = narrow_app();
+    app.modals.push(Modal::Confirm(ConfirmState {
+        message: "switch every profile to a freshly rotated credential set immediately".into(),
+        detail: None,
+        choice: false,
+        on_confirm: ConfirmAction::RotateAll,
+    }));
+    let out = dump(&app, 45, 38);
+    assert!(
+        out.contains("immediately"),
+        "modal body clipped its tail at 45 cols:\n{out}"
+    );
+}
+
 #[test]
 fn empty_state_renders() {
     let config = AppConfig {
