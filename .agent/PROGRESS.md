@@ -1192,3 +1192,37 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   profiles moved to `~/.codex/<name>.config.toml` overlay files.
 - **`codex exec` stdin gotcha**: blocks in `resolve_root_prompt` until stdin
   EOF — a backgrounded shell's held-open pipe hangs it forever; `< /dev/null`.
+
+## 2026-07-18 — CLA-SPLIT: long-lived session tokens (commit 57cef39)
+
+- **Why**: 2026-07-16..18 all three claude accounts serially died with
+  `refresh token revoked` — N long-lived CC sessions + clauth's refresher all
+  rotating single-use chains through the one live slot; a stale-token refresh
+  trips reuse detection and revokes the whole chain. oat-only migration was
+  ruled out live (setup-token scope = inference+sessions → usage endpoint 403s).
+- **Design (split credentials per profile)**: `session-token.json` (static
+  `claude setup-token` mint) is what switches install — sessions run on a
+  never-rotating token; `credentials.json` OAuth becomes clauth-private,
+  usage-only, single-writer. `install_source_path` is the one concept: classify
+  /first-login/link/keychain/snapshot/adopt/`clauth start` runtime all resolve
+  through it. Guards: snapshot & runtime watchdog never write the token over
+  the usage pair; rotation persist never mirrors the usage chain over an
+  installed token; gate is Ready for split profiles unless the token is
+  clock-dead (Broken + re-mint hint). Non-split profiles byte-identical.
+- **Review (opus code-reviewer)**: HIGH `clauth start` runtime still handed
+  sessions credentials.json (fixed: canonical_credentials → install source +
+  watchdog never adopts over the token); MED gate ignored token's own clock
+  (fixed); LOW TUI relink affordance + keychain double-stat TOCTOU (fixed).
+  force_snapshot left as-is: user-confirmed Overwrite writes the captured
+  OAuth into credentials.json (usage side) and relink reinstalls the token —
+  correct destination, no clobber.
+- **herdr real-backend validation 7/7 PASS** (isolated $HOME, zylos sha256
+  unchanged): switch links live→session-token.json; real turn `SPLIT_OK` on
+  the clauth-installed token; **image turn `IMAGE_OK red`** (file_upload-scope
+  concern cleared — images ride messages inline); usage pair byte-identical
+  after real turns; live token unrotated.
+- **Deployed**: three Mac profiles filled from `~/.claude-fleet/
+  claude_long_live_tokens.env` (tokens verified ALIVE + sha256-matched to the
+  fleet hosts' mints — first probe false-401'd by quoted-value parsing, fixed);
+  binary installed, daemon restarted. Split arms per profile at its NEXT
+  switch (live slot still holds the old OAuth until then). 1266 tests green.
