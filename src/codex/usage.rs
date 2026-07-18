@@ -241,7 +241,17 @@ fn snapshot_from_lines<'a>(
         let Some(rl) = payload.rate_limits else {
             continue;
         };
-        let (five_hour, seven_day, verdict) = route_windows(rl);
+        // Codex now emits more than one independent limiter in the same
+        // session log. `codex` is the account-wide quota shown by CCU;
+        // model-specific buckets such as `codex_bengalfox` (Spark) must not
+        // replace it merely because their token_count event is newer. Older
+        // releases omitted limit_id, so absence remains the compatibility
+        // path while an explicit non-codex id is skipped.
+        if rl.limit_id.as_deref().is_some_and(|id| id != "codex") {
+            continue;
+        }
+        let (five_hour, seven_day, verdict) =
+            route_windows(rl.primary, rl.secondary, rl.rate_limit_reached_type);
         return Some(Box::new(CodexSnapshot {
             info: UsageInfo {
                 five_hour,
@@ -288,21 +298,25 @@ enum Slot {
 /// the verdict is republished as the SLOT name-equivalent: "primary" when the
 /// named window routed to the short slot, "secondary" when it routed weekly.
 /// Unknown verdict strings pass through (consumers degrade to either-window).
-fn route_windows(rl: RateLimits) -> (Option<UsageWindow>, Option<UsageWindow>, Option<String>) {
-    fn classify(w: &RawWindow, positional: Slot) -> Slot {
+pub(crate) fn route_windows(
+    primary: Option<LimiterWindow>,
+    secondary: Option<LimiterWindow>,
+    rate_limit_reached_type: Option<String>,
+) -> (Option<UsageWindow>, Option<UsageWindow>, Option<String>) {
+    fn classify(w: &LimiterWindow, positional: Slot) -> Slot {
         match w.window_minutes {
             Some(m) if m > 24 * 60 => Slot::Weekly,
             Some(_) => Slot::Short,
             None => positional,
         }
     }
-    let map = |w: &RawWindow| UsageWindow {
+    let map = |w: &LimiterWindow| UsageWindow {
         utilization: w.used_percent,
         resets_at: w.resets_at.map(epoch_secs_to_iso),
     };
 
-    let primary_slot = rl.primary.as_ref().map(|w| classify(w, Slot::Short));
-    let mut secondary_slot = rl.secondary.as_ref().map(|w| classify(w, Slot::Weekly));
+    let primary_slot = primary.as_ref().map(|w| classify(w, Slot::Short));
+    let mut secondary_slot = secondary.as_ref().map(|w| classify(w, Slot::Weekly));
     // Same-slot collision: the second window takes the other slot.
     if primary_slot.is_some() && secondary_slot == primary_slot {
         secondary_slot = Some(match primary_slot {
@@ -313,7 +327,7 @@ fn route_windows(rl: RateLimits) -> (Option<UsageWindow>, Option<UsageWindow>, O
 
     let mut five_hour = None;
     let mut seven_day = None;
-    for (raw, slot) in [(&rl.primary, primary_slot), (&rl.secondary, secondary_slot)] {
+    for (raw, slot) in [(&primary, primary_slot), (&secondary, secondary_slot)] {
         let (Some(w), Some(slot)) = (raw, slot) else {
             continue;
         };
@@ -323,22 +337,19 @@ fn route_windows(rl: RateLimits) -> (Option<UsageWindow>, Option<UsageWindow>, O
         }
     }
 
-    let verdict = rl
-        .rate_limit_reached_type
-        .filter(|s| !s.is_empty())
-        .map(|t| {
-            let named_slot = match t.as_str() {
-                "primary" => primary_slot,
-                "secondary" => secondary_slot,
-                _ => return t, // unknown → pass through, consumers check both
-            };
-            match named_slot {
-                Some(Slot::Weekly) => "secondary".to_string(),
-                Some(Slot::Short) => "primary".to_string(),
-                // Verdict names a window that isn't present — pass through.
-                None => t,
-            }
-        });
+    let verdict = rate_limit_reached_type.filter(|s| !s.is_empty()).map(|t| {
+        let named_slot = match t.as_str() {
+            "primary" => primary_slot,
+            "secondary" => secondary_slot,
+            _ => return t, // unknown → pass through, consumers check both
+        };
+        match named_slot {
+            Some(Slot::Weekly) => "secondary".to_string(),
+            Some(Slot::Short) => "primary".to_string(),
+            // Verdict names a window that isn't present — pass through.
+            None => t,
+        }
+    });
 
     (five_hour, seven_day, verdict)
 }
@@ -393,10 +404,15 @@ struct Payload {
 
 #[derive(Deserialize)]
 struct RateLimits {
+    /// Limiter bucket identity. `codex` is the account-wide quota; newer
+    /// clients also publish model-specific buckets (for example
+    /// `codex_bengalfox`) that must not drive the shared usage display.
     #[serde(default)]
-    primary: Option<RawWindow>,
+    limit_id: Option<String>,
     #[serde(default)]
-    secondary: Option<RawWindow>,
+    primary: Option<LimiterWindow>,
+    #[serde(default)]
+    secondary: Option<LimiterWindow>,
     /// Which window the limiter says is exhausted (`primary`/`secondary`),
     /// when codex recorded a limit rejection.
     #[serde(default)]
@@ -404,17 +420,17 @@ struct RateLimits {
 }
 
 #[derive(Deserialize)]
-struct RawWindow {
+pub(crate) struct LimiterWindow {
     #[serde(default)]
-    used_percent: f64,
+    pub(crate) used_percent: f64,
     /// Unix seconds in current codex releases; absent in very old ones.
     #[serde(default)]
-    resets_at: Option<i64>,
+    pub(crate) resets_at: Option<i64>,
     /// The window's own duration — the slot-routing signal (see
     /// [`route_windows`]): OpenAI's limiter shape moves (2026-07: `primary`
     /// became the 10080-minute weekly window), so position can't name a slot.
     #[serde(default)]
-    window_minutes: Option<i64>,
+    pub(crate) window_minutes: Option<i64>,
 }
 
 #[cfg(test)]

@@ -21,6 +21,23 @@ fn token_count_line(ts: &str, five_pct: f64, seven_pct: f64) -> String {
     .to_string()
 }
 
+fn token_count_line_for_limit(ts: &str, limit_id: &str, weekly_pct: f64) -> String {
+    serde_json::json!({
+        "timestamp": ts,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": { "total_token_usage": { "total_tokens": 42 } },
+            "rate_limits": {
+                "limit_id": limit_id,
+                "primary": { "used_percent": weekly_pct, "window_minutes": 10080, "resets_at": 1_900_600_000_u64 },
+                "plan_type": "pro",
+            },
+        },
+    })
+    .to_string()
+}
+
 fn write_rollout(sessions: &Path, day: &str, name: &str, lines: &[String]) -> PathBuf {
     let dir = sessions.join(day);
     std::fs::create_dir_all(&dir).unwrap();
@@ -63,6 +80,51 @@ fn reads_the_newest_snapshot_from_the_newest_file() {
     );
     assert!((snap.info.seven_day.unwrap().utilization - 13.0).abs() < f64::EPSILON);
     assert!(snap.snapshot_at_ms.is_some());
+}
+
+#[test]
+fn model_specific_limiter_does_not_override_account_wide_codex_usage() {
+    let sandbox = HomeSandbox::new();
+    let sessions = sandbox.home().join(".codex/sessions");
+    write_rollout(
+        &sessions,
+        "2026/07/18",
+        "rollout-mixed-limiters.jsonl",
+        &[
+            token_count_line_for_limit("2026-07-18T01:00:00Z", "codex", 42.0),
+            token_count_line_for_limit("2026-07-18T02:00:00Z", "codex_bengalfox", 0.0),
+        ],
+    );
+
+    let SnapshotOutcome::Snapshot(snap) = read_latest_snapshot_in(&sessions) else {
+        panic!("expected the account-wide codex snapshot");
+    };
+    assert_eq!(
+        snap.info.seven_day.as_ref().map(|w| w.utilization),
+        Some(42.0),
+        "a newer model-specific quota must not replace overall Codex usage"
+    );
+}
+
+#[test]
+fn model_specific_limiter_alone_is_no_usage_data() {
+    let sandbox = HomeSandbox::new();
+    let sessions = sandbox.home().join(".codex/sessions");
+    write_rollout(
+        &sessions,
+        "2026/07/18",
+        "rollout-model-only.jsonl",
+        &[token_count_line_for_limit(
+            "2026-07-18T02:00:00Z",
+            "codex_bengalfox",
+            0.0,
+        )],
+    );
+
+    assert!(
+        matches!(read_latest_snapshot_in(&sessions), SnapshotOutcome::NoData),
+        "a model-specific bucket must not publish a fake 0% overall snapshot"
+    );
 }
 
 // A resumed session appends into its START-date directory, so the freshest

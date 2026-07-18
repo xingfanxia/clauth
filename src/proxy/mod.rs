@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use crate::logline::logline;
 use crate::profile::AppConfig;
 use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
-use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_ms};
+use crate::usage::{UsageInfo, now_ms};
 
 use self::http::{RequestError, RequestHead, read_body, read_request_head};
 use self::pool::{Cooldowns, PoolMember, Selection, next_after_failure, select_account};
@@ -552,25 +552,35 @@ fn capture_usage_headers(account: &str, response: &ureq::http::Response<ureq::Bo
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
     };
-    let window = |prefix: &str| -> Option<UsageWindow> {
+    // Read only the default `x-codex-*` header family. Model-specific quota
+    // families use a longer prefix (for example
+    // `x-codex-bengalfox-primary-*`) and are intentionally ignored.
+    let window = |prefix: &str| -> Option<crate::codex::usage::LimiterWindow> {
         let pct: f64 = h(&format!("x-codex-{prefix}-used-percent"))?.parse().ok()?;
-        let resets_at = h(&format!("x-codex-{prefix}-reset-at"))
-            .and_then(|s| s.parse::<i64>().ok())
-            .map(epoch_secs_to_iso);
-        Some(UsageWindow {
-            utilization: pct,
+        let resets_at =
+            h(&format!("x-codex-{prefix}-reset-at")).and_then(|s| s.parse::<i64>().ok());
+        let window_minutes =
+            h(&format!("x-codex-{prefix}-window-minutes")).and_then(|s| s.parse::<i64>().ok());
+        Some(crate::codex::usage::LimiterWindow {
+            used_percent: pct,
             resets_at,
+            window_minutes,
         })
     };
-    let five_hour = window("primary");
-    let seven_day = window("secondary");
-    if five_hour.is_none() && seven_day.is_none() {
+    let primary = window("primary");
+    let secondary = window("secondary");
+    if primary.is_none() && secondary.is_none() {
         return; // no rate-limit headers on this response
     }
+    let (five_hour, seven_day, codex_rate_limit_reached) = crate::codex::usage::route_windows(
+        primary,
+        secondary,
+        h("x-codex-rate-limit-reached-type").filter(|s| !s.is_empty()),
+    );
     let info = UsageInfo {
         five_hour,
         seven_day,
-        codex_rate_limit_reached: h("x-codex-rate-limit-reached-type").filter(|s| !s.is_empty()),
+        codex_rate_limit_reached,
         ..UsageInfo::default()
     };
     write_profile_cache(account, USAGE_CACHE_FILE, &info);

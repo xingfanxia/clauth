@@ -142,8 +142,10 @@ fn sse_200_with_usage(primary_pct: &str) -> Vec<u8> {
         "HTTP/1.1 200 OK\r\n\
          Content-Type: text/event-stream\r\n\
          x-codex-primary-used-percent: {primary_pct}\r\n\
+         x-codex-primary-window-minutes: 10080\r\n\
          x-codex-primary-reset-at: 1900000000\r\n\
-         x-codex-secondary-used-percent: 3.0\r\n\
+         x-codex-bengalfox-primary-used-percent: 0.0\r\n\
+         x-codex-bengalfox-primary-window-minutes: 10080\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
@@ -245,7 +247,35 @@ fn e2e_injects_identity_and_relays_the_sse_response() {
         crate::profile_cache::USAGE_CACHE_FILE,
     )
     .expect("usage cached from headers");
-    assert!((cached.five_hour.unwrap().utilization - 42.0).abs() < f64::EPSILON);
+    assert!(cached.five_hour.is_none());
+    assert!((cached.seven_day.unwrap().utilization - 42.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn model_specific_header_family_does_not_replace_default_codex_usage() {
+    let _home = HomeSandbox::new();
+    let config = two_profile_config();
+    crate::codex::write_profile_auth("cdx-a", &codex_auth("at-a", "acct-a")).unwrap();
+
+    let stub = spawn_stub(vec![sse_200_with_usage("42.0")]);
+    let base = format!("http://127.0.0.1:{}", stub.port);
+    let resp = drive_request(config, base, &responses_request());
+    assert!(
+        String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200"),
+        "model-specific response still relays normally"
+    );
+
+    let cached = crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+        "cdx-a",
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .expect("default Codex usage cached");
+    assert_eq!(
+        cached.seven_day.as_ref().map(|w| w.utilization),
+        Some(42.0),
+        "Spark's independent 0% header family must not replace overall Codex usage"
+    );
+    assert!(cached.five_hour.is_none());
 }
 
 /// A bodyless GET model-metadata refresh (codex issues this alongside the
