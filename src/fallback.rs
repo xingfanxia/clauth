@@ -237,21 +237,24 @@ fn burn_rate_for_profile(name: &str, window: &UsageWindow) -> Option<f64> {
 
 /// Burn-aware exhaustion test shared by [`is_exhausted_active`] and its
 /// scheduler-side store variant (issue #8 follow-up b, opt-in — off by
-/// default). `None` burn (no history yet, a fresh profile, or a provider with
-/// none) falls back to the plain `util_pct >= threshold` check — never leaves
-/// an account uncovered for lack of data. With a rate, "exhausted" means the
-/// *projected* utilization has crossed the 100% cap, not the per-profile
-/// threshold: within the `floor_pct..=100` band, a heavier burn switches sooner
-/// and a light one runs on toward the cap since it won't blow it before the
-/// next poll. (With the default floor 98 above the default threshold 95,
-/// burn-aware runs the window LONGER than static, never shorter.)
+/// default). The static `util_pct >= threshold` check always applies, so
+/// enabling burn-aware can only ever move the switch EARLIER than mode-off,
+/// never later. `None` burn (no history yet, a fresh profile, or a provider
+/// with none) leaves only that static check — never uncovers an account for
+/// lack of data. With a rate, the projection ADDS an earlier trip inside the
+/// `floor_pct.min(threshold)..threshold` band: a heavier burn crosses the 100%
+/// cap before the next poll and switches sooner, a light one runs on since it
+/// won't blow the cap in time. (Above `threshold` the static check has already
+/// fired, so the band's upper bound is `threshold`; a `floor_pct` set above
+/// `threshold` — the stock default 98 over 95 — just clamps to `threshold` and
+/// burn-aware reduces to static.)
 ///
 /// Two guards keep the projection from switching too early — the failure the
 /// unbounded form hit worst on the smallest tier (Pro): the burn %/h is
 /// window-relative, so the same activity reads a higher rate on a smaller
 /// window and the projection trips from further below 100.
-///   * `floor_pct`: the projection may not fire below it, so wasted headroom is
-///     capped at `100 - floor` on EVERY tier regardless of rate or interval.
+///   * `floor_pct`: the projection may not fire below `floor_pct.min(threshold)`,
+///     bounding how far below `threshold` an early switch can land.
 ///   * `horizon_cap_ms`: the look-ahead is `min(interval_ms, horizon_cap_ms)`,
 ///     so a long poll cadence can't balloon the margin (it scales linearly with
 ///     the look-ahead). Folded in here rather than in
@@ -267,8 +270,9 @@ fn is_exhausted_projected(
     match burn_pct_per_hour {
         Some(rate) => {
             let horizon = interval_ms.min(horizon_cap_ms);
-            util_pct >= floor_pct
-                && crate::usage::project_utilization(util_pct, rate, horizon) >= 100.0
+            (util_pct >= floor_pct.min(threshold)
+                && crate::usage::project_utilization(util_pct, rate, horizon) >= 100.0)
+                || util_pct >= threshold
         }
         None => util_pct >= threshold,
     }
