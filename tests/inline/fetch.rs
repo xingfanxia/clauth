@@ -1149,3 +1149,29 @@ fn non_2xx_arrives_as_ok_so_the_status_branches_stay_reachable() {
     );
     assert_eq!(response.status().as_u16(), 401);
 }
+
+// ── humanize_duration: seconds under 5 min ───────────────────────────────────
+
+#[test]
+fn humanize_duration_shows_seconds_under_five_minutes() {
+    assert_eq!(humanize_duration(0), "now");
+    assert_eq!(humanize_duration(-5), "now");
+    assert_eq!(humanize_duration(1), "1s");
+    assert_eq!(humanize_duration(45), "45s");
+    assert_eq!(humanize_duration(59), "59s");
+    assert_eq!(humanize_duration(60), "1m");
+    assert_eq!(humanize_duration(90), "1m 30s");
+    assert_eq!(humanize_duration(120), "2m");
+    assert_eq!(humanize_duration(299), "4m 59s");
+}
+
+#[test]
+fn humanize_duration_five_minutes_and_up_stays_coarse() {
+    // At 5 min the seconds drop: minute granularity is enough that far out, and
+    // the old rounding stays for every longer span.
+    assert_eq!(humanize_duration(300), "5m");
+    assert_eq!(humanize_duration(59 * 60), "59m");
+    assert_eq!(humanize_duration(3600), "1h 0m");
+    assert_eq!(humanize_duration(90 * 60), "1h 30m");
+    assert_eq!(humanize_duration(25 * 3600), "1d 1h");
+}

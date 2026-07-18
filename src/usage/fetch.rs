@@ -1310,7 +1310,10 @@ pub(crate) fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Format seconds as `Nd Nh`, `Nh Nm`, or `Nm`; returns `"now"` for ≤0.
+/// Format seconds as `Nd Nh`, `Nh Nm`, `Nm`, `Nm Ns`, or `Ns`; returns `"now"`
+/// for ≤0. Spans under 5 min carry seconds so an imminent countdown (a switch,
+/// a kick lift, a reset) reads precisely instead of rounding up to a coarse
+/// `1m`; whole minutes there still drop the trailing ` 0s`.
 pub(crate) fn humanize_duration(secs: i64) -> String {
     if secs <= 0 {
         return "now".to_string();
@@ -1322,8 +1325,14 @@ pub(crate) fn humanize_duration(secs: i64) -> String {
         format!("{}d {}h", days, hours % 24)
     } else if hours > 0 {
         format!("{}h {}m", hours, mins % 60)
+    } else if secs < 300 {
+        match (mins, secs % 60) {
+            (0, s) => format!("{s}s"),
+            (m, 0) => format!("{m}m"),
+            (m, s) => format!("{m}m {s}s"),
+        }
     } else {
-        format!("{}m", mins.max(1))
+        format!("{mins}m")
     }
 }
 
