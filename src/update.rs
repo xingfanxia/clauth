@@ -227,6 +227,13 @@ fn verify_sums_signature(
 }
 
 fn make_agent() -> ureq::Agent {
+    // CAUTION if FORK_BUILD is ever flipped back on: in ureq 3
+    // `timeout_recv_response` keeps counting through the BODY read (pinned by
+    // the proxy's timeout-semantics tests) — 30 s over the multi-MB release
+    // binary aborts the download below ~340 KB/s. Dead code today (spawn()
+    // short-circuits on FORK_BUILD), but re-enabling self-update must size
+    // this for the full asset at worst-case throughput, or stream with the
+    // proxy's terminal-detection approach (timeout-sweep 2026-07-18).
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(5)))
         .timeout_recv_response(Some(Duration::from_secs(30)))

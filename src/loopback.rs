@@ -238,7 +238,14 @@ pub(crate) fn handle_callback(
     expected_state: &str,
     callback_path: &str,
 ) -> Result<Option<String>> {
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    // 60 s, not a tight probe-catcher (timeout-sweep 2026-07-18): the caller's
+    // 180 s login deadline already bounds the total wait, and this connection
+    // may BE the one real browser callback carrying the single-use OAuth code —
+    // dropping it on a slow request line (VPN/AV loopback interception, a
+    // thrashing machine, WSL2-style forwarded loopback) loses the code with no
+    // retry, forcing the whole consent flow over. A stray probe holding a slot
+    // for a minute costs nothing; a dropped real callback costs the login.
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
     let mut request_line = String::new();
     // A read failure (half-open browser preconnect, a probe that stalls past the
     // read timeout) must NOT abort the whole login — ignore this connection and

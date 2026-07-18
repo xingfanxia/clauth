@@ -326,30 +326,39 @@ pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
 
-        if let Ok(meta) = link.symlink_metadata() {
-            if !meta.file_type().is_symlink() {
-                let live_bytes = std::fs::read(&link).ok();
-                let target_bytes = std::fs::read(&target).ok();
-                if live_bytes != target_bytes {
-                    anyhow::bail!(
-                        "refusing to replace .credentials.json: live file differs from profile '{name}'; {} first",
-                        crate::format::RESOLVE_IN_TUI
-                    );
-                }
+        if let Ok(meta) = link.symlink_metadata()
+            && !meta.file_type().is_symlink()
+        {
+            let live_bytes = std::fs::read(&link).ok();
+            let target_bytes = std::fs::read(&target).ok();
+            if live_bytes != target_bytes {
+                anyhow::bail!(
+                    "refusing to replace .credentials.json: live file differs from profile '{name}'; {} first",
+                    crate::format::RESOLVE_IN_TUI
+                );
             }
-            std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
         }
 
+        // macOS Keychain write FIRST (timeout-sweep 2026-07-18): it is the
+        // realistic failure on this path (locked keychain / unanswered ACL
+        // prompt → the 20 s subprocess kill), and it must fail BEFORE any
+        // local mutation. The old order swapped the symlink first, so a
+        // failed write stranded link→new / Keychain→old with no rollback.
+        // Claude Code reads the Keychain — failing here leaves every surface
+        // consistently on the previous login.
+        #[cfg(target_os = "macos")]
+        if target.exists() && crate::keychain::enabled() {
+            keychain_write_source(&target)?;
+        }
+
+        if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
+        }
         if target.exists() {
             if let Some(parent) = link.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             create_symlink(&target, &link)?;
-            // macOS: make the switch real — Claude Code reads the Keychain.
-            #[cfg(target_os = "macos")]
-            if crate::keychain::enabled() {
-                keychain_write_source(&target)?;
-            }
         }
 
         Ok(())
@@ -695,20 +704,21 @@ pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Resul
 pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
+        let target = install_source_path(name)?;
+        // Keychain first, mutations after — same ordering rationale as
+        // `link_profile_credentials` (a failed write must strand nothing).
+        #[cfg(target_os = "macos")]
+        if target.exists() && crate::keychain::enabled() {
+            keychain_write_source(&target)?;
+        }
         if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
-        let target = install_source_path(name)?;
         if target.exists() {
             if let Some(parent) = link.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             create_symlink(&target, &link)?;
-            // macOS: make the switch real — Claude Code reads the Keychain.
-            #[cfg(target_os = "macos")]
-            if crate::keychain::enabled() {
-                keychain_write_source(&target)?;
-            }
         }
         Ok(())
     })
