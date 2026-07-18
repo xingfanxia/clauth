@@ -481,7 +481,7 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
     let now = now_epoch_secs();
     let mut profile = crate::testutil::blank_profile("a");
     // Kick (a long hint) + a cached fetch: two hints, so the kick hint is
-    // non-last. At 44 cells the kick hint wraps; the fetch's shorter hint does not.
+    // non-last. At 30 cells the kick hint wraps; the fetch's shorter hint does not.
     profile.fetch_status = Some(FetchStatus::Cached);
     let lines: Vec<String> = status_lines(
         &profile,
@@ -501,7 +501,7 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
                 ..DiagFlags::default()
             },
         },
-        44,
+        30,
     )
     .iter()
     .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
@@ -867,15 +867,12 @@ fn kick_hint_diverges_on_auto_start() {
     let on = diag_fix(UsageDiag::KickSwitchGrade { auto_start: true }, "a");
     let off = diag_fix(UsageDiag::KickSwitchGrade { auto_start: false }, "a");
     assert_ne!(on, off, "the auto_start split must change the copy");
-    assert_eq!(
-        on,
-        "clauth is re-testing periodically, clears when claude code unblocks"
-    );
+    assert_eq!(on, "clauth is re-testing periodically");
     assert_eq!(off, "won't recover with auto-start off, enable it");
     // A non-switch-grade burst is neither — low-urgency backoff, no chain switch.
     assert_eq!(
         diag_fix(UsageDiag::KickBurst, "a"),
-        "claude code hit a short burst limit, retrying shortly"
+        "claude code hit a burst limit"
     );
 }
 

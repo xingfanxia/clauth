@@ -154,6 +154,15 @@ pub(crate) fn spend_is_uncapped(config: &AppConfig, ceiling: f64) -> bool {
         && !config.profiles.iter().any(|p| p.last_resort)
 }
 
+/// The fix list for an uncapped-spend config ([`spend_is_uncapped`]): the two
+/// actions that bound the bill. Shared by its three consumers (the Usage
+/// `SpendUncapped` diagnostic, the Fallback always-on tooltip, the daemon
+/// boot warning) so the copy cannot drift apart the way three hand-maintained
+/// literals would.
+pub(crate) fn uncapped_spend_fix() -> &'static str {
+    "set extra usage spent to switch off all, or mark an account last resort"
+}
+
 /// [`spend_room`] over a member's usage snapshot: true when the chain may pick
 /// it purely to spend money. Never consulted until every subscription member
 /// with free quota has been passed over — see [`next_target`].

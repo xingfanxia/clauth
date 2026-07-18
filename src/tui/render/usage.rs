@@ -1059,29 +1059,19 @@ enum UsageDiag {
 fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
     match diag {
         UsageDiag::KickSwitchGrade { auto_start: true } => {
-            "clauth is re-testing periodically, clears when claude code unblocks".to_string()
+            "clauth is re-testing periodically".to_string()
         }
         UsageDiag::KickSwitchGrade { auto_start: false } => {
             "won't recover with auto-start off, enable it".to_string()
         }
-        UsageDiag::KickBurst => "claude code hit a short burst limit, retrying shortly".to_string(),
-        UsageDiag::Stuck429 => {
-            "anthropic is throttling usage reads, these numbers are old, retrying".to_string()
-        }
+        UsageDiag::KickBurst => "claude code hit a burst limit".to_string(),
+        UsageDiag::Stuck429 => "anthropic is throttling usage reads".to_string(),
         UsageDiag::AuthBroken => format!("re-login with clauth login {profile_name}"),
-        UsageDiag::WeeklyHard => {
-            "weekly limit is spent, a fresh 5h window won't help until it resets".to_string()
-        }
-        UsageDiag::BudgetSpent => {
-            "raise max spend on the fallback tab to keep this account serving".to_string()
-        }
-        UsageDiag::SpendUncapped => {
-            "set extra usage spent to switch off all, or mark an account last resort".to_string()
-        }
-        UsageDiag::Stale => "last check failed, showing older numbers".to_string(),
-        UsageDiag::RefreshFailing => {
-            "login refresh keeps failing, re-login if it doesn't clear".to_string()
-        }
+        UsageDiag::WeeklyHard => "weekly limit is spent".to_string(),
+        UsageDiag::BudgetSpent => "raise max spend on the fallback tab".to_string(),
+        UsageDiag::SpendUncapped => crate::fallback::uncapped_spend_fix().to_string(),
+        UsageDiag::Stale => "last usage check failed".to_string(),
+        UsageDiag::RefreshFailing => "login refresh failing, re-login if it persists".to_string(),
     }
 }
 

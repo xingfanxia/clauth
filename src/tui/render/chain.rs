@@ -27,7 +27,7 @@ use super::panes::{
 };
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, soonest_resume, spend_is_uncapped,
-    spend_room, threshold_for,
+    spend_room, threshold_for, uncapped_spend_fix,
 };
 use crate::profile::AppConfig;
 use crate::usage::{humanize_duration, switch_grade_kick_lifts};
@@ -415,8 +415,7 @@ fn member_detail(
                 // it is the one state where the ceiling does not bound the bill,
                 // so it must not hide until someone arrows onto the field.
                 None if spend_is_uncapped(cfg, ceiling) => lines.extend(invalid_tooltip_lines(
-                    "nothing stops the spending: set extra usage spent to switch off all, or mark \
-                     an account last resort",
+                    &format!("nothing stops the spending: {}", uncapped_spend_fix()),
                     width,
                 )),
                 None if selected => lines.extend(help_tooltip_lines(
