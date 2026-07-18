@@ -14,8 +14,8 @@ use super::super::app::App;
 use super::super::theme;
 use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
 use super::panes::{
-    draw_profile_selector, help_tooltip_lines, key_cell, section_box, section_box_verbatim,
-    selector_width,
+    draw_profile_selector, empty_state, help_tooltip_lines, key_cell, section_box,
+    section_box_verbatim, selector_width,
 };
 use crate::format::plan_label;
 use crate::profile::Profile;
@@ -112,12 +112,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let Some(profile) = profile else {
-        let hint = Paragraph::new(Line::from(Span::styled(
-            "no accounts yet, press n to create one",
-            theme::dim(),
-        )))
-        .style(theme::base());
-        frame.render_widget(hint, inner);
+        frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     };
 
@@ -598,7 +593,10 @@ fn collect_stats(profile: &Profile) -> Vec<Stat> {
     // Per-period extra-credit breakdowns (`daily`/`weekly`) — shape unconfirmed,
     // absent on every current account; rendered only when a value is extractable.
     if let Some(extra) = &usage.extra_usage {
-        for (label, raw) in [("extra (24h)", &extra.daily), ("extra (7d)", &extra.weekly)] {
+        for (label, raw) in [
+            ("extra usage (24h)", &extra.daily),
+            ("extra usage (7d)", &extra.weekly),
+        ] {
             let Some(period) = raw.as_ref().and_then(ExtraPeriod::from_value) else {
                 continue;
             };
@@ -1023,22 +1021,23 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
         UsageDiag::KickSwitchGrade { auto_start: false } => {
             "won't recover with auto-start off, enable it".to_string()
         }
-        UsageDiag::KickBurst => "short burst limit, backing off".to_string(),
+        UsageDiag::KickBurst => "claude code hit a short burst limit, retrying shortly".to_string(),
         UsageDiag::Stuck429 => {
-            "usage endpoint throttling, numbers are old and draining via backoff".to_string()
+            "anthropic is throttling usage reads, these numbers are old, retrying".to_string()
         }
         UsageDiag::AuthBroken => format!("re-login with clauth login {profile_name}"),
         UsageDiag::WeeklyHard => {
-            "weekly quota spent, the 5h window won't help until the weekly reset".to_string()
+            "weekly limit is spent, a fresh 5h window won't help until it resets".to_string()
         }
-        UsageDiag::BudgetSpent => "raise max_auto_spend to keep serving".to_string(),
+        UsageDiag::BudgetSpent => {
+            "raise max spend on the fallback tab to keep this account serving".to_string()
+        }
         UsageDiag::SpendUncapped => {
-            "spend runs past the ceiling, switch off all when spent or add a last-resort"
-                .to_string()
+            "set extra usage spent to switch off all, or mark an account last resort".to_string()
         }
-        UsageDiag::Stale => "showing last-known numbers, last fetch didn't land".to_string(),
+        UsageDiag::Stale => "last check failed, showing older numbers".to_string(),
         UsageDiag::RefreshFailing => {
-            "token refresh failing but not fatal yet, retrying".to_string()
+            "login refresh keeps failing, re-login if it doesn't clear".to_string()
         }
     }
 }
@@ -1081,7 +1080,7 @@ fn oauth_empty_msg(profile: &Profile) -> &'static str {
         .as_ref()
         .is_some_and(|c| c.claude_ai_oauth.is_some());
     if !has_oauth {
-        "no credentials, capture or log in"
+        "not logged in, use + login on the setup tab"
     } else if profile.fetch_status == Some(FetchStatus::Failed) {
         "no usage available"
     } else {

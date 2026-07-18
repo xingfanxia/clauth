@@ -173,7 +173,7 @@ fn empty_msg_credless_profile_is_terminal() {
     let profile = crate::testutil::blank_profile("a");
     assert_eq!(
         oauth_empty_msg(&profile),
-        "no credentials, capture or log in"
+        "not logged in, use + login on the setup tab"
     );
 }
 
@@ -661,7 +661,7 @@ fn kick_hint_diverges_on_auto_start() {
     // A non-switch-grade burst is neither — low-urgency backoff, no chain switch.
     assert_eq!(
         diag_fix(UsageDiag::KickBurst, "a"),
-        "short burst limit, backing off"
+        "claude code hit a short burst limit, retrying shortly"
     );
 }
 
@@ -745,9 +745,9 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
         },
         120,
     ));
-    assert!(out.contains("[ uncapped ]") && out.contains("spend runs past the ceiling"));
+    assert!(out.contains("[ uncapped ]") && out.contains("mark an account last resort"));
     assert!(
-        !out.contains("extra usage spent"),
+        !out.contains("[ extra usage spent ]"),
         "uncapped must suppress the extra-usage-spent pill: {out}"
     );
 }
