@@ -858,7 +858,11 @@ fn a_wrapped_hint_scrolls_into_view_with_its_row() {
         .position(|r| *r == GlobalConfigRow::SpendBudget)
         .unwrap();
 
-    let screen = dump(&app, 34, 24);
+    // 33 cols is the widest terminal where this hint still wraps to four lines;
+    // one cell more and the block fits the viewport, so the assertion below stops
+    // discriminating block-scroll from row-scroll. `scroll_offset_keeps_the_whole
+    // _focused_block_on_screen` pins the same rule off real copy.
+    let screen = dump(&app, 33, 24);
     assert!(
         screen.contains("allow extra"),
         "the focused row renders:\n{screen}"
@@ -875,4 +879,23 @@ fn a_wrapped_hint_scrolls_into_view_with_its_row() {
             .any(|l| l.trim_matches(['│', '┊', '┃', ' ']) == "off"),
         "the hint's final wrapped line must not clip:\n{screen}"
     );
+}
+
+/// The block-vs-row scroll rule, pinned off the pure function instead of live
+/// hint copy: the screen test above only discriminates while some real hint
+/// happens to wrap past the viewport, so rewording one silently retires it.
+#[test]
+fn scroll_offset_keeps_the_whole_focused_block_on_screen() {
+    use super::panes::scroll_offset;
+
+    // Block 18..22 in a 20-row viewport. Scrolling to the ROW alone yields 1
+    // (18 + 3 pad - 20) and clips the block's tail at 21.
+    assert_eq!(scroll_offset(30, 20, (18, 22)), 5);
+    // A block taller than the viewport caps at its first line, so the row it
+    // explains survives even though its hint cannot.
+    assert_eq!(scroll_offset(40, 10, (5, 30)), 5);
+    // Content that fits never scrolls, whatever the focus.
+    assert_eq!(scroll_offset(12, 20, (8, 11)), 0);
+    // A block already on screen without scrolling stays put.
+    assert_eq!(scroll_offset(30, 20, (2, 5)), 0);
 }

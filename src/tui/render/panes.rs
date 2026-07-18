@@ -318,7 +318,7 @@ pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// A `  └ text` help sub-line wrapped to `width`: the `└ ` leader stays `LINE`,
+/// A ` └ text` help sub-line wrapped to `width`: the `└ ` leader stays `LINE`,
 /// the reason renders `faint`; continuation lines indent under the text so the
 /// hint reads as one block instead of clipping off the pane edge.
 pub(super) fn help_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
@@ -337,12 +337,12 @@ fn tooltip_lines(
     leader_style: Style,
     text_style: Style,
 ) -> Vec<Line<'static>> {
-    const LEAD_W: usize = 4; // "  └ " and the matching continuation indent
+    const LEAD_W: usize = 3; // " └ " and the matching continuation indent
     wrap_words(text, width.saturating_sub(LEAD_W).max(8))
         .into_iter()
         .enumerate()
         .map(|(i, seg)| {
-            let lead = if i == 0 { "  └ " } else { "    " };
+            let lead = if i == 0 { " └ " } else { "   " };
             Line::from(vec![
                 Span::styled(lead, leader_style),
                 Span::styled(seg, text_style),

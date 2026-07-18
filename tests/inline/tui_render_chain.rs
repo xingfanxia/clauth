@@ -104,15 +104,17 @@ fn last_resort_hint_wraps_on_a_narrow_pane() {
     let texts: Vec<String> = lines.iter().map(line_text).collect();
     let lead = texts
         .iter()
-        .position(|t| t.starts_with("  └ "))
+        .position(|t| t.starts_with(" └ "))
         .expect("hint leader line renders");
     assert!(
         texts[lead].chars().count() <= 28,
         "first hint line must fit the pane: {:?}",
         texts[lead]
     );
+    // Exactly the leader's width, so the continuation stacks under the text
+    // rather than under the `└` (or one cell past it).
     assert!(
-        texts[lead + 1].starts_with("    "),
+        texts[lead + 1].starts_with("   ") && !texts[lead + 1].starts_with("    "),
         "hint continues on an indented line instead of clipping: {:?}",
         texts[lead + 1]
     );
