@@ -180,7 +180,7 @@ fn warn_if_spend_is_uncapped(config: &crate::profile::AppConfig) {
         .collect();
     if !uncapped.is_empty() {
         logline!(
-            "clauth daemon: {} armed to spend with no cap: `money spent` is stay-on-last and \
+            "clauth daemon: {} armed to spend with no cap: `extra usage spent` is stay-on-last and \
              the chain has no last resort to park on, so max auto-spend only gates when billing \
              STARTS, never when it stops",
             uncapped.join(", ")

@@ -4,8 +4,8 @@
 //! timing (`refresh` cadence, `refresh spent` toggle, `rotation`), fallback
 //! detection (`weekly limit`, `rotate mode` = burn-aware, plus the burn-aware
 //! `burn floor`/`burn horizon` tunables it gates, issue #8 follow-up b),
-//! fallback halt (`quota spent`), then the spend block (`spend budget` opt-in +
-//! its own `money spent` halt default — real money, see `docs/internals.md`).
+//! fallback halt (`quota spent`), then the spend block (`allow extra usage` opt-in +
+//! its own `extra usage spent` halt default — real money, see `docs/internals.md`).
 //! ↑↓ walks the rows; space cycles a row's value in place; ⏎ opens the
 //! refresh-interval and weekly-threshold custom-value editors and otherwise
 //! mirrors space. No left selector, no popups — settings are global.
@@ -27,10 +27,11 @@ use super::panes::{
     label_style, section_box,
 };
 
-/// Width of the key column: the longest key (`refresh spent`, 13). Keys pad to
-/// it, then [`KEY_GUTTER`] separates them from the value — so every row's value
-/// starts at the same column (the Config tab is a cloudy-tui tight chip group).
-const KEY_W: usize = 13;
+/// Width of the key column: the longest keys (`allow extra usage` /
+/// `extra usage spent`, 17). Keys pad to it, then [`KEY_GUTTER`] separates them
+/// from the value — so every row's value starts at the same column (the Config
+/// tab is a cloudy-tui tight chip group).
+const KEY_W: usize = 17;
 /// Fixed gap between the padded key and the value column.
 const KEY_GUTTER: usize = 2;
 
@@ -195,17 +196,17 @@ fn row_hint(
             if toggles.spend_budget {
                 "spent accounts may fall back to pay-as-you-go, up to each max auto-spend"
             } else {
-                "never spend money automatically; a spent chain parks or switches off"
+                "never allow extra usage automatically; a spent chain parks or switches off"
             }
         }
         GlobalConfigRow::SwitchOffWhenBudgetSpent => {
             if !toggles.spend_budget {
-                "inert until spend budget is on; decides the halt once a billing account's budget \
+                "inert until extra usage is allowed; decides the halt once an account's extra usage \
                  runs out"
             } else if toggles.switch_off_when_budget_spent {
-                "once an account's spend budget runs out, switch everything off"
+                "once an account's extra usage runs out, switch everything off"
             } else {
-                "once an account's spend budget runs out, stay on it and keep billing"
+                "once an account's extra usage runs out, stay on it and keep billing"
             }
         }
         GlobalConfigRow::PreemptiveRotation => {
@@ -310,7 +311,7 @@ fn detail_row(
         }
         GlobalConfigRow::SpendBudget => cycle_row(
             arrow,
-            "spend budget",
+            "allow extra usage",
             &[
                 ("off", !toggles.spend_budget),
                 ("pay-as-you-go", toggles.spend_budget),
@@ -319,7 +320,7 @@ fn detail_row(
         ),
         // Same two values as `quota spent` on purpose: the pairing is the point.
         // Only the default differs — staying is free there and costs money here.
-        // Inert until `spend budget` is on: nothing spends, so nothing halts on a
+        // Inert until `allow extra usage` is on: nothing spends, so nothing halts on a
         // spent budget. Rendered dimmed AND the key no-ops (a true disabled row),
         // so `faint` never decouples from "not editable".
         GlobalConfigRow::SwitchOffWhenBudgetSpent => {
@@ -328,9 +329,9 @@ fn detail_row(
                 ("switch off all", toggles.switch_off_when_budget_spent),
             ];
             if toggles.spend_budget {
-                cycle_row(arrow, "money spent", &options, selected)
+                cycle_row(arrow, "extra usage spent", &options, selected)
             } else {
-                dimmed_cycle_row("money spent", &options, selected)
+                dimmed_cycle_row("extra usage spent", &options, selected)
             }
         }
         GlobalConfigRow::PreemptiveRotation => cycle_row(
@@ -491,7 +492,7 @@ fn weekly_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> 
 
 /// The `burn floor` row: burn-aware early-switch floor as a segmented control
 /// over [`BURN_FLOOR_PRESETS`]. Dimmed + inert when burn-aware is off (the
-/// projection it gates never runs), mirroring the `money spent` row. A
+/// projection it gates never runs), mirroring the `extra usage spent` row. A
 /// hand-edited in-band value matching no preset is appended in `ACCENT`, same
 /// grammar as the weekly row.
 fn burn_floor_line(

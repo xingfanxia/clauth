@@ -74,17 +74,22 @@ fn every_blurred_row_starts_its_value_at_the_shared_column() {
     }
 }
 
-/// The regression the screenshot caught: `weekly limit` is exactly `KEY_W`
-/// chars, so a `saturating_sub(..).max(1)` pad made its block 1 cell wider.
+/// The regression the screenshot caught: a key exactly `KEY_W` chars wide (now
+/// `extra usage spent`) must not let a `saturating_sub(..).max(1)` pad widen its
+/// block by a cell and push the value column right.
 #[test]
 fn longest_key_aligns_with_shortest() {
     let theme = row("theme", &[("full", true), ("compatible", false)], false);
-    let weekly = row("weekly limit", &[("90%", true), ("95%", false)], false);
+    let widest = row(
+        "extra usage spent",
+        &[("stay on last", true), ("switch off all", false)],
+        false,
+    );
     assert_eq!(value_col("theme", &theme), 2 + KEY_W + KEY_GUTTER);
     assert_eq!(
         value_col("theme", &theme),
-        value_col("weekly limit", &weekly),
-        "`weekly limit` (== KEY_W chars) must not push its value column right"
+        value_col("extra usage spent", &widest),
+        "`extra usage spent` (== KEY_W chars) must not push its value column right"
     );
 }
 
@@ -256,7 +261,7 @@ fn money_spent_dims_when_spend_budget_is_off() {
 fn money_spent_hint_explains_inertness_when_spend_off() {
     let hint = row_hint(GlobalConfigRow::SwitchOffWhenBudgetSpent, None, toggles())
         .expect("an inert money-spent row still carries its reason");
-    assert!(hint.contains("inert until spend budget"), "{hint}");
+    assert!(hint.contains("inert until extra usage"), "{hint}");
 }
 
 // ── burn floor / horizon dim while inert (burn-aware off) ─────────────────────

@@ -268,7 +268,7 @@ fn reason_pill(reason: &BlockedReason) -> Line<'static> {
             format!("window blocked · {}", humanize_duration(*lifts_in)),
             theme::warning().bold(),
         ),
-        BlockedReason::BudgetSpent => ("money spent".to_string(), theme::warning().bold()),
+        BlockedReason::BudgetSpent => ("extra usage spent".to_string(), theme::warning().bold()),
         BlockedReason::FiveHour { pct, resets_in } => (
             match resets_in {
                 Some(s) => format!("5h {pct:.0}% · {}", humanize_duration(*s)),
@@ -418,7 +418,7 @@ fn member_detail(
                 // it is the one state where the ceiling does not bound the bill,
                 // so it must not hide until someone arrows onto the field.
                 None if spend_is_uncapped(cfg, ceiling) => lines.extend(invalid_tooltip_lines(
-                    "no cap: `money spent` is stay-on-last and no last resort to park on",
+                    "no cap: `extra usage spent` is stay-on-last and no last resort to park on",
                     width,
                 )),
                 None if selected => {
@@ -491,7 +491,7 @@ fn max_spend_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
 /// case names the gate regardless of the ceiling value.
 fn max_spend_hint(cfg: &AppConfig, ceiling: f64) -> String {
     if !cfg.state.spend_budget_switching {
-        return "inert until spend budget is on (config); then a ceiling caps spending here"
+        return "inert until extra usage is allowed (config); then a ceiling caps spending here"
             .to_string();
     }
     if ceiling > 0.0 {

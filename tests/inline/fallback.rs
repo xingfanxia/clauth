@@ -1423,6 +1423,48 @@ fn spend_is_uncapped_only_when_nothing_can_stop_the_billing() {
     );
 }
 
+// `budget_spent_blocking` (the Usage-tab diagnostic's reader) gates a spent
+// budget behind 5h-exhaustion exactly like `blocked_reason`: a billing member
+// that maxed its money budget but still has free 5h quota serves for FREE and the
+// walk prefers it, so the diagnostic must NOT claim it blocked. Only once the 5h
+// window is also over threshold is the budget the thing stopping it. Guards the
+// render-only invariant against a regression to a raw `budget_spent` read.
+#[test]
+fn budget_spent_blocking_needs_5h_exhaustion_too() {
+    let member = |five_h: f64| {
+        let mut p = profile_with_usage(
+            "a",
+            Some(95.0),
+            Some(UsageInfo {
+                five_hour: Some(window(five_h, Some(live_reset()))),
+                spend: Some(spend_block(true, 99.0, Some(50.0))),
+                ..UsageInfo::default()
+            }),
+        );
+        p.max_auto_spend = Some(5.0);
+        p
+    };
+    let cfg = |p: Profile| {
+        let mut c = config_with_chain(vec![p], "a");
+        c.state.spend_budget_switching = true;
+        c
+    };
+
+    // 5h has headroom (50% < 95%): serves free, so a maxed money budget is moot.
+    let free = cfg(member(50.0));
+    assert!(
+        !budget_spent_blocking(&free, &free.profiles[0]),
+        "free 5h quota → budget is not a block"
+    );
+
+    // 5h over threshold (100% >= 95%): nothing free left, so the budget blocks.
+    let spent = cfg(member(100.0));
+    assert!(
+        budget_spent_blocking(&spent, &spent.profiles[0]),
+        "no free quota + budget maxed → really blocked"
+    );
+}
+
 // ── spend budget: walk ordering ─────────────────────────────────────────────
 
 // Everything is spent and one member is billing with room → the chain pays

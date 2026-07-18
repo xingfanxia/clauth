@@ -224,6 +224,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block,
+        diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
         ls.iter()
@@ -237,7 +238,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
             .join("\n")
     };
 
-    let clean = text(status_lines(&profile, &header(None)));
+    let clean = text(status_lines(&profile, &header(None), 120));
     assert!(
         !clean.contains("blocked"),
         "no block → no pill, got {clean:?}"
@@ -252,6 +253,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
             until: Some(now + 3 * 60 * 60),
             next_retry: now + 30,
         })),
+        120,
     ));
     assert!(blocked.contains("[ blocked ]"), "got {blocked:?}");
     assert!(
@@ -267,6 +269,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
             until: None,
             next_retry: now + 10,
         })),
+        120,
     ));
     assert!(no_ceiling.contains("[ blocked ]"));
     assert!(
@@ -289,6 +292,9 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.fetch_status = Some(FetchStatus::RateLimited);
     let now = now_epoch_secs();
+    // 52 inner cells is the narrowest pane the layout builds (an 80-col terminal
+    // yields a 24-cell selector), so the block/fetch pills AND their `└` hints
+    // must all fit — the whole reason this row was split off a single ~83-cell one.
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
@@ -305,39 +311,44 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
                 until: Some(now + 4 * 60 * 60),
                 next_retry: now + 30,
             }),
+            diag: DiagFlags::default(),
         },
+        52,
     )
     .iter()
     .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
     .collect();
 
-    assert_eq!(lines.len(), 2, "block + fetch state, got {lines:?}");
+    // The block pill leads its own keyed line; the fetch pill opens a later line
+    // indented to the value column. The `└` hints sit between them but never
+    // merge a pill onto another row, so exactly two lines carry a `[ … ]` pill.
+    let pill_lines: Vec<&String> = lines.iter().filter(|l| l.contains("[ ")).collect();
+    assert_eq!(
+        pill_lines.len(),
+        2,
+        "block pill + fetch pill, got {lines:?}"
+    );
     assert!(
-        lines[0].starts_with("status") && lines[0].contains("[ blocked ]"),
+        pill_lines[0].starts_with("status") && pill_lines[0].contains("[ blocked ]"),
         "the block leads, keyed: {:?}",
-        lines[0]
+        pill_lines[0]
     );
     assert!(
-        lines[1].starts_with(&" ".repeat(KEY_W + KEY_GUTTER)),
-        "the fetch line indents to the value column: {:?}",
-        lines[1]
+        pill_lines[1].starts_with(&" ".repeat(KEY_W + KEY_GUTTER)),
+        "the fetch pill indents to the value column: {:?}",
+        pill_lines[1]
     );
     assert!(
-        lines[1].trim_start().starts_with("[ rate limited ]"),
+        pill_lines[1].trim_start().starts_with("[ rate limited ]"),
         "the fetch pill opens its own line: {:?}",
-        lines[1]
+        pill_lines[1]
     );
 
-    // The glue this file could not see before: no segment may touch its
-    // neighbour. Every `]` and every countdown is followed by a real gap.
+    // No segment may touch its neighbour, and every line survives the 52-cell
+    // pane — hint lines included (they word-wrap, so the wrap must actually fit).
     for l in &lines {
         assert!(!l.contains("]["), "pills must not abut each other: {l:?}");
         assert!(!l.contains("s["), "a countdown must not abut a pill: {l:?}");
-    }
-
-    // Each line has to survive the narrowest pane the layout builds: an 80-col
-    // terminal yields a 24-cell selector, leaving 52 inner cells here.
-    for l in &lines {
         assert!(
             l.chars().count() <= 52,
             "line clips at 80 cols ({} cells): {l:?}",
@@ -362,6 +373,7 @@ fn rate_limited_suffix_counts_the_retry() {
             refresh_fail: 0,
         },
         kick_block: None,
+        diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
         ls.iter()
@@ -375,8 +387,8 @@ fn rate_limited_suffix_counts_the_retry() {
             .join("\n")
     };
 
-    assert!(text(status_lines(&profile, &header(7))).contains("7th retry in"));
-    let bare = text(status_lines(&profile, &header(0)));
+    assert!(text(status_lines(&profile, &header(7), 120)).contains("7th retry in"));
+    let bare = text(status_lines(&profile, &header(0), 120));
     assert!(bare.contains("retry in"));
     assert!(
         !bare.contains("th retry"),
@@ -402,6 +414,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
             refresh_fail,
         },
         kick_block: None,
+        diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
         ls.iter()
@@ -416,7 +429,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
     };
 
     // No failures: the plain cached row, counting down to a usage refresh.
-    let healthy = text(status_lines(&profile, &header(0)));
+    let healthy = text(status_lines(&profile, &header(0), 120));
     assert!(healthy.contains("cached"), "got {healthy:?}");
     assert!(healthy.contains("refresh in"));
     assert!(
@@ -426,7 +439,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
 
     // Failing: the pill names the cause and the countdown becomes a retry
     // ordinal, since it now leads to the next REFRESH attempt, not a poll.
-    let failing = text(status_lines(&profile, &header(3)));
+    let failing = text(status_lines(&profile, &header(3), 120));
     assert!(failing.contains("auth failing"), "got {failing:?}");
     assert!(failing.contains("3rd retry in"), "got {failing:?}");
     assert!(
@@ -443,7 +456,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
 #[test]
 fn a_streak_pill_turns_red_only_once_it_is_stuck() {
     let pill_style = |profile: &Profile, header: &HeaderState| {
-        status_lines(profile, header)
+        status_lines(profile, header, 120)
             .iter()
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains("rate limited") || s.content.contains("auth failing"))
@@ -456,6 +469,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
         tick: 0,
         streaks,
         kick_block: None,
+        diag: DiagFlags::default(),
     };
 
     for (status, axis) in [
@@ -517,6 +531,7 @@ fn spent_skipped_account_names_its_reset() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        diag: DiagFlags::default(),
     };
     let with_window = |util: f64| {
         let mut p = crate::testutil::blank_profile("a");
@@ -531,7 +546,7 @@ fn spent_skipped_account_names_its_reset() {
         p
     };
 
-    let spent = text(status_lines(&with_window(100.0), &header));
+    let spent = text(status_lines(&with_window(100.0), &header, 120));
     assert!(
         spent.contains("[ spent ]") && spent.contains("resets in"),
         "a spent skipped account renders a pill naming its reset: {spent}"
@@ -541,7 +556,7 @@ fn spent_skipped_account_names_its_reset() {
         "must not freeze at a stale 0s: {spent}"
     );
 
-    let below = text(status_lines(&with_window(50.0), &header));
+    let below = text(status_lines(&with_window(50.0), &header, 120));
     assert!(
         below.contains("up to date"),
         "a below-cap idle account with no scheduled refresh is up to date: {below}"
@@ -621,4 +636,171 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
     let bar = legacy.iter().find(|s| s.label == "extra").unwrap();
     assert_eq!(bar.trailing, "$4.87 / $50.00");
     assert!(bar.amount.is_empty());
+}
+
+// ── diagnostic hints ──────────────────────────────────────────────────────────
+//
+// Each degraded/misconfigured state maps to a `└` fix line naming WHAT is wrong
+// and HOW to fix it, varying with config. The flagship is the kick-block split:
+// a switch-grade block reads differently under `auto_start` on vs off.
+
+/// The flagship (state, config) → hint divergence: a switch-grade kick block on
+/// an `auto_start` account is reassurance (clauth re-tests each poll and it
+/// clears itself), on a manual one it names the fix (enable auto-start). The two
+/// copies MUST differ — collapsing them to one string is the mutation this guards.
+#[test]
+fn kick_hint_diverges_on_auto_start() {
+    let on = diag_fix(UsageDiag::KickSwitchGrade { auto_start: true }, "a");
+    let off = diag_fix(UsageDiag::KickSwitchGrade { auto_start: false }, "a");
+    assert_ne!(on, off, "the auto_start split must change the copy");
+    assert_eq!(
+        on,
+        "clauth is re-testing periodically, clears when claude code unblocks"
+    );
+    assert_eq!(off, "won't recover with auto-start off, enable it");
+    // A non-switch-grade burst is neither — low-urgency backoff, no chain switch.
+    assert_eq!(
+        diag_fix(UsageDiag::KickBurst, "a"),
+        "short burst limit, backing off"
+    );
+}
+
+/// The auth-broken fix names the exact re-login command for THIS profile, so the
+/// account name has to thread through (a generic "re-login" wouldn't).
+#[test]
+fn auth_broken_hint_names_the_profile() {
+    assert_eq!(
+        diag_fix(UsageDiag::AuthBroken, "kerry"),
+        "re-login with clauth login kerry"
+    );
+}
+
+/// The divergence must reach the rendered row, not just the pure formatter: drive
+/// the real `status_lines` dispatch (a kick pill + its `└`) with `auto_start`
+/// flipped and read the copy back — a fix that hard-coded one arm reds here too.
+#[test]
+fn status_lines_renders_the_auto_start_divergence() {
+    use crate::usage::KickBlock;
+    let now = now_epoch_secs();
+    let joined = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let render = |auto_start: bool| {
+        let mut profile = crate::testutil::blank_profile("a");
+        profile.fetch_status = Some(FetchStatus::Fresh);
+        joined(status_lines(
+            &profile,
+            &HeaderState {
+                activity: ProfileActivity::Idle,
+                next_refresh_ms: Some(now_ms() + 90_000),
+                tick: 0,
+                streaks: StreakCounts::default(),
+                kick_block: Some(KickBlock {
+                    streak: 2,
+                    rejected: true,
+                    until: Some(now + 4 * 60 * 60),
+                    next_retry: now + 30,
+                }),
+                diag: DiagFlags {
+                    auto_start,
+                    ..DiagFlags::default()
+                },
+            },
+            120,
+        ))
+    };
+    assert!(render(true).contains("clauth is re-testing periodically"));
+    assert!(render(false).contains("won't recover with auto-start off"));
+}
+
+/// A DANGER `uncapped` state outranks a spent budget on the same account — an
+/// uncapped ceiling can't be "raised to keep serving", so it takes the pill and
+/// suppresses the budget-spent one (the two never render together).
+#[test]
+fn uncapped_outranks_budget_spent_in_the_status_block() {
+    let joined = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Fresh);
+    let out = joined(status_lines(
+        &profile,
+        &HeaderState {
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 90_000),
+            tick: 0,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            diag: DiagFlags {
+                spend_uncapped: true,
+                budget_spent: true,
+                ..DiagFlags::default()
+            },
+        },
+        120,
+    ));
+    assert!(out.contains("[ uncapped ]") && out.contains("spend runs past the ceiling"));
+    assert!(
+        !out.contains("extra usage spent"),
+        "uncapped must suppress the extra-usage-spent pill: {out}"
+    );
+}
+
+/// Dead-first: an auth-broken account can't serve regardless of a standing kick
+/// block or spend state, so only the `[ auth broken ]` pill + its re-login hint
+/// render — the lesser pills are suppressed (mirrors `blocked_reason`'s ranking).
+#[test]
+fn auth_broken_suppresses_the_lesser_pills() {
+    use crate::usage::KickBlock;
+    let now = now_epoch_secs();
+    let joined = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Cached);
+    let out = joined(status_lines(
+        &profile,
+        &HeaderState {
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 90_000),
+            tick: 0,
+            streaks: StreakCounts {
+                rate_limit: 0,
+                refresh_fail: 3,
+            },
+            kick_block: Some(KickBlock {
+                streak: 2,
+                rejected: true,
+                until: Some(now + 4 * 60 * 60),
+                next_retry: now + 30,
+            }),
+            diag: DiagFlags {
+                auth_broken: true,
+                spend_uncapped: true,
+                ..DiagFlags::default()
+            },
+        },
+        120,
+    ));
+    assert!(
+        out.contains("[ auth broken ]") && out.contains("re-login with clauth login a"),
+        "the dead login leads: {out}"
+    );
+    assert!(
+        !out.contains("[ blocked ]") && !out.contains("[ uncapped ]"),
+        "kick + spend pills are suppressed on a dead login: {out}"
+    );
+    assert!(
+        !out.contains("auth failing"),
+        "the confirmed pill supersedes the transient refresh-fail swap: {out}"
+    );
 }

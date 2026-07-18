@@ -122,6 +122,21 @@ fn budget_spent(usage: Option<&crate::usage::UsageInfo>, budget_on: bool, ceilin
     })
 }
 
+/// [`budget_spent`] gated the way [`blocked_reason`] gates it: only a member with
+/// NO free 5h quota (a live window at/over its threshold) is BLOCKED by a spent
+/// budget — one with headroom serves for free and the walk PREFERS it, never
+/// consulting `budget_spent`, so a raw read would claim a block the engine never
+/// acts on. The Usage-tab diagnostic reads THIS, not raw `budget_spent`, to hold
+/// the render-only invariant a hint shares with `blocked_reason`.
+pub(crate) fn budget_spent_blocking(config: &AppConfig, profile: &Profile) -> bool {
+    live_five_hour(profile).is_some_and(|w| w.utilization >= threshold_for(profile))
+        && budget_spent(
+            profile.usage.as_ref(),
+            config.state.spend_budget_switching,
+            profile.max_auto_spend.unwrap_or(0.0),
+        )
+}
+
 /// Whether this member's live config can bill with nothing stopping it: armed to
 /// spend, but told to stay on the account once the budget runs out, and no free
 /// parking spot to be sent to instead. `max_auto_spend` then bounds only when
@@ -179,7 +194,7 @@ fn weekly_blocked_info(info: &crate::usage::UsageInfo, now_secs: i64, weekly_pct
 }
 
 /// [`weekly_blocked_info`] over a profile's own usage snapshot.
-fn weekly_blocked(profile: &Profile, weekly_pct: f64) -> bool {
+pub(crate) fn weekly_blocked(profile: &Profile, weekly_pct: f64) -> bool {
     profile
         .usage
         .as_ref()

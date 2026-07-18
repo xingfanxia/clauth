@@ -949,7 +949,7 @@ fn kick_retry_due(block: Option<&KickBlock>, now_secs: i64) -> bool {
 /// at least two consecutive kicks, with the advertised ceiling still ahead. A
 /// single header-less burst 429 gets the pill and the backoff but never moves
 /// the chain.
-fn kick_block_switch_grade(block: &KickBlock, now_secs: i64) -> bool {
+pub(crate) fn kick_block_switch_grade(block: &KickBlock, now_secs: i64) -> bool {
     block.rejected && block.streak >= 2 && block.until.is_some_and(|u| now_secs < u)
 }
 

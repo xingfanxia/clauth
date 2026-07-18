@@ -14,19 +14,44 @@ use super::super::app::App;
 use super::super::theme;
 use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
 use super::panes::{
-    draw_profile_selector, key_cell, section_box, section_box_verbatim, selector_width,
+    draw_profile_selector, help_tooltip_lines, key_cell, section_box, section_box_verbatim,
+    selector_width,
 };
 use crate::format::plan_label;
 use crate::profile::Profile;
 use crate::providers::StatRowKind;
 use crate::usage::{
     ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, StreakCounts, UsageWindow, WindowDollars,
-    ideal_pace_pct, is_stuck_streak, now_epoch_secs, now_ms,
+    ideal_pace_pct, is_stuck_streak, kick_block_switch_grade, now_epoch_secs, now_ms,
 };
 
 const KEY_W: usize = 8;
 /// Fixed gap between the padded key and the value column (house standard).
 const KEY_GUTTER: usize = 2;
+
+/// Config-derived diagnostic flags for the shown profile, gathered under the
+/// config guard in [`draw_usage_detail`] so [`status_lines`] stays lock-free.
+/// Each maps to a `└` fix hint (see [`diag_fix`]); render-only, no decision
+/// consumes them — the same invariant `fallback::blocked_reason` holds.
+#[derive(Clone, Copy, Default)]
+struct DiagFlags {
+    /// AUTH-1 quarantine (`AppConfig::is_auth_broken`).
+    auth_broken: bool,
+    /// Opted into auto-start — flips the kick-block fix: an auto_start account
+    /// self-recovers (7bbeae4 re-tests each poll on a live window), a manual one
+    /// never re-tests and must be toggled on.
+    auto_start: bool,
+    /// 7d window at/over the hard cap (`fallback::weekly_blocked` at
+    /// `WEEKLY_HARD_BLOCK_PCT`).
+    weekly_hard: bool,
+    /// Billing member out of free 5h quota AND over its `max_auto_spend` budget
+    /// (`fallback::budget_spent_blocking` — gated on 5h-exhaustion exactly like
+    /// `blocked_reason`, so the hint never claims a block the engine skips).
+    budget_spent: bool,
+    /// Armed to spend with nothing bounding it (`fallback::spend_is_uncapped`) —
+    /// the DANGER config warning. Outranks `budget_spent` when both hold.
+    spend_uncapped: bool,
+}
 
 /// Runtime state gathered once under locks; keeps line builders lock-free.
 struct HeaderState {
@@ -41,6 +66,8 @@ struct HeaderState {
     /// rejecting the 5h auto-start kick. Orthogonal to `fetch_status` — `/usage`
     /// can stay Fresh straight through the outage — so it earns its own pill.
     kick_block: Option<KickBlock>,
+    /// Config-derived diagnostic flags driving the `└` fix hints.
+    diag: DiagFlags,
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -113,6 +140,23 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .copied()
             .unwrap_or_default(),
         kick_block: kick_blocks.get(profile.name.as_str()).copied(),
+        // Config-dependent predicates, computed under the live config guard so
+        // the lock-free line builders below just read booleans. Reuses the
+        // fallback engine's own predicates (never a second opinion), the same
+        // reason `blocked_reason` reads the walk's.
+        diag: {
+            let ceiling = profile.max_auto_spend.unwrap_or(0.0);
+            DiagFlags {
+                auth_broken: cfg.is_auth_broken(&profile.name),
+                auto_start: profile.auto_start,
+                weekly_hard: crate::fallback::weekly_blocked(
+                    profile,
+                    crate::fallback::WEEKLY_HARD_BLOCK_PCT,
+                ),
+                budget_spent: crate::fallback::budget_spent_blocking(&cfg, profile),
+                spend_uncapped: crate::fallback::spend_is_uncapped(&cfg, ceiling),
+            }
+        },
     };
 
     let show_estimates = cfg.state.show_estimates;
@@ -137,7 +181,7 @@ fn build_usage_lines(
     show_pace: bool,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.extend(header_lines(profile, header));
+    lines.extend(header_lines(profile, header, inner_w));
     lines.push(Line::from(""));
 
     // Api-key/provider accounts (recognised or generic) render via the third-party
@@ -658,7 +702,7 @@ fn bar_spans(
     spans
 }
 
-fn header_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
+fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Line<'static>> {
     let plan = profile
         .third_party_usage
         .as_ref()
@@ -681,17 +725,20 @@ fn header_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
         key_span("plan"),
         Span::styled(plan, theme::body()),
     ])];
-    lines.extend(status_lines(profile, header));
+    lines.extend(status_lines(profile, header, inner_w));
     lines
 }
 
-/// The `status` row: a kick-429 block line on top when one is live, then the
-/// fetch state / refresh countdown. Two lines, because at full spread
-/// (`[ rate limited ]  3rd retry in 14s  [ blocked ]  lifts within 4h 37m`) one
-/// line runs 78 cells — the detail pane clears that only past a ~116-column
-/// terminal, and this `Paragraph` has no wrap, so the ceiling silently clipped
-/// off.
-fn status_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
+/// The `status` block: dead-first diagnostic pills (auth-broken → kick → spend),
+/// then the fetch state / refresh countdown, each carrying a `└` fix hint that
+/// names what's wrong and how to fix it (config-aware; see [`diag_fix`]). Kept
+/// multi-line because at full spread one line runs ~78 cells — the detail pane
+/// clears that only past a ~116-column terminal, and this `Paragraph` has no
+/// wrap, so a single row silently clipped the ceiling off.
+///
+/// Render-only: reads the fallback engine's own predicates via `header.diag`,
+/// never a second opinion, so a hint can't claim a state the engine won't act on.
+fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Line<'static>> {
     if !matches!(header.activity, ProfileActivity::Idle) {
         let frame = spinner_frame(header.tick);
         let verb = activity_verb(header.activity);
@@ -701,28 +748,77 @@ fn status_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
         ])];
     }
 
+    let now = now_epoch_secs();
+    let w = inner_w as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // Whether the `status` key cell has been emitted; every row after the first
+    // indents to the value column so the key never repeats down the block.
+    let mut key_used = false;
 
-    // Kick-429 block leads, and is additive to whatever the fetch state says:
-    // `/usage` can stay Fresh straight through a messages-limiter outage, so the
-    // fetch line below reads healthy while the 5h window silently never opens.
-    // Same amber→red escalation as the other streak pills; the suffix names the
-    // limiter's advertised ceiling, an upper bound (it has relented early).
-    if let Some(block) = header.kick_block {
+    // 1. Auth-broken leads and DOMINATES (dead-first): a revoked login can't
+    //    serve at all, so a kick block or spend state on it is moot — re-login is
+    //    the only action, and `blocked_reason` ranks it first for the same reason.
+    //    The lesser pills below are suppressed while it stands.
+    let auth_dead = header.diag.auth_broken;
+    if auth_dead {
+        lines.push(diag_pill(&mut key_used, "auth broken", theme::danger()));
+        lines.extend(help_tooltip_lines(
+            &diag_fix(UsageDiag::AuthBroken, &profile.name),
+            w,
+        ));
+    }
+
+    // 2. Kick-429 block, additive to whatever the fetch state says: `/usage` can
+    //    stay Fresh straight through a messages-limiter outage, so the fetch line
+    //    below reads healthy while the 5h window silently never opens. Same
+    //    amber→red escalation as the other streak pills; the suffix names the
+    //    limiter's advertised ceiling, an upper bound (it has relented early).
+    if !auth_dead && let Some(block) = header.kick_block {
         let mut spans = vec![
-            key_span("status"),
+            status_key_cell(&mut key_used),
             Span::styled("[ ", theme::dim()),
             Span::styled("blocked", streak_style(block.streak)),
             Span::styled(" ]", theme::dim()),
         ];
         if let Some(until) = block.until {
-            let left = until.saturating_sub(now_epoch_secs());
+            let left = until.saturating_sub(now);
             spans.push(Span::styled(
                 format!("  lifts within {}", crate::usage::humanize_duration(left)),
                 theme::faint(),
             ));
         }
         lines.push(Line::from(spans));
+        // The flagship divergence: a switch-grade block on an auto_start account
+        // self-recovers (re-tested each poll on a live window), a manual one sits
+        // until the ceiling; a non-switch-grade burst is low-urgency backoff.
+        let diag = if kick_block_switch_grade(&block, now) {
+            UsageDiag::KickSwitchGrade {
+                auto_start: header.diag.auto_start,
+            }
+        } else {
+            UsageDiag::KickBurst
+        };
+        lines.extend(help_tooltip_lines(&diag_fix(diag, &profile.name), w));
+    }
+
+    // 3. Spend: uncapped (DANGER config) outranks a spent budget (WARN); the two
+    //    never render together — an uncapped ceiling makes "raise it" meaningless.
+    if !auth_dead && header.diag.spend_uncapped {
+        lines.push(diag_pill(&mut key_used, "uncapped", theme::danger()));
+        lines.extend(help_tooltip_lines(
+            &diag_fix(UsageDiag::SpendUncapped, &profile.name),
+            w,
+        ));
+    } else if !auth_dead && header.diag.budget_spent {
+        lines.push(diag_pill(
+            &mut key_used,
+            "extra usage spent",
+            theme::warning(),
+        ));
+        lines.extend(help_tooltip_lines(
+            &diag_fix(UsageDiag::BudgetSpent, &profile.name),
+            w,
+        ));
     }
 
     let countdown = header.next_refresh_ms.map(|next| {
@@ -730,11 +826,10 @@ fn status_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
         format!("{secs}s")
     });
 
-    // The fetch line takes the key cell only when no block line claimed it.
-    let mut spans = vec![match lines.is_empty() {
-        true => key_span("status"),
-        false => Span::raw(" ".repeat(KEY_W + KEY_GUTTER)),
-    }];
+    // 4. The fetch line, keyed only if no pill above claimed the key cell. A `└`
+    //    fix rides beneath the arms that carry one.
+    let mut spans = vec![status_key_cell(&mut key_used)];
+    let mut fetch_hint: Option<UsageDiag> = None;
     match profile.fetch_status {
         Some(FetchStatus::Failed) => {
             spans.extend([
@@ -753,8 +848,9 @@ fn status_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
             // would say the chain has stopped rotating. `auth failing` claims no
             // more than we know: the refresh is not going through, and the
             // endpoint has not confirmed the token is dead (that path
-            // quarantines instead and shows the `×` marker).
-            let failing = header.streaks.refresh_fail > 0;
+            // quarantines instead — the leading `auth broken` pill owns it, so
+            // suppress the transient swap once it's confirmed).
+            let failing = header.streaks.refresh_fail > 0 && !auth_dead;
             let label = if failing { "auth failing" } else { "cached" };
             let style = if failing {
                 streak_style(header.streaks.refresh_fail)
@@ -777,6 +873,13 @@ fn status_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
                 };
                 spans.push(Span::styled(suffix, theme::faint()));
             }
+            // Set unconditionally; the emission below suppresses it under
+            // auth-broken (the leading pill carries the only actionable hint).
+            fetch_hint = Some(if failing {
+                UsageDiag::RefreshFailing
+            } else {
+                UsageDiag::Stale
+            });
         }
         Some(FetchStatus::RateLimited) => {
             spans.extend([
@@ -795,6 +898,13 @@ fn status_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
                 };
                 spans.push(Span::styled(suffix, theme::faint()));
             }
+            // A deep slot the daemon itself distrusts (#40) names the throttle; a
+            // shallow one is merely serving old numbers.
+            fetch_hint = Some(if is_stuck_streak(header.streaks.rate_limit) {
+                UsageDiag::Stuck429
+            } else {
+                UsageDiag::Stale
+            });
         }
         _ => match countdown {
             // A scheduled refresh is work lined up — the cloudy-tui `queued`
@@ -813,17 +923,25 @@ fn status_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
                 let resumes = profile
                     .usage
                     .as_ref()
-                    .and_then(|u| crate::usage::spent_resume_in_secs(u, now_epoch_secs()));
+                    .and_then(|u| crate::usage::spent_resume_in_secs(u, now));
                 match resumes {
-                    Some(secs) => spans.extend([
-                        Span::styled("[ ", theme::dim()),
-                        Span::styled("spent", theme::warning().add_modifier(Modifier::BOLD)),
-                        Span::styled(" ]", theme::dim()),
-                        Span::styled(
-                            format!("  resets in {}", crate::usage::humanize_duration(secs)),
-                            theme::faint(),
-                        ),
-                    ]),
+                    Some(secs) => {
+                        spans.extend([
+                            Span::styled("[ ", theme::dim()),
+                            Span::styled("spent", theme::warning().add_modifier(Modifier::BOLD)),
+                            Span::styled(" ]", theme::dim()),
+                            Span::styled(
+                                format!("  resets in {}", crate::usage::humanize_duration(secs)),
+                                theme::faint(),
+                            ),
+                        ]);
+                        // Only the weekly cap earns the teach — the domain fact
+                        // that a live-looking 5h window can't serve while the week
+                        // is spent. A 5h-only spend is self-evident from the reset.
+                        if header.diag.weekly_hard {
+                            fetch_hint = Some(UsageDiag::WeeklyHard);
+                        }
+                    }
                     // Nothing pending and nothing maxed — the `idle` dot, which
                     // differs from `queued` above by color alone, so the label
                     // carries the meaning on a monochrome read.
@@ -836,7 +954,93 @@ fn status_lines(profile: &Profile, header: &HeaderState) -> Vec<Line<'static>> {
         },
     }
     lines.push(Line::from(spans));
+    // Suppressed under auth-broken: the leading pill's re-login hint is the only
+    // actionable one, so a dead-token account's fetch line stays pill-only.
+    if let Some(diag) = fetch_hint.filter(|_| !auth_dead) {
+        lines.extend(help_tooltip_lines(&diag_fix(diag, &profile.name), w));
+    }
     lines
+}
+
+/// The `status` key cell for the first diagnostic/fetch row; blank padding for
+/// every row after it, so the key never repeats down the status block.
+fn status_key_cell(used: &mut bool) -> Span<'static> {
+    if *used {
+        Span::raw(" ".repeat(KEY_W + KEY_GUTTER))
+    } else {
+        *used = true;
+        key_span("status")
+    }
+}
+
+/// A `[ label ]` diagnostic pill line, keyed like the fetch row. `label_style`
+/// carries the severity; the `└` fix beneath stays faint (§139), so the pill is
+/// the WHAT and the sub-line is the FIX.
+fn diag_pill(used: &mut bool, label: &'static str, label_style: Style) -> Line<'static> {
+    Line::from(vec![
+        status_key_cell(used),
+        Span::styled("[ ", theme::dim()),
+        Span::styled(label, label_style.add_modifier(Modifier::BOLD)),
+        Span::styled(" ]", theme::dim()),
+    ])
+}
+
+/// A detected Usage-tab diagnostic state paired with the config context that
+/// shapes its fix. Pure input to [`diag_fix`]; render-only, no decision consumes
+/// it (mirrors `fallback::blocked_reason`).
+#[derive(Clone, Copy)]
+enum UsageDiag {
+    /// Switch-grade kick block. `auto_start` flips the fix (the flagship
+    /// divergence): an auto_start account self-recovers, a manual one won't.
+    KickSwitchGrade { auto_start: bool },
+    /// Burst (non-switch-grade) kick 429 — pill + backoff only, no chain switch.
+    KickBurst,
+    /// Deep-slot stuck-429 distrust (#40).
+    Stuck429,
+    /// AUTH-1 quarantine.
+    AuthBroken,
+    /// 7d window at/over the hard cap.
+    WeeklyHard,
+    /// Billing member that spent its `max_auto_spend` budget.
+    BudgetSpent,
+    /// Armed to spend with no cap and no parking spot (DANGER).
+    SpendUncapped,
+    /// Serving last-known numbers (cached / endpoint-429).
+    Stale,
+    /// Transient (non-quarantining) refresh failure.
+    RefreshFailing,
+}
+
+/// The `└` fix text for a diagnostic state: what's wrong and the concrete fix,
+/// varying with config. The `KickSwitchGrade` `auto_start` split is the flagship
+/// (state, config) → hint divergence — an auto_start account self-recovers on
+/// the poll-paced re-test (7bbeae4), a manual one sits until the ceiling.
+fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
+    match diag {
+        UsageDiag::KickSwitchGrade { auto_start: true } => {
+            "clauth is re-testing periodically, clears when claude code unblocks".to_string()
+        }
+        UsageDiag::KickSwitchGrade { auto_start: false } => {
+            "won't recover with auto-start off, enable it".to_string()
+        }
+        UsageDiag::KickBurst => "short burst limit, backing off".to_string(),
+        UsageDiag::Stuck429 => {
+            "usage endpoint throttling, numbers are old and draining via backoff".to_string()
+        }
+        UsageDiag::AuthBroken => format!("re-login with clauth login {profile_name}"),
+        UsageDiag::WeeklyHard => {
+            "weekly quota spent, the 5h window won't help until the weekly reset".to_string()
+        }
+        UsageDiag::BudgetSpent => "raise max_auto_spend to keep serving".to_string(),
+        UsageDiag::SpendUncapped => {
+            "spend runs past the ceiling, switch off all when spent or add a last-resort"
+                .to_string()
+        }
+        UsageDiag::Stale => "showing last-known numbers, last fetch didn't land".to_string(),
+        UsageDiag::RefreshFailing => {
+            "token refresh failing but not fatal yet, retrying".to_string()
+        }
+    }
 }
 
 /// Pill style for a consecutive-failure streak. Amber while it may still be a
