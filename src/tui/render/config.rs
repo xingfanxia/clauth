@@ -212,9 +212,9 @@ fn draw_settings_rows(
         .trim()
         .is_empty();
     let (type_value, type_style) = if is_api {
-        ("API", theme::accent())
+        ("api", theme::accent())
     } else {
-        ("OAuth", theme::accent())
+        ("oauth", theme::accent())
     };
 
     let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
@@ -260,9 +260,9 @@ fn draw_settings_rows(
         line_idx += 1;
         if selected
             && !is_editing
-            && let Some(text) = row_hint(*row, !snap.login_is_oauth)
+            && let Some(text) = row_hint(*row, snap)
         {
-            let hint = help_tooltip_lines(text, inner.width as usize);
+            let hint = help_tooltip_lines(&text, inner.width as usize);
             line_idx += hint.len() as u16;
             lines.extend(hint);
         }
@@ -333,41 +333,46 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
     }
 }
 
-/// Inline help for rows whose labels don't self-describe. `api_login` picks the
-/// login/log-out wording: an API account re-enters a base url + api key, an OAuth
-/// account mints tokens through the browser. It's the rows' credential typing,
-/// not the base-url buffer — the copy has to name what ⏎ really does.
-fn row_hint(row: ConfigRow, api_login: bool) -> Option<&'static str> {
-    match row {
-        ConfigRow::BaseUrl => {
-            Some("api endpoint for this account; leave empty for claude.ai OAuth")
+/// Inline help for rows whose labels don't self-describe, phrased for the row's
+/// current value so it re-explains itself as the value changes. `login_is_oauth`
+/// (not the base-url buffer) picks the login/log-out wording — the copy has to
+/// name what ⏎ really does — while `auto_start` / `base_url` flip on their own
+/// value.
+fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
+    let api_login = !snap.login_is_oauth;
+    let hint = match row {
+        ConfigRow::BaseUrl if snap.base_url.trim().is_empty() => {
+            "leave empty for a claude.ai account, or set an api endpoint"
         }
-        ConfigRow::ApiKey => Some("x-api-key sent to the custom endpoint"),
+        ConfigRow::BaseUrl => "the api endpoint this account calls instead of claude.ai",
+        ConfigRow::ApiKey => "api key sent to the endpoint above",
         // The value grammar (`space cycle · ↵ custom`) already lives in the footer.
-        ConfigRow::Model => Some("default model for this account"),
-        ConfigRow::OpusModel => Some("what the `opus` alias resolves to (full model id)"),
-        ConfigRow::SonnetModel => Some("what the `sonnet` alias resolves to (full model id)"),
-        ConfigRow::HaikuModel => Some("what the `haiku` alias resolves to (full model id)"),
-        ConfigRow::SubagentModel => Some("model forced for every subagent in this account"),
-        ConfigRow::EnvEntry(_) => Some("custom env var merged into settings.json while active"),
-        ConfigRow::EnvAdd => Some("add a custom settings.json env var to this account"),
-        ConfigRow::AutoStart => Some("launch a session on idle to arm the 5h window"),
-        ConfigRow::ModelOverrideAdd => {
-            Some("pin what an alias resolves to, or force the subagent model")
+        ConfigRow::Model => "default model for this account",
+        ConfigRow::OpusModel => "what the opus alias resolves to (full model id)",
+        ConfigRow::SonnetModel => "what the sonnet alias resolves to (full model id)",
+        ConfigRow::HaikuModel => "what the haiku alias resolves to (full model id)",
+        ConfigRow::SubagentModel => "model forced for every subagent in this account",
+        ConfigRow::EnvEntry(_) => "env var set for claude code while this account is active",
+        ConfigRow::EnvAdd => "add an env var for this account",
+        ConfigRow::AutoStart if snap.auto_start => {
+            "starts a throwaway session when idle so the 5h window counts"
         }
-        ConfigRow::Login if api_login => Some("re-enter the base url + api key for this account"),
-        ConfigRow::Login => Some("browser OAuth login; mints fresh tokens for this account"),
+        ConfigRow::AutoStart => "never starts a session on its own",
+        ConfigRow::ModelOverrideAdd => "pin what an alias resolves to, or force the subagent model",
+        ConfigRow::Login if api_login => "re-enter the base url + api key for this account",
+        ConfigRow::Login => "browser OAuth login; mints fresh tokens for this account",
         ConfigRow::DeleteCreds if api_login => {
-            Some("clears the stored api key; keeps the account and its settings")
+            "clears the stored api key; keeps the account and its settings"
         }
         ConfigRow::DeleteCreds => {
-            Some("clears the stored OAuth login; keeps the account and its settings")
+            "clears the stored OAuth login; keeps the account and its settings"
         }
         ConfigRow::Delete => {
-            Some("deletes the account and everything stored for it, usage history included")
+            "deletes the account and everything stored for it, usage history included"
         }
-        ConfigRow::Name | ConfigRow::Create => None,
-    }
+        ConfigRow::Name | ConfigRow::Create => return None,
+    };
+    Some(hint.to_string())
 }
 
 fn detail_row(

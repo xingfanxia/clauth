@@ -108,3 +108,24 @@ fn action_rows_bold_on_select_and_keep_their_color() {
     assert!(focused.spans[1].style.add_modifier.contains(Modifier::BOLD));
     assert_eq!(focused.spans[1].style.fg, theme::success().fg);
 }
+
+/// Setup hints follow their row's current value — auto-start flips on/off, the
+/// base-url hint flips between the claude.ai and custom-endpoint phrasings.
+#[test]
+fn setup_hints_follow_the_row_value() {
+    let mut snap = Snap::blank("a");
+
+    snap.auto_start = true;
+    let on = row_hint(ConfigRow::AutoStart, &snap).unwrap();
+    assert!(on.contains("throwaway session"), "{on}");
+    snap.auto_start = false;
+    let off = row_hint(ConfigRow::AutoStart, &snap).unwrap();
+    assert!(off.contains("never starts"), "{off}");
+
+    snap.base_url = String::new();
+    let empty = row_hint(ConfigRow::BaseUrl, &snap).unwrap();
+    assert!(empty.contains("claude.ai account"), "{empty}");
+    snap.base_url = "https://api.example.com".into();
+    let set = row_hint(ConfigRow::BaseUrl, &snap).unwrap();
+    assert!(set.contains("calls instead"), "{set}");
+}
