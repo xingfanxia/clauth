@@ -1315,3 +1315,19 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   always kept for session resume), bootstraps the proxy LaunchAgent, caption
   warns routed-but-not-serving; state re-read per panel open so any outside
   edit of the file is visible. Pure transforms unit-tested.
+
+## 2026-07-18 (TSW-1) — timeout-semantics sweep (post-PROX-2 class hunt)
+
+- Swept all 11 timeout/deadline sites in clauth + ccsbar + ccu against the
+  pinned ureq-3 fact (recv_response counts through the body). Fixed
+  (8083d5f): mcp serve() gc moved off the initialize path (BUG — 3s probe
+  killed healthy servers while gc deleted multi-GB stale isolated trees);
+  claude.rs link/force_link Keychain write now precedes the symlink swap
+  (ordering BUG — failed ACL-prompt write stranded link=new/Keychain=old);
+  loopback OAuth catcher 10s→60s (could drop the real callback + its
+  single-use code); pricing 15s→60s, status feed 10s→30s (through-body
+  semantics on multi-hundred-KB fetches); update.rs caution comment (dead
+  FORK_BUILD code, exact incident shape if re-enabled). ccsbar (8285a47):
+  truncated daemon reply now surfaces as connectedNoReply instead of
+  misreading as unreachable → CLI double-apply. Verified SAFE: proxy client
+  socket, daemon socket, doctor, lock chain 25s/20s/30s, oauth AGENT, ccu.
