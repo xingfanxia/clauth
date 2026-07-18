@@ -372,6 +372,23 @@ pub(crate) struct AppState {
     /// threshold): the line protects the CHAIN — a wrong hop strands days.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) weekly_switch_threshold: Option<f64>,
+    /// Burn-aware floor: the lowest 5h utilization at which a projected switch
+    /// may fire (`burn_aware_switching` only). The projection replaces the
+    /// static threshold with "would cross 100% before the next poll", and on a
+    /// small window (Pro) the window-relative burn %/h reads high, so the
+    /// projection trips from well below 100 — this caps the wasted headroom at
+    /// `100 - floor` on every tier. `None` = [`DEFAULT_BURN_FLOOR_PCT`]. Read
+    /// through [`AppState::burn_switch_floor_pct`], which resets a hand-edited
+    /// out-of-band value to the default. Inert unless burn-aware is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) burn_switch_floor_pct: Option<f64>,
+    /// Burn-aware horizon cap (ms): the projection looks ahead by
+    /// `min(refresh_interval, this)` instead of the full refresh interval, so a
+    /// long poll cadence can't balloon the early-switch margin (it scales
+    /// linearly with the look-ahead). `None` = [`DEFAULT_BURN_HORIZON_MS`]. Read
+    /// through [`AppState::burn_horizon_cap_ms`]. Inert unless burn-aware is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) burn_horizon_cap_ms: Option<u64>,
 }
 
 impl AppState {
@@ -385,6 +402,24 @@ impl AppState {
         self.weekly_switch_threshold
             .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v))
             .unwrap_or(DEFAULT_WEEKLY_SWITCH_PCT)
+    }
+
+    /// The effective burn-aware floor, resetting an out-of-band hand-edit to the
+    /// default (same fail-safe reset-not-clamp rationale as
+    /// [`AppState::weekly_switch_threshold_pct`]).
+    pub(crate) fn burn_switch_floor_pct(&self) -> f64 {
+        self.burn_switch_floor_pct
+            .filter(|v| (MIN_BURN_FLOOR_PCT..=MAX_BURN_FLOOR_PCT).contains(v))
+            .unwrap_or(DEFAULT_BURN_FLOOR_PCT)
+    }
+
+    /// The effective burn-aware horizon cap (ms), resetting an out-of-band
+    /// hand-edit to the default. Shares the refresh-interval band since the cap
+    /// is only ever compared against — and floored by — the refresh interval.
+    pub(crate) fn burn_horizon_cap_ms(&self) -> u64 {
+        self.burn_horizon_cap_ms
+            .filter(|v| (MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS).contains(v))
+            .unwrap_or(DEFAULT_BURN_HORIZON_MS)
     }
 }
 
@@ -442,6 +477,27 @@ pub(crate) const MIN_WEEKLY_SWITCH_PCT: f64 = 50.0;
 /// hard-cap behavior (switch only once the API already refuses).
 pub(crate) const MAX_WEEKLY_SWITCH_PCT: f64 = 100.0;
 
+/// Default burn-aware floor (percent). 98 mirrors the weekly default: a safe
+/// backstop that never lets a projected switch waste more than 2% of the
+/// window, while the horizon cap does the common-case reclaiming. Tune up for
+/// tighter margins (more window used, small rate-limit risk), 100 = only ever
+/// switch at the cap.
+pub(crate) const DEFAULT_BURN_FLOOR_PCT: f64 = 98.0;
+
+/// Lowest configurable burn-aware floor. Below this the projection may switch
+/// so far from 100 that the poll-lag margin it exists to protect is gone.
+pub(crate) const MIN_BURN_FLOOR_PCT: f64 = 90.0;
+
+/// Highest configurable burn-aware floor — 100 makes the projection fire only
+/// once utilization is already at the cap.
+pub(crate) const MAX_BURN_FLOOR_PCT: f64 = 100.0;
+
+/// Default burn-aware horizon cap (60 s). Under the default 90 s cadence this
+/// shrinks the projected look-ahead below the full interval, reclaiming most of
+/// the early-switch margin while keeping a poll-lag cushion. Bounded by the
+/// refresh interval either way (`min(interval, cap)`).
+pub(crate) const DEFAULT_BURN_HORIZON_MS: u64 = 60_000;
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
@@ -463,6 +519,8 @@ impl Default for AppState {
             refresh_interval_ms: default_refresh_interval(),
             default_divergence: None,
             weekly_switch_threshold: None,
+            burn_switch_floor_pct: None,
+            burn_horizon_cap_ms: None,
         }
     }
 }
@@ -970,6 +1028,14 @@ fn load_app_state() -> Result<AppState> {
     // field stays unset so `skip_serializing_if` keeps omitting it.
     if state.weekly_switch_threshold.is_some() {
         state.weekly_switch_threshold = Some(state.weekly_switch_threshold_pct());
+    }
+    // Same on-disk normalization for the burn-aware tunables: an out-of-band
+    // hand-edit must not survive to the next save or a direct field read.
+    if state.burn_switch_floor_pct.is_some() {
+        state.burn_switch_floor_pct = Some(state.burn_switch_floor_pct());
+    }
+    if state.burn_horizon_cap_ms.is_some() {
+        state.burn_horizon_cap_ms = Some(state.burn_horizon_cap_ms());
     }
     Ok(state)
 }

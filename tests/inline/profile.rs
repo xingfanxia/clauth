@@ -1128,3 +1128,51 @@ fn reload_fingerprint_catches_a_non_newest_config_edit() {
         "an edit to a non-newest config.toml must still flip the fingerprint"
     );
 }
+
+// The burn-aware tunable accessors reset a hand-edited out-of-band value to the
+// default (fail-safe, like the weekly line) and keep an in-band one. An unset
+// field reads as the default so `skip_serializing_if` keeps omitting it.
+#[test]
+fn burn_switch_floor_pct_resets_out_of_band_and_keeps_in_band() {
+    let mut st = AppState::default();
+    assert_eq!(st.burn_switch_floor_pct(), DEFAULT_BURN_FLOOR_PCT);
+
+    st.burn_switch_floor_pct = Some(MIN_BURN_FLOOR_PCT - 1.0);
+    assert_eq!(
+        st.burn_switch_floor_pct(),
+        DEFAULT_BURN_FLOOR_PCT,
+        "below-band floor resets to the default, not clamped to the bound"
+    );
+    st.burn_switch_floor_pct = Some(99.0);
+    assert_eq!(st.burn_switch_floor_pct(), 99.0);
+}
+
+#[test]
+fn burn_horizon_cap_ms_resets_out_of_band_and_keeps_in_band() {
+    let mut st = AppState::default();
+    assert_eq!(st.burn_horizon_cap_ms(), DEFAULT_BURN_HORIZON_MS);
+
+    st.burn_horizon_cap_ms = Some(MIN_REFRESH_INTERVAL_MS - 1);
+    assert_eq!(st.burn_horizon_cap_ms(), DEFAULT_BURN_HORIZON_MS);
+    st.burn_horizon_cap_ms = Some(45_000);
+    assert_eq!(st.burn_horizon_cap_ms(), 45_000);
+}
+
+#[test]
+fn burn_tunables_round_trip_and_omit_when_unset() {
+    let on = AppState {
+        burn_switch_floor_pct: Some(99.0),
+        burn_horizon_cap_ms: Some(45_000),
+        ..AppState::default()
+    };
+    let rendered = toml::to_string_pretty(&on).expect("render");
+    let reparsed: AppState = toml::from_str(&rendered).expect("reparse");
+    assert_eq!(reparsed.burn_switch_floor_pct, Some(99.0));
+    assert_eq!(reparsed.burn_horizon_cap_ms, Some(45_000));
+
+    let off = toml::to_string_pretty(&AppState::default()).expect("render default");
+    assert!(
+        !off.contains("burn_switch_floor_pct") && !off.contains("burn_horizon_cap_ms"),
+        "unset burn tunables must be omitted, got:\n{off}"
+    );
+}

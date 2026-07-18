@@ -50,7 +50,17 @@ fn key_cell_is_uniform_width() {
 fn every_blurred_row_starts_its_value_at_the_shared_column() {
     let value_col = 2 + KEY_W + KEY_GUTTER;
     for r in GLOBAL_CONFIG_ROWS {
-        let line = line_text(&detail_row(r, false, toggles(), 60_000, 95.0, None, None));
+        let line = line_text(&detail_row(
+            r,
+            false,
+            toggles(),
+            60_000,
+            95.0,
+            98.0,
+            60_000,
+            None,
+            None,
+        ));
         let before: String = line.chars().take(value_col).collect();
         assert!(
             before.ends_with(&" ".repeat(KEY_GUTTER)),
@@ -162,6 +172,8 @@ fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
         toggles(),
         60_000,
         95.0,
+        98.0,
+        60_000,
         None,
         None,
     ));
@@ -179,6 +191,8 @@ fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
         off,
         60_000,
         95.0,
+        98.0,
+        60_000,
         None,
         None,
     ));
@@ -205,6 +219,8 @@ fn money_spent_dims_when_spend_budget_is_off() {
         toggles(), // spend_budget: false
         60_000,
         95.0,
+        98.0,
+        60_000,
         None,
         None,
     );
@@ -225,6 +241,8 @@ fn money_spent_dims_when_spend_budget_is_off() {
         on,
         60_000,
         95.0,
+        98.0,
+        60_000,
         None,
         None,
     ));
@@ -239,4 +257,34 @@ fn money_spent_hint_explains_inertness_when_spend_off() {
     let hint = row_hint(GlobalConfigRow::SwitchOffWhenBudgetSpent, None, toggles())
         .expect("an inert money-spent row still carries its reason");
     assert!(hint.contains("inert until spend budget"), "{hint}");
+}
+
+// ── burn floor / horizon dim while inert (burn-aware off) ─────────────────────
+
+/// Both burn-aware tunables gate a projection that never runs under static
+/// rotate mode, so they render as cloudy-tui disabled rows (whole content faint)
+/// while burn-aware is off, and become live cycles once it is on.
+#[test]
+fn burn_tunables_dim_when_burn_aware_is_off() {
+    for r in [GlobalConfigRow::BurnFloor, GlobalConfigRow::BurnHorizon] {
+        let dimmed = detail_row(r, false, toggles(), 60_000, 95.0, 98.0, 60_000, None, None);
+        assert!(
+            dimmed
+                .spans
+                .iter()
+                .all(|s| s.content.trim().is_empty() || s.style.fg == theme::faint().fg),
+            "{r:?} must render fully faint while burn-aware is off: {:?}",
+            dimmed.spans,
+        );
+
+        let mut on = toggles();
+        on.burn_aware = true;
+        let live = line_text(&detail_row(
+            r, true, on, 60_000, 95.0, 98.0, 60_000, None, None,
+        ));
+        assert!(
+            live.contains('['),
+            "{r:?} burn-aware on: live + focused brackets the active preset: {live}"
+        );
+    }
 }

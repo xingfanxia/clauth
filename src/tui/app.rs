@@ -240,6 +240,16 @@ pub(crate) const MODEL_PRESETS: [&str; 4] = ["opus", "sonnet", "haiku", "opuspla
 /// hard-cap behavior (switch only once the API already refuses).
 pub(crate) const WEEKLY_PRESETS: [f64; 4] = [90.0, 95.0, 98.0, 100.0];
 
+/// Presets for the burn-aware early-switch floor (percent). The projection may
+/// not switch below the chosen value, so wasted headroom is capped at
+/// `100 - floor`. Default 98 (see [`crate::profile::DEFAULT_BURN_FLOOR_PCT`]).
+pub(crate) const BURN_FLOOR_PRESETS: [f64; 4] = [97.0, 98.0, 99.0, 100.0];
+
+/// Presets for the burn-aware projection horizon cap (ms). The projection looks
+/// ahead by `min(refresh_interval, this)`; a shorter cap keeps the switch
+/// nearer 100. Default 60 s (see [`crate::profile::DEFAULT_BURN_HORIZON_MS`]).
+pub(crate) const BURN_HORIZON_PRESETS: [u64; 4] = [30_000, 45_000, 60_000, 90_000];
+
 /// One row on the program-wide Config tab. These back real persisted globals in
 /// [`AppState`] — no decorative toggles. ⏎/space cycles or flips in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +273,13 @@ pub(crate) enum GlobalConfigRow {
     /// follow-up b) — off by default, projects the ACTIVE profile's
     /// utilization ahead of the next poll instead of the static threshold.
     BurnAware,
+    /// Burn-aware early-switch floor (`AppState.burn_switch_floor_pct`) — space
+    /// cycles [`BURN_FLOOR_PRESETS`]. Dimmed + inert unless burn-aware is on.
+    BurnFloor,
+    /// Burn-aware projection horizon cap (`AppState.burn_horizon_cap_ms`) —
+    /// space cycles [`BURN_HORIZON_PRESETS`]. Dimmed + inert unless burn-aware
+    /// is on.
+    BurnHorizon,
     /// Opt-in master switch for real-money fallback
     /// (`AppState.spend_budget_switching`) — off by default. On, the chain may
     /// hop to a member whose subscription is spent but whose account still has
@@ -3476,7 +3493,7 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 4] = [
 // (weekly line, rotate mode), fallback halt (quota spent), then the spend block
 // (arm + money-spent halt). Related knobs sit together instead of interleaving
 // halt above detection.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 10] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 12] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
@@ -3484,6 +3501,8 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 10] = [
     GlobalConfigRow::PreemptiveRotation,
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
+    GlobalConfigRow::BurnFloor,
+    GlobalConfigRow::BurnHorizon,
     GlobalConfigRow::SwitchOffWhenSpent,
     GlobalConfigRow::SpendBudget,
     GlobalConfigRow::SwitchOffWhenBudgetSpent,
@@ -3540,6 +3559,18 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
+        // Inert while burn-aware is off (rendered dimmed): the floor/cap only
+        // shape the projection, which the static path never runs.
+        GlobalConfigRow::BurnFloor => {
+            if app.config().state.burn_aware_switching {
+                step_burn_floor(app);
+            }
+        }
+        GlobalConfigRow::BurnHorizon => {
+            if app.config().state.burn_aware_switching {
+                step_burn_horizon(app);
+            }
+        }
         GlobalConfigRow::SpendBudget => toggle_spend_budget_switching(app),
         // Inert while spend budget is off (rendered dimmed): decides no halt when
         // nothing spends, so it stays a true disabled row — the key is a no-op.
@@ -3731,6 +3762,43 @@ fn toggle_burn_aware_switching(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.burn_aware_switching = !cfg.state.burn_aware_switching;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Step the burn-aware floor forward through [`BURN_FLOOR_PRESETS`] (space on
+/// the Config row), wrapping past the top back to the first — the same
+/// segmented-control grammar as the weekly row. Only reachable while burn-aware
+/// is on (the row is inert otherwise). Persists the `Option` field so an unset
+/// default keeps `skip_serializing_if` omitting it until the first change.
+fn step_burn_floor(app: &mut App) {
+    let current = app.config().state.burn_switch_floor_pct();
+    let next = BURN_FLOOR_PRESETS
+        .iter()
+        .copied()
+        .find(|&p| p > current)
+        .unwrap_or(BURN_FLOOR_PRESETS[0]);
+    {
+        let mut cfg = app.config();
+        cfg.state.burn_switch_floor_pct = Some(next);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Step the burn-aware horizon cap forward through [`BURN_HORIZON_PRESETS`].
+/// Same grammar + persistence as [`step_burn_floor`].
+fn step_burn_horizon(app: &mut App) {
+    let current = app.config().state.burn_horizon_cap_ms();
+    let next = BURN_HORIZON_PRESETS
+        .iter()
+        .copied()
+        .find(|&p| p > current)
+        .unwrap_or(BURN_HORIZON_PRESETS[0]);
+    {
+        let mut cfg = app.config();
+        cfg.state.burn_horizon_cap_ms = Some(next);
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();

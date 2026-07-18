@@ -2,7 +2,8 @@
 //! the per-account Setup tab. Rows back real persisted state in `AppState`,
 //! grouped by concern: appearance (`theme`), login (`on mismatch`), background
 //! timing (`refresh` cadence, `refresh spent` toggle, `rotation`), fallback
-//! detection (`weekly limit`, `rotate mode` = burn-aware, issue #8 follow-up b),
+//! detection (`weekly limit`, `rotate mode` = burn-aware, plus the burn-aware
+//! `burn floor`/`burn horizon` tunables it gates, issue #8 follow-up b),
 //! fallback halt (`quota spent`), then the spend block (`spend budget` opt-in +
 //! its own `money spent` halt default — real money, see `docs/internals.md`).
 //! ↑↓ walks the rows; space cycles a row's value in place; ⏎ opens the
@@ -17,8 +18,8 @@ use ratatui::widgets::Paragraph;
 use crate::profile::{DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTERVAL_MS};
 
 use super::super::app::{
-    App, GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState, WEEKLY_PRESETS, format_weekly_pct,
-    parse_refresh_secs, parse_weekly_pct,
+    App, BURN_FLOOR_PRESETS, BURN_HORIZON_PRESETS, GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState,
+    WEEKLY_PRESETS, format_weekly_pct, parse_refresh_secs, parse_weekly_pct,
 };
 use super::super::theme::{self, Tier};
 use super::panes::{
@@ -53,6 +54,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .refresh_interval
         .load(std::sync::atomic::Ordering::Relaxed);
     let weekly_pct = app.config().state.weekly_switch_threshold_pct();
+    let burn_floor_pct = app.config().state.burn_switch_floor_pct();
+    let burn_horizon_ms = app.config().state.burn_horizon_cap_ms();
     let default_divergence = app.config().state.default_divergence;
     let cursor = app
         .global_config_cursor
@@ -75,6 +78,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             toggles,
             refresh_interval_ms,
             weekly_pct,
+            burn_floor_pct,
+            burn_horizon_ms,
             default_divergence,
             row_editing,
         );
@@ -169,6 +174,23 @@ fn row_hint(
                 "switch the active account away once its usage crosses its threshold"
             }
         }
+        GlobalConfigRow::BurnFloor => {
+            if !toggles.burn_aware {
+                "inert until rotate mode is burn-aware: the lowest usage % a projected switch may \
+                 fire at"
+            } else {
+                "burn-aware never switches below this %, so it can't waste more than 100 minus it \
+                 (default 98)"
+            }
+        }
+        GlobalConfigRow::BurnHorizon => {
+            if !toggles.burn_aware {
+                "inert until rotate mode is burn-aware: how far ahead the burn projection looks"
+            } else {
+                "project burn at most this far ahead (also capped by refresh); shorter switches \
+                 nearer 100 (default 60s)"
+            }
+        }
         GlobalConfigRow::SpendBudget => {
             if toggles.spend_budget {
                 "spent accounts may fall back to pay-as-you-go, up to each max auto-spend"
@@ -204,12 +226,15 @@ fn row_hint(
     Some(tip.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn detail_row(
     row: GlobalConfigRow,
     selected: bool,
     toggles: ToggleState,
     refresh_interval_ms: u64,
     weekly_pct: f64,
+    burn_floor_pct: f64,
+    burn_horizon_ms: u64,
     default_divergence: Option<DivergenceChoice>,
     editing: Option<&InputState>,
 ) -> Line<'static> {
@@ -277,6 +302,12 @@ fn detail_row(
             ],
             selected,
         ),
+        GlobalConfigRow::BurnFloor => {
+            burn_floor_line(arrow, burn_floor_pct, selected, toggles.burn_aware)
+        }
+        GlobalConfigRow::BurnHorizon => {
+            burn_horizon_line(arrow, burn_horizon_ms, selected, toggles.burn_aware)
+        }
         GlobalConfigRow::SpendBudget => cycle_row(
             arrow,
             "spend budget",
@@ -456,6 +487,70 @@ fn weekly_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> 
     } else {
         help_tooltip_lines(range, width)
     }
+}
+
+/// The `burn floor` row: burn-aware early-switch floor as a segmented control
+/// over [`BURN_FLOOR_PRESETS`]. Dimmed + inert when burn-aware is off (the
+/// projection it gates never runs), mirroring the `money spent` row. A
+/// hand-edited in-band value matching no preset is appended in `ACCENT`, same
+/// grammar as the weekly row.
+fn burn_floor_line(
+    arrow: Span<'static>,
+    floor_pct: f64,
+    selected: bool,
+    burn_aware: bool,
+) -> Line<'static> {
+    let labels: Vec<String> = BURN_FLOOR_PRESETS
+        .iter()
+        .map(|p| format!("{}%", format_weekly_pct(*p)))
+        .collect();
+    let options: Vec<(&str, bool)> = labels
+        .iter()
+        .zip(BURN_FLOOR_PRESETS.iter())
+        .map(|(label, p)| (label.as_str(), *p == floor_pct))
+        .collect();
+    if !burn_aware {
+        return dimmed_cycle_row("burn floor", &options, selected);
+    }
+    let mut line = cycle_row(arrow, "burn floor", &options, selected);
+    if !BURN_FLOOR_PRESETS.contains(&floor_pct) {
+        line.push_span(Span::styled(
+            format!("  {}%", format_weekly_pct(floor_pct)),
+            theme::accent(),
+        ));
+    }
+    line
+}
+
+/// The `burn horizon` row: burn-aware projection look-ahead cap as a segmented
+/// control over [`BURN_HORIZON_PRESETS`] (labelled in seconds). Dimmed + inert
+/// when burn-aware is off. Custom in-band value appended in `ACCENT`.
+fn burn_horizon_line(
+    arrow: Span<'static>,
+    horizon_ms: u64,
+    selected: bool,
+    burn_aware: bool,
+) -> Line<'static> {
+    let labels: Vec<String> = BURN_HORIZON_PRESETS
+        .iter()
+        .map(|ms| format!("{}s", ms / 1000))
+        .collect();
+    let options: Vec<(&str, bool)> = labels
+        .iter()
+        .zip(BURN_HORIZON_PRESETS.iter())
+        .map(|(label, ms)| (label.as_str(), *ms == horizon_ms))
+        .collect();
+    if !burn_aware {
+        return dimmed_cycle_row("burn horizon", &options, selected);
+    }
+    let mut line = cycle_row(arrow, "burn horizon", &options, selected);
+    if !BURN_HORIZON_PRESETS.contains(&horizon_ms) {
+        line.push_span(Span::styled(
+            format!("  {}s", horizon_ms / 1000),
+            theme::accent(),
+        ));
+    }
+    line
 }
 
 /// A cloudy-tui cycle row: `key  label  [active]  other`. Options are bare

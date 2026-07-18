@@ -165,9 +165,11 @@ fn weighted_rate_per_hour(entries: &[(u64, f64)], half_life_ms: f64) -> Option<f
     Some(slope_per_ms * 3_600_000.0)
 }
 
-/// Projects a window's utilization at the next scheduler poll: current value
-/// plus the recent burn rate (%/h, from [`compute_burn_rates_from_history`])
-/// times the refresh interval. Burn is floored at 0 — an idle or negative rate
+/// Projects a window's utilization over a look-ahead: current value plus the
+/// recent burn rate (%/h, from [`compute_burn_rates_from_history`]) times
+/// `interval_ms`. The caller (`fallback::is_exhausted_projected`) passes the
+/// capped horizon `min(refresh_interval, horizon_cap)`, not the raw interval, so
+/// this helper keeps its single job. Burn is floored at 0 — an idle or negative rate
 /// can't project a utilization *drop* mid-window, so an idle account simply
 /// projects flat at its current value ("run to ~100" only via real
 /// accumulation). The result is clamped finite so a corrupt or extreme rate

@@ -225,18 +225,36 @@ fn burn_rate_for_profile(name: &str, window: &UsageWindow) -> Option<f64> {
 /// default). `None` burn (no history yet, a fresh profile, or a provider with
 /// none) falls back to the plain `util_pct >= threshold` check — never leaves
 /// an account uncovered for lack of data. With a rate, "exhausted" means the
-/// *projected* utilization at the next poll has crossed the 100% cap, not the
-/// per-profile threshold: a heavy burn switches ahead of the static
-/// threshold, a light one may run past it since it won't blow the cap before
-/// the next poll.
+/// *projected* utilization has crossed the 100% cap, not the per-profile
+/// threshold: within the `floor_pct..=100` band, a heavier burn switches sooner
+/// and a light one runs on toward the cap since it won't blow it before the
+/// next poll. (With the default floor 98 above the default threshold 95,
+/// burn-aware runs the window LONGER than static, never shorter.)
+///
+/// Two guards keep the projection from switching too early — the failure the
+/// unbounded form hit worst on the smallest tier (Pro): the burn %/h is
+/// window-relative, so the same activity reads a higher rate on a smaller
+/// window and the projection trips from further below 100.
+///   * `floor_pct`: the projection may not fire below it, so wasted headroom is
+///     capped at `100 - floor` on EVERY tier regardless of rate or interval.
+///   * `horizon_cap_ms`: the look-ahead is `min(interval_ms, horizon_cap_ms)`,
+///     so a long poll cadence can't balloon the margin (it scales linearly with
+///     the look-ahead). Folded in here rather than in
+///     [`crate::usage::project_utilization`] so that helper keeps its one job.
 fn is_exhausted_projected(
     util_pct: f64,
     threshold: f64,
     burn_pct_per_hour: Option<f64>,
     interval_ms: u64,
+    floor_pct: f64,
+    horizon_cap_ms: u64,
 ) -> bool {
     match burn_pct_per_hour {
-        Some(rate) => crate::usage::project_utilization(util_pct, rate, interval_ms) >= 100.0,
+        Some(rate) => {
+            let horizon = interval_ms.min(horizon_cap_ms);
+            util_pct >= floor_pct
+                && crate::usage::project_utilization(util_pct, rate, horizon) >= 100.0
+        }
         None => util_pct >= threshold,
     }
 }
@@ -256,6 +274,8 @@ pub(crate) fn is_exhausted_active(
     interval_ms: u64,
     active_burn_pct_per_hour: Option<f64>,
     weekly_pct: f64,
+    floor_pct: f64,
+    horizon_cap_ms: u64,
 ) -> bool {
     // Weekly line first: a 7d window past it is treated as dead until its
     // weekly reset whatever the 5h window (often lapsed/idle by then) says,
@@ -275,6 +295,8 @@ pub(crate) fn is_exhausted_active(
         threshold,
         active_burn_pct_per_hour,
         interval_ms,
+        floor_pct,
+        horizon_cap_ms,
     )
 }
 
@@ -498,6 +520,12 @@ pub(crate) struct ChainSnapshot {
     /// Snapshot of `AppState::weekly_switch_threshold_pct()` — the chain-wide
     /// weekly (7d) exhaustion line both walk directions gate on.
     pub(crate) weekly_pct: f64,
+    /// Snapshot of `AppState::burn_switch_floor_pct()` — the burn-aware
+    /// projection's early-switch floor (inert unless `burn_aware`).
+    pub(crate) burn_floor_pct: f64,
+    /// Snapshot of `AppState::burn_horizon_cap_ms()` — caps the projection's
+    /// look-ahead to `min(interval_ms, this)` (inert unless `burn_aware`).
+    pub(crate) burn_horizon_cap_ms: u64,
     /// Snapshot of `AppState::spend_budget_switching` — the master half of the
     /// real-money opt-in. Off (the default) makes the spend pass inert whatever
     /// any member's ceiling says.
@@ -559,6 +587,8 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
         burn_aware: config.state.burn_aware_switching,
         interval_ms: config.state.refresh_interval_ms,
         weekly_pct: config.state.weekly_switch_threshold_pct(),
+        burn_floor_pct: config.state.burn_switch_floor_pct(),
+        burn_horizon_cap_ms: config.state.burn_horizon_cap_ms(),
         spend_budget: config.state.spend_budget_switching,
         switch_off_when_budget_spent: config.state.switch_off_when_budget_spent,
         kick_rejected: Vec::new(),
@@ -596,6 +626,7 @@ fn is_exhausted_from_store(
 /// decision. The store lock is dropped before the (disk-only, unlocked) burn
 /// rate lookup — never held across that I/O. A poisoned store lock fails safe
 /// to "not exhausted".
+#[allow(clippy::too_many_arguments)]
 fn is_exhausted_active_from_store(
     name: &str,
     threshold: f64,
@@ -603,6 +634,8 @@ fn is_exhausted_active_from_store(
     interval_ms: u64,
     store: &UsageStore,
     weekly_pct: f64,
+    floor_pct: f64,
+    horizon_cap_ms: u64,
 ) -> bool {
     let now = now_epoch_secs();
     // One lock window for both reads; the weekly line trumps projection
@@ -631,7 +664,14 @@ fn is_exhausted_active_from_store(
         return window.utilization >= threshold;
     }
     let rate = burn_rate_for_profile(name, &window);
-    is_exhausted_projected(window.utilization, threshold, rate, interval_ms)
+    is_exhausted_projected(
+        window.utilization,
+        threshold,
+        rate,
+        interval_ms,
+        floor_pct,
+        horizon_cap_ms,
+    )
 }
 
 /// Chain walk shared by [`next_target`] and [`next_auto_switch_target`]. Scans
@@ -818,6 +858,8 @@ pub(crate) fn next_target(
                 config.state.refresh_interval_ms,
                 active_burn_pct_per_hour,
                 WEEKLY_HARD_BLOCK_PCT,
+                config.state.burn_switch_floor_pct(),
+                config.state.burn_horizon_cap_ms(),
             )
         })
     {
@@ -868,6 +910,8 @@ pub(crate) fn next_auto_switch_target(
         snapshot.interval_ms,
         store,
         snapshot.weekly_pct,
+        snapshot.burn_floor_pct,
+        snapshot.burn_horizon_cap_ms,
     );
     if !active_broken && !active_kick_rejected && !active_exhausted {
         return None;
@@ -985,6 +1029,8 @@ pub(crate) fn next_auto_switch_target(
             snapshot.interval_ms,
             store,
             WEEKLY_HARD_BLOCK_PCT,
+            snapshot.burn_floor_pct,
+            snapshot.burn_horizon_cap_ms,
         )
     {
         return Some(SwitchAction::Off);
@@ -1062,6 +1108,8 @@ pub(crate) fn auto_switch_if_needed(
                 config.state.refresh_interval_ms,
                 active_burn_pct_per_hour,
                 config.state.weekly_switch_threshold_pct(),
+                config.state.burn_switch_floor_pct(),
+                config.state.burn_horizon_cap_ms(),
             )
         {
             return Ok(None);

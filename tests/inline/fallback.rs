@@ -1858,28 +1858,95 @@ fn next_target_skips_broken_last_resort_member() {
 #[test]
 fn is_exhausted_projected_none_burn_falls_back_to_static_threshold() {
     assert!(
-        is_exhausted_projected(96.0, 95.0, None, 90_000),
-        "over threshold, no rate available → static check fires"
+        is_exhausted_projected(96.0, 95.0, None, 90_000, 98.0, 60_000),
+        "over threshold, no rate available → static check fires (floor/cap unused)"
     );
     assert!(
-        !is_exhausted_projected(90.0, 95.0, None, 90_000),
+        !is_exhausted_projected(90.0, 95.0, None, 90_000, 98.0, 60_000),
         "under threshold, no rate available → static check doesn't fire"
     );
 }
 
 #[test]
-fn is_exhausted_projected_heavy_burn_fires_before_static_threshold() {
-    // 90% is under the 95% static threshold, but a 1200 %/h burn over a 90s
-    // poll projects to 120% — the cap fires ahead of the static check.
-    assert!(is_exhausted_projected(90.0, 95.0, Some(1200.0), 90_000));
+fn is_exhausted_projected_heavy_burn_crosses_cap() {
+    // Guards disabled (floor 0, cap ≥ interval) to isolate the raw projection:
+    // a 1200 %/h burn over a 90s poll projects 98 → 128, past the 100% cap.
+    // (The floor's effect on the same burn is a separate test below.)
+    assert!(is_exhausted_projected(
+        98.0,
+        95.0,
+        Some(1200.0),
+        90_000,
+        0.0,
+        90_000
+    ));
 }
 
 #[test]
-fn is_exhausted_projected_light_burn_runs_past_static_threshold() {
-    // 96% is already over the 95% static threshold, but a light 4 %/h burn
-    // over a 90s poll barely moves — nowhere near the 100% cap, so burn-aware
-    // mode keeps running where mode-off would already have switched.
-    assert!(!is_exhausted_projected(96.0, 95.0, Some(4.0), 90_000));
+fn is_exhausted_projected_light_burn_stays_under_cap() {
+    // 96% over the 95% static threshold, but a light 4 %/h burn over a 90s poll
+    // barely moves — nowhere near the 100% cap, so burn-aware keeps running
+    // where mode-off would already have switched. Guards disabled to isolate
+    // the projection (96 would also fail the default 98 floor).
+    assert!(!is_exhausted_projected(
+        96.0,
+        95.0,
+        Some(4.0),
+        90_000,
+        0.0,
+        90_000
+    ));
+}
+
+#[test]
+fn is_exhausted_projected_floor_blocks_a_transient_burst() {
+    // The Pro over-switch fix: a heavy burst at 90% (window-relative %/h reads
+    // high on a small window) projects past 100, but the default 98 floor
+    // refuses to switch that far from the cap — the window is not spent yet.
+    // Without the floor guard this would fire; with it, it holds.
+    assert!(!is_exhausted_projected(
+        90.0,
+        95.0,
+        Some(1200.0),
+        90_000,
+        98.0,
+        90_000
+    ));
+    // At/above the floor the same burn switches — the floor is a lower bound on
+    // the switch point, not a veto on switching.
+    assert!(is_exhausted_projected(
+        98.0,
+        95.0,
+        Some(1200.0),
+        90_000,
+        98.0,
+        90_000
+    ));
+}
+
+#[test]
+fn is_exhausted_projected_horizon_cap_tightens_the_margin() {
+    // 98.5% + 80 %/h. Over the full 90s interval the projection reaches 100.5
+    // and fires; capped to a 30s look-ahead it only reaches ~99.2 and holds —
+    // so the cap reclaims the tail a long look-ahead would switch away early.
+    // Mutation-check: ignoring the cap (using the full interval) flips the
+    // second assertion.
+    assert!(is_exhausted_projected(
+        98.5,
+        95.0,
+        Some(80.0),
+        90_000,
+        98.0,
+        90_000
+    ));
+    assert!(!is_exhausted_projected(
+        98.5,
+        95.0,
+        Some(80.0),
+        90_000,
+        98.0,
+        30_000
+    ));
 }
 
 #[test]
@@ -1889,15 +1956,19 @@ fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
     let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
     let headroom = profile_with_util("a", Some(95.0), Some(50.0));
     assert_eq!(
-        is_exhausted_active(&exhausted, false, 90_000, None, 98.0),
+        is_exhausted_active(&exhausted, false, 90_000, None, 98.0, 98.0, 90_000),
         is_exhausted(&exhausted, 98.0)
     );
     assert_eq!(
-        is_exhausted_active(&headroom, false, 90_000, None, 98.0),
+        is_exhausted_active(&headroom, false, 90_000, None, 98.0, 98.0, 90_000),
         is_exhausted(&headroom, 98.0)
     );
-    assert!(is_exhausted_active(&exhausted, false, 90_000, None, 98.0));
-    assert!(!is_exhausted_active(&headroom, false, 90_000, None, 98.0));
+    assert!(is_exhausted_active(
+        &exhausted, false, 90_000, None, 98.0, 98.0, 90_000
+    ));
+    assert!(!is_exhausted_active(
+        &headroom, false, 90_000, None, 98.0, 98.0, 90_000
+    ));
 }
 
 // Burn-aware ON but no rate available (fresh profile / first tick, or the
@@ -1911,8 +1982,12 @@ fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
 fn is_exhausted_active_burn_aware_falls_back_without_rate() {
     let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
     let headroom = profile_with_util("a", Some(95.0), Some(50.0));
-    assert!(is_exhausted_active(&exhausted, true, 90_000, None, 98.0));
-    assert!(!is_exhausted_active(&headroom, true, 90_000, None, 98.0));
+    assert!(is_exhausted_active(
+        &exhausted, true, 90_000, None, 98.0, 98.0, 90_000
+    ));
+    assert!(!is_exhausted_active(
+        &headroom, true, 90_000, None, 98.0, 98.0, 90_000
+    ));
 }
 
 // Same fallback, exercised through the full `next_target` entry point (wrap-off
@@ -1952,45 +2027,46 @@ fn write_history(_home: &crate::testutil::HomeSandbox, name: &str, entries: &[(u
 }
 
 // End-to-end proof that the UI-thread walk (`next_target`) and the
-// scheduler-side walk (`next_auto_switch_target`) agree: a heavy burn on the
-// active flips the wrap-off decision from "stay" to "switch off" before it
-// ever reaches its 95% static threshold, on both paths.
+// scheduler-side walk (`next_auto_switch_target`) agree, and that the
+// burn-aware FLOOR holds a transient burst instead of over-switching (the Pro
+// over-switch report): a heavy burn at 96% projects past 100%, but the default
+// 98% floor refuses to switch that far from the cap, reclaiming the window the
+// unbounded projection used to burn away.
 //
-// `b` is pinned exhausted (100%, no `last_resort`) on both members so the
-// headroom-walk and last-resort-walk (unaffected by burn-aware mode by
-// design) both come up empty either way; the only thing that can move the
-// outcome is the ACTIVE-only decision this issue changes — the wrap-off
-// Off-check inside `next_target`, and the entry gate inside
-// `next_auto_switch_target`.
+// `b` is pinned exhausted (100%, no `last_resort`) so the headroom-walk and
+// last-resort-walk (unaffected by burn-aware mode by design) both come up empty
+// either way; the only thing that can move the outcome is the ACTIVE-only
+// decision the floor guards — the wrap-off Off-check inside `next_target`, and
+// the entry gate inside `next_auto_switch_target`.
 #[test]
-fn burn_aware_heavy_burn_flips_wrap_off_decision_on_both_walks() {
+fn burn_aware_floor_holds_a_transient_burst_on_both_walks() {
     let _home = crate::testutil::HomeSandbox::new();
     let now = crate::usage::now_ms();
-    // Perfectly linear climb, 30 → 90 over 6 minutes = 600 %/h.
+    // Perfectly linear climb, 36 → 96 over 6 minutes = 600 %/h.
     write_history(
         &_home,
         "a",
         &[
             (
                 now - 360_000,
-                usage_info(Some(window(30.0, Some(live_reset())))),
+                usage_info(Some(window(36.0, Some(live_reset())))),
             ),
             (
                 now - 240_000,
-                usage_info(Some(window(50.0, Some(live_reset())))),
+                usage_info(Some(window(56.0, Some(live_reset())))),
             ),
             (
                 now - 120_000,
-                usage_info(Some(window(70.0, Some(live_reset())))),
+                usage_info(Some(window(76.0, Some(live_reset())))),
             ),
         ],
     );
 
-    // Static (mode off): 90% is still under the 95% threshold — active isn't
-    // exhausted yet, so wrap-off's Off-check never fires.
+    // Static (mode off): 96% is over the 95% threshold → active exhausted, and
+    // with `b` spent too, wrap-off signs everything out.
     let mut static_config = config_with_chain(
         vec![
-            profile_with_util("a", Some(95.0), Some(90.0)),
+            profile_with_util("a", Some(95.0), Some(96.0)),
             profile_with_util("b", Some(95.0), Some(100.0)),
         ],
         "a",
@@ -1998,24 +2074,25 @@ fn burn_aware_heavy_burn_flips_wrap_off_decision_on_both_walks() {
     static_config.state.switch_off_when_spent = true;
     assert_eq!(
         next_target(&static_config, None),
-        None,
-        "static mode: 90% is still under the 95% threshold, active stays"
+        Some(SwitchAction::Off),
+        "static mode: 96% is over the 95% threshold → Off"
     );
 
     // `next_target` takes the burn rate as a parameter — it never reads disk
     // itself. Source it the same way `burn_rate_for_profile` does here,
     // standing in for the caller's in-memory `history_cache` lookup
     // (`App::active_burn_rate`) that feeds the real UI-thread call site.
-    let active_window = window(90.0, Some(live_reset()));
+    let active_window = window(96.0, Some(live_reset()));
     let rate = burn_rate_for_profile("a", &active_window).expect("rate computed from history");
     assert!((rate - 600.0).abs() < 1.0, "expected ~600 %/h, got {rate}");
 
-    // Burn-aware: 90% + 600 %/h over a 90s poll projects to 105% — the active
-    // is judged exhausted a full 5 points before the static threshold, and
-    // with `b` exhausted too and no sink, wrap-off switches off.
+    // Burn-aware: the same 600 %/h projects 96% past 100% within a poll, but the
+    // default 98% floor refuses to switch below it — the window is not spent, so
+    // the active HOLDS where the raw projection (and static mode) would switch.
+    // Removing the floor guard flips this back to Off.
     let mut config = config_with_chain(
         vec![
-            profile_with_util("a", Some(95.0), Some(90.0)),
+            profile_with_util("a", Some(95.0), Some(96.0)),
             profile_with_util("b", Some(95.0), Some(100.0)),
         ],
         "a",
@@ -2025,19 +2102,20 @@ fn burn_aware_heavy_burn_flips_wrap_off_decision_on_both_walks() {
     config.state.refresh_interval_ms = 90_000;
     assert_eq!(
         next_target(&config, Some(rate)),
-        Some(SwitchAction::Off),
-        "burn-aware mode: heavy burn projects past 100% within one poll, no sink → Off"
+        None,
+        "burn-aware mode: 96% is under the 98% floor → active holds, no Off"
     );
 
     let snap = snapshot_chain(&config).expect("snapshot");
     assert!(snap.switch_off_when_spent);
     assert!(snap.burn_aware);
     assert_eq!(snap.interval_ms, 90_000);
-    let store = store_with_utils(&[("a", 90.0), ("b", 100.0)]);
+    assert_eq!(snap.burn_floor_pct, 98.0);
+    let store = store_with_utils(&[("a", 96.0), ("b", 100.0)]);
     assert_eq!(
         next_auto_switch_target(&snap, &store),
-        Some(SwitchAction::Off),
-        "scheduler-side walk agrees with next_target under burn-aware mode"
+        None,
+        "scheduler-side walk agrees: the floor holds the active on both paths"
     );
 }
 
@@ -2095,8 +2173,18 @@ fn weekly_dead_active_is_exhausted_despite_idle_5h() {
     let p = weekly_dead_profile("a");
     assert!(is_exhausted(&p, 98.0));
     // Hard block trumps both burn-aware modes (nothing left to project).
-    assert!(is_exhausted_active(&p, false, 90_000, None, 98.0));
-    assert!(is_exhausted_active(&p, true, 90_000, Some(5.0), 98.0));
+    assert!(is_exhausted_active(
+        &p, false, 90_000, None, 98.0, 98.0, 90_000
+    ));
+    assert!(is_exhausted_active(
+        &p,
+        true,
+        90_000,
+        Some(5.0),
+        98.0,
+        98.0,
+        90_000
+    ));
 }
 
 #[test]
@@ -2149,7 +2237,9 @@ fn weekly_soft_exhausted_active_triggers_a_switch_despite_5h_headroom() {
         is_exhausted(&active, 98.0),
         "7d 98.5% triggers despite 5h 40%"
     );
-    assert!(is_exhausted_active(&active, false, 90_000, None, 98.0));
+    assert!(is_exhausted_active(
+        &active, false, 90_000, None, 98.0, 98.0, 90_000
+    ));
     let config = config_with_chain(
         vec![active, profile_with_util("b", Some(95.0), Some(10.0))],
         "a",
