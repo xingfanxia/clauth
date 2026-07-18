@@ -293,7 +293,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
     profile.fetch_status = Some(FetchStatus::RateLimited);
     let now = now_epoch_secs();
     // 52 inner cells is the narrowest pane the layout builds (an 80-col terminal
-    // yields a 24-cell selector), so the block/fetch pills AND their `└` hints
+    // yields a 24-cell selector), so the block/fetch pills AND their rail hints
     // must all fit — the whole reason this row was split off a single ~83-cell one.
     let lines: Vec<String> = status_lines(
         &profile,
@@ -320,8 +320,8 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
     .collect();
 
     // The block pill leads its own keyed line; the fetch pill opens a later line
-    // indented to the value column. The `└` hints sit between them but never
-    // merge a pill onto another row, so exactly two lines carry a `[ … ]` pill.
+    // that bridges the rail connecting the two hints between them, so exactly
+    // two lines carry a `[ … ]` pill.
     let pill_lines: Vec<&String> = lines.iter().filter(|l| l.contains("[ ")).collect();
     assert_eq!(
         pill_lines.len(),
@@ -334,12 +334,16 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
         pill_lines[0]
     );
     assert!(
-        pill_lines[1].starts_with(&" ".repeat(KEY_W + KEY_GUTTER)),
-        "the fetch pill indents to the value column: {:?}",
+        pill_lines[1].starts_with(&format!("│{}", " ".repeat(KEY_W + KEY_GUTTER - 1))),
+        "the fetch pill bridges the rail between the block's hint and its own, \
+         still at the value column: {:?}",
         pill_lines[1]
     );
     assert!(
-        pill_lines[1].trim_start().starts_with("[ rate limited ]"),
+        pill_lines[1]
+            .trim_start_matches('│')
+            .trim_start()
+            .starts_with("[ rate limited ]"),
         "the fetch pill opens its own line: {:?}",
         pill_lines[1]
     );
@@ -355,6 +359,212 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
             l.chars().count()
         );
     }
+}
+
+/// Two or more fix hints in the same status block connect into one rail
+/// (`├`/`│`/`└`, cloudy-tui Stacked hints) instead of floating as separate
+/// detached `└` lines: a pill row sitting strictly between the first and last
+/// hint bridges the rail at col 0 (`│` + blank padding to the value column),
+/// every hint but the last branches off with `├`, and only the last closes
+/// the rail with `└`.
+#[test]
+fn status_lines_connects_two_plus_hints_into_one_rail() {
+    use crate::usage::KickBlock;
+
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Cached);
+    let now = now_epoch_secs();
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 45_000),
+            tick: 0,
+            streaks: StreakCounts {
+                rate_limit: 0,
+                refresh_fail: 3,
+            },
+            kick_block: Some(KickBlock {
+                streak: 2,
+                rejected: true,
+                until: Some(now + 3 * 60 * 60),
+                next_retry: now + 30,
+            }),
+            diag: DiagFlags {
+                auto_start: false,
+                budget_spent: true,
+                ..DiagFlags::default()
+            },
+        },
+        120,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    let bridge = format!("│{}", " ".repeat(KEY_W + KEY_GUTTER - 1));
+
+    // Kick + budget-spent + auth-failing: three pills, three hints.
+    let pill_lines: Vec<&String> = lines.iter().filter(|l| l.contains("[ ")).collect();
+    assert_eq!(
+        pill_lines.len(),
+        3,
+        "kick + budget-spent + auth-failing pills, got {lines:?}"
+    );
+    assert!(pill_lines[0].starts_with("status"), "{:?}", pill_lines[0]);
+    assert!(
+        pill_lines[1].starts_with(&bridge) && pill_lines[2].starts_with(&bridge),
+        "pill rows sitting between two hints bridge the rail at col 0: {lines:?}"
+    );
+
+    let hint_lines: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("├ ") || l.starts_with("└ "))
+        .collect();
+    assert_eq!(hint_lines.len(), 3, "one hint per pill, got {lines:?}");
+    assert!(
+        hint_lines[0].starts_with("├ ") && hint_lines[1].starts_with("├ "),
+        "every hint but the last branches off the still-open rail: {lines:?}"
+    );
+    assert!(
+        hint_lines[2].starts_with("└ "),
+        "only the last hint closes the rail: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with(" └ ")),
+        "no detached single-hint lead survives once 2+ hints stack: {lines:?}"
+    );
+}
+
+/// A lone hint (nothing to connect) stays the plain `└` form anchored at col 0
+/// — this block's own key column, not the generic tooltip's one-cell offset
+/// for panes whose row opens past col 0.
+#[test]
+fn status_lines_single_hint_has_no_rail() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Failed);
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 20_000),
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags {
+            auth_broken: true,
+            ..DiagFlags::default()
+        },
+    };
+    let lines: Vec<String> = status_lines(&profile, &header, 120)
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+
+    let hint_lines: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("└ ") || l.starts_with("├ ") || l.starts_with("│"))
+        .collect();
+    assert_eq!(hint_lines.len(), 1, "a single hint, got {lines:?}");
+    assert!(
+        hint_lines[0].starts_with("└ re-login with clauth login a"),
+        "col-0 anchored, no rail glyph needed for a lone hint: {:?}",
+        hint_lines[0]
+    );
+}
+
+/// A wrapped non-last hint carries the rail `│` on its continuation lines, so a
+/// multi-line diagnostic reads as one unbroken stroke (cloudy-tui Stacked hints).
+/// Guards `rail_hint_lines`' `cont = "│ "` branch — the width-120 rail test never
+/// wraps into it, so a mutation to blank continuations otherwise stays green.
+#[test]
+fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
+    use crate::usage::KickBlock;
+    let now = now_epoch_secs();
+    let mut profile = crate::testutil::blank_profile("a");
+    // Kick (a long hint) + a cached fetch: two hints, so the kick hint is
+    // non-last. At 44 cells the kick hint wraps; the fetch's shorter hint does not.
+    profile.fetch_status = Some(FetchStatus::Cached);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 30_000),
+            tick: 0,
+            streaks: StreakCounts::default(),
+            kick_block: Some(KickBlock {
+                streak: 1,
+                rejected: true,
+                until: Some(now + 3 * 60 * 60),
+                next_retry: now + 30,
+            }),
+            diag: DiagFlags {
+                auto_start: true,
+                ..DiagFlags::default()
+            },
+        },
+        44,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    assert!(
+        lines.iter().any(|l| l.starts_with("├ ")),
+        "the non-last kick hint branches off the open rail: {lines:?}"
+    );
+    // A bridged pill row also opens with `│`, so exclude those by the pill
+    // bracket — a pure hint continuation carries none.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("│ ") && !l.contains('[')),
+        "its wrapped continuation carries the rail `│` at col 0: {lines:?}"
+    );
+}
+
+/// A no-hint row sitting AFTER the rail has closed keeps its blank value-column
+/// pad, never a stray `│` below the closing `└` (cloudy-tui Stacked hints).
+/// Guards `render_status_rows`' `seen < hint_count` upper bound on the bridge.
+#[test]
+fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
+    use crate::usage::KickBlock;
+    let now = now_epoch_secs();
+    let mut profile = crate::testutil::blank_profile("a");
+    // Fetch FAILED carries no fix hint and renders last, so with kick +
+    // budget-spent hints above it the rail closes on the spend `└` and the
+    // failed row sits below the closed rail.
+    profile.fetch_status = Some(FetchStatus::Failed);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 14_000),
+            tick: 0,
+            streaks: StreakCounts::default(),
+            kick_block: Some(KickBlock {
+                streak: 1,
+                rejected: false,
+                until: Some(now + 60 * 60),
+                next_retry: now + 30,
+            }),
+            diag: DiagFlags {
+                budget_spent: true,
+                ..DiagFlags::default()
+            },
+        },
+        120,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    let failed = lines
+        .iter()
+        .find(|l| l.contains("[ failed ]"))
+        .expect("the failed fetch row renders");
+    assert!(
+        failed.starts_with(&" ".repeat(KEY_W + KEY_GUTTER)) && !failed.starts_with('│'),
+        "a no-hint row below the closed rail keeps blank pad, no stray `│`: {failed:?}"
+    );
 }
 
 /// The `[ rate limited ]` suffix names which retry the countdown leads to
@@ -802,5 +1012,48 @@ fn auth_broken_suppresses_the_lesser_pills() {
     assert!(
         !out.contains("auth failing"),
         "the confirmed pill supersedes the transient refresh-fail swap: {out}"
+    );
+    assert!(
+        !out.contains("[ cached ]") && !out.contains("refresh in"),
+        "the freshness/refresh line is moot on a dead login and stays suppressed: {out}"
+    );
+}
+
+/// Reproduces the screenshot bug: a dead login with no scheduled refresh and no
+/// maxed window used to fall through to the idle `up to date` dot, painting a
+/// reassuring state directly under the `[ auth broken ]` pill. Dead-first
+/// dominance returns after the pill + hint, so nothing idle leaks below.
+#[test]
+fn auth_broken_does_not_render_a_reassuring_idle_line() {
+    let joined = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let mut profile = crate::testutil::blank_profile("OmniRoute");
+    profile.fetch_status = None;
+    let out = joined(status_lines(
+        &profile,
+        &HeaderState {
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            diag: DiagFlags {
+                auth_broken: true,
+                ..DiagFlags::default()
+            },
+        },
+        120,
+    ));
+    assert!(
+        out.contains("[ auth broken ]") && out.contains("re-login with clauth login OmniRoute"),
+        "the dead login still leads with the pill + its re-login hint: {out}"
+    );
+    assert!(
+        !out.contains("up to date"),
+        "no idle dot may sit under a dead-login pill: {out}"
     );
 }
