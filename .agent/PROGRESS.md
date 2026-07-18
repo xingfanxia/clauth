@@ -1289,14 +1289,15 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   residual format-drift 2h-linger documented as accepted tradeoff.
 - Live-proved: 48s / 793KB single stream → `completed` clean close (old
   binary died at 29s).
-- **Config battleground discovered**: AX rolled `~/.codex/config.toml` back
-  to `.bak-pre-proxy` (05:02, direct mode), and when we re-appended the
-  `[model_providers.clauth]` DEFINITION block for session resume, zylos
-  (the codex agent managing that file) commented it out within a minute.
-  Do NOT edit config.toml for proxy routing — created
-  `~/.codex/proxy.config.toml` overlay instead (`codex --profile proxy`),
-  sibling of direct.config.toml. Global re-enable needs AX to arbitrate
-  with zylos.
+- Config timeline: AX rolled `~/.codex/config.toml` back to
+  `.bak-pre-proxy` (05:02, direct mode); the re-appended
+  `[model_providers.clauth]` DEFINITION block was commented out at 05:11 —
+  **by AX manually** (CORRECTION: first attributed to zylos on
+  timing+file-header inference without verification; AX confirmed it was
+  their own hand. No agent contests this file — zylos only manages its
+  project trust entries per the header). `~/.codex/proxy.config.toml`
+  overlay exists for opt-in routing (`codex --profile proxy`, sibling of
+  direct.config.toml); the ccsbar PROXY-1 toggle edits config.toml freely.
 
 ## 2026-07-18 (SCW-1) — per-model weekly windows join the claude chain walk
 
@@ -1312,5 +1313,5 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
 - ccsbar PROXY-1 (98fe1e6): codex-page "Proxy mode" toggle — flips the
   top-level model_provider line in ~/.codex/config.toml (definition block
   always kept for session resume), bootstraps the proxy LaunchAgent, caption
-  warns routed-but-not-serving; state re-read per panel open so a zylos
-  revert is visible. Pure transforms unit-tested.
+  warns routed-but-not-serving; state re-read per panel open so any outside
+  edit of the file is visible. Pure transforms unit-tested.
