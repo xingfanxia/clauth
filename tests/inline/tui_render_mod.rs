@@ -751,7 +751,7 @@ fn form_panes_keep_the_focused_row_on_screen_when_they_overflow() {
         "the focused last row must not clip:\n{bottom}"
     );
     assert!(
-        bottom.contains("inert until extra usage"),
+        bottom.contains("extra usage runs out"),
         "its hint tooltip must not clip either:\n{bottom}"
     );
     assert!(
@@ -846,7 +846,12 @@ fn a_wrapped_hint_scrolls_into_view_with_its_row() {
     use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
 
     let mut app = App::new(AppConfig {
-        state: AppState::default(),
+        state: AppState {
+            // `allow extra usage` = pay-as-you-go carries the long ON hint, so its
+            // wrapped block overflows a narrow pane and discriminates block-scroll.
+            spend_budget_switching: true,
+            ..AppState::default()
+        },
         profiles: Vec::new(),
     });
     app.tab = Tab::Config;
@@ -858,25 +863,25 @@ fn a_wrapped_hint_scrolls_into_view_with_its_row() {
         .position(|r| *r == GlobalConfigRow::SpendBudget)
         .unwrap();
 
-    // 33 cols is the widest terminal where this hint still wraps to four lines;
-    // one cell more and the block fits the viewport, so the assertion below stops
-    // discriminating block-scroll from row-scroll. `scroll_offset_keeps_the_whole
-    // _focused_block_on_screen` pins the same rule off real copy.
-    let screen = dump(&app, 33, 24);
+    // 26 cols is the widest terminal where this hint still wraps to a tail line
+    // that lands past the viewport, so the assertion below keeps discriminating
+    // block-scroll from row-scroll. `scroll_offset_keeps_the_whole_focused_block
+    // _on_screen` pins the same rule off real copy.
+    let screen = dump(&app, 26, 24);
     assert!(
         screen.contains("allow extra"),
         "the focused row renders:\n{screen}"
     );
-    // The hint wraps to four lines ending in a lone `off`. That last line is
-    // present only if the scroll cleared the block's tail, not just its row.
     assert!(
-        screen.contains("chain parks or switches"),
-        "the hint's third line renders:\n{screen}"
+        !screen.contains("APPEARANCE"),
+        "the pane really scrolled: the first band is off the top:\n{screen}"
     );
+    // The hint wraps to four lines ending in `its max spend`. That last line is
+    // present only if the scroll cleared the block's tail, not just its row.
     assert!(
         screen
             .lines()
-            .any(|l| l.trim_matches(['│', '┊', '┃', ' ']) == "off"),
+            .any(|l| l.trim_matches(['│', '┊', '┃', ' ']) == "its max spend"),
         "the hint's final wrapped line must not clip:\n{screen}"
     );
 }

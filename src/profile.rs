@@ -303,7 +303,7 @@ pub(crate) struct AppState {
     /// answers "the chain ran out of SUBSCRIPTION quota", where staying costs
     /// nothing but rate-limit errors. Here staying IS the spending, so the same
     /// words mean opposite things and an operator can legitimately want opposite
-    /// answers: stay on last when the quota runs out, switch off when the money
+    /// answers: stay on active when the quota runs out, switch off when the money
     /// does. Defaults to switching off so `max auto-spend` is a real cap rather
     /// than an entry gate. See `fallback::budget_spent`.
     /// Unlike its `wrap_off` twin this key needs no compatibility spelling: it
