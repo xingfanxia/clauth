@@ -524,3 +524,121 @@ fn live_credentials_are_shell_requires_a_parsed_empty_login() {
     .expect("write live");
     assert!(!live_credentials_are_shell());
 }
+
+// ── CLA-SPLIT: long-lived session token beside the usage OAuth pair ───────────
+
+/// Write a `session-token.json` (static long-lived login) into `name`'s
+/// profile dir, as the split-credential fill does.
+fn write_session_token(name: &str, access: &str) {
+    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    fs::create_dir_all(&dir).expect("mkdir profile");
+    fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds(access, None)).expect("ser session token"),
+    )
+    .expect("write session token");
+}
+
+/// The install source is `credentials.json` until a session token appears,
+/// then the session token — and never the OAuth pair while it exists.
+#[test]
+fn install_source_prefers_session_token() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("split".to_string(), None, None);
+    profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    assert!(!has_session_token("split"));
+    assert!(
+        install_source_path("split")
+            .expect("source")
+            .ends_with("credentials.json")
+    );
+
+    write_session_token("split", "oat-access");
+    assert!(has_session_token("split"));
+    assert!(
+        install_source_path("split")
+            .expect("source")
+            .ends_with("session-token.json")
+    );
+}
+
+/// A live slot holding the profile's static session token is the designed
+/// steady state: LinkedTo (the divergence machinery stays dormant), and a
+/// snapshot leaves the clauth-private usage OAuth pair untouched instead of
+/// clobbering it with the token just read.
+#[test]
+fn session_token_live_is_linked_and_snapshot_keeps_usage_oauth() {
+    let _home = HomeSandbox::new();
+    let mut config = seed_relogin_scenario(
+        "split",
+        creds("usage-access", Some("usage-refresh")),
+        creds("oat-access", None),
+    );
+    write_session_token("split", "oat-access");
+
+    assert_eq!(
+        classify_credentials_link("split").expect("classify"),
+        LinkState::LinkedTo,
+        "live slot holding the session token is the steady state, not divergence",
+    );
+
+    snapshot_active_credentials(&mut config).expect("snapshot");
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("split")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("usage-refresh"),
+        "snapshot must never overwrite the usage OAuth pair with the session token",
+    );
+}
+
+/// A switch to a session-token profile links the LIVE slot to
+/// `session-token.json` — the rotating usage pair is never installed, and it
+/// survives the switch on disk byte-for-byte.
+#[cfg(unix)]
+#[test]
+fn switch_installs_session_token_not_usage_oauth() {
+    let _home = HomeSandbox::new();
+
+    let mut a = crate::profile::Profile::new("a".to_string(), None, None);
+    a.credentials = Some(creds("at-a", Some("rt-a")));
+    crate::profile::save_profile(&a).expect("save a");
+    let mut b = crate::profile::Profile::new("b".to_string(), None, None);
+    b.credentials = Some(creds("usage-access-b", Some("usage-refresh-b")));
+    crate::profile::save_profile(&b).expect("save b");
+    write_session_token("b", "oat-b");
+
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![a, b],
+    };
+    config.state.profiles = vec!["a".into(), "b".into()];
+    config.state.active_profile = Some("a".into());
+    force_link_profile_credentials("a").expect("link a");
+
+    crate::actions::switch_profile(&mut config, "b").expect("switch to b");
+
+    let live_target =
+        std::fs::read_link(claude_credentials_path().expect("path")).expect("live is a symlink");
+    assert!(
+        live_target.ends_with("session-token.json"),
+        "the live slot must point at b's session token, got {live_target:?}",
+    );
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("b")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read b store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("usage-refresh-b"),
+        "b's usage OAuth pair must survive the switch untouched",
+    );
+}

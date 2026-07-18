@@ -16,6 +16,34 @@ fn claude_settings_path() -> Result<PathBuf> {
     Ok(claude_dir()?.join("settings.json"))
 }
 
+/// CLA-SPLIT: true when the profile carries a long-lived session token
+/// (`session-token.json`, e.g. a `claude setup-token` mint). Such a profile
+/// splits its credentials: the STATIC session token is what switches install
+/// for Claude Code sessions to run on, while the rotating OAuth pair in
+/// `credentials.json` stays clauth-private for usage polling. Sessions then
+/// hold a token that never rotates, so they can never race clauth's refresher
+/// on a single-use refresh chain (the root cause of the 2026-07-16..18
+/// serial `refresh token revoked` deaths: N live sessions + clauth all
+/// rotating the same chains through one live slot).
+pub(crate) fn has_session_token(name: &str) -> bool {
+    profile_dir(name)
+        .map(|d| d.join("session-token.json").exists())
+        .unwrap_or(false)
+}
+
+/// The file a switch INSTALLS as the live login: the profile's
+/// `session-token.json` when present ([`has_session_token`]), else its
+/// `credentials.json` — which is exactly the pre-split behavior, so profiles
+/// without the sidecar are byte-identical to before.
+pub(crate) fn install_source_path(name: &str) -> Result<PathBuf> {
+    let dir = profile_dir(name)?;
+    let session = dir.join("session-token.json");
+    if session.exists() {
+        return Ok(session);
+    }
+    Ok(dir.join("credentials.json"))
+}
+
 /// State of `~/.claude/.credentials.json` relative to a profile's stored credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkState {
@@ -33,7 +61,11 @@ pub(crate) enum LinkState {
 
 pub(crate) fn classify_credentials_link(active: &str) -> Result<LinkState> {
     let link = claude_credentials_path()?;
-    let expected = profile_dir(active)?.join("credentials.json");
+    // CLA-SPLIT: the live slot is compared against what a switch INSTALLS —
+    // for a session-token profile that's the static token, so a live slot
+    // holding it classifies LinkedTo and the whole divergence machinery
+    // stays dormant (a static token never rotates out from under us).
+    let expected = install_source_path(active)?;
     classify_link_at(&link, &expected)
 }
 
@@ -86,7 +118,9 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
 /// clauth adopts this rather than treating it as divergence.
 pub(crate) fn is_first_login(active: &str) -> Result<bool> {
     let link = claude_credentials_path()?;
-    let expected = profile_dir(active)?.join("credentials.json");
+    // CLA-SPLIT: a profile whose install source is its session token is never
+    // "credential-less" — a live OAuth login must not be adopted over it.
+    let expected = install_source_path(active)?;
     Ok(is_first_login_at(&link, &expected))
 }
 
@@ -147,12 +181,14 @@ pub(crate) fn live_credentials_are_shell() -> bool {
 /// switched while CC still reads the old Keychain login. Loud + recoverable —
 /// both writes are idempotent, so retrying the switch re-runs the pair.
 #[cfg(target_os = "macos")]
-fn keychain_write_profile(name: &str) -> Result<()> {
-    let path = profile_dir(name)?.join("credentials.json");
+fn keychain_write_source(path: &Path) -> Result<()> {
+    // CLA-SPLIT: callers pass the already-resolved install source so the
+    // symlink target and the Keychain content come from ONE resolution — a
+    // session-token.json vanishing between two stats can't split them.
     if !path.exists() {
         return Ok(());
     }
-    let creds: ClaudeCredentials = read_json_file(&path)?;
+    let creds: ClaudeCredentials = read_json_file(path)?;
     crate::keychain::keychain_write(&creds)
 }
 
@@ -184,7 +220,7 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
 pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
-        let target = profile_dir(name)?.join("credentials.json");
+        let target = install_source_path(name)?;
 
         if let Ok(meta) = link.symlink_metadata() {
             if !meta.file_type().is_symlink() {
@@ -208,7 +244,7 @@ pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
             // macOS: make the switch real — Claude Code reads the Keychain.
             #[cfg(target_os = "macos")]
             if crate::keychain::enabled() {
-                keychain_write_profile(name)?;
+                keychain_write_source(&target)?;
             }
         }
 
@@ -430,6 +466,13 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
             }
             return Ok(());
         }
+        // CLA-SPLIT: a live slot holding the profile's static session token
+        // (LinkedTo by definition) carries nothing to snapshot — and writing
+        // it into `profile.credentials` would clobber the clauth-private
+        // usage OAuth pair. Leave both stores untouched.
+        if has_session_token(&active) {
+            return Ok(());
+        }
         snapshot_active_credentials_unchecked(config, &active)
     })
 }
@@ -469,7 +512,7 @@ pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
         if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
-        let target = profile_dir(name)?.join("credentials.json");
+        let target = install_source_path(name)?;
         if target.exists() {
             if let Some(parent) = link.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -478,7 +521,7 @@ pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
             // macOS: make the switch real — Claude Code reads the Keychain.
             #[cfg(target_os = "macos")]
             if crate::keychain::enabled() {
-                keychain_write_profile(name)?;
+                keychain_write_source(&target)?;
             }
         }
         Ok(())

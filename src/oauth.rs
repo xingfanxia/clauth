@@ -991,7 +991,12 @@ pub(crate) fn apply_rotated_tokens_locked(
         clear_staged_credentials(name);
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() && cfg.is_active(name) {
-            if live_login_is_foreign(name, &old_access) {
+            if crate::claude::has_session_token(name) {
+                // CLA-SPLIT: the live slot intentionally holds this profile's
+                // static session token — the rotated pair is the clauth-private
+                // USAGE chain and must never be mirrored over it. Quiet: this
+                // is the designed steady state, not a divergence.
+            } else if live_login_is_foreign(name, &old_access) {
                 logline!(
                     "clauth: rotated '{name}' but the live login diverged (a re-login clauth \
                      doesn't own). Keychain left untouched; {}",
@@ -1257,6 +1262,30 @@ pub(crate) fn ensure_installable(
     name: &str,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> AuthGate {
+    // CLA-SPLIT: a session-token profile installs its STATIC long-lived token
+    // — there is no chain to refresh before install, and a stale/broken
+    // usage-side OAuth pair (what `oauth_shape` + `auth_broken` describe)
+    // must not bench an account whose session token is perfectly usable.
+    // The token's own clock is the one thing worth checking: there is no
+    // refresh chain to probe or repair, so a clock-dead static token would
+    // otherwise install as-is and sign every session out (Incident C shape).
+    if crate::claude::has_session_token(name) {
+        let clock_dead = crate::claude::install_source_path(name)
+            .ok()
+            .and_then(|p| {
+                crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&p).ok()
+            })
+            .and_then(|t| t.access_token_expires_at())
+            .is_some_and(|exp| (now_ms() as i64) >= exp);
+        if clock_dead {
+            logline!(
+                "clauth: '{name}' session token has expired — re-mint with \
+                 `claude setup-token` and refill its session-token.json"
+            );
+            return AuthGate::Broken;
+        }
+        return AuthGate::Ready;
+    }
     // Cheap pre-check WITHOUT the rotation guard: non-OAuth and
     // comfortably-live tokens install as-is. Token data read here is
     // discarded — only the post-guard re-read may feed the refresher (a
