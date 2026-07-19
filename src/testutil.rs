@@ -91,6 +91,7 @@ pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
         env: Default::default(),
         models: Default::default(),
         fallback_threshold: None,
+        weekly_threshold: None,
         last_resort: false,
         max_auto_spend: None,
         check_weekly: true,

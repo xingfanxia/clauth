@@ -67,6 +67,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: threshold,
+        weekly_threshold: None,
         last_resort: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -646,25 +647,25 @@ fn find_recovered_returns_first_member_below_threshold() {
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
-            check_weekly: true,
-            check_scoped: true,
+            weekly_line: 98.0,
+            scoped_line: 98.0,            check_scoped: true,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
-            check_weekly: true,
-            check_scoped: true,
+            weekly_line: 98.0,
+            scoped_line: 98.0,            check_scoped: true,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &[]),
+        find_recovered_member(&members, &store, &[]),
         Some("b".to_string()),
     );
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &["b".to_string()]),
+        find_recovered_member(&members, &store, &["b".to_string()]),
         None,
         "a kick-rejected member's idle usage is not recovery — its account \
          still refuses inference"
@@ -679,20 +680,20 @@ fn find_recovered_skips_exhausted_members() {
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
-            check_weekly: true,
-            check_scoped: true,
+            weekly_line: 98.0,
+            scoped_line: 98.0,            check_scoped: true,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
-            check_weekly: true,
-            check_scoped: true,
+            weekly_line: 98.0,
+            scoped_line: 98.0,            check_scoped: true,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
-    assert_eq!(find_recovered_member(&members, &store, 98.0, &[]), None);
+    assert_eq!(find_recovered_member(&members, &store, &[]), None);
 }
 
 #[test]
@@ -703,20 +704,20 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
-            check_weekly: true,
-            check_scoped: true,
+            weekly_line: 98.0,
+            scoped_line: 98.0,            check_scoped: true,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
-            check_weekly: true,
-            check_scoped: true,
+            weekly_line: 98.0,
+            scoped_line: 98.0,            check_scoped: true,
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
-    assert_eq!(find_recovered_member(&members, &store, 98.0, &[]), None);
+    assert_eq!(find_recovered_member(&members, &store, &[]), None);
 }
 
 #[test]
@@ -727,21 +728,21 @@ fn find_recovered_uses_threshold_per_member() {
             threshold: 90.0,
             last_resort: false,
             max_spend: 0.0,
-            check_weekly: true,
-            check_scoped: true,
+            weekly_line: 98.0,
+            scoped_line: 98.0,            check_scoped: true,
         }, // 95% util ≥ 90 → exhausted
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
-            check_weekly: true,
-            check_scoped: true,
+            weekly_line: 98.0,
+            scoped_line: 98.0,            check_scoped: true,
         }, // 94% util < 95 → recovered
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &[]),
+        find_recovered_member(&members, &store, &[]),
         Some("b".to_string()),
     );
 }
@@ -756,15 +757,15 @@ fn find_recovered_recovers_when_window_expired() {
         threshold: 95.0,
         last_resort: false,
         max_spend: 0.0,
-        check_weekly: true,
-        check_scoped: true,
+        weekly_line: 98.0,
+        scoped_line: 98.0,        check_scoped: true,
     }];
     let store = store_with_infos(vec![(
         "a",
         usage_info(Some(window(100.0, Some(expired_reset())))),
     )]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &[]),
+        find_recovered_member(&members, &store, &[]),
         Some("a".to_string()),
     );
 }
@@ -778,12 +779,12 @@ fn find_recovered_recovers_when_windowless() {
         threshold: 95.0,
         last_resort: false,
         max_spend: 0.0,
-        check_weekly: true,
-        check_scoped: true,
+        weekly_line: 98.0,
+        scoped_line: 98.0,        check_scoped: true,
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &[]),
+        find_recovered_member(&members, &store, &[]),
         Some("a".to_string()),
     );
 }
@@ -797,12 +798,12 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
         threshold: 95.0,
         last_resort: false,
         max_spend: 0.0,
-        check_weekly: true,
-        check_scoped: true,
+        weekly_line: 98.0,
+        scoped_line: 98.0,        check_scoped: true,
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &[]),
+        find_recovered_member(&members, &store, &[]),
         Some("a".to_string()),
     );
 }
@@ -2281,18 +2282,18 @@ fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
     let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
     let headroom = profile_with_util("a", Some(95.0), Some(50.0));
     assert_eq!(
-        is_exhausted_active(&exhausted, false, 90_000, None, 98.0, 98.0, 90_000),
+        is_exhausted_active(&exhausted, false, 90_000, None, weekly_blocked(&exhausted, 98.0), 98.0, 90_000),
         is_exhausted(&exhausted, 98.0)
     );
     assert_eq!(
-        is_exhausted_active(&headroom, false, 90_000, None, 98.0, 98.0, 90_000),
+        is_exhausted_active(&headroom, false, 90_000, None, weekly_blocked(&headroom, 98.0), 98.0, 90_000),
         is_exhausted(&headroom, 98.0)
     );
     assert!(is_exhausted_active(
-        &exhausted, false, 90_000, None, 98.0, 98.0, 90_000
+        &exhausted, false, 90_000, None, weekly_blocked(&exhausted, 98.0), 98.0, 90_000
     ));
     assert!(!is_exhausted_active(
-        &headroom, false, 90_000, None, 98.0, 98.0, 90_000
+        &headroom, false, 90_000, None, weekly_blocked(&headroom, 98.0), 98.0, 90_000
     ));
 }
 
@@ -2308,10 +2309,10 @@ fn is_exhausted_active_burn_aware_falls_back_without_rate() {
     let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
     let headroom = profile_with_util("a", Some(95.0), Some(50.0));
     assert!(is_exhausted_active(
-        &exhausted, true, 90_000, None, 98.0, 98.0, 90_000
+        &exhausted, true, 90_000, None, weekly_blocked(&exhausted, 98.0), 98.0, 90_000
     ));
     assert!(!is_exhausted_active(
-        &headroom, true, 90_000, None, 98.0, 98.0, 90_000
+        &headroom, true, 90_000, None, weekly_blocked(&headroom, 98.0), 98.0, 90_000
     ));
 }
 
@@ -2500,14 +2501,14 @@ fn weekly_dead_active_is_exhausted_despite_idle_5h() {
     assert!(is_exhausted(&p, 98.0));
     // Hard block trumps both burn-aware modes (nothing left to project).
     assert!(is_exhausted_active(
-        &p, false, 90_000, None, 98.0, 98.0, 90_000
+        &p, false, 90_000, None, weekly_blocked(&p, 98.0), 98.0, 90_000
     ));
     assert!(is_exhausted_active(
         &p,
         true,
         90_000,
         Some(5.0),
-        98.0,
+        weekly_blocked(&p, 98.0),
         98.0,
         90_000
     ));
@@ -2564,7 +2565,7 @@ fn weekly_soft_exhausted_active_triggers_a_switch_despite_5h_headroom() {
         "7d 98.5% triggers despite 5h 40%"
     );
     assert!(is_exhausted_active(
-        &active, false, 90_000, None, 98.0, 98.0, 90_000
+        &active, false, 90_000, None, weekly_blocked(&active, 98.0), 98.0, 90_000
     ));
     let config = config_with_chain(
         vec![active, profile_with_util("b", Some(95.0), Some(10.0))],
@@ -2636,21 +2637,21 @@ fn weekly_dead_member_never_recovers() {
         threshold: 95.0,
         last_resort: false,
         max_spend: 0.0,
-        check_weekly: true,
-        check_scoped: true,
+        weekly_line: 98.0,
+        scoped_line: 98.0,        check_scoped: true,
     }];
     let dead = store_with_infos(vec![(
         "b",
         usage_both(None, Some(window(100.0, Some(live_reset())))),
     )]);
-    assert_eq!(find_recovered_member(&members, &dead, 98.0, &[]), None);
+    assert_eq!(find_recovered_member(&members, &dead, &[]), None);
     // Same member with the weekly reset in the past HAS recovered.
     let renewed = store_with_infos(vec![(
         "b",
         usage_both(None, Some(window(100.0, Some(expired_reset())))),
     )]);
     assert_eq!(
-        find_recovered_member(&members, &renewed, 98.0, &[]),
+        find_recovered_member(&members, &renewed, &[]),
         Some("b".to_string())
     );
 }
@@ -3174,7 +3175,8 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 threshold: 95.0,
                 last_resort: false,
                 max_spend: 0.0,
-                check_weekly: true,
+                weekly_line: 98.0,
+                scoped_line: 98.0,
                 check_scoped: true,
             },
             ChainMember {
@@ -3182,7 +3184,8 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 threshold: 95.0,
                 last_resort: false,
                 max_spend: 0.0,
-                check_weekly: true,
+                weekly_line: 98.0,
+                scoped_line: 98.0,
                 check_scoped: true,
             },
             ChainMember {
@@ -3190,7 +3193,8 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 threshold: 95.0,
                 last_resort: false,
                 max_spend: 100.0,
-                check_weekly: true,
+                weekly_line: 98.0,
+                scoped_line: 98.0,
                 check_scoped: true,
             },
         ],
@@ -3198,7 +3202,6 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
         broken: vec![],
         burn_aware: false,
         interval_ms: 60_000,
-        weekly_pct: 98.0,
         burn_floor_pct: 80.0,
         burn_horizon_cap_ms: 3_600_000,
         spend_budget,
@@ -3257,7 +3260,8 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
         threshold: 95.0,
         last_resort: false,
         max_spend: 0.0,
-        check_weekly: true,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
         check_scoped: true,
     };
 
@@ -3736,16 +3740,16 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
-            check_weekly: true,
-            check_scoped: true,
+            weekly_line: 98.0,
+            scoped_line: 98.0,            check_scoped: true,
         },
         ChainMember {
             name: "c".into(),
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
-            check_weekly: true,
-            check_scoped: true,
+            weekly_line: 98.0,
+            scoped_line: 98.0,            check_scoped: true,
         },
     ];
     let store = store_with_infos(vec![
@@ -3760,7 +3764,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         ("c", usage_with_scoped(5.0, 30.0, vec![])),
     ]);
     assert_eq!(
-        find_recovered_member(&chain, &store, 98.0, &[]),
+        find_recovered_member(&chain, &store, &[]),
         Some("c".to_string()),
         "recovery relinks the fully-clear member first"
     );
@@ -3778,11 +3782,11 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         threshold: 95.0,
         last_resort: false,
         max_spend: 0.0,
-        check_weekly: true,
-        check_scoped: true,
+        weekly_line: 98.0,
+        scoped_line: 98.0,        check_scoped: true,
     }];
     assert_eq!(
-        find_recovered_member(&chain_b, &store, 98.0, &[]),
+        find_recovered_member(&chain_b, &store, &[]),
         Some("b".to_string()),
     );
 }
@@ -3797,7 +3801,9 @@ fn recovery_respects_each_members_gates() {
         threshold: 95.0,
         last_resort: false,
         max_spend: 0.0,
-        check_weekly,
+        // Snapshot-folded shape: a gate-off weekly reads as the hard cap.
+        weekly_line: if check_weekly { 98.0 } else { 100.0 },
+        scoped_line: 98.0,
         check_scoped,
     };
     let chain = vec![member("b", true, false), member("c", false, true)];
@@ -3813,16 +3819,106 @@ fn recovery_respects_each_members_gates() {
         ("c", usage_with_scoped(0.0, 99.0, vec![])),
     ]);
     assert_eq!(
-        find_recovered_member(&chain, &store, 98.0, &[]),
+        find_recovered_member(&chain, &store, &[]),
         Some("b".to_string()),
     );
     // c alone: its weekly-gate-off soft-band week recovers; at the hard cap
     // it never does.
     let chain_c = vec![member("c", false, true)];
     assert_eq!(
-        find_recovered_member(&chain_c, &store, 98.0, &[]),
+        find_recovered_member(&chain_c, &store, &[]),
         Some("c".to_string()),
     );
     let store = store_with_infos(vec![("c", usage_with_scoped(0.0, 100.0, vec![]))]);
-    assert_eq!(find_recovered_member(&chain_c, &store, 98.0, &[]), None);
+    assert_eq!(find_recovered_member(&chain_c, &store, &[]), None);
+}
+
+#[test]
+fn weekly_override_tightens_and_loosens_the_member_line() {
+    // b overrides the chain-wide 98 line DOWN to 50: at weekly 60 it is out
+    // of rotation even though the chain line would accept it.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].weekly_threshold = Some(50.0);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_with_scoped(0.0, 60.0, vec![])),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+
+    // Overridden UP to 100: b at weekly 99 keeps rotating where the chain
+    // line (98) would have blocked it.
+    config.profiles[1].weekly_threshold = Some(100.0);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_with_scoped(0.0, 99.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+#[test]
+fn weekly_override_governs_the_actives_scoped_windows_too() {
+    // One per-account line for both judgments: active's fable week at 90 is
+    // under the chain line (98) but over its own override (85) — the scoped
+    // trigger fires and hops to the clear sibling.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[0].weekly_threshold = Some(85.0);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_with_scoped(
+                20.0,
+                40.0,
+                vec![scoped_window("7d fable", 90.0, Some(week_reset()))],
+            ),
+        ),
+        ("b", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+#[test]
+fn weekly_override_never_softens_the_hard_sink_and_halt_judgments() {
+    // A last-resort sink whose week is at 99 with an override of 50: the
+    // serving-sink pass keys on the HARD cap, so the sink still parks —
+    // a member's soft-line taste must not bench a literally-usable account.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].last_resort = true;
+    config.profiles[1].weekly_threshold = Some(50.0);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_with_scoped(0.0, 99.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "the sink pass judges at the hard cap, not the member's soft line"
+    );
 }

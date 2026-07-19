@@ -156,6 +156,12 @@ pub(crate) struct Profile {
     pub(crate) models: ModelSettings,
     /// Utilization % to auto-switch off at (fallback chain only). None = use default.
     pub(crate) fallback_threshold: Option<f64>,
+    /// Per-account override of the chain-wide weekly (7d) switch line
+    /// (`AppState::weekly_switch_threshold_pct`, the Config tab's `weekly
+    /// limit`). None — the default — follows the chain-wide value. Applies to
+    /// the aggregate 7d judgment (while `check_weekly` is on) AND to the
+    /// per-model `weekly_scoped` windows (while `check_scoped` is on).
+    pub(crate) weekly_threshold: Option<f64>,
     /// Chain-walk terminal stop (fallback chain only): once the auto-switch
     /// picker lands here with nothing else viable, it parks instead of turning
     /// off all accounts. Independent of `fallback_threshold` — this profile
@@ -211,6 +217,7 @@ impl Profile {
             env: BTreeMap::new(),
             models: ModelSettings::default(),
             fallback_threshold: None,
+            weekly_threshold: None,
             last_resort: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -772,6 +779,8 @@ struct ProfileConfig {
     #[serde(default)]
     fallback_threshold: Option<f64>,
     #[serde(default)]
+    weekly_threshold: Option<f64>,
+    #[serde(default)]
     last_resort: bool,
     #[serde(default)]
     max_auto_spend: Option<f64>,
@@ -1238,6 +1247,7 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
         env: config.env,
         models: config.models,
         fallback_threshold: finite_pct(config.fallback_threshold),
+        weekly_threshold: config.weekly_threshold.map(|v| v.clamp(0.0, 100.0)),
         last_resort: config.last_resort,
         // Normalize at the LOAD boundary so the on-disk value is never a live
         // trap for a direct reader (the 2026-07-14 weekly-line lesson). `inf`
@@ -1278,6 +1288,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 env: profile.env.clone(),
                 models: profile.models.clone(),
                 fallback_threshold: profile.fallback_threshold,
+                weekly_threshold: profile.weekly_threshold,
                 last_resort: profile.last_resort,
                 max_auto_spend: profile.max_auto_spend,
                 // Default-on booleans render as commented examples when on, so
@@ -1442,6 +1453,16 @@ fn render_config_toml(profile: &Profile) -> String {
     match profile.fallback_threshold {
         Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
         None => out.push_str("# fallback_threshold = 95.0\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# Per-account override of the chain-wide weekly (7d) switch line (the\n");
+    out.push_str("# Config tab's `weekly limit`, default 98). Governs when auto-switching\n");
+    out.push_str("# treats this account's week — aggregate and per-model — as spent.\n");
+    out.push_str("# Commented = follow the chain-wide value. Range 0..=100.\n");
+    match profile.weekly_threshold {
+        Some(v) => out.push_str(&format!("weekly_threshold = {v}\n")),
+        None => out.push_str("# weekly_threshold = 98.0\n"),
     }
     out.push('\n');
 

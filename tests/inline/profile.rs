@@ -936,6 +936,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         env: std::collections::BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        weekly_threshold: None,
         last_resort: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -1475,4 +1476,22 @@ fn burn_tunables_round_trip_and_omit_when_unset() {
         !off.contains("burn_switch_floor_pct") && !off.contains("burn_horizon_cap_ms"),
         "unset burn tunables must be omitted, got:\n{off}"
     );
+}
+
+// The per-account weekly-line override must default unset (follow the chain),
+// round-trip through config.toml, and clamp like the other percent fields.
+#[test]
+fn weekly_threshold_round_trips_and_clamps() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.weekly_threshold, None);
+
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.weekly_threshold = Some(90.0);
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.weekly_threshold, Some(90.0));
+
+    let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
+    let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
+    assert_eq!(parsed.weekly_threshold, None);
 }

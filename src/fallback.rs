@@ -224,32 +224,46 @@ fn weekly_blocked_info(info: &crate::usage::UsageInfo, now_secs: i64, weekly_pct
             .is_some_and(|w| w.utilization >= weekly_pct)
 }
 
-/// The weekly line a member is actually judged against: the chain's soft line
-/// while its `check_weekly` gate is on, else only the API's hard refusal cap
-/// ([`WEEKLY_HARD_BLOCK_PCT`]) — an account past 100% cannot serve at all, so
-/// no toggle bypasses that. `max` so callers already passing the hard cap
-/// (sink passes, halt gates) are unaffected by the toggle either way.
-fn weekly_line(check_weekly: bool, weekly_pct: f64) -> f64 {
-    if check_weekly {
-        weekly_pct
-    } else {
-        WEEKLY_HARD_BLOCK_PCT.max(weekly_pct)
+/// The SOFT weekly line a member's aggregate 7d window is judged at:
+/// the account's own `weekly_threshold` override when set, else the passed
+/// chain-wide line — unless its `check_weekly` gate is off, which lifts the
+/// soft judgment entirely (only [`WEEKLY_HARD_BLOCK_PCT`] remains: an account
+/// past the API's refusal cap cannot serve at all, so no setting bypasses
+/// that — hard callers use [`weekly_hard_blocked`] and never resolve here).
+pub(crate) fn member_weekly_line(profile: &Profile, chain_soft: f64) -> f64 {
+    if !profile.check_weekly {
+        return WEEKLY_HARD_BLOCK_PCT;
     }
+    profile.weekly_threshold.unwrap_or(chain_soft)
+}
+
+/// The line a member's per-model (`weekly_scoped`) windows are judged at: the
+/// same per-account `weekly_threshold` override, else the chain-wide line.
+/// The `check_weekly` gate does NOT apply — that gate governs the aggregate
+/// judgment; scoped windows have their own (`check_scoped`).
+pub(crate) fn member_scoped_line(profile: &Profile, chain_soft: f64) -> f64 {
+    profile.weekly_threshold.unwrap_or(chain_soft)
 }
 
 /// [`weekly_blocked_info`] over a profile's own usage snapshot, judged at the
-/// profile's own [`weekly_line`].
-pub(crate) fn weekly_blocked(profile: &Profile, weekly_pct: f64) -> bool {
+/// profile's own SOFT line ([`member_weekly_line`]) — `chain_soft` is the
+/// chain-wide default the member's override/gate resolves against. Hard-cap
+/// callers (sinks, halts, the dead-for-days chip) use [`weekly_hard_blocked`]
+/// instead: a per-account override must never soften — or tighten — the
+/// literal can-it-serve-at-all judgment.
+pub(crate) fn weekly_blocked(profile: &Profile, chain_soft: f64) -> bool {
+    profile.usage.as_ref().is_some_and(|u| {
+        weekly_blocked_info(u, now_epoch_secs(), member_weekly_line(profile, chain_soft))
+    })
+}
+
+/// The aggregate 7d window at/over the API's refusal cap — dead for days, no
+/// per-account setting consulted (see [`weekly_blocked`]).
+pub(crate) fn weekly_hard_blocked(profile: &Profile) -> bool {
     profile
         .usage
         .as_ref()
-        .is_some_and(|u| {
-            weekly_blocked_info(
-                u,
-                now_epoch_secs(),
-                weekly_line(profile.check_weekly, weekly_pct),
-            )
-        })
+        .is_some_and(|u| weekly_blocked_info(u, now_epoch_secs(), WEEKLY_HARD_BLOCK_PCT))
 }
 
 /// Whether one window carries a parseable reset still in the future — the
@@ -284,29 +298,25 @@ pub(crate) fn scoped_weekly_blocked_info(
         .any(|s| window_live(&s.window, now_secs) && s.window.utilization >= weekly_pct)
 }
 
-/// [`scoped_weekly_blocked_info`] over a profile's own usage snapshot,
-/// gated by the profile's own `check_scoped` toggle.
-fn scoped_weekly_blocked(profile: &Profile, weekly_pct: f64) -> bool {
+/// [`scoped_weekly_blocked_info`] over a profile's own usage snapshot, gated
+/// by the profile's own `check_scoped` toggle and judged at its own line
+/// ([`member_scoped_line`]).
+fn scoped_weekly_blocked(profile: &Profile, chain_soft: f64) -> bool {
     profile.check_scoped
-        && profile
-            .usage
-            .as_ref()
-            .is_some_and(|u| scoped_weekly_blocked_info(u, now_epoch_secs(), weekly_pct))
+        && profile.usage.as_ref().is_some_and(|u| {
+            scoped_weekly_blocked_info(u, now_epoch_secs(), member_scoped_line(profile, chain_soft))
+        })
 }
 
 /// Scheduler-side [`scoped_weekly_blocked`]: reads from the walk's one
-/// usage snapshot, gated by the member's `check_scoped` toggle. An absent
-/// entry fails safe to "not blocked" (the member is then judged by the
-/// aggregate gates alone).
-fn scoped_blocked_from_usage(
-    member: &ChainMember,
-    usage: &HashMap<String, UsageInfo>,
-    weekly_pct: f64,
-) -> bool {
+/// usage snapshot, gated by the member's `check_scoped` toggle and judged at
+/// its snapshot-resolved `scoped_line`. An absent entry fails safe to "not
+/// blocked" (the member is then judged by the aggregate gates alone).
+fn scoped_blocked_from_usage(member: &ChainMember, usage: &HashMap<String, UsageInfo>) -> bool {
     member.check_scoped
-        && usage
-            .get(&member.name)
-            .is_some_and(|info| scoped_weekly_blocked_info(info, now_epoch_secs(), weekly_pct))
+        && usage.get(&member.name).is_some_and(|info| {
+            scoped_weekly_blocked_info(info, now_epoch_secs(), member.scoped_line)
+        })
 }
 
 /// True when the profile's 5h utilization has crossed its own threshold. Also
@@ -315,8 +325,16 @@ fn scoped_blocked_from_usage(
 /// `soonest_resume` keep this exact behavior by design; only the ACTIVE
 /// profile's own decision becomes projection-aware (see
 /// [`is_exhausted_active`]).
-pub(crate) fn is_exhausted(profile: &Profile, weekly_pct: f64) -> bool {
-    weekly_blocked(profile, weekly_pct)
+pub(crate) fn is_exhausted(profile: &Profile, chain_soft: f64) -> bool {
+    weekly_blocked(profile, chain_soft)
+        || live_five_hour(profile).is_some_and(|w| w.utilization >= threshold_for(profile))
+}
+
+/// [`is_exhausted`] at the HARD weekly cap: can this account literally serve
+/// right now? Sink passes, halt gates, and the all-exhausted premise key on
+/// this — a member's soft-line override/gates never soften it.
+pub(crate) fn is_exhausted_hard(profile: &Profile) -> bool {
+    weekly_hard_blocked(profile)
         || live_five_hour(profile).is_some_and(|w| w.utilization >= threshold_for(profile))
 }
 
@@ -417,14 +435,17 @@ pub(crate) fn is_exhausted_active(
     burn_aware: bool,
     interval_ms: u64,
     active_burn_pct_per_hour: Option<f64>,
-    weekly_pct: f64,
+    weekly_blocked_now: bool,
     floor_pct: f64,
     horizon_cap_ms: u64,
 ) -> bool {
     // Weekly line first: a 7d window past it is treated as dead until its
     // weekly reset whatever the 5h window (often lapsed/idle by then) says,
     // and no burn projection applies — there is nothing left to project.
-    if weekly_blocked(profile, weekly_pct) {
+    // The judgment itself is the CALLER'S (`weekly_blocked_now`): the switch
+    // trigger judges at the member's soft line, the halt gate at the hard cap
+    // — bundling one pct here couldn't serve both once lines went per-member.
+    if weekly_blocked_now {
         return true;
     }
     let Some(window) = live_five_hour(profile) else {
@@ -475,7 +496,7 @@ pub(crate) fn soonest_resume(config: &AppConfig) -> Option<(String, i64)> {
     let mut best: Option<(&str, i64)> = None;
     for name in chain {
         let profile = config.find(name)?;
-        if !is_exhausted(profile, WEEKLY_HARD_BLOCK_PCT) {
+        if !is_exhausted_hard(profile) {
             return None;
         }
         // A weekly-dead member resumes at its 7d reset (its 5h window may be
@@ -598,7 +619,7 @@ pub(crate) fn health_blocked_reason(
     }
     let now = now_epoch_secs();
     // Weekly HARD cap first: dead for days regardless of the 5h window.
-    if weekly_blocked(profile, WEEKLY_HARD_BLOCK_PCT) {
+    if weekly_hard_blocked(profile) {
         let resets_in = profile
             .usage
             .as_ref()
@@ -645,6 +666,7 @@ pub(crate) fn health_blocked_reason(
     // headroom accept skips it), though other models still serve. Worst such
     // window names the chip. Above `WeeklySoft` — same still-serving band,
     // but this one is model-dead rather than merely dispreferred.
+    let scoped_line = member_scoped_line(profile, soft);
     if profile.check_scoped
         && let Some(worst) = profile
             .usage
@@ -652,7 +674,7 @@ pub(crate) fn health_blocked_reason(
             .map(|u| &u.weekly_scoped)
             .into_iter()
             .flatten()
-            .filter(|s| window_live(&s.window, now) && s.window.utilization >= soft)
+            .filter(|s| window_live(&s.window, now) && s.window.utilization >= scoped_line)
             .max_by(|a, b| a.window.utilization.total_cmp(&b.window.utilization))
     {
         return Some(BlockedReason::ScopedSpent {
@@ -694,9 +716,13 @@ pub(crate) struct ChainMember {
     /// Mirrors `Profile::max_auto_spend` in dollars, `0` when unset — the
     /// member's own ceiling on unattended pay-as-you-go spending.
     pub(crate) max_spend: f64,
-    /// Mirrors `Profile::check_weekly` — whether this member is judged
-    /// against the soft weekly line (off: hard cap only, see [`weekly_line`]).
-    pub(crate) check_weekly: bool,
+    /// The member's resolved SOFT weekly line ([`member_weekly_line`]:
+    /// `weekly_threshold` override else the chain-wide line; the hard cap
+    /// when its `check_weekly` gate is off). Snapshot-folded so the lock-free
+    /// walk never re-derives it.
+    pub(crate) weekly_line: f64,
+    /// The member's resolved per-model-window line ([`member_scoped_line`]).
+    pub(crate) scoped_line: f64,
     /// Mirrors `Profile::check_scoped` — whether per-model weekly windows
     /// (e.g. "7d fable") keep this member out of rotation.
     pub(crate) check_scoped: bool,
@@ -725,9 +751,6 @@ pub(crate) struct ChainSnapshot {
     /// hot-path `Arc<AtomicU64>`, mirroring exactly how `switch_off_when_spent` reaches
     /// this struct.
     pub(crate) interval_ms: u64,
-    /// Snapshot of `AppState::weekly_switch_threshold_pct()` — the chain-wide
-    /// weekly (7d) exhaustion line both walk directions gate on.
-    pub(crate) weekly_pct: f64,
     /// Snapshot of `AppState::burn_switch_floor_pct()` — the burn-aware
     /// projection's early-switch floor (inert unless `burn_aware`).
     pub(crate) burn_floor_pct: f64,
@@ -770,6 +793,7 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     if !chain.iter().any(|n| n == &active) {
         return None;
     }
+    let weekly_pct = config.state.weekly_switch_threshold_pct();
     let chain = chain
         .iter()
         // A disabled NON-active member is invisible to the scheduler-side walk
@@ -793,7 +817,12 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
                 threshold: profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD),
                 last_resort: profile.is_some_and(|p| p.last_resort),
                 max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
-                check_weekly: profile.is_none_or(|p| p.check_weekly),
+                weekly_line: profile
+                    .map(|p| member_weekly_line(p, weekly_pct))
+                    .unwrap_or(weekly_pct),
+                scoped_line: profile
+                    .map(|p| member_scoped_line(p, weekly_pct))
+                    .unwrap_or(weekly_pct),
                 check_scoped: profile.is_none_or(|p| p.check_scoped),
             }
         })
@@ -810,7 +839,6 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
             .collect(),
         burn_aware: config.state.burn_aware_switching,
         interval_ms: config.state.refresh_interval_ms,
-        weekly_pct: config.state.weekly_switch_threshold_pct(),
         burn_floor_pct: config.state.burn_switch_floor_pct(),
         burn_horizon_cap_ms: config.state.burn_horizon_cap_ms(),
         spend_budget: config.state.spend_budget_switching,
@@ -823,16 +851,16 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
 /// Scheduler-side [`is_exhausted`] over a usage snapshot: reads 5h utilization
 /// from a `HashMap<String, UsageInfo>` taken under a single `UsageStore` lock
 /// (see [`next_auto_switch_target`]) rather than `Profile.usage` (which only the
-/// UI thread writes via `apply_usage`). The snapshot is taken once per
-/// evaluation so a fetch landing between this read and the next pass cannot
-/// flip the decision.
+/// UI thread writes via `apply_usage`), judged at the caller's weekly `line`
+/// (the member's snapshot-resolved one, or the literal hard cap). The snapshot
+/// is taken once per evaluation so a fetch landing between this read and the
+/// next pass cannot flip the decision.
 fn is_exhausted_from_usage(
     member: &ChainMember,
     usage: &HashMap<String, UsageInfo>,
-    weekly_pct: f64,
+    line: f64,
 ) -> bool {
     let now = now_epoch_secs();
-    let line = weekly_line(member.check_weekly, weekly_pct);
     usage.get(&member.name).is_some_and(|info| {
         weekly_blocked_info(info, now, line)
             || (five_hour_live(info, now)
@@ -864,12 +892,11 @@ fn is_exhausted_active_from_usage(
     burn_aware: bool,
     interval_ms: u64,
     usage: &HashMap<String, UsageInfo>,
-    weekly_pct: f64,
+    line: f64,
     floor_pct: f64,
     horizon_cap_ms: u64,
 ) -> bool {
     let now = now_epoch_secs();
-    let line = weekly_line(member.check_weekly, weekly_pct);
     let Some(info) = usage.get(&member.name) else {
         return false;
     };
@@ -1094,7 +1121,7 @@ pub(crate) fn next_target(
                 config.state.burn_aware_switching,
                 config.state.refresh_interval_ms,
                 active_burn_pct_per_hour,
-                WEEKLY_HARD_BLOCK_PCT,
+                weekly_hard_blocked(p),
                 config.state.burn_switch_floor_pct(),
                 config.state.burn_horizon_cap_ms(),
             )
@@ -1181,7 +1208,7 @@ fn next_auto_switch_target_with_usage(
         snapshot.burn_aware,
         snapshot.interval_ms,
         usage,
-        snapshot.weekly_pct,
+        active.weekly_line,
         snapshot.burn_floor_pct,
         snapshot.burn_horizon_cap_ms,
     );
@@ -1203,8 +1230,8 @@ fn next_auto_switch_target_with_usage(
     // gates AND — per the member's own `check_scoped` gate — every per-model
     // weekly window (see `scoped_weekly_blocked_info`).
     let clear = |m: &ChainMember| {
-        !is_exhausted_from_usage(m, usage, snapshot.weekly_pct)
-            && !scoped_blocked_from_usage(m, usage, snapshot.weekly_pct)
+        !is_exhausted_from_usage(m, usage, m.weekly_line)
+            && !scoped_blocked_from_usage(m, usage)
     };
 
     if !active_broken && !active_kick_rejected && !active_canceled && !active_exhausted {
@@ -1212,7 +1239,7 @@ fn next_auto_switch_target_with_usage(
         // otherwise-healthy active (its `check_scoped` gate on) hops ONLY
         // when a clear member exists. When every sibling is equally blocked
         // the hop buys nothing and the chain would ping-pong — stay put.
-        if scoped_blocked_from_usage(active, usage, snapshot.weekly_pct)
+        if scoped_blocked_from_usage(active, usage)
             && let Some(name) = walk(&clear)
         {
             return Some(SwitchAction::To(name));
@@ -1347,7 +1374,6 @@ fn fully_clear_target(config: &AppConfig, weekly_pct: f64) -> Option<String> {
 pub(crate) fn find_recovered_member(
     chain: &[ChainMember],
     store: &UsageStore,
-    weekly_pct: f64,
     kick_rejected: &[String],
 ) -> Option<String> {
     let now = now_epoch_secs();
@@ -1362,10 +1388,10 @@ pub(crate) fn find_recovered_member(
         // exactly what made it look reborn while the 7d cap still blocks it.
         match store.lock() {
             Ok(s) => s.get(&member.name).map(|info| {
-                !weekly_blocked_info(info, now, weekly_line(member.check_weekly, weekly_pct))
+                !weekly_blocked_info(info, now, member.weekly_line)
                     && (!require_scoped_clear
                         || !member.check_scoped
-                        || !scoped_weekly_blocked_info(info, now, weekly_pct))
+                        || !scoped_weekly_blocked_info(info, now, member.scoped_line))
                     && (!five_hour_live(info, now)
                         || info
                             .five_hour
@@ -1426,7 +1452,7 @@ pub(crate) fn auto_switch_if_needed(
                 config.state.burn_aware_switching,
                 config.state.refresh_interval_ms,
                 active_burn_pct_per_hour,
-                weekly_pct,
+                weekly_blocked(active, weekly_pct),
                 config.state.burn_switch_floor_pct(),
                 config.state.burn_horizon_cap_ms(),
             )
