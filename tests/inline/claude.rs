@@ -529,7 +529,7 @@ fn live_credentials_are_shell_requires_a_parsed_empty_login() {
 
 /// Write a `session-token.json` (static long-lived login) into `name`'s
 /// profile dir, as the split-credential fill does.
-fn write_session_token(name: &str, access: &str) {
+fn fill_session_token_by_hand(name: &str, access: &str) {
     let dir = crate::profile::profile_dir(name).expect("profile dir");
     fs::create_dir_all(&dir).expect("mkdir profile");
     fs::write(
@@ -555,7 +555,7 @@ fn install_source_prefers_session_token() {
             .ends_with("credentials.json")
     );
 
-    write_session_token("split", "oat-access");
+    fill_session_token_by_hand("split", "oat-access");
     assert!(has_session_token("split"));
     assert!(
         install_source_path("split")
@@ -576,7 +576,7 @@ fn session_token_live_is_linked_and_snapshot_keeps_usage_oauth() {
         creds("usage-access", Some("usage-refresh")),
         creds("oat-access", None),
     );
-    write_session_token("split", "oat-access");
+    fill_session_token_by_hand("split", "oat-access");
 
     assert_eq!(
         classify_credentials_link("split").expect("classify"),
@@ -612,7 +612,7 @@ fn switch_installs_session_token_not_usage_oauth() {
     let mut b = crate::profile::Profile::new("b".to_string(), None, None);
     b.credentials = Some(creds("usage-access-b", Some("usage-refresh-b")));
     crate::profile::save_profile(&b).expect("save b");
-    write_session_token("b", "oat-b");
+    fill_session_token_by_hand("b", "oat-b");
 
     let mut config = AppConfig {
         state: crate::profile::AppState::default(),
@@ -641,4 +641,80 @@ fn switch_installs_session_token_not_usage_oauth() {
         Some("usage-refresh-b"),
         "b's usage OAuth pair must survive the switch untouched",
     );
+}
+
+// ── CLA-SPLIT-2: the `--setup-token` capture flow's building blocks ───────────
+
+/// The paste validator refuses everything but a clean single-token mint: a
+/// broken sidecar signs every session out on first use, so the failure has to
+/// happen at the paste, loudly, and without echoing the value.
+#[test]
+fn validate_setup_token_accepts_a_mint_and_rejects_bad_pastes() {
+    let good = format!("sk-ant-oat01-{}", "x".repeat(48));
+    assert_eq!(
+        validate_setup_token(&format!("  {good}\n")).expect("valid"),
+        good,
+        "surrounding whitespace trims away"
+    );
+    assert!(validate_setup_token("").is_err(), "empty paste");
+    assert!(validate_setup_token("   \n").is_err(), "blank paste");
+    assert!(
+        validate_setup_token("api-key-not-a-mint-0123456789012345678901234567890").is_err(),
+        "wrong prefix"
+    );
+    assert!(
+        validate_setup_token(&format!("Setup token: {good}")).is_err(),
+        "paste with prompt text has interior whitespace"
+    );
+    assert!(validate_setup_token("sk-ant-short").is_err(), "truncated paste");
+}
+
+/// The capture writes a sidecar the whole CLA-SPLIT machinery recognises:
+/// `has_session_token` flips, the install source re-points, the stamped
+/// one-year horizon reads back through `session_token_expiry`, and the file
+/// carries credential permissions.
+#[test]
+fn write_session_token_produces_a_recognised_sidecar() {
+    let _home = HomeSandbox::new();
+    let profile = crate::profile::Profile::new("cap".to_string(), None, None);
+    crate::profile::save_profile(&profile).expect("save profile");
+    assert_eq!(session_token_expiry("cap"), None, "no sidecar yet");
+
+    let now = 1_700_000_000_000_i64;
+    let token = format!("sk-ant-oat01-{}", "y".repeat(48));
+    let stamped = write_session_token("cap", &token, now).expect("write sidecar");
+    assert_eq!(stamped, now + SETUP_TOKEN_ASSUMED_LIFETIME_MS);
+
+    assert!(has_session_token("cap"));
+    assert!(
+        install_source_path("cap")
+            .expect("source")
+            .ends_with("session-token.json")
+    );
+    assert_eq!(session_token_expiry("cap"), Some(Some(stamped)));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(
+            crate::profile::profile_dir("cap")
+                .expect("dir")
+                .join("session-token.json"),
+        )
+        .expect("meta")
+        .permissions()
+        .mode();
+        assert_eq!(mode & 0o777, 0o600, "sidecar is a credential file");
+    }
+}
+
+/// A hand-rolled sidecar without `expiresAt` still reports "present, horizon
+/// unknown" — never `None` (which would hide the session row entirely).
+#[test]
+fn session_token_expiry_distinguishes_missing_from_unstamped() {
+    let _home = HomeSandbox::new();
+    let profile = crate::profile::Profile::new("hand".to_string(), None, None);
+    crate::profile::save_profile(&profile).expect("save profile");
+    fill_session_token_by_hand("hand", "oat-access");
+    assert_eq!(session_token_expiry("hand"), Some(None));
 }

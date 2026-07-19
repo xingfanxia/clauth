@@ -129,3 +129,39 @@ fn setup_hints_follow_the_row_value() {
     let set = row_hint(ConfigRow::BaseUrl, &snap).unwrap();
     assert!(set.contains("calls instead"), "{set}");
 }
+
+// ── CLA-SPLIT: the `session` static-token status row ─────────────────────────
+
+// The row states the horizon in days and escalates: accent while comfortable,
+// WARNING inside 30 days, DANGER + the re-mint hint once expired; a sidecar
+// without a stamp says so instead of inventing a countdown.
+#[test]
+fn session_token_row_counts_down_and_escalates() {
+    let day = 86_400_000_i64;
+    let now = 1_700_000_000_000_i64;
+
+    let comfy = line_text(&session_token_line(Some(now + 340 * day), now));
+    assert!(comfy.contains("session"), "{comfy}");
+    assert!(comfy.contains("expires in ~340d"), "{comfy}");
+
+    let soon = session_token_line(Some(now + 12 * day), now);
+    assert!(line_text(&soon).contains("expires in ~12d"));
+    assert!(
+        soon.spans.iter().any(|s| s.style == theme::warning()),
+        "last 30 days warn"
+    );
+
+    let dead = session_token_line(Some(now - day), now);
+    let dead_text = line_text(&dead);
+    assert!(
+        dead_text.contains("re-mint: claude setup-token"),
+        "{dead_text}"
+    );
+    assert!(
+        dead.spans.iter().any(|s| s.style == theme::danger()),
+        "expired is DANGER"
+    );
+
+    let unstamped = line_text(&session_token_line(None, now));
+    assert!(unstamped.contains("no recorded expiry"), "{unstamped}");
+}

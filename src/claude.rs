@@ -31,6 +31,79 @@ pub(crate) fn has_session_token(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Documented lifetime of a `claude setup-token` mint (~1 year). The minted
+/// string carries no expiry of its own, so the capture flow stamps this
+/// assumed horizon into the sidecar — the Setup-tab countdown and
+/// `ensure_installable`'s clock gate both read that stamp, and a re-mint
+/// refreshes it. An operator who knows better can edit `expiresAt` by hand.
+pub(crate) const SETUP_TOKEN_ASSUMED_LIFETIME_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+
+/// Scopes a `claude setup-token` mint carries (verified live in the #52 root
+/// cause: `/api/oauth/usage` 403s them, which is exactly why the rotating
+/// usage pair stays separate). Recorded in the sidecar for the record.
+const SETUP_TOKEN_SCOPES: [&str; 2] = ["user:inference", "user:sessions:claude_code"];
+
+/// Shape-check a pasted `claude setup-token` mint before anything is written:
+/// trimmed, non-empty, `sk-ant-` prefixed, no interior whitespace (a partial
+/// paste or a paste-with-prompt both fail loud here instead of producing a
+/// sidecar that signs sessions out on first use). Returns the trimmed token.
+/// Never logs the value — the error names the failure, not the paste.
+pub(crate) fn validate_setup_token(raw: &str) -> Result<String> {
+    let token = raw.trim();
+    if token.is_empty() {
+        anyhow::bail!("no token pasted");
+    }
+    if !token.starts_with("sk-ant-") {
+        anyhow::bail!("that doesn't look like a `claude setup-token` mint (expected an sk-ant-… value)");
+    }
+    if token.chars().any(char::is_whitespace) {
+        anyhow::bail!("the pasted token contains whitespace — looks like a partial or padded paste");
+    }
+    if token.len() < 40 {
+        anyhow::bail!("the pasted token is too short to be a real mint");
+    }
+    Ok(token.to_string())
+}
+
+/// Write `name`'s `session-token.json` from a validated mint, stamping the
+/// assumed one-year expiry. 0600 like every credential file. Returns the
+/// stamped epoch-ms expiry for the caller's summary line.
+pub(crate) fn write_session_token(name: &str, token: &str, now_ms: i64) -> Result<i64> {
+    let expires_at = now_ms + SETUP_TOKEN_ASSUMED_LIFETIME_MS;
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: token.to_string(),
+            refresh_token: None,
+            expires_at: Some(expires_at),
+            scopes: Some(SETUP_TOKEN_SCOPES.iter().map(|s| s.to_string()).collect()),
+            subscription_type: None,
+        }),
+    };
+    let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
+    let path = profile_dir(name)?.join("session-token.json");
+    with_state_lock(|| {
+        atomic_write_600(&path, &bytes).context("write session-token.json")?;
+        Ok(())
+    })?;
+    Ok(expires_at)
+}
+
+/// The sidecar's recorded expiry: `None` = profile has no session token;
+/// `Some(None)` = sidecar present but no readable `expiresAt` (hand-rolled);
+/// `Some(Some(ms))` = the recorded epoch-ms horizon. Read-only and cheap (one
+/// small file), so render paths may call it per frame for a selected profile.
+pub(crate) fn session_token_expiry(name: &str) -> Option<Option<i64>> {
+    let path = profile_dir(name).ok()?.join("session-token.json");
+    if !path.exists() {
+        return None;
+    }
+    Some(
+        read_json_file::<ClaudeCredentials>(&path)
+            .ok()
+            .and_then(|c| c.access_token_expires_at()),
+    )
+}
+
 /// The file a switch INSTALLS as the live login: the profile's
 /// `session-token.json` when present ([`has_session_token`]), else its
 /// `credentials.json` — which is exactly the pre-split behavior, so profiles

@@ -133,7 +133,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         [cmd, rest @ ..] if cmd == "login" => match parse_login_args(rest) {
             Some(args) => cmd_login(args),
             None => anyhow::bail!(
-                "usage: clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>]"
+                "usage: clauth login <profile> [--base-url <url>] [--api-key <key>] [--setup-token [--yes]] [--model <id>]"
             ),
         },
         [cmd, rest @ ..] if cmd == "delete" => match parse_delete_args(rest) {
@@ -275,6 +275,12 @@ struct LoginArgs<'a> {
     model: Option<&'a str>,
     base_url: Option<&'a str>,
     api_key: Option<&'a str>,
+    /// CLA-SPLIT capture flow: read a `claude setup-token` mint and write it as
+    /// the profile's `session-token.json` sidecar instead of any OAuth/API login.
+    setup_token: bool,
+    /// With `--setup-token` only: replace an existing sidecar without the
+    /// `[y/N]` prompt (required on a non-TTY stdin, where nothing can confirm).
+    yes: bool,
 }
 
 impl LoginArgs<'_> {
@@ -289,10 +295,26 @@ fn parse_login_args(rest: &[String]) -> Option<LoginArgs<'_>> {
     let mut model: Option<&str> = None;
     let mut base_url: Option<&str> = None;
     let mut api_key: Option<&str> = None;
+    let mut setup_token = false;
+    let mut yes = false;
 
     let mut i = 0;
     while i < rest.len() {
         let arg = rest[i].as_str();
+        // Boolean flags consume nothing.
+        match arg {
+            "--setup-token" => {
+                setup_token = true;
+                i += 1;
+                continue;
+            }
+            "--yes" | "-y" => {
+                yes = true;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
         // A known value flag consumes the next token as its value.
         let slot = match arg {
             "--model" => Some(&mut model),
@@ -324,11 +346,22 @@ fn parse_login_args(rest: &[String]) -> Option<LoginArgs<'_>> {
         i += 1;
     }
 
+    // `--setup-token` is its own capture mode — combining it with the API-key
+    // pair is a contradiction, and `--yes` means nothing outside it.
+    if setup_token && (base_url.is_some() || api_key.is_some()) {
+        return None;
+    }
+    if yes && !setup_token {
+        return None;
+    }
+
     Some(LoginArgs {
         name: name?,
         model,
         base_url,
         api_key,
+        setup_token,
+        yes,
     })
 }
 
@@ -522,6 +555,14 @@ fn cmd_login(args: LoginArgs<'_>) -> Result<()> {
     let reauth = matches!(route, LoginRoute::Reauth(_));
     let is_api = args.is_api_mode();
 
+    // CLA-SPLIT capture flow: `--setup-token` writes the profile's
+    // session-token sidecar and touches NOTHING else — the usage OAuth pair,
+    // env, chain slot, and model settings all survive, so it needs none of
+    // the reauth/overwrite machinery below.
+    if args.setup_token {
+        return cmd_login_setup_token(&mut config, &target, reauth, args.model, args.yes);
+    }
+
     // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
     // declined overwrite must not open a browser or read a secret.
     if reauth && !confirm_reauth(&target, is_api)? {
@@ -578,6 +619,89 @@ fn cmd_login(args: LoginArgs<'_>) -> Result<()> {
         }
         println!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     }
+    Ok(())
+}
+
+/// `clauth login <name> --setup-token [--yes] [--model <id>]` — capture a
+/// `claude setup-token` mint into the profile's `session-token.json` sidecar
+/// (CLA-SPLIT), replacing today's fill-it-by-hand step. The token is read
+/// echo-off on a TTY (it's a bearer credential) or as one line from a piped
+/// stdin (so a GUI/script can drive the capture); its value is never echoed
+/// or logged. Additive: nothing else about the profile moves, and the sidecar
+/// takes effect on the next switch — this deliberately does not touch the
+/// live slot, so capturing can never sign a running session out.
+fn cmd_login_setup_token(
+    config: &mut profile::AppConfig,
+    target: &str,
+    exists: bool,
+    model: Option<&str>,
+    yes: bool,
+) -> Result<()> {
+    use std::io::IsTerminal as _;
+    let interactive = std::io::stdin().is_terminal();
+
+    // Replacing an existing sidecar re-points every future switch at the new
+    // token — confirm like the other in-place replacements. A fresh capture
+    // (no sidecar yet) is additive and needs no ceremony.
+    if claude::has_session_token(target) && !yes {
+        if !interactive {
+            anyhow::bail!(
+                "'{target}' already has a session token; pass --yes to replace it non-interactively"
+            );
+        }
+        print!("Replace the stored session token for '{target}'? [y/N] ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !reauth_confirmed(&answer) {
+            println!("clauth: aborted. '{target}' left unchanged.");
+            return Ok(());
+        }
+    }
+
+    let raw = if interactive {
+        println!("clauth: capturing a long-lived session token for '{target}'.");
+        println!("  1. in another terminal, run:  claude setup-token");
+        println!("  2. complete the browser flow it opens");
+        println!("  3. paste the minted token below (input stays hidden)");
+        rpassword::prompt_password("Setup token: ")
+            .map_err(|e| anyhow::anyhow!("failed to read the token: {e}"))?
+    } else {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        line
+    };
+    let token = claude::validate_setup_token(&raw)?;
+
+    // A brand-new name gets a blank profile first (no credentials — the
+    // sidecar IS its login; a usage OAuth pair can be added later with a
+    // normal `clauth login`).
+    if !exists {
+        actions::create_blank_profile(
+            config,
+            target.to_string(),
+            None,
+            None,
+            model.map(str::to_string),
+        )?;
+    } else if let Some(model) = model {
+        actions::set_profile_default_model(config, target, model)?;
+    }
+
+    let expires_at = claude::write_session_token(target, &token, crate::usage::now_ms() as i64)?;
+    let days = (expires_at - crate::usage::now_ms() as i64) / 86_400_000;
+    println!(
+        "clauth: session token installed for '{target}' · assumed to expire in ~{days}d \
+         (`claude setup-token` mints last about a year)."
+    );
+    println!(
+        "clauth: it takes effect on the next switch:  clauth {target}{}",
+        if exists {
+            ""
+        } else {
+            "\nclauth: for usage polling, also add an OAuth pair later:  clauth login <name>"
+        }
+    );
     Ok(())
 }
 
@@ -682,12 +806,15 @@ fn print_help() {
          --rescue/--no-rescue (isolated only) override the auto_rescue\n                                  \
          setting, lifting the run's transcripts into the global store;\n                                  \
          extra args go to claude\n  \
-           clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>]\n                                  \
+           clauth login <profile> [--base-url <url>] [--api-key <key>] [--setup-token [--yes]] [--model <id>]\n                                  \
          add a new account, or re-authenticate an existing one in place\n                                  \
          (neither switches to it). Bare = browser OAuth; pass --base-url\n                                  \
          or --api-key to capture an API-key account instead (a missing\n                                  \
-         value is prompted; the key is read echo-off). --model sets its\n                                  \
-         default model (opus/sonnet/haiku/opusplan or a full model id)\n  \
+         value is prompted; the key is read echo-off). --setup-token\n                                  \
+         captures a `claude setup-token` mint into the profile's\n                                  \
+         long-lived session-token sidecar (pasted echo-off, or piped on\n                                  \
+         stdin; --yes replaces an existing one unprompted). --model sets\n                                  \
+         its default model (opus/sonnet/haiku/opusplan or a full model id)\n  \
            clauth delete <profile> [--yes|-y] [--force]\n                                  \
          remove a profile and all its credentials; --yes (-y) skips the\n                                  \
          confirm, --force overrides the live-session guard\n  \
