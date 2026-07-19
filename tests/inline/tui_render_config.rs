@@ -56,28 +56,31 @@ fn model_cycle_appends_a_custom_id_without_brackets() {
     );
 }
 
-// ── CLA-SPLIT: the `session` static-token status row ─────────────────────────
+
+// ── CLA-SPLIT: the `token` long-lived-login status row ──────────────────────
 
 // The row states the horizon in days and escalates: accent while comfortable,
 // WARNING inside 30 days, DANGER + the re-mint hint once expired; a sidecar
-// without a stamp says so instead of inventing a countdown.
+// without a stamp says so; a mis-filled rotating pair reads as disengaged in
+// DANGER (the operator thinks the split is armed and it isn't).
 #[test]
-fn session_token_row_counts_down_and_escalates() {
+fn long_lived_token_row_counts_down_and_escalates() {
+    use crate::claude::SessionTokenStatus as S;
     let day = 86_400_000_i64;
     let now = 1_700_000_000_000_i64;
 
-    let comfy = line_text(&session_token_line(Some(now + 340 * day), now));
-    assert!(comfy.contains("session"), "{comfy}");
-    assert!(comfy.contains("expires in ~340d"), "{comfy}");
+    let comfy = line_text(&session_token_line(&S::LongLived(Some(now + 340 * day)), now));
+    assert!(comfy.contains("token"), "{comfy}");
+    assert!(comfy.contains("long-lived · expires in ~340d"), "{comfy}");
 
-    let soon = session_token_line(Some(now + 12 * day), now);
+    let soon = session_token_line(&S::LongLived(Some(now + 12 * day)), now);
     assert!(line_text(&soon).contains("expires in ~12d"));
     assert!(
         soon.spans.iter().any(|s| s.style == theme::warning()),
         "last 30 days warn"
     );
 
-    let dead = session_token_line(Some(now - day), now);
+    let dead = session_token_line(&S::LongLived(Some(now - day)), now);
     let dead_text = line_text(&dead);
     assert!(
         dead_text.contains("re-mint: claude setup-token"),
@@ -88,6 +91,17 @@ fn session_token_row_counts_down_and_escalates() {
         "expired is DANGER"
     );
 
-    let unstamped = line_text(&session_token_line(None, now));
+    let unstamped = line_text(&session_token_line(&S::LongLived(None), now));
     assert!(unstamped.contains("no recorded expiry"), "{unstamped}");
+
+    let misfilled = session_token_line(&S::NotLongLived, now);
+    let misfilled_text = line_text(&misfilled);
+    assert!(
+        misfilled_text.contains("not long-lived") && misfilled_text.contains("ignored"),
+        "{misfilled_text}"
+    );
+    assert!(
+        misfilled.spans.iter().any(|s| s.style == theme::danger()),
+        "a disengaged sidecar is DANGER"
+    );
 }
