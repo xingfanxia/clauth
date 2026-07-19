@@ -69,6 +69,8 @@ fn cue_profile(status: Option<FetchStatus>) -> Profile {
         fallback_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: None,

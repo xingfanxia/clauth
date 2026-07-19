@@ -96,6 +96,34 @@ fn disabled_round_trips_through_config_toml() {
     assert!(!parsed_off.disabled);
 }
 
+// The per-account usage gates must default ON (unset = `None` = checked) so
+// every config.toml written before they existed keeps its stock gating.
+#[test]
+fn profile_config_usage_gates_default_unset() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.check_weekly, None);
+    assert_eq!(cfg.check_scoped, None);
+}
+
+// Only the non-default (`false`) value renders uncommented, and it must
+// survive a render→parse round-trip; the default renders as a commented
+// example that parses back to unset.
+#[test]
+fn usage_gates_round_trip_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.check_weekly = false;
+    profile.check_scoped = false;
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.check_weekly, Some(false));
+    assert_eq!(parsed.check_scoped, Some(false));
+
+    let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
+    let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
+    assert_eq!(parsed.check_weekly, None);
+    assert_eq!(parsed.check_scoped, None);
+}
+
 // `burn_aware_switching` (issue #8 follow-up b) must default to `false` so
 // every existing profiles.toml written before this field existed keeps
 // loading unchanged, matching the `last_resort` guarantee above at the
@@ -910,6 +938,8 @@ fn credential_and_cache_files_have_restricted_permissions() {
         fallback_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: Some(creds.clone()),

@@ -2617,6 +2617,8 @@ fn scan_recovery(
                         .unwrap_or(crate::fallback::DEFAULT_THRESHOLD),
                     last_resort: profile.is_some_and(|p| p.last_resort),
                     max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
+                    check_weekly: profile.is_none_or(|p| p.check_weekly),
+                    check_scoped: profile.is_none_or(|p| p.check_scoped),
                 }
             })
             .collect();

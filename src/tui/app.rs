@@ -160,12 +160,21 @@ impl InputState {
 // ── Modals ────────────────────────────────────────────────────────────────────
 
 /// One interactive line in the Fallback tab's detail pane for a chain member.
-/// `Threshold` is a stepper (±5 on `+`/`-`); `LastResort` is a boolean toggle
-/// (space/⏎, per the enumerated-row grammar); `Remove` arms then confirms. The
-/// chain-global wrap-off setting lives on the program-wide Config tab, not here.
+/// `Threshold` is a stepper (±5 on `+`/`-`); `CheckWeekly`/`CheckScoped`/
+/// `LastResort` are boolean toggles (space/⏎, per the enumerated-row grammar);
+/// `Remove` arms then confirms. The chain-global wrap-off setting lives on the
+/// program-wide Config tab, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FallbackRow {
     Threshold,
+    /// Whether auto-switching checks this account's aggregate weekly usage
+    /// (`Profile::check_weekly`, on by default). Off, only the 100% hard cap
+    /// blocks it.
+    CheckWeekly,
+    /// Whether auto-switching checks this account's per-model weekly windows,
+    /// e.g. "7d fable" (`Profile::check_scoped`, on by default). Off, the
+    /// account stays in rotation for use with other models.
+    CheckScoped,
     LastResort,
     /// Dollar ceiling on what the chain may spend of this member's
     /// pay-as-you-go budget unattended (`Profile::max_auto_spend`, $0 default).
@@ -631,6 +640,8 @@ pub(crate) enum ActionMenuAction {
     ReorderDown,
     // Fallback detail
     EditThreshold,
+    ToggleCheckWeekly,
+    ToggleCheckScoped,
     ToggleLastResort,
     EditMaxSpend,
     RemoveMember,
@@ -738,6 +749,8 @@ impl ActionMenuAction {
             Self::ReorderUp => "reorder up",
             Self::ReorderDown => "reorder down",
             Self::EditThreshold => "edit threshold",
+            Self::ToggleCheckWeekly => "toggle weekly gate",
+            Self::ToggleCheckScoped => "toggle scoped gate",
             Self::ToggleLastResort => "toggle last resort",
             Self::EditMaxSpend => "edit max auto-spend",
             Self::RemoveMember => "remove member",
@@ -3560,8 +3573,10 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
 }
 
 /// Detail rows for a chain member: threshold stepper, last-resort toggle, remove.
-pub(crate) const FALLBACK_ROWS: [FallbackRow; 4] = [
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 6] = [
     FallbackRow::Threshold,
+    FallbackRow::CheckWeekly,
+    FallbackRow::CheckScoped,
     FallbackRow::LastResort,
     FallbackRow::MaxSpend,
     FallbackRow::Remove,
@@ -3732,6 +3747,8 @@ pub(crate) enum FallbackHint {
     ChainAdd,
     DetailThreshold,
     DetailThresholdEdit,
+    DetailCheckWeekly,
+    DetailCheckScoped,
     DetailLastResort,
     DetailMaxSpend,
     DetailMaxSpendEdit,
@@ -3763,6 +3780,8 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
             let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
             match FALLBACK_ROWS[cursor] {
                 FallbackRow::Threshold => FallbackHint::DetailThreshold,
+                FallbackRow::CheckWeekly => FallbackHint::DetailCheckWeekly,
+                FallbackRow::CheckScoped => FallbackHint::DetailCheckScoped,
                 FallbackRow::LastResort => FallbackHint::DetailLastResort,
                 FallbackRow::MaxSpend => FallbackHint::DetailMaxSpend,
                 FallbackRow::Remove if app.fallback_armed_remove => FallbackHint::DetailRemoveArmed,
@@ -4328,6 +4347,8 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
                 app.fallback_threshold_draft = Some(InputState::new(&format!("{current:.0}")));
             }
         }
+        FallbackRow::CheckWeekly => toggle_member_flag(app, MemberFlag::CheckWeekly),
+        FallbackRow::CheckScoped => toggle_member_flag(app, MemberFlag::CheckScoped),
         FallbackRow::LastResort => toggle_last_resort(app),
         FallbackRow::MaxSpend => {
             // Inert while spend budget is off (rendered dimmed): opening the editor
@@ -4499,6 +4520,50 @@ fn adjust_threshold(app: &mut App, delta: f64) {
 /// reads the shared config directly, unlike `auto_start` which lives in the
 /// `TokenList`); it's kept so every per-profile toggle path re-derives the
 /// scheduler snapshot the same way.
+/// Which per-member usage gate a toggle row flips (`Profile::check_weekly` /
+/// `Profile::check_scoped`).
+#[derive(Clone, Copy)]
+enum MemberFlag {
+    CheckWeekly,
+    CheckScoped,
+}
+
+/// Flip a per-member usage gate and persist it; rolls back in memory when the
+/// save fails so the UI never shows a state the disk doesn't hold (same
+/// contract as [`toggle_last_resort`], minus its exclusivity move).
+fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
+    let Some(pos) = selected_chain_member(app) else {
+        return;
+    };
+    let failed = {
+        let mut cfg = app.config();
+        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
+            return;
+        };
+        let Some(profile) = cfg.find_mut(&name) else {
+            return;
+        };
+        fn field(p: &mut crate::profile::Profile, flag: MemberFlag) -> &mut bool {
+            match flag {
+                MemberFlag::CheckWeekly => &mut p.check_weekly,
+                MemberFlag::CheckScoped => &mut p.check_scoped,
+            }
+        }
+        *field(profile, flag) = !*field(profile, flag);
+        match save_profile(profile) {
+            Ok(()) => None,
+            Err(e) => {
+                *field(profile, flag) = !*field(profile, flag);
+                Some(e)
+            }
+        }
+    };
+    match failed {
+        None => app.refresh_tokens(),
+        Some(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+    }
+}
+
 fn toggle_last_resort(app: &mut App) {
     enum Outcome {
         Missing,
@@ -4752,6 +4817,8 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 if let Some(&row) = FALLBACK_ROWS.get(app.fallback_detail_cursor) {
                     match row {
                         FallbackRow::Threshold => actions.push(EditThreshold),
+                        FallbackRow::CheckWeekly => actions.push(ToggleCheckWeekly),
+                        FallbackRow::CheckScoped => actions.push(ToggleCheckScoped),
                         FallbackRow::LastResort => actions.push(ToggleLastResort),
                         FallbackRow::MaxSpend => actions.push(EditMaxSpend),
                         FallbackRow::Remove => actions.push(RemoveMember),
@@ -4895,6 +4962,12 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::ReorderDown => reorder_chain_member(app, 1),
         ActionMenuAction::EditThreshold => {
             run_fallback_row(app, FallbackRow::Threshold);
+        }
+        ActionMenuAction::ToggleCheckWeekly => {
+            run_fallback_row(app, FallbackRow::CheckWeekly);
+        }
+        ActionMenuAction::ToggleCheckScoped => {
+            run_fallback_row(app, FallbackRow::CheckScoped);
         }
         ActionMenuAction::ToggleLastResort => {
             run_fallback_row(app, FallbackRow::LastResort);

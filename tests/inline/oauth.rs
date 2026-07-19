@@ -61,6 +61,8 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         fallback_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: Some(ClaudeCredentials {
@@ -175,6 +177,8 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         fallback_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: Some(ClaudeCredentials {
@@ -240,6 +244,8 @@ fn rotate_one_inner_skips_live_session() {
         fallback_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: Some(ClaudeCredentials {
@@ -297,6 +303,8 @@ fn profile_without_refresh_token_excluded() {
         fallback_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: Some(ClaudeCredentials {
@@ -384,6 +392,8 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         fallback_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: Some(ClaudeCredentials {
@@ -420,6 +430,8 @@ fn third_party_config(name: &str) -> AppConfig {
         fallback_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: None,

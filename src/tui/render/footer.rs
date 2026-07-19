@@ -191,7 +191,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             FallbackHint::DetailThresholdEdit => {
                 &[("↵", "save"), ("←→", "caret"), ("esc", "cancel")]
             }
-            FallbackHint::DetailLastResort => &[
+            FallbackHint::DetailCheckWeekly
+            | FallbackHint::DetailCheckScoped
+            | FallbackHint::DetailLastResort => &[
                 ("↑↓", "row"),
                 ("space/↵", "toggle"),
                 ("a", "actions"),

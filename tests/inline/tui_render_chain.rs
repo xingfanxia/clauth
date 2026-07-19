@@ -24,6 +24,8 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         fallback_threshold: Some(threshold),
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: None,
@@ -131,13 +133,99 @@ fn last_resort_hint_names_the_currently_marked_member() {
     b.last_resort = true;
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let lines = member_detail(&cfg, "a", true, 1, false, None, None, 80, None).0;
+    let lines = member_detail(&cfg, "a", true, 3, false, None, None, 80, None).0;
     let hint = lines
         .iter()
         .map(line_text)
         .find(|t| t.contains("└"))
         .expect("hint renders");
     assert!(hint.contains("instead of 'b'"), "{hint}");
+}
+
+// The per-account usage-gate rows render as toggles whose hint states the
+// CURRENT walk behavior for this account, flipping wording with the gate.
+#[test]
+fn usage_gate_rows_hint_the_current_state() {
+    let texts = |p: Profile, cursor: usize| -> Vec<String> {
+        let cfg = config_with(vec![p], Some("a"), vec!["a"]);
+        member_detail(&cfg, "a", true, cursor, false, None, None, 80, None)
+            .0
+            .iter()
+            .map(line_text)
+            .collect()
+    };
+
+    // FALLBACK_ROWS[1] == CheckWeekly.
+    let on = texts(profile("a", 95.0, 20.0, 3600), 1);
+    assert!(on.iter().any(|t| t.contains("weekly gate")), "{on:?}");
+    assert!(
+        on.iter()
+            .any(|t| t.contains("out of rotation") && t.contains("weekly usage")),
+        "{on:?}"
+    );
+    let mut p = profile("a", 95.0, 20.0, 3600);
+    p.check_weekly = false;
+    let off = texts(p, 1);
+    assert!(
+        off.iter().any(|t| t.contains("isn't checked")),
+        "{off:?}"
+    );
+
+    // FALLBACK_ROWS[2] == CheckScoped.
+    let on = texts(profile("a", 95.0, 20.0, 3600), 2);
+    assert!(on.iter().any(|t| t.contains("scoped gate")), "{on:?}");
+    assert!(
+        on.iter().any(|t| t.contains("per-model week")),
+        "{on:?}"
+    );
+    let mut p = profile("a", 95.0, 20.0, 3600);
+    p.check_scoped = false;
+    let off = texts(p, 2);
+    assert!(
+        off.iter()
+            .any(|t| t.contains("stays in rotation for other models")),
+        "{off:?}"
+    );
+}
+
+// A gated-on per-model week over the line pills the detail card with its
+// label; the gate off drops it (chip and walk must not drift).
+#[test]
+fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
+    let scoped = |check_scoped: bool| -> Profile {
+        let mut p = profile("a", 95.0, 20.0, 3600);
+        p.check_scoped = check_scoped;
+        if let Some(u) = p.usage.as_mut() {
+            u.seven_day = Some(UsageWindow {
+                utilization: 40.0,
+                resets_at: Some(reset_in(5 * 86_400)),
+            });
+            u.weekly_scoped = vec![crate::usage::ScopedWindow {
+                label: "7d fable".to_string(),
+                window: UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some(reset_in(5 * 86_400)),
+                },
+            }];
+        }
+        p
+    };
+
+    let cfg = config_with(vec![scoped(true)], Some("a"), vec!["a"]);
+    let lines = member_detail(&cfg, "a", false, 0, false, None, None, 80, None).0;
+    let pill = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("7d fable"))
+        .expect("scoped pill renders");
+    assert!(pill.contains("other models ok"), "{pill}");
+
+    let cfg = config_with(vec![scoped(false)], Some("a"), vec!["a"]);
+    let lines = member_detail(&cfg, "a", false, 0, false, None, None, 80, None).0;
+    assert!(
+        !lines.iter().map(line_text).any(|t| t.contains("7d fable")),
+        "gate off must drop the scoped pill"
+    );
 }
 
 // The `max spend` hint names whichever half of the opt-in is holding spending

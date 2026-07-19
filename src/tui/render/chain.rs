@@ -2,7 +2,8 @@
 //! chain (plus a trailing `+ add` row), cursor = `❯`, `#n` chain position, active
 //! member name in orange. Right: the selected member's rotation card — labeled
 //! key:value rows (`5h usage` gauge with a threshold tick, `rotate at`
-//! threshold stepper, `last resort` toggle, `max spend` ceiling, `remove`) — or,
+//! threshold stepper, `weekly gate` + `scoped gate` per-account usage-check
+//! toggles, `last resort` toggle, `max spend` ceiling, `remove`) — or,
 //! on `+ add`, a candidate picker. Order = priority (reorder with ⇧↑↓). The
 //! chain-global wrap-off and spend-budget settings live on the Config tab, not
 //! here. Editing happens in place: ⏎ on the left drops focus into the right
@@ -261,6 +262,7 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
         BlockedReason::KickRejected { .. } => ("⧗", theme::warning()),
         BlockedReason::BudgetSpent => ("$", theme::warning()),
         BlockedReason::FiveHour { .. } => ("◔", theme::warning()),
+        BlockedReason::ScopedSpent { .. } => ("◇", theme::warning()),
         BlockedReason::WeeklySoft { .. } => ("~", theme::warning()),
         BlockedReason::Stale => ("⋯", theme::faint()),
     };
@@ -300,6 +302,11 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
             theme::warning().bold(),
             resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
         ),
+        BlockedReason::ScopedSpent { label, pct } => (
+            format!("{label} {pct:.0}%"),
+            theme::warning().bold(),
+            Some("other models ok".to_string()),
+        ),
         BlockedReason::WeeklySoft { pct } => (
             format!("weekly {pct:.0}%"),
             theme::warning().bold(),
@@ -329,6 +336,9 @@ fn reason_fix(reason: &BlockedReason, name: &str) -> String {
         BlockedReason::KickRejected { .. } => "claude code is refusing to start it".to_string(),
         BlockedReason::BudgetSpent => "raise max spend below".to_string(),
         BlockedReason::FiveHour { .. } => "5h quota is spent, it resets on its own".to_string(),
+        BlockedReason::ScopedSpent { .. } => {
+            "that model's weekly window is spent, other models still serve".to_string()
+        }
         BlockedReason::WeeklySoft { .. } => {
             "past the weekly switch line, still serving".to_string()
         }
@@ -468,6 +478,8 @@ fn member_detail(
             *row,
             selected,
             threshold,
+            profile.check_weekly,
+            profile.check_scoped,
             profile.last_resort,
             profile.max_auto_spend.unwrap_or(0.0),
             cfg.state.spend_budget_switching,
@@ -491,6 +503,25 @@ fn member_detail(
                 )),
                 None => {}
             }
+        }
+        // The gate toggles hint the CURRENT state — what the walk does with
+        // this account right now — so flipping reads as choosing the other
+        // sentence.
+        if *row == FallbackRow::CheckWeekly && selected {
+            let hint = if profile.check_weekly {
+                "weekly usage past the limit takes this account out of rotation"
+            } else {
+                "weekly usage isn't checked when auto-switching; only the 100% cap blocks"
+            };
+            lines.extend(help_tooltip_lines(hint, width));
+        }
+        if *row == FallbackRow::CheckScoped && selected {
+            let hint = if profile.check_scoped {
+                "a spent per-model week (e.g. 7d fable) takes this account out of rotation"
+            } else {
+                "per-model weeks aren't checked; stays in rotation for other models"
+            };
+            lines.extend(help_tooltip_lines(hint, width));
         }
         if *row == FallbackRow::LastResort && selected {
             lines.extend(help_tooltip_lines(
@@ -619,6 +650,8 @@ fn detail_row(
     row: FallbackRow,
     selected: bool,
     threshold: f64,
+    check_weekly: bool,
+    check_scoped: bool,
     last_resort: bool,
     max_spend: f64,
     spend_budget: bool,
@@ -669,18 +702,20 @@ fn detail_row(
             }
             Line::from(spans)
         }
-        FallbackRow::LastResort => {
-            let (value, style) = if last_resort {
+        FallbackRow::CheckWeekly | FallbackRow::CheckScoped | FallbackRow::LastResort => {
+            let (key, on) = match row {
+                FallbackRow::CheckWeekly => ("weekly gate", check_weekly),
+                FallbackRow::CheckScoped => ("scoped gate", check_scoped),
+                _ => ("last resort", last_resort),
+            };
+            let (value, style) = if on {
                 (theme::toggle_on().to_string(), theme::accent())
             } else {
                 (theme::toggle_off().to_string(), theme::faint())
             };
             Line::from(vec![
                 arrow,
-                Span::styled(
-                    key_cell("last resort", KEY_W, KEY_GUTTER),
-                    label_style(selected),
-                ),
+                Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(selected)),
                 Span::styled(value, style),
             ])
         }

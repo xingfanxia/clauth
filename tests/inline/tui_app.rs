@@ -3139,7 +3139,7 @@ fn fallback_last_resort_toggle_persists_and_refreshes_tokens() {
     app.tab = Tab::Fallback;
     app.fallback_focus = super::FallbackFocus::Detail;
     app.chain_cursor = 0;
-    app.fallback_detail_cursor = 1; // FALLBACK_ROWS[1] == LastResort
+    app.fallback_detail_cursor = 3; // FALLBACK_ROWS[3] == LastResort
 
     assert!(
         !app.config().find("a").is_some_and(|p| p.last_resort),
@@ -3185,7 +3185,7 @@ fn fallback_last_resort_is_exclusive_across_the_chain() {
     app.tab = Tab::Fallback;
     app.fallback_focus = super::FallbackFocus::Detail;
     app.chain_cursor = 0; // member "a"
-    app.fallback_detail_cursor = 1; // FALLBACK_ROWS[1] == LastResort
+    app.fallback_detail_cursor = 3; // FALLBACK_ROWS[3] == LastResort
 
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
 
@@ -3208,6 +3208,39 @@ fn fallback_last_resort_is_exclusive_across_the_chain() {
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
     assert_eq!(app.config().find("a").map(|p| p.last_resort), Some(false));
     assert_eq!(app.config().find("b").map(|p| p.last_resort), Some(false));
+}
+
+// The per-account usage gates flip and persist through their toggle rows,
+// independently of each other.
+#[test]
+fn fallback_usage_gate_toggles_persist() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+
+    app.fallback_detail_cursor = 1; // FALLBACK_ROWS[1] == CheckWeekly
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().find("a").map(|p| (p.check_weekly, p.check_scoped)),
+        Some((false, true)),
+        "space flips only the weekly gate"
+    );
+
+    app.fallback_detail_cursor = 2; // FALLBACK_ROWS[2] == CheckScoped
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config().find("a").map(|p| (p.check_weekly, p.check_scoped)),
+        Some((false, false)),
+        "⏎ flips only the scoped gate"
+    );
+
+    // The off states survive a config reload from disk (persisted, not
+    // just in-memory).
+    let reloaded = crate::profile::load_profile("a").expect("reload profile");
+    assert!(!reloaded.check_weekly);
+    assert!(!reloaded.check_scoped);
 }
 
 // ── tokens tab: model filter via the action menu ─────────────────────────────

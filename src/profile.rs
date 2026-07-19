@@ -169,6 +169,18 @@ pub(crate) struct Profile {
     /// default — means the chain never picks this member for spend reasons, so
     /// stock behavior costs nothing. See `fallback::spend_armed`.
     pub(crate) max_auto_spend: Option<f64>,
+    /// Whether auto-switching checks this account's aggregate weekly (7d)
+    /// usage against the soft weekly line (fallback chain only). Off, only the
+    /// hard cap (100%) blocks it — the account stays in rotation across the
+    /// soft band. Default on (stock behavior).
+    pub(crate) check_weekly: bool,
+    /// Whether auto-switching checks this account's per-model weekly windows
+    /// (e.g. "7d fable") against the weekly line (fallback chain only). On, a
+    /// scoped window past the line keeps this account out of rotation — for
+    /// sessions on that model it is as dead as a spent week. Off, scoped
+    /// windows are ignored here: the account stays in rotation for use with
+    /// other models. Default on.
+    pub(crate) check_scoped: bool,
     /// Utilization % at/above which a bell toast fires in the overview tab.
     /// None = no bell for this profile.
     pub(crate) bell_threshold: Option<f64>,
@@ -201,6 +213,8 @@ impl Profile {
             fallback_threshold: None,
             last_resort: false,
             max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
             bell_threshold: None,
             disabled: false,
             credentials: None,
@@ -761,6 +775,13 @@ struct ProfileConfig {
     last_resort: bool,
     #[serde(default)]
     max_auto_spend: Option<f64>,
+    /// `Option` (not `bool`) so the derived `Default` and an absent key agree:
+    /// `None` means "unset", which resolves to the on default at the load
+    /// boundary — a plain `#[serde(default)] bool` would silently default OFF.
+    #[serde(default)]
+    check_weekly: Option<bool>,
+    #[serde(default)]
+    check_scoped: Option<bool>,
     #[serde(default)]
     bell_threshold: Option<f64>,
     #[serde(default)]
@@ -1226,6 +1247,8 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
         max_auto_spend: config
             .max_auto_spend
             .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 }),
+        check_weekly: config.check_weekly.unwrap_or(true),
+        check_scoped: config.check_scoped.unwrap_or(true),
         bell_threshold: finite_pct(config.bell_threshold),
         disabled: config.disabled,
         credentials,
@@ -1257,6 +1280,11 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 fallback_threshold: profile.fallback_threshold,
                 last_resort: profile.last_resort,
                 max_auto_spend: profile.max_auto_spend,
+                // Default-on booleans render as commented examples when on, so
+                // the canonical form is `None` (unset) — an explicit `= true`
+                // on disk normalizes away on the next rewrite.
+                check_weekly: (!profile.check_weekly).then_some(false),
+                check_scoped: (!profile.check_scoped).then_some(false),
                 bell_threshold: profile.bell_threshold,
                 disabled: profile.disabled,
             };
@@ -1439,6 +1467,26 @@ fn render_config_toml(profile: &Profile) -> String {
     match profile.max_auto_spend {
         Some(v) => out.push_str(&format!("max_auto_spend = {v}\n")),
         None => out.push_str("# max_auto_spend = 5.0\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# Whether auto-switching checks this account's aggregate weekly (7d)\n");
+    out.push_str("# usage against the weekly limit. Set false to keep this account in\n");
+    out.push_str("# rotation across the soft weekly band; the 100% hard cap always blocks.\n");
+    if profile.check_weekly {
+        out.push_str("# check_weekly = false\n");
+    } else {
+        out.push_str("check_weekly = false\n");
+    }
+    out.push('\n');
+
+    out.push_str("# Whether auto-switching checks this account's per-model weekly windows\n");
+    out.push_str("# (e.g. \"7d fable\") against the weekly limit. Set false to ignore them\n");
+    out.push_str("# and keep this account in rotation for use with other models.\n");
+    if profile.check_scoped {
+        out.push_str("# check_scoped = false\n");
+    } else {
+        out.push_str("check_scoped = false\n");
     }
     out.push('\n');
 
