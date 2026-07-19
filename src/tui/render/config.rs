@@ -226,10 +226,7 @@ fn session_token_line(status: &crate::claude::SessionTokenStatus, now_ms: i64) -
                         theme::warning(),
                     )
                 } else {
-                    (
-                        format!("long-lived · expires in ~{days}d"),
-                        theme::accent(),
-                    )
+                    (format!("long-lived · expires in ~{days}d"), theme::accent())
                 }
             }
         }

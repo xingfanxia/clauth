@@ -142,7 +142,10 @@ fn long_lived_token_row_counts_down_and_escalates() {
     let day = 86_400_000_i64;
     let now = 1_700_000_000_000_i64;
 
-    let comfy = line_text(&session_token_line(&S::LongLived(Some(now + 340 * day)), now));
+    let comfy = line_text(&session_token_line(
+        &S::LongLived(Some(now + 340 * day)),
+        now,
+    ));
     assert!(comfy.contains("token"), "{comfy}");
     assert!(comfy.contains("long-lived · expires in ~340d"), "{comfy}");
 
