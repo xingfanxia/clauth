@@ -40,7 +40,7 @@ mod which;
 #[cfg(test)]
 mod testutil;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::profile::{AppConfig, ThemeName, load_config};
 use crate::runtime::Isolation;
@@ -148,6 +148,12 @@ fn dispatch(args: &[String]) -> Result<()> {
         // Hidden: the bundled PostToolUse `asyncRewake` hook body. Reads the hook
         // payload on stdin, waits for a background delegate, and wakes the model.
         [cmd] if cmd == "mcp-await-job" => mcp::await_job(),
+        // Hidden: CC's `apiKeyHelper` body for an api-key profile. Reads the
+        // key from `~/.clauth/profiles/<name>/config.toml` (0o600, the source
+        // of truth) and prints it to stdout so the runtime settings.json never
+        // holds the raw key. Fails closed with no stdout if the profile is
+        // missing or has no api_key.
+        [cmd, profile] if cmd == "__api-key" => cmd_api_key(profile),
         [cmd] if cmd == "sessions" => sessions_cli::run_sessions(false),
         [cmd, flag] if cmd == "sessions" && flag == "--json" => sessions_cli::run_sessions(true),
         [cmd, ..] if cmd == "sessions" => Err(usage_error("usage: clauth sessions [--json]")),
@@ -467,6 +473,7 @@ fn collect_api_endpoint(
             if k.is_empty() {
                 anyhow::bail!("api key is required for an API account");
             }
+            claude::validate_api_key(k)?;
             eprintln!(
                 "clauth: warning: --api-key is visible in shell history and process listings; prefer the prompt"
             );
@@ -482,6 +489,7 @@ fn collect_api_endpoint(
             if k.is_empty() {
                 anyhow::bail!("api key is required for an API account");
             }
+            claude::validate_api_key(&k)?;
             Some(k)
         }
     };
@@ -775,6 +783,68 @@ fn cmd_switch(name: &str) -> Result<()> {
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
     actions::switch_profile_cli(config, &canonical)
+}
+
+/// `clauth __api-key <profile>` — the body CC's `apiKeyHelper` invokes per
+/// request for an api-key profile. Loads the key from the profile's
+/// `config.toml` (0o600) and prints it to stdout. The key never reaches argv
+/// (the helper command line carries only the profile name) nor the spawned
+/// CC process's env (the runtime `settings.json` writes `apiKeyHelper`, not
+/// `env.ANTHROPIC_AUTH_TOKEN`). Fails closed with no stdout if the profile
+/// is missing or carries no api_key, so a misconfigured helper surfaces as a
+/// 401, not a silent leak of some other value.
+fn cmd_api_key(name: &str) -> Result<()> {
+    let key = api_key_for_profile(name)?;
+    // `api_key_for_profile` returns Ok(Some) only when the key is non-empty;
+    // Ok(None) means the profile has no key to mint, so the helper must fail
+    // closed rather than emit a blank line CC would send as a credential.
+    let Some(key) = key else {
+        anyhow::bail!("profile '{name}' has no api_key");
+    };
+    let mut stdout = std::io::stdout().lock();
+    write_api_key(&mut stdout, &key)
+}
+
+/// Write the api_key verbatim to `writer` — NO trailing newline, NO framing.
+/// CC's `apiKeyHelper` contract does not document whether stdout is trimmed
+/// (the docs say only "any shell command that prints the current credential
+/// to stdout"), so the no-newline form strictly dominates: it is correct
+/// whether CC trims or not, whereas `key + "\n"` would only be correct under
+/// the unverified trim assumption. For a credential path, fail safe — CC
+/// reads the bytes via EOF on process exit, no line-read hang.
+fn write_api_key<W: std::io::Write>(writer: &mut W, key: &str) -> Result<()> {
+    writer
+        .write_all(key.as_bytes())
+        .context("writing api_key to stdout")?;
+    writer.flush().context("flushing api_key to stdout")
+}
+
+/// Read a profile's stored api_key from `config.toml`. Returns `Ok(None)` for
+/// a profile that exists but has no api_key, `Err` for a missing profile or
+/// unreadable config. Kept separate from [`cmd_api_key`] so the load is
+/// unit-testable without capturing stdout. An empty key reads as `None`:
+/// a credential that is whitespace-only is not a credential.
+fn api_key_for_profile(name: &str) -> Result<Option<String>> {
+    // `load_profile` is permissive — a missing `config.toml` reads as the
+    // default profile, so a helper pointing at a typo'd or deleted name would
+    // otherwise return `Ok(None)` indistinguishable from a real no-key
+    // profile. The dir-existence check fails closed with a clearer message
+    // instead; both cases still surface as exit 1 via `cmd_api_key`.
+    if !profile::profile_dir(name)?.exists() {
+        anyhow::bail!("profile '{name}' not found");
+    }
+    let profile = profile::load_profile(name)?;
+    let key = profile
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // Fail closed on a hand-edited config that poisoned the key with control
+    // chars: emitting it verbatim would inject a header, so refuse to mint.
+    if let Some(k) = key {
+        claude::validate_api_key(k)?;
+    }
+    Ok(key.map(str::to_string))
 }
 
 fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {

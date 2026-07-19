@@ -1067,9 +1067,14 @@ fn build_runtime_dir_links_claude_json_from_parent() {
     });
 }
 
-/// `runtime/settings.json` carries the profile's `ANTHROPIC_AUTH_TOKEN` for an
-/// api-key profile, so it is a credential file and must land 0o600 like every
-/// other clauth-owned write. The seeded `.claude.json` rides the same rule.
+/// `runtime/settings.json` carries clauth-owned credential routing for an
+/// api-key profile (top-level `apiKeyHelper` naming the profile, plus the
+/// base_url and model env keys), so it is a credential file and must land
+/// 0o600 like every other clauth-owned write. The raw key is NOT in this file
+/// (it lives in `config.toml`, minted per request by the helper) — but the
+/// helper string and the surrounding env are still operator-sensitive, so the
+/// perm invariant is unchanged from the pre-helper era. The seeded
+/// `.claude.json` rides the same rule.
 #[cfg(unix)]
 #[test]
 fn runtime_settings_and_seed_are_owner_only() {
@@ -1099,11 +1104,14 @@ fn runtime_settings_and_seed_are_owner_only() {
         .expect("build");
 
         let settings = runtime.join("settings.json");
+        let settings_bytes = fs::read_to_string(&settings).expect("read settings");
         assert!(
-            fs::read_to_string(&settings)
-                .expect("read settings")
-                .contains("sk-secret-key"),
-            "precondition: the api key is in this file"
+            settings_bytes.contains("apiKeyHelper"),
+            "precondition: the apiKeyHelper wiring is in this file (got: {settings_bytes})"
+        );
+        assert!(
+            !settings_bytes.contains("sk-secret-key"),
+            "the raw api key must NOT be in this file — only the helper command string"
         );
         let mode = fs::metadata(&settings).expect("meta").permissions().mode();
         assert_eq!(

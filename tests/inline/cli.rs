@@ -236,6 +236,19 @@ fn collect_api_endpoint_rejects_empty_flag_values() {
     );
 }
 
+#[test]
+fn collect_api_endpoint_rejects_control_chars_in_key() {
+    // The key is minted verbatim into a request header; a CRLF would inject one.
+    assert!(
+        collect_api_endpoint(Some("https://x"), Some("sk-a\r\nX-Evil: 1")).is_err(),
+        "a control-char key must bail at capture, not persist a header-injecting value"
+    );
+    assert!(
+        collect_api_endpoint(Some("https://x"), Some("sk a b")).is_err(),
+        "interior whitespace in a key is a bad paste"
+    );
+}
+
 // ── parse_delete_args ──
 
 #[test]
@@ -442,4 +455,137 @@ fn parse_start_args_requires_a_name() {
         None,
         "flags without a name must bail"
     );
+}
+
+// ── hidden `clauth __api-key <profile>` (CC's apiKeyHelper body) ──────────────
+//
+// The hidden subcommand is what CC's `apiKeyHelper` runs per request to mint
+// an auth value for an api-key profile (see `src/claude.rs`
+// `build_claude_settings_json`). It reads the key from `config.toml` and
+// prints it to stdout; on a missing profile or a profile with no api_key it
+// fails closed with no stdout. The key never reaches argv (the helper command
+// line carries only the profile name).
+
+#[cfg(unix)]
+mod api_key_helper_tests {
+    use super::*;
+    use crate::profile::save_profile;
+    use crate::testutil::HomeSandbox;
+
+    /// Write a profile to the sandboxed home with the given api_key (or none),
+    /// then save it so `load_profile` can read it back the way the helper does.
+    fn save_profile_with_key(name: &str, api_key: Option<&str>) {
+        let mut profile = crate::testutil::blank_profile(name);
+        profile.api_key = api_key.map(str::to_string);
+        save_profile(&profile).expect("save_profile");
+    }
+
+    /// `api_key_for_profile` returns the stored key verbatim for a profile that
+    /// has one — the load path CC's helper relies on each request.
+    #[test]
+    fn api_key_for_profile_returns_stored_key() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let key = api_key_for_profile("acme").expect("load_profile");
+        assert_eq!(key.as_deref(), Some("sk-test-12345"));
+    }
+
+    /// A profile that exists but has no api_key yields `Ok(None)`, which
+    /// `cmd_api_key` turns into an Err (no stdout). This is the fail-closed
+    /// path for a misconfigured helper.
+    #[test]
+    fn api_key_for_profile_none_when_profile_has_no_key() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("oauth-profile", None);
+        let key = api_key_for_profile("oauth-profile").expect("load_profile");
+        assert!(
+            key.is_none(),
+            "a profile with no api_key must yield Ok(None), not a blank Some"
+        );
+    }
+
+    /// A missing profile surfaces as `Err`, not `Ok(None)` — so `cmd_api_key`
+    /// fails for a helper string pointing at a profile name that no longer
+    /// exists, rather than silently minting nothing.
+    #[test]
+    fn api_key_for_profile_err_for_missing_profile() {
+        let _home = HomeSandbox::new();
+        let err = api_key_for_profile("no-such-profile").expect_err("missing profile");
+        assert!(
+            err.to_string().contains("no-such-profile")
+                || err.to_string().contains("failed to read"),
+            "error must name the missing profile; got: {err}"
+        );
+    }
+
+    /// A whitespace-only api_key reads as `None`: the helper must fail closed
+    /// rather than emit a blank line CC would send as a credential. The trim
+    /// also forgives a config.toml hand-edit with a trailing newline inside
+    /// the quotes, which serde would otherwise preserve.
+    #[test]
+    fn api_key_for_profile_treats_blank_key_as_absent() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("blank", Some("   "));
+        let key = api_key_for_profile("blank").expect("load_profile");
+        assert!(key.is_none(), "a whitespace-only key must read as None");
+    }
+
+    /// End-to-end through `dispatch`: the helper dispatch arm reaches
+    /// `cmd_api_key` for a profile that has a key and returns Ok (CC sees exit
+    /// 0; the printed bytes are asserted separately by `write_api_key_*`
+    /// below, since stdout can't be captured cleanly from a same-process
+    /// `dispatch` call).
+    #[test]
+    fn dispatch_api_key_helper_returns_ok_for_profile_with_key() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-dispatch-xyz"));
+        let args = ["__api-key".to_string(), "acme".to_string()];
+        dispatch(&args).expect("a profile with a key must exit 0");
+    }
+
+    /// `write_api_key` emits the key bytes VERBATIM with no trailing newline
+    /// or other framing. CC's `apiKeyHelper` contract does not document
+    /// trimming, so a trailing `\n` would be correct only under the unverified
+    /// trim assumption; the bare-key form is correct either way. Pinned as a
+    /// byte-exact assertion so a regression that reintroduces `println!`-style
+    /// framing fails loudly instead of leaking a `\n`-suffixed credential.
+    #[test]
+    fn write_api_key_emits_no_trailing_newline() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_api_key(&mut buf, "sk-test-12345").expect("write");
+        assert_eq!(
+            buf,
+            b"sk-test-12345".to_vec(),
+            "must emit exactly the key bytes — no newline, no framing"
+        );
+
+        // An empty-key call is structurally unreachable (`cmd_api_key` bails
+        // before this fn on None), but the writer itself handles it without
+        // inventing output.
+        let mut empty: Vec<u8> = Vec::new();
+        write_api_key(&mut empty, "").expect("write empty");
+        assert!(empty.is_empty(), "an empty key writes zero bytes");
+    }
+
+    /// End-to-end through `dispatch`: the helper returns Err for a profile with
+    /// no api_key — a helper pointing at a non-api profile must surface as a
+    /// non-zero exit so CC's request fails loudly rather than sending a blank
+    /// credential.
+    #[test]
+    fn dispatch_api_key_helper_fails_closed_for_profile_without_key() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("oauth-profile", None);
+        let args = ["__api-key".to_string(), "oauth-profile".to_string()];
+        dispatch(&args).expect_err("profile without a key must fail closed");
+    }
+
+    /// End-to-end through `dispatch`: the helper returns Err for a profile name
+    /// that doesn't exist. A stale helper string from a deleted profile must
+    /// surface as a request failure, not silently exit 0.
+    #[test]
+    fn dispatch_api_key_helper_fails_closed_for_missing_profile() {
+        let _home = HomeSandbox::new();
+        let args = ["__api-key".to_string(), "ghost-profile".to_string()];
+        dispatch(&args).expect_err("missing profile must fail closed");
+    }
 }

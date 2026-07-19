@@ -1140,11 +1140,29 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     // Adopt a staged rotation that never committed (crash/failed write between OAuth response and save).
     let credentials = recover_pending_credentials(name, credentials);
 
-    let provider = config.base_url.as_deref().and_then(Provider::from_base_url);
+    // The OAuth-bearer leak needs BOTH a stored pair AND no api key: CC would
+    // send that bearer to the third-party base_url. Gate on the pair so a PURE
+    // api account (no pair) with a cleared key keeps its base_url shell and
+    // stays re-loginable (`clear_profile_api_key`). Normalize at the LOAD
+    // boundary, same discipline as the `max_auto_spend` case below. This governs
+    // the managed base_url FIELD only: clauth never copies `ANTHROPIC_BASE_URL`
+    // into `profile.env`, so an env override is always operator-authored and is
+    // left untouched — normalize the state clauth authors, not an explicit one.
+    let has_usable_key = config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|k| !k.is_empty());
+    let base_url = match config.base_url {
+        Some(_) if credentials.is_some() && !has_usable_key => None,
+        other => other,
+    };
+
+    let provider = base_url.as_deref().and_then(Provider::from_base_url);
     // Seed third-party usage from disk for recognised providers AND generic
     // api-key endpoints (whose discovered usage is cached the same way).
     let third_party_usage =
-        if provider.is_some() || (config.base_url.is_some() && config.api_key.is_some()) {
+        if provider.is_some() || (base_url.is_some() && config.api_key.is_some()) {
             crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
                 name,
                 crate::profile_cache::THIRD_PARTY_CACHE_FILE,
@@ -1155,7 +1173,7 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
 
     let profile = Profile {
         name: name.into(),
-        base_url: config.base_url,
+        base_url,
         api_key: config.api_key,
         auto_start: config.auto_start,
         env: config.env,

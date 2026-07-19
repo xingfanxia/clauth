@@ -534,6 +534,69 @@ fn non_finite_max_auto_spend_reads_as_zero_at_load() {
     );
 }
 
+/// The load boundary drops a base_url ONLY when a stored OAuth pair could leak
+/// to it (pair present + no usable key). A pure api account with a cleared key
+/// keeps its base_url shell so `clear_profile_api_key` stays re-loginable — the
+/// same normalize-at-load discipline as `max_auto_spend`, scoped to the leak.
+#[cfg(unix)]
+#[test]
+fn base_url_dropped_only_when_a_stored_pair_could_leak() {
+    let _home = HomeSandbox::new();
+    let name = "endpoint-key-gate";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let endpoint = "https://api.z.ai/anthropic";
+
+    // No stored pair + no key: nothing to leak, so the base_url shell is kept —
+    // a cleared api account (`clear_profile_api_key`) must stay re-loginable.
+    std::fs::write(&config_path, format!("base_url = \"{endpoint}\"\n")).expect("write config");
+    let pure = load_profile(name).expect("load_profile");
+    assert_eq!(
+        pure.base_url.as_deref(),
+        Some(endpoint),
+        "no pair means no leak, so the base_url shell is kept"
+    );
+
+    // Seed an OAuth pair (a hybrid). With no key the pair would reach the
+    // endpoint, so base_url (and its provider) is dropped; CC routes to Anthropic.
+    std::fs::write(
+        &cred_path,
+        serde_json::to_string(&oauth_credentials()).expect("ser creds"),
+    )
+    .expect("write credentials.json");
+    let hybrid = load_profile(name).expect("load_profile");
+    assert_eq!(
+        hybrid.base_url, None,
+        "a stored pair with no key must not route to the endpoint"
+    );
+    assert!(
+        hybrid.provider.is_none(),
+        "a dropped endpoint has no provider"
+    );
+
+    // A whitespace-only key is still no usable key → still dropped.
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\napi_key = \"   \"\n"),
+    )
+    .expect("write config");
+    assert_eq!(load_profile(name).expect("load_profile").base_url, None);
+
+    // A real key on the same hybrid keeps the endpoint and its provider.
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\napi_key = \"sk-real\"\n"),
+    )
+    .expect("write config");
+    let keyed = load_profile(name).expect("load_profile");
+    assert_eq!(keyed.base_url.as_deref(), Some(endpoint));
+    assert!(
+        keyed.provider.is_some(),
+        "a keyed z.ai endpoint keeps its provider"
+    );
+}
+
 // ── crash-durable rotation: the pending sidecar's adopt/discard decision ─────
 //
 // `stage_rotated_credentials` writes a rotated pair to `credentials.json.pending`

@@ -788,10 +788,13 @@ fn write_merged_settings(
     };
     let merged = build_claude_settings_json(base, profile, active_env_keys)?;
     let settings_dst = runtime.join("settings.json");
-    // This file carries the api-key profile's `ANTHROPIC_AUTH_TOKEN`, so it must
-    // land 0o600 like every other clauth-owned write. The write gate also fires
-    // when only the mode is wrong (a byte-identical file an older build left at
-    // the umask never self-heals otherwise).
+    // This file carries the api-key profile's top-level `apiKeyHelper` command
+    // string (plus the base_url/model env keys), so it must land 0o600 like
+    // every other clauth-owned write. The raw key itself lives in `config.toml`
+    // (minted per request by the helper); the runtime settings.json is still
+    // operator-sensitive. The write gate also fires when only the mode is wrong
+    // (a byte-identical file an older build left at the umask never self-heals
+    // otherwise).
     let needs_write = match std::fs::read(&settings_dst) {
         Ok(existing) => existing != merged.as_bytes() || !is_owner_only(&settings_dst),
         Err(_) => true,
