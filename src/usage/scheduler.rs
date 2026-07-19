@@ -2902,7 +2902,7 @@ fn scan_recovery(
     // Build chain-member snapshot under config lock, then drop before
     // touching store (avoids the config↔store inversion that
     // `next_auto_switch_target` avoids via ChainSnapshot).
-    let (members, weekly_pct): (Vec<crate::fallback::ChainMember>, f64) = {
+    let members: Vec<crate::fallback::ChainMember> = {
         let cfg = match config.lock() {
             Ok(c) => c,
             Err(_) => return,
@@ -2915,8 +2915,7 @@ fn scan_recovery(
         if cfg.state.fallback_chain.is_empty() {
             return;
         }
-        let members = cfg
-            .state
+        cfg.state
             .fallback_chain
             .iter()
             // AUTH-1: never recover into an auth-broken member (dead token).
@@ -2929,10 +2928,16 @@ fn scan_recovery(
                         .map(crate::fallback::threshold_for)
                         .unwrap_or(crate::fallback::DEFAULT_THRESHOLD),
                     last_resort: profile.is_some_and(|p| p.last_resort),
+                    weekly_line: profile
+                        .map(|p| crate::fallback::member_weekly_line(p, weekly_pct))
+                        .unwrap_or(weekly_pct),
+                    scoped_line: profile
+                        .map(|p| crate::fallback::member_scoped_line(p, weekly_pct))
+                        .unwrap_or(weekly_pct),
+                    check_scoped: profile.is_none_or(|p| p.check_scoped),
                 }
             })
-            .collect();
-        (members, weekly_pct)
+            .collect()
     };
 
     // Relink only to a member with a confirmed-live read; a synthetic/stale 0%
@@ -2946,7 +2951,7 @@ fn scan_recovery(
     // usage is exactly what the messages-limiter rejection freezes it in.
     let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
     if let Some(name) =
-        crate::fallback::find_recovered_member(&members, store, weekly_pct, &kick_rejected)
+        crate::fallback::find_recovered_member(&members, store, &kick_rejected)
         && let Ok(mut p) = pending_switch.lock()
     {
         enqueue_pending_switch(

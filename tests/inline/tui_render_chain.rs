@@ -21,6 +21,9 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: Some(threshold),
+        weekly_threshold: None,
+        check_weekly: true,
+        check_scoped: true,
         last_resort: false,
         bell_threshold: None,
         credentials: None,
@@ -66,11 +69,11 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
     let b = profile("b", 95.0, 100.0, 1800);
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let on_a = member_detail(&cfg, "a", 0, 2, false, 0, false, None, 60);
+    let on_a = member_detail(&cfg, "a", 0, 2, false, 0, false, None, None, 60);
     let hint_a = resumes_line(&on_a).expect("resumes hint renders while viewing member a");
     assert!(hint_a.contains("resumes: b in ~"), "{hint_a}");
 
-    let on_b = member_detail(&cfg, "b", 1, 2, false, 0, false, None, 60);
+    let on_b = member_detail(&cfg, "b", 1, 2, false, 0, false, None, None, 60);
     let hint_b = resumes_line(&on_b).expect("resumes hint renders while viewing member b");
     assert!(hint_b.contains("resumes: b in ~"), "{hint_b}");
 }
@@ -82,7 +85,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let lines = member_detail(&cfg, "a", 0, 2, false, 0, false, None, 60);
+    let lines = member_detail(&cfg, "a", 0, 2, false, 0, false, None, None, 60);
     assert!(
         resumes_line(&lines).is_none(),
         "must not show when the chain isn't fully exhausted"
@@ -100,7 +103,7 @@ fn last_resort_hint_wraps_on_a_narrow_pane() {
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
     // Focused on the `last resort` row (FALLBACK_ROWS[1]) at 28 cols.
-    let lines = member_detail(&cfg, "a", 0, 2, true, 1, false, None, 28);
+    let lines = member_detail(&cfg, "a", 0, 2, true, 1, false, None, None, 28);
     let texts: Vec<String> = lines.iter().map(line_text).collect();
     let lead = texts
         .iter()
@@ -126,7 +129,7 @@ fn last_resort_hint_names_the_currently_marked_member() {
     b.last_resort = true;
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let lines = member_detail(&cfg, "a", 0, 2, true, 1, false, None, 80);
+    let lines = member_detail(&cfg, "a", 0, 2, true, 4, false, None, None, 80);
     let hint = lines
         .iter()
         .map(line_text)
@@ -155,7 +158,7 @@ fn value_col(key: &str, rendered: &str) -> usize {
 fn last_resort_value_aligns_with_other_rows() {
     let a = profile("a", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a], Some("a"), vec!["a"]);
-    let texts: Vec<String> = member_detail(&cfg, "a", 0, 1, true, 1, false, None, 60)
+    let texts: Vec<String> = member_detail(&cfg, "a", 0, 1, true, 1, false, None, None, 60)
         .iter()
         .map(line_text)
         .collect();

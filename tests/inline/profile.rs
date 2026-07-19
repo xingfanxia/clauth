@@ -624,6 +624,9 @@ fn credential_and_cache_files_have_restricted_permissions() {
         env: std::collections::BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        weekly_threshold: None,
+        check_weekly: true,
+        check_scoped: true,
         last_resort: false,
         bell_threshold: None,
         credentials: Some(creds.clone()),
@@ -1187,4 +1190,30 @@ fn reload_fingerprint_catches_a_non_newest_config_edit() {
         before, after,
         "an edit to a non-newest config.toml must still flip the fingerprint"
     );
+}
+
+// The per-account usage gates must default ON (unset = `None` = checked) and
+// the weekly-line override unset; both round-trip through config.toml.
+#[test]
+fn usage_gates_and_weekly_override_round_trip_through_config_toml() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.check_weekly, None);
+    assert_eq!(cfg.check_scoped, None);
+    assert_eq!(cfg.weekly_threshold, None);
+
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.check_weekly = false;
+    profile.check_scoped = false;
+    profile.weekly_threshold = Some(90.0);
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.check_weekly, Some(false));
+    assert_eq!(parsed.check_scoped, Some(false));
+    assert_eq!(parsed.weekly_threshold, Some(90.0));
+
+    let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
+    let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
+    assert_eq!(parsed.check_weekly, None);
+    assert_eq!(parsed.check_scoped, None);
+    assert_eq!(parsed.weekly_threshold, None);
 }

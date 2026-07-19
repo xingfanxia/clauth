@@ -2439,7 +2439,7 @@ fn fallback_last_resort_toggle_persists_and_refreshes_tokens() {
     app.tab = Tab::Fallback;
     app.fallback_focus = super::FallbackFocus::Detail;
     app.chain_cursor = 0;
-    app.fallback_detail_cursor = 1; // FALLBACK_ROWS[1] == LastResort
+    app.fallback_detail_cursor = 4; // FALLBACK_ROWS[4] == LastResort
 
     assert!(
         !app.config().find("a").is_some_and(|p| p.last_resort),
@@ -2485,7 +2485,7 @@ fn fallback_last_resort_is_exclusive_across_the_chain() {
     app.tab = Tab::Fallback;
     app.fallback_focus = super::FallbackFocus::Detail;
     app.chain_cursor = 0; // member "a"
-    app.fallback_detail_cursor = 1; // FALLBACK_ROWS[1] == LastResort
+    app.fallback_detail_cursor = 4; // FALLBACK_ROWS[4] == LastResort
 
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
 
@@ -3355,4 +3355,93 @@ fn config_rows_for_a_codex_profile_hide_claude_settings() {
         rows.contains(&super::ConfigRow::DeleteCreds),
         "a stored codex login makes log-out reachable"
     );
+}
+
+/// FALLBACK_ROWS index of the `weekly at` override editor.
+fn weekly_at_row() -> usize {
+    super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::WeeklyAt)
+        .expect("WeeklyAt row exists")
+}
+
+// The per-member weekly override: ⏎ opens seeded with the current override
+// (empty when following the chain default), a typed value persists, and an
+// EMPTY commit clears back to the default. Inert while the weekly gate is off.
+#[test]
+fn fallback_weekly_override_editor_sets_and_clears() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    // ⏎ opens the editor with an EMPTY seed (no override yet).
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_weekly_draft.is_some(), "⏎ opens the field");
+    for c in ['9', '0'] {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_weekly_draft.is_none(), "⏎ closes the field");
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(90.0),
+        "the typed override persists"
+    );
+
+    // Re-open: seeded with "90"; clear it and commit EMPTY → back to default.
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    for _ in 0..2 {
+        super::handle_key(&mut app, key(KeyCode::Backspace));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        None,
+        "an empty commit clears the override"
+    );
+}
+
+// The per-account usage gates flip and persist through their toggle rows,
+// independently of each other; the override row is inert while the weekly
+// gate is off.
+#[test]
+fn fallback_usage_gate_toggles_persist_and_gate_off_inerts_the_override() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+
+    app.fallback_detail_cursor = 2; // FALLBACK_ROWS[2] == CheckWeekly
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().find("a").map(|p| (p.check_weekly, p.check_scoped)),
+        Some((false, true)),
+        "space flips only the weekly gate"
+    );
+
+    app.fallback_detail_cursor = 3; // FALLBACK_ROWS[3] == CheckScoped
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config().find("a").map(|p| (p.check_weekly, p.check_scoped)),
+        Some((false, false)),
+        "⏎ flips only the scoped gate"
+    );
+
+    // Weekly gate is now off → the override editor must not open.
+    app.fallback_detail_cursor = weekly_at_row();
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.fallback_weekly_draft.is_none(),
+        "⏎ must not open the editor while the weekly gate is off"
+    );
+
+    // The off states survive a config reload from disk (persisted, not
+    // just in-memory).
+    let reloaded = crate::profile::load_profile("a").expect("reload profile");
+    assert!(!reloaded.check_weekly);
+    assert!(!reloaded.check_scoped);
 }

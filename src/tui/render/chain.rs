@@ -16,7 +16,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ChainItemKind, FALLBACK_ROWS, FallbackFocus, FallbackRow, InputState, chain_candidates,
-    chain_items, parse_threshold,
+    chain_items, parse_threshold, parse_weekly_override,
 };
 use super::super::theme;
 use super::panes::{
@@ -132,6 +132,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 app.fallback_detail_cursor,
                 app.fallback_armed_remove,
                 app.fallback_threshold_draft.as_ref(),
+                app.fallback_weekly_draft.as_ref(),
                 inner_w,
             );
             (name, true, lines)
@@ -153,18 +154,31 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 
-    // Position the native terminal cursor when the threshold field is being typed,
-    // matching the post-draw cursor path the other edit screens use. The `rotate at`
-    // row is FALLBACK_ROWS[0]; member_detail pushes exactly `ROWS_BEFORE` fixed
-    // lines before the loop (priority, blank, gauge, figure, blank).
+    // Position the native terminal cursor for whichever field is being typed,
+    // matching the post-draw cursor path the other edit screens use.
+    // `member_detail` pushes exactly `ROWS_BEFORE` fixed lines before the row
+    // loop (priority, blank, gauge, figure, blank), and only the row being
+    // typed is selected — so no earlier row contributes a tooltip line and the
+    // row's index in FALLBACK_ROWS is its offset past `ROWS_BEFORE`.
+    let typing = [
+        (
+            FallbackRow::Threshold,
+            app.fallback_threshold_draft.as_ref(),
+        ),
+        (FallbackRow::WeeklyAt, app.fallback_weekly_draft.as_ref()),
+    ]
+    .into_iter()
+    .find_map(|(row, draft)| draft.map(|d| (row, d)));
+
     if detail_focused
         && let Some(ChainItemKind::Member(_)) = selected
-        && let Some(draft) = &app.fallback_threshold_draft
+        && let Some((row, draft)) = typing
+        && let Some(row_idx) = FALLBACK_ROWS.iter().position(|r| *r == row)
     {
-        // x = "❯ " (2) + "rotate at" key block (KEY_W + KEY_GUTTER cols) + cols before caret.
+        // x = "❯ " (2) + key block (KEY_W + KEY_GUTTER cols) + cols before caret.
         let prefix_cols = 2 + KEY_W + KEY_GUTTER + head_cols(draft);
         let cx = inner.x.saturating_add(prefix_cols as u16);
-        let cy = inner.y.saturating_add(ROWS_BEFORE as u16);
+        let cy = inner.y.saturating_add((ROWS_BEFORE + row_idx) as u16);
         frame.set_cursor_position((cx, cy));
     }
 }
@@ -182,6 +196,7 @@ fn member_detail(
     row_cursor: usize,
     armed_remove: bool,
     editing: Option<&InputState>,
+    weekly_editing: Option<&InputState>,
     width: usize,
 ) -> Vec<Line<'static>> {
     let Some(profile) = cfg.find(name) else {
@@ -245,15 +260,19 @@ fn member_detail(
 
     for (i, row) in FALLBACK_ROWS.iter().enumerate() {
         let selected = focused && i == cursor;
-        let row_editing = if *row == FallbackRow::Threshold {
-            editing
-        } else {
-            None
+        let row_editing = match *row {
+            FallbackRow::Threshold => editing,
+            FallbackRow::WeeklyAt => weekly_editing,
+            _ => None,
         };
         let line = detail_row(
             *row,
             selected,
             threshold,
+            profile.weekly_threshold,
+            cfg.state.weekly_switch_threshold_pct(),
+            profile.check_weekly,
+            profile.check_scoped,
             profile.last_resort,
             armed_remove,
             row_editing,
@@ -275,6 +294,50 @@ fn member_detail(
                 )),
                 None => {}
             }
+        }
+        // `weekly at` mirrors `rotate at`: a range tooltip while typing, else
+        // a hint naming what the current value does — including the inert
+        // state while the member's weekly gate is off.
+        if *row == FallbackRow::WeeklyAt {
+            match row_editing {
+                Some(input) => lines.extend(weekly_override_range_tooltip(input, width)),
+                None if selected => {
+                    let chain_default = cfg.state.weekly_switch_threshold_pct();
+                    let hint = if !profile.check_weekly {
+                        "weekly gate is off — this line isn't checked for this account".to_string()
+                    } else {
+                        match profile.weekly_threshold {
+                            Some(v) => format!(
+                                "switches away once weekly usage hits {v:.0}% here (chain default {chain_default:.0}%)"
+                            ),
+                            None => format!(
+                                "follows the chain-wide weekly limit ({chain_default:.0}%); type a value to override"
+                            ),
+                        }
+                    };
+                    lines.extend(help_tooltip_lines(&hint, width));
+                }
+                None => {}
+            }
+        }
+        // The gate toggles hint the CURRENT state — what the walk does with
+        // this account right now — so flipping reads as choosing the other
+        // sentence.
+        if *row == FallbackRow::CheckWeekly && selected {
+            let hint = if profile.check_weekly {
+                "weekly usage past the limit takes this account out of rotation"
+            } else {
+                "weekly usage isn't checked when auto-switching; only the 100% cap blocks"
+            };
+            lines.extend(help_tooltip_lines(hint, width));
+        }
+        if *row == FallbackRow::CheckScoped && selected {
+            let hint = if profile.check_scoped {
+                "a spent per-model week (e.g. 7d fable) takes this account out of rotation"
+            } else {
+                "per-model weeks aren't checked; stays in rotation for other models"
+            };
+            lines.extend(help_tooltip_lines(hint, width));
         }
         if *row == FallbackRow::LastResort && selected {
             lines.extend(help_tooltip_lines(
@@ -327,10 +390,26 @@ fn threshold_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
     }
 }
 
+/// Sub-line under the `weekly at` field while typing: the valid range plus
+/// the empty-clears rule, DANGER when the buffer parses invalid.
+fn weekly_override_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
+    let range = "0-100 % · empty follows the chain default";
+    if parse_weekly_override(input.trimmed()).is_none() {
+        invalid_tooltip_lines(range, width)
+    } else {
+        help_tooltip_lines(range, width)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn detail_row(
     row: FallbackRow,
     selected: bool,
     threshold: f64,
+    weekly_override: Option<f64>,
+    weekly_default: f64,
+    check_weekly: bool,
+    check_scoped: bool,
     last_resort: bool,
     armed_remove: bool,
     editing: Option<&InputState>,
@@ -379,18 +458,72 @@ fn detail_row(
             }
             Line::from(spans)
         }
-        FallbackRow::LastResort => {
-            let (value, style) = if last_resort {
+        FallbackRow::WeeklyAt => {
+            // Inert while the member's weekly gate is off: the line isn't
+            // judged, so render the whole row faint (the key handler no-ops
+            // it).
+            let dimmed = !check_weekly && editing.is_none();
+            let arrow = if dimmed && selected {
+                Span::styled("❯ ", theme::faint())
+            } else {
+                arrow
+            };
+            let key_style = if dimmed {
+                theme::faint()
+            } else {
+                label_style(selected)
+            };
+            let mut spans = vec![
+                arrow,
+                Span::styled(key_cell("weekly at", KEY_W, KEY_GUTTER), key_style),
+            ];
+            match editing {
+                Some(input) => {
+                    let invalid = parse_weekly_override(input.trimmed()).is_none();
+                    spans.extend(value_caret(input, invalid));
+                    let pct_style = if invalid {
+                        theme::danger()
+                    } else {
+                        theme::faint()
+                    };
+                    spans.push(Span::styled(" %", pct_style));
+                }
+                None => match weekly_override {
+                    Some(v) => {
+                        let value_style = if dimmed { theme::faint() } else { theme::accent() };
+                        spans.push(Span::styled(format!("{v:.0}%"), value_style));
+                        spans.push(Span::styled(
+                            format!("   default: {weekly_default:.0}%"),
+                            theme::faint(),
+                        ));
+                    }
+                    // Unset follows the chain-wide line — show that value, but
+                    // faint, so a member-set figure stays visually distinct.
+                    None => {
+                        spans.push(Span::styled(
+                            format!("{weekly_default:.0}%"),
+                            theme::faint(),
+                        ));
+                        spans.push(Span::styled("   chain default", theme::faint()));
+                    }
+                },
+            }
+            Line::from(spans)
+        }
+        FallbackRow::CheckWeekly | FallbackRow::CheckScoped | FallbackRow::LastResort => {
+            let (key, on) = match row {
+                FallbackRow::CheckWeekly => ("weekly gate", check_weekly),
+                FallbackRow::CheckScoped => ("scoped gate", check_scoped),
+                _ => ("last resort", last_resort),
+            };
+            let (value, style) = if on {
                 (theme::toggle_on().to_string(), theme::accent())
             } else {
                 (theme::toggle_off().to_string(), theme::faint())
             };
             Line::from(vec![
                 arrow,
-                Span::styled(
-                    key_cell("last resort", KEY_W, KEY_GUTTER),
-                    label_style(selected),
-                ),
+                Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(selected)),
                 Span::styled(value, style),
             ])
         }

@@ -159,12 +159,27 @@ impl InputState {
 // ── Modals ────────────────────────────────────────────────────────────────────
 
 /// One interactive line in the Fallback tab's detail pane for a chain member.
-/// `Threshold` is a stepper (±5 on `+`/`-`); `LastResort` is a boolean toggle
-/// (space/⏎, per the enumerated-row grammar); `Remove` arms then confirms. The
-/// chain-global wrap-off setting lives on the program-wide Config tab, not here.
+/// `Threshold` is a stepper (±5 on `+`/`-`); `CheckWeekly`/`CheckScoped`/
+/// `LastResort` are boolean toggles (space/⏎, per the enumerated-row grammar);
+/// `Remove` arms then confirms. The chain-global wrap-off setting lives on the
+/// program-wide Config tab, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FallbackRow {
     Threshold,
+    /// Per-account override of the chain-wide weekly (7d) switch line
+    /// (`Profile::weekly_threshold`; the Config tab's `weekly limit` stays
+    /// the default). ⏎ opens an inline editor; an EMPTY commit clears the
+    /// override back to the chain-wide value. Inert (dimmed, no-op) while the
+    /// member's `check_weekly` gate is off — the line isn't judged there.
+    WeeklyAt,
+    /// Whether auto-switching checks this account's aggregate weekly usage
+    /// (`Profile::check_weekly`, on by default). Off, only the 100% hard cap
+    /// blocks it.
+    CheckWeekly,
+    /// Whether auto-switching checks this account's per-model weekly windows,
+    /// e.g. "7d fable" (`Profile::check_scoped`, on by default). Off, the
+    /// account stays in rotation for use with other models.
+    CheckScoped,
     LastResort,
     Remove,
 }
@@ -572,6 +587,9 @@ pub(crate) enum ActionMenuAction {
     ReorderDown,
     // Fallback detail
     EditThreshold,
+    EditWeeklyAt,
+    ToggleCheckWeekly,
+    ToggleCheckScoped,
     ToggleLastResort,
     RemoveMember,
     // Config detail actions (proxied through run_config_row)
@@ -676,6 +694,9 @@ impl ActionMenuAction {
             Self::ReorderUp => "reorder up",
             Self::ReorderDown => "reorder down",
             Self::EditThreshold => "edit threshold",
+            Self::EditWeeklyAt => "edit weekly line",
+            Self::ToggleCheckWeekly => "toggle weekly gate",
+            Self::ToggleCheckScoped => "toggle scoped gate",
             Self::ToggleLastResort => "toggle last resort",
             Self::RemoveMember => "remove member",
             Self::ToggleAutoStart => "toggle auto-start",
@@ -1255,6 +1276,10 @@ pub(crate) struct App {
     /// `Some` while the threshold field is open (⏎ opens, owns keyboard).
     /// `+`/`-` still step the value when `None`.
     pub(crate) fallback_threshold_draft: Option<InputState>,
+    /// The `weekly at` override editor's buffer, or None (not editing). Same
+    /// lifecycle as `fallback_threshold_draft`; an EMPTY commit clears the
+    /// member's override.
+    pub(crate) fallback_weekly_draft: Option<InputState>,
     /// Cursor into [`GLOBAL_CONFIG_ROWS`] on the program-wide Config tab.
     pub(crate) global_config_cursor: usize,
     /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
@@ -1588,6 +1613,7 @@ impl App {
             fallback_detail_cursor: 0,
             fallback_armed_remove: false,
             fallback_threshold_draft: None,
+            fallback_weekly_draft: None,
             global_config_cursor: 0,
             refresh_interval_draft: None,
             weekly_threshold_draft: None,
@@ -2278,6 +2304,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         && app.fallback_threshold_draft.is_some()
     {
         handle_fallback_threshold_edit_key(app, key);
+        return;
+    }
+
+    // Same for the per-member `weekly at` override editor.
+    if app.tab == Tab::Fallback
+        && app.fallback_focus == FallbackFocus::Detail
+        && app.fallback_weekly_draft.is_some()
+    {
+        handle_fallback_weekly_edit_key(app, key);
         return;
     }
 
@@ -3505,8 +3540,11 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
 }
 
 /// Detail rows for a chain member: threshold stepper, last-resort toggle, remove.
-pub(crate) const FALLBACK_ROWS: [FallbackRow; 3] = [
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 6] = [
     FallbackRow::Threshold,
+    FallbackRow::WeeklyAt,
+    FallbackRow::CheckWeekly,
+    FallbackRow::CheckScoped,
     FallbackRow::LastResort,
     FallbackRow::Remove,
 ];
@@ -3607,6 +3645,10 @@ pub(crate) enum FallbackHint {
     ChainAdd,
     DetailThreshold,
     DetailThresholdEdit,
+    DetailWeeklyAt,
+    DetailWeeklyAtEdit,
+    DetailCheckWeekly,
+    DetailCheckScoped,
     DetailLastResort,
     DetailRemove,
     DetailRemoveArmed,
@@ -3630,9 +3672,15 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
             if app.fallback_threshold_draft.is_some() {
                 return FallbackHint::DetailThresholdEdit;
             }
+            if app.fallback_weekly_draft.is_some() {
+                return FallbackHint::DetailWeeklyAtEdit;
+            }
             let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
             match FALLBACK_ROWS[cursor] {
                 FallbackRow::Threshold => FallbackHint::DetailThreshold,
+                FallbackRow::WeeklyAt => FallbackHint::DetailWeeklyAt,
+                FallbackRow::CheckWeekly => FallbackHint::DetailCheckWeekly,
+                FallbackRow::CheckScoped => FallbackHint::DetailCheckScoped,
                 FallbackRow::LastResort => FallbackHint::DetailLastResort,
                 FallbackRow::Remove if app.fallback_armed_remove => FallbackHint::DetailRemoveArmed,
                 FallbackRow::Remove => FallbackHint::DetailRemove,
@@ -4071,6 +4119,7 @@ fn leave_fallback_detail(app: &mut App) {
     app.fallback_armed_remove = false;
     app.fallback_detail_cursor = 0;
     app.fallback_threshold_draft = None;
+    app.fallback_weekly_draft = None;
 }
 
 /// ⇧↑↓: move the selected member up/down, cursor follows. No-op on `+ add`
@@ -4100,6 +4149,19 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
                 app.fallback_threshold_draft = Some(InputState::new(&format!("{current:.0}")));
             }
         }
+        FallbackRow::WeeklyAt => {
+            // Inert while the member's weekly gate is off (rendered dimmed):
+            // the line isn't judged there, so typing one would silently do
+            // nothing.
+            if let Some((override_pct, check_weekly)) = selected_weekly_override(app)
+                && check_weekly
+            {
+                let seed = override_pct.map(|v| format!("{v:.0}")).unwrap_or_default();
+                app.fallback_weekly_draft = Some(InputState::new(&seed));
+            }
+        }
+        FallbackRow::CheckWeekly => toggle_member_flag(app, MemberFlag::CheckWeekly),
+        FallbackRow::CheckScoped => toggle_member_flag(app, MemberFlag::CheckScoped),
         FallbackRow::LastResort => toggle_last_resort(app),
         FallbackRow::Remove => {
             if app.fallback_armed_remove {
@@ -4144,6 +4206,120 @@ pub(crate) fn parse_threshold(raw: &str) -> Option<f64> {
     raw.parse::<f64>()
         .ok()
         .filter(|v| (0.0..=100.0).contains(v))
+}
+
+/// Keystrokes while the `weekly at` override field is open: ⏎ saves, ⎋ discards.
+fn handle_fallback_weekly_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.fallback_weekly_draft = None,
+        KeyCode::Enter => commit_weekly_edit(app),
+        _ => {
+            if let Some(input) = app.fallback_weekly_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// Parse and persist the typed override. Invalid input keeps the draft open
+/// (same no-toast treatment as the threshold editor); an EMPTY commit clears
+/// the override back to the chain-wide default.
+fn commit_weekly_edit(app: &mut App) {
+    let Some(raw) = app.fallback_weekly_draft.as_ref().map(|i| i.trimmed()) else {
+        return;
+    };
+    let Some(value) = parse_weekly_override(raw) else {
+        return;
+    };
+    write_weekly_override(app, value);
+    app.fallback_weekly_draft = None;
+}
+
+/// A typed override is a number in `0..=100`, or EMPTY — the explicit
+/// clear-back-to-default. `Some(None)` = clear, `Some(Some(v))` = set,
+/// `None` = invalid. Shared by the commit path and the detail card's inline
+/// Invalid-input check.
+pub(crate) fn parse_weekly_override(raw: &str) -> Option<Option<f64>> {
+    if raw.is_empty() {
+        return Some(None);
+    }
+    parse_threshold(raw).map(Some)
+}
+
+/// The selected member's `(weekly_threshold override, check_weekly)`, or
+/// `None` on `+ add`.
+fn selected_weekly_override(app: &App) -> Option<(Option<f64>, bool)> {
+    let pos = selected_chain_member(app)?;
+    let cfg = app.config();
+    let name = cfg.state.fallback_chain.get(pos)?;
+    cfg.find(name).map(|p| (p.weekly_threshold, p.check_weekly))
+}
+
+/// Write (or clear) the selected member's weekly-line override and persist.
+fn write_weekly_override(app: &mut App, value: Option<f64>) {
+    let Some(pos) = selected_chain_member(app) else {
+        return;
+    };
+    let save_err = {
+        let mut cfg = app.config();
+        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
+            return;
+        };
+        match cfg.find_mut(&name) {
+            Some(profile) => {
+                profile.weekly_threshold = value;
+                save_profile(profile).err()
+            }
+            None => None,
+        }
+    };
+    if let Some(e) = save_err {
+        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+    }
+}
+
+/// Which per-member usage gate a toggle row flips (`Profile::check_weekly` /
+/// `Profile::check_scoped`).
+#[derive(Clone, Copy)]
+enum MemberFlag {
+    CheckWeekly,
+    CheckScoped,
+}
+
+/// Flip a per-member usage gate and persist it; rolls back in memory when the
+/// save fails so the UI never shows a state the disk doesn't hold (same
+/// contract as [`toggle_last_resort`], minus its exclusivity move).
+fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
+    let Some(pos) = selected_chain_member(app) else {
+        return;
+    };
+    let failed = {
+        let mut cfg = app.config();
+        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
+            return;
+        };
+        let Some(profile) = cfg.find_mut(&name) else {
+            return;
+        };
+        fn field(p: &mut crate::profile::Profile, flag: MemberFlag) -> &mut bool {
+            match flag {
+                MemberFlag::CheckWeekly => &mut p.check_weekly,
+                MemberFlag::CheckScoped => &mut p.check_scoped,
+            }
+        }
+        *field(profile, flag) = !*field(profile, flag);
+        match save_profile(profile) {
+            Ok(()) => None,
+            Err(e) => {
+                *field(profile, flag) = !*field(profile, flag);
+                Some(e)
+            }
+        }
+    };
+    match failed {
+        None => app.refresh_tokens(),
+        Some(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+    }
 }
 
 /// Effective threshold for the selected member, or `None` on `+ add`.
@@ -4435,6 +4611,9 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 if let Some(&row) = FALLBACK_ROWS.get(app.fallback_detail_cursor) {
                     match row {
                         FallbackRow::Threshold => actions.push(EditThreshold),
+                        FallbackRow::WeeklyAt => actions.push(EditWeeklyAt),
+                        FallbackRow::CheckWeekly => actions.push(ToggleCheckWeekly),
+                        FallbackRow::CheckScoped => actions.push(ToggleCheckScoped),
                         FallbackRow::LastResort => actions.push(ToggleLastResort),
                         FallbackRow::Remove => actions.push(RemoveMember),
                     }
@@ -4563,6 +4742,15 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::ReorderDown => reorder_chain_member(app, 1),
         ActionMenuAction::EditThreshold => {
             run_fallback_row(app, FallbackRow::Threshold);
+        }
+        ActionMenuAction::EditWeeklyAt => {
+            run_fallback_row(app, FallbackRow::WeeklyAt);
+        }
+        ActionMenuAction::ToggleCheckWeekly => {
+            run_fallback_row(app, FallbackRow::CheckWeekly);
+        }
+        ActionMenuAction::ToggleCheckScoped => {
+            run_fallback_row(app, FallbackRow::CheckScoped);
         }
         ActionMenuAction::ToggleLastResort => {
             run_fallback_row(app, FallbackRow::LastResort);
