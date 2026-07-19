@@ -1140,8 +1140,15 @@ fn usage_tab_reset_follows_the_reset_display_setting() {
     });
     app.tab = Tab::Usage;
 
-    let stamped = regex::Regex::new(r"resets in \d+m \(\d\d:\d\d\)").expect("valid pattern");
+    // The stamp carries a `mon`-style day qualifier when the reset crosses
+    // midnight (a 40m reset from late evening does), so accept both shapes.
+    let stamped =
+        regex::Regex::new(r"resets in \d+m \((?:[a-z]{3} )?\d\d:\d\d\)").expect("valid pattern");
     let countdown = regex::Regex::new(r"resets in \d+m").expect("valid pattern");
+    // Pin both stamp shapes directly so the test holds at any wall clock, not
+    // just when the fixture's 40m reset happens to stay same-day.
+    assert!(stamped.is_match("resets in 9m (mon 00:09)"));
+    assert!(stamped.is_match("resets in 9m (00:09)"));
 
     let relative = dump(&app, 100, 30);
     assert!(
