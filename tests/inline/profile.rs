@@ -150,6 +150,50 @@ fn auto_rescue_defaults_false_and_round_trips() {
     );
 }
 
+// The reset-display pair (issue #39) renders as its own on-disk vocabulary, so
+// these pin the literal keys AND values rather than round-tripping through the
+// same enum both ways: a renamed variant would keep a round-trip green while
+// every existing profiles.toml silently reverted to the default.
+#[test]
+fn reset_display_pair_round_trips_and_is_omitted_at_the_default() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert_eq!(state.reset_display(), ResetDisplay::Relative);
+    assert_eq!(state.clock_format(), ClockFormat::H24);
+
+    let on = AppState {
+        reset_display: Some(ResetDisplay::Both),
+        clock_format: Some(ClockFormat::H12),
+        ..AppState::default()
+    };
+    let rendered_on = toml::to_string_pretty(&on).expect("render on state");
+    assert!(
+        rendered_on.contains(r#"reset_display = "both""#),
+        "reset_display renders its lowercase name, got:\n{rendered_on}"
+    );
+    assert!(
+        rendered_on.contains(r#"clock_format = "12h""#),
+        "clock_format renders as 12h/24h, not the Rust variant, got:\n{rendered_on}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_on).expect("reparse on state");
+    assert_eq!(reparsed.reset_display(), ResetDisplay::Both);
+    assert_eq!(reparsed.clock_format(), ClockFormat::H12);
+
+    // 24h is the default but still a real stored choice: it must survive a
+    // round trip rather than reading back as "never set".
+    let h24 = AppState {
+        clock_format: Some(ClockFormat::H24),
+        ..AppState::default()
+    };
+    let rendered_h24 = toml::to_string_pretty(&h24).expect("render 24h state");
+    assert!(rendered_h24.contains(r#"clock_format = "24h""#));
+
+    let rendered_off = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_off.contains("reset_display") && !rendered_off.contains("clock_format"),
+        "an untouched state file gains neither key, got:\n{rendered_off}"
+    );
+}
+
 // `refresh_spent_accounts` defaults to TRUE (poll every account — today's
 // behavior) so pre-field profiles.toml files load unchanged; only an explicit
 // `false` opt-out renders, and the default is omitted (the inverse serde shape

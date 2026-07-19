@@ -1117,3 +1117,119 @@ fn scroll_offset_keeps_the_whole_focused_block_on_screen() {
     // A block already on screen without scrolling stays put.
     assert_eq!(scroll_offset(30, 20, (2, 5)), 0);
 }
+
+/// End-to-end wiring for the reset-display setting (issue #39). The formatters
+/// are unit-tested pure; only a real frame proves the operator's choice reaches
+/// the usage-tab bar line — a call site left on `ResetFmt::default()` would keep
+/// every other test green. Asserts a SHAPE, never a literal clock, so the test
+/// holds in any timezone.
+#[test]
+fn usage_tab_reset_follows_the_reset_display_setting() {
+    use crate::profile::ResetDisplay;
+    use crate::tui::app::Tab;
+
+    let mut profile = oauth("a", 40.0, 10.0, false);
+    if let Some(w) = profile.usage.as_mut().and_then(|u| u.five_hour.as_mut()) {
+        w.resets_at = Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + 40 * 60,
+        ));
+    }
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    app.tab = Tab::Usage;
+
+    let stamped = regex::Regex::new(r"resets in \d+m \(\d\d:\d\d\)").expect("valid pattern");
+    let countdown = regex::Regex::new(r"resets in \d+m").expect("valid pattern");
+
+    let relative = dump(&app, 100, 30);
+    assert!(
+        countdown.is_match(&relative),
+        "the stock shape is a bare countdown:\n{relative}"
+    );
+    assert!(
+        !stamped.is_match(&relative),
+        "no clock renders until the operator asks for one:\n{relative}"
+    );
+
+    {
+        let mut cfg = app.config();
+        cfg.state.reset_display = Some(ResetDisplay::Both);
+    }
+    let both = dump(&app, 100, 30);
+    assert!(
+        stamped.is_match(&both),
+        "`both` carries the countdown and a 24h stamp:\n{both}"
+    );
+}
+
+/// The overview column is the one reset surface with a width budget, and no
+/// frame test covered it — which is how a first cut shipped that DELETED the
+/// countdown (and the 7d bar with it) at widths between the old and new tiers.
+/// Opting into a clock must never render less than `relative` did at the same
+/// width: worst case the stamp is dropped, never the countdown.
+#[test]
+fn overview_reset_column_never_loses_ground_to_the_clock_setting() {
+    use crate::profile::ResetDisplay;
+    use crate::tui::app::Tab;
+
+    let mut profile = oauth("a", 40.0, 60.0, false);
+    let now = crate::usage::now_epoch_secs();
+    if let Some(u) = profile.usage.as_mut() {
+        if let Some(w) = u.five_hour.as_mut() {
+            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600));
+        }
+        if let Some(w) = u.seven_day.as_mut() {
+            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400));
+        }
+    }
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    app.tab = Tab::Overview;
+
+    // The reset cell is whatever sits in parens after a bar's `%`, so this counts
+    // it in every shape — `(3h 0m)`, `(22:50)`, `(thu 19:50)`, `(3h 0m · 22:50)`.
+    let reset_cell = regex::Regex::new(r"% \([^)]+\)").expect("valid pattern");
+    let stamped = regex::Regex::new(r"· \d\d:\d\d\)").expect("valid pattern");
+
+    // Widths spanning every tier boundary the setting touches, including the
+    // 81-90 and 102-111 bands where moving a threshold used to drop a column.
+    for width in [85, 91, 100, 110, 112, 130, 160] {
+        let relative = dump(&app, width, 20);
+        let base = reset_cell.find_iter(&relative).count();
+
+        for display in [ResetDisplay::Clock, ResetDisplay::Both] {
+            {
+                let mut cfg = app.config();
+                cfg.state.reset_display = Some(display);
+            }
+            let with_clock = dump(&app, width, 20);
+            let kept = reset_cell.find_iter(&with_clock).count();
+            assert!(
+                kept >= base,
+                "at {width} cols {display:?} shows {kept} resets where relative showed \
+                 {base}:\nrelative:\n{relative}\n{display:?}:\n{with_clock}"
+            );
+        }
+        {
+            let mut cfg = app.config();
+            cfg.state.reset_display = None;
+        }
+    }
+
+    // And the wide tier genuinely carries a stamp on BOTH columns once the
+    // terminal can pay for it — the point of the setting.
+    {
+        let mut cfg = app.config();
+        cfg.state.reset_display = Some(ResetDisplay::Both);
+    }
+    let wide = dump(&app, 160, 20);
+    assert_eq!(
+        stamped.find_iter(&wide).count(),
+        2,
+        "a 160-col overview stamps both the 5h and 7d resets:\n{wide}"
+    );
+}

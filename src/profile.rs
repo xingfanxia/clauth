@@ -249,6 +249,43 @@ pub(crate) enum ThemeName {
     Compatible,
 }
 
+/// How a usage window's reset renders across the TUI (`AppState.reset_display`,
+/// issue #39). `Relative` is the shipped default and the pre-setting behavior,
+/// byte for byte.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ResetDisplay {
+    /// `resets in 40m` — countdown only.
+    #[default]
+    Relative,
+    /// `resets at 21:20` — wall-clock stamp only.
+    Clock,
+    /// `resets in 40m (21:20)` — both.
+    Both,
+}
+
+impl ResetDisplay {
+    /// Whether this mode renders a wall-clock stamp — the gate on the `clock`
+    /// Config row and on the wider overview reset column.
+    pub(crate) fn shows_clock(self) -> bool {
+        matches!(self, ResetDisplay::Clock | ResetDisplay::Both)
+    }
+}
+
+/// Wall-clock notation for the stamp [`ResetDisplay`] renders
+/// (`AppState.clock_format`). Defaults to 24-hour, matching the only other
+/// clock in the tree (`tui::render::format::clock_label`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ClockFormat {
+    /// `21:20`
+    #[default]
+    #[serde(rename = "24h")]
+    H24,
+    /// `9:20pm`
+    #[serde(rename = "12h")]
+    H12,
+}
+
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
 /// Credentials and endpoint config live in per-profile subdirectories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +380,17 @@ pub(crate) struct AppState {
     /// detect applies when this is `None` and no flag was passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) theme: Option<ThemeName>,
+    /// Shape of every reset countdown in the TUI. `None` = the
+    /// [`ResetDisplay`] default, so an untouched profiles.toml carries neither
+    /// this key nor [`AppState::clock_format`] and renders exactly as it did
+    /// before the setting existed. Read through [`AppState::reset_display`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reset_display: Option<ResetDisplay>,
+    /// Notation for the wall-clock half of a reset stamp. Inert while
+    /// `reset_display` is `Relative` (nothing renders a clock then). `None` =
+    /// the [`ClockFormat`] default; read through [`AppState::clock_format`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) clock_format: Option<ClockFormat>,
     /// When false, burn-rate estimates ("34.4 %/h · 1h 56m left") are hidden
     /// in the Usage tab even when data is available.
     #[serde(default = "default_show_estimates", skip_serializing_if = "is_true")]
@@ -392,6 +440,16 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+    /// The effective reset-countdown shape (unset = the stock relative form).
+    pub(crate) fn reset_display(&self) -> ResetDisplay {
+        self.reset_display.unwrap_or_default()
+    }
+
+    /// The effective wall-clock notation (unset = 24-hour).
+    pub(crate) fn clock_format(&self) -> ClockFormat {
+        self.clock_format.unwrap_or_default()
+    }
+
     /// The effective weekly exhaustion line: the configured value when it sits
     /// inside [`MIN_WEEKLY_SWITCH_PCT`]`..=`[`MAX_WEEKLY_SWITCH_PCT`], else the
     /// DEFAULT (a reset, not a clamp-to-nearest-bound: fail-safe high beats
@@ -513,6 +571,8 @@ impl Default for AppState {
             auto_rescue: false,
             refresh_spent_accounts: true,
             theme: None,
+            reset_display: None,
+            clock_format: None,
             show_estimates: true,
             show_pace: false,
             count_cache: false,

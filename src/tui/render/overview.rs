@@ -10,8 +10,8 @@ use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
-    account_type_label, cue_style, fetch_cue_color, fixed, fixed_split, spinner_frame,
-    spinner_style, window_summary_spans_bracketed,
+    ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split, reset_resume,
+    spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
 use super::header::pulse_name_spans;
 use super::panes::{
@@ -167,6 +167,29 @@ impl OverviewWidths {
                 name -= 1;
             } else {
                 break;
+            }
+        }
+
+        // A wall-clock stamp needs 10 cells beyond the countdown (the worst real
+        // product is `6d 23h · 12:05am`, since `reset_column` drops the day
+        // qualifier once a countdown carries it). Take them ONLY from slack the
+        // layout would otherwise spend on gap padding, after the shrink loop has
+        // settled — so turning the setting on can add a stamp but never cost a
+        // countdown or a bar. Widening the tier itself instead pushed the 7d
+        // column down to 5 at 130 columns, deleting its bar. A column that gets
+        // only part of the 10 still degrades cleanly in `reset_suffix`.
+        if ResetFmt::from_state(&app.config().state).shows_clock() {
+            const CLOCK_COLS: usize = 10;
+            let slack = |five: usize, seven: usize| {
+                total.saturating_sub(
+                    fixed_overview_width(name, kind, five, seven, gap_min) + TIMER_SLOT,
+                )
+            };
+            if five_hour == 26 {
+                five_hour += CLOCK_COLS.min(slack(five_hour, seven_day));
+            }
+            if seven_day == 26 {
+                seven_day += CLOCK_COLS.min(slack(five_hour, seven_day));
             }
         }
 
@@ -348,11 +371,13 @@ fn render_overview_row(
             window,
         )
     };
+    let reset_fmt = ResetFmt::from_state(&cfg.state);
     let five_spans = window_summary_spans_bracketed(
         five_window.as_ref(),
         widths.five_hour,
         true,
         reset_style(LABEL_5H, five_window.as_ref()),
+        reset_fmt,
     );
     let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
@@ -365,6 +390,7 @@ fn render_overview_row(
             widths.seven_day,
             widths.seven_day >= 18,
             reset_style(LABEL_7D, seven_window.as_ref()),
+            reset_fmt,
         );
         let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
         let seven_pad = widths.seven_day.saturating_sub(seven_len);
@@ -548,7 +574,10 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!("resumes: {name} in ~{}", humanize_duration(eta)),
+                format!(
+                    "resumes: {name} {}",
+                    reset_resume(eta, ResetFmt::from_state(&cfg.state))
+                ),
                 theme::faint(),
             ),
         ]));

@@ -196,6 +196,7 @@ name = "clauth"
 version = "0.12.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs",
  "getrandom 0.4.3",
  "libc",

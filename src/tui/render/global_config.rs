@@ -1,7 +1,8 @@
 //! Program-wide Config tab — a single panel of global settings, distinct from
 //! the per-account Setup tab. Rows back real persisted state in `AppState` and
 //! run in the concern bands `GlobalConfigRow::band` names, each opened by an
-//! eyebrow header: appearance (`theme`), scheduler (`on mismatch`, `refresh`
+//! eyebrow header: appearance (`theme`, `reset display`, and the `clock`
+//! notation it gates), scheduler (`on mismatch`, `refresh`
 //! cadence, `refresh spent` toggle, `rotation`), auto-switch (`weekly limit`,
 //! `switch mode` = burn-aware, the burn-aware `burn floor`/`burn horizon`
 //! tunables it gates (issue #8 follow-up b), then the `quota spent` halt), then
@@ -16,8 +17,9 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use crate::profile::{
-    DEFAULT_BURN_FLOOR_PCT, DEFAULT_BURN_HORIZON_MS, DEFAULT_REFRESH_INTERVAL_MS,
+    ClockFormat, DEFAULT_BURN_FLOOR_PCT, DEFAULT_BURN_HORIZON_MS, DEFAULT_REFRESH_INTERVAL_MS,
     DEFAULT_WEEKLY_SWITCH_PCT, DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTERVAL_MS,
+    ResetDisplay,
 };
 
 use super::super::app::{
@@ -43,15 +45,17 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let toggles = {
+    let rows = {
         let state = &app.config().state;
-        ToggleState {
+        RowState {
             switch_off_when_spent: state.switch_off_when_spent,
             burn_aware: state.burn_aware_switching,
             spend_budget: state.spend_budget_switching,
             switch_off_when_budget_spent: state.switch_off_when_budget_spent,
             preemptive: state.preemptive_rotation,
             refresh_spent: state.refresh_spent_accounts,
+            reset_display: state.reset_display(),
+            clock_format: state.clock_format(),
         }
     };
     let refresh_interval_ms = app
@@ -97,7 +101,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let line = detail_row(
             *row,
             selected,
-            toggles,
+            rows,
             refresh_interval_ms,
             weekly_pct,
             burn_floor_pct,
@@ -131,7 +135,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     && let Some(tip) = row_hint(
                         *row,
                         default_divergence,
-                        toggles,
+                        rows,
                         refresh_interval_ms,
                         weekly_pct,
                         burn_floor_pct,
@@ -170,22 +174,25 @@ fn band_header(label: &str, focused: bool) -> Line<'static> {
 
 /// Inline help for rows whose value doesn't self-describe. Phrased for the
 /// value currently selected, so cycling a row re-explains what it now does.
-/// The boolean toggles the Config tab renders, bundled so `detail_row` /
-/// `row_hint` stay within clippy's argument budget as rows accumulate.
+/// The persisted values the Config tab's non-numeric rows render, bundled so
+/// `detail_row` / `row_hint` stay within clippy's argument budget as rows
+/// accumulate.
 #[derive(Clone, Copy)]
-struct ToggleState {
+struct RowState {
     switch_off_when_spent: bool,
     burn_aware: bool,
     spend_budget: bool,
     switch_off_when_budget_spent: bool,
     preemptive: bool,
     refresh_spent: bool,
+    reset_display: ResetDisplay,
+    clock_format: ClockFormat,
 }
 
 fn row_hint(
     row: GlobalConfigRow,
     default_divergence: Option<DivergenceChoice>,
-    toggles: ToggleState,
+    rows: RowState,
     refresh_interval_ms: u64,
     weekly_pct: f64,
     burn_floor_pct: f64,
@@ -197,6 +204,15 @@ fn row_hint(
     // behavior hint — the dim is the "can't touch this", not a gate clause.
     let tip: String = match row {
         GlobalConfigRow::Theme => return None,
+        GlobalConfigRow::ResetShape => String::from(match rows.reset_display {
+            ResetDisplay::Relative => "show how long a usage window has left",
+            ResetDisplay::Clock => "show the time of day a usage window resets",
+            ResetDisplay::Both => "show how long a window has left and the time it resets",
+        }),
+        GlobalConfigRow::ClockNotation => String::from(match rows.clock_format {
+            ClockFormat::H24 => "write reset times as 21:20, in your local timezone",
+            ClockFormat::H12 => "write reset times as 9:20pm, in your local timezone",
+        }),
         GlobalConfigRow::DivergenceDefault => String::from(match default_divergence {
             None => "ask what to do when claude code signs in over the active account",
             Some(DivergenceChoice::Overwrite) => {
@@ -219,12 +235,12 @@ fn row_hint(
             "don't send new work to an account past {}% of its weekly limit",
             format_weekly_pct(weekly_pct)
         ),
-        GlobalConfigRow::SwitchOffWhenSpent => String::from(if toggles.switch_off_when_spent {
+        GlobalConfigRow::SwitchOffWhenSpent => String::from(if rows.switch_off_when_spent {
             "sign every account out once they're all spent, unless one is marked last resort"
         } else {
             "keep using whichever account is active once they're all spent"
         }),
-        GlobalConfigRow::BurnAware => String::from(if toggles.burn_aware {
+        GlobalConfigRow::BurnAware => String::from(if rows.burn_aware {
             "switch away once the burn rate would hit 100% before the next check"
         } else {
             "switch the active account away once its usage crosses its threshold"
@@ -237,13 +253,13 @@ fn row_hint(
             "look at most {}s ahead when guessing the next switch",
             burn_horizon_ms / 1000
         ),
-        GlobalConfigRow::SpendBudget => String::from(if toggles.spend_budget {
+        GlobalConfigRow::SpendBudget => String::from(if rows.spend_budget {
             "let a spent account keep working on paid usage, up to its max spend"
         } else {
             "never spend real money automatically"
         }),
         GlobalConfigRow::SwitchOffWhenBudgetSpent => {
-            String::from(if toggles.switch_off_when_budget_spent {
+            String::from(if rows.switch_off_when_budget_spent {
                 "once an account's extra usage runs out, switch everything off"
             } else {
                 "once an account's extra usage runs out, stay on it and keep billing"
@@ -251,12 +267,12 @@ fn row_hint(
         }
         GlobalConfigRow::PreemptiveRotation => String::from(if !cfg!(target_os = "macos") {
             "only rotates the login ahead of expiry on macos"
-        } else if toggles.preemptive {
+        } else if rows.preemptive {
             "rotate the login before it expires"
         } else {
             "rotate the login only when a request rejects it"
         }),
-        GlobalConfigRow::RefreshSpentAccounts => String::from(if toggles.refresh_spent {
+        GlobalConfigRow::RefreshSpentAccounts => String::from(if rows.refresh_spent {
             "keep checking accounts that are already at 100%"
         } else {
             "skip refreshing a spent account until its window resets"
@@ -269,7 +285,7 @@ fn row_hint(
 fn detail_row(
     row: GlobalConfigRow,
     selected: bool,
-    toggles: ToggleState,
+    rows: RowState,
     refresh_interval_ms: u64,
     weekly_pct: f64,
     burn_floor_pct: f64,
@@ -295,6 +311,29 @@ fn detail_row(
             ],
             selected,
         ),
+        GlobalConfigRow::ResetShape => cycle_row(
+            arrow,
+            "reset display",
+            &[
+                ("relative", rows.reset_display == ResetDisplay::Relative),
+                ("clock", rows.reset_display == ResetDisplay::Clock),
+                ("both", rows.reset_display == ResetDisplay::Both),
+            ],
+            selected,
+        ),
+        // Inert until a reset renders a clock — the notation decides nothing
+        // under `relative`. Dimmed AND the key no-ops, like `extra usage spent`.
+        GlobalConfigRow::ClockNotation => {
+            let options = [
+                ("24h", rows.clock_format == ClockFormat::H24),
+                ("12h", rows.clock_format == ClockFormat::H12),
+            ];
+            if rows.reset_display.shows_clock() {
+                cycle_row(arrow, "clock", &options, selected)
+            } else {
+                dimmed_cycle_row("clock", &options, selected)
+            }
+        }
         GlobalConfigRow::RefreshInterval => match editing {
             Some(input) => refresh_edit_line(arrow, input),
             None => refresh_cycle_line(arrow, refresh_interval_ms, selected),
@@ -327,8 +366,8 @@ fn detail_row(
             arrow,
             "quota spent",
             &[
-                ("stay on active", !toggles.switch_off_when_spent),
-                ("switch off all", toggles.switch_off_when_spent),
+                ("stay on active", !rows.switch_off_when_spent),
+                ("switch off all", rows.switch_off_when_spent),
             ],
             selected,
         ),
@@ -336,23 +375,23 @@ fn detail_row(
             arrow,
             "switch mode",
             &[
-                ("static", !toggles.burn_aware),
-                ("burn-aware", toggles.burn_aware),
+                ("static", !rows.burn_aware),
+                ("burn-aware", rows.burn_aware),
             ],
             selected,
         ),
         GlobalConfigRow::BurnFloor => {
-            burn_floor_line(arrow, burn_floor_pct, selected, toggles.burn_aware)
+            burn_floor_line(arrow, burn_floor_pct, selected, rows.burn_aware)
         }
         GlobalConfigRow::BurnHorizon => {
-            burn_horizon_line(arrow, burn_horizon_ms, selected, toggles.burn_aware)
+            burn_horizon_line(arrow, burn_horizon_ms, selected, rows.burn_aware)
         }
         GlobalConfigRow::SpendBudget => cycle_row(
             arrow,
             "allow extra usage",
             &[
-                ("off", !toggles.spend_budget),
-                ("pay-as-you-go", toggles.spend_budget),
+                ("off", !rows.spend_budget),
+                ("pay-as-you-go", rows.spend_budget),
             ],
             selected,
         ),
@@ -363,10 +402,10 @@ fn detail_row(
         // so `faint` never decouples from "not editable".
         GlobalConfigRow::SwitchOffWhenBudgetSpent => {
             let options = [
-                ("stay on active", !toggles.switch_off_when_budget_spent),
-                ("switch off all", toggles.switch_off_when_budget_spent),
+                ("stay on active", !rows.switch_off_when_budget_spent),
+                ("switch off all", rows.switch_off_when_budget_spent),
             ];
-            if toggles.spend_budget {
+            if rows.spend_budget {
                 cycle_row(arrow, "extra usage spent", &options, selected)
             } else {
                 dimmed_cycle_row("extra usage spent", &options, selected)
@@ -377,10 +416,7 @@ fn detail_row(
             // live (`scheduler::keychain_live`); off macOS the toggle can do
             // nothing, so it renders as a disabled row (and its key no-ops),
             // mirroring the burn tunables.
-            let options = [
-                ("lazy", !toggles.preemptive),
-                ("preemptive", toggles.preemptive),
-            ];
+            let options = [("lazy", !rows.preemptive), ("preemptive", rows.preemptive)];
             if cfg!(target_os = "macos") {
                 cycle_row(arrow, "rotation", &options, selected)
             } else {
@@ -388,7 +424,7 @@ fn detail_row(
             }
         }
         GlobalConfigRow::RefreshSpentAccounts => {
-            toggle_row(arrow, "refresh spent", toggles.refresh_spent, selected)
+            toggle_row(arrow, "refresh spent", rows.refresh_spent, selected)
         }
     }
 }

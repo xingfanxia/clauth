@@ -72,7 +72,7 @@ fn stats_from_bars_keeps_api_labels_and_source_order() {
         // Short reset, percentage-only → stays second (no reordering).
         tp_bar("tokens limit", 1.0, now + 4 * 3600, None, None),
     ];
-    let stats = stats_from_bars(&bars, true, true);
+    let stats = stats_from_bars(&bars, true, true, ResetFmt::default());
     assert_eq!(stats[0].label, "time limit", "API label kept verbatim");
     assert_eq!(stats[1].label, "tokens limit");
 
@@ -95,7 +95,7 @@ fn stats_from_bars_does_not_rename_duplicate_labels() {
         tp_bar("tokens limit", 0.0, now + 4 * 3600, None, None),
         tp_bar("tokens limit", 12.0, now + 6 * 86_400, None, None),
     ];
-    let stats = stats_from_bars(&bars, true, true);
+    let stats = stats_from_bars(&bars, true, true, ResetFmt::default());
     assert_eq!(stats[0].label, "tokens limit");
     assert_eq!(stats[1].label, "tokens limit");
     assert_eq!(stats[0].pct, 0.0);
@@ -118,7 +118,7 @@ fn stats_from_bars_fills_pace_for_windowed_labels() {
         tp_bar("30d", 30.0, now + 15 * 86_400, None, None),
     ];
 
-    let stats = stats_from_bars(&bars, true, true);
+    let stats = stats_from_bars(&bars, true, true, ResetFmt::default());
     assert_eq!(stats[0].rate_unit, "h");
     assert!(approx(stats[0].burn_rate, 5.0), "5h shows %/h average pace");
     assert!(approx(stats[0].pace_pct, 80.0), "5h ideal-pace marker");
@@ -133,7 +133,7 @@ fn stats_from_bars_fills_pace_for_windowed_labels() {
     );
 
     // Both toggles off → no rate, no marker (matches the OAuth gating).
-    let bare = stats_from_bars(&bars, false, false);
+    let bare = stats_from_bars(&bars, false, false, ResetFmt::default());
     assert!(bare.iter().all(|s| s.burn_rate.is_none()));
     assert!(bare.iter().all(|s| s.pace_pct.is_none()));
 
@@ -142,6 +142,7 @@ fn stats_from_bars_fills_pace_for_windowed_labels() {
         &[tp_bar("balance", 50.0, now + 3600, None, None)],
         true,
         true,
+        ResetFmt::default(),
     );
     assert!(other[0].burn_rate.is_none() && other[0].pace_pct.is_none());
 }
@@ -818,7 +819,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
             extra_usage: extra,
             spend,
         });
-        collect_stats(&profile)
+        collect_stats(&profile, ResetFmt::default())
     };
     let extra = crate::usage::ExtraUsage {
         is_enabled: true,

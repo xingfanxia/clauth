@@ -20,6 +20,7 @@ use super::super::app::{
     chain_items, parse_max_spend, parse_threshold,
 };
 use super::super::theme;
+use super::format::{ResetFmt, reset_pill, reset_resume};
 use super::panes::{
     bold_when, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
     invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill, section_box,
@@ -249,13 +250,16 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
 
 /// Blocked-reason status pill for the detail card: `[ label ]`, label bold in the
 /// reason's semantic color (neutral dim for stale), brackets dim — the cloudy-tui
-/// status pill. The reset countdown reuses `humanize_duration`.
-fn reason_pill(reason: &BlockedReason) -> Line<'static> {
+/// status pill. Window resets run through `reset_pill`, so they follow the
+/// operator's `reset display` setting; the kick-block lift stays a bare
+/// countdown — the limiter relents on its own schedule, so a wall-clock time
+/// there would claim a precision the estimate doesn't have.
+fn reason_pill(reason: &BlockedReason, fmt: ResetFmt) -> Line<'static> {
     let (label, style) = match reason {
         BlockedReason::AuthBroken => ("auth broken".to_string(), theme::danger().bold()),
         BlockedReason::WeeklySpent { resets_in } => (
             match resets_in {
-                Some(s) => format!("weekly spent · {}", humanize_duration(*s)),
+                Some(s) => format!("weekly spent · {}", reset_pill(*s, fmt)),
                 None => "weekly spent".to_string(),
             },
             theme::danger().bold(),
@@ -267,7 +271,7 @@ fn reason_pill(reason: &BlockedReason) -> Line<'static> {
         BlockedReason::BudgetSpent => ("extra usage spent".to_string(), theme::warning().bold()),
         BlockedReason::FiveHour { pct, resets_in } => (
             match resets_in {
-                Some(s) => format!("5h {pct:.0}% · {}", humanize_duration(*s)),
+                Some(s) => format!("5h {pct:.0}% · {}", reset_pill(*s, fmt)),
                 None => format!("5h {pct:.0}%"),
             },
             theme::warning().bold(),
@@ -320,7 +324,7 @@ fn member_detail(
     // must equal the count pushed here — `draw_chain_detail` adds it to the
     // native-cursor row math.
     if let Some(reason) = blocked_reason(cfg, profile, kick_lift) {
-        lines.push(reason_pill(&reason));
+        lines.push(reason_pill(&reason, ResetFmt::from_state(&cfg.state)));
         lines.push(Line::from(""));
     }
 
@@ -430,7 +434,10 @@ fn member_detail(
     if let Some((resume_name, eta)) = soonest_resume(cfg) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("resumes: {resume_name} in ~{}", humanize_duration(eta)),
+            format!(
+                "resumes: {resume_name} {}",
+                reset_resume(eta, ResetFmt::from_state(&cfg.state))
+            ),
             theme::faint(),
         )));
     }

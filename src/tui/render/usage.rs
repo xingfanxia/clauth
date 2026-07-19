@@ -12,7 +12,9 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::App;
 use super::super::theme;
-use super::format::{activity_verb, format_reset, spinner_frame, spinner_style};
+use super::format::{
+    ResetFmt, activity_verb, reset_in_secs, reset_phrase, spinner_frame, spinner_style,
+};
 use super::panes::{
     draw_profile_selector, empty_state, key_cell, master_detail, section_box, section_box_verbatim,
     wrap_words,
@@ -153,6 +155,9 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let show_estimates = cfg.state.show_estimates;
     let show_pace = cfg.state.show_pace;
+    // Read off the guard already held here: `config` is a plain (non-reentrant)
+    // mutex, so a second `app.config()` deeper in the render would self-deadlock.
+    let reset_fmt = ResetFmt::from_state(&cfg.state);
     let lines = build_usage_lines(
         profile,
         inner.width,
@@ -160,6 +165,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app,
         show_estimates,
         show_pace,
+        reset_fmt,
     );
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
@@ -171,6 +177,7 @@ fn build_usage_lines(
     app: &App,
     show_estimates: bool,
     show_pace: bool,
+    reset_fmt: ResetFmt,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.extend(header_lines(profile, header, inner_w));
@@ -180,7 +187,13 @@ fn build_usage_lines(
     // rows/bars path; OAuth accounts — including OAuth run against a custom
     // base_url — fall through to their live window bars.
     if profile.api_key.is_some() || profile.is_third_party() {
-        lines.extend(build_tp_rows(profile, inner_w, show_estimates, show_pace));
+        lines.extend(build_tp_rows(
+            profile,
+            inner_w,
+            show_estimates,
+            show_pace,
+            reset_fmt,
+        ));
         return lines;
     }
 
@@ -192,7 +205,7 @@ fn build_usage_lines(
         return lines;
     }
 
-    let mut stats = collect_stats(profile);
+    let mut stats = collect_stats(profile, reset_fmt);
     if stats.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("  {}", oauth_empty_msg(profile)),
@@ -522,15 +535,15 @@ fn fmt_window_dollars(d: &WindowDollars) -> String {
     }
 }
 
-fn collect_stats(profile: &Profile) -> Vec<Stat> {
+fn collect_stats(profile: &Profile, reset_fmt: ResetFmt) -> Vec<Stat> {
     let Some(usage) = profile.usage.as_ref() else {
         return Vec::new();
     };
     let now_secs = now_epoch_secs();
     let mut stats: Vec<Stat> = Vec::new();
     for (label, w) in usage.windows() {
-        let trailing = format_reset(w)
-            .map(|r| format!("  resets in {r}"))
+        let trailing = reset_in_secs(w)
+            .map(|secs| format!("  {}", reset_phrase(secs, reset_fmt)))
             .unwrap_or_default();
         // Absolute $ figures on the eyebrow when the window carries them (null on
         // every current account; Claude Code itself drops these fields).
@@ -1128,6 +1141,7 @@ fn build_tp_rows(
     inner_w: u16,
     show_estimates: bool,
     show_pace: bool,
+    reset_fmt: ResetFmt,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -1152,7 +1166,7 @@ fn build_tp_rows(
     // API-provided label in source order and showing absolute `used / total` on
     // the eyebrow just before the %.
     if has_bars {
-        let bar_stats = stats_from_bars(&stats.bars, show_estimates, show_pace);
+        let bar_stats = stats_from_bars(&stats.bars, show_estimates, show_pace, reset_fmt);
         lines.extend(render_stat_block(&bar_stats, inner_w));
     }
 
@@ -1220,6 +1234,7 @@ fn stats_from_bars(
     bars: &[crate::providers::UsageBar],
     show_estimates: bool,
     show_pace: bool,
+    reset_fmt: ResetFmt,
 ) -> Vec<Stat> {
     let now = now_epoch_secs();
     let gates = WindowGates {
@@ -1235,7 +1250,7 @@ fn stats_from_bars(
                 bar.resets_at.as_deref(),
                 now,
                 bar_amount(bar),
-                bar_reset_trailing(rem),
+                bar_reset_trailing(rem, reset_fmt),
                 gates,
             )
         })
@@ -1251,9 +1266,9 @@ fn window_remaining(bar: &crate::providers::UsageBar, now: i64) -> Option<i64> {
 
 /// Bar-line trailing: the reset countdown (`  resets in …`), or empty when the
 /// bar carries no future reset. The absolute amount now lives on the eyebrow.
-fn bar_reset_trailing(rem: Option<i64>) -> String {
+fn bar_reset_trailing(rem: Option<i64>, reset_fmt: ResetFmt) -> String {
     match rem.filter(|&s| s > 0) {
-        Some(secs) => format!("  resets in {}", crate::usage::humanize_duration(secs)),
+        Some(secs) => format!("  {}", reset_phrase(secs, reset_fmt)),
         None => String::new(),
     }
 }

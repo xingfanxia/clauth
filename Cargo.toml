@@ -31,6 +31,11 @@ getrandom = "0.4.3"
 # key never routes through argv / shell history / process listings. Cross-
 # platform; no transitive deps beyond libc (already in the tree).
 rpassword = "7"
+# Local wall-clock stamps on the TUI's reset countdowns (`resets in 40m
+# (21:20)`, issue #39) — std has no timezone. chrono already compiles in the
+# tree via rmcp → schemars; only the `clock` feature is new, which adds
+# `iana-time-zone` for the zone lookup. Its `unsafe` stays inside chrono.
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 rmcp = { version = "2.1.0", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1.52.3", features = ["rt", "io-std"] }
 regex = "1.13.1"

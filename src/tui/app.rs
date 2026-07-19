@@ -39,9 +39,10 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
-    MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings, Profile, ReloadFingerprint,
-    ThemeName, load_config, reload_fingerprint, save_app_state, save_profile,
+    AppConfig, ClockFormat, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS,
+    MAX_WEEKLY_SWITCH_PCT, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings, Profile,
+    ReloadFingerprint, ResetDisplay, ThemeName, load_config, reload_fingerprint, save_app_state,
+    save_profile,
 };
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
@@ -257,6 +258,13 @@ pub(crate) enum GlobalConfigRow {
     /// Color-depth tier: `full` (truecolor) / `compatible` (xterm-256).
     /// Persists to `[theme]` and live-swaps the active palette.
     Theme,
+    /// Shape of every reset countdown (`AppState.reset_display`, issue #39):
+    /// `relative` (stock) / `clock` / `both`. ⏎/space cycles.
+    ResetShape,
+    /// Notation for the wall-clock half of a reset stamp
+    /// (`AppState.clock_format`): `24h` / `12h`. Dimmed + inert while
+    /// `reset display` is `relative`, since nothing renders a clock then.
+    ClockNotation,
     /// Chain-wide "when spent" behavior (`AppState.switch_off_when_spent`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.
     SwitchOffWhenSpent,
@@ -3529,8 +3537,10 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 4] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 12] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 14] = [
     GlobalConfigRow::Theme,
+    GlobalConfigRow::ResetShape,
+    GlobalConfigRow::ClockNotation,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
@@ -3551,7 +3561,9 @@ impl GlobalConfigRow {
     /// is what `config_bands_stay_contiguous` pins.
     pub(crate) fn band(self) -> &'static str {
         match self {
-            GlobalConfigRow::Theme => "appearance",
+            GlobalConfigRow::Theme
+            | GlobalConfigRow::ResetShape
+            | GlobalConfigRow::ClockNotation => "appearance",
             GlobalConfigRow::DivergenceDefault
             | GlobalConfigRow::RefreshInterval
             | GlobalConfigRow::RefreshSpentAccounts
@@ -3614,6 +3626,14 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
 fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
     match row {
         GlobalConfigRow::Theme => cycle_theme(app),
+        GlobalConfigRow::ResetShape => cycle_reset_display(app),
+        // Inert while the countdown is relative (rendered dimmed): no surface
+        // draws a clock then, so the notation would decide nothing.
+        GlobalConfigRow::ClockNotation => {
+            if app.config().state.reset_display().shows_clock() {
+                cycle_clock_format(app);
+            }
+        }
         GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
         GlobalConfigRow::SwitchOffWhenSpent => toggle_wrap_off(app),
         GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
@@ -3798,6 +3818,38 @@ pub(crate) fn next_divergence_default(
         Some(DivergenceChoice::NewProfile) => Some(DivergenceChoice::Discard),
         Some(DivergenceChoice::Discard) => None,
     }
+}
+
+/// Reset-shape cycle order, wrapping back to the stock relative form.
+pub(crate) fn next_reset_display(current: ResetDisplay) -> ResetDisplay {
+    match current {
+        ResetDisplay::Relative => ResetDisplay::Clock,
+        ResetDisplay::Clock => ResetDisplay::Both,
+        ResetDisplay::Both => ResetDisplay::Relative,
+    }
+}
+
+fn cycle_reset_display(app: &mut App) {
+    let next = next_reset_display(app.config().state.reset_display());
+    {
+        let mut cfg = app.config();
+        cfg.state.reset_display = Some(next);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+fn cycle_clock_format(app: &mut App) {
+    let next = match app.config().state.clock_format() {
+        ClockFormat::H24 => ClockFormat::H12,
+        ClockFormat::H12 => ClockFormat::H24,
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.clock_format = Some(next);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
 }
 
 fn cycle_divergence_default(app: &mut App) {

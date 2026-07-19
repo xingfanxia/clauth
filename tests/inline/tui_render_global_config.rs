@@ -23,14 +23,16 @@ fn value_col(key: &str, rendered: &str) -> usize {
             .expect("row renders a value")
 }
 
-fn toggles() -> ToggleState {
-    ToggleState {
+fn toggles() -> RowState {
+    RowState {
         switch_off_when_spent: false,
         burn_aware: false,
         spend_budget: false,
         switch_off_when_budget_spent: true,
         preemptive: false,
         refresh_spent: true,
+        reset_display: ResetDisplay::Relative,
+        clock_format: ClockFormat::H24,
     }
 }
 
@@ -469,4 +471,107 @@ fn band_header_underlines_only_the_focused_band() {
             .contains(Modifier::UNDERLINED),
         "the underline is the active-section cue"
     );
+}
+
+// ── reset display + clock notation (issue #39) ───────────────────────────────
+
+/// The reset row is a three-way cycle and the focused row brackets whichever
+/// value is live, so the operator can see the other two without cycling.
+#[test]
+fn reset_display_row_shows_all_three_shapes() {
+    for (display, active) in [
+        (ResetDisplay::Relative, "[relative]"),
+        (ResetDisplay::Clock, "[clock]"),
+        (ResetDisplay::Both, "[both]"),
+    ] {
+        let mut rows = toggles();
+        rows.reset_display = display;
+        let line = line_text(&detail_row(
+            GlobalConfigRow::ResetShape,
+            true,
+            rows,
+            60_000,
+            95.0,
+            98.0,
+            60_000,
+            None,
+            None,
+        ));
+        assert!(
+            line.contains(active),
+            "{display:?} must bracket {active}: {line}"
+        );
+        for label in ["relative", "clock", "both"] {
+            assert!(line.contains(label), "{display:?} lists {label}: {line}");
+        }
+    }
+}
+
+/// The notation decides nothing while resets render as a bare countdown, so the
+/// row is a cloudy-tui disabled row until a clock shows — and live after.
+#[test]
+fn clock_row_dims_until_a_reset_renders_a_clock() {
+    let dimmed = detail_row(
+        GlobalConfigRow::ClockNotation,
+        false,
+        toggles(),
+        60_000,
+        95.0,
+        98.0,
+        60_000,
+        None,
+        None,
+    );
+    assert!(
+        dimmed
+            .spans
+            .iter()
+            .all(|s| s.content.trim().is_empty() || s.style.fg == theme::faint().fg),
+        "clock must render fully faint under relative resets: {:?}",
+        dimmed.spans,
+    );
+
+    for display in [ResetDisplay::Clock, ResetDisplay::Both] {
+        let mut rows = toggles();
+        rows.reset_display = display;
+        let live = line_text(&detail_row(
+            GlobalConfigRow::ClockNotation,
+            true,
+            rows,
+            60_000,
+            95.0,
+            98.0,
+            60_000,
+            None,
+            None,
+        ));
+        assert!(
+            live.contains("[24h]") && live.contains("12h"),
+            "{display:?} makes the clock row live: {live}"
+        );
+    }
+}
+
+/// Both rows re-explain themselves per value — the value alone doesn't say what
+/// changes on screen, and the notation hint is where "local timezone" is stated.
+#[test]
+fn reset_rows_hints_track_their_value() {
+    let hint = |rows: RowState, row| {
+        row_hint(row, None, rows, 60_000, 95.0, 98.0, 60_000).expect("row has a hint")
+    };
+    let mut rows = toggles();
+    assert!(hint(rows, GlobalConfigRow::ResetShape).contains("how long"));
+    rows.reset_display = ResetDisplay::Clock;
+    assert!(hint(rows, GlobalConfigRow::ResetShape).contains("time of day"));
+    rows.reset_display = ResetDisplay::Both;
+    let both = hint(rows, GlobalConfigRow::ResetShape);
+    assert!(
+        both.contains("how long") && both.contains("time it resets"),
+        "{both}"
+    );
+
+    let h24 = hint(rows, GlobalConfigRow::ClockNotation);
+    assert!(h24.contains("21:20") && h24.contains("local"), "{h24}");
+    rows.clock_format = ClockFormat::H12;
+    assert!(hint(rows, GlobalConfigRow::ClockNotation).contains("9:20pm"));
 }
