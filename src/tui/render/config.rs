@@ -209,22 +209,28 @@ fn session_token_line(status: &crate::claude::SessionTokenStatus, now_ms: i64) -
     use crate::claude::SessionTokenStatus;
     let (text, style) = match status {
         SessionTokenStatus::LongLived(Some(ms)) => {
-            let days = (ms - now_ms) / 86_400_000;
-            if days < 0 {
+            if now_ms >= *ms {
                 (
                     "expired · re-mint: claude setup-token".to_string(),
                     theme::danger(),
                 )
-            } else if days <= 30 {
-                (
-                    format!("long-lived · expires in ~{days}d"),
-                    theme::warning(),
-                )
             } else {
-                (
-                    format!("long-lived · expires in ~{days}d"),
-                    theme::accent(),
-                )
+                // Truncating division: an expiry inside the next 24h reads
+                // "~0d" and still warns; only a past expiry (handled above)
+                // is DANGER, so a sub-day-expired token no longer mislabels as
+                // "~0d / warning" while the install gate already refuses it.
+                let days = (ms - now_ms) / 86_400_000;
+                if days <= 30 {
+                    (
+                        format!("long-lived · expires in ~{days}d"),
+                        theme::warning(),
+                    )
+                } else {
+                    (
+                        format!("long-lived · expires in ~{days}d"),
+                        theme::accent(),
+                    )
+                }
             }
         }
         SessionTokenStatus::LongLived(None) => (

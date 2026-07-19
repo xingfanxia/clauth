@@ -164,6 +164,19 @@ fn long_lived_token_row_counts_down_and_escalates() {
         "expired is DANGER"
     );
 
+    // Expired within the last 24h: truncating division gives 0 days, so the old
+    // `days < 0` check mislabeled it "~0d / warning". It must read as expired.
+    let just_dead = session_token_line(&S::LongLived(Some(now - day / 2)), now);
+    let just_dead_text = line_text(&just_dead);
+    assert!(
+        just_dead_text.contains("expired"),
+        "a token expired <24h ago is expired, not ~0d: {just_dead_text}"
+    );
+    assert!(
+        just_dead.spans.iter().any(|s| s.style == theme::danger()),
+        "sub-day-expired is DANGER"
+    );
+
     let unstamped = line_text(&session_token_line(&S::LongLived(None), now));
     assert!(unstamped.contains("no recorded expiry"), "{unstamped}");
 
