@@ -20,6 +20,8 @@ fn login_args<'a>(
         new_only: false,
         codex: false,
         browser: false,
+        setup_token: false,
+        yes: false,
     })
 }
 
@@ -93,6 +95,38 @@ fn parse_login_args_rejects_duplicate_codex() {
         "--codex".to_string(),
         "--codex".to_string(),
     ];
+    assert_eq!(parse_login_args(&args), None);
+}
+
+#[test]
+fn parse_login_args_setup_token_flag() {
+    let args = ["acme".to_string(), "--setup-token".to_string()];
+    let parsed = parse_login_args(&args).expect("valid shape");
+    assert!(parsed.setup_token);
+    assert!(!parsed.yes);
+    assert_eq!(parsed.name, "acme");
+
+    let args = [
+        "acme".to_string(),
+        "--setup-token".to_string(),
+        "--yes".to_string(),
+    ];
+    assert!(parse_login_args(&args).expect("valid shape").yes);
+}
+
+#[test]
+fn parse_login_args_setup_token_excludes_api_mode_and_bare_yes() {
+    // The sidecar capture and the API-key pair are different logins — the
+    // combination is a contradiction, not a preference.
+    let args = [
+        "acme".to_string(),
+        "--setup-token".to_string(),
+        "--base-url".to_string(),
+        "https://x".to_string(),
+    ];
+    assert_eq!(parse_login_args(&args), None);
+    // `--yes` means nothing outside the capture flow.
+    let args = ["acme".to_string(), "--yes".to_string()];
     assert_eq!(parse_login_args(&args), None);
 }
 

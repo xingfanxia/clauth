@@ -102,7 +102,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         [cmd, rest @ ..] if cmd == "login" => match parse_login_args(rest) {
             Some(args) => cmd_login(args),
             None => anyhow::bail!(
-                "usage: clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>] [--new] [--codex [--browser]]"
+                "usage: clauth login <profile> [--base-url <url>] [--api-key <key>] [--setup-token [--yes]] [--model <id>] [--new] [--codex [--browser]]"
             ),
         },
         [cmd, rest @ ..] if cmd == "delete" => match parse_delete_args(rest) {
@@ -319,6 +319,12 @@ struct LoginArgs<'a> {
     /// loopback flow into the profile store, never touching the live
     /// `~/.codex/auth.json` (CDX-3 R5). Meaningless without `--codex`.
     browser: bool,
+    /// CLA-SPLIT capture flow: read a `claude setup-token` mint and write it as
+    /// the profile's `session-token.json` sidecar instead of any OAuth/API login.
+    setup_token: bool,
+    /// With `--setup-token` only: replace an existing sidecar without the
+    /// `[y/N]` prompt (required on a non-TTY stdin, where nothing can confirm).
+    yes: bool,
 }
 
 impl LoginArgs<'_> {
@@ -336,6 +342,8 @@ fn parse_login_args(rest: &[String]) -> Option<LoginArgs<'_>> {
     let mut new_only = false;
     let mut codex = false;
     let mut browser = false;
+    let mut setup_token = false;
+    let mut yes = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -363,6 +371,22 @@ fn parse_login_args(rest: &[String]) -> Option<LoginArgs<'_>> {
                 return None;
             }
             browser = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--setup-token" {
+            if setup_token {
+                return None;
+            }
+            setup_token = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--yes" || arg == "-y" {
+            if yes {
+                return None;
+            }
+            yes = true;
             i += 1;
             continue;
         }
@@ -407,6 +431,15 @@ fn parse_login_args(rest: &[String]) -> Option<LoginArgs<'_>> {
     if browser && !codex {
         return None;
     }
+    // `--setup-token` is its own capture mode — combining it with the API-key
+    // pair, the codex capture, or `--new` is a contradiction, and `--yes`
+    // means nothing outside it.
+    if setup_token && (base_url.is_some() || api_key.is_some() || codex || new_only) {
+        return None;
+    }
+    if yes && !setup_token {
+        return None;
+    }
 
     Some(LoginArgs {
         name: name?,
@@ -416,6 +449,8 @@ fn parse_login_args(rest: &[String]) -> Option<LoginArgs<'_>> {
         new_only,
         codex,
         browser,
+        setup_token,
+        yes,
     })
 }
 
@@ -651,11 +686,21 @@ fn cmd_login(args: LoginArgs<'_>) -> Result<()> {
     // also re-enters the Anthropic fetch legs (breaking the §0.1 exclusion
     // invariant). The forward direction (`--codex` at a claude profile) is
     // guarded inside `codex_capture_into_profile`; the writer-level backstop
-    // lives in `overwrite_captured_profile`.
+    // lives in `overwrite_captured_profile`. Ahead of the `--setup-token`
+    // branch so a claude-shaped sidecar can never land in a codex profile
+    // either.
     if reauth && !args.codex && config.find(&target).is_some_and(|p| p.is_codex()) {
         anyhow::bail!(
             "profile '{target}' is a codex profile — re-auth it with: clauth login {target} --codex"
         );
+    }
+
+    // CLA-SPLIT capture flow: `--setup-token` writes the profile's
+    // session-token sidecar and touches NOTHING else — the usage OAuth pair,
+    // env, chain slot, and model settings all survive, so it needs none of
+    // the reauth/overwrite machinery below.
+    if args.setup_token {
+        return cmd_login_setup_token(&mut config, &target, reauth, args.model, args.yes);
     }
 
     // `--new` pins the CREATE semantics: refuse to touch an existing profile
@@ -763,6 +808,89 @@ fn cmd_login(args: LoginArgs<'_>) -> Result<()> {
         }
         println!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     }
+    Ok(())
+}
+
+/// `clauth login <name> --setup-token [--yes] [--model <id>]` — capture a
+/// `claude setup-token` mint into the profile's `session-token.json` sidecar
+/// (CLA-SPLIT), replacing today's fill-it-by-hand step. The token is read
+/// echo-off on a TTY (it's a bearer credential) or as one line from a piped
+/// stdin (so a GUI/script can drive the capture); its value is never echoed
+/// or logged. Additive: nothing else about the profile moves, and the sidecar
+/// takes effect on the next switch — this deliberately does not touch the
+/// live slot, so capturing can never sign a running session out.
+fn cmd_login_setup_token(
+    config: &mut profile::AppConfig,
+    target: &str,
+    exists: bool,
+    model: Option<&str>,
+    yes: bool,
+) -> Result<()> {
+    use std::io::IsTerminal as _;
+    let interactive = std::io::stdin().is_terminal();
+
+    // Replacing an existing sidecar re-points every future switch at the new
+    // token — confirm like the other in-place replacements. A fresh capture
+    // (no sidecar yet) is additive and needs no ceremony.
+    if claude::has_session_token(target) && !yes {
+        if !interactive {
+            anyhow::bail!(
+                "'{target}' already has a session token; pass --yes to replace it non-interactively"
+            );
+        }
+        print!("Replace the stored session token for '{target}'? [y/N] ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !reauth_confirmed(&answer) {
+            println!("clauth: aborted. '{target}' left unchanged.");
+            return Ok(());
+        }
+    }
+
+    let raw = if interactive {
+        println!("clauth: capturing a long-lived session token for '{target}'.");
+        println!("  1. in another terminal, run:  claude setup-token");
+        println!("  2. complete the browser flow it opens");
+        println!("  3. paste the minted token below (input stays hidden)");
+        rpassword::prompt_password("Setup token: ")
+            .map_err(|e| anyhow::anyhow!("failed to read the token: {e}"))?
+    } else {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        line
+    };
+    let token = claude::validate_setup_token(&raw)?;
+
+    // A brand-new name gets a blank profile first (no credentials — the
+    // sidecar IS its login; a usage OAuth pair can be added later with a
+    // normal `clauth login`).
+    if !exists {
+        actions::create_blank_profile(
+            config,
+            target.to_string(),
+            None,
+            None,
+            model.map(str::to_string),
+        )?;
+    } else if let Some(model) = model {
+        actions::set_profile_default_model(config, target, model)?;
+    }
+
+    let expires_at = claude::write_session_token(target, &token, crate::usage::now_ms() as i64)?;
+    let days = (expires_at - crate::usage::now_ms() as i64) / 86_400_000;
+    println!(
+        "clauth: session token installed for '{target}' · assumed to expire in ~{days}d \
+         (`claude setup-token` mints last about a year)."
+    );
+    println!(
+        "clauth: it takes effect on the next switch:  clauth {target}{}",
+        if exists {
+            ""
+        } else {
+            "\nclauth: for usage polling, also add an OAuth pair later:  clauth login <name>"
+        }
+    );
     Ok(())
 }
 
@@ -942,14 +1070,17 @@ fn print_help() {
          extra args go to claude. A CODEX profile instead launches\n                                  \
          `codex` in its own CODEX_HOME (profile chain, isolated\n                                  \
          history; always isolated — no --isolated flag)\n  \
-           clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>] [--new] [--codex [--browser]]\n                                  \
+           clauth login <profile> [--base-url <url>] [--api-key <key>] [--setup-token [--yes]] [--model <id>] [--new] [--codex [--browser]]\n                                  \
          add a new account, or re-authenticate an existing one in place\n                                  \
          (neither switches to it). Bare = browser OAuth; pass --base-url\n                                  \
          or --api-key to capture an API-key account instead (a missing\n                                  \
-         value is prompted; the key is read echo-off). --model sets its\n                                  \
-         default model (opus/sonnet/haiku/opusplan or a full model id);\n                                  \
-         --new refuses to touch an existing profile (race-proof create\n                                  \
-         for non-TTY callers); --codex captures the live ~/.codex\n                                  \
+         value is prompted; the key is read echo-off). --setup-token\n                                  \
+         captures a `claude setup-token` mint into the profile's\n                                  \
+         long-lived session-token sidecar (pasted echo-off, or piped on\n                                  \
+         stdin; --yes replaces an existing one unprompted). --model sets\n                                  \
+         its default model (opus/sonnet/haiku/opusplan or a full model\n                                  \
+         id); --new refuses to touch an existing profile (race-proof\n                                  \
+         create for non-TTY callers); --codex captures the live ~/.codex\n                                  \
          login (OpenAI Codex CLI) into a codex profile instead — no\n                                  \
          browser; add --browser to mint a NEW codex login via the\n                                  \
          PKCE flow straight into the store (live login untouched);\n                                  \
