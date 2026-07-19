@@ -3557,3 +3557,163 @@ fn parse_weekly_pct_pins_the_band_edges() {
     assert_eq!(parse_weekly_pct("inf"), None, "non-finite rejected");
     assert_eq!(parse_weekly_pct(""), None, "empty rejected");
 }
+
+// ── apply_usage Fresh-gate (docs/todo.md #1) ─────────────────────────────────
+//
+// `App::apply_usage` is driven every tick over the shared usage stores. The
+// bell + the burn-rate history JSONL append must fire ONLY when the per-
+// profile status is `FetchStatus::Fresh`. A phantom entry from a
+// `RateLimited` or stale-`Cached` tick survives restart and skews the burn
+// rate; a false bell cries wolf. The three tests below inject the status
+// directly into `usage_status` — the same field the scheduler writes on
+// every fetch — then call `apply_usage` and assert the durable side effects.
+//
+// The seam: `apply_usage` reads each profile's status out of the shared
+// `usage_status` map (`Arc<RankedMutex<HashMap<String, FetchStatus>>>`), so
+// seeding that map from a test is indistinguishable from a real scheduler
+// tick landing a fetch result.
+
+use crate::usage::{FetchStatus, UsageInfo, UsageWindow};
+
+/// Single-profile fixture: "alice" with `bell_threshold = 70.0` and a seeded
+/// `usage_store["alice"]` at 80 % utilization (>= threshold, so the bell
+/// would fire if the gate were removed). The injected `status` lands in
+/// `usage_status["alice"]`.
+const GATE_PROFILE: &str = "alice";
+const GATE_THRESHOLD: f64 = 70.0;
+const GATE_UTIL: f64 = 80.0;
+
+/// Pre-seed `usage_history.jsonl` with one entry at 50 % utilization so the
+/// Fresh case has something to differ from (forcing `changed = true`), and
+/// the RateLimited/Cached cases can assert byte-identical no-op. Returns the
+/// file's bytes after seeding (one line, util 50).
+fn seed_prior_history_entry() -> String {
+    let path = crate::profile::profile_history_path(GATE_PROFILE)
+        .expect("profile_history_path resolves under the sandbox home");
+    std::fs::create_dir_all(path.parent().expect("parent dir"))
+        .expect("create profile dir for seeded history");
+    let old = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 50.0,
+            resets_at: None,
+        }),
+        ..UsageInfo::default()
+    };
+    let usage_json = serde_json::to_string(&old).unwrap_or_default();
+    let name_json = serde_json::to_string(GATE_PROFILE).unwrap_or_default();
+    let line = format!(
+        r#"{{"ts":{},"name":{},"usage":{}}}"#,
+        crate::usage::now_ms().saturating_sub(60_000),
+        name_json,
+        usage_json,
+    );
+    std::fs::write(&path, format!("{line}\n")).expect("seed prior history entry");
+    std::fs::read_to_string(&path).expect("read seeded history")
+}
+
+/// Build a fresh `App` over the caller-held sandbox. Caller owns the
+/// `HomeSandbox` so it outlives the App's disk writes.
+fn gate_app(
+    _home: &crate::testutil::HomeSandbox,
+    status: FetchStatus,
+) -> (App, std::path::PathBuf) {
+    let mut profile = crate::testutil::blank_profile(GATE_PROFILE);
+    profile.bell_threshold = Some(GATE_THRESHOLD);
+    let app = app_with(vec![profile]);
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: GATE_UTIL,
+            resets_at: None,
+        }),
+        ..UsageInfo::default()
+    };
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut store = app.usage_store.lock().expect("usage_store mutex poisoned");
+        store.insert(GATE_PROFILE.to_string(), usage);
+    }
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut s = app
+            .usage_status
+            .lock()
+            .expect("usage_status mutex poisoned");
+        s.insert(GATE_PROFILE.to_string(), status);
+    }
+    let history_path = crate::profile::profile_history_path(GATE_PROFILE)
+        .expect("profile_history_path resolves under the sandbox home");
+    (app, history_path)
+}
+
+#[test]
+fn apply_usage_fresh_status_fires_bell_and_appends_history() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let prior = seed_prior_history_entry();
+    let (mut app, history_path) = gate_app(&_home, FetchStatus::Fresh);
+
+    app.apply_usage();
+
+    // Bell arm: util(80) >= threshold(70), no prior bell_fired entry → fires.
+    assert_eq!(
+        app.bell_fired.get(GATE_PROFILE),
+        Some(&true),
+        "Fresh + util over threshold must ring the bell",
+    );
+
+    // History arm: file gains a new entry carrying the live util.
+    let after =
+        std::fs::read_to_string(&history_path).expect("history file readable after apply_usage");
+    assert!(
+        after.len() > prior.len(),
+        "Fresh must append a new history line (pre {} bytes, post {} bytes)",
+        prior.len(),
+        after.len(),
+    );
+    assert!(
+        after.contains(r#""utilization":"#.to_string().as_str())
+            && after.contains(&format!("{}", GATE_UTIL)),
+        "the appended live sample must carry the seeded utilization {GATE_UTIL} (got: {after})",
+    );
+    assert!(
+        after.starts_with(&prior),
+        "the prior entry must survive intact at the head of the file",
+    );
+}
+
+#[test]
+fn apply_usage_rate_limited_status_skips_bell_and_history_append() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let prior = seed_prior_history_entry();
+    let (mut app, history_path) = gate_app(&_home, FetchStatus::RateLimited);
+
+    app.apply_usage();
+
+    assert!(
+        !app.bell_fired.contains_key(GATE_PROFILE),
+        "RateLimited must not ring the bell (util would have fired on Fresh)",
+    );
+    let after = std::fs::read_to_string(&history_path).expect("history file still readable");
+    assert_eq!(
+        after, prior,
+        "RateLimited must not append a phantom history entry (file must be byte-identical)",
+    );
+}
+
+#[test]
+fn apply_usage_cached_status_skips_bell_and_history_append() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let prior = seed_prior_history_entry();
+    let (mut app, history_path) = gate_app(&_home, FetchStatus::Cached);
+
+    app.apply_usage();
+
+    assert!(
+        !app.bell_fired.contains_key(GATE_PROFILE),
+        "Cached must not ring the bell (util would have fired on Fresh)",
+    );
+    let after = std::fs::read_to_string(&history_path).expect("history file still readable");
+    assert_eq!(
+        after, prior,
+        "Cached must not append a phantom history entry (file must be byte-identical)",
+    );
+}
