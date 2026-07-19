@@ -1,12 +1,27 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 
 use crate::actions::{switch_off, switch_profile};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile};
 use crate::usage::{
-    FetchStatus, UsageStore, UsageWindow, five_hour_live, iso_to_epoch_secs, now_epoch_secs,
-    seven_day_live,
+    FetchStatus, UsageInfo, UsageStore, UsageWindow, five_hour_live, iso_to_epoch_secs,
+    now_epoch_secs, seven_day_live,
 };
+
+// Test-only per-thread counter: increments each time `next_auto_switch_target`
+// takes the `UsageStore` lock. The snapshot refactor takes it exactly once per
+// evaluation; the pre-snapshot shape (which locked per predicate: headroom walk
+// pass 1a + 1b, serving-sink active + sibling, spend-armed active + sibling,
+// budget-spent active, halt re-check), plus a re-lock per member visited in
+// each walk, took the lock a dozen-plus times per evaluation on a typical chain.
+// Thread-local sidesteps parallel-test counter pollution: each test thread
+// sees only its own calls.
+#[cfg(test)]
+std::thread_local! {
+    static NEXT_AUTO_SWITCH_TARGET_STORE_LOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// What the auto-switch evaluator decided when the active profile crossed its
 /// threshold.
@@ -193,7 +208,7 @@ fn spend_armed(usage: Option<&crate::usage::UsageInfo>, budget_on: bool, ceiling
 /// taste. Only `seven_day` gates here — a per-model `weekly_scoped` limit at
 /// 100 (e.g. "7d fable" spent while 7d has room) blocks just that model, and
 /// the walk cannot know which model the next session will drive. Store-side
-/// twin logic inlines this same shape (see `is_exhausted_from_store`).
+/// twin logic inlines this same shape (see `is_exhausted_from_usage`).
 fn weekly_blocked_info(info: &crate::usage::UsageInfo, now_secs: i64, weekly_pct: f64) -> bool {
     seven_day_live(info, now_secs)
         && info
@@ -227,7 +242,7 @@ pub(crate) fn is_exhausted(profile: &Profile, weekly_pct: f64) -> bool {
 /// holding the `AppConfig` guard) plus the current live sample, run through
 /// the same recency-weighted computation and windowing `App::active_burn_rate`
 /// uses for the Overview ETA line. `None` until enough distinct samples exist.
-/// Sole caller is the scheduler-side [`is_exhausted_active_from_store`] — the
+/// Sole caller is the scheduler-side [`is_exhausted_active_from_usage`] — the
 /// UI-thread [`is_exhausted_active`] takes its rate as a parameter instead so
 /// the render pass never triggers this disk read under the config guard.
 fn burn_rate_for_profile(name: &str, window: &UsageWindow) -> Option<f64> {
@@ -291,7 +306,7 @@ fn is_exhausted_projected(
 /// reproduces [`is_exhausted`] bit for bit — mode off must never diverge from
 /// today's static behavior. On, `active_burn_pct_per_hour` — the caller's
 /// in-memory rate; this function never reads disk itself, see
-/// [`is_exhausted_active_from_store`] for the disk-reading scheduler twin —
+/// [`is_exhausted_active_from_usage`] for the disk-reading scheduler twin —
 /// feeds [`is_exhausted_projected`]. Deliberately never applied to the target
 /// walk's candidates or `soonest_resume` — see docs/internals.md's auto-switch
 /// asymmetry; this only ever changes whether the ACTIVE profile itself is
@@ -624,68 +639,59 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     })
 }
 
-/// Scheduler-side [`is_exhausted`]: reads 5h utilization from the shared
-/// `UsageStore` rather than `Profile.usage` (which only the UI thread writes via
-/// `apply_usage`). A poisoned store lock fails safe to "not exhausted" so a
-/// momentarily wedged mutex can't trigger a switch.
-fn is_exhausted_from_store(
+/// Scheduler-side [`is_exhausted`] over a usage snapshot: reads 5h utilization
+/// from a `HashMap<String, UsageInfo>` taken under a single `UsageStore` lock
+/// (see [`next_auto_switch_target`]) rather than `Profile.usage` (which only the
+/// UI thread writes via `apply_usage`). The snapshot is taken once per
+/// evaluation so a fetch landing between this read and the next pass cannot
+/// flip the decision.
+fn is_exhausted_from_usage(
     name: &str,
     threshold: f64,
-    store: &UsageStore,
+    usage: &HashMap<String, UsageInfo>,
     weekly_pct: f64,
 ) -> bool {
     let now = now_epoch_secs();
-    match store.lock() {
-        Ok(s) => s.get(name).is_some_and(|info| {
-            weekly_blocked_info(info, now, weekly_pct)
-                || (five_hour_live(info, now)
-                    && info
-                        .five_hour
-                        .as_ref()
-                        .is_some_and(|w| w.utilization >= threshold))
-        }),
-        Err(_) => false,
-    }
+    usage.get(name).is_some_and(|info| {
+        weekly_blocked_info(info, now, weekly_pct)
+            || (five_hour_live(info, now)
+                && info
+                    .five_hour
+                    .as_ref()
+                    .is_some_and(|w| w.utilization >= threshold))
+    })
 }
 
-/// Scheduler-side [`is_exhausted_active`]: reads the 5h window from
-/// `UsageStore` instead of `Profile.usage`, so the scheduler's periodic scan
-/// agrees with the UI-thread one-shot (`auto_switch_if_needed`) on the ACTIVE
-/// decision. The store lock is dropped before the (disk-only, unlocked) burn
-/// rate lookup — never held across that I/O. A poisoned store lock fails safe
-/// to "not exhausted".
+/// Scheduler-side [`is_exhausted_active`] over a usage snapshot: reads the 5h
+/// window from the same single-lock snapshot as [`is_exhausted_from_usage`], so
+/// the scheduler's periodic scan agrees with the UI-thread one-shot
+/// (`auto_switch_if_needed`) on the ACTIVE decision. The snapshot is owned
+/// (cloned under the one lock), so the (disk-only, unlocked) burn rate lookup
+/// below runs with no store lock held — same property the pre-snapshot shape
+/// upheld per predicate.
 #[allow(clippy::too_many_arguments)]
-fn is_exhausted_active_from_store(
+fn is_exhausted_active_from_usage(
     name: &str,
     threshold: f64,
     burn_aware: bool,
     interval_ms: u64,
-    store: &UsageStore,
+    usage: &HashMap<String, UsageInfo>,
     weekly_pct: f64,
     floor_pct: f64,
     horizon_cap_ms: u64,
 ) -> bool {
     let now = now_epoch_secs();
-    // One lock window for both reads; the weekly line trumps projection
-    // (mirrors `is_exhausted_active`).
-    let (blocked, window): (bool, Option<UsageWindow>) = match store.lock() {
-        Ok(s) => match s.get(name) {
-            Some(info) => (
-                weekly_blocked_info(info, now, weekly_pct),
-                if five_hour_live(info, now) {
-                    info.five_hour.clone()
-                } else {
-                    None
-                },
-            ),
-            None => (false, None),
-        },
-        Err(_) => (false, None),
+    let Some(info) = usage.get(name) else {
+        return false;
     };
-    if blocked {
+    // The weekly line trumps projection (mirrors `is_exhausted_active`).
+    if weekly_blocked_info(info, now, weekly_pct) {
         return true;
     }
-    let Some(window) = window else {
+    let Some(window) = (five_hour_live(info, now).then_some(info.five_hour.as_ref()))
+        .flatten()
+        .cloned()
+    else {
         return false;
     };
     if !burn_aware {
@@ -904,9 +910,39 @@ pub(crate) fn next_target(
 /// `usage_store` then `config`, so the scheduler must never hold `config` while
 /// taking `usage_store`. Caller builds the snapshot under `config.lock()`, drops
 /// the guard, then calls this.
+///
+/// The usage store is locked EXACTLY ONCE per evaluation, cloned into an owned
+/// `HashMap<String, UsageInfo>`, and released before any pass runs. Every
+/// predicate (headroom walk, serving-sink, spend-armed, halt) reads from that
+/// same snapshot, so a fetch landing mid-evaluation (a concurrent
+/// `App::apply_usage` acquiring `usage_store` between two predicate locks under
+/// the old per-predicate-lock shape) cannot flip a free-sibling decision into a
+/// paid one. The clone is bounded — one entry per profile.
 pub(crate) fn next_auto_switch_target(
     snapshot: &ChainSnapshot,
     store: &UsageStore,
+) -> Option<SwitchAction> {
+    // One lock window — fail-safe to an empty map on poison, matching the
+    // per-predicate shape's `Err(_) => false` paths in aggregate (every
+    // predicate reads a missing entry the same way it reads no entry).
+    let usage: HashMap<String, UsageInfo> = match store.lock() {
+        Ok(s) => {
+            #[cfg(test)]
+            NEXT_AUTO_SWITCH_TARGET_STORE_LOCKS.with(|c| c.set(c.get() + 1));
+            s.clone()
+        }
+        Err(_) => HashMap::new(),
+    };
+    next_auto_switch_target_with_usage(snapshot, &usage)
+}
+
+/// Snapshot-driven core of [`next_auto_switch_target`]: every predicate reads
+/// from `usage`, the single per-evaluation clone of the `UsageStore` map. Split
+/// out so tests can drive the evaluation against a frozen snapshot and prove
+/// the decision depends only on its content, never on a later store mutation.
+fn next_auto_switch_target_with_usage(
+    snapshot: &ChainSnapshot,
+    usage: &HashMap<String, UsageInfo>,
 ) -> Option<SwitchAction> {
     let active_idx = snapshot
         .chain
@@ -931,12 +967,12 @@ pub(crate) fn next_auto_switch_target(
     // form (limiter-confirmed `rejected`, ≥2 kicks, ceiling ahead) reaches
     // this snapshot at all.
     let active_kick_rejected = snapshot.kick_rejected.iter().any(|k| k == &active.name);
-    let active_exhausted = is_exhausted_active_from_store(
+    let active_exhausted = is_exhausted_active_from_usage(
         &active.name,
         active.threshold,
         snapshot.burn_aware,
         snapshot.interval_ms,
-        store,
+        usage,
         snapshot.weekly_pct,
         snapshot.burn_floor_pct,
         snapshot.burn_horizon_cap_ms,
@@ -967,12 +1003,12 @@ pub(crate) fn next_auto_switch_target(
     // stale-but-viable escape (2026-06-28 target asymmetry).
     let is_fresh = |m: &ChainMember| snapshot.fresh.iter().any(|n| n == &m.name);
     if let Some(name) = walk(&|m| {
-        !is_exhausted_from_store(&m.name, m.threshold, store, snapshot.weekly_pct) && is_fresh(m)
+        !is_exhausted_from_usage(&m.name, m.threshold, usage, snapshot.weekly_pct) && is_fresh(m)
     }) {
         return Some(SwitchAction::To(name));
     }
     if let Some(name) =
-        walk(&|m| !is_exhausted_from_store(&m.name, m.threshold, store, snapshot.weekly_pct))
+        walk(&|m| !is_exhausted_from_usage(&m.name, m.threshold, usage, snapshot.weekly_pct))
     {
         return Some(SwitchAction::To(name));
     }
@@ -986,14 +1022,14 @@ pub(crate) fn next_auto_switch_target(
     // stay-put-or-spend behavior below).
     let active_is_last_resort = active.last_resort;
     if active_is_last_resort
-        && !is_exhausted_from_store(&active.name, active.threshold, store, WEEKLY_HARD_BLOCK_PCT)
+        && !is_exhausted_from_usage(&active.name, active.threshold, usage, WEEKLY_HARD_BLOCK_PCT)
     {
         return None;
     }
     if !active_is_last_resort
         && let Some(name) = walk(&|m| {
             m.last_resort
-                && !is_exhausted_from_store(&m.name, m.threshold, store, WEEKLY_HARD_BLOCK_PCT)
+                && !is_exhausted_from_usage(&m.name, m.threshold, usage, WEEKLY_HARD_BLOCK_PCT)
         })
     {
         return Some(SwitchAction::To(name));
@@ -1004,19 +1040,17 @@ pub(crate) fn next_auto_switch_target(
     // store's `UsageInfo` exactly like utilization does. Same loop guard — an
     // active still within budget stays put rather than ping-ponging between two
     // paying members.
-    let active_is_spend_armed = store
-        .lock()
-        .ok()
-        .is_some_and(|s| spend_armed(s.get(&active.name), snapshot.spend_budget, active.max_spend));
+    let active_is_spend_armed = spend_armed(
+        usage.get(&active.name),
+        snapshot.spend_budget,
+        active.max_spend,
+    );
     if active_is_spend_armed {
         return None;
     }
-    if let Some(name) = walk(&|m| {
-        store
-            .lock()
-            .ok()
-            .is_some_and(|s| spend_armed(s.get(&m.name), snapshot.spend_budget, m.max_spend))
-    }) {
+    if let Some(name) =
+        walk(&|m| spend_armed(usage.get(&m.name), snapshot.spend_budget, m.max_spend))
+    {
         return Some(SwitchAction::To(name));
     }
 
@@ -1041,21 +1075,23 @@ pub(crate) fn next_auto_switch_target(
     // Budget-aware halt flag, lockstep with [`next_target`]: an active that
     // spent its pay-as-you-go budget reads `switch_off_when_budget_spent`, since staying on
     // it keeps costing money rather than merely erroring.
-    let active_budget_spent = store.lock().ok().is_some_and(|s| {
-        budget_spent(s.get(&active.name), snapshot.spend_budget, active.max_spend)
-    });
+    let active_budget_spent = budget_spent(
+        usage.get(&active.name),
+        snapshot.spend_budget,
+        active.max_spend,
+    );
     let halt_flag = if active_budget_spent {
         snapshot.switch_off_when_budget_spent
     } else {
         snapshot.switch_off_when_spent
     };
     if halt_flag
-        && is_exhausted_active_from_store(
+        && is_exhausted_active_from_usage(
             &active.name,
             active.threshold,
             snapshot.burn_aware,
             snapshot.interval_ms,
-            store,
+            usage,
             WEEKLY_HARD_BLOCK_PCT,
             snapshot.burn_floor_pct,
             snapshot.burn_horizon_cap_ms,

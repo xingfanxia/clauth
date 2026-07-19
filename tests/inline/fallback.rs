@@ -1892,9 +1892,9 @@ fn next_target_skips_broken_last_resort_member() {
 
 // ── issue #8 follow-up b: burn-aware auto-switch (opt-in, default off) ─────
 //
-// `is_exhausted_projected`/`is_exhausted_active`/`is_exhausted_active_from_store`
+// `is_exhausted_projected`/`is_exhausted_active`/`is_exhausted_active_from_usage`
 // only ever change the ACTIVE profile's own exhaustion decision; candidate
-// selection stays on the static `is_exhausted`/`is_exhausted_from_store`
+// selection stays on the static `is_exhausted`/`is_exhausted_from_usage`
 // tested above (unchanged by this section).
 
 #[test]
@@ -2813,4 +2813,258 @@ fn blocked_reason_weekly_hard_outranks_a_kick_block() {
         blocked_reason(&cfg, &cfg.profiles[0], Some(until)),
         Some(BlockedReason::WeeklySpent { .. })
     ));
+}
+
+// ── weekly fallback §5: spend pass lock consolidation ─────────────────────────
+//
+// `next_auto_switch_target` takes ONE usage-store snapshot per evaluation and
+// drives every pass off it, so a fetch landing mid-evaluation (between the
+// headroom pass and the spend-armed pass) cannot flip a free-sibling decision
+// into a paid one. The pre-snapshot shape locked the store per predicate, so
+// each pass could observe a different state.
+//
+// The tests below pin the new contract:
+//   * exactly one store lock per evaluation (the snapshot);
+//   * the snapshot's content alone drives the decision (mutation after the
+//     snapshot is invisible);
+//   * a real `UsageStore` mutated between simulated passes flips the per-pass
+//     read, but not the snapshot read.
+
+/// Chain: A active + exhausted (the switch trigger), B no fresh + free 5h
+/// headroom (pass-2 candidate; pass 1 skips it for lack of freshness), C
+/// spend-armed (pass-4 candidate). With B viable the walk returns To(B) FREE;
+/// with B exhausted it falls through to To(C) PAID. Three members, no
+/// `last_resort`, no broken, no kick-rejected.
+fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
+    ChainSnapshot {
+        active: "a".into(),
+        chain: vec![
+            ChainMember {
+                name: "a".into(),
+                threshold: 95.0,
+                last_resort: false,
+                max_spend: 0.0,
+            },
+            ChainMember {
+                name: "b".into(),
+                threshold: 95.0,
+                last_resort: false,
+                max_spend: 0.0,
+            },
+            ChainMember {
+                name: "c".into(),
+                threshold: 95.0,
+                last_resort: false,
+                max_spend: 100.0,
+            },
+        ],
+        switch_off_when_spent: true,
+        broken: vec![],
+        burn_aware: false,
+        interval_ms: 60_000,
+        weekly_pct: 98.0,
+        burn_floor_pct: 80.0,
+        burn_horizon_cap_ms: 3_600_000,
+        spend_budget,
+        switch_off_when_budget_spent: false,
+        kick_rejected: vec![],
+        fresh: vec![],
+    }
+}
+
+/// Asserts [`next_auto_switch_target`] takes the `UsageStore` lock exactly once
+/// per evaluation. The pre-snapshot shape took it per predicate (headroom walk
+/// pass 1a + 1b, serving-sink active + sibling, spend-armed active + sibling,
+/// budget-spent active, halt re-check) — six-plus lock windows an interleaved
+/// `App::apply_usage` could mutate between. With the snapshot, the count is
+/// exactly 1, which is the load-bearing guarantee: one lock window means no
+/// mid-evaluation mutation can change the outcome.
+///
+/// This is the deterministic RED-against-old-shape test. Reverting the
+/// snapshot refactor brings the count back above 1 and trips the assert.
+#[test]
+fn next_auto_switch_target_takes_store_lock_exactly_once() {
+    super::NEXT_AUTO_SWITCH_TARGET_STORE_LOCKS.with(|c| c.set(0));
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0)]);
+    let snapshot = snapshot_for_lock_consolidation(false);
+    let _ = next_auto_switch_target(&snapshot, &store);
+    let count = super::NEXT_AUTO_SWITCH_TARGET_STORE_LOCKS.with(|c| c.get());
+    assert_eq!(
+        count, 1,
+        "snapshot mechanism must take the store lock exactly once per evaluation \
+         (pre-snapshot shape locked per predicate — observed {count} > 1)"
+    );
+}
+
+/// Real `UsageStore`, mutated between two simulated predicate reads, returns
+/// different answers per read — reproducing the bug class the snapshot closes.
+/// The snapshot read (a single clone at one instant) is invariant across the
+/// same mutation. Uses the real predicates ([`is_exhausted_from_usage`]) and a
+/// real `Arc<RankedMutex<HashMap<…>>>` store the test mutates by re-locking.
+#[test]
+fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
+    use super::is_exhausted_from_usage;
+
+    // Pre-mutation store: B has live 5h headroom.
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 10.0, Some(100.0))),
+        ),
+    ]);
+
+    let weekly_pct = 98.0;
+    let threshold = 95.0;
+
+    // Per-predicate-lock simulation (the pre-snapshot shape): each call
+    // re-locks the store, so a mutation between two calls IS observable.
+    let read_pre_mutation = {
+        let snap = store.lock().unwrap().clone();
+        !is_exhausted_from_usage("b", threshold, &snap, weekly_pct)
+    };
+    // A fetch lands between predicate calls — B's window crosses the line.
+    {
+        let mut s = store.lock().unwrap();
+        s.insert(
+            "b".into(),
+            usage_info(Some(window(100.0, Some(live_reset())))),
+        );
+    }
+    let read_post_mutation = {
+        let snap = store.lock().unwrap().clone();
+        !is_exhausted_from_usage("b", threshold, &snap, weekly_pct)
+    };
+    assert!(
+        read_pre_mutation && !read_post_mutation,
+        "per-predicate reads must observe the mutation — pre={read_pre_mutation}, \
+         post={read_post_mutation}. If both agree, the test never re-locked the store."
+    );
+
+    // Snapshot evaluation (the new shape): clone once, drive every read off
+    // the same clone. The same mutation after the snapshot leaves the answer
+    // unchanged.
+    let store2 = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 10.0, Some(100.0))),
+        ),
+    ]);
+    let snapshot = store2.lock().unwrap().clone();
+    {
+        let mut s = store2.lock().unwrap();
+        s.insert(
+            "b".into(),
+            usage_info(Some(window(100.0, Some(live_reset())))),
+        );
+    }
+    let snapshot_read = !is_exhausted_from_usage("b", threshold, &snapshot, weekly_pct);
+    assert!(
+        snapshot_read,
+        "snapshot evaluation must ignore the between-pass mutation — \
+         the decision is locked to the snapshot's content"
+    );
+}
+
+/// End-to-end: a single call to [`next_auto_switch_target`] returns To(B) FREE
+/// when B has headroom at snapshot time, and To(C) PAID when B is exhausted at
+/// snapshot time. The store's content at the snapshot instant drives the
+/// decision — the load-bearing semantic the lock-count test above relies on.
+#[test]
+fn next_auto_switch_target_snapshot_content_drives_the_decision() {
+    let snapshot = snapshot_for_lock_consolidation(true);
+
+    // Snapshot state X: B has headroom → To(B) FREE.
+    let store_with_b_headroom = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 10.0, Some(100.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snapshot, &store_with_b_headroom),
+        Some(SwitchAction::To("b".to_string())),
+        "pass 2 must pick the free sibling when it has headroom at snapshot time"
+    );
+
+    // Snapshot state Y: B exhausted → To(C) PAID.
+    let store_with_b_exhausted = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 10.0, Some(100.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snapshot, &store_with_b_exhausted),
+        Some(SwitchAction::To("c".to_string())),
+        "pass 4 must pick the spend-armed sibling when the free one is exhausted \
+         at snapshot time — the bug direction: a fetch landing between the \
+         headroom pass and the spend-armed pass could have caused this flip in \
+         the pre-snapshot shape"
+    );
+}
+
+/// End-to-end bug repro: with the snapshot, a store mutation AFTER the snapshot
+/// instant cannot flip the result. The test takes the snapshot against
+/// state X (B headroom), mutates the live store to state Y (B exhausted + C
+/// spend-armed — the bug-direction flip), and asserts the snapshot-driven
+/// evaluation still returns To(B) FREE. Pre-snapshot, the next predicate
+/// re-lock would observe Y and return To(C) PAID.
+///
+/// Two evaluations run here:
+///   * one with a snapshot taken AFTER the mutation — proves the same store
+///     now yields To(C), so the assertion against the pre-mutation snapshot is
+///     meaningful (not a tautology);
+///   * one with the pre-mutation snapshot — the bug-direction check.
+#[test]
+fn next_auto_switch_target_ignores_store_mutation_after_snapshot() {
+    // State X: B has headroom, C inert.
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    let snapshot = snapshot_for_lock_consolidation(true);
+
+    // Pre-mutation snapshot (mimics what `next_auto_switch_target` clones as
+    // its first and only store read).
+    let pre_mutation: HashMap<String, UsageInfo> = store.lock().unwrap().clone();
+
+    // The fetch lands: B crosses the line, C becomes spend-armed.
+    {
+        let mut s = store.lock().unwrap();
+        s.insert(
+            "b".into(),
+            usage_info(Some(window(100.0, Some(live_reset())))),
+        );
+        s.insert(
+            "c".into(),
+            usage_spent_with_spend(spend_block(true, 10.0, Some(100.0))),
+        );
+    }
+
+    // Snapshot evaluation against the PRE-mutation clone: To(B) FREE.
+    let result_with_pre_snapshot =
+        super::next_auto_switch_target_with_usage(&snapshot, &pre_mutation);
+    assert_eq!(
+        result_with_pre_snapshot,
+        Some(SwitchAction::To("b".to_string())),
+        "the snapshot is immutable — a post-snapshot mutation must not flip the \
+         free-sibling decision into a paid one"
+    );
+
+    // Sanity: the live store HAS mutated, so a fresh snapshot returns To(C).
+    // This proves the assertion above is not vacuous — the store genuinely
+    // changed, the snapshot just refused to re-read it.
+    assert_eq!(
+        next_auto_switch_target(&snapshot, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "a fresh snapshot taken AFTER the mutation must reflect it — To(C) PAID"
+    );
 }
