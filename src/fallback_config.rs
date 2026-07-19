@@ -287,6 +287,66 @@ pub(crate) fn set_last_resort(config: &mut AppConfig, name: &str, on: bool) -> R
     }
 }
 
+/// Set or clear `name`'s per-account weekly-line override (`weekly at` on the
+/// Fallback tab; the chain-wide `weekly_switch_threshold` stays the default).
+/// `None` clears back to the default. Writes only the profile's `config.toml`,
+/// so it returns `Ok(false)`. Errors when `name` resolves to no known profile.
+pub(crate) fn set_member_weekly(
+    config: &mut AppConfig,
+    name: &str,
+    value: Option<f64>,
+) -> Result<bool> {
+    let canonical = resolve(config, name)?;
+    let clamped = value.map(|v| v.clamp(0.0, 100.0));
+    match config.find_mut(&canonical) {
+        Some(profile) => {
+            let previous = profile.weekly_threshold;
+            profile.weekly_threshold = clamped;
+            if let Err(e) = save_profile(profile) {
+                profile.weekly_threshold = previous;
+                return Err(e);
+            }
+            Ok(false)
+        }
+        None => bail!("unknown profile '{name}'"),
+    }
+}
+
+/// Flip one of `name`'s per-account usage gates (`check_weekly` /
+/// `check_scoped` — the Fallback tab's `weekly gate` / `scoped gate`).
+/// Writes only the profile's `config.toml`, so it returns `Ok(false)`.
+/// Errors when `name` resolves to no known profile.
+pub(crate) fn set_usage_gate(
+    config: &mut AppConfig,
+    name: &str,
+    scoped: bool,
+    on: bool,
+) -> Result<bool> {
+    let canonical = resolve(config, name)?;
+    match config.find_mut(&canonical) {
+        Some(profile) => {
+            let field: &mut bool = if scoped {
+                &mut profile.check_scoped
+            } else {
+                &mut profile.check_weekly
+            };
+            let previous = *field;
+            *field = on;
+            if let Err(e) = save_profile(profile) {
+                let field: &mut bool = if scoped {
+                    &mut profile.check_scoped
+                } else {
+                    &mut profile.check_weekly
+                };
+                *field = previous;
+                return Err(e);
+            }
+            Ok(false)
+        }
+        None => bail!("unknown profile '{name}'"),
+    }
+}
+
 /// Toggle wrap-off mode (switch every account off once the whole chain is spent,
 /// rather than staying on the last one) and persist.
 pub(crate) fn set_wrap_off(config: &mut AppConfig, on: bool) -> Result<bool> {

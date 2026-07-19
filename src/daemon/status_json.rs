@@ -93,6 +93,14 @@ fn fallback_json(config: &AppConfig, p: &Profile) -> Option<serde_json::Value> {
         // Additive (schema stays 1): the exclusive last-resort mark — this member
         // is accepted by the walk's sink pass even while exhausted.
         "last_resort": p.last_resort,
+        // Additive (SCW-2/WKO): the per-account usage gates and weekly-line
+        // override, so a client can render/edit the same per-member controls
+        // the Fallback tab carries (`set_check_weekly` / `set_check_scoped` /
+        // `set_member_weekly` on the socket). `weekly_threshold` is null when
+        // the member follows the chain-wide line.
+        "check_weekly": p.check_weekly,
+        "check_scoped": p.check_scoped,
+        "weekly_threshold": p.weekly_threshold,
     }))
 }
 

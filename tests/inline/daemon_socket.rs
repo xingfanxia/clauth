@@ -440,3 +440,81 @@ fn rename_unknown_profile_or_missing_new_name_errors() {
     );
     assert_eq!(only_op(&h), None);
 }
+
+#[test]
+fn per_member_weekly_and_gate_commands_validate_and_enqueue() {
+    let _home = HomeSandbox::new();
+
+    // Override set, cleared via explicit null, and cleared via absent value.
+    let h = handles(&["work"]);
+    assert_eq!(
+        dispatch(
+            r#"{"cmd":"set_member_weekly","profile":"work","value":90}"#,
+            &no_status(),
+            &h,
+        ),
+        "{\"ok\":true}"
+    );
+    assert_eq!(
+        only_op(&h),
+        Some(ConfigOp::SetMemberWeekly("work".into(), Some(90.0)))
+    );
+    for clear in [
+        r#"{"cmd":"set_member_weekly","profile":"work","value":null}"#,
+        r#"{"cmd":"set_member_weekly","profile":"work"}"#,
+    ] {
+        let h = handles(&["work"]);
+        assert_eq!(dispatch(clear, &no_status(), &h), "{\"ok\":true}", "{clear}");
+        assert_eq!(
+            only_op(&h),
+            Some(ConfigOp::SetMemberWeekly("work".into(), None)),
+            "{clear}"
+        );
+    }
+
+    // The two gates route to their scoped/weekly halves.
+    let h = handles(&["work"]);
+    assert_eq!(
+        dispatch(
+            r#"{"cmd":"set_check_weekly","profile":"work","value":false}"#,
+            &no_status(),
+            &h,
+        ),
+        "{\"ok\":true}"
+    );
+    assert_eq!(
+        only_op(&h),
+        Some(ConfigOp::SetUsageGate("work".into(), false, false))
+    );
+    let h = handles(&["work"]);
+    assert_eq!(
+        dispatch(
+            r#"{"cmd":"set_check_scoped","profile":"work","value":true}"#,
+            &no_status(),
+            &h,
+        ),
+        "{\"ok\":true}"
+    );
+    assert_eq!(
+        only_op(&h),
+        Some(ConfigOp::SetUsageGate("work".into(), true, true))
+    );
+
+    // Rejections error on the socket and enqueue nothing.
+    for bad in [
+        r#"{"cmd":"set_member_weekly","profile":"work","value":150}"#,
+        r#"{"cmd":"set_member_weekly","profile":"work","value":"90"}"#,
+        r#"{"cmd":"set_member_weekly","value":90}"#,
+        r#"{"cmd":"set_member_weekly","profile":"ghost","value":90}"#,
+        r#"{"cmd":"set_check_weekly","profile":"work","value":1}"#,
+        r#"{"cmd":"set_check_scoped","profile":"work"}"#,
+        r#"{"cmd":"set_check_scoped","value":true}"#,
+    ] {
+        let h = handles(&["work"]);
+        assert!(
+            dispatch(bad, &no_status(), &h).contains("\"ok\":false"),
+            "{bad}"
+        );
+        assert!(h.pending_config_ops.lock().unwrap().is_empty(), "{bad}");
+    }
+}

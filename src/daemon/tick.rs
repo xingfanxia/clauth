@@ -1400,6 +1400,12 @@ impl super::Daemon {
                     ConfigOp::SetLastResort(name, on) => {
                         fallback_config::set_last_resort(&mut cfg, &name, on)
                     }
+                    ConfigOp::SetMemberWeekly(name, value) => {
+                        fallback_config::set_member_weekly(&mut cfg, &name, value)
+                    }
+                    ConfigOp::SetUsageGate(name, scoped, on) => {
+                        fallback_config::set_usage_gate(&mut cfg, &name, scoped, on)
+                    }
                     ConfigOp::SetWrapOff(on) => fallback_config::set_wrap_off(&mut cfg, on),
                     ConfigOp::SetWeeklyThreshold(v) => {
                         fallback_config::set_weekly_threshold(&mut cfg, v)

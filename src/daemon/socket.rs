@@ -10,6 +10,9 @@
 //! → {"cmd":"fallback_move","profile":"work","dir":"up"}   ← {"ok":true}  (dir: up|down)
 //! → {"cmd":"set_threshold","profile":"work","value":90}  ← {"ok":true}  (0..=100)
 //! → {"cmd":"set_last_resort","profile":"work","value":true}  ← {"ok":true}
+//! → {"cmd":"set_member_weekly","profile":"work","value":90}  ← {"ok":true}  (null clears)
+//! → {"cmd":"set_check_weekly","profile":"work","value":false}  ← {"ok":true}
+//! → {"cmd":"set_check_scoped","profile":"work","value":false}  ← {"ok":true}
 //! → {"cmd":"set_wrap_off","value":true}       ← {"ok":true}
 //! → {"cmd":"set_weekly_threshold","value":98}  ← {"ok":true}  (50..=100, chain-global)
 //! → {"cmd":"rename","profile":"work","new_name":"work2"} ← {"ok":true} | {"ok":false,"error":"…"}
@@ -225,7 +228,7 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
             ok()
         }
         "fallback_add" | "fallback_remove" | "fallback_move" | "set_threshold"
-        | "set_last_resort" => {
+        | "set_last_resort" | "set_member_weekly" | "set_check_weekly" | "set_check_scoped" => {
             // Resolve + validate the profile up front so an unknown name errors on
             // the socket rather than silently no-op'ing in the drain.
             let Some(raw) = cmd.profile.as_deref() else {
@@ -249,6 +252,29 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
                     match cmd.value.as_ref().and_then(serde_json::Value::as_bool) {
                         Some(on) => ConfigOp::SetLastResort(name, on),
                         None => return err("set_last_resort requires a boolean value"),
+                    }
+                }
+                // Per-account weekly-line override: a number sets it, an
+                // explicit null (or absent value) clears back to the
+                // chain-wide default.
+                "set_member_weekly" => match cmd.value.as_ref() {
+                    None | Some(serde_json::Value::Null) => ConfigOp::SetMemberWeekly(name, None),
+                    Some(v) => match v.as_f64() {
+                        Some(v) if (0.0..=100.0).contains(&v) => {
+                            ConfigOp::SetMemberWeekly(name, Some(v))
+                        }
+                        _ => {
+                            return err(
+                                "set_member_weekly requires a numeric value within 0..=100, or null to clear",
+                            );
+                        }
+                    },
+                },
+                "set_check_weekly" | "set_check_scoped" => {
+                    let scoped = cmd.cmd == "set_check_scoped";
+                    match cmd.value.as_ref().and_then(serde_json::Value::as_bool) {
+                        Some(on) => ConfigOp::SetUsageGate(name, scoped, on),
+                        None => return err(&format!("{} requires a boolean value", cmd.cmd)),
                     }
                 }
                 _ => unreachable!("outer match limits these arms"),

@@ -17,6 +17,12 @@ pub(crate) enum ConfigOp {
     SetThreshold(String, f64),
     /// Set/clear the exclusive last-resort mark on a chain member's profile.
     SetLastResort(String, bool),
+    /// Set (`Some`) or clear (`None`) a member's per-account weekly-line
+    /// override (`weekly at`).
+    SetMemberWeekly(String, Option<f64>),
+    /// Flip a member's usage gate: `(name, scoped, on)` — scoped=false is the
+    /// `weekly gate` (`check_weekly`), scoped=true the `scoped gate`.
+    SetUsageGate(String, bool, bool),
     SetWrapOff(bool),
     /// Set the chain-wide weekly (7d) exhaustion line (percent).
     SetWeeklyThreshold(f64),
