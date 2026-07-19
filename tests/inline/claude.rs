@@ -259,13 +259,16 @@ fn classify_link_linked_to_even_when_target_missing() {
 // fires) and both BRANCHES (confirm overwrites/captures, cancel is a no-op) at
 // the home-derived seam the prompt actually drives, no TTY needed.
 
-#[cfg(unix)]
+// Not `#[cfg(unix)]`: the ungated session-token tests below use HomeSandbox on
+// every platform (it writes only a tempdir + files, no symlinks), so gating the
+// import broke the Windows test build.
 use crate::testutil::HomeSandbox;
 
 /// Seed an active profile `name` with stored credentials, then simulate CC
 /// re-logging into a different account: write a plain (non-symlink) live
 /// `~/.claude/.credentials.json` carrying `live`. Returns the assembled config.
-#[cfg(unix)]
+// Not `#[cfg(unix)]`: writes only plain files, and the ungated session-token
+// tests call it on Windows too.
 fn seed_relogin_scenario(
     name: &str,
     stored: ClaudeCredentials,
