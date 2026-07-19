@@ -1343,3 +1343,55 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   sse.rs hunk dropped from the pick (fork-only). 1114 tests green, clippy
   clean. NOTE: upstream mommy moved again (3 TUI/docs commits post-2497a36)
   — PRs #51/#53 may need another conflict check.
+
+## 2026-07-18 (SCW-2) — PR #55 reworked to per-account gates (maintainer review)
+
+- uwuclxdy on PR #55: wants per-account Fallback-tab toggles, not a global
+  preference — "weekly usage" / "scoped usage" checks switchable per member
+  ("users may still want to use that account with other models or exclude
+  only the maxxed out fable account from rotation"). Implemented on
+  `feat/scoped-weekly-walk` (3d312a1, after merging mommy 6a793d5):
+  `Profile::check_weekly` / `check_scoped` (default ON; config.toml keys,
+  absent = on), ChainMember mirrors, TUI rows `weekly gate` / `scoped gate`
+  (11-col labels; maintainer's wording lives in the state-flipping hints).
+  SEMANTICS CHANGE vs SCW-1: scoped-blocked (gate on) is now a HARD
+  rotation exclusion — the 4-tier preference stack collapsed back to
+  2 passes (clear+fresh → clear) with a stronger accept; `check_weekly`
+  off lifts the soft weekly line only (`weekly_line()` — the 100% hard cap
+  always blocks); scoped still never counts as full exhaustion (wrap-off /
+  soonest_resume / recovery premise stay aggregate-keyed); recovery still
+  relinks a model-blocked member as last pick. New `BlockedReason::
+  ScopedSpent` chip (◇, "7d fable 100% · other models ok"). 1152 tests
+  green, clippy clean. Replied on #55: defaults + hard-cap floor flagged
+  for veto; weekly-limit-per-account answered as "override with global
+  default, follow-up PR" (rotate-at pattern).
+- FORK NOTE: fork main still runs SCW-1 preference-stack semantics — the
+  SCW-2 gate rework is upstream-branch only until AX wants it adopted.
+
+## 2026-07-18 (CLA-SPLIT-2) — #53 follow-ups into the same PR + fork + ccsbar
+
+- PR #53 follow-ups implemented on `feat/session-token-split` (2022c4e,
+  after merging mommy) and cherry-picked to fork main (f55146f; conflicts:
+  fork's --new/--codex login flags + account_email row composed with the
+  new --setup-token/--yes + session row):
+  * `clauth login <p> --setup-token [--yes] [--model <id>]` — capture a
+    `claude setup-token` mint into session-token.json: echo-off rpassword
+    paste on a TTY, ONE stdin line when piped (the GUI/script path);
+    validate_setup_token (sk-ant- prefix, no interior whitespace, ≥40)
+    before any write; atomic 0600; expiresAt stamped now+365d (documented
+    lifetime — the mint carries no expiry); scopes recorded. Additive:
+    never touches the live slot (takes effect on next switch), usage pair/
+    env/chain/models survive; new name → blank profile; existing sidecar →
+    confirm or --yes; --setup-token excludes api/codex/--new at parse.
+  * Setup-tab `session` row: "static token · expires in ~Nd" (WARNING ≤30d,
+    DANGER + "re-mint: claude setup-token" when expired, "no recorded
+    expiry" for hand-rolled sidecars). session_token_expiry() reads only
+    the sidecar. Upstream branch 1143 green; fork 1294 green; clippy clean
+    both. Deployed: cargo install + daemon/proxy restarted.
+- ccsbar (01cbcee): context-menu "Install/Replace session token…" → inline
+  SecureField banner (validation mirrors clauth's; token piped to
+  `clauth login <p> --setup-token --yes` stdin — NEVER argv/ps/logs);
+  DetailCard shows the sidecar state under the account email (direct
+  sidecar read, CodexProxyMode idiom — daemon-down safe; only expiresAt
+  decoded). LoginMode.setupToken joins the single-login guard + flight
+  banner. 210+5 tests green; repackaged + redeployed to /Applications.
