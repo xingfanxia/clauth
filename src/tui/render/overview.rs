@@ -393,8 +393,8 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'st
     let block = section_box("fallback chain", false, false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    // No `Wrap`: the chain rows are tabular (they pad to `inner.width`, so they
-    // never wrap), and the empty-state prose is pre-wrapped into its own lines.
+    // No `Wrap`: an over-wide row truncates rather than folding onto a second
+    // line, and the empty-state prose is pre-wrapped into its own lines.
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
 }
 
@@ -404,6 +404,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // Switch-grade kick blocks feed the blocked-reason markers; read BEFORE the
     // Config lock (rank order: KickBlockState 230 < Config 400).
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
+    let narrow = super::panes::narrow(width as u16);
     let cfg = app.config();
     if cfg.state.fallback_chain.is_empty() {
         let mut lines = vec![Line::from(Span::styled(
@@ -412,8 +413,8 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         ))];
         lines.extend(
             wrap_words(
-                "fallback tab adds accounts that rotate automatically when a 5h \
-                 window crosses its threshold.",
+                "add accounts on the fallback tab and clauth switches between them \
+                 as each runs out.",
                 width,
             )
             .into_iter()
@@ -423,13 +424,37 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     }
 
     let chain = &cfg.state.fallback_chain;
+    // Narrow: tighter name clamp + a gauge sized from what's left, so a chain
+    // row fits a phone line instead of hard-wrapping its trailing figures.
     let name_w = chain
         .iter()
         .map(|n| n.chars().count())
         .max()
         .unwrap_or(8)
-        .clamp(6, 18);
+        .clamp(6, if narrow { 12 } else { 18 });
+    // Threshold digits vary across members (`95%` vs `100%`), so left-pad them to
+    // the widest so the `%` signs line up (cloudy-tui numeric-column alignment).
+    // It also makes every row's content the same width, which is what lets the
+    // trailer column below sit flush against the content.
+    let thr_w = chain
+        .iter()
+        .filter_map(|n| cfg.find(n))
+        .map(|p| format!("{:.0}", threshold_for(p)).len())
+        .max()
+        .unwrap_or(3);
     let last = chain.len() - 1;
+    let gauge_w = if narrow {
+        // Exact-fit budget against chain_row's spans: ` ╭ `(3) + `N `(digits+1)
+        // + name(name_w+2) + figure `  100`(5) + ` / 100%`(7, 3-digit worst).
+        // Trailers (hint/marker) only render when the base leaves room, so a
+        // narrow line keeps its figures on one row instead of hard-wrapping.
+        let idx_w = (last + 1).to_string().chars().count() + 1;
+        width
+            .saturating_sub(3 + idx_w + name_w + 2 + 5 + 7)
+            .clamp(4, GAUGE_W)
+    } else {
+        GAUGE_W
+    };
 
     // Project the active profile's next switch once, up front: a `To(target)`
     // renders inline on the target member's row (right side); `Off` has no
@@ -440,19 +465,31 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         _ => None,
     };
 
-    let mut lines = Vec::new();
-    for (i, name) in chain.iter().enumerate() {
-        let reason = cfg
-            .find(name)
-            .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(name.as_str()).copied()));
-        let switch_eta = switch_to
-            .as_ref()
-            .filter(|(target, _)| target.as_str() == name.as_str())
-            .map(|(_, secs)| *secs);
-        lines.push(chain_row(
-            &cfg, name, i, last, name_w, width, reason, switch_eta,
-        ));
-    }
+    // Two passes: build every row's content first so the trailers can share one
+    // column just past the widest row, rather than each one flying out to the
+    // panel's right edge (which strands the markers far from the data they mark).
+    let rows: Vec<ChainRow> = chain
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let reason = cfg
+                .find(name)
+                .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(name.as_str()).copied()));
+            let switch_eta = switch_to
+                .as_ref()
+                .filter(|(target, _)| target.as_str() == name.as_str())
+                .map(|(_, secs)| *secs);
+            chain_row(
+                &cfg, name, i, last, name_w, gauge_w, thr_w, reason, switch_eta,
+            )
+        })
+        .collect();
+    let trailer_col = rows.iter().map(ChainRow::base_width).max().unwrap_or(0) + TRAILER_GAP;
+
+    let mut lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .map(|row| row.into_line(trailer_col, width))
+        .collect();
 
     // All-spent caption: wrap-off `stop` vs wrap-mode `stay`.
     let caption = if cfg.state.switch_off_when_spent {
@@ -469,7 +506,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             Span::styled("[ ", theme::dim()),
             Span::styled("stay", theme::dim().bold()),
             Span::styled(" ]", theme::dim()),
-            Span::styled(" on last when all spent", theme::faint()),
+            Span::styled(" on the active account when all spent", theme::faint()),
         ]
     };
     lines.push(Line::from(caption));
@@ -479,7 +516,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!("stops all in ~{}", humanize_duration(*secs)),
+                format!("signs everything out in ~{}", humanize_duration(*secs)),
                 theme::faint(),
             ),
         ]));
@@ -526,6 +563,54 @@ fn projected_switch(app: &App, cfg: &AppConfig) -> Option<(SwitchAction, i64)> {
     next_target(cfg, active_rate).map(|action| (action, eta_secs))
 }
 
+/// Cells between the widest chain row's content and the shared trailer column.
+/// Matches the row's own internal 2-space gaps, so a trailer reads as part of
+/// its row instead of a right-edge rail.
+const TRAILER_GAP: usize = 2;
+
+/// A chain row before its trailer lands. Split from the assembled `Line` so the
+/// panel can measure every row's content and start every trailer at one column.
+/// Only ONE row can carry the `↩ ~eta` hint (the single projected-switch
+/// target), so at most that row's marker sits further right than its siblings'.
+struct ChainRow {
+    base: Vec<Span<'static>>,
+    hint: Option<Span<'static>>,
+    marker: Option<Span<'static>>,
+}
+
+impl ChainRow {
+    fn base_width(&self) -> usize {
+        self.base.iter().map(|s| s.width()).sum()
+    }
+
+    /// Pad the content out to `col`, then append whichever trailers fit inside
+    /// `width` (the panel's inner width). A projected-switch target carries the
+    /// `↩ ~eta` hint; a blocked member carries its 1-cell reason marker. BOTH can
+    /// apply to one row: `next_target`'s headroom walk only prefers a fresh
+    /// member and falls through to a stale-but-unexhausted one (`is_exhausted`
+    /// ignores `fetch_status`), so a `To` target can also be `Stale`. Render both
+    /// then (hint, then marker outermost) instead of dropping the imminent-switch
+    /// projection. Too narrow for the pair → keep the marker (the persistent
+    /// signal) and drop the hint; too narrow for even that → drop both.
+    fn into_line(self, col: usize, width: usize) -> Line<'static> {
+        let fits = |w: usize| col + w <= width;
+        let trailer: Vec<Span<'static>> = match (self.hint, self.marker) {
+            (Some(h), Some(m)) if fits(h.width() + 1 + m.width()) => vec![h, Span::raw(" "), m],
+            (Some(_), Some(m)) if fits(m.width()) => vec![m],
+            (Some(h), None) if fits(h.width()) => vec![h],
+            (None, Some(m)) if fits(m.width()) => vec![m],
+            _ => Vec::new(),
+        };
+        let mut spans = self.base;
+        if !trailer.is_empty() {
+            let used: usize = spans.iter().map(|s| s.width()).sum();
+            spans.push(Span::raw(" ".repeat(col.saturating_sub(used))));
+            spans.extend(trailer);
+        }
+        Line::from(spans)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn chain_row(
     cfg: &AppConfig,
@@ -533,10 +618,11 @@ fn chain_row(
     index: usize,
     last: usize,
     name_w: usize,
-    width: usize,
+    gauge_w: usize,
+    thr_w: usize,
     reason: Option<BlockedReason>,
     switch_eta: Option<i64>,
-) -> Line<'static> {
+) -> ChainRow {
     let active = cfg.is_active(name);
     let rail = if index == 0 && last == 0 {
         "╶"
@@ -570,7 +656,7 @@ fn chain_row(
                 .as_ref()
                 .and_then(|u| u.five_hour.as_ref())
                 .map(|w| w.utilization);
-            spans.extend(gauge_spans(pct, threshold));
+            spans.extend(gauge_spans(pct, threshold, gauge_w));
             let (figure, figure_style) = match pct {
                 Some(v) => (
                     format!("  {v:>3.0}"),
@@ -579,43 +665,24 @@ fn chain_row(
                 None => ("    —".to_string(), theme::faint()),
             };
             spans.push(Span::styled(figure, figure_style));
-            spans.push(Span::styled(format!(" / {threshold:.0}%"), theme::faint()));
+            spans.push(Span::styled(
+                format!(" / {threshold:>thr_w$.0}%"),
+                theme::faint(),
+            ));
         }
     }
 
-    // Right-aligned trailer. A projected-switch target carries the `↩ ~eta`
-    // hint; a blocked member carries its 1-cell reason marker. BOTH can apply to
-    // one row: `next_target`'s headroom walk only prefers a fresh member and
-    // falls through to a stale-but-unexhausted one (`is_exhausted` ignores
-    // `fetch_status`), so a `To` target can also be `Stale`. Render both then
-    // (hint, then marker outermost) instead of dropping the imminent-switch
-    // projection. Too narrow for the pair → keep the marker (the persistent
-    // signal) and drop the hint; too narrow for even that → drop both. Each
-    // guard's strict `<` leaves >= 1 pad cell so the group never abuts the
-    // figure.
-    let base_used: usize = spans.iter().map(|s| s.width()).sum();
-    let hint = switch_eta
-        .map(|secs| Span::styled(format!("↩ ~{}", humanize_duration(secs)), theme::faint()));
-    let marker = reason.as_ref().map(reason_marker);
-    let trailer: Vec<Span<'static>> = match (hint, marker) {
-        (Some(h), Some(m)) if base_used + h.width() + 1 + m.width() < width => {
-            vec![h, Span::raw(" "), m]
-        }
-        (Some(_), Some(m)) if base_used + m.width() < width => vec![m],
-        (Some(h), None) if base_used + h.width() < width => vec![h],
-        (None, Some(m)) if base_used + m.width() < width => vec![m],
-        _ => Vec::new(),
-    };
-    if !trailer.is_empty() {
-        let tw: usize = trailer.iter().map(|s| s.width()).sum();
-        spans.push(Span::raw(" ".repeat(width.saturating_sub(base_used + tw))));
-        spans.extend(trailer);
+    ChainRow {
+        base: spans,
+        hint: switch_eta
+            .map(|secs| Span::styled(format!("↩ ~{}", humanize_duration(secs)), theme::faint())),
+        marker: reason.as_ref().map(reason_marker),
     }
-    Line::from(spans)
 }
 
-/// `GAUGE_W`-cell bar relative to the member's threshold (full = rotate off).
-fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
+/// `gauge_w`-cell bar relative to the member's threshold (full = rotate off).
+/// `GAUGE_W` on desktop; narrow rows pass what their line has left.
+fn gauge_spans(pct: Option<f64>, threshold: f64, gauge_w: usize) -> Vec<Span<'static>> {
     let fill = pct
         .map(|v| {
             let frac = if threshold > 0.0 {
@@ -623,15 +690,15 @@ fn gauge_spans(pct: Option<f64>, threshold: f64) -> Vec<Span<'static>> {
             } else {
                 1.0
             };
-            (frac * GAUGE_W as f64).round() as usize
+            (frac * gauge_w as f64).round() as usize
         })
         .unwrap_or(0)
-        .min(GAUGE_W);
+        .min(gauge_w);
     let fill_color = pct
         .map(theme::util_color)
         .unwrap_or(theme::text_faint_color());
 
-    (0..GAUGE_W)
+    (0..gauge_w)
         .map(|i| {
             if i < fill {
                 Span::styled("▰", Style::default().fg(fill_color))

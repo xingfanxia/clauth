@@ -552,6 +552,219 @@ fn status_selected_row_tint_spans_both_lines() {
     );
 }
 
+// ── Narrow (phone-width) mode ────────────────────────────────────────────────
+// A Moshi-class terminal is ~45 columns. These tests pin the two halves of the
+// narrow contract: information survives at 45 cols (no truncation loss), and
+// the narrow paths are width-gated (desktop renders keep their side-by-side
+// shape). `╮╭` is the top-row junction two side-by-side boxes produce.
+
+/// A loaded app for the narrow sweeps: profiles + chain + incidents + tokens.
+fn narrow_app() -> App {
+    use crate::tokens::{ModelTokens, TokenStats};
+
+    let profiles = vec![
+        oauth("uwuclxdy", 42.0, 18.0, true),
+        oauth("work-account", 12.0, 3.0, false),
+    ];
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: names,
+            fallback_chain: vec!["uwuclxdy".into(), "work-account".into()],
+            ..AppState::default()
+        },
+        profiles,
+    };
+    let mut app = App::new(config);
+    app.status.incidents = demo_incidents();
+    app.token_stats = Some(TokenStats {
+        models: vec![
+            ModelTokens {
+                model: "claude-opus-4-8".to_string(),
+                input: 10_000_000,
+                output: 800_000,
+                ..Default::default()
+            },
+            ModelTokens {
+                model: "claude-sonnet-5".to_string(),
+                input: 4_000_000,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    app
+}
+
+#[test]
+fn narrow_master_detail_stacks_wide_stays_side_by_side() {
+    let mut app = narrow_app();
+    for tab in [
+        Tab::Usage,
+        Tab::Setup,
+        Tab::Fallback,
+        Tab::Status,
+        Tab::Plugin,
+        Tab::Tokens,
+    ] {
+        app.tab = tab;
+        let narrow = dump(&app, 45, 38);
+        assert!(
+            !narrow.contains("╮╭"),
+            "{tab:?} still renders side-by-side boxes at 45 cols:\n{narrow}"
+        );
+        let wide = dump(&app, 100, 30);
+        assert!(
+            wide.contains("╮╭"),
+            "{tab:?} lost its desktop side-by-side layout at 100 cols:\n{wide}"
+        );
+    }
+}
+
+#[test]
+fn narrow_tokens_dashboard_keeps_card_text_whole() {
+    let mut app = narrow_app();
+    app.tab = Tab::Tokens;
+    let out = dump(&app, 45, 44);
+    for needle in [
+        "idle so far today",
+        "cache hit",
+        "COMPOSITION",
+        "cache read",
+    ] {
+        assert!(
+            out.contains(needle),
+            "`{needle}` truncated away at 45 cols:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
+    let mut app = narrow_app();
+    app.tab = Tab::Overview;
+    let out = dump(&app, 45, 38);
+    let row = out
+        .lines()
+        .find(|l| l.contains("1 uwuclxdy"))
+        .unwrap_or_else(|| panic!("chain row missing:\n{out}"));
+    assert!(
+        row.contains("42") && row.contains("/ 80%"),
+        "chain figures wrapped off the row at 45 cols:\n{out}"
+    );
+
+    // Wide keeps the full 12-cell gauge; narrow shrinks it instead of wrapping.
+    let gauge_cells = |line: &str| line.chars().filter(|c| *c == '▰' || *c == '▱').count();
+    assert_eq!(
+        gauge_cells(row),
+        10,
+        "narrow gauge sized from leftover width"
+    );
+    let wide = dump(&app, 90, 24);
+    let wide_row = wide
+        .lines()
+        .find(|l| l.contains("1 uwuclxdy"))
+        .unwrap_or_else(|| panic!("wide chain row missing:\n{wide}"));
+    assert_eq!(gauge_cells(wide_row), 12, "desktop gauge untouched");
+
+    // The 3-digit worst case (a 100% last-resort member) is exactly the row
+    // the old figure(4) budget overflowed by one column.
+    let mut maxed = narrow_app();
+    {
+        let mut cfg = maxed.config();
+        for p in cfg.profiles.iter_mut() {
+            p.fallback_threshold = Some(100.0);
+        }
+    }
+    maxed.tab = Tab::Overview;
+    let out = dump(&maxed, 45, 38);
+    let row = out
+        .lines()
+        .find(|l| l.contains("1 uwuclxdy"))
+        .unwrap_or_else(|| panic!("100%-threshold chain row missing:\n{out}"));
+    assert!(
+        row.contains("/ 100%"),
+        "3-digit threshold wrapped off the row at 45 cols:\n{out}"
+    );
+}
+
+#[test]
+fn narrow_footer_degrades_to_essential_hints() {
+    let mut app = narrow_app();
+    app.tab = Tab::Usage;
+    let out = dump(&app, 45, 38);
+    for needle in ["←→ tabs", "? help", "q quit"] {
+        assert!(
+            out.contains(needle),
+            "essential hint `{needle}` missing at 45 cols:\n{out}"
+        );
+    }
+    assert!(
+        !out.contains("refresh account"),
+        "non-essential hint should be dropped at 45 cols:\n{out}"
+    );
+    let wide = dump(&app, 120, 30);
+    assert!(
+        wide.contains("refresh account"),
+        "desktop keeps the full hint set:\n{wide}"
+    );
+}
+
+#[test]
+fn narrow_header_hides_the_gauge_without_a_dangling_separator() {
+    let mut app = narrow_app();
+    app.tab = Tab::Usage;
+    let narrow = dump(&app, 45, 38);
+    let row = narrow
+        .lines()
+        .find(|l| l.contains("accounts"))
+        .unwrap_or_else(|| panic!("header count row missing:\n{narrow}"));
+    assert!(
+        !row.contains('·'),
+        "hidden gauge left a dangling separator:\n{row}"
+    );
+    let wide = dump(&app, 120, 30);
+    let wide_row = wide
+        .lines()
+        .find(|l| l.contains("accounts"))
+        .unwrap_or_else(|| panic!("wide header count row missing:\n{wide}"));
+    assert!(
+        wide_row.contains('·'),
+        "desktop separator + gauge unchanged:\n{wide_row}"
+    );
+}
+
+#[test]
+fn narrow_status_detail_duration_drops_to_its_own_line() {
+    let mut app = narrow_app();
+    app.tab = Tab::Status;
+    let out = dump(&app, 45, 38);
+    // The duration must sit on its OWN line (bordered, otherwise empty), not
+    // glued to the age at the end of the pill row.
+    assert!(
+        out.lines().any(|l| l.trim_matches([' ', '│']) == "ongoing"),
+        "duration is not on its own line at 45 cols:\n{out}"
+    );
+}
+
+#[test]
+fn narrow_modal_body_wraps_instead_of_clipping() {
+    use crate::tui::app::{ConfirmAction, ConfirmState, Modal};
+    let mut app = narrow_app();
+    app.modals.push(Modal::Confirm(ConfirmState {
+        message: "switch every profile to a freshly rotated credential set immediately".into(),
+        detail: None,
+        choice: false,
+        on_confirm: ConfirmAction::RotateAll,
+    }));
+    let out = dump(&app, 45, 38);
+    assert!(
+        out.contains("immediately"),
+        "modal body clipped its tail at 45 cols:\n{out}"
+    );
+}
+
 #[test]
 fn empty_state_renders() {
     let config = AppConfig {
@@ -582,7 +795,7 @@ fn banner_renders() {
     let mut app = App::new(config);
     app.banner = Some(Banner {
         severity: BannerSeverity::Danger,
-        message: "all accounts spent · switch to a profile to resume".to_string(),
+        message: "all accounts spent · switch to an account to resume".to_string(),
     });
 
     let screen = dump(&app, 90, 20);
@@ -725,4 +938,182 @@ fn fallback_edit_caret_follows_the_blocked_reason_pill() {
         unblocked + 2,
         "the blocked-reason pill (2 rows) shifts the edit caret down (unblocked={unblocked}, blocked={blocked})"
     );
+}
+
+/// The Config and Setup panes rebuild their whole row list every frame into a
+/// fixed-height `Paragraph`. Before they scrolled, anything past the viewport
+/// vanished with no scrollbar and no clue — the last settings row and its hint
+/// were simply absent at 24 rows. Both panes must keep the FOCUSED row (and its
+/// tooltip) on screen at the smallest size the app renders at.
+#[test]
+fn form_panes_keep_the_focused_row_on_screen_when_they_overflow() {
+    use crate::tui::app::{ConfigFocus, GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+
+    // Cursor on the last row: it and its two-line hint sit past an 18-line
+    // viewport, so only a scroll can reveal them.
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS.len() - 1;
+    let bottom = dump(&app, 90, 24);
+    assert!(
+        bottom.contains("extra usage spent"),
+        "the focused last row must not clip:\n{bottom}"
+    );
+    assert!(
+        bottom.contains("extra usage runs out"),
+        "its hint tooltip must not clip either:\n{bottom}"
+    );
+    assert!(
+        bottom.contains('\u{2503}'),
+        "an overflowing pane shows its scrollbar thumb:\n{bottom}"
+    );
+
+    // Cursor back near the top with a hinted row (so the pane still overflows):
+    // the offset really tracks the cursor both ways — the first band header is
+    // back AND the bottom row has gone off screen.
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::DivergenceDefault)
+        .unwrap();
+    let top = dump(&app, 90, 24);
+    assert!(
+        top.contains("APPEARANCE"),
+        "the first band header is back on screen at the top:\n{top}"
+    );
+    assert!(
+        !top.contains("extra usage spent"),
+        "the offset really moved: the bottom row is off screen now:\n{top}"
+    );
+
+    // Setup's detail pane grows with a profile's env entries, so it overflows
+    // the same way — its last row (`delete account`) must stay reachable.
+    let mut p = oauth("uwuclxdy", 10.0, 10.0, false);
+    for i in 0..8 {
+        p.env.insert(format!("CUSTOM_VAR_{i}"), "value".into());
+    }
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    });
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    app.config_action_cursor = usize::MAX; // clamped to the last row by `draw_settings`
+    let setup = dump(&app, 90, 24);
+    assert!(
+        setup.contains("delete account"),
+        "Setup's focused last row must not clip:\n{setup}"
+    );
+}
+
+/// Each concern band is separated from the previous one by a blank row, so the
+/// groups read as sections instead of one 12-row wall. The FIRST band opens the
+/// pane, so it must not carry a leading spacer.
+#[test]
+fn config_bands_are_separated_by_one_blank_row() {
+    use crate::tui::app::Tab;
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = 0;
+    let screen = dump(&app, 90, 50);
+    let lines: Vec<&str> = screen.lines().collect();
+    let header = |label: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(label))
+            .unwrap_or_else(|| panic!("{label} renders:\n{screen}"))
+    };
+
+    for label in ["SCHEDULER", "AUTO-SWITCH", "EXTRA USAGE"] {
+        let above = lines[header(label) - 1];
+        assert!(
+            !above.chars().any(char::is_alphanumeric),
+            "{label} opens on a blank spacer row, got {above:?}:\n{screen}"
+        );
+    }
+    let above_first = lines[header("APPEARANCE") - 1];
+    assert!(
+        above_first.contains("SETTINGS"),
+        "the first band sits right under the panel title, no leading spacer: \
+         {above_first:?}\n{screen}"
+    );
+}
+
+/// A row's help tooltip wraps to the pane width, so a narrow pane turns a
+/// one-line hint into four. Scrolling to the focused ROW is not enough — the
+/// scroll has to clear the whole focused BLOCK, or the hint clips off the bottom
+/// while the row it explains sits comfortably on screen.
+#[test]
+fn a_wrapped_hint_scrolls_into_view_with_its_row() {
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            // `allow extra usage` = pay-as-you-go carries the long ON hint, so its
+            // wrapped block overflows a narrow pane and discriminates block-scroll.
+            spend_budget_switching: true,
+            ..AppState::default()
+        },
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    // `allow extra usage` carries a long hint and sits mid-pane, so the tail of
+    // its wrapped block lands past the viewport without pulling the whole pane
+    // to the end the way the last row would.
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SpendBudget)
+        .unwrap();
+
+    // 26 cols is the widest terminal where this hint still wraps to a tail line
+    // that lands past the viewport, so the assertion below keeps discriminating
+    // block-scroll from row-scroll. `scroll_offset_keeps_the_whole_focused_block
+    // _on_screen` pins the same rule off real copy.
+    let screen = dump(&app, 26, 24);
+    assert!(
+        screen.contains("allow extra"),
+        "the focused row renders:\n{screen}"
+    );
+    assert!(
+        !screen.contains("APPEARANCE"),
+        "the pane really scrolled: the first band is off the top:\n{screen}"
+    );
+    // The hint wraps to four lines ending in `its max spend`. That last line is
+    // present only if the scroll cleared the block's tail, not just its row.
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.trim_matches(['│', '┊', '┃', ' ']) == "its max spend"),
+        "the hint's final wrapped line must not clip:\n{screen}"
+    );
+}
+
+/// The block-vs-row scroll rule, pinned off the pure function instead of live
+/// hint copy: the screen test above only discriminates while some real hint
+/// happens to wrap past the viewport, so rewording one silently retires it.
+#[test]
+fn scroll_offset_keeps_the_whole_focused_block_on_screen() {
+    use super::panes::scroll_offset;
+
+    // Block 18..22 in a 20-row viewport. Scrolling to the ROW alone yields 1
+    // (18 + 3 pad - 20) and clips the block's tail at 21.
+    assert_eq!(scroll_offset(30, 20, (18, 22)), 5);
+    // A block taller than the viewport caps at its first line, so the row it
+    // explains survives even though its hint cannot.
+    assert_eq!(scroll_offset(40, 10, (5, 30)), 5);
+    // Content that fits never scrolls, whatever the focus.
+    assert_eq!(scroll_offset(12, 20, (8, 11)), 0);
+    // A block already on screen without scrolling stays put.
+    assert_eq!(scroll_offset(30, 20, (2, 5)), 0);
 }

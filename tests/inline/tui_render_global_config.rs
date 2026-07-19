@@ -4,6 +4,7 @@
 //! an on/off boolean renders as a toggle, not a 2-option cycle.
 
 use super::*;
+use ratatui::style::Modifier;
 
 fn line_text(line: &Line<'static>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -82,7 +83,7 @@ fn longest_key_aligns_with_shortest() {
     let theme = row("theme", &[("full", true), ("compatible", false)], false);
     let widest = row(
         "extra usage spent",
-        &[("stay on last", true), ("switch off all", false)],
+        &[("stay on active", true), ("switch off all", false)],
         false,
     );
     assert_eq!(value_col("theme", &theme), 2 + KEY_W + KEY_GUTTER);
@@ -258,16 +259,91 @@ fn money_spent_dims_when_spend_budget_is_off() {
 }
 
 #[test]
-fn money_spent_hint_explains_inertness_when_spend_off() {
-    let hint = row_hint(GlobalConfigRow::SwitchOffWhenBudgetSpent, None, toggles())
-        .expect("an inert money-spent row still carries its reason");
-    assert!(hint.contains("inert until extra usage"), "{hint}");
+fn money_spent_hint_states_the_halt_not_inertness() {
+    // The dim row already signals inertness, so the hint drops the gate clause
+    // and states what the setting does. `toggles()` has switch-off-when-spent on.
+    let hint = row_hint(
+        GlobalConfigRow::SwitchOffWhenBudgetSpent,
+        None,
+        toggles(),
+        90_000,
+        98.0,
+        98.0,
+        60_000,
+    )
+    .expect("the money-spent row carries a behavior hint");
+    assert!(!hint.contains("inert"), "gate clause dropped: {hint}");
+    assert!(hint.contains("switch everything off"), "{hint}");
+}
+
+/// The faint `default: X` reminder rides a value row only while it is off its
+/// default — the operator sees the default exactly when they've moved off it.
+#[test]
+fn a_non_default_value_shows_a_faint_default_reminder() {
+    let off = line_text(&detail_row(
+        GlobalConfigRow::RefreshInterval,
+        false,
+        toggles(),
+        30_000,
+        98.0,
+        98.0,
+        60_000,
+        None,
+        None,
+    ));
+    assert!(
+        off.contains("default: 90s"),
+        "off-default carries it: {off}"
+    );
+    let default = line_text(&detail_row(
+        GlobalConfigRow::RefreshInterval,
+        false,
+        toggles(),
+        90_000,
+        98.0,
+        98.0,
+        60_000,
+        None,
+        None,
+    ));
+    assert!(
+        !default.contains("default:"),
+        "the default value carries no reminder: {default}"
+    );
+}
+
+/// Value rows fold the live value into their hint, so cycling a row re-explains
+/// what it now does with the real number.
+#[test]
+fn value_rows_interpolate_the_live_value_into_their_hint() {
+    let refresh = row_hint(
+        GlobalConfigRow::RefreshInterval,
+        None,
+        toggles(),
+        30_000,
+        98.0,
+        98.0,
+        60_000,
+    )
+    .expect("refresh row has a hint");
+    assert!(refresh.contains("every 30s"), "{refresh}");
+    let weekly = row_hint(
+        GlobalConfigRow::WeeklyThreshold,
+        None,
+        toggles(),
+        90_000,
+        95.0,
+        98.0,
+        60_000,
+    )
+    .expect("weekly row has a hint");
+    assert!(weekly.contains("95%"), "{weekly}");
 }
 
 // ── burn floor / horizon dim while inert (burn-aware off) ─────────────────────
 
 /// Both burn-aware tunables gate a projection that never runs under static
-/// rotate mode, so they render as cloudy-tui disabled rows (whole content faint)
+/// switch mode, so they render as cloudy-tui disabled rows (whole content faint)
 /// while burn-aware is off, and become live cycles once it is on.
 #[test]
 fn burn_tunables_dim_when_burn_aware_is_off() {
@@ -292,4 +368,105 @@ fn burn_tunables_dim_when_burn_aware_is_off() {
             "{r:?} burn-aware on: live + focused brackets the active preset: {live}"
         );
     }
+}
+
+// ── preemptive rotation dims where it can't fire (off macOS) ──────────────────
+
+/// Preemptive rotation only fires while the macOS Keychain mirror is live
+/// (`scheduler::keychain_live`), so off macOS the `rotation` row renders as a
+/// cloudy-tui disabled row and its hint names the platform reason — it can't do
+/// anything there.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn rotation_dims_off_macos() {
+    let dimmed = detail_row(
+        GlobalConfigRow::PreemptiveRotation,
+        false,
+        toggles(),
+        60_000,
+        95.0,
+        98.0,
+        60_000,
+        None,
+        None,
+    );
+    assert!(
+        dimmed
+            .spans
+            .iter()
+            .all(|s| s.content.trim().is_empty() || s.style.fg == theme::faint().fg),
+        "rotation must render fully faint off macOS: {:?}",
+        dimmed.spans,
+    );
+    let hint = row_hint(
+        GlobalConfigRow::PreemptiveRotation,
+        None,
+        toggles(),
+        90_000,
+        98.0,
+        98.0,
+        60_000,
+    )
+    .expect("the dimmed rotation row carries a reason");
+    assert!(hint.contains("macos"), "names the platform reason: {hint}");
+}
+
+// ── concern bands + their eyebrow headers ────────────────────────────────────
+
+/// The renderer opens a band the first time it sees a new one, so a band whose
+/// rows are split by an unrelated row would print its header twice and read as
+/// two sections. Pins the contiguity `GLOBAL_CONFIG_ROWS` relies on.
+#[test]
+fn config_bands_stay_contiguous() {
+    let mut seen: Vec<&str> = Vec::new();
+    for row in GLOBAL_CONFIG_ROWS {
+        if seen.last() != Some(&row.band()) {
+            assert!(
+                !seen.contains(&row.band()),
+                "band {:?} reopens after another band: {seen:?}",
+                row.band(),
+            );
+            seen.push(row.band());
+        }
+    }
+    assert_eq!(
+        seen,
+        ["appearance", "scheduler", "auto-switch", "extra usage"],
+        "the band order is the display order",
+    );
+}
+
+/// The header is a fixed `TEXT_DIM + bold` eyebrow whatever the cursor does; the
+/// underline is the only thing focus moves. Rendering the focused band brighter,
+/// or underlining a band with no row focused, is the bug this pins.
+#[test]
+fn band_header_underlines_only_the_focused_band() {
+    let blurred = band_header("auto-switch", false);
+    let focused = band_header("auto-switch", true);
+    for line in [&blurred, &focused] {
+        assert_eq!(line_text(line), "AUTO-SWITCH", "eyebrows render uppercase");
+        assert_eq!(
+            line.spans[0].style.fg,
+            theme::label().fg,
+            "the tier never changes with focus"
+        );
+        assert!(
+            line.spans[0].style.add_modifier.contains(Modifier::BOLD),
+            "the eyebrow bold is a fixed label treatment, not a focus cue"
+        );
+    }
+    assert!(
+        !blurred.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "no underline while focus is elsewhere"
+    );
+    assert!(
+        focused.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "the underline is the active-section cue"
+    );
 }

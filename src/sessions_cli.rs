@@ -76,11 +76,11 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
     // Resume must land in the recorded workspace, else `--resume` would run in
     // the wrong dir (or fail to find the transcript). Refuse rather than spawn.
     if workspace_str.is_empty() {
-        anyhow::bail!("session '{id}' has no recorded workspace; cannot resume");
+        anyhow::bail!("can't resume '{id}': no workspace recorded for it");
     }
     let workspace = Path::new(&workspace_str);
     if !workspace.is_dir() {
-        anyhow::bail!("session '{id}' workspace '{workspace_str}' no longer exists; cannot resume");
+        anyhow::bail!("can't resume '{id}': workspace '{workspace_str}' no longer exists");
     }
 
     let active = config.state.active_profile.as_deref().unwrap_or_default();
@@ -162,7 +162,7 @@ fn resolve_profile_name(config: &AppConfig, chosen: &str) -> Result<String> {
 /// [`resume_profile_choice`] returns `should_prompt`.
 fn prompt_profile(config: &AppConfig, default: &str) -> Result<String> {
     use std::io::Write as _;
-    println!("Resume under which profile?");
+    println!("resume under which account?");
     for name in config.names() {
         let marker = if name == default { "  (default)" } else { "" };
         println!("  {name}{marker}");

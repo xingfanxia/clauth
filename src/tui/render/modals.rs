@@ -93,11 +93,23 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 /// Modal sized to content: snaps to widest line/title, exact line count.
 /// Chrome = rounded border (1) + `Padding::new(2,2,1,1)` = 6 cols, 4 rows.
+///
+/// A line wider than the modal's inner width (only possible on a terminal
+/// too narrow for the content) is pre-split into inner-width rows by
+/// [`chunk_line`], so the height is exact by construction — ratatui's own
+/// word-wrap may use MORE rows than any cheap estimate and silently clip the
+/// tail. On any terminal wide enough for the content nothing splits and the
+/// modal renders exactly as before.
 fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let w = (content_w + 6)
         .max(title.chars().count() as u16 + 4)
         .min(area.width.saturating_sub(4));
+    let inner_w = (w.saturating_sub(6) as usize).max(1);
+    let lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .flat_map(|l| chunk_line(l, inner_w))
+        .collect();
     let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
 
     let rect = centered(area, w, h);
@@ -106,6 +118,56 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+}
+
+/// Split one styled line into `w`-column rows by character, preserving span
+/// styles and the line's alignment/style. A line that already fits returns
+/// itself (owned) untouched. Modal copy is ASCII, so chars ≈ display cells.
+fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
+    let own = |l: &Line<'_>| -> Line<'static> {
+        let mut out = Line::from(
+            l.spans
+                .iter()
+                .map(|s| Span::styled(s.content.to_string(), s.style))
+                .collect::<Vec<_>>(),
+        )
+        .style(l.style);
+        out.alignment = l.alignment;
+        out
+    };
+    if w == 0 || line.width() <= w {
+        return vec![own(&line)];
+    }
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut flush = |cur: &mut Vec<Span<'static>>| {
+        let mut row = Line::from(std::mem::take(cur)).style(line.style);
+        row.alignment = line.alignment;
+        rows.push(row);
+    };
+    for span in &line.spans {
+        let mut buf = String::new();
+        for ch in span.content.chars() {
+            if used == w {
+                if !buf.is_empty() {
+                    cur.push(Span::styled(std::mem::take(&mut buf), span.style));
+                }
+                flush(&mut cur);
+                used = 0;
+            }
+            buf.push(ch);
+            used += 1;
+        }
+        if !buf.is_empty() {
+            cur.push(Span::styled(buf, span.style));
+        }
+    }
+    if !cur.is_empty() {
+        flush(&mut cur);
+    }
+    rows
 }
 
 /// Rounded `ACCENT_2` border, uppercase italic dim title, base `BG` fill.
@@ -128,19 +190,9 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
 
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let title = match state.on_confirm {
-        ConfirmAction::CaptureConflict(..) => "CONFIRM",
-        ConfirmAction::CaptureOverwrite(..) => "CONFIRM",
-        ConfirmAction::AdoptDivergence(..) => "CONFIRM",
-        ConfirmAction::Switch(_) => "CONFIRM",
-        ConfirmAction::DiscardDivergence(_) => "CONFIRM",
-        ConfirmAction::RotateAll => "CONFIRM",
-        ConfirmAction::RotateOne(_) => "CONFIRM",
-        ConfirmAction::WireMcpServers => "CONFIRM",
-        ConfirmAction::RelinkCredentials(_) => "CONFIRM",
-        ConfirmAction::BlankCredentials(_) => "CONFIRM",
-        ConfirmAction::RestartLogin(..) => "CONFIRM",
-        ConfirmAction::DeleteLiveSession(_) => "CONFIRM",
+        // The one non-confirm modal: an in-use account can't be acted on.
         ConfirmAction::Acknowledge => "IN USE",
+        _ => "CONFIRM",
     };
 
     // Destructive/global ops carry a DANGER cue on their confirm button.
@@ -256,7 +308,7 @@ fn divergence_action_text(action: &DivergenceAction, active: &str) -> String {
             format!("overwrite '{active}' with this login")
         }
         DivergenceAction::Choice(DivergenceChoice::NewProfile) => {
-            "save this login to another profile…".to_string()
+            "save this login to another account…".to_string()
         }
         DivergenceAction::Choice(DivergenceChoice::Discard) => {
             format!("discard this login and restore '{active}'")
@@ -286,7 +338,7 @@ fn draw_divergence_target(frame: &mut Frame<'_>, area: Rect, form: &DivergenceTa
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled("where to save the login?", theme::dim())),
         Line::from(""),
-        option_line(cursor == 0, "+ new profile".to_string()),
+        option_line(cursor == 0, "+ new account".to_string()),
     ];
     for (i, name) in form.targets.iter().enumerate() {
         lines.push(option_line(cursor == i + 1, format!("overwrite '{name}'")));
@@ -359,7 +411,7 @@ fn env_collision_option_text(
 fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
     let lines = vec![
         Line::from(Span::styled(
-            "stores the live ~/.claude/.credentials.json under this profile.",
+            "stores the live ~/.claude/.credentials.json under this account.",
             theme::dim(),
         )),
         Line::from(""),
@@ -444,7 +496,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("space", "cycle the focused setting"),
                 (
                     "\u{21b5}",
-                    "same as space · custom value on refresh interval",
+                    "same as space · type a value on refresh or weekly limit",
                 ),
             ][..],
         )],
@@ -471,13 +523,13 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
             "fallback chain",
             &[
                 ("\u{2191}\u{2193}", "move cursor / detail row"),
-                ("shift \u{2191}\u{2193}", "reorder member = priority"),
+                ("shift \u{2191}\u{2193}", "reorder to set priority"),
                 (
                     "\u{21b5}",
-                    "open \u{00b7} edit threshold \u{00b7} toggle last resort \u{00b7} remove \u{00b7} add",
+                    "open \u{00b7} edit threshold \u{00b7} edit max spend \u{00b7} toggle last resort \u{00b7} remove \u{00b7} add",
                 ),
                 ("+ / -", "step threshold by 5"),
-                ("\u{21b5}", "type a threshold, \u{21b5} saves"),
+                ("\u{21b5} on rotate at", "type a value, \u{21b5} saves"),
                 ("esc", "back / cancel edit"),
             ][..],
         )],

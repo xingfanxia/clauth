@@ -1276,7 +1276,7 @@ fn next_target_over_budget_active_switches_off_by_default() {
 
 // `switch_off_when_budget_spent` is its own decision, not `switch_off_when_spent`'s: staying costs
 // nothing when free quota runs out and costs money when a budget does, so an
-// operator may want stay-on-last for one and switch-off for the other.
+// operator may want stay-on-active for one and switch-off-all for the other.
 #[test]
 fn next_target_over_budget_active_can_be_told_to_keep_billing() {
     let mut config = config_with_chain(
@@ -1352,7 +1352,7 @@ fn next_target_over_budget_halt_is_inert_with_the_toggle_off() {
 
 // A plain subscription active must never reach the budget halt: `budget_spent`
 // is what separates "out of money" from "out of quota", and reading it wrong
-// would halt ordinary accounts that were only ever told to stay on last.
+// would halt ordinary accounts that were only ever told to stay on active.
 #[test]
 fn budget_spent_never_fires_on_a_subscription_account() {
     let plain = usage_info(Some(window(100.0, Some(live_reset()))));
@@ -1395,7 +1395,7 @@ fn spend_is_uncapped_only_when_nothing_can_stop_the_billing() {
     config.state.switch_off_when_budget_spent = false;
     assert!(
         spend_is_uncapped(&config, 5.0),
-        "armed + stay-on-last + no sink = the ceiling never stops anything"
+        "armed + stay-on-active + no sink = the ceiling never stops anything"
     );
 
     // Each of the three, alone, caps it again.
@@ -1898,6 +1898,23 @@ fn next_target_skips_broken_last_resort_member() {
 // tested above (unchanged by this section).
 
 #[test]
+fn is_exhausted_projected_never_switches_later_than_static() {
+    // Regression: burn-aware may only ever move the switch EARLIER than mode-off,
+    // never later. 96% is over the 95% static threshold, so mode-off switches —
+    // but with the default floor 98 above the threshold, the old predicate
+    // required 96 ≥ 98 and held, running the window LONGER than static. The
+    // static check now always fires here, whatever a slow burn projects.
+    assert!(is_exhausted_projected(
+        96.0,
+        95.0,
+        Some(4.0),
+        90_000,
+        98.0,
+        60_000
+    ));
+}
+
+#[test]
 fn is_exhausted_projected_none_burn_falls_back_to_static_threshold() {
     assert!(
         is_exhausted_projected(96.0, 95.0, None, 90_000, 98.0, 60_000),
@@ -1911,11 +1928,12 @@ fn is_exhausted_projected_none_burn_falls_back_to_static_threshold() {
 
 #[test]
 fn is_exhausted_projected_heavy_burn_crosses_cap() {
-    // Guards disabled (floor 0, cap ≥ interval) to isolate the raw projection:
-    // a 1200 %/h burn over a 90s poll projects 98 → 128, past the 100% cap.
+    // Guards relaxed (floor 0, cap ≥ interval) and util below threshold so the
+    // static check can't mask it — isolating the raw projection: a 1200 %/h burn
+    // over a 90s poll projects 90 → 120, past the 100% cap.
     // (The floor's effect on the same burn is a separate test below.)
     assert!(is_exhausted_projected(
-        98.0,
+        90.0,
         95.0,
         Some(1200.0),
         90_000,
@@ -1926,56 +1944,58 @@ fn is_exhausted_projected_heavy_burn_crosses_cap() {
 
 #[test]
 fn is_exhausted_projected_light_burn_stays_under_cap() {
-    // 96% over the 95% static threshold, but a light 4 %/h burn over a 90s poll
-    // barely moves — nowhere near the 100% cap, so burn-aware keeps running
-    // where mode-off would already have switched. Guards disabled to isolate
-    // the projection (96 would also fail the default 98 floor).
+    // Inside the sub-threshold early band (floor 90, threshold 98): 96% with a
+    // light 4 %/h burn over a 90s poll barely moves, nowhere near the 100% cap,
+    // so the projection holds. Kept below threshold so the static check can't
+    // mask it — that isolates the hold to the burn being light.
     assert!(!is_exhausted_projected(
         96.0,
-        95.0,
+        98.0,
         Some(4.0),
         90_000,
-        0.0,
+        90.0,
         90_000
     ));
 }
 
 #[test]
 fn is_exhausted_projected_floor_blocks_a_transient_burst() {
-    // The Pro over-switch fix: a heavy burst at 90% (window-relative %/h reads
-    // high on a small window) projects past 100, but the default 98 floor
-    // refuses to switch that far from the cap — the window is not spent yet.
-    // Without the floor guard this would fire; with it, it holds.
+    // The Pro over-switch fix: a heavy burst (window-relative %/h reads high on a
+    // small window) projects past 100, but the floor (90, below the 95 threshold)
+    // refuses an early switch further from the cap than that — at 88% the window
+    // is not spent yet, so it holds despite the burst.
     assert!(!is_exhausted_projected(
-        90.0,
+        88.0,
         95.0,
         Some(1200.0),
         90_000,
-        98.0,
+        90.0,
         90_000
     ));
-    // At/above the floor the same burn switches — the floor is a lower bound on
-    // the switch point, not a veto on switching.
+    // Above the floor but still below threshold, the same burn switches early —
+    // the floor is a lower bound on the switch point, not a veto on switching.
     assert!(is_exhausted_projected(
-        98.0,
+        93.0,
         95.0,
         Some(1200.0),
         90_000,
-        98.0,
+        90.0,
         90_000
     ));
 }
 
 #[test]
 fn is_exhausted_projected_horizon_cap_tightens_the_margin() {
-    // 98.5% + 80 %/h. Over the full 90s interval the projection reaches 100.5
-    // and fires; capped to a 30s look-ahead it only reaches ~99.2 and holds —
-    // so the cap reclaims the tail a long look-ahead would switch away early.
+    // 98.5% + 80 %/h, inside the sub-threshold band (floor 98, threshold 99) so
+    // the static check can't mask the difference. Over the full 90s interval the
+    // projection reaches 100.5 and fires; capped to a 30s look-ahead it only
+    // reaches ~99.2 and holds — so the cap reclaims the tail a long look-ahead
+    // would switch away early.
     // Mutation-check: ignoring the cap (using the full interval) flips the
     // second assertion.
     assert!(is_exhausted_projected(
         98.5,
-        95.0,
+        99.0,
         Some(80.0),
         90_000,
         98.0,
@@ -1983,7 +2003,7 @@ fn is_exhausted_projected_horizon_cap_tightens_the_margin() {
     ));
     assert!(!is_exhausted_projected(
         98.5,
-        95.0,
+        99.0,
         Some(80.0),
         90_000,
         98.0,
@@ -2069,19 +2089,20 @@ fn write_history(_home: &crate::testutil::HomeSandbox, name: &str, entries: &[(u
 }
 
 // End-to-end proof that the UI-thread walk (`next_target`) and the
-// scheduler-side walk (`next_auto_switch_target`) agree, and that the
-// burn-aware FLOOR holds a transient burst instead of over-switching (the Pro
-// over-switch report): a heavy burn at 96% projects past 100%, but the default
-// 98% floor refuses to switch that far from the cap, reclaiming the window the
-// unbounded projection used to burn away.
+// scheduler-side walk (`next_auto_switch_target`) agree, and that burn-aware
+// never holds the active where static would switch (the burn-floor regression):
+// a heavy burn climbs the active to 96%, over the 95% threshold, so static signs
+// everything out. Burn-aware with the default floor 98 once HELD here (96 < 98),
+// running the window longer than static; the static check now always applies, so
+// both walks switch off too.
 //
 // `b` is pinned exhausted (100%, no `last_resort`) so the headroom-walk and
 // last-resort-walk (unaffected by burn-aware mode by design) both come up empty
-// either way; the only thing that can move the outcome is the ACTIVE-only
-// decision the floor guards — the wrap-off Off-check inside `next_target`, and
-// the entry gate inside `next_auto_switch_target`.
+// either way; the only thing that can move the outcome is the ACTIVE-only Off
+// decision — the wrap-off Off-check inside `next_target`, and the entry gate
+// inside `next_auto_switch_target`.
 #[test]
-fn burn_aware_floor_holds_a_transient_burst_on_both_walks() {
+fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     let _home = crate::testutil::HomeSandbox::new();
     let now = crate::usage::now_ms();
     // Perfectly linear climb, 36 → 96 over 6 minutes = 600 %/h.
@@ -2128,10 +2149,10 @@ fn burn_aware_floor_holds_a_transient_burst_on_both_walks() {
     let rate = burn_rate_for_profile("a", &active_window).expect("rate computed from history");
     assert!((rate - 600.0).abs() < 1.0, "expected ~600 %/h, got {rate}");
 
-    // Burn-aware: the same 600 %/h projects 96% past 100% within a poll, but the
-    // default 98% floor refuses to switch below it — the window is not spent, so
-    // the active HOLDS where the raw projection (and static mode) would switch.
-    // Removing the floor guard flips this back to Off.
+    // Burn-aware: 96% is over the 95% threshold, so the static check inside the
+    // projection fires and the active switches Off — same as mode-off. Before the
+    // fix the default 98% floor held it here (96 < 98), running the window longer
+    // than static.
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(96.0)),
@@ -2144,8 +2165,8 @@ fn burn_aware_floor_holds_a_transient_burst_on_both_walks() {
     config.state.refresh_interval_ms = 90_000;
     assert_eq!(
         next_target(&config, Some(rate)),
-        None,
-        "burn-aware mode: 96% is under the 98% floor → active holds, no Off"
+        Some(SwitchAction::Off),
+        "burn-aware agrees with static: 96% ≥ 95% threshold → Off"
     );
 
     let snap = snapshot_chain(&config).expect("snapshot");
@@ -2156,8 +2177,8 @@ fn burn_aware_floor_holds_a_transient_burst_on_both_walks() {
     let store = store_with_utils(&[("a", 96.0), ("b", 100.0)]);
     assert_eq!(
         next_auto_switch_target(&snap, &store),
-        None,
-        "scheduler-side walk agrees: the floor holds the active on both paths"
+        Some(SwitchAction::Off),
+        "scheduler-side walk agrees: burn-aware switches off at 96%, same as static"
     );
 }
 

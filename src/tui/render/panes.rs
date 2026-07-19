@@ -17,6 +17,47 @@ pub(super) fn selector_width(body_w: u16) -> u16 {
     (body_w.saturating_mul(3) / 10).clamp(20, 40)
 }
 
+/// Phone-width threshold: below this, layouts that place panes side-by-side
+/// stack them vertically instead — at Moshi's ~45 columns the horizontal
+/// master-detail split leaves the detail pane ~13 usable cells. At or above
+/// it every layout is byte-identical to the desktop rendering.
+pub(super) const NARROW_BODY_W: u16 = 60;
+
+/// True when `w` is under the phone-width threshold.
+pub(super) fn narrow(w: u16) -> bool {
+    w < NARROW_BODY_W
+}
+
+/// The master-detail pane split shared by the Usage/Setup/Fallback/Status/
+/// Plugin tabs. Desktop: the house horizontal selector|detail. Narrow: stacked
+/// selector-above-detail — the selector takes its `items` rows (+ box chrome)
+/// up to 40% of the body, the detail the rest, so both panes keep full-width
+/// lines on a phone. Rows, not columns, are the abundant resource there.
+pub(super) fn master_detail(area: Rect, items: usize) -> (Rect, Rect) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    if narrow(area.width) {
+        let max_sel = (area.height.saturating_mul(2) / 5).max(5);
+        let want = u16::try_from(items.saturating_add(3)).unwrap_or(u16::MAX);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(want.clamp(5, max_sel)),
+                Constraint::Min(8),
+            ])
+            .split(area);
+        (rows[0], rows[1])
+    } else {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(selector_width(area.width)),
+                Constraint::Min(20),
+            ])
+            .split(area);
+        (cols[0], cols[1])
+    }
+}
+
 /// Display columns occupied by the text before the caret in `input`.
 /// `InputState::cursor` is a byte offset; every edited field is ASCII-only in
 /// practice, so the char count of the pre-caret slice equals display columns.
@@ -160,7 +201,7 @@ pub(super) fn draw_scrollbar(
     offset: usize,
     viewport: usize,
 ) {
-    if total <= viewport || viewport == 0 || inner.height == 0 {
+    if total <= viewport || viewport == 0 || inner.height == 0 || inner.width == 0 {
         return;
     }
     // Right-padding column: one cell to the right of the content rect.
@@ -188,6 +229,59 @@ pub(super) fn draw_scrollbar(
             }
         }
     }
+}
+
+/// Rows of context the form scroll keeps past the focused line while content
+/// remains (cloudy-tui: the cursor never rests against the viewport edge).
+const SCROLL_PAD: usize = 3;
+
+/// Render a form pane's assembled lines into `inner`, scrolled so the focused
+/// block `focus.0..focus.1` stays on screen, plus the overflow scrollbar.
+/// Returns the applied offset so a caller placing the native terminal cursor can
+/// shift its row by it.
+///
+/// These panes rebuild one `Vec<Line>` per frame and hold no offset in `App`, so
+/// the scroll is derived from the focused block each draw. Without it a pane
+/// taller than its viewport silently drops its bottom rows — no scrollbar, no
+/// clue anything is missing, which is how a hint tooltip and a whole settings
+/// row went missing on a 24-row terminal.
+pub(super) fn draw_scrolled_lines(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    lines: Vec<Line<'static>>,
+    focus: (usize, usize),
+) -> usize {
+    let total = lines.len();
+    let viewport = inner.height as usize;
+    let offset = scroll_offset(total, viewport, focus);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((offset as u16, 0)),
+        inner,
+    );
+    draw_scrollbar(frame, inner, total, offset, viewport);
+    offset
+}
+
+/// Smallest offset that keeps the focused block (`focus.0` inclusive, `focus.1`
+/// exclusive) plus a [`SCROLL_PAD`] band on screen, clamped to the content.
+///
+/// The block, not just its first line: a row's help tooltip wraps to the pane
+/// width, so a narrow pane can push a 4-line hint past the viewport while the
+/// row it explains sits comfortably on screen. Capping at `focus.0` keeps the
+/// row itself visible when its block is taller than the whole viewport. The
+/// focus alone determines the offset, so no cross-frame state is needed and the
+/// view can never drift out of sync with the cursor.
+pub(super) fn scroll_offset(total: usize, viewport: usize, focus: (usize, usize)) -> usize {
+    if viewport == 0 || total <= viewport {
+        return 0;
+    }
+    let pad = SCROLL_PAD.min(viewport.saturating_sub(1) / 2);
+    (focus.1 + pad)
+        .saturating_sub(viewport)
+        .min(focus.0)
+        .min(total - viewport)
 }
 
 /// Bordered selector list; `build_rows` receives the inner width for the selection bar.
@@ -265,7 +359,7 @@ pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// A `  └ text` help sub-line wrapped to `width`: the `└ ` leader stays `LINE`,
+/// A ` └ text` help sub-line wrapped to `width`: the `└ ` leader stays `LINE`,
 /// the reason renders `faint`; continuation lines indent under the text so the
 /// hint reads as one block instead of clipping off the pane edge.
 pub(super) fn help_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
@@ -284,12 +378,12 @@ fn tooltip_lines(
     leader_style: Style,
     text_style: Style,
 ) -> Vec<Line<'static>> {
-    const LEAD_W: usize = 4; // "  └ " and the matching continuation indent
+    const LEAD_W: usize = 3; // " └ " and the matching continuation indent
     wrap_words(text, width.saturating_sub(LEAD_W).max(8))
         .into_iter()
         .enumerate()
         .map(|(i, seg)| {
-            let lead = if i == 0 { "  └ " } else { "    " };
+            let lead = if i == 0 { " └ " } else { "   " };
             Line::from(vec![
                 Span::styled(lead, leader_style),
                 Span::styled(seg, text_style),

@@ -1932,7 +1932,7 @@ fn budget_wrap_off_space_toggles_and_persists() {
     super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
     assert!(
         !app.config().state.switch_off_when_budget_spent,
-        "space flips it to stay-on-last"
+        "space flips it to stay on active"
     );
     assert!(
         !app.config().state.switch_off_when_spent,
@@ -2021,7 +2021,7 @@ fn money_spent_is_inert_through_the_top_level_router() {
 // ── preemptive rotation (rotation coherence #1) ─────────────────────────────
 
 #[test]
-fn preemptive_rotation_space_toggles_and_persists() {
+fn preemptive_rotation_space_toggles_on_macos_inert_elsewhere() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = Tab::Config;
@@ -2035,25 +2035,34 @@ fn preemptive_rotation_space_toggles_and_persists() {
     );
 
     super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
-    assert!(
-        app.config().state.preemptive_rotation,
-        "space toggles the mode on"
-    );
 
-    // Persisted to profiles.toml — the scheduler reads the flag off the
-    // shared config, but a relaunch must pick it up from disk too.
-    let reloaded: crate::profile::AppState = toml::from_str(
-        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
-            .expect("read profiles.toml"),
-    )
-    .expect("parse profiles.toml");
-    assert!(reloaded.preemptive_rotation, "toggle persists to disk");
+    // Off macOS the Keychain mirror is never live, so preemptive rotation can't
+    // fire and the row is a disabled no-op; on macOS the toggle works + persists.
+    if cfg!(target_os = "macos") {
+        assert!(
+            app.config().state.preemptive_rotation,
+            "space toggles the mode on"
+        );
+        // Persisted to profiles.toml — the scheduler reads the flag off the
+        // shared config, but a relaunch must pick it up from disk too.
+        let reloaded: crate::profile::AppState = toml::from_str(
+            &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+                .expect("read profiles.toml"),
+        )
+        .expect("parse profiles.toml");
+        assert!(reloaded.preemptive_rotation, "toggle persists to disk");
 
-    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
-    assert!(
-        !app.config().state.preemptive_rotation,
-        "space toggles the mode back off"
-    );
+        super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(
+            !app.config().state.preemptive_rotation,
+            "space toggles the mode back off"
+        );
+    } else {
+        assert!(
+            !app.config().state.preemptive_rotation,
+            "inert off macOS — space must not toggle a row that can't fire"
+        );
+    }
 }
 
 // ── refresh interval custom value ──────────────────────────────────────────
@@ -2522,7 +2531,7 @@ fn no_active_banner_without_spent_evidence() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "no active profile · select one to resume"
+        "no active account · select one to resume"
     );
 }
 
@@ -2542,7 +2551,7 @@ fn all_spent_banner_needs_live_spent_window() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "all accounts spent · switch to a profile to resume"
+        "all accounts spent · switch to an account to resume"
     );
 }
 
@@ -2566,7 +2575,7 @@ fn all_spent_banner_ignores_a_soft_blocked_member_that_still_serves() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "no active profile · select one to resume",
+        "no active account · select one to resume",
         "soft-blocked is not spent — the banner must not claim it is"
     );
 }
@@ -2588,7 +2597,7 @@ fn all_spent_banner_fires_at_the_weekly_hard_cap() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "all accounts spent · switch to a profile to resume"
+        "all accounts spent · switch to an account to resume"
     );
 }
 
@@ -3001,7 +3010,7 @@ fn capture_overwrite_cancel_changes_nothing() {
         account_uuid: None,
     };
     app.modals.push(super::Modal::Confirm(super::ConfirmState {
-        message: "Profile 'acme' already exists.".to_string(),
+        message: "account 'acme' already exists.".to_string(),
         detail: None,
         choice: false, // cancel is the default-focused, safe choice
         on_confirm: super::ConfirmAction::CaptureOverwrite(

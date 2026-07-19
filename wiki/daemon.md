@@ -98,7 +98,7 @@ key**: names, tiers, percentages, timestamps only.
 | `generated_at` | Write stamp, ISO-8601 UTC with an explicit `+00:00` offset (all timestamps are; parse the offset, never key on a `Z` suffix; the writer does not emit one). Readers derive staleness from it: a stamp much older than `refresh_interval_ms` means the daemon is gone/stuck, so show last-known data with a stale cue, never spin. |
 | `active_profile` | The profile whose credentials are currently installed, else `null`. |
 | `pending_switch` | A switch the daemon has accepted but not yet applied (`"<name>"`), else `null`. Exists so readers can show in-flight truth instead of a timing heuristic. Always `null` from the single-shot CLI. |
-| `wrap_off` | The fallback chain's stop-vs-stay-on-last flag, verbatim from state. |
+| `wrap_off` | The fallback chain's stop-vs-stay-on-active flag, verbatim from state. |
 | `profiles[].provider` | `"anthropic"` for OAuth profiles, else the recognised provider's display name. |
 | `profiles[].tier` | Plan label (`"Max 5x"`…), `null` when unknown. Opaque display string. |
 | `profiles[].auth_status` | `"ok" \| "expiring" \| "broken"`. `broken` = last refresh rejected as revoked/invalid → excluded from fallback walks, refused as a switch target. `expiring` = past expiry, not yet refreshed. `broken` outranks `expiring`. Reports on the credential a profile STORES, not on where its requests route: a hybrid (an OAuth pair kept alongside a `base_url`) reports `expiring` on a dead token like any other account. Absent ⇒ `"ok"`. |

@@ -167,9 +167,11 @@ fn dispatch(args: &[String]) -> Result<()> {
         }
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
-        _ => anyhow::bail!(
-            "usage: clauth [profile] | clauth start [--isolated] <profile> [args] | clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>] | clauth delete <profile> [--yes] [--force] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
-        ),
+        // Unrecognized invocation: show the full command list, not a stale subset.
+        _ => {
+            print_help();
+            Ok(())
+        }
     }
 }
 
@@ -668,9 +670,10 @@ fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
 
 fn print_help() {
     println!(
-        "clauth {ver}: Claude Code account switcher\n\n\
+        "clauth {ver}: launcher and account manager for claude code\n\n\
          Usage:\n  \
-           clauth [--theme=full|compatible] launch the TUI\n  \
+           clauth [--theme=full|compatible]\n                                  \
+         launch the TUI\n  \
            clauth <profile>                switch to profile by name and exit\n  \
            clauth start [--isolated] [--rescue|--no-rescue] <profile> [args]\n                                  \
          launch claude with that profile's settings in a per-profile\n                                  \
@@ -689,7 +692,7 @@ fn print_help() {
          remove a profile and all its credentials; --yes (-y) skips the\n                                  \
          confirm, --force overrides the live-session guard\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
-         credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
+         .credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
            clauth sessions [--json]        list Claude Code sessions as a table; --json\n                                  \
          emits a stable newest-first array (exit 0/1/2)\n  \
            clauth resume <id|latest> [--profile <name>]\n                                  \
@@ -701,13 +704,15 @@ fn print_help() {
          usage, auto-switch on exhaustion, and write ~/.clauth/status.json\n  \
            clauth status --json            print the current usage / auto-switch snapshot\n                                  \
          as JSON (same shape the daemon writes)\n  \
+           clauth mcp                      run the stdio MCP server (claude code\n                                  \
+         launches this)\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \
            clauth completions install [shell]\n                                  \
          install completions into the user's shell rc\n  \
            clauth --version                print version\n  \
            clauth --help                   show this help\n\n\
          Theme:\n  \
-           --theme=full        force 24-bit truecolor (default when $COLORTERM=truecolor)\n  \
+           --theme=full        force 24-bit truecolor (default when $COLORTERM=truecolor or 24bit)\n  \
            --theme=compatible  force xterm-256 palette (safe on all terminals)\n  \
            Config file:        set `theme = \"full\"` in ~/.clauth/profiles.toml",
         ver = env!("CARGO_PKG_VERSION"),

@@ -1,11 +1,12 @@
 //! Program-wide Config tab — a single panel of global settings, distinct from
-//! the per-account Setup tab. Rows back real persisted state in `AppState`,
-//! grouped by concern: appearance (`theme`), login (`on mismatch`), background
-//! timing (`refresh` cadence, `refresh spent` toggle, `rotation`), fallback
-//! detection (`weekly limit`, `rotate mode` = burn-aware, plus the burn-aware
-//! `burn floor`/`burn horizon` tunables it gates, issue #8 follow-up b),
-//! fallback halt (`quota spent`), then the spend block (`allow extra usage` opt-in +
-//! its own `extra usage spent` halt default — real money, see `docs/internals.md`).
+//! the per-account Setup tab. Rows back real persisted state in `AppState` and
+//! run in the concern bands `GlobalConfigRow::band` names, each opened by an
+//! eyebrow header: appearance (`theme`), scheduler (`on mismatch`, `refresh`
+//! cadence, `refresh spent` toggle, `rotation`), auto-switch (`weekly limit`,
+//! `switch mode` = burn-aware, the burn-aware `burn floor`/`burn horizon`
+//! tunables it gates (issue #8 follow-up b), then the `quota spent` halt), then
+//! extra usage (`allow extra usage` opt-in + its own `extra usage spent` halt
+//! default — real money, see `docs/internals.md`).
 //! ↑↓ walks the rows; space cycles a row's value in place; ⏎ opens the
 //! refresh-interval and weekly-threshold custom-value editors and otherwise
 //! mirrors space. No left selector, no popups — settings are global.
@@ -13,9 +14,11 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 
-use crate::profile::{DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTERVAL_MS};
+use crate::profile::{
+    DEFAULT_BURN_FLOOR_PCT, DEFAULT_BURN_HORIZON_MS, DEFAULT_REFRESH_INTERVAL_MS,
+    DEFAULT_WEEKLY_SWITCH_PCT, DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MIN_REFRESH_INTERVAL_MS,
+};
 
 use super::super::app::{
     App, BURN_FLOOR_PRESETS, BURN_HORIZON_PRESETS, GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState,
@@ -23,8 +26,8 @@ use super::super::app::{
 };
 use super::super::theme::{self, Tier};
 use super::panes::{
-    cycle_option, head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell,
-    label_style, section_box,
+    cycle_option, draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row,
+    invalid_tooltip_lines, key_cell, label_style, section_box,
 };
 
 /// Width of the key column: the longest keys (`allow extra usage` /
@@ -64,10 +67,28 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let editing = app.refresh_interval_draft.as_ref();
     let weekly_editing = app.weekly_threshold_draft.as_ref();
 
+    let focused_band = GLOBAL_CONFIG_ROWS[cursor].band();
+
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut caret: Option<(u16, u16)> = None;
+    let mut caret: Option<(u16, usize)> = None;
+    // Start + end of the focused row's block (row plus its tooltip lines), so a
+    // wrapped hint can't scroll off the bottom while its row stays visible.
+    let mut focus = (0usize, 1usize);
+    let mut band: Option<&str> = None;
     for (i, row) in GLOBAL_CONFIG_ROWS.iter().enumerate() {
         let selected = i == cursor;
+        // Eyebrow header opening each concern band, preceded by a blank spacer
+        // from the second band on so the groups read as separate sections.
+        if band != Some(row.band()) {
+            if band.is_some() {
+                lines.push(Line::default());
+            }
+            band = Some(row.band());
+            lines.push(band_header(row.band(), row.band() == focused_band));
+        }
+        if selected {
+            focus.0 = lines.len();
+        }
         let row_editing = match row {
             GlobalConfigRow::RefreshInterval => editing,
             GlobalConfigRow::WeeklyThreshold => weekly_editing,
@@ -92,8 +113,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 let cx = inner
                     .x
                     .saturating_add((2 + KEY_W + KEY_GUTTER + head_cols(input)) as u16);
-                let cy = inner.y.saturating_add(lines.len() as u16);
-                caret = Some((cx, cy));
+                caret = Some((cx, lines.len()));
                 lines.push(line);
                 lines.extend(if *row == GlobalConfigRow::WeeklyThreshold {
                     weekly_range_tooltip(input, inner.width as usize)
@@ -107,17 +127,45 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 } else {
                     line
                 });
-                if selected && let Some(tip) = row_hint(*row, default_divergence, toggles) {
+                if selected
+                    && let Some(tip) = row_hint(
+                        *row,
+                        default_divergence,
+                        toggles,
+                        refresh_interval_ms,
+                        weekly_pct,
+                        burn_floor_pct,
+                        burn_horizon_ms,
+                    )
+                {
                     lines.extend(help_tooltip_lines(&tip, inner.width as usize));
                 }
             }
         }
+        if selected {
+            focus.1 = lines.len();
+        }
     }
 
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
-    if let Some((cx, cy)) = caret {
-        frame.set_cursor_position((cx, cy));
+    let offset = draw_scrolled_lines(frame, inner, lines, focus);
+    // A caret scrolled off the top has no cell to sit in; leaving the cursor
+    // unset is better than parking it on an unrelated row.
+    if let Some((cx, row)) = caret
+        && let Some(visible) = row
+            .checked_sub(offset)
+            .filter(|v| *v < inner.height as usize)
+    {
+        frame.set_cursor_position((cx, inner.y.saturating_add(visible as u16)));
     }
+}
+
+/// Eyebrow header opening a concern band: UPPERCASE, `TEXT_DIM + bold` at all
+/// times (a fixed label treatment, not a focus cue), gaining an underline while
+/// the cursor sits on one of its rows — the contract's section-header form.
+fn band_header(label: &str, focused: bool) -> Line<'static> {
+    let style = theme::label();
+    let style = if focused { style.underlined() } else { style };
+    Line::from(Span::styled(label.to_uppercase(), style))
 }
 
 /// Inline help for rows whose value doesn't self-describe. Phrased for the
@@ -138,10 +186,18 @@ fn row_hint(
     row: GlobalConfigRow,
     default_divergence: Option<DivergenceChoice>,
     toggles: ToggleState,
+    refresh_interval_ms: u64,
+    weekly_pct: f64,
+    burn_floor_pct: f64,
+    burn_horizon_ms: u64,
 ) -> Option<String> {
-    let tip = match row {
+    // The default + units live on the row as a faint span (only when the value
+    // is off its default), so the hint states behavior alone, interpolating the
+    // live value. Rows another toggle makes inert render dimmed and keep their
+    // behavior hint — the dim is the "can't touch this", not a gate clause.
+    let tip: String = match row {
         GlobalConfigRow::Theme => return None,
-        GlobalConfigRow::DivergenceDefault => match default_divergence {
+        GlobalConfigRow::DivergenceDefault => String::from(match default_divergence {
             None => "ask what to do when claude code signs in over the active account",
             Some(DivergenceChoice::Overwrite) => {
                 "fold a new login into the active account, replacing its credentials"
@@ -152,79 +208,61 @@ fn row_hint(
             Some(DivergenceChoice::Discard) => {
                 "restore the previous credentials and drop the new login"
             }
-        },
+        }),
         GlobalConfigRow::RefreshInterval => {
-            "how often usage is refreshed for every account (default 90s)"
+            format!(
+                "check every account's usage every {}s",
+                refresh_interval_ms / 1000
+            )
         }
-        GlobalConfigRow::WeeklyThreshold => {
-            "soft switch-early line on the 7d window (default 98%): a member past it is handed off \
-             but still serves; 100% = only at the hard cap"
-        }
-        GlobalConfigRow::SwitchOffWhenSpent => {
-            if toggles.switch_off_when_spent {
-                "once every account is spent, switch everything off until one recovers"
-            } else {
-                "once every account is spent, stay on the last one until one recovers"
-            }
-        }
-        GlobalConfigRow::BurnAware => {
-            if toggles.burn_aware {
-                "switch the active account away once its burn rate projects 100% before the next \
-                 refresh"
-            } else {
-                "switch the active account away once its usage crosses its threshold"
-            }
-        }
-        GlobalConfigRow::BurnFloor => {
-            if !toggles.burn_aware {
-                "inert until rotate mode is burn-aware: the lowest usage % a projected switch may \
-                 fire at"
-            } else {
-                "burn-aware never switches below this %, so it can't waste more than 100 minus it \
-                 (default 98)"
-            }
-        }
-        GlobalConfigRow::BurnHorizon => {
-            if !toggles.burn_aware {
-                "inert until rotate mode is burn-aware: how far ahead the burn projection looks"
-            } else {
-                "project burn at most this far ahead (also capped by refresh); shorter switches \
-                 nearer 100 (default 60s)"
-            }
-        }
-        GlobalConfigRow::SpendBudget => {
-            if toggles.spend_budget {
-                "spent accounts may fall back to pay-as-you-go, up to each max auto-spend"
-            } else {
-                "never allow extra usage automatically; a spent chain parks or switches off"
-            }
-        }
+        GlobalConfigRow::WeeklyThreshold => format!(
+            "don't send new work to an account past {}% of its weekly limit",
+            format_weekly_pct(weekly_pct)
+        ),
+        GlobalConfigRow::SwitchOffWhenSpent => String::from(if toggles.switch_off_when_spent {
+            "sign every account out once they're all spent, unless one is marked last resort"
+        } else {
+            "keep using whichever account is active once they're all spent"
+        }),
+        GlobalConfigRow::BurnAware => String::from(if toggles.burn_aware {
+            "switch away once the burn rate would hit 100% before the next check"
+        } else {
+            "switch the active account away once its usage crosses its threshold"
+        }),
+        GlobalConfigRow::BurnFloor => format!(
+            "never switch away before {}% used, however fast the burn",
+            format_weekly_pct(burn_floor_pct)
+        ),
+        GlobalConfigRow::BurnHorizon => format!(
+            "look at most {}s ahead when guessing the next switch",
+            burn_horizon_ms / 1000
+        ),
+        GlobalConfigRow::SpendBudget => String::from(if toggles.spend_budget {
+            "let a spent account keep working on paid usage, up to its max spend"
+        } else {
+            "never spend real money automatically"
+        }),
         GlobalConfigRow::SwitchOffWhenBudgetSpent => {
-            if !toggles.spend_budget {
-                "inert until extra usage is allowed; decides the halt once an account's extra usage \
-                 runs out"
-            } else if toggles.switch_off_when_budget_spent {
+            String::from(if toggles.switch_off_when_budget_spent {
                 "once an account's extra usage runs out, switch everything off"
             } else {
                 "once an account's extra usage runs out, stay on it and keep billing"
-            }
+            })
         }
-        GlobalConfigRow::PreemptiveRotation => {
-            if toggles.preemptive {
-                "rotate the active account's login ahead of expiry (macos keychain)"
-            } else {
-                "rotate the active account's login only when a request rejects it"
-            }
-        }
-        GlobalConfigRow::RefreshSpentAccounts => {
-            if toggles.refresh_spent {
-                "keep refreshing usage for spent (100%) accounts every interval"
-            } else {
-                "skip refreshing a spent account until its window resets"
-            }
-        }
+        GlobalConfigRow::PreemptiveRotation => String::from(if !cfg!(target_os = "macos") {
+            "only rotates the login ahead of expiry on macos"
+        } else if toggles.preemptive {
+            "rotate the login before it expires"
+        } else {
+            "rotate the login only when a request rejects it"
+        }),
+        GlobalConfigRow::RefreshSpentAccounts => String::from(if toggles.refresh_spent {
+            "keep checking accounts that are already at 100%"
+        } else {
+            "skip refreshing a spent account until its window resets"
+        }),
     };
-    Some(tip.to_string())
+    Some(tip)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -289,14 +327,14 @@ fn detail_row(
             arrow,
             "quota spent",
             &[
-                ("stay on last", !toggles.switch_off_when_spent),
+                ("stay on active", !toggles.switch_off_when_spent),
                 ("switch off all", toggles.switch_off_when_spent),
             ],
             selected,
         ),
         GlobalConfigRow::BurnAware => cycle_row(
             arrow,
-            "rotate mode",
+            "switch mode",
             &[
                 ("static", !toggles.burn_aware),
                 ("burn-aware", toggles.burn_aware),
@@ -325,7 +363,7 @@ fn detail_row(
         // so `faint` never decouples from "not editable".
         GlobalConfigRow::SwitchOffWhenBudgetSpent => {
             let options = [
-                ("stay on last", !toggles.switch_off_when_budget_spent),
+                ("stay on active", !toggles.switch_off_when_budget_spent),
                 ("switch off all", toggles.switch_off_when_budget_spent),
             ];
             if toggles.spend_budget {
@@ -334,19 +372,33 @@ fn detail_row(
                 dimmed_cycle_row("extra usage spent", &options, selected)
             }
         }
-        GlobalConfigRow::PreemptiveRotation => cycle_row(
-            arrow,
-            "rotation",
-            &[
+        GlobalConfigRow::PreemptiveRotation => {
+            // Preemptive rotation only fires while the macOS Keychain mirror is
+            // live (`scheduler::keychain_live`); off macOS the toggle can do
+            // nothing, so it renders as a disabled row (and its key no-ops),
+            // mirroring the burn tunables.
+            let options = [
                 ("lazy", !toggles.preemptive),
                 ("preemptive", toggles.preemptive),
-            ],
-            selected,
-        ),
+            ];
+            if cfg!(target_os = "macos") {
+                cycle_row(arrow, "rotation", &options, selected)
+            } else {
+                dimmed_cycle_row("rotation", &options, selected)
+            }
+        }
         GlobalConfigRow::RefreshSpentAccounts => {
             toggle_row(arrow, "refresh spent", toggles.refresh_spent, selected)
         }
     }
+}
+
+/// Trailing faint ` default: X` reminder appended to a value row only when its
+/// live value is off the shipped default — the operator sees the default at the
+/// moment they've moved away from it, and never as noise otherwise (the chain
+/// `rotate at` idiom).
+fn default_reminder(value: String) -> Span<'static> {
+    Span::styled(format!("   default: {value}"), theme::faint())
 }
 
 /// The presets the refresh row steps through, paired with their `ms` value.
@@ -384,6 +436,12 @@ fn refresh_cycle_line(
             format!("  {}s", refresh_interval_ms / 1000),
             theme::accent(),
         ));
+    }
+    if refresh_interval_ms != DEFAULT_REFRESH_INTERVAL_MS {
+        line.push_span(default_reminder(format!(
+            "{}s",
+            DEFAULT_REFRESH_INTERVAL_MS / 1000
+        )));
     }
     line
 }
@@ -455,6 +513,12 @@ fn weekly_cycle_line(arrow: Span<'static>, weekly_pct: f64, selected: bool) -> L
             theme::accent(),
         ));
     }
+    if (weekly_pct - DEFAULT_WEEKLY_SWITCH_PCT).abs() > f64::EPSILON {
+        line.push_span(default_reminder(format!(
+            "{}%",
+            format_weekly_pct(DEFAULT_WEEKLY_SWITCH_PCT)
+        )));
+    }
     line
 }
 
@@ -520,6 +584,12 @@ fn burn_floor_line(
             theme::accent(),
         ));
     }
+    if (floor_pct - DEFAULT_BURN_FLOOR_PCT).abs() > f64::EPSILON {
+        line.push_span(default_reminder(format!(
+            "{}%",
+            format_weekly_pct(DEFAULT_BURN_FLOOR_PCT)
+        )));
+    }
     line
 }
 
@@ -550,6 +620,12 @@ fn burn_horizon_line(
             format!("  {}s", horizon_ms / 1000),
             theme::accent(),
         ));
+    }
+    if horizon_ms != DEFAULT_BURN_HORIZON_MS {
+        line.push_span(default_reminder(format!(
+            "{}s",
+            DEFAULT_BURN_HORIZON_MS / 1000
+        )));
     }
     line
 }
