@@ -643,13 +643,13 @@ fn cmd_login_setup_token(
     // Replacing an existing sidecar re-points every future switch at the new
     // token — confirm like the other in-place replacements. A fresh capture
     // (no sidecar yet) is additive and needs no ceremony.
-    if claude::has_session_token(target) && !yes {
+    if claude::session_token_status(target).is_some() && !yes {
         if !interactive {
             anyhow::bail!(
-                "'{target}' already has a session token; pass --yes to replace it non-interactively"
+                "'{target}' already has a long-lived token; pass --yes to replace it non-interactively"
             );
         }
-        print!("Replace the stored session token for '{target}'? [y/N] ");
+        print!("Replace the stored long-lived token for '{target}'? [y/N] ");
         std::io::Write::flush(&mut std::io::stdout())?;
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
@@ -660,7 +660,7 @@ fn cmd_login_setup_token(
     }
 
     let raw = if interactive {
-        println!("clauth: capturing a long-lived session token for '{target}'.");
+        println!("clauth: capturing a long-lived token for '{target}'.");
         println!("  1. in another terminal, run:  claude setup-token");
         println!("  2. complete the browser flow it opens");
         println!("  3. paste the minted token below (input stays hidden)");
@@ -691,7 +691,7 @@ fn cmd_login_setup_token(
     let expires_at = claude::write_session_token(target, &token, crate::usage::now_ms() as i64)?;
     let days = (expires_at - crate::usage::now_ms() as i64) / 86_400_000;
     println!(
-        "clauth: session token installed for '{target}' · assumed to expire in ~{days}d \
+        "clauth: long-lived token installed for '{target}' · assumed to expire in ~{days}d \
          (`claude setup-token` mints last about a year)."
     );
     println!(

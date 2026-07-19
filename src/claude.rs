@@ -26,9 +26,42 @@ fn claude_settings_path() -> Result<PathBuf> {
 /// serial `refresh token revoked` deaths: N live sessions + clauth all
 /// rotating the same chains through one live slot).
 pub(crate) fn has_session_token(name: &str) -> bool {
-    profile_dir(name)
-        .map(|d| d.join("session-token.json").exists())
-        .unwrap_or(false)
+    matches!(
+        session_token_status(name),
+        Some(SessionTokenStatus::LongLived(_))
+    )
+}
+
+/// What the `session-token.json` sidecar actually holds (#53 review: the
+/// split must engage only when the installed token IS long-lived).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SessionTokenStatus {
+    /// A genuine long-lived login — defined by carrying NO refresh token:
+    /// with nothing to rotate, sessions can never race clauth's refresher on
+    /// it, which is the whole point of the split. Carries the recorded
+    /// epoch-ms expiry when stamped.
+    LongLived(Option<i64>),
+    /// The sidecar holds a rotating pair (refresh token present) — a
+    /// mis-fill, not a `claude setup-token` mint. The split stays DISENGAGED:
+    /// installing it would put a dies-in-hours token in front of sessions
+    /// with no refresher behind it, so switches keep installing
+    /// `credentials.json` as if the sidecar weren't there.
+    NotLongLived,
+}
+
+/// Content-aware read of a profile's sidecar: `None` = no sidecar (or one too
+/// corrupt to parse a login out of — same disengaged outcome either way).
+pub(crate) fn session_token_status(name: &str) -> Option<SessionTokenStatus> {
+    let path = profile_dir(name).ok()?.join("session-token.json");
+    if !path.exists() {
+        return None;
+    }
+    let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
+    let oauth = creds.claude_ai_oauth.as_ref()?;
+    if oauth.refresh_token.is_some() {
+        return Some(SessionTokenStatus::NotLongLived);
+    }
+    Some(SessionTokenStatus::LongLived(oauth.expires_at))
 }
 
 /// Documented lifetime of a `claude setup-token` mint (~1 year). The minted
@@ -88,31 +121,17 @@ pub(crate) fn write_session_token(name: &str, token: &str, now_ms: i64) -> Resul
     Ok(expires_at)
 }
 
-/// The sidecar's recorded expiry: `None` = profile has no session token;
-/// `Some(None)` = sidecar present but no readable `expiresAt` (hand-rolled);
-/// `Some(Some(ms))` = the recorded epoch-ms horizon. Read-only and cheap (one
-/// small file), so render paths may call it per frame for a selected profile.
-pub(crate) fn session_token_expiry(name: &str) -> Option<Option<i64>> {
-    let path = profile_dir(name).ok()?.join("session-token.json");
-    if !path.exists() {
-        return None;
-    }
-    Some(
-        read_json_file::<ClaudeCredentials>(&path)
-            .ok()
-            .and_then(|c| c.access_token_expires_at()),
-    )
-}
-
 /// The file a switch INSTALLS as the live login: the profile's
 /// `session-token.json` when present ([`has_session_token`]), else its
 /// `credentials.json` — which is exactly the pre-split behavior, so profiles
 /// without the sidecar are byte-identical to before.
 pub(crate) fn install_source_path(name: &str) -> Result<PathBuf> {
     let dir = profile_dir(name)?;
-    let session = dir.join("session-token.json");
-    if session.exists() {
-        return Ok(session);
+    // Content-aware, not a bare existence check (#53 review): a sidecar that
+    // isn't genuinely long-lived must not become the install source — see
+    // [`SessionTokenStatus::NotLongLived`].
+    if has_session_token(name) {
+        return Ok(dir.join("session-token.json"));
     }
     Ok(dir.join("credentials.json"))
 }

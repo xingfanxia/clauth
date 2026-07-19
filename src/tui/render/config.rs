@@ -92,11 +92,11 @@ struct Snap {
     captured: bool,
     /// Recognised third-party provider display name, if any.
     provider: Option<&'static str>,
-    /// CLA-SPLIT session-token sidecar state: `None` = none; `Some(None)` =
-    /// present without a readable expiry; `Some(Some(ms))` = its recorded
-    /// epoch-ms horizon. Read per frame for the selected profile only (one
-    /// small file, see `claude::session_token_expiry`).
-    session_token: Option<Option<i64>>,
+    /// CLA-SPLIT sidecar state (`claude::session_token_status`): `None` = no
+    /// sidecar; long-lived with its stamped horizon, or the mis-filled
+    /// not-long-lived shape the split disengages for. Read per frame for the
+    /// selected profile only (one small file).
+    session_token: Option<crate::claude::SessionTokenStatus>,
 }
 
 impl Snap {
@@ -171,7 +171,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             login_is_oauth: p.login_is_oauth(),
             captured: false,
             provider: p.provider.map(|p| p.display_name()),
-            session_token: crate::claude::session_token_expiry(p.name.as_str()),
+            session_token: crate::claude::session_token_status(p.name.as_str()),
         },
         None => Snap::blank("settings"),
     }
@@ -198,40 +198,46 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_settings_rows(frame, inner, app, &rows, cursor, &snap, actions_focused);
 }
 
-/// CLA-SPLIT status row: a profile carrying a session-token sidecar runs its
-/// sessions on that static token, and the ~1yr horizon is the one thing about
-/// it worth watching — expired means every switch would sign sessions out, so
-/// it escalates to a DANGER re-mint hint (the same wording
-/// `ensure_installable` logs); the last 30 days warn. `expiry = None` is a
-/// hand-rolled sidecar without a stamp: present, horizon unknown.
-fn session_token_line(expiry: Option<i64>, now_ms: i64) -> Line<'static> {
-    let (text, style) = match expiry {
-        Some(ms) => {
+/// CLA-SPLIT status row: a profile carrying a long-lived-token sidecar runs
+/// its sessions on that static login, and the ~1yr horizon is the one thing
+/// about it worth watching — expired means every switch would sign sessions
+/// out, so it escalates to a DANGER re-mint hint (the same wording
+/// `ensure_installable` logs); the last 30 days warn. A mis-filled sidecar
+/// (rotating pair, split disengaged) reads as exactly that, in DANGER — the
+/// operator thinks the split is armed and it isn't.
+fn session_token_line(status: &crate::claude::SessionTokenStatus, now_ms: i64) -> Line<'static> {
+    use crate::claude::SessionTokenStatus;
+    let (text, style) = match status {
+        SessionTokenStatus::LongLived(Some(ms)) => {
             let days = (ms - now_ms) / 86_400_000;
             if days < 0 {
                 (
-                    "token expired · re-mint: claude setup-token".to_string(),
+                    "expired · re-mint: claude setup-token".to_string(),
                     theme::danger(),
                 )
             } else if days <= 30 {
                 (
-                    format!("static token · expires in ~{days}d"),
+                    format!("long-lived · expires in ~{days}d"),
                     theme::warning(),
                 )
             } else {
                 (
-                    format!("static token · expires in ~{days}d"),
+                    format!("long-lived · expires in ~{days}d"),
                     theme::accent(),
                 )
             }
         }
-        None => (
-            "static token · no recorded expiry".to_string(),
+        SessionTokenStatus::LongLived(None) => (
+            "long-lived · no recorded expiry".to_string(),
             theme::accent(),
+        ),
+        SessionTokenStatus::NotLongLived => (
+            "not long-lived (has a refresh token) · ignored".to_string(),
+            theme::danger(),
         ),
     };
     Line::from(vec![
-        Span::styled(key_cell("session", KEY_W, KEY_GUTTER), theme::label()),
+        Span::styled(key_cell("token", KEY_W, KEY_GUTTER), theme::label()),
         Span::styled(text, style),
     ])
 }
@@ -275,8 +281,8 @@ fn draw_settings_rows(
         ]));
     }
 
-    if let Some(expiry) = snap.session_token {
-        lines.push(session_token_line(expiry, crate::usage::now_ms() as i64));
+    if let Some(status) = &snap.session_token {
+        lines.push(session_token_line(status, crate::usage::now_ms() as i64));
     }
 
     lines.push(Line::from(""));

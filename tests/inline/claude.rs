@@ -678,7 +678,7 @@ fn write_session_token_produces_a_recognised_sidecar() {
     let _home = HomeSandbox::new();
     let profile = crate::profile::Profile::new("cap".to_string(), None, None);
     crate::profile::save_profile(&profile).expect("save profile");
-    assert_eq!(session_token_expiry("cap"), None, "no sidecar yet");
+    assert_eq!(session_token_status("cap"), None, "no sidecar yet");
 
     let now = 1_700_000_000_000_i64;
     let token = format!("sk-ant-oat01-{}", "y".repeat(48));
@@ -691,7 +691,10 @@ fn write_session_token_produces_a_recognised_sidecar() {
             .expect("source")
             .ends_with("session-token.json")
     );
-    assert_eq!(session_token_expiry("cap"), Some(Some(stamped)));
+    assert_eq!(
+        session_token_status("cap"),
+        Some(SessionTokenStatus::LongLived(Some(stamped)))
+    );
 
     #[cfg(unix)]
     {
@@ -709,12 +712,50 @@ fn write_session_token_produces_a_recognised_sidecar() {
 }
 
 /// A hand-rolled sidecar without `expiresAt` still reports "present, horizon
-/// unknown" — never `None` (which would hide the session row entirely).
+/// unknown" — never `None` (which would hide the token row entirely).
 #[test]
-fn session_token_expiry_distinguishes_missing_from_unstamped() {
+fn session_token_status_distinguishes_missing_from_unstamped() {
     let _home = HomeSandbox::new();
     let profile = crate::profile::Profile::new("hand".to_string(), None, None);
     crate::profile::save_profile(&profile).expect("save profile");
     fill_session_token_by_hand("hand", "oat-access");
-    assert_eq!(session_token_expiry("hand"), Some(None));
+    assert_eq!(
+        session_token_status("hand"),
+        Some(SessionTokenStatus::LongLived(None))
+    );
+}
+
+// ── #53 review: the split engages only for a genuinely LONG-LIVED token ──────
+
+/// A sidecar mis-filled with a rotating pair (refresh token present) must NOT
+/// engage the split: it reads `NotLongLived`, `has_session_token` stays
+/// false, and the install source falls back to `credentials.json` exactly as
+/// if the sidecar weren't there — installing a dies-in-hours token with no
+/// refresher behind it is the failure this detection exists to prevent.
+#[test]
+fn a_rotating_pair_in_the_sidecar_never_engages_the_split() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("mis".to_string(), None, None);
+    profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    let dir = crate::profile::profile_dir("mis").expect("profile dir");
+    fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("rotating-access", Some("rotating-refresh")))
+            .expect("ser sidecar"),
+    )
+    .expect("write sidecar");
+
+    assert_eq!(
+        session_token_status("mis"),
+        Some(SessionTokenStatus::NotLongLived)
+    );
+    assert!(!has_session_token("mis"), "the split stays disengaged");
+    assert!(
+        install_source_path("mis")
+            .expect("source")
+            .ends_with("credentials.json"),
+        "switches keep installing the rotating pair from credentials.json"
+    );
 }

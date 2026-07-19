@@ -1269,22 +1269,32 @@ pub(crate) fn ensure_installable(
     // The token's own clock is the one thing worth checking: there is no
     // refresh chain to probe or repair, so a clock-dead static token would
     // otherwise install as-is and sign every session out (Incident C shape).
-    if crate::claude::has_session_token(name) {
-        let clock_dead = crate::claude::install_source_path(name)
-            .ok()
-            .and_then(|p| {
-                crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&p).ok()
-            })
-            .and_then(|t| t.access_token_expires_at())
-            .is_some_and(|exp| (now_ms() as i64) >= exp);
-        if clock_dead {
-            logline!(
-                "clauth: '{name}' session token has expired — re-mint with \
-                 `claude setup-token` and refill its session-token.json"
-            );
-            return AuthGate::Broken;
+    match crate::claude::session_token_status(name) {
+        Some(crate::claude::SessionTokenStatus::LongLived(expires_at)) => {
+            let clock_dead = expires_at.is_some_and(|exp| (now_ms() as i64) >= exp);
+            if clock_dead {
+                logline!(
+                    "clauth: '{name}' long-lived token has expired — re-mint with \
+                     `claude setup-token` (clauth login {name} --setup-token)"
+                );
+                return AuthGate::Broken;
+            }
+            return AuthGate::Ready;
         }
-        return AuthGate::Ready;
+        // #53 review: the split engages only for a token that actually IS
+        // long-lived. A sidecar holding a rotating pair is a mis-fill —
+        // installing it would front sessions with a dies-in-hours token and
+        // no refresher, so it is IGNORED (credentials.json installs below,
+        // exactly as if the sidecar weren't there) and called out here, the
+        // per-switch chokepoint, rather than on every hot-path stat.
+        Some(crate::claude::SessionTokenStatus::NotLongLived) => {
+            logline!(
+                "clauth: '{name}' session-token.json holds a rotating pair (refresh \
+                 token present), not a long-lived mint — ignoring it; re-capture \
+                 with `clauth login {name} --setup-token`"
+            );
+        }
+        None => {}
     }
     // Cheap pre-check WITHOUT the rotation guard: non-OAuth and
     // comfortably-live tokens install as-is. Token data read here is
