@@ -16,7 +16,7 @@ use super::super::theme;
 use super::panes::{
     bold_when, cycle_option, draw_scrolled_lines, draw_selector_list, head_cols,
     help_tooltip_lines, highlight_row, key_cell, label_style, master_detail, name_color,
-    picker_row, section_box, section_box_verbatim,
+    picker_row, pill, section_box, section_box_verbatim,
 };
 
 const KEY_W: usize = 11;
@@ -198,51 +198,65 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_settings_rows(frame, inner, app, &rows, cursor, &snap, actions_focused);
 }
 
-/// CLA-SPLIT status row: a profile carrying a long-lived-token sidecar runs
-/// its sessions on that static login, and the ~1yr horizon is the one thing
-/// about it worth watching — expired means every switch would sign sessions
-/// out, so it escalates to a DANGER re-mint hint (the same wording
-/// `ensure_installable` logs); the last 30 days warn. A mis-filled sidecar
-/// (rotating pair, split disengaged) reads as exactly that, in DANGER — the
-/// operator thinks the split is armed and it isn't.
-fn session_token_line(status: &crate::claude::SessionTokenStatus, now_ms: i64) -> Line<'static> {
+/// CLA-SPLIT status row (`token`): a profile carrying a long-lived-token sidecar
+/// runs its sessions on that static login, and the ~1yr horizon is the one thing
+/// about it worth watching. A comfortable horizon is a plain accent value; the
+/// last 30 days warn as a pill; expired and mis-filled escalate to a DANGER pill
+/// plus a `└` fix line — matching the usage-tab diagnostic shape. Expired means
+/// every switch would sign sessions out; a mis-filled sidecar (rotating pair,
+/// split disengaged) means the operator thinks the split is armed and it isn't.
+///
+/// Returns the row line plus, for the two charged states, an always-on `└` fix
+/// line (this row lives in the non-focusable header block, so the hint can't be
+/// focus-gated — it renders like the usage-tab status hints). `width` sizes the
+/// tooltip wrap.
+fn session_token_lines(
+    status: &crate::claude::SessionTokenStatus,
+    now_ms: i64,
+    width: usize,
+) -> Vec<Line<'static>> {
     use crate::claude::SessionTokenStatus;
-    let (text, style) = match status {
+    let key = || Span::styled(key_cell("token", KEY_W, KEY_GUTTER), theme::label());
+    let plain =
+        |text: String, style: Style| vec![Line::from(vec![key(), Span::styled(text, style)])];
+    let pill_row =
+        |label: String, style: Style| Line::from([vec![key()], pill(label, style)].concat());
+    // A charged state = pill row + a `└ fix` line (reuses the help-tooltip leader).
+    let charged = |label: String, fix: &str| {
+        let mut lines = vec![pill_row(label, theme::danger().bold())];
+        lines.extend(help_tooltip_lines(fix, width));
+        lines
+    };
+
+    match status {
         SessionTokenStatus::LongLived(Some(ms)) => {
             if now_ms >= *ms {
-                (
-                    "expired · re-mint: claude setup-token".to_string(),
-                    theme::danger(),
-                )
+                charged("expired".to_string(), "re-mint with claude setup-token")
             } else {
                 // Truncating division: an expiry inside the next 24h reads
-                // "~0d" and still warns; only a past expiry (handled above)
-                // is DANGER, so a sub-day-expired token no longer mislabels as
+                // "~0d" and still warns; only a past expiry (handled above) is
+                // DANGER, so a sub-day-expired token no longer mislabels as
                 // "~0d / warning" while the install gate already refuses it.
                 let days = (ms - now_ms) / 86_400_000;
                 if days <= 30 {
-                    (
-                        format!("long-lived · expires in ~{days}d"),
-                        theme::warning(),
-                    )
+                    vec![pill_row(
+                        format!("expires in ~{days}d"),
+                        theme::warning().bold(),
+                    )]
                 } else {
-                    (format!("long-lived · expires in ~{days}d"), theme::accent())
+                    plain(format!("long-lived · ~{days}d left"), theme::accent())
                 }
             }
         }
-        SessionTokenStatus::LongLived(None) => (
+        SessionTokenStatus::LongLived(None) => plain(
             "long-lived · no recorded expiry".to_string(),
             theme::accent(),
         ),
-        SessionTokenStatus::NotLongLived => (
-            "not long-lived (has a refresh token) · ignored".to_string(),
-            theme::danger(),
+        SessionTokenStatus::NotLongLived => charged(
+            "mis-filled".to_string(),
+            "sidecar has a refresh token, split is off",
         ),
-    };
-    Line::from(vec![
-        Span::styled(key_cell("token", KEY_W, KEY_GUTTER), theme::label()),
-        Span::styled(text, style),
-    ])
+    }
 }
 
 fn draw_settings_rows(
@@ -285,7 +299,11 @@ fn draw_settings_rows(
     }
 
     if let Some(status) = &snap.session_token {
-        lines.push(session_token_line(status, crate::usage::now_ms() as i64));
+        lines.extend(session_token_lines(
+            status,
+            crate::usage::now_ms() as i64,
+            inner.width as usize,
+        ));
     }
 
     lines.push(Line::from(""));

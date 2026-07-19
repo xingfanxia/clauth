@@ -283,11 +283,22 @@ fn render_overview_row(
         }
     };
 
+    // Long-lived-token state from the per-frame-free cache (App::session_tokens).
+    // `token_danger` (expired or mis-filled) drives the `⊘` marker; `token_mode`
+    // (running on a genuine long-lived token) drives the type tag below.
+    let token_status = app.session_tokens.get(&name_str);
+    let token_danger = token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
+    let token_mode = token_status.is_some_and(|s| s.is_long_lived_mode());
+
     let mut spans = vec![cursor];
-    // Marker precedence: broken login (×) > bell (!) > active (●) — a dead
-    // login makes usage alerts moot until re-login.
+    // Marker precedence: broken login (×) > token danger (⊘) > bell (!) > active
+    // (●). A dead login makes usage alerts moot until re-login; a dead / mis-filled
+    // long-lived token signs sessions out on the next switch, so it outranks a bell.
     if cfg.is_auth_broken(&profile.name) {
         spans.push(Span::styled("×", theme::danger()));
+        spans.push(Span::raw(" "));
+    } else if token_danger {
+        spans.push(Span::styled("⊘", theme::danger()));
         spans.push(Span::raw(" "));
     } else if app.bell_fired.contains_key(&name_str) {
         spans.push(Span::styled("!", theme::danger()));
@@ -303,7 +314,13 @@ fn render_overview_row(
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
     spans.push(gap(widths));
-    let label = account_type_label(profile);
+    // Type tag: a session-token profile appends ` ·token` so its mode reads on
+    // the list without drilling into Setup. The tag trails the tier, so
+    // `fixed_split` drops it first under width pressure (tier stays legible).
+    let mut label = account_type_label(profile);
+    if token_mode {
+        label.push_str(" ·token");
+    }
     if profile.credentials.is_some() {
         let (clamped, pad) = fixed_split(&label, widths.kind);
         let elapsed = app.started_at.elapsed().as_millis() as u64;

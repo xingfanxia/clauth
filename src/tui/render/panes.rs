@@ -149,6 +149,18 @@ pub(super) fn name_color(active: bool) -> Style {
     }
 }
 
+/// cloudy-tui status pill `[ label ]`: brackets in `TEXT_DIM`, the label in the
+/// caller's semantic style (bold for a charged state). Returns the three spans
+/// so a caller can compose them after a key cell; wrap in a `Line` for a
+/// standalone pill.
+pub(super) fn pill(label: String, label_style: Style) -> Vec<Span<'static>> {
+    vec![
+        Span::styled("[ ", theme::dim()),
+        Span::styled(label, label_style),
+        Span::styled(" ]", theme::dim()),
+    ]
+}
+
 pub(super) fn picker_row(
     selected: bool,
     focused: bool,

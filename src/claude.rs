@@ -49,6 +49,27 @@ pub(crate) enum SessionTokenStatus {
     NotLongLived,
 }
 
+impl SessionTokenStatus {
+    /// Whether this profile actually runs its sessions on a long-lived token —
+    /// the "token mode" the overview type tag marks. A `NotLongLived` sidecar is
+    /// disengaged (sessions run on `credentials.json`), so it is NOT token mode.
+    pub(crate) fn is_long_lived_mode(&self) -> bool {
+        matches!(self, SessionTokenStatus::LongLived(_))
+    }
+
+    /// Whether the sidecar is in a state a switch would install to sessions'
+    /// harm: an expired long-lived token (every switch signs sessions out) or a
+    /// mis-fill the operator believes is armed. Drives the overview `⊘` marker.
+    /// A stamped-but-live or unstamped long-lived token is fine (`false`).
+    pub(crate) fn is_danger(&self, now_ms: i64) -> bool {
+        match self {
+            SessionTokenStatus::LongLived(Some(ms)) => now_ms >= *ms,
+            SessionTokenStatus::LongLived(None) => false,
+            SessionTokenStatus::NotLongLived => true,
+        }
+    }
+}
+
 /// Content-aware read of a profile's sidecar: `None` = no sidecar (or one too
 /// corrupt to parse a login out of — same disengaged outcome either way).
 pub(crate) fn session_token_status(name: &str) -> Option<SessionTokenStatus> {

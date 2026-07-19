@@ -1031,8 +1031,8 @@ fn reload_fingerprint_bumps_when_a_config_toml_is_added() {
         before
             .config_mtimes
             .iter()
-            .find(|(n, _)| n == "newcomer")
-            .map(|(_, m)| m.is_some()),
+            .find(|(n, _, _)| n == "newcomer")
+            .map(|(_, m, _)| m.is_some()),
         Some(false),
         "the dir exists but has no config.toml yet"
     );
@@ -1042,8 +1042,8 @@ fn reload_fingerprint_bumps_when_a_config_toml_is_added() {
         after
             .config_mtimes
             .iter()
-            .find(|(n, _)| n == "newcomer")
-            .map(|(_, m)| m.is_some()),
+            .find(|(n, _, _)| n == "newcomer")
+            .map(|(_, m, _)| m.is_some()),
         Some(true),
         "adding a config.toml gives the entry an mtime"
     );
@@ -1059,16 +1059,16 @@ fn reload_fingerprint_advances_when_a_config_toml_is_edited() {
     let before_mtime = before
         .config_mtimes
         .iter()
-        .find(|(n, _)| n == "p")
-        .and_then(|(_, m)| *m);
+        .find(|(n, _, _)| n == "p")
+        .and_then(|(_, m, _)| *m);
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
     crate::testutil::set_mtime(&cfg, later);
     let after = reload_fingerprint();
     let after_mtime = after
         .config_mtimes
         .iter()
-        .find(|(n, _)| n == "p")
-        .and_then(|(_, m)| *m);
+        .find(|(n, _, _)| n == "p")
+        .and_then(|(_, m, _)| *m);
     assert!(
         after_mtime > before_mtime,
         "editing a config.toml must advance its recorded mtime"
@@ -1089,7 +1089,7 @@ fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
         before
             .config_mtimes
             .iter()
-            .any(|(n, m)| n == "p" && m.is_some()),
+            .any(|(n, m, _)| n == "p" && m.is_some()),
         "the saved profile has a config.toml"
     );
     std::fs::remove_file(&cfg).expect("remove config");
@@ -1098,10 +1098,37 @@ fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
         after
             .config_mtimes
             .iter()
-            .any(|(n, m)| n == "p" && m.is_none()),
+            .any(|(n, m, _)| n == "p" && m.is_none()),
         "removing the config.toml drops its recorded mtime to None"
     );
     assert_ne!(before, after);
+}
+
+// A `login --setup-token` re-mint writes only `session-token.json` (touches no
+// config.toml, no profiles.toml), so the fingerprint must fold that file in or
+// the hot reload never sees a new / re-minted long-lived token.
+#[test]
+fn reload_fingerprint_bumps_when_a_session_token_is_added_or_changed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    let sidecar = profile_dir("p")
+        .expect("profile_dir")
+        .join("session-token.json");
+    let before = reload_fingerprint();
+    std::fs::write(&sidecar, b"{}\n").expect("write sidecar");
+    let after_add = reload_fingerprint();
+    assert_ne!(
+        before, after_add,
+        "adding a session-token.json must trip the fingerprint"
+    );
+
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
+    crate::testutil::set_mtime(&sidecar, later);
+    let after_edit = reload_fingerprint();
+    assert_ne!(
+        after_add, after_edit,
+        "a re-mint (session-token.json mtime change) must trip the fingerprint"
+    );
 }
 
 /// Regression: an edit to a config.toml that is NOT the newest one — its mtime

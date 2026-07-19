@@ -351,6 +351,71 @@ fn bell_marker_shows_when_login_is_fine() {
     assert!(!text.contains('×'), "{text}");
 }
 
+/// A dead / mis-filled long-lived token (⊘) outranks bell (!) and active (●):
+/// the next switch would sign sessions out, so it beats a usage alert.
+#[test]
+fn token_danger_marker_outranks_bell_and_active() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec![]); // active
+    let mut app = App::new(config);
+    app.bell_fired.insert("a".into(), true); // bell also fired
+    app.session_tokens
+        .insert("a".into(), crate::claude::SessionTokenStatus::NotLongLived);
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let text = line_text(&line);
+    assert!(text.contains('⊘'), "mis-filled token renders ⊘: {text}");
+    assert!(!text.contains('!'), "bell yields to ⊘: {text}");
+    assert!(!text.contains('●'), "active dot yields to ⊘: {text}");
+    let marker = line.spans.iter().find(|s| s.content == "⊘").unwrap();
+    assert_eq!(marker.style.fg, theme::danger().fg);
+}
+
+/// But a broken login (×) still wins over a token-danger marker.
+#[test]
+fn broken_login_outranks_token_danger_marker() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let mut config = config_with(vec![a], Some("a"), vec![]);
+    config.state.auth_broken.push("a".into());
+    let mut app = App::new(config);
+    app.session_tokens
+        .insert("a".into(), crate::claude::SessionTokenStatus::NotLongLived);
+    let widths = OverviewWidths::new(80, &app);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    assert!(text.contains('×'), "broken login wins: {text}");
+    assert!(!text.contains('⊘'), "token marker yields to ×: {text}");
+}
+
+/// A live long-lived token tags the type column (·token) and raises no marker;
+/// an expired one raises the ⊘ danger marker.
+#[test]
+fn long_lived_token_tags_type_column_and_expired_marks() {
+    use crate::claude::SessionTokenStatus as S;
+    let day = 86_400_000_i64;
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], None, vec![]);
+    let mut app = App::new(config);
+    // Wide terminal so the type column isn't clamped narrow enough to drop the tag.
+    let widths = OverviewWidths::new(120, &app);
+
+    app.session_tokens
+        .insert("a".into(), S::LongLived(Some(now_ms() as i64 + 340 * day)));
+    let live = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    assert!(
+        live.contains("·token"),
+        "type column tags token mode: {live}"
+    );
+    assert!(
+        !live.contains('⊘'),
+        "a live token raises no danger marker: {live}"
+    );
+
+    app.session_tokens
+        .insert("a".into(), S::LongLived(Some(now_ms() as i64 - day)));
+    let dead = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    assert!(dead.contains('⊘'), "expired token raises ⊘: {dead}");
+}
+
 /// The stale-data cue lives on the refresh countdown now — an underlined name
 /// would double-signal, and the bar brackets stay plain dim.
 #[test]

@@ -22,7 +22,7 @@ use super::super::app::{
 use super::super::theme;
 use super::panes::{
     bold_when, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
-    invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, section_box,
+    invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill, section_box,
     section_box_verbatim, select_line, wrap_words,
 };
 use crate::fallback::{
@@ -278,11 +278,7 @@ fn reason_pill(reason: &BlockedReason) -> Line<'static> {
         ),
         BlockedReason::Stale => ("stale data".to_string(), theme::dim().bold()),
     };
-    Line::from(vec![
-        Span::styled("[ ", theme::dim()),
-        Span::styled(label, style),
-        Span::styled(" ]", theme::dim()),
-    ])
+    Line::from(pill(label, style))
 }
 
 /// Priority, 5h gauge with threshold tick, headroom figure, and the

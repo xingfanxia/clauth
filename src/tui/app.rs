@@ -1439,6 +1439,26 @@ pub(crate) struct App {
     /// Last-seen usage per profile, keyed by name.
     /// Used to detect fresh fetches and append history JSONL lines.
     pub(crate) last_history_usage: HashMap<String, UsageInfo>,
+
+    /// Cached long-lived-token status per profile, keyed by name (absent when a
+    /// profile has no sidecar). Read by the Overview render for the `⊘` danger
+    /// marker + the type tag, so it needn't stat each `session-token.json` per
+    /// frame. Seeded at construct and refreshed on config reload; the expiry
+    /// stamp it carries is compared to live `now_ms` at render time, so the
+    /// clock ticking past expiry never needs a re-read — only an add / delete /
+    /// re-mint does, which `reload_fingerprint` now catches.
+    pub(crate) session_tokens: HashMap<String, crate::claude::SessionTokenStatus>,
+}
+
+/// Read every named profile's long-lived-token status for the Overview cache.
+/// Reads each `session-token.json` off disk, so callers gather the names under a
+/// brief config guard and call this with the guard already dropped — the read
+/// never happens while the config lock is held.
+fn collect_session_tokens(names: &[String]) -> HashMap<String, crate::claude::SessionTokenStatus> {
+    names
+        .iter()
+        .filter_map(|n| crate::claude::session_token_status(n).map(|s| (n.clone(), s)))
+        .collect()
 }
 
 /// Cloned `Arc`s bundled for [`spawn_refresher`]; carries no lock rank and is
@@ -1587,6 +1607,15 @@ impl App {
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
 
+        // Seed the token cache before `config` moves into the handle below.
+        let session_tokens = collect_session_tokens(
+            &config
+                .profiles
+                .iter()
+                .map(|p| p.name.to_string())
+                .collect::<Vec<_>>(),
+        );
+
         Self {
             config: Arc::new(RankedMutex::new(config)),
             usage_store,
@@ -1674,6 +1703,7 @@ impl App {
             history_cache,
             history_mtimes,
             last_history_usage: HashMap::new(),
+            session_tokens,
         }
     }
 
@@ -2037,19 +2067,24 @@ impl App {
         if let Ok(fresh) = load_config() {
             *self.config() = fresh;
             self.last_reload_fp = current;
-            let cfg = self.config();
-            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-            {
-                *self
-                    .usage_tokens
-                    .lock()
-                    .expect("usage_tokens mutex poisoned") = collect_tokens(&cfg);
-                *self
-                    .third_party_tokens
-                    .lock()
-                    .expect("third_party_tokens mutex poisoned") =
-                    collect_third_party_entries(&cfg.profiles);
-            }
+            let names: Vec<String> = {
+                let cfg = self.config();
+                #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+                {
+                    *self
+                        .usage_tokens
+                        .lock()
+                        .expect("usage_tokens mutex poisoned") = collect_tokens(&cfg);
+                    *self
+                        .third_party_tokens
+                        .lock()
+                        .expect("third_party_tokens mutex poisoned") =
+                        collect_third_party_entries(&cfg.profiles);
+                }
+                cfg.profiles.iter().map(|p| p.name.to_string()).collect()
+            };
+            // Sidecar reads happen with the config guard dropped (above scope).
+            self.session_tokens = collect_session_tokens(&names);
             true
         } else {
             false

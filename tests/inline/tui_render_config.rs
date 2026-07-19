@@ -132,65 +132,93 @@ fn setup_hints_follow_the_row_value() {
 
 // ── CLA-SPLIT: the `token` long-lived-login status row ──────────────────────
 
-// The row states the horizon in days and escalates: accent while comfortable,
-// WARNING inside 30 days, DANGER + the re-mint hint once expired; a sidecar
-// without a stamp says so; a mis-filled rotating pair reads as disengaged in
-// DANGER (the operator thinks the split is armed and it isn't).
+// A comfortable horizon is a plain accent value; the last 30 days warn as a
+// pill; expired and mis-filled escalate to a DANGER pill plus a `└` fix line
+// (the operator thinks the split is armed and it isn't). Unstamped says so.
 #[test]
 fn long_lived_token_row_counts_down_and_escalates() {
     use crate::claude::SessionTokenStatus as S;
     let day = 86_400_000_i64;
     let now = 1_700_000_000_000_i64;
+    let w = 60usize;
+    let text = |ls: &[Line<'static>]| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect()
+    };
+    // Match on fg only, so the pill label's added BOLD doesn't defeat the check.
+    let has_color = |ls: &[Line<'static>], st: Style| {
+        ls.iter()
+            .flat_map(|l| &l.spans)
+            .any(|s| s.style.fg == st.fg)
+    };
 
-    let comfy = line_text(&session_token_line(
-        &S::LongLived(Some(now + 340 * day)),
-        now,
-    ));
-    assert!(comfy.contains("token"), "{comfy}");
-    assert!(comfy.contains("long-lived · expires in ~340d"), "{comfy}");
+    // Comfortable horizon: a plain accent value, no pill, one line.
+    let comfy = session_token_lines(&S::LongLived(Some(now + 340 * day)), now, w);
+    assert_eq!(comfy.len(), 1);
+    let comfy_t = text(&comfy);
+    assert!(comfy_t.contains("token"), "{comfy_t}");
+    assert!(comfy_t.contains("long-lived · ~340d left"), "{comfy_t}");
+    assert!(
+        !comfy_t.contains('['),
+        "comfortable is a value, not a pill: {comfy_t}"
+    );
+    assert!(has_color(&comfy, theme::accent()));
 
-    let soon = session_token_line(&S::LongLived(Some(now + 12 * day)), now);
-    assert!(line_text(&soon).contains("expires in ~12d"));
+    // Last 30 days: a WARNING pill, still one line, no fix.
+    let soon = session_token_lines(&S::LongLived(Some(now + 12 * day)), now, w);
+    assert_eq!(soon.len(), 1);
     assert!(
-        soon.spans.iter().any(|s| s.style == theme::warning()),
-        "last 30 days warn"
+        text(&soon).contains("[ expires in ~12d ]"),
+        "{}",
+        text(&soon)
     );
+    assert!(has_color(&soon, theme::warning()), "last 30 days warn");
 
-    let dead = session_token_line(&S::LongLived(Some(now - day)), now);
-    let dead_text = line_text(&dead);
+    // Expired: DANGER pill + a `└` re-mint fix line.
+    let dead = session_token_lines(&S::LongLived(Some(now - day)), now, w);
+    assert_eq!(dead.len(), 2, "expired = pill + fix line");
+    let dead_t = text(&dead);
+    assert!(dead_t.contains("[ expired ]"), "{dead_t}");
     assert!(
-        dead_text.contains("re-mint: claude setup-token"),
-        "{dead_text}"
+        dead_t.contains("re-mint with claude setup-token"),
+        "{dead_t}"
     );
-    assert!(
-        dead.spans.iter().any(|s| s.style == theme::danger()),
-        "expired is DANGER"
-    );
+    assert!(has_color(&dead, theme::danger()), "expired is DANGER");
 
-    // Expired within the last 24h: truncating division gives 0 days, so the old
-    // `days < 0` check mislabeled it "~0d / warning". It must read as expired.
-    let just_dead = session_token_line(&S::LongLived(Some(now - day / 2)), now);
-    let just_dead_text = line_text(&just_dead);
+    // Expired within the last 24h: truncating division gives 0 days; it must
+    // read as expired, not "~0d / warning".
+    let just_dead = session_token_lines(&S::LongLived(Some(now - day / 2)), now, w);
+    let just_dead_t = text(&just_dead);
     assert!(
-        just_dead_text.contains("expired"),
-        "a token expired <24h ago is expired, not ~0d: {just_dead_text}"
+        just_dead_t.contains("[ expired ]"),
+        "a token expired <24h ago is expired, not ~0d: {just_dead_t}"
     );
     assert!(
-        just_dead.spans.iter().any(|s| s.style == theme::danger()),
+        has_color(&just_dead, theme::danger()),
         "sub-day-expired is DANGER"
     );
 
-    let unstamped = line_text(&session_token_line(&S::LongLived(None), now));
-    assert!(unstamped.contains("no recorded expiry"), "{unstamped}");
-
-    let misfilled = session_token_line(&S::NotLongLived, now);
-    let misfilled_text = line_text(&misfilled);
+    // Unstamped long-lived: a plain accent value.
+    let unstamped = session_token_lines(&S::LongLived(None), now, w);
+    assert_eq!(unstamped.len(), 1);
     assert!(
-        misfilled_text.contains("not long-lived") && misfilled_text.contains("ignored"),
-        "{misfilled_text}"
+        text(&unstamped).contains("no recorded expiry"),
+        "{}",
+        text(&unstamped)
+    );
+
+    // Mis-filled (rotating pair): DANGER pill + fix, split disengaged.
+    let misfilled = session_token_lines(&S::NotLongLived, now, w);
+    assert_eq!(misfilled.len(), 2, "mis-filled = pill + fix line");
+    let mis_t = text(&misfilled);
+    assert!(mis_t.contains("[ mis-filled ]"), "{mis_t}");
+    assert!(
+        mis_t.contains("sidecar has a refresh token, split is off"),
+        "{mis_t}"
     );
     assert!(
-        misfilled.spans.iter().any(|s| s.style == theme::danger()),
+        has_color(&misfilled, theme::danger()),
         "a disengaged sidecar is DANGER"
     );
 }
