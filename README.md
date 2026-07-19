@@ -161,7 +161,7 @@ The active profile shows in orange. Usage bars are cached locally, so they stay 
 | **Tokens** | global Claude Code token stats + API-equivalent cost across all models |
 | **Setup** | endpoint, key, env, auto-start, per-profile model routing |
 | **Fallback** | chain editor |
-| **Config** | theme, refresh interval, wrap-off, divergence default |
+| **Config** | theme, reset display, refresh interval, wrap-off, divergence default |
 | **Status** | Claude incident feed |
 | **Plugin** | Claude Code wiring + per-profile runtime, with one-key fixes |
 
