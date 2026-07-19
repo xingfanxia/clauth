@@ -259,13 +259,16 @@ fn classify_link_linked_to_even_when_target_missing() {
 // fires) and both BRANCHES (confirm overwrites/captures, cancel is a no-op) at
 // the home-derived seam the prompt actually drives, no TTY needed.
 
-#[cfg(unix)]
+// Not `#[cfg(unix)]`: the ungated session-token tests below use HomeSandbox on
+// every platform (it writes only a tempdir + files, no symlinks), so gating the
+// import broke the Windows test build.
 use crate::testutil::HomeSandbox;
 
 /// Seed an active profile `name` with stored credentials, then simulate CC
 /// re-logging into a different account: write a plain (non-symlink) live
 /// `~/.claude/.credentials.json` carrying `live`. Returns the assembled config.
-#[cfg(unix)]
+// Not `#[cfg(unix)]`: writes only plain files, and the ungated session-token
+// tests call it on Windows too.
 fn seed_relogin_scenario(
     name: &str,
     stored: ClaudeCredentials,
@@ -523,4 +526,275 @@ fn live_credentials_are_shell_requires_a_parsed_empty_login() {
     )
     .expect("write live");
     assert!(!live_credentials_are_shell());
+}
+
+// ── CLA-SPLIT: long-lived session token beside the usage OAuth pair ───────────
+
+/// Write a `session-token.json` (static long-lived login) into `name`'s
+/// profile dir, as the split-credential fill does.
+fn fill_session_token_by_hand(name: &str, access: &str) {
+    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    fs::create_dir_all(&dir).expect("mkdir profile");
+    fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds(access, None)).expect("ser session token"),
+    )
+    .expect("write session token");
+}
+
+/// The install source is `credentials.json` until a session token appears,
+/// then the session token — and never the OAuth pair while it exists.
+#[test]
+fn install_source_prefers_session_token() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("split".to_string(), None, None);
+    profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    assert!(!has_session_token("split"));
+    assert!(
+        install_source_path("split")
+            .expect("source")
+            .ends_with("credentials.json")
+    );
+
+    fill_session_token_by_hand("split", "oat-access");
+    assert!(has_session_token("split"));
+    assert!(
+        install_source_path("split")
+            .expect("source")
+            .ends_with("session-token.json")
+    );
+}
+
+/// A live slot holding the profile's static session token is the designed
+/// steady state: LinkedTo (the divergence machinery stays dormant), and a
+/// snapshot leaves the clauth-private usage OAuth pair untouched instead of
+/// clobbering it with the token just read.
+#[test]
+fn session_token_live_is_linked_and_snapshot_keeps_usage_oauth() {
+    let _home = HomeSandbox::new();
+    let mut config = seed_relogin_scenario(
+        "split",
+        creds("usage-access", Some("usage-refresh")),
+        creds("oat-access", None),
+    );
+    fill_session_token_by_hand("split", "oat-access");
+
+    assert_eq!(
+        classify_credentials_link("split").expect("classify"),
+        LinkState::LinkedTo,
+        "live slot holding the session token is the steady state, not divergence",
+    );
+
+    snapshot_active_credentials(&mut config).expect("snapshot");
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("split")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("usage-refresh"),
+        "snapshot must never overwrite the usage OAuth pair with the session token",
+    );
+}
+
+/// A switch to a session-token profile links the LIVE slot to
+/// `session-token.json` — the rotating usage pair is never installed, and it
+/// survives the switch on disk byte-for-byte.
+#[cfg(unix)]
+#[test]
+fn switch_installs_session_token_not_usage_oauth() {
+    let _home = HomeSandbox::new();
+
+    let mut a = crate::profile::Profile::new("a".to_string(), None, None);
+    a.credentials = Some(creds("at-a", Some("rt-a")));
+    crate::profile::save_profile(&a).expect("save a");
+    let mut b = crate::profile::Profile::new("b".to_string(), None, None);
+    b.credentials = Some(creds("usage-access-b", Some("usage-refresh-b")));
+    crate::profile::save_profile(&b).expect("save b");
+    fill_session_token_by_hand("b", "oat-b");
+
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![a, b],
+    };
+    config.state.profiles = vec!["a".into(), "b".into()];
+    config.state.active_profile = Some("a".into());
+    force_link_profile_credentials("a").expect("link a");
+
+    crate::actions::switch_profile(&mut config, "b").expect("switch to b");
+
+    let live_target =
+        std::fs::read_link(claude_credentials_path().expect("path")).expect("live is a symlink");
+    assert!(
+        live_target.ends_with("session-token.json"),
+        "the live slot must point at b's session token, got {live_target:?}",
+    );
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("b")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read b store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("usage-refresh-b"),
+        "b's usage OAuth pair must survive the switch untouched",
+    );
+}
+
+// ── CLA-SPLIT-2: the `--setup-token` capture flow's building blocks ───────────
+
+/// The paste validator refuses everything but a clean single-token mint: a
+/// broken sidecar signs every session out on first use, so the failure has to
+/// happen at the paste, loudly, and without echoing the value.
+#[test]
+fn validate_setup_token_accepts_a_mint_and_rejects_bad_pastes() {
+    let good = format!("sk-ant-oat01-{}", "x".repeat(48));
+    assert_eq!(
+        validate_setup_token(&format!("  {good}\n")).expect("valid"),
+        good,
+        "surrounding whitespace trims away"
+    );
+    assert!(validate_setup_token("").is_err(), "empty paste");
+    assert!(validate_setup_token("   \n").is_err(), "blank paste");
+    assert!(
+        validate_setup_token("api-key-not-a-mint-0123456789012345678901234567890").is_err(),
+        "wrong prefix"
+    );
+    assert!(
+        validate_setup_token(&format!("Setup token: {good}")).is_err(),
+        "paste with prompt text has interior whitespace"
+    );
+    assert!(
+        validate_setup_token("sk-ant-short").is_err(),
+        "truncated paste"
+    );
+    assert!(
+        validate_setup_token(&format!("sk-ant-api03-{}", "z".repeat(48))).is_err(),
+        "an API key must be rejected, not installed as the session bearer",
+    );
+}
+
+/// Force-snapshot (the divergence-modal "overwrite" and the CLI reconciled
+/// switch both reach it) must never capture the live login into a session-token
+/// profile's clauth-private usage OAuth pair. Here the live slot holds a FOREIGN
+/// login; the guard at the shared sink leaves the stored usage pair intact.
+#[test]
+fn force_snapshot_never_clobbers_the_session_token_usage_pair() {
+    let _home = HomeSandbox::new();
+    let mut config = seed_relogin_scenario(
+        "split",
+        creds("usage-access", Some("usage-refresh")),
+        creds("foreign-access", Some("foreign-refresh")),
+    );
+    fill_session_token_by_hand("split", "oat-access");
+
+    force_snapshot_active_credentials(&mut config).expect("force snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("split")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("usage-refresh"),
+        "force-snapshot must leave the clauth-private usage OAuth pair untouched",
+    );
+}
+
+/// The capture writes a sidecar the whole CLA-SPLIT machinery recognises:
+/// `has_session_token` flips, the install source re-points, the stamped
+/// one-year horizon reads back through `session_token_expiry`, and the file
+/// carries credential permissions.
+#[test]
+fn write_session_token_produces_a_recognised_sidecar() {
+    let _home = HomeSandbox::new();
+    let profile = crate::profile::Profile::new("cap".to_string(), None, None);
+    crate::profile::save_profile(&profile).expect("save profile");
+    assert_eq!(session_token_status("cap"), None, "no sidecar yet");
+
+    let now = 1_700_000_000_000_i64;
+    let token = format!("sk-ant-oat01-{}", "y".repeat(48));
+    let stamped = write_session_token("cap", &token, now).expect("write sidecar");
+    assert_eq!(stamped, now + SETUP_TOKEN_ASSUMED_LIFETIME_MS);
+
+    assert!(has_session_token("cap"));
+    assert!(
+        install_source_path("cap")
+            .expect("source")
+            .ends_with("session-token.json")
+    );
+    assert_eq!(
+        session_token_status("cap"),
+        Some(SessionTokenStatus::LongLived(Some(stamped)))
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(
+            crate::profile::profile_dir("cap")
+                .expect("dir")
+                .join("session-token.json"),
+        )
+        .expect("meta")
+        .permissions()
+        .mode();
+        assert_eq!(mode & 0o777, 0o600, "sidecar is a credential file");
+    }
+}
+
+/// A hand-rolled sidecar without `expiresAt` still reports "present, horizon
+/// unknown" — never `None` (which would hide the token row entirely).
+#[test]
+fn session_token_status_distinguishes_missing_from_unstamped() {
+    let _home = HomeSandbox::new();
+    let profile = crate::profile::Profile::new("hand".to_string(), None, None);
+    crate::profile::save_profile(&profile).expect("save profile");
+    fill_session_token_by_hand("hand", "oat-access");
+    assert_eq!(
+        session_token_status("hand"),
+        Some(SessionTokenStatus::LongLived(None))
+    );
+}
+
+// ── #53 review: the split engages only for a genuinely LONG-LIVED token ──────
+
+/// A sidecar mis-filled with a rotating pair (refresh token present) must NOT
+/// engage the split: it reads `NotLongLived`, `has_session_token` stays
+/// false, and the install source falls back to `credentials.json` exactly as
+/// if the sidecar weren't there — installing a dies-in-hours token with no
+/// refresher behind it is the failure this detection exists to prevent.
+#[test]
+fn a_rotating_pair_in_the_sidecar_never_engages_the_split() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("mis".to_string(), None, None);
+    profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    let dir = crate::profile::profile_dir("mis").expect("profile dir");
+    fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("rotating-access", Some("rotating-refresh")))
+            .expect("ser sidecar"),
+    )
+    .expect("write sidecar");
+
+    assert_eq!(
+        session_token_status("mis"),
+        Some(SessionTokenStatus::NotLongLived)
+    );
+    assert!(!has_session_token("mis"), "the split stays disengaged");
+    assert!(
+        install_source_path("mis")
+            .expect("source")
+            .ends_with("credentials.json"),
+        "switches keep installing the rotating pair from credentials.json"
+    );
 }

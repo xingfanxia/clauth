@@ -92,6 +92,11 @@ struct Snap {
     captured: bool,
     /// Recognised third-party provider display name, if any.
     provider: Option<&'static str>,
+    /// CLA-SPLIT sidecar state (`claude::session_token_status`): `None` = no
+    /// sidecar; long-lived with its stamped horizon, or the mis-filled
+    /// not-long-lived shape the split disengages for. Read per frame for the
+    /// selected profile only (one small file).
+    session_token: Option<crate::claude::SessionTokenStatus>,
 }
 
 impl Snap {
@@ -113,6 +118,7 @@ impl Snap {
             login_is_oauth: true,
             captured: false,
             provider: None,
+            session_token: None,
         }
     }
 }
@@ -165,6 +171,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             login_is_oauth: p.login_is_oauth(),
             captured: false,
             provider: p.provider.map(|p| p.display_name()),
+            session_token: crate::claude::session_token_status(p.name.as_str()),
         },
         None => Snap::blank("settings"),
     }
@@ -189,6 +196,53 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cursor = app.config_action_cursor.min(rows.len().saturating_sub(1));
 
     draw_settings_rows(frame, inner, app, &rows, cursor, &snap, actions_focused);
+}
+
+/// CLA-SPLIT status row: a profile carrying a long-lived-token sidecar runs
+/// its sessions on that static login, and the ~1yr horizon is the one thing
+/// about it worth watching — expired means every switch would sign sessions
+/// out, so it escalates to a DANGER re-mint hint (the same wording
+/// `ensure_installable` logs); the last 30 days warn. A mis-filled sidecar
+/// (rotating pair, split disengaged) reads as exactly that, in DANGER — the
+/// operator thinks the split is armed and it isn't.
+fn session_token_line(status: &crate::claude::SessionTokenStatus, now_ms: i64) -> Line<'static> {
+    use crate::claude::SessionTokenStatus;
+    let (text, style) = match status {
+        SessionTokenStatus::LongLived(Some(ms)) => {
+            if now_ms >= *ms {
+                (
+                    "expired · re-mint: claude setup-token".to_string(),
+                    theme::danger(),
+                )
+            } else {
+                // Truncating division: an expiry inside the next 24h reads
+                // "~0d" and still warns; only a past expiry (handled above)
+                // is DANGER, so a sub-day-expired token no longer mislabels as
+                // "~0d / warning" while the install gate already refuses it.
+                let days = (ms - now_ms) / 86_400_000;
+                if days <= 30 {
+                    (
+                        format!("long-lived · expires in ~{days}d"),
+                        theme::warning(),
+                    )
+                } else {
+                    (format!("long-lived · expires in ~{days}d"), theme::accent())
+                }
+            }
+        }
+        SessionTokenStatus::LongLived(None) => (
+            "long-lived · no recorded expiry".to_string(),
+            theme::accent(),
+        ),
+        SessionTokenStatus::NotLongLived => (
+            "not long-lived (has a refresh token) · ignored".to_string(),
+            theme::danger(),
+        ),
+    };
+    Line::from(vec![
+        Span::styled(key_cell("token", KEY_W, KEY_GUTTER), theme::label()),
+        Span::styled(text, style),
+    ])
 }
 
 fn draw_settings_rows(
@@ -230,11 +284,17 @@ fn draw_settings_rows(
         ]));
     }
 
+    if let Some(status) = &snap.session_token {
+        lines.push(session_token_line(status, crate::usage::now_ms() as i64));
+    }
+
     lines.push(Line::from(""));
     // Tracks the absolute line index + buffer + row of the active edit row for
-    // cursor placement after rendering. `lines` starts with [type (, provider), blank].
+    // cursor placement after rendering. The header block above is variable
+    // (type + optional provider + optional session + blank), so the row loop's
+    // base index is simply what has been pushed so far.
     let mut edit_caret: Option<(u16, InputState, ConfigRow)> = None;
-    let mut line_idx: u16 = if provider_label.is_some() { 3 } else { 2 };
+    let mut line_idx: u16 = lines.len() as u16;
 
     // Start + end of the focused row's block (row plus its tooltip lines), so a
     // wrapped hint can't scroll off the bottom while its row stays visible.

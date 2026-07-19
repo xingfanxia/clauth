@@ -991,7 +991,12 @@ pub(crate) fn apply_rotated_tokens_locked(
         clear_staged_credentials(name);
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() && cfg.is_active(name) {
-            if live_login_is_foreign(name, &old_access) {
+            if crate::claude::has_session_token(name) {
+                // CLA-SPLIT: the live slot intentionally holds this profile's
+                // static session token — the rotated pair is the clauth-private
+                // USAGE chain and must never be mirrored over it. Quiet: this
+                // is the designed steady state, not a divergence.
+            } else if live_login_is_foreign(name, &old_access) {
                 logline!(
                     "clauth: rotated '{name}' but the live login diverged (a re-login clauth \
                      doesn't own). Keychain left untouched; {}",
@@ -1257,6 +1262,40 @@ pub(crate) fn ensure_installable(
     name: &str,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> AuthGate {
+    // CLA-SPLIT: a session-token profile installs its STATIC long-lived token
+    // — there is no chain to refresh before install, and a stale/broken
+    // usage-side OAuth pair (what `oauth_shape` + `auth_broken` describe)
+    // must not bench an account whose session token is perfectly usable.
+    // The token's own clock is the one thing worth checking: there is no
+    // refresh chain to probe or repair, so a clock-dead static token would
+    // otherwise install as-is and sign every session out (Incident C shape).
+    match crate::claude::session_token_status(name) {
+        Some(crate::claude::SessionTokenStatus::LongLived(expires_at)) => {
+            let clock_dead = expires_at.is_some_and(|exp| (now_ms() as i64) >= exp);
+            if clock_dead {
+                logline!(
+                    "clauth: '{name}' long-lived token has expired — re-mint with \
+                     `claude setup-token` (clauth login {name} --setup-token)"
+                );
+                return AuthGate::Broken;
+            }
+            return AuthGate::Ready;
+        }
+        // #53 review: the split engages only for a token that actually IS
+        // long-lived. A sidecar holding a rotating pair is a mis-fill —
+        // installing it would front sessions with a dies-in-hours token and
+        // no refresher, so it is IGNORED (credentials.json installs below,
+        // exactly as if the sidecar weren't there) and called out here, the
+        // per-switch chokepoint, rather than on every hot-path stat.
+        Some(crate::claude::SessionTokenStatus::NotLongLived) => {
+            logline!(
+                "clauth: '{name}' session-token.json holds a rotating pair (refresh \
+                 token present), not a long-lived mint — ignoring it; re-capture \
+                 with `clauth login {name} --setup-token`"
+            );
+        }
+        None => {}
+    }
     // Cheap pre-check WITHOUT the rotation guard: non-OAuth and
     // comfortably-live tokens install as-is. Token data read here is
     // discarded — only the post-guard re-read may feed the refresher (a

@@ -233,7 +233,11 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
 }
 
 fn canonical_credentials(name: &str) -> Result<PathBuf> {
-    profile_subpath(name, "credentials.json")
+    // CLA-SPLIT: a `clauth start` session runs on what a switch would install —
+    // the static session token when the profile has one. The rotating usage
+    // pair in `credentials.json` must never be handed to a session (it would
+    // re-arm the session-vs-refresher single-use-chain race the split removes).
+    crate::claude::install_source_path(name)
 }
 
 fn rotation_lock_path(name: &str) -> Result<PathBuf> {
@@ -1040,6 +1044,24 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     }
     let canonical_bytes = std::fs::read(canonical).ok();
     let differs = canonical_bytes.as_deref() != Some(runtime_bytes.as_slice());
+    // CLA-SPLIT: a static session token never rotates, so a differing runtime
+    // file is a session-side re-login — never adopt it over the token (that
+    // would clobber the long-lived login with a rotating chain). Keep
+    // canonical and relink; the re-login stays recoverable in the runtime
+    // file's lineage, and `clauth login` is the supported way to refresh the
+    // profile's usage OAuth pair.
+    if differs
+        && canonical
+            .file_name()
+            .is_some_and(|f| f == "session-token.json")
+    {
+        logline!(
+            "clauth: watchdog kept the static session token \
+             (a session-side re-login is never adopted over it)"
+        );
+        relink_to_canonical(link_path, canonical)?;
+        return Ok(false);
+    }
     let mut wrote_canonical = false;
     if differs {
         // Bytes differ. The keep-canonical-vs-adopt-runtime decision (write

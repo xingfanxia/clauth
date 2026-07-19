@@ -16,6 +16,137 @@ fn claude_settings_path() -> Result<PathBuf> {
     Ok(claude_dir()?.join("settings.json"))
 }
 
+/// CLA-SPLIT: true when the profile carries a long-lived session token
+/// (`session-token.json`, e.g. a `claude setup-token` mint). Such a profile
+/// splits its credentials: the STATIC session token is what switches install
+/// for Claude Code sessions to run on, while the rotating OAuth pair in
+/// `credentials.json` stays clauth-private for usage polling. Sessions then
+/// hold a token that never rotates, so they can never race clauth's refresher
+/// on a single-use refresh chain (the root cause of the 2026-07-16..18
+/// serial `refresh token revoked` deaths: N live sessions + clauth all
+/// rotating the same chains through one live slot).
+pub(crate) fn has_session_token(name: &str) -> bool {
+    matches!(
+        session_token_status(name),
+        Some(SessionTokenStatus::LongLived(_))
+    )
+}
+
+/// What the `session-token.json` sidecar actually holds (#53 review: the
+/// split must engage only when the installed token IS long-lived).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SessionTokenStatus {
+    /// A genuine long-lived login — defined by carrying NO refresh token:
+    /// with nothing to rotate, sessions can never race clauth's refresher on
+    /// it, which is the whole point of the split. Carries the recorded
+    /// epoch-ms expiry when stamped.
+    LongLived(Option<i64>),
+    /// The sidecar holds a rotating pair (refresh token present) — a
+    /// mis-fill, not a `claude setup-token` mint. The split stays DISENGAGED:
+    /// installing it would put a dies-in-hours token in front of sessions
+    /// with no refresher behind it, so switches keep installing
+    /// `credentials.json` as if the sidecar weren't there.
+    NotLongLived,
+}
+
+/// Content-aware read of a profile's sidecar: `None` = no sidecar (or one too
+/// corrupt to parse a login out of — same disengaged outcome either way).
+pub(crate) fn session_token_status(name: &str) -> Option<SessionTokenStatus> {
+    let path = profile_dir(name).ok()?.join("session-token.json");
+    if !path.exists() {
+        return None;
+    }
+    let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
+    let oauth = creds.claude_ai_oauth.as_ref()?;
+    if oauth.refresh_token.is_some() {
+        return Some(SessionTokenStatus::NotLongLived);
+    }
+    Some(SessionTokenStatus::LongLived(oauth.expires_at))
+}
+
+/// Documented lifetime of a `claude setup-token` mint (~1 year). The minted
+/// string carries no expiry of its own, so the capture flow stamps this
+/// assumed horizon into the sidecar — the Setup-tab countdown and
+/// `ensure_installable`'s clock gate both read that stamp, and a re-mint
+/// refreshes it. An operator who knows better can edit `expiresAt` by hand.
+pub(crate) const SETUP_TOKEN_ASSUMED_LIFETIME_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+
+/// Scopes a `claude setup-token` mint carries (verified live in the #52 root
+/// cause: `/api/oauth/usage` 403s them, which is exactly why the rotating
+/// usage pair stays separate). Recorded in the sidecar for the record.
+const SETUP_TOKEN_SCOPES: [&str; 2] = ["user:inference", "user:sessions:claude_code"];
+
+/// Shape-check a pasted `claude setup-token` mint before anything is written:
+/// trimmed, non-empty, `sk-ant-` prefixed, no interior whitespace (a partial
+/// paste or a paste-with-prompt both fail loud here instead of producing a
+/// sidecar that signs sessions out on first use). Returns the trimmed token.
+/// Never logs the value — the error names the failure, not the paste.
+pub(crate) fn validate_setup_token(raw: &str) -> Result<String> {
+    let token = raw.trim();
+    if token.is_empty() {
+        anyhow::bail!("no token pasted");
+    }
+    if !token.starts_with("sk-ant-") {
+        anyhow::bail!(
+            "that doesn't look like a `claude setup-token` mint (expected an sk-ant-… value)"
+        );
+    }
+    if token.starts_with("sk-ant-api") {
+        anyhow::bail!(
+            "that looks like an API key (sk-ant-api…), not a `claude setup-token` mint. \
+             Installing it as the session bearer signs sessions out on first use; capture an \
+             API key with `clauth login <name> --base-url <url> --api-key <key>` instead"
+        );
+    }
+    if token.chars().any(char::is_whitespace) {
+        anyhow::bail!(
+            "the pasted token contains whitespace — looks like a partial or padded paste"
+        );
+    }
+    if token.len() < 40 {
+        anyhow::bail!("the pasted token is too short to be a real mint");
+    }
+    Ok(token.to_string())
+}
+
+/// Write `name`'s `session-token.json` from a validated mint, stamping the
+/// assumed one-year expiry. 0600 like every credential file. Returns the
+/// stamped epoch-ms expiry for the caller's summary line.
+pub(crate) fn write_session_token(name: &str, token: &str, now_ms: i64) -> Result<i64> {
+    let expires_at = now_ms + SETUP_TOKEN_ASSUMED_LIFETIME_MS;
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: token.to_string(),
+            refresh_token: None,
+            expires_at: Some(expires_at),
+            scopes: Some(SETUP_TOKEN_SCOPES.iter().map(|s| s.to_string()).collect()),
+            subscription_type: None,
+        }),
+    };
+    let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
+    let path = profile_dir(name)?.join("session-token.json");
+    with_state_lock(|| {
+        atomic_write_600(&path, &bytes).context("write session-token.json")?;
+        Ok(())
+    })?;
+    Ok(expires_at)
+}
+
+/// The file a switch INSTALLS as the live login: the profile's
+/// `session-token.json` when present ([`has_session_token`]), else its
+/// `credentials.json` — which is exactly the pre-split behavior, so profiles
+/// without the sidecar are byte-identical to before.
+pub(crate) fn install_source_path(name: &str) -> Result<PathBuf> {
+    let dir = profile_dir(name)?;
+    // Content-aware, not a bare existence check (#53 review): a sidecar that
+    // isn't genuinely long-lived must not become the install source — see
+    // [`SessionTokenStatus::NotLongLived`].
+    if has_session_token(name) {
+        return Ok(dir.join("session-token.json"));
+    }
+    Ok(dir.join("credentials.json"))
+}
+
 /// State of `~/.claude/.credentials.json` relative to a profile's stored credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkState {
@@ -33,7 +164,11 @@ pub(crate) enum LinkState {
 
 pub(crate) fn classify_credentials_link(active: &str) -> Result<LinkState> {
     let link = claude_credentials_path()?;
-    let expected = profile_dir(active)?.join("credentials.json");
+    // CLA-SPLIT: the live slot is compared against what a switch INSTALLS —
+    // for a session-token profile that's the static token, so a live slot
+    // holding it classifies LinkedTo and the whole divergence machinery
+    // stays dormant (a static token never rotates out from under us).
+    let expected = install_source_path(active)?;
     classify_link_at(&link, &expected)
 }
 
@@ -86,7 +221,9 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
 /// clauth adopts this rather than treating it as divergence.
 pub(crate) fn is_first_login(active: &str) -> Result<bool> {
     let link = claude_credentials_path()?;
-    let expected = profile_dir(active)?.join("credentials.json");
+    // CLA-SPLIT: a profile whose install source is its session token is never
+    // "credential-less" — a live OAuth login must not be adopted over it.
+    let expected = install_source_path(active)?;
     Ok(is_first_login_at(&link, &expected))
 }
 
@@ -147,12 +284,14 @@ pub(crate) fn live_credentials_are_shell() -> bool {
 /// switched while CC still reads the old Keychain login. Loud + recoverable —
 /// both writes are idempotent, so retrying the switch re-runs the pair.
 #[cfg(target_os = "macos")]
-fn keychain_write_profile(name: &str) -> Result<()> {
-    let path = profile_dir(name)?.join("credentials.json");
+fn keychain_write_source(path: &Path) -> Result<()> {
+    // CLA-SPLIT: callers pass the already-resolved install source so the
+    // symlink target and the Keychain content come from ONE resolution — a
+    // session-token.json vanishing between two stats can't split them.
     if !path.exists() {
         return Ok(());
     }
-    let creds: ClaudeCredentials = read_json_file(&path)?;
+    let creds: ClaudeCredentials = read_json_file(path)?;
     crate::keychain::keychain_write(&creds)
 }
 
@@ -184,7 +323,7 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
 pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
-        let target = profile_dir(name)?.join("credentials.json");
+        let target = install_source_path(name)?;
 
         if let Ok(meta) = link.symlink_metadata() {
             if !meta.file_type().is_symlink() {
@@ -208,7 +347,7 @@ pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
             // macOS: make the switch real — Claude Code reads the Keychain.
             #[cfg(target_os = "macos")]
             if crate::keychain::enabled() {
-                keychain_write_profile(name)?;
+                keychain_write_source(&target)?;
             }
         }
 
@@ -444,6 +583,17 @@ pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &str) -> Result<
 }
 
 fn snapshot_active_credentials_unchecked(config: &mut AppConfig, active: &str) -> Result<()> {
+    // CLA-SPLIT: a profile whose live slot holds its static session token carries
+    // nothing to snapshot, and capturing the live file into `profile.credentials`
+    // would clobber the clauth-private usage OAuth pair. The guard lives at this
+    // shared sink so every caller is covered: both the divergence-modal
+    // "overwrite" and the CLI reconciled switch reach here via
+    // `force_snapshot_active_credentials`. `adopt_first_login` never hits it for
+    // a session-token profile (the install source exists, so `is_first_login` is
+    // false), so the guard is a safe no-op on that path.
+    if has_session_token(active) {
+        return Ok(());
+    }
     let credentials = read_claude_credentials()?;
     if let Some(profile) = config.find_mut(active) {
         profile.credentials = credentials;
@@ -469,7 +619,7 @@ pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
         if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
-        let target = profile_dir(name)?.join("credentials.json");
+        let target = install_source_path(name)?;
         if target.exists() {
             if let Some(parent) = link.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -478,7 +628,7 @@ pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
             // macOS: make the switch real — Claude Code reads the Keychain.
             #[cfg(target_os = "macos")]
             if crate::keychain::enabled() {
-                keychain_write_profile(name)?;
+                keychain_write_source(&target)?;
             }
         }
         Ok(())
