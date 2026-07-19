@@ -666,7 +666,43 @@ fn validate_setup_token_accepts_a_mint_and_rejects_bad_pastes() {
         validate_setup_token(&format!("Setup token: {good}")).is_err(),
         "paste with prompt text has interior whitespace"
     );
-    assert!(validate_setup_token("sk-ant-short").is_err(), "truncated paste");
+    assert!(
+        validate_setup_token("sk-ant-short").is_err(),
+        "truncated paste"
+    );
+    assert!(
+        validate_setup_token(&format!("sk-ant-api03-{}", "z".repeat(48))).is_err(),
+        "an API key must be rejected, not installed as the session bearer",
+    );
+}
+
+/// Force-snapshot (the divergence-modal "overwrite" and the CLI reconciled
+/// switch both reach it) must never capture the live login into a session-token
+/// profile's clauth-private usage OAuth pair. Here the live slot holds a FOREIGN
+/// login; the guard at the shared sink leaves the stored usage pair intact.
+#[test]
+fn force_snapshot_never_clobbers_the_session_token_usage_pair() {
+    let _home = HomeSandbox::new();
+    let mut config = seed_relogin_scenario(
+        "split",
+        creds("usage-access", Some("usage-refresh")),
+        creds("foreign-access", Some("foreign-refresh")),
+    );
+    fill_session_token_by_hand("split", "oat-access");
+
+    force_snapshot_active_credentials(&mut config).expect("force snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("split")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("usage-refresh"),
+        "force-snapshot must leave the clauth-private usage OAuth pair untouched",
+    );
 }
 
 /// The capture writes a sidecar the whole CLA-SPLIT machinery recognises:

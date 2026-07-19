@@ -87,10 +87,21 @@ pub(crate) fn validate_setup_token(raw: &str) -> Result<String> {
         anyhow::bail!("no token pasted");
     }
     if !token.starts_with("sk-ant-") {
-        anyhow::bail!("that doesn't look like a `claude setup-token` mint (expected an sk-ant-… value)");
+        anyhow::bail!(
+            "that doesn't look like a `claude setup-token` mint (expected an sk-ant-… value)"
+        );
+    }
+    if token.starts_with("sk-ant-api") {
+        anyhow::bail!(
+            "that looks like an API key (sk-ant-api…), not a `claude setup-token` mint. \
+             Installing it as the session bearer signs sessions out on first use; capture an \
+             API key with `clauth login <name> --base-url <url> --api-key <key>` instead"
+        );
     }
     if token.chars().any(char::is_whitespace) {
-        anyhow::bail!("the pasted token contains whitespace — looks like a partial or padded paste");
+        anyhow::bail!(
+            "the pasted token contains whitespace — looks like a partial or padded paste"
+        );
     }
     if token.len() < 40 {
         anyhow::bail!("the pasted token is too short to be a real mint");
@@ -558,13 +569,6 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
             }
             return Ok(());
         }
-        // CLA-SPLIT: a live slot holding the profile's static session token
-        // (LinkedTo by definition) carries nothing to snapshot — and writing
-        // it into `profile.credentials` would clobber the clauth-private
-        // usage OAuth pair. Leave both stores untouched.
-        if has_session_token(&active) {
-            return Ok(());
-        }
         snapshot_active_credentials_unchecked(config, &active)
     })
 }
@@ -579,6 +583,17 @@ pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &str) -> Result<
 }
 
 fn snapshot_active_credentials_unchecked(config: &mut AppConfig, active: &str) -> Result<()> {
+    // CLA-SPLIT: a profile whose live slot holds its static session token carries
+    // nothing to snapshot, and capturing the live file into `profile.credentials`
+    // would clobber the clauth-private usage OAuth pair. The guard lives at this
+    // shared sink so every caller is covered: both the divergence-modal
+    // "overwrite" and the CLI reconciled switch reach here via
+    // `force_snapshot_active_credentials`. `adopt_first_login` never hits it for
+    // a session-token profile (the install source exists, so `is_first_login` is
+    // false), so the guard is a safe no-op on that path.
+    if has_session_token(active) {
+        return Ok(());
+    }
     let credentials = read_claude_credentials()?;
     if let Some(profile) = config.find_mut(active) {
         profile.credentials = credentials;
