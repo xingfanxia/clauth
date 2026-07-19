@@ -1395,3 +1395,34 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   sidecar read, CodexProxyMode idiom — daemon-down safe; only expiresAt
   decoded). LoginMode.setupToken joins the single-login guard + flight
   banner. 210+5 tests green; repackaged + redeployed to /Applications.
+
+## 2026-07-19 (WKO-1) — weekly override + long-lived detection/rename + full ccsbar integration
+
+- PR #55 (b12ec28): folded the maintainer's weekly-limit-per-account ask in
+  as an OVERRIDE (`weekly at` row; Config-tab `weekly limit` stays the
+  chain default; empty commit clears). One per-account line governs the
+  aggregate + scoped judgments; NEVER the hard-cap ones. Predicates split
+  soft (member_weekly_line/member_scoped_line) vs hard (weekly_hard_blocked/
+  is_exhausted_hard); ChainMember snapshots resolved weekly_line/scoped_line;
+  is_exhausted_active takes the caller's weekly bool. 1159 green.
+- PR #53 (2244a46): maintainer's remaining ask — content-aware long-lived
+  detection. `session_token_status`: long-lived IFF no refresh token; a
+  mis-filled rotating pair DISENGAGES the split (install source back to
+  credentials.json, gate logs the re-capture hint, Setup row shows DANGER
+  "not long-lived (has a refresh token) · ignored"). NAMING (AX): user-facing
+  term is now **long-lived token** everywhere (claude setup-token's own
+  wording; "session token" reads as the opposite) — TUI row keyed `token`;
+  sidecar filename session-token.json unchanged. 1144 green.
+- FORK main ADOPTED SCW-2+WKO (a108ae0..51c177b): hand-port, not cherry-pick
+  (fork fallback.rs diverges — codex harness chains, no freshness pass, no
+  spend budget, no burn floor/horizon, wrap_off naming). Codex ChainMembers
+  get inert neutral lines. Fork now runs the per-account gate semantics live.
+  Daemon grew socket verbs `set_member_weekly` (null clears) /
+  `set_check_weekly` / `set_check_scoped` + status.json fallback fields
+  check_weekly/check_scoped/weekly_threshold. 1304 green; deployed (cargo
+  install + daemon/proxy restart; status.json verified carrying the fields).
+- ccsbar (97e114b): context-menu "Weekly limit here ▸" (follow-default/
+  presets/custom via ThresholdEditTarget.memberWeekly) + "Check weekly
+  usage"/"Check per-model weekly (7d fable)" gate toggles; FallbackInfo
+  decodes the new fields with old-daemon defaults (gates ON); long-lived
+  rename across all copy. 210+8 tests; repackaged + redeployed.
