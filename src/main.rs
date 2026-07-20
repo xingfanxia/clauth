@@ -5,6 +5,7 @@ mod completions;
 mod daemon;
 mod fallback;
 mod format;
+mod jsonsync;
 // macOS-only: Claude Code reads its login from the Keychain, not the credentials
 // file, so a switch must also write there. Gated so non-macOS builds stay clean.
 #[cfg(target_os = "macos")]
@@ -26,6 +27,7 @@ mod providers;
 mod runtime;
 mod sessions;
 mod sessions_cli;
+mod settings_sync;
 mod spinner;
 mod start;
 mod status;

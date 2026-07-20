@@ -172,6 +172,45 @@ fn account_scoped_model_caches_stay_per_profile() {
     assert_eq!(bj["additionalModelCostsCache"], json!({}));
 }
 
+/// `primaryApiKey` is a raw `/login`-managed API key Claude Code stores in
+/// `.claude.json`; `customApiKeyResponses` is its per-key approval ledger. Both
+/// are account-scoped, so a sync must never carry one profile's into another.
+#[test]
+fn the_login_managed_api_key_never_propagates() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let a = tmp.path().join("a.json");
+    let b = tmp.path().join("b.json");
+    write_json(
+        &a,
+        &json!({
+            "numStartups": 2,
+            "primaryApiKey": "sk-ant-AAAA-a-account-key",
+            "customApiKeyResponses": {"approved": ["hash-a"], "rejected": []}
+        }),
+    );
+    // b holds its own key, and would otherwise inherit a's.
+    write_json(
+        &b,
+        &json!({"numStartups": 1, "primaryApiKey": "sk-ant-BBBB-b-account-key"}),
+    );
+    set_mtime(&a, t(10));
+    set_mtime(&b, t(5));
+
+    sync_paths(&[a, b.clone()]).expect("sync");
+
+    let bj = read_json(&b);
+    assert_eq!(bj["numStartups"], json!(2), "shared field still propagates");
+    assert_eq!(
+        bj["primaryApiKey"],
+        json!("sk-ant-BBBB-b-account-key"),
+        "one account's raw /login key must never reach another profile"
+    );
+    assert!(
+        bj.get("customApiKeyResponses").is_none(),
+        "an absent per-profile key must not be injected from the winner: {bj}"
+    );
+}
+
 #[test]
 fn shared_key_absent_in_winner_is_removed_from_target() {
     let tmp = tempfile::tempdir().expect("tempdir");

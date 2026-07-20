@@ -385,16 +385,20 @@ impl ProfileRuntime {
         let watchdog_handle = thread::Builder::new()
             .name(format!("clauth-wdog-{name}"))
             .spawn(move || {
-                // One thread, two cadences: `.claude.json` reconciles every
-                // CJSON_INTERVAL; credentials reconcile every ~WATCHDOG_INTERVAL,
-                // counted in cjson ticks. Loop exits on Disconnected (sender
-                // dropped in Drop) or Ok(()).
+                // One thread, two cadences: the config reconcilers
+                // (`.claude.json` + `settings.json`) run every CJSON_INTERVAL;
+                // credentials reconcile every ~WATCHDOG_INTERVAL, counted in
+                // cjson ticks. Loop exits on Disconnected (sender dropped in
+                // Drop) or Ok(()).
                 let cred_every =
                     (WATCHDOG_INTERVAL.as_millis() / CJSON_INTERVAL.as_millis()).max(1);
                 let mut until_cred = cred_every;
                 while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(CJSON_INTERVAL) {
                     if let Err(e) = crate::claude_json::sync_once() {
                         logline!("clauth: .claude.json sync failed: {e}");
+                    }
+                    if let Err(e) = crate::settings_sync::sync_once() {
+                        logline!("clauth: settings.json sync failed: {e}");
                     }
                     until_cred -= 1;
                     if until_cred == 0 {
@@ -450,10 +454,14 @@ impl Drop for ProfileRuntime {
             logline!("clauth: final sync failed: {e}");
         }
 
-        // Flush this session's last `.claude.json` changes to the global file
-        // and siblings before a possible teardown removes this runtime copy.
+        // Flush this session's last `.claude.json` / `settings.json` changes to
+        // the global files and siblings before a possible teardown removes this
+        // runtime's copies.
         if let Err(e) = crate::claude_json::sync_once() {
             logline!("clauth: final .claude.json sync failed: {e}");
+        }
+        if let Err(e) = crate::settings_sync::sync_once() {
+            logline!("clauth: final settings.json sync failed: {e}");
         }
 
         if let Err(e) = with_state_lock(|| {
@@ -774,6 +782,11 @@ fn prune_dangling_links(runtime: &Path) -> Result<()> {
 /// per profile in `build_claude_settings_json`, so only custom `[env]` needs
 /// this. Callers with no active profile pass empty; starting the active profile
 /// itself passes its own keys, which the merge re-inserts (a no-op strip).
+///
+/// This computes the copy; `crate::settings_sync` then keeps it converged with
+/// the base and every sibling runtime for the session's lifetime. The two agree
+/// by construction: the syncer writes shared fields back into the base, so this
+/// recompute reproduces the same bytes on the next start instead of undoing it.
 fn write_merged_settings(
     runtime: &Path,
     claude_home: &Path,
