@@ -520,6 +520,58 @@ fn memoized_identity<'a>(
     }
 }
 
+/// What the plain (pre-rotation) fetch result means for `fetch_with_rotation`.
+/// Produced by [`classify_pre_rotation`] — see its tests (`pre_rotation_*`) for
+/// the truth table live HTTP can't drive.
+#[derive(Debug)]
+enum PreRotationDecision {
+    /// Live API body — return straight from `fetch_with_rotation`. Boxed:
+    /// `UsageInfo` dwarfs every other variant here (clippy::large_enum_variant).
+    Serve(Box<UsageInfo>),
+    /// 429 on a still-valid token: a pure endpoint rate limit, not a token
+    /// problem — bail to cache. `plan` rides along: a canceled account's tier
+    /// flip is only ever observed through the `/profile` reading the fetch
+    /// took despite the 429.
+    BailRateLimited {
+        retry_after: Option<Duration>,
+        plan: Option<PlanInfo>,
+    },
+    /// 401, or a 429 on a clock-expired token (AUTH-1 unmask): fall through to
+    /// the rotation leg so a dead refresh token surfaces as `auth_broken`
+    /// rather than staying masked as `RateLimited`. `unmask_429` is `None` for
+    /// the 401 case; `Some` (the 429's retry-after) for the unmask case, so a
+    /// failed unmask keeps the deferral + streak (see [`rotation_bail_context`]).
+    /// The plan on the unmask arm rode a dead token and has no field here —
+    /// deliberately discarded, unlike `BailRateLimited`'s.
+    Rotate {
+        unmask_429: Option<Option<Duration>>,
+    },
+    /// Any other error: bail straight to disk cache.
+    BailCached,
+}
+
+/// Pure classification of the plain fetch's [`FetchError`] — no I/O, no clock
+/// read of its own. `token_clock_expired` is passed in ALREADY COMPUTED by the
+/// caller (see [`token_clock_expired`]) so pulling this branch logic out of
+/// `fetch_with_rotation` can't introduce a second, differently-timed
+/// `now_ms()` read.
+fn classify_pre_rotation(
+    result: Result<UsageInfo, FetchError>,
+    token_clock_expired: bool,
+) -> PreRotationDecision {
+    match result {
+        Ok(info) => PreRotationDecision::Serve(Box::new(info)),
+        Err(FetchError::RateLimited { retry_after, plan }) if !token_clock_expired => {
+            PreRotationDecision::BailRateLimited { retry_after, plan }
+        }
+        Err(FetchError::Status(401)) => PreRotationDecision::Rotate { unmask_429: None },
+        Err(FetchError::RateLimited { retry_after, .. }) => PreRotationDecision::Rotate {
+            unmask_429: Some(retry_after),
+        },
+        Err(_) => PreRotationDecision::BailCached,
+    }
+}
+
 /// Fetch + rotate + retry for one profile. On 401 — or a 429 on a clock-expired
 /// token (the AUTH-1 dead-login unmasking, see [`token_clock_expired`]) — refresh
 /// the OAuth pair, persist, retry once. A 429 on a still-valid token bails to disk
@@ -573,28 +625,23 @@ fn fetch_with_rotation(
     );
     let mut unmask_429: Option<Option<Duration>> = None;
     if !proactive {
-        match fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity)) {
-            Ok(info) => return FetchOutcome::live(name, info, None),
-            // 429 on a still-valid token: an endpoint rate limit, not a token problem —
-            // bail to cache (see `token_clock_expired`). The `/profile` reading the
-            // fetch took despite the 429 rides along so a canceled account's tier flip
-            // still lands (its `/usage` never stops 429ing).
-            Err(FetchError::RateLimited { retry_after, plan })
-                if !token_clock_expired(access_expires_at, now_ms() as i64) =>
-            {
+        let result = fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity));
+        // Read the clock AFTER the fetch resolves — `fetch_raw` is a blocking
+        // HTTP round-trip, so reading it earlier would classify a token whose
+        // expiry falls inside that window against a stale `now`. Read once,
+        // right here, and hand the bool to the pure classifier — never let it
+        // re-read `now_ms()` on its own timing.
+        let expired = token_clock_expired(access_expires_at, now_ms() as i64);
+        match classify_pre_rotation(result, expired) {
+            PreRotationDecision::Serve(info) => return FetchOutcome::live(name, *info, None),
+            PreRotationDecision::BailRateLimited { retry_after, plan } => {
                 return FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after)
                     .with_plan(plan);
             }
-            // 401, or a 429 on a clock-expired token (AUTH-1): fall through to the
-            // rotation leg so a dead refresh token surfaces as `auth_broken` rather
-            // than staying masked as `RateLimited`. The 429's endpoint-level
-            // context rides along so a failed unmask keeps the deferral + streak
-            // (see `rotation_bail_context`).
-            Err(FetchError::Status(401)) => {}
-            // Clock-expired 429: falls to rotation, which re-fetches `/profile` with
-            // the fresh token — the plan here rode a dead token, so discard it.
-            Err(FetchError::RateLimited { retry_after, .. }) => unmask_429 = Some(retry_after),
-            Err(_) => return FetchOutcome::cached(name, FetchStatus::Cached, None, None),
+            PreRotationDecision::Rotate { unmask_429: unmask } => unmask_429 = unmask,
+            PreRotationDecision::BailCached => {
+                return FetchOutcome::cached(name, FetchStatus::Cached, None, None);
+            }
         }
     }
 
