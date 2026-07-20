@@ -190,18 +190,9 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
 
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let title = match state.on_confirm {
-        ConfirmAction::CaptureConflict(..) => "CONFIRM",
-        ConfirmAction::CaptureOverwrite(..) => "CONFIRM",
-        ConfirmAction::AdoptDivergence(..) => "CONFIRM",
-        ConfirmAction::Switch(_) => "CONFIRM",
-        ConfirmAction::DiscardDivergence(_) => "CONFIRM",
-        ConfirmAction::RotateAll => "CONFIRM",
-        ConfirmAction::RotateOne(_) => "CONFIRM",
-        ConfirmAction::WireMcpServers => "CONFIRM",
-        ConfirmAction::RelinkCredentials(_) => "CONFIRM",
-        ConfirmAction::BlankCredentials(_) => "CONFIRM",
-        ConfirmAction::RestartLogin(..) => "CONFIRM",
-        ConfirmAction::DeleteLiveSession(_) => "CONFIRM",
+        // The one non-confirm modal: an in-use account can't be acted on.
+        ConfirmAction::Acknowledge => "IN USE",
+        _ => "CONFIRM",
     };
 
     // Destructive/global ops carry a DANGER cue on their confirm button.
@@ -226,7 +217,13 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         lines.push(Line::from(Span::styled(detail.clone(), theme::dim())));
     }
     lines.push(Line::from(""));
-    lines.push(choice_buttons(state.choice, destructive).alignment(Alignment::Right));
+    // An acknowledge-only notice has nothing to cancel — a single focused `ok`.
+    let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
+        Line::from(modal_button(" ok ", true))
+    } else {
+        choice_buttons(state.choice, destructive)
+    };
+    lines.push(buttons.alignment(Alignment::Right));
 
     draw_modal(frame, area, title, lines);
 }
@@ -311,7 +308,7 @@ fn divergence_action_text(action: &DivergenceAction, active: &str) -> String {
             format!("overwrite '{active}' with this login")
         }
         DivergenceAction::Choice(DivergenceChoice::NewProfile) => {
-            "save this login to another profile…".to_string()
+            "save this login to another account…".to_string()
         }
         DivergenceAction::Choice(DivergenceChoice::Discard) => {
             format!("discard this login and restore '{active}'")
@@ -341,7 +338,7 @@ fn draw_divergence_target(frame: &mut Frame<'_>, area: Rect, form: &DivergenceTa
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled("where to save the login?", theme::dim())),
         Line::from(""),
-        option_line(cursor == 0, "+ new profile".to_string()),
+        option_line(cursor == 0, "+ new account".to_string()),
     ];
     for (i, name) in form.targets.iter().enumerate() {
         lines.push(option_line(cursor == i + 1, format!("overwrite '{name}'")));
@@ -414,7 +411,7 @@ fn env_collision_option_text(
 fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
     let lines = vec![
         Line::from(Span::styled(
-            "stores the live ~/.claude/.credentials.json under this profile.",
+            "stores the live ~/.claude/.credentials.json under this account.",
             theme::dim(),
         )),
         Line::from(""),
@@ -499,7 +496,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("space", "cycle the focused setting"),
                 (
                     "\u{21b5}",
-                    "same as space · custom value on refresh interval",
+                    "same as space · type a value on refresh or weekly limit",
                 ),
             ][..],
         )],
@@ -526,13 +523,13 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
             "fallback chain",
             &[
                 ("\u{2191}\u{2193}", "move cursor / detail row"),
-                ("shift \u{2191}\u{2193}", "reorder member = priority"),
+                ("shift \u{2191}\u{2193}", "reorder to set priority"),
                 (
                     "\u{21b5}",
-                    "open \u{00b7} edit threshold \u{00b7} edit weekly line \u{00b7} toggle gates / last resort \u{00b7} remove \u{00b7} add",
+                    "open \u{00b7} edit threshold \u{00b7} edit weekly line \u{00b7} edit max spend \u{00b7} toggle gates / last resort \u{00b7} remove \u{00b7} add",
                 ),
                 ("+ / -", "step threshold by 5"),
-                ("\u{21b5}", "type a threshold, \u{21b5} saves"),
+                ("\u{21b5} on rotate at", "type a value, \u{21b5} saves"),
                 ("esc", "back / cancel edit"),
             ][..],
         )],

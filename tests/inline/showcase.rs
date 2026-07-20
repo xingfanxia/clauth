@@ -295,11 +295,13 @@ fn oauth_profile(
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::from_profile(Some(plan_type), has_max, has_pro, Some(tier)),
+                subscription_status: None,
             }),
             five_hour,
             seven_day: None,
@@ -331,6 +333,7 @@ fn api_profile(name: &str) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,
@@ -354,6 +357,7 @@ fn failed_profile(name: &str) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,
@@ -1209,4 +1213,61 @@ fn tab_key_does_not_leak_past_modal_or_field_capture() {
         Some("personal"),
         "cancelling the modal must not have switched profiles"
     );
+}
+
+// ── reset display + clock notation (issue #39) ───────────────────────────────
+
+/// Both rows persist through the same `save_app_state` path every other Config
+/// row uses, and the notation row is a TRUE disabled row while resets render
+/// relative — dimming it in the renderer while the key still cycled it would
+/// let an invisible value drift.
+#[test]
+fn config_reset_rows_cycle_and_persist_with_the_clock_row_gated() {
+    use crate::profile::{ClockFormat, ResetDisplay};
+    use app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+    let _home = ShowcaseHome::new();
+    let mut app = app::App::new(demo_config());
+    app.tab = Tab::Config;
+
+    let cursor_to = |app: &mut app::App, row: GlobalConfigRow| {
+        app.global_config_cursor = GLOBAL_CONFIG_ROWS
+            .iter()
+            .position(|r| *r == row)
+            .expect("row is in the config list");
+    };
+    let shape = |app: &app::App| app.config().state.reset_display();
+    let notation = |app: &app::App| app.config().state.clock_format();
+
+    // The clock row no-ops while the countdown is relative.
+    cursor_to(&mut app, GlobalConfigRow::ClockNotation);
+    assert_eq!(shape(&app), ResetDisplay::Relative);
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(
+        notation(&app),
+        ClockFormat::H24,
+        "the clock row must stay inert while no reset renders a clock"
+    );
+
+    // Cycling the shape row wraps back to the stock relative form.
+    cursor_to(&mut app, GlobalConfigRow::ResetShape);
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(shape(&app), ResetDisplay::Clock);
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(shape(&app), ResetDisplay::Both);
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(shape(&app), ResetDisplay::Relative);
+
+    // With a clock on screen the notation row cycles and persists.
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(shape(&app), ResetDisplay::Clock);
+    cursor_to(&mut app, GlobalConfigRow::ClockNotation);
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(notation(&app), ClockFormat::H12);
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(notation(&app), ClockFormat::H24);
+
+    // Both landed on disk, not just in the in-memory config.
+    let reloaded = crate::profile::load_config().expect("reload state");
+    assert_eq!(reloaded.state.reset_display(), ResetDisplay::Clock);
+    assert_eq!(reloaded.state.clock_format(), ClockFormat::H24);
 }

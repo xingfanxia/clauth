@@ -82,6 +82,31 @@ fn every_shell_completes_start_isolated_flag() {
     assert!(ZSH.contains("--json") && ZSH.contains("--base-url") && ZSH.contains("--force"));
 }
 
+/// Every shell must offer `--setup-token` under the `login` subcommand — the
+/// long-lived-token capture flow (#53), gated to login like the other login
+/// flags. Mirrors the `--isolated` coverage above.
+#[test]
+fn every_shell_completes_login_setup_token_flag() {
+    let cases = [
+        (
+            BASH,
+            "--base-url --api-key --model --new --codex --browser --setup-token",
+        ),
+        (ZSH, "'--setup-token[capture a claude setup-token"),
+        (FISH, "__fish_seen_subcommand_from login\" -a --setup-token"),
+    ];
+    for (script, gated) in cases {
+        assert!(
+            script.contains("--setup-token"),
+            "script must offer --setup-token",
+        );
+        assert!(
+            script.contains(gated),
+            "the --setup-token completion must be gated to `login`, missing {gated:?}",
+        );
+    }
+}
+
 #[test]
 fn print_script_rejects_unsupported_shell() {
     let err = print_script("powershell").expect_err("unsupported shell must error");

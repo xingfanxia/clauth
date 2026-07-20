@@ -19,6 +19,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -50,6 +51,7 @@ fn endpoint_profile(name: &str) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,
@@ -73,6 +75,7 @@ fn blank_profile(name: &str) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,

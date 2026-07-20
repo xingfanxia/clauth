@@ -303,6 +303,18 @@ fn cache_path() -> Option<PathBuf> {
     clauth_dir().ok().map(|d| d.join("price_cache.json"))
 }
 
+/// Synchronous one-shot read of the on-disk price cache, off the background
+/// [`spawn`] channel — the CLI sessions surface needs a `PriceTable` on the main
+/// thread without standing up the worker. `None` when the cache is absent or
+/// unparseable; never fetches, so a cold cache simply prices nothing.
+#[allow(
+    dead_code,
+    reason = "sync price path for the sessions CLI, wired by a later phase"
+)]
+pub(crate) fn load_cached() -> Option<PriceTable> {
+    load_cache(&cache_path()?)
+}
+
 /// Load the cache if it exists and parses; `None` on any miss/error (a stale or
 /// reshaped cache is silently treated as no cache).
 fn load_cache(path: &Path) -> Option<PriceTable> {

@@ -39,9 +39,10 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
-    MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings, Profile, ReloadFingerprint,
-    ThemeName, load_config, reload_fingerprint, save_app_state, save_profile,
+    AppConfig, ClockFormat, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS,
+    MAX_WEEKLY_SWITCH_PCT, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings, Profile,
+    ReloadFingerprint, ResetDisplay, ThemeName, load_config, reload_fingerprint, save_app_state,
+    save_profile,
 };
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
@@ -181,6 +182,11 @@ pub(crate) enum FallbackRow {
     /// account stays in rotation for use with other models.
     CheckScoped,
     LastResort,
+    /// Dollar ceiling on what the chain may spend of this member's
+    /// pay-as-you-go budget unattended (`Profile::max_auto_spend`, $0 default).
+    /// Inert unless `AppState::spend_budget_switching` is also on — see
+    /// `fallback::spend_room`. ⏎ opens an inline editor.
+    MaxSpend,
     Remove,
 }
 
@@ -251,6 +257,16 @@ pub(crate) const MODEL_PRESETS: [&str; 4] = ["opus", "sonnet", "haiku", "opuspla
 /// refuses).
 pub(crate) const WEEKLY_PRESETS: [f64; 4] = [90.0, 95.0, 98.0, 100.0];
 
+/// Presets for the burn-aware early-switch floor (percent). The projection may
+/// not switch below the chosen value, so wasted headroom is capped at
+/// `100 - floor`. Default 98 (see [`crate::profile::DEFAULT_BURN_FLOOR_PCT`]).
+pub(crate) const BURN_FLOOR_PRESETS: [f64; 4] = [97.0, 98.0, 99.0, 100.0];
+
+/// Presets for the burn-aware projection horizon cap (ms). The projection looks
+/// ahead by `min(refresh_interval, this)`; a shorter cap keeps the switch
+/// nearer 100. Default 60 s (see [`crate::profile::DEFAULT_BURN_HORIZON_MS`]).
+pub(crate) const BURN_HORIZON_PRESETS: [u64; 4] = [30_000, 45_000, 60_000, 90_000];
+
 /// One row on the program-wide Config tab. These back real persisted globals in
 /// [`AppState`] — no decorative toggles. ⏎/space cycles or flips in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,9 +274,16 @@ pub(crate) enum GlobalConfigRow {
     /// Color-depth tier: `full` (truecolor) / `compatible` (xterm-256).
     /// Persists to `[theme]` and live-swaps the active palette.
     Theme,
-    /// Chain-wide "when spent" behavior (`AppState.wrap_off`) — surfaced here as
+    /// Shape of every reset countdown (`AppState.reset_display`, issue #39):
+    /// `relative` (stock) / `clock` / `both`. ⏎/space cycles.
+    ResetShape,
+    /// Notation for the wall-clock half of a reset stamp
+    /// (`AppState.clock_format`): `24h` / `12h`. Dimmed + inert while
+    /// `reset display` is `relative`, since nothing renders a clock then.
+    ClockNotation,
+    /// Chain-wide "when spent" behavior (`AppState.switch_off_when_spent`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.
-    WrapOff,
+    SwitchOffWhenSpent,
     /// Chain-wide weekly (7d) exhaustion line
     /// (`AppState.weekly_switch_threshold`, default 98) — space steps presets,
     /// ⏎ opens the custom-value editor (50–100, decimals allowed).
@@ -274,6 +297,26 @@ pub(crate) enum GlobalConfigRow {
     /// follow-up b) — off by default, projects the ACTIVE profile's
     /// utilization ahead of the next poll instead of the static threshold.
     BurnAware,
+    /// Burn-aware early-switch floor (`AppState.burn_switch_floor_pct`) — space
+    /// cycles [`BURN_FLOOR_PRESETS`]. Dimmed + inert unless burn-aware is on.
+    BurnFloor,
+    /// Burn-aware projection horizon cap (`AppState.burn_horizon_cap_ms`) —
+    /// space cycles [`BURN_HORIZON_PRESETS`]. Dimmed + inert unless burn-aware
+    /// is on.
+    BurnHorizon,
+    /// Opt-in master switch for real-money fallback
+    /// (`AppState.spend_budget_switching`) — off by default. On, the chain may
+    /// hop to a member whose subscription is spent but whose account still has
+    /// pay-as-you-go budget, bounded by that member's `max auto-spend` ceiling
+    /// (Fallback tab, $0 by default). BOTH halves are needed, so flipping this
+    /// alone still spends nothing.
+    SpendBudget,
+    /// What happens once a billing account has spent its `max auto-spend`
+    /// budget (`AppState.switch_off_when_budget_spent`, default switch-off). Deliberately
+    /// NOT `SwitchOffWhenSpent`: that row answers "the chain is out of free quota", where
+    /// staying costs nothing, and this one answers "the money ran out", where
+    /// staying is the spending.
+    SwitchOffWhenBudgetSpent,
     /// Opt-in preemptive rotation (`AppState.preemptive_rotation`, rotation
     /// coherence #1) — off by default (stock stays strictly lazy: rotate only
     /// on 401). Rotates the ACTIVE Keychain-installed profile ahead of token
@@ -426,6 +469,11 @@ pub(crate) enum ConfirmAction {
     /// guard in `delete_profile` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
     DeleteLiveSession(String),
+    /// Info-only modal: an action the user asked for is blocked for a reason
+    /// they should read (e.g. rotating a profile a live session owns, which
+    /// would 400 — see `docs/internals.md`). Confirming just dismisses;
+    /// `run_confirm_action` does nothing.
+    Acknowledge,
 }
 
 #[derive(Debug, Clone)]
@@ -591,6 +639,7 @@ pub(crate) enum ActionMenuAction {
     ToggleCheckWeekly,
     ToggleCheckScoped,
     ToggleLastResort,
+    EditMaxSpend,
     RemoveMember,
     // Config detail actions (proxied through run_config_row)
     ToggleAutoStart,
@@ -698,10 +747,11 @@ impl ActionMenuAction {
             Self::ToggleCheckWeekly => "toggle weekly gate",
             Self::ToggleCheckScoped => "toggle scoped gate",
             Self::ToggleLastResort => "toggle last resort",
+            Self::EditMaxSpend => "edit max auto-spend",
             Self::RemoveMember => "remove member",
             Self::ToggleAutoStart => "toggle auto-start",
-            Self::DeleteProfile => "delete profile",
-            Self::CreateProfile => "create profile",
+            Self::DeleteProfile => "delete account",
+            Self::CreateProfile => "create account",
             Self::LoginAccount => "log in",
             Self::ClearCredentials => "log out",
             Self::EditField => "edit field",
@@ -758,9 +808,8 @@ pub(crate) struct Toast {
     pub(crate) born: Instant,
 }
 
-const ROTATE_ALL_MSG: &str = "Rotate all access tokens?";
-const ROTATE_ALL_DETAIL: &str = "accounts with a live session might be logged out.";
-const ROTATE_ONE_DETAIL: &str = "a live session on this account might be logged out.";
+const ROTATE_ALL_MSG: &str = "rotate all access tokens?";
+const ROTATE_ALL_DETAIL: &str = "accounts with a live session are skipped.";
 const TOAST_CAPACITY: usize = 3;
 const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
 const TOAST_TTL_DANGER: Duration = Duration::from_secs(6);
@@ -1280,6 +1329,9 @@ pub(crate) struct App {
     /// lifecycle as `fallback_threshold_draft`; an EMPTY commit clears the
     /// member's override.
     pub(crate) fallback_weekly_draft: Option<InputState>,
+    /// In-flight value for the member's `max auto-spend` field (`None` = not
+    /// editing). Same lifecycle as `fallback_threshold_draft`.
+    pub(crate) fallback_max_spend_draft: Option<InputState>,
     /// Cursor into [`GLOBAL_CONFIG_ROWS`] on the program-wide Config tab.
     pub(crate) global_config_cursor: usize,
     /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
@@ -1430,6 +1482,25 @@ pub(crate) struct App {
     /// another lock (the reloader snapshots names first, reads disk, then
     /// stores).
     pub(crate) overview_emails: Mutex<Option<EmailsByName>>,
+    /// Cached long-lived-token status per profile, keyed by name (absent when a
+    /// profile has no sidecar). Read by the Overview render for the `⊘` danger
+    /// marker + the type tag, so it needn't stat each `session-token.json` per
+    /// frame. Seeded at construct and refreshed on config reload; the expiry
+    /// stamp it carries is compared to live `now_ms` at render time, so the
+    /// clock ticking past expiry never needs a re-read — only an add / delete /
+    /// re-mint does, which `reload_fingerprint` now catches.
+    pub(crate) session_tokens: HashMap<String, crate::claude::SessionTokenStatus>,
+}
+
+/// Read every named profile's long-lived-token status for the Overview cache.
+/// Reads each `session-token.json` off disk, so callers gather the names under a
+/// brief config guard and call this with the guard already dropped — the read
+/// never happens while the config lock is held.
+fn collect_session_tokens(names: &[String]) -> HashMap<String, crate::claude::SessionTokenStatus> {
+    names
+        .iter()
+        .filter_map(|n| crate::claude::session_token_status(n).map(|s| (n.clone(), s)))
+        .collect()
 }
 
 /// `(tick stamp, cached account email per profile name)` — see
@@ -1582,6 +1653,15 @@ impl App {
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
 
+        // Seed the token cache before `config` moves into the handle below.
+        let session_tokens = collect_session_tokens(
+            &config
+                .profiles
+                .iter()
+                .map(|p| p.name.to_string())
+                .collect::<Vec<_>>(),
+        );
+
         Self {
             config: Arc::new(RankedMutex::new(config)),
             usage_store,
@@ -1614,6 +1694,7 @@ impl App {
             fallback_armed_remove: false,
             fallback_threshold_draft: None,
             fallback_weekly_draft: None,
+            fallback_max_spend_draft: None,
             global_config_cursor: 0,
             refresh_interval_draft: None,
             weekly_threshold_draft: None,
@@ -1670,6 +1751,7 @@ impl App {
             history_mtimes,
             last_history_usage: HashMap::new(),
             overview_emails: Mutex::new(None),
+            session_tokens,
         }
     }
 
@@ -2040,19 +2122,24 @@ impl App {
         if let Ok(fresh) = load_config() {
             *self.config() = fresh;
             self.last_reload_fp = current;
-            let cfg = self.config();
-            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-            {
-                *self
-                    .usage_tokens
-                    .lock()
-                    .expect("usage_tokens mutex poisoned") = collect_tokens(&cfg);
-                *self
-                    .third_party_tokens
-                    .lock()
-                    .expect("third_party_tokens mutex poisoned") =
-                    collect_third_party_entries(&cfg.profiles);
-            }
+            let names: Vec<String> = {
+                let cfg = self.config();
+                #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+                {
+                    *self
+                        .usage_tokens
+                        .lock()
+                        .expect("usage_tokens mutex poisoned") = collect_tokens(&cfg);
+                    *self
+                        .third_party_tokens
+                        .lock()
+                        .expect("third_party_tokens mutex poisoned") =
+                        collect_third_party_entries(&cfg.profiles);
+                }
+                cfg.profiles.iter().map(|p| p.name.to_string()).collect()
+            };
+            // Sidecar reads happen with the config guard dropped (above scope).
+            self.session_tokens = collect_session_tokens(&names);
             true
         } else {
             false
@@ -2313,6 +2400,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         && app.fallback_weekly_draft.is_some()
     {
         handle_fallback_weekly_edit_key(app, key);
+        return;
+    }
+
+    // Same for the `max auto-spend` editor.
+    if app.tab == Tab::Fallback
+        && app.fallback_focus == FallbackFocus::Detail
+        && app.fallback_max_spend_draft.is_some()
+    {
+        handle_fallback_max_spend_edit_key(app, key);
         return;
     }
 
@@ -2756,9 +2852,9 @@ fn apply_plugin_fix(app: &mut App) {
         PluginFix::WireMcpServers => {
             app.disarm_quit();
             app.modals.push(Modal::Confirm(ConfirmState {
-                message: "Wire clauth into Claude Code's mcpServers?".to_string(),
+                message: "wire clauth into claude code's mcpServers?".to_string(),
                 detail: Some(
-                    "Writes the clauth entry into ~/.claude.json; other fields are preserved."
+                    "writes the clauth entry into ~/.claude.json; other fields are preserved."
                         .to_string(),
                 ),
                 choice: false,
@@ -2772,9 +2868,9 @@ fn apply_plugin_fix(app: &mut App) {
         PluginFix::RelinkCredentials(name) => {
             app.disarm_quit();
             app.modals.push(Modal::Confirm(ConfirmState {
-                message: format!("Relink ~/.claude credentials to '{name}'?"),
+                message: format!("relink ~/.claude credentials to '{name}'?"),
                 detail: Some(
-                    "Re-points .credentials.json at the profile's own stored tokens; spends nothing.".to_string(),
+                    "re-points .credentials.json at the account's own stored tokens; spends nothing.".to_string(),
                 ),
                 choice: false,
                 on_confirm: ConfirmAction::RelinkCredentials(name),
@@ -2822,7 +2918,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         None => {
             about_detail.push("path: not on PATH".to_string());
             about_detail.push(
-                "Claude Code spawns `clauth mcp` by name, so the server won't start".to_string(),
+                "claude code spawns clauth mcp by name, so the server won't start".to_string(),
             );
             about_detail.push("install clauth so its bin directory is on PATH".to_string());
         }
@@ -2831,8 +2927,8 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         Some(version) => about_detail.push(format!("claude: {version}")),
         None => {
             about_detail.push("claude: not found".to_string());
-            about_detail.push("`claude --version` failed or claude is not on PATH".to_string());
-            about_detail.push("install Claude Code so the `claude` binary resolves".to_string());
+            about_detail.push("claude --version failed or claude is not on PATH".to_string());
+            about_detail.push("install claude code so the claude binary resolves".to_string());
         }
     }
     checks.push(Check {
@@ -3001,7 +3097,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             detail.push(format!("marketplace: {repo}"));
         }
         detail.push(String::new());
-        detail.push("install (run in Claude Code):".to_string());
+        detail.push("install (run in claude code):".to_string());
         detail.push("  /plugin marketplace add uwuclxdy/clauth".to_string());
         detail.push("  /plugin install clauth@clauth".to_string());
         Check {
@@ -3227,7 +3323,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
     }
     drop(cfg);
     app.modals.push(Modal::Confirm(ConfirmState {
-        message: format!("Switch to '{name}'?"),
+        message: format!("switch to '{name}'?"),
         detail: None,
         choice: true,
         on_confirm: ConfirmAction::Switch(name),
@@ -3366,7 +3462,7 @@ fn active_diverged_unsaved(active: &str) -> bool {
 fn prompt_divergence(app: &mut App, active: String, verb: &str) {
     app.toast(
         ToastKind::Warning,
-        format!("'{active}' has unsaved Claude Code credentials\nresolve before {verb}"),
+        format!("'{active}' has unsaved claude code credentials\nresolve before {verb}"),
     );
     open_divergence_modal(app, &active);
 }
@@ -3479,10 +3575,14 @@ fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
         .as_ref()
         .is_some_and(|c| c.claude_ai_oauth.is_some());
     if !has_oauth && snapshot.base_url.is_none() && snapshot.api_key.is_none() {
-        app.toast(
-            ToastKind::Danger,
-            "no live login found\nnothing to capture (macOS keychain isn't supported yet)",
-        );
+        // The Keychain caveat only makes sense on macOS, where a live login can
+        // hide in the Keychain clauth doesn't read; elsewhere it's noise.
+        let msg = if cfg!(target_os = "macos") {
+            "no live login found\nnothing to capture (macos keychain isn't supported yet)"
+        } else {
+            "no live login found\nnothing to capture"
+        };
+        app.toast(ToastKind::Danger, msg);
         return None;
     }
     Some(snapshot)
@@ -3498,8 +3598,8 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
     };
     if let Some(existing) = existing_match {
         app.modals.push(Modal::Confirm(ConfirmState {
-            message: format!("These credentials already belong to '{existing}'."),
-            detail: Some("Capture anyway?".to_string()),
+            message: format!("these credentials already belong to '{existing}'."),
+            detail: Some("capture anyway?".to_string()),
             choice: false,
             on_confirm: ConfirmAction::CaptureConflict(Box::new(snapshot), from_divergence),
         }));
@@ -3540,26 +3640,61 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
 }
 
 /// Detail rows for a chain member: threshold stepper, last-resort toggle, remove.
-pub(crate) const FALLBACK_ROWS: [FallbackRow; 6] = [
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 7] = [
     FallbackRow::Threshold,
     FallbackRow::WeeklyAt,
     FallbackRow::CheckWeekly,
     FallbackRow::CheckScoped,
     FallbackRow::LastResort,
+    FallbackRow::MaxSpend,
     FallbackRow::Remove,
 ];
 
-/// Rows on the program-wide Config tab, in display order.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 8] = [
+/// Rows on the program-wide Config tab, in display order. Related knobs sit
+/// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
+/// names each run, and the renderer turns a band change into an eyebrow header.
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 14] = [
     GlobalConfigRow::Theme,
+    GlobalConfigRow::ResetShape,
+    GlobalConfigRow::ClockNotation,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
-    GlobalConfigRow::WrapOff,
+    GlobalConfigRow::PreemptiveRotation,
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
-    GlobalConfigRow::PreemptiveRotation,
+    GlobalConfigRow::BurnFloor,
+    GlobalConfigRow::BurnHorizon,
+    GlobalConfigRow::SwitchOffWhenSpent,
+    GlobalConfigRow::SpendBudget,
+    GlobalConfigRow::SwitchOffWhenBudgetSpent,
 ];
+
+impl GlobalConfigRow {
+    /// The concern this row belongs to. Rows sharing a band are contiguous in
+    /// [`GLOBAL_CONFIG_ROWS`]; the Config renderer opens each run with an eyebrow
+    /// header, so a band that stops being contiguous would render twice — which
+    /// is what `config_bands_stay_contiguous` pins.
+    pub(crate) fn band(self) -> &'static str {
+        match self {
+            GlobalConfigRow::Theme
+            | GlobalConfigRow::ResetShape
+            | GlobalConfigRow::ClockNotation => "appearance",
+            GlobalConfigRow::DivergenceDefault
+            | GlobalConfigRow::RefreshInterval
+            | GlobalConfigRow::RefreshSpentAccounts
+            | GlobalConfigRow::PreemptiveRotation => "scheduler",
+            GlobalConfigRow::WeeklyThreshold
+            | GlobalConfigRow::BurnAware
+            | GlobalConfigRow::BurnFloor
+            | GlobalConfigRow::BurnHorizon
+            | GlobalConfigRow::SwitchOffWhenSpent => "auto-switch",
+            GlobalConfigRow::SpendBudget | GlobalConfigRow::SwitchOffWhenBudgetSpent => {
+                "extra usage"
+            }
+        }
+    }
+}
 
 /// Config tab keymap (enumerated rows only, per the unified value-row grammar):
 /// ↑↓ walks rows; space cycles every row's value forward, wrapping the top
@@ -3607,12 +3742,47 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
 fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
     match row {
         GlobalConfigRow::Theme => cycle_theme(app),
+        GlobalConfigRow::ResetShape => cycle_reset_display(app),
+        // Inert while the countdown is relative (rendered dimmed): no surface
+        // draws a clock then, so the notation would decide nothing.
+        GlobalConfigRow::ClockNotation => {
+            if app.config().state.reset_display().shows_clock() {
+                cycle_clock_format(app);
+            }
+        }
         GlobalConfigRow::DivergenceDefault => cycle_divergence_default(app),
-        GlobalConfigRow::WrapOff => toggle_wrap_off(app),
+        GlobalConfigRow::SwitchOffWhenSpent => toggle_wrap_off(app),
         GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
-        GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
+        // Inert while burn-aware is off (rendered dimmed): the floor/cap only
+        // shape the projection, which the static path never runs.
+        GlobalConfigRow::BurnFloor => {
+            if app.config().state.burn_aware_switching {
+                step_burn_floor(app);
+            }
+        }
+        GlobalConfigRow::BurnHorizon => {
+            if app.config().state.burn_aware_switching {
+                step_burn_horizon(app);
+            }
+        }
+        GlobalConfigRow::SpendBudget => toggle_spend_budget_switching(app),
+        // Inert while spend budget is off (rendered dimmed): decides no halt when
+        // nothing spends, so it stays a true disabled row — the key is a no-op.
+        GlobalConfigRow::SwitchOffWhenBudgetSpent => {
+            if app.config().state.spend_budget_switching {
+                toggle_budget_wrap_off(app);
+            }
+        }
+        // Inert off macOS (rendered dimmed): preemptive rotation only fires
+        // while the Keychain mirror is live (`scheduler::keychain_live`), which
+        // is macOS-only, so the key is a no-op elsewhere.
+        GlobalConfigRow::PreemptiveRotation => {
+            if cfg!(target_os = "macos") {
+                toggle_preemptive_rotation(app);
+            }
+        }
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
     }
 }
@@ -3650,6 +3820,8 @@ pub(crate) enum FallbackHint {
     DetailCheckWeekly,
     DetailCheckScoped,
     DetailLastResort,
+    DetailMaxSpend,
+    DetailMaxSpendEdit,
     DetailRemove,
     DetailRemoveArmed,
     DetailAdd,
@@ -3675,6 +3847,9 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
             if app.fallback_weekly_draft.is_some() {
                 return FallbackHint::DetailWeeklyAtEdit;
             }
+            if app.fallback_max_spend_draft.is_some() {
+                return FallbackHint::DetailMaxSpendEdit;
+            }
             let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
             match FALLBACK_ROWS[cursor] {
                 FallbackRow::Threshold => FallbackHint::DetailThreshold,
@@ -3682,6 +3857,7 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
                 FallbackRow::CheckWeekly => FallbackHint::DetailCheckWeekly,
                 FallbackRow::CheckScoped => FallbackHint::DetailCheckScoped,
                 FallbackRow::LastResort => FallbackHint::DetailLastResort,
+                FallbackRow::MaxSpend => FallbackHint::DetailMaxSpend,
                 FallbackRow::Remove if app.fallback_armed_remove => FallbackHint::DetailRemoveArmed,
                 FallbackRow::Remove => FallbackHint::DetailRemove,
             }
@@ -3770,6 +3946,38 @@ pub(crate) fn next_divergence_default(
     }
 }
 
+/// Reset-shape cycle order, wrapping back to the stock relative form.
+pub(crate) fn next_reset_display(current: ResetDisplay) -> ResetDisplay {
+    match current {
+        ResetDisplay::Relative => ResetDisplay::Clock,
+        ResetDisplay::Clock => ResetDisplay::Both,
+        ResetDisplay::Both => ResetDisplay::Relative,
+    }
+}
+
+fn cycle_reset_display(app: &mut App) {
+    let next = next_reset_display(app.config().state.reset_display());
+    {
+        let mut cfg = app.config();
+        cfg.state.reset_display = Some(next);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+fn cycle_clock_format(app: &mut App) {
+    let next = match app.config().state.clock_format() {
+        ClockFormat::H24 => ClockFormat::H12,
+        ClockFormat::H12 => ClockFormat::H24,
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.clock_format = Some(next);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
 fn cycle_divergence_default(app: &mut App) {
     let next = next_divergence_default(app.config().state.default_divergence);
     {
@@ -3783,22 +3991,86 @@ fn cycle_divergence_default(app: &mut App) {
 fn toggle_wrap_off(app: &mut App) {
     {
         let mut cfg = app.config();
-        cfg.state.wrap_off = !cfg.state.wrap_off;
+        cfg.state.switch_off_when_spent = !cfg.state.switch_off_when_spent;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();
 }
 
 /// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
-/// `wrap_off`'s persistence shape exactly: mutate the shared `AppConfig`,
+/// `switch_off_when_spent`'s persistence shape exactly: mutate the shared `AppConfig`,
 /// `save_app_state`, bump `last_reload_fp` — no separate propagation to the
 /// scheduler is needed since both `next_target` and `next_auto_switch_target`
 /// read the flag straight off the same shared `config` (`snapshot_chain`
-/// mirrors `wrap_off`'s copy into `ChainSnapshot`).
+/// mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
 fn toggle_burn_aware_switching(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.burn_aware_switching = !cfg.state.burn_aware_switching;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Step the burn-aware floor forward through [`BURN_FLOOR_PRESETS`] (space on
+/// the Config row), wrapping past the top back to the first — the same
+/// segmented-control grammar as the weekly row. Only reachable while burn-aware
+/// is on (the row is inert otherwise). Persists the `Option` field so an unset
+/// default keeps `skip_serializing_if` omitting it until the first change.
+fn step_burn_floor(app: &mut App) {
+    let current = app.config().state.burn_switch_floor_pct();
+    let next = BURN_FLOOR_PRESETS
+        .iter()
+        .copied()
+        .find(|&p| p > current)
+        .unwrap_or(BURN_FLOOR_PRESETS[0]);
+    {
+        let mut cfg = app.config();
+        cfg.state.burn_switch_floor_pct = Some(next);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Step the burn-aware horizon cap forward through [`BURN_HORIZON_PRESETS`].
+/// Same grammar + persistence as [`step_burn_floor`].
+fn step_burn_horizon(app: &mut App) {
+    let current = app.config().state.burn_horizon_cap_ms();
+    let next = BURN_HORIZON_PRESETS
+        .iter()
+        .copied()
+        .find(|&p| p > current)
+        .unwrap_or(BURN_HORIZON_PRESETS[0]);
+    {
+        let mut cfg = app.config();
+        cfg.state.burn_horizon_cap_ms = Some(next);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Flip the master half of the real-money opt-in
+/// (`AppState.spend_budget_switching`). Same persistence shape as
+/// `toggle_burn_aware_switching`; both walk twins read the flag off the shared
+/// config (the UI twin directly, the scheduler's through `snapshot_chain`), so
+/// no separate propagation is needed. Flipping this on alone still spends
+/// nothing — every member's ceiling defaults to $0.
+fn toggle_spend_budget_switching(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.spend_budget_switching = !cfg.state.spend_budget_switching;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Flip what happens once a billing account has spent its budget
+/// (`AppState.switch_off_when_budget_spent`). Same persistence shape as
+/// `toggle_spend_budget_switching`.
+fn toggle_budget_wrap_off(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.switch_off_when_budget_spent = !cfg.state.switch_off_when_budget_spent;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();
@@ -4163,6 +4435,14 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
         FallbackRow::CheckWeekly => toggle_member_flag(app, MemberFlag::CheckWeekly),
         FallbackRow::CheckScoped => toggle_member_flag(app, MemberFlag::CheckScoped),
         FallbackRow::LastResort => toggle_last_resort(app),
+        FallbackRow::MaxSpend => {
+            // Inert while spend budget is off (rendered dimmed): opening the editor
+            // would let a ceiling be typed that does nothing, so no-op.
+            let armed = app.config().state.spend_budget_switching;
+            if armed && let Some(current) = selected_max_spend(app) {
+                app.fallback_max_spend_draft = Some(InputState::new(&format!("{current:.2}")));
+            }
+        }
         FallbackRow::Remove => {
             if app.fallback_armed_remove {
                 remove_chain_member(app);
@@ -4221,6 +4501,19 @@ fn handle_fallback_weekly_edit_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Keystrokes while the `max auto-spend` field is open: ⏎ saves, ⎋ discards.
+fn handle_fallback_max_spend_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.fallback_max_spend_draft = None,
+        KeyCode::Enter => commit_max_spend_edit(app),
+        _ => {
+            if let Some(input) = app.fallback_max_spend_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
 /// Parse and persist the typed override. Invalid input keeps the draft open
 /// (same no-toast treatment as the threshold editor); an EMPTY commit clears
 /// the override back to the chain-wide default.
@@ -4268,6 +4561,62 @@ fn write_weekly_override(app: &mut App, value: Option<f64>) {
         match cfg.find_mut(&name) {
             Some(profile) => {
                 profile.weekly_threshold = value;
+                save_profile(profile).err()
+            }
+            None => None,
+        }
+    };
+    if let Some(e) = save_err {
+        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+    }
+}
+
+/// Parse and persist the typed ceiling. Invalid input keeps the draft open, the
+/// same no-toast treatment the threshold editor uses.
+fn commit_max_spend_edit(app: &mut App) {
+    let Some(raw) = app.fallback_max_spend_draft.as_ref().map(|i| i.trimmed()) else {
+        return;
+    };
+    let Some(value) = parse_max_spend(raw) else {
+        return;
+    };
+    write_max_spend(app, value);
+    app.fallback_max_spend_draft = None;
+}
+
+/// A typed ceiling is valid only as a finite, non-negative number of dollars.
+/// `is_finite` is the load-bearing half: `"inf"` parses as a perfectly good
+/// `f64`, and an infinite ceiling means unbounded unattended spending
+/// (`fallback::spend_room`). Shared by the commit path and the detail card's
+/// inline Invalid-input check.
+pub(crate) fn parse_max_spend(raw: &str) -> Option<f64> {
+    raw.parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// This member's ceiling in dollars, or `None` on `+ add`. Unset reads as $0 —
+/// the never-spend default.
+fn selected_max_spend(app: &App) -> Option<f64> {
+    let pos = selected_chain_member(app)?;
+    let cfg = app.config();
+    let name = cfg.state.fallback_chain.get(pos)?;
+    Some(cfg.find(name).and_then(|p| p.max_auto_spend).unwrap_or(0.0))
+}
+
+/// Write the ceiling for the selected member and persist.
+fn write_max_spend(app: &mut App, value: f64) {
+    let Some(pos) = selected_chain_member(app) else {
+        return;
+    };
+    let save_err = {
+        let mut cfg = app.config();
+        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
+            return;
+        };
+        match cfg.find_mut(&name) {
+            Some(profile) => {
+                profile.max_auto_spend = Some(value);
                 save_profile(profile).err()
             }
             None => None,
@@ -4615,6 +4964,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                         FallbackRow::CheckWeekly => actions.push(ToggleCheckWeekly),
                         FallbackRow::CheckScoped => actions.push(ToggleCheckScoped),
                         FallbackRow::LastResort => actions.push(ToggleLastResort),
+                        FallbackRow::MaxSpend => actions.push(EditMaxSpend),
                         FallbackRow::Remove => actions.push(RemoveMember),
                     }
                 }
@@ -4722,10 +5072,24 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             None => {}
         },
         ActionMenuAction::RotateTokens => match focused_account(app) {
+            // A live `clauth start` session owns this profile's single-use OAuth
+            // chain and rotates it itself, so our stored token is already spent —
+            // rotating from here would 400 (docs/internals.md, 2026-06-17). Explain
+            // the block in an acknowledge modal instead of a dead-end toast.
+            Some((name, true, _)) if crate::runtime::has_live_session(&name) => {
+                app.modals.push(Modal::Confirm(ConfirmState {
+                    message: format!("'{name}' is in use by a running session"),
+                    detail: Some(
+                        "it manages its own tokens; rotating here would fail.".to_string(),
+                    ),
+                    choice: true,
+                    on_confirm: ConfirmAction::Acknowledge,
+                }));
+            }
             Some((name, true, _)) => {
                 app.modals.push(Modal::Confirm(ConfirmState {
-                    message: format!("Rotate access token for '{name}'?"),
-                    detail: Some(ROTATE_ONE_DETAIL.to_string()),
+                    message: format!("rotate access token for '{name}'?"),
+                    detail: None,
                     choice: false,
                     on_confirm: ConfirmAction::RotateOne(name),
                 }));
@@ -4754,6 +5118,9 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         }
         ActionMenuAction::ToggleLastResort => {
             run_fallback_row(app, FallbackRow::LastResort);
+        }
+        ActionMenuAction::EditMaxSpend => {
+            run_fallback_row(app, FallbackRow::MaxSpend);
         }
         ActionMenuAction::RemoveMember => {
             run_fallback_row(app, FallbackRow::Remove);
@@ -5085,7 +5452,7 @@ fn leave_config_detail(app: &mut App) {
     if mint_dropped {
         app.toast(
             ToastKind::Warning,
-            "the captured login was dropped with the form",
+            "closing the form dropped the login you just captured",
         );
     }
 }
@@ -5224,11 +5591,8 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                     .is_some_and(|d| d.captured_login.is_some());
                 if has_stash {
                     app.modals.push(Modal::Confirm(ConfirmState {
-                        message: "Replace the captured login?".to_string(),
-                        detail: Some(
-                            "A fresh browser login replaces the one already captured for this account. The stashed tokens are dropped."
-                                .to_string(),
-                        ),
+                        message: "replace the captured login?".to_string(),
+                        detail: Some("the login you already captured will be dropped".to_string()),
                         choice: false,
                         on_confirm: ConfirmAction::RestartLogin(name, is_new),
                     }));
@@ -5246,12 +5610,12 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                         .unwrap_or(false)
                 };
                 let detail = if is_api {
-                    "Blanks the api key; keeps the base url, model, and env. Re-login any time."
+                    "blanks the api key; keeps the base url, model, and env. re-login any time."
                 } else {
-                    "Blanks the login; keeps the profile, model, env, and chain slot. Re-login any time."
+                    "blanks the login; keeps the account, model, env, and chain slot. re-login any time."
                 };
                 app.modals.push(Modal::Confirm(ConfirmState {
-                    message: format!("Log out of '{name}'?"),
+                    message: format!("log out of '{name}'?"),
                     detail: Some(detail.to_string()),
                     choice: false,
                     on_confirm: ConfirmAction::BlankCredentials(name),
@@ -6042,9 +6406,9 @@ fn perform_delete(app: &mut App, name: &str) {
     // the unforced delete first.
     if crate::runtime::has_live_session(name) {
         app.modals.push(Modal::Confirm(ConfirmState {
-            message: format!("Delete '{name}' anyway?"),
+            message: format!("delete '{name}' anyway?"),
             detail: Some(
-                "This profile has a live `clauth start` session; deleting it may log that \
+                "this account has a live clauth start session; deleting it may log that \
                  session out."
                     .to_string(),
             ),
@@ -6105,7 +6469,7 @@ fn toggle_auto_start(app: &mut App, name: &str) {
         Outcome::Missing => {}
         Outcome::NotOAuth => app.toast(
             ToastKind::Warning,
-            "auto-start usage only applies to OAuth profiles",
+            "auto-start only works on oauth accounts",
         ),
         Outcome::Saved(_now_on) => {
             // Rebuild the scheduler's token snapshot so the new `auto_start` flag
@@ -6324,6 +6688,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
         ConfirmAction::DeleteLiveSession(name) => finish_delete(app, &name, true),
+        ConfirmAction::Acknowledge => {}
     }
 }
 
@@ -6366,10 +6731,10 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                         return;
                     };
                     app.modals.push(Modal::Confirm(ConfirmState {
-                        message: format!("Switch to '{owner}'? The live login is its account."),
+                        message: format!("switch to '{owner}'? the live login is its account."),
                         detail: Some(format!(
-                            "The login is saved into '{owner}' and '{owner}' becomes the active \
-                             account. The running claude is untouched."
+                            "the login is saved into '{owner}' and '{owner}' becomes the active \
+                             account. the running claude is untouched."
                         )),
                         choice: false,
                         on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), owner),
@@ -6406,9 +6771,9 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
         DivergenceChoice::NewProfile => open_divergence_target_picker(app),
         DivergenceChoice::Discard => {
             app.modals.push(Modal::Confirm(ConfirmState {
-                message: format!("Discard the new login and restore '{active}'?"),
+                message: format!("discard the new login and restore '{active}'?"),
                 detail: Some(
-                    "Claude Code's freshly written credentials will be overwritten with the profile's stored tokens.".to_string(),
+                    "claude code's freshly written credentials will be overwritten with the account's stored tokens.".to_string(),
                 ),
                 choice: false,
                 on_confirm: ConfirmAction::DiscardDivergence(active.to_string()),
@@ -6502,9 +6867,9 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                 return;
             };
             app.modals.push(Modal::Confirm(ConfirmState {
-                message: format!("Save the live login into '{target}'?"),
+                message: format!("save the live login into '{target}'?"),
                 detail: Some(format!(
-                    "'{target}' becomes the active account; its old credentials are replaced. Usage history, env, and model settings are kept."
+                    "'{target}' becomes the active account; its old credentials are replaced. usage history, env, and model settings are kept."
                 )),
                 choice: false,
                 on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), target),
@@ -6549,9 +6914,9 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 // with an error. Route to the same confirm-modal machinery as
                 // every other destructive action instead of a picker/new modal.
                 app.modals.push(Modal::Confirm(ConfirmState {
-                    message: format!("Profile '{existing}' already exists."),
+                    message: format!("account '{existing}' already exists."),
                     detail: Some(
-                        "Overwrite its credentials with the captured login? Usage history, env, and model settings are kept.".to_string(),
+                        "overwrite its credentials with the captured login? usage history, env, and model settings are kept.".to_string(),
                     ),
                     choice: false,
                     on_confirm: ConfirmAction::CaptureOverwrite(
@@ -6871,9 +7236,9 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         );
     if !apply_now {
         app.modals.push(Modal::Confirm(ConfirmState {
-            message: format!("Replace the stored credentials for '{}'?", session.name),
+            message: format!("replace the stored credentials for '{}'?", session.name),
             detail: Some(
-                "A fresh browser login finished for this account. The old tokens are dropped; chain slot, env, and model settings stay."
+                "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, and model settings stay."
                     .to_string(),
             ),
             choice: false,
@@ -6909,7 +7274,7 @@ pub(crate) fn on_tick(app: &mut App) {
             UpdateEvent::Available(v) => {
                 app.toast(
                     ToastKind::Info,
-                    format!("update available: v{v}\nrun `cargo install clauth`"),
+                    format!("update available: v{v}\nreinstall with cargo install clauth"),
                 );
             }
         }
@@ -7036,9 +7401,9 @@ fn update_banner(app: &mut App) {
 
     app.banner = if no_active {
         let message = if any_spent {
-            "all accounts spent · switch to a profile to resume"
+            "all accounts spent · switch to an account to resume"
         } else {
-            "no active profile · select one to resume"
+            "no active account · select one to resume"
         };
         Some(Banner {
             severity: BannerSeverity::Danger,

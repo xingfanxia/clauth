@@ -123,6 +123,77 @@ fn preemptive_rotation_defaults_false_and_round_trips() {
     );
 }
 
+// `auto_rescue` (isolated-transcript rescue) shares `preemptive_rotation`'s
+// serde contract exactly: absent from old state files → false (stock discards
+// an isolated store on teardown), on renders explicitly, off is omitted.
+#[test]
+fn auto_rescue_defaults_false_and_round_trips() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(!state.auto_rescue);
+
+    let on = AppState {
+        auto_rescue: true,
+        ..AppState::default()
+    };
+    let rendered_on = toml::to_string_pretty(&on).expect("render on state");
+    assert!(
+        rendered_on.contains("auto_rescue = true"),
+        "on must render explicitly, got:\n{rendered_on}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_on).expect("reparse on state");
+    assert!(reparsed.auto_rescue);
+
+    let rendered_off = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_off.contains("auto_rescue"),
+        "off (default) must be omitted, got:\n{rendered_off}"
+    );
+}
+
+// The reset-display pair (issue #39) renders as its own on-disk vocabulary, so
+// these pin the literal keys AND values rather than round-tripping through the
+// same enum both ways: a renamed variant would keep a round-trip green while
+// every existing profiles.toml silently reverted to the default.
+#[test]
+fn reset_display_pair_round_trips_and_is_omitted_at_the_default() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert_eq!(state.reset_display(), ResetDisplay::Relative);
+    assert_eq!(state.clock_format(), ClockFormat::H24);
+
+    let on = AppState {
+        reset_display: Some(ResetDisplay::Both),
+        clock_format: Some(ClockFormat::H12),
+        ..AppState::default()
+    };
+    let rendered_on = toml::to_string_pretty(&on).expect("render on state");
+    assert!(
+        rendered_on.contains(r#"reset_display = "both""#),
+        "reset_display renders its lowercase name, got:\n{rendered_on}"
+    );
+    assert!(
+        rendered_on.contains(r#"clock_format = "12h""#),
+        "clock_format renders as 12h/24h, not the Rust variant, got:\n{rendered_on}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_on).expect("reparse on state");
+    assert_eq!(reparsed.reset_display(), ResetDisplay::Both);
+    assert_eq!(reparsed.clock_format(), ClockFormat::H12);
+
+    // 24h is the default but still a real stored choice: it must survive a
+    // round trip rather than reading back as "never set".
+    let h24 = AppState {
+        clock_format: Some(ClockFormat::H24),
+        ..AppState::default()
+    };
+    let rendered_h24 = toml::to_string_pretty(&h24).expect("render 24h state");
+    assert!(rendered_h24.contains(r#"clock_format = "24h""#));
+
+    let rendered_off = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_off.contains("reset_display") && !rendered_off.contains("clock_format"),
+        "an untouched state file gains neither key, got:\n{rendered_off}"
+    );
+}
+
 // `refresh_spent_accounts` defaults to TRUE (poll every account — today's
 // behavior) so pre-field profiles.toml files load unchanged; only an explicit
 // `false` opt-out renders, and the default is omitted (the inverse serde shape
@@ -184,7 +255,9 @@ fallback_chain = ["work"]
     );
 
     // Byte-for-byte equality with a String-typed control — no format migration.
-    // Field order and serde attrs mirror `AppState` exactly.
+    // Field order and serde attrs mirror `AppState`'s ON-DISK shape exactly, so
+    // this field is spelled `wrap_off` (the published key) rather than
+    // `switch_off_when_spent` (the Rust name behind `serde(rename)`).
     #[derive(serde::Serialize, Default)]
     struct BareState {
         active_profile: Option<String>,
@@ -389,6 +462,139 @@ fn out_of_band_per_profile_thresholds_clamp_to_the_band_at_load() {
     let loaded = load_profile(name).expect("load_profile");
     assert_eq!(loaded.fallback_threshold, Some(73.5));
     assert_eq!(loaded.bell_threshold, Some(12.0));
+}
+
+/// The Rust field is `switch_off_when_spent`; the ON-DISK key must stay
+/// `wrap_off`. Nothing else pins this: `status.json`'s contract test covers its
+/// own key, and every round-trip test goes through serde in both directions, so
+/// a rename of the serde name passes them all while silently resetting the
+/// setting to `false` in every profiles.toml already on disk. A blind
+/// find-and-replace across the field name did exactly that (2026-07-17), which
+/// is what this test exists to catch.
+#[test]
+fn switch_off_when_spent_keeps_its_wrap_off_key_on_disk() {
+    let from_disk: AppState = toml::from_str("profiles = []\nwrap_off = true\n")
+        .expect("the legacy key must still parse");
+    assert!(
+        from_disk.switch_off_when_spent,
+        "an existing profiles.toml's `wrap_off = true` must survive the rename"
+    );
+
+    let rendered = toml::to_string(&AppState {
+        switch_off_when_spent: true,
+        ..AppState::default()
+    })
+    .expect("serialize");
+    assert!(
+        rendered.contains("wrap_off = true"),
+        "writes must keep the published key, else an older clauth reads the file \
+         and silently loses the setting: {rendered}"
+    );
+    assert!(
+        !rendered.contains("switch_off_when_spent"),
+        "the Rust name must not reach disk: {rendered}"
+    );
+}
+
+/// `max_auto_spend` is a dollar ceiling on unattended spending, so its load
+/// normalization is a money guard, not a tidy-up. `inf` and `nan` are both
+/// valid TOML floats: left raw, an infinite ceiling means an account with no
+/// declared cap has infinite room (`fallback::spend_room`), i.e. unbounded
+/// spending from one hand-edited word. Anything non-finite reads as the
+/// never-spend default instead.
+#[cfg(unix)]
+#[test]
+fn non_finite_max_auto_spend_reads_as_zero_at_load() {
+    let _home = HomeSandbox::new();
+    let name = "spend-ceiling-test";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+
+    for raw in ["max_auto_spend = inf\n", "max_auto_spend = nan\n"] {
+        std::fs::write(&config_path, raw).expect("write config.toml");
+        assert_eq!(
+            load_profile(name).expect("load_profile").max_auto_spend,
+            Some(0.0),
+            "{raw:?} must not survive the load boundary as a spendable ceiling"
+        );
+    }
+
+    // A negative ceiling floors at $0 rather than staying raw...
+    std::fs::write(&config_path, "max_auto_spend = -5.0\n").expect("write config.toml");
+    assert_eq!(
+        load_profile(name).expect("load_profile").max_auto_spend,
+        Some(0.0)
+    );
+
+    // ...and an ordinary ceiling is passed through untouched.
+    std::fs::write(&config_path, "max_auto_spend = 12.5\n").expect("write config.toml");
+    assert_eq!(
+        load_profile(name).expect("load_profile").max_auto_spend,
+        Some(12.5)
+    );
+}
+
+/// The load boundary drops a base_url ONLY when a stored OAuth pair could leak
+/// to it (pair present + no usable key). A pure api account with a cleared key
+/// keeps its base_url shell so `clear_profile_api_key` stays re-loginable — the
+/// same normalize-at-load discipline as `max_auto_spend`, scoped to the leak.
+#[cfg(unix)]
+#[test]
+fn base_url_dropped_only_when_a_stored_pair_could_leak() {
+    let _home = HomeSandbox::new();
+    let name = "endpoint-key-gate";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let endpoint = "https://api.z.ai/anthropic";
+
+    // No stored pair + no key: nothing to leak, so the base_url shell is kept —
+    // a cleared api account (`clear_profile_api_key`) must stay re-loginable.
+    std::fs::write(&config_path, format!("base_url = \"{endpoint}\"\n")).expect("write config");
+    let pure = load_profile(name).expect("load_profile");
+    assert_eq!(
+        pure.base_url.as_deref(),
+        Some(endpoint),
+        "no pair means no leak, so the base_url shell is kept"
+    );
+
+    // Seed an OAuth pair (a hybrid). With no key the pair would reach the
+    // endpoint, so base_url (and its provider) is dropped; CC routes to Anthropic.
+    std::fs::write(
+        &cred_path,
+        serde_json::to_string(&oauth_credentials()).expect("ser creds"),
+    )
+    .expect("write credentials.json");
+    let hybrid = load_profile(name).expect("load_profile");
+    assert_eq!(
+        hybrid.base_url, None,
+        "a stored pair with no key must not route to the endpoint"
+    );
+    assert!(
+        hybrid.provider.is_none(),
+        "a dropped endpoint has no provider"
+    );
+
+    // A whitespace-only key is still no usable key → still dropped.
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\napi_key = \"   \"\n"),
+    )
+    .expect("write config");
+    assert_eq!(load_profile(name).expect("load_profile").base_url, None);
+
+    // A real key on the same hybrid keeps the endpoint and its provider.
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\napi_key = \"sk-real\"\n"),
+    )
+    .expect("write config");
+    let keyed = load_profile(name).expect("load_profile");
+    assert_eq!(keyed.base_url.as_deref(), Some(endpoint));
+    assert!(
+        keyed.provider.is_some(),
+        "a keyed z.ai endpoint keeps its provider"
+    );
 }
 
 // ── crash-durable rotation: the pending sidecar's adopt/discard decision ─────
@@ -628,6 +834,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(creds.clone()),
         usage: None,
@@ -1094,8 +1301,8 @@ fn reload_fingerprint_bumps_when_a_config_toml_is_added() {
         before
             .config_mtimes
             .iter()
-            .find(|(n, _)| n == "newcomer")
-            .map(|(_, m)| m.is_some()),
+            .find(|(n, _, _)| n == "newcomer")
+            .map(|(_, m, _)| m.is_some()),
         Some(false),
         "the dir exists but has no config.toml yet"
     );
@@ -1105,8 +1312,8 @@ fn reload_fingerprint_bumps_when_a_config_toml_is_added() {
         after
             .config_mtimes
             .iter()
-            .find(|(n, _)| n == "newcomer")
-            .map(|(_, m)| m.is_some()),
+            .find(|(n, _, _)| n == "newcomer")
+            .map(|(_, m, _)| m.is_some()),
         Some(true),
         "adding a config.toml gives the entry an mtime"
     );
@@ -1122,16 +1329,16 @@ fn reload_fingerprint_advances_when_a_config_toml_is_edited() {
     let before_mtime = before
         .config_mtimes
         .iter()
-        .find(|(n, _)| n == "p")
-        .and_then(|(_, m)| *m);
+        .find(|(n, _, _)| n == "p")
+        .and_then(|(_, m, _)| *m);
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
     crate::testutil::set_mtime(&cfg, later);
     let after = reload_fingerprint();
     let after_mtime = after
         .config_mtimes
         .iter()
-        .find(|(n, _)| n == "p")
-        .and_then(|(_, m)| *m);
+        .find(|(n, _, _)| n == "p")
+        .and_then(|(_, m, _)| *m);
     assert!(
         after_mtime > before_mtime,
         "editing a config.toml must advance its recorded mtime"
@@ -1152,7 +1359,7 @@ fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
         before
             .config_mtimes
             .iter()
-            .any(|(n, m)| n == "p" && m.is_some()),
+            .any(|(n, m, _)| n == "p" && m.is_some()),
         "the saved profile has a config.toml"
     );
     std::fs::remove_file(&cfg).expect("remove config");
@@ -1161,10 +1368,37 @@ fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
         after
             .config_mtimes
             .iter()
-            .any(|(n, m)| n == "p" && m.is_none()),
+            .any(|(n, m, _)| n == "p" && m.is_none()),
         "removing the config.toml drops its recorded mtime to None"
     );
     assert_ne!(before, after);
+}
+
+// A `login --setup-token` re-mint writes only `session-token.json` (touches no
+// config.toml, no profiles.toml), so the fingerprint must fold that file in or
+// the hot reload never sees a new / re-minted long-lived token.
+#[test]
+fn reload_fingerprint_bumps_when_a_session_token_is_added_or_changed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    let sidecar = profile_dir("p")
+        .expect("profile_dir")
+        .join("session-token.json");
+    let before = reload_fingerprint();
+    std::fs::write(&sidecar, b"{}\n").expect("write sidecar");
+    let after_add = reload_fingerprint();
+    assert_ne!(
+        before, after_add,
+        "adding a session-token.json must trip the fingerprint"
+    );
+
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
+    crate::testutil::set_mtime(&sidecar, later);
+    let after_edit = reload_fingerprint();
+    assert_ne!(
+        after_add, after_edit,
+        "a re-mint (session-token.json mtime change) must trip the fingerprint"
+    );
 }
 
 /// Regression: an edit to a config.toml that is NOT the newest one — its mtime
@@ -1216,4 +1450,52 @@ fn usage_gates_and_weekly_override_round_trip_through_config_toml() {
     assert_eq!(parsed.check_weekly, None);
     assert_eq!(parsed.check_scoped, None);
     assert_eq!(parsed.weekly_threshold, None);
+}
+
+// The burn-aware tunable accessors reset a hand-edited out-of-band value to the
+// default (fail-safe, like the weekly line) and keep an in-band one. An unset
+// field reads as the default so `skip_serializing_if` keeps omitting it.
+#[test]
+fn burn_switch_floor_pct_resets_out_of_band_and_keeps_in_band() {
+    let mut st = AppState::default();
+    assert_eq!(st.burn_switch_floor_pct(), DEFAULT_BURN_FLOOR_PCT);
+
+    st.burn_switch_floor_pct = Some(MIN_BURN_FLOOR_PCT - 1.0);
+    assert_eq!(
+        st.burn_switch_floor_pct(),
+        DEFAULT_BURN_FLOOR_PCT,
+        "below-band floor resets to the default, not clamped to the bound"
+    );
+    st.burn_switch_floor_pct = Some(99.0);
+    assert_eq!(st.burn_switch_floor_pct(), 99.0);
+}
+
+#[test]
+fn burn_horizon_cap_ms_resets_out_of_band_and_keeps_in_band() {
+    let mut st = AppState::default();
+    assert_eq!(st.burn_horizon_cap_ms(), DEFAULT_BURN_HORIZON_MS);
+
+    st.burn_horizon_cap_ms = Some(MIN_REFRESH_INTERVAL_MS - 1);
+    assert_eq!(st.burn_horizon_cap_ms(), DEFAULT_BURN_HORIZON_MS);
+    st.burn_horizon_cap_ms = Some(45_000);
+    assert_eq!(st.burn_horizon_cap_ms(), 45_000);
+}
+
+#[test]
+fn burn_tunables_round_trip_and_omit_when_unset() {
+    let on = AppState {
+        burn_switch_floor_pct: Some(99.0),
+        burn_horizon_cap_ms: Some(45_000),
+        ..AppState::default()
+    };
+    let rendered = toml::to_string_pretty(&on).expect("render");
+    let reparsed: AppState = toml::from_str(&rendered).expect("reparse");
+    assert_eq!(reparsed.burn_switch_floor_pct, Some(99.0));
+    assert_eq!(reparsed.burn_horizon_cap_ms, Some(45_000));
+
+    let off = toml::to_string_pretty(&AppState::default()).expect("render default");
+    assert!(
+        !off.contains("burn_switch_floor_pct") && !off.contains("burn_horizon_cap_ms"),
+        "unset burn tunables must be omitted, got:\n{off}"
+    );
 }

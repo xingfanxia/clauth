@@ -72,7 +72,7 @@ fn stats_from_bars_keeps_api_labels_and_source_order() {
         // Short reset, percentage-only → stays second (no reordering).
         tp_bar("tokens limit", 1.0, now + 4 * 3600, None, None),
     ];
-    let stats = stats_from_bars(&bars, true, true);
+    let stats = stats_from_bars(&bars, true, true, ResetFmt::default());
     assert_eq!(stats[0].label, "time limit", "API label kept verbatim");
     assert_eq!(stats[1].label, "tokens limit");
 
@@ -95,7 +95,7 @@ fn stats_from_bars_does_not_rename_duplicate_labels() {
         tp_bar("tokens limit", 0.0, now + 4 * 3600, None, None),
         tp_bar("tokens limit", 12.0, now + 6 * 86_400, None, None),
     ];
-    let stats = stats_from_bars(&bars, true, true);
+    let stats = stats_from_bars(&bars, true, true, ResetFmt::default());
     assert_eq!(stats[0].label, "tokens limit");
     assert_eq!(stats[1].label, "tokens limit");
     assert_eq!(stats[0].pct, 0.0);
@@ -118,7 +118,7 @@ fn stats_from_bars_fills_pace_for_windowed_labels() {
         tp_bar("30d", 30.0, now + 15 * 86_400, None, None),
     ];
 
-    let stats = stats_from_bars(&bars, true, true);
+    let stats = stats_from_bars(&bars, true, true, ResetFmt::default());
     assert_eq!(stats[0].rate_unit, "h");
     assert!(approx(stats[0].burn_rate, 5.0), "5h shows %/h average pace");
     assert!(approx(stats[0].pace_pct, 80.0), "5h ideal-pace marker");
@@ -133,7 +133,7 @@ fn stats_from_bars_fills_pace_for_windowed_labels() {
     );
 
     // Both toggles off → no rate, no marker (matches the OAuth gating).
-    let bare = stats_from_bars(&bars, false, false);
+    let bare = stats_from_bars(&bars, false, false, ResetFmt::default());
     assert!(bare.iter().all(|s| s.burn_rate.is_none()));
     assert!(bare.iter().all(|s| s.pace_pct.is_none()));
 
@@ -142,6 +142,7 @@ fn stats_from_bars_fills_pace_for_windowed_labels() {
         &[tp_bar("balance", 50.0, now + 3600, None, None)],
         true,
         true,
+        ResetFmt::default(),
     );
     assert!(other[0].burn_rate.is_none() && other[0].pace_pct.is_none());
 }
@@ -173,7 +174,7 @@ fn empty_msg_credless_profile_is_terminal() {
     let profile = crate::testutil::blank_profile("a");
     assert_eq!(
         oauth_empty_msg(&profile),
-        "no credentials, capture or log in"
+        "not logged in, use + login on the setup tab"
     );
 }
 
@@ -208,7 +209,7 @@ fn empty_msg_pending_fetch_loads() {
     assert_eq!(oauth_empty_msg(&profile), "loading");
 }
 
-/// A kick-429 block pins its own `[ window blocked ]` pill on the row, even
+/// A kick-429 block pins its own `[ blocked ]` pill on the row, even
 /// while the fetch status reads Fresh — `/usage` stayed 200 through the whole
 /// 2026-07-15 messages-limiter outage, so no fetch-status pill can carry this.
 /// The suffix names the limiter's advertised ceiling when one was given.
@@ -226,17 +227,28 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block,
+        diag: DiagFlags::default(),
     };
-    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
-    let clean = text(status_line(&profile, &header(None)));
+    let clean = text(status_lines(&profile, &header(None), 120));
     assert!(
-        !clean.contains("window blocked"),
+        !clean.contains("blocked"),
         "no block → no pill, got {clean:?}"
     );
 
     let now = now_epoch_secs();
-    let blocked = text(status_line(
+    let blocked = text(status_lines(
         &profile,
         &header(Some(KickBlock {
             streak: 2,
@@ -244,14 +256,15 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
             until: Some(now + 3 * 60 * 60),
             next_retry: now + 30,
         })),
+        120,
     ));
-    assert!(blocked.contains("window blocked"), "got {blocked:?}");
+    assert!(blocked.contains("[ blocked ]"), "got {blocked:?}");
     assert!(
         blocked.contains("lifts within"),
         "an advertised ceiling names itself, got {blocked:?}"
     );
 
-    let no_ceiling = text(status_line(
+    let no_ceiling = text(status_lines(
         &profile,
         &header(Some(KickBlock {
             streak: 1,
@@ -259,11 +272,311 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
             until: None,
             next_retry: now + 10,
         })),
+        120,
     ));
-    assert!(no_ceiling.contains("window blocked"));
+    assert!(no_ceiling.contains("[ blocked ]"));
     assert!(
         !no_ceiling.contains("lifts within"),
         "no ceiling → no made-up deadline, got {no_ceiling:?}"
+    );
+}
+
+/// The block owns the top line and the fetch state drops below it, indented to
+/// the value column. Both halves shipped broken behind `contains` assertions:
+/// the pill appended straight onto the countdown (`refresh in 14s[ window
+/// blocked ]`) because the separator lived inside each suffix's own format
+/// string, and at full spread the one-line row ran 83 cells against a detail
+/// pane that clears 80 only past a ~123-column terminal, clipping the ceiling
+/// off with no wrap. Assert the shape, not just the words.
+#[test]
+fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
+    use crate::usage::KickBlock;
+
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::RateLimited);
+    let now = now_epoch_secs();
+    // 52 inner cells is the narrowest pane the layout builds (an 80-col terminal
+    // yields a 24-cell selector), so the block/fetch pills AND their rail hints
+    // must all fit — the whole reason this row was split off a single ~83-cell one.
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            is_active: false,
+            account_email: None,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 14_000),
+            tick: 0,
+            streaks: StreakCounts {
+                rate_limit: 3,
+                refresh_fail: 0,
+            },
+            kick_block: Some(KickBlock {
+                streak: 2,
+                rejected: true,
+                until: Some(now + 4 * 60 * 60),
+                next_retry: now + 30,
+            }),
+            diag: DiagFlags::default(),
+        },
+        52,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    // The block pill leads its own keyed line; the fetch pill opens a later line
+    // that bridges the rail connecting the two hints between them, so exactly
+    // two lines carry a `[ … ]` pill.
+    let pill_lines: Vec<&String> = lines.iter().filter(|l| l.contains("[ ")).collect();
+    assert_eq!(
+        pill_lines.len(),
+        2,
+        "block pill + fetch pill, got {lines:?}"
+    );
+    assert!(
+        pill_lines[0].starts_with("status") && pill_lines[0].contains("[ blocked ]"),
+        "the block leads, keyed: {:?}",
+        pill_lines[0]
+    );
+    assert!(
+        pill_lines[1].starts_with(&format!("│{}", " ".repeat(KEY_W + KEY_GUTTER - 1))),
+        "the fetch pill bridges the rail between the block's hint and its own, \
+         still at the value column: {:?}",
+        pill_lines[1]
+    );
+    assert!(
+        pill_lines[1]
+            .trim_start_matches('│')
+            .trim_start()
+            .starts_with("[ rate limited ]"),
+        "the fetch pill opens its own line: {:?}",
+        pill_lines[1]
+    );
+
+    // No segment may touch its neighbour, and every line survives the 52-cell
+    // pane — hint lines included (they word-wrap, so the wrap must actually fit).
+    for l in &lines {
+        assert!(!l.contains("]["), "pills must not abut each other: {l:?}");
+        assert!(!l.contains("s["), "a countdown must not abut a pill: {l:?}");
+        assert!(
+            l.chars().count() <= 52,
+            "line clips at 80 cols ({} cells): {l:?}",
+            l.chars().count()
+        );
+    }
+}
+
+/// Two or more fix hints in the same status block connect into one rail
+/// (`├`/`│`/`└`, cloudy-tui Stacked hints) instead of floating as separate
+/// detached `└` lines: a pill row sitting strictly between the first and last
+/// hint bridges the rail at col 0 (`│` + blank padding to the value column),
+/// every hint but the last branches off with `├`, and only the last closes
+/// the rail with `└`.
+#[test]
+fn status_lines_connects_two_plus_hints_into_one_rail() {
+    use crate::usage::KickBlock;
+
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Cached);
+    let now = now_epoch_secs();
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            is_active: false,
+            account_email: None,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 45_000),
+            tick: 0,
+            streaks: StreakCounts {
+                rate_limit: 0,
+                refresh_fail: 3,
+            },
+            kick_block: Some(KickBlock {
+                streak: 2,
+                rejected: true,
+                until: Some(now + 3 * 60 * 60),
+                next_retry: now + 30,
+            }),
+            diag: DiagFlags {
+                auto_start: false,
+                budget_spent: true,
+                ..DiagFlags::default()
+            },
+        },
+        120,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    let bridge = format!("│{}", " ".repeat(KEY_W + KEY_GUTTER - 1));
+
+    // Kick + budget-spent + auth-failing: three pills, three hints.
+    let pill_lines: Vec<&String> = lines.iter().filter(|l| l.contains("[ ")).collect();
+    assert_eq!(
+        pill_lines.len(),
+        3,
+        "kick + budget-spent + auth-failing pills, got {lines:?}"
+    );
+    assert!(pill_lines[0].starts_with("status"), "{:?}", pill_lines[0]);
+    assert!(
+        pill_lines[1].starts_with(&bridge) && pill_lines[2].starts_with(&bridge),
+        "pill rows sitting between two hints bridge the rail at col 0: {lines:?}"
+    );
+
+    let hint_lines: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("├ ") || l.starts_with("└ "))
+        .collect();
+    assert_eq!(hint_lines.len(), 3, "one hint per pill, got {lines:?}");
+    assert!(
+        hint_lines[0].starts_with("├ ") && hint_lines[1].starts_with("├ "),
+        "every hint but the last branches off the still-open rail: {lines:?}"
+    );
+    assert!(
+        hint_lines[2].starts_with("└ "),
+        "only the last hint closes the rail: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with(" └ ")),
+        "no detached single-hint lead survives once 2+ hints stack: {lines:?}"
+    );
+}
+
+/// A lone hint (nothing to connect) stays the plain `└` form anchored at col 0
+/// — this block's own key column, not the generic tooltip's one-cell offset
+/// for panes whose row opens past col 0.
+#[test]
+fn status_lines_single_hint_has_no_rail() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Failed);
+    let header = HeaderState {
+        is_active: false,
+        account_email: None,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 20_000),
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags {
+            auth_broken: true,
+            ..DiagFlags::default()
+        },
+    };
+    let lines: Vec<String> = status_lines(&profile, &header, 120)
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+
+    let hint_lines: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("└ ") || l.starts_with("├ ") || l.starts_with("│"))
+        .collect();
+    assert_eq!(hint_lines.len(), 1, "a single hint, got {lines:?}");
+    assert!(
+        hint_lines[0].starts_with("└ re-login with clauth login a"),
+        "col-0 anchored, no rail glyph needed for a lone hint: {:?}",
+        hint_lines[0]
+    );
+}
+
+/// A wrapped non-last hint carries the rail `│` on its continuation lines, so a
+/// multi-line diagnostic reads as one unbroken stroke (cloudy-tui Stacked hints).
+/// Guards `rail_hint_lines`' `cont = "│ "` branch — the width-120 rail test never
+/// wraps into it, so a mutation to blank continuations otherwise stays green.
+#[test]
+fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
+    use crate::usage::KickBlock;
+    let now = now_epoch_secs();
+    let mut profile = crate::testutil::blank_profile("a");
+    // Kick (a long hint) + a cached fetch: two hints, so the kick hint is
+    // non-last. At 30 cells the kick hint wraps; the fetch's shorter hint does not.
+    profile.fetch_status = Some(FetchStatus::Cached);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            is_active: false,
+            account_email: None,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 30_000),
+            tick: 0,
+            streaks: StreakCounts::default(),
+            kick_block: Some(KickBlock {
+                streak: 1,
+                rejected: true,
+                until: Some(now + 3 * 60 * 60),
+                next_retry: now + 30,
+            }),
+            diag: DiagFlags {
+                auto_start: true,
+                ..DiagFlags::default()
+            },
+        },
+        30,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    assert!(
+        lines.iter().any(|l| l.starts_with("├ ")),
+        "the non-last kick hint branches off the open rail: {lines:?}"
+    );
+    // A bridged pill row also opens with `│`, so exclude those by the pill
+    // bracket — a pure hint continuation carries none.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("│ ") && !l.contains('[')),
+        "its wrapped continuation carries the rail `│` at col 0: {lines:?}"
+    );
+}
+
+/// A no-hint row sitting AFTER the rail has closed keeps its blank value-column
+/// pad, never a stray `│` below the closing `└` (cloudy-tui Stacked hints).
+/// Guards `render_status_rows`' `seen < hint_count` upper bound on the bridge.
+#[test]
+fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
+    use crate::usage::KickBlock;
+    let now = now_epoch_secs();
+    let mut profile = crate::testutil::blank_profile("a");
+    // Fetch FAILED carries no fix hint and renders last, so with kick +
+    // budget-spent hints above it the rail closes on the spend `└` and the
+    // failed row sits below the closed rail.
+    profile.fetch_status = Some(FetchStatus::Failed);
+    let lines: Vec<String> = status_lines(
+        &profile,
+        &HeaderState {
+            is_active: false,
+            account_email: None,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 14_000),
+            tick: 0,
+            streaks: StreakCounts::default(),
+            kick_block: Some(KickBlock {
+                streak: 1,
+                rejected: false,
+                until: Some(now + 60 * 60),
+                next_retry: now + 30,
+            }),
+            diag: DiagFlags {
+                budget_spent: true,
+                ..DiagFlags::default()
+            },
+        },
+        120,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
+
+    let failed = lines
+        .iter()
+        .find(|l| l.contains("[ failed ]"))
+        .expect("the failed fetch row renders");
+    assert!(
+        failed.starts_with(&" ".repeat(KEY_W + KEY_GUTTER)) && !failed.starts_with('│'),
+        "a no-hint row below the closed rail keeps blank pad, no stray `│`: {failed:?}"
     );
 }
 
@@ -285,11 +598,22 @@ fn rate_limited_suffix_counts_the_retry() {
             refresh_fail: 0,
         },
         kick_block: None,
+        diag: DiagFlags::default(),
     };
-    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
-    assert!(text(status_line(&profile, &header(7))).contains("7th retry in"));
-    let bare = text(status_line(&profile, &header(0)));
+    assert!(text(status_lines(&profile, &header(7), 120)).contains("7th retry in"));
+    let bare = text(status_lines(&profile, &header(0), 120));
     assert!(bare.contains("retry in"));
     assert!(
         !bare.contains("th retry"),
@@ -317,11 +641,22 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
             refresh_fail,
         },
         kick_block: None,
+        diag: DiagFlags::default(),
     };
-    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
     // No failures: the plain cached row, counting down to a usage refresh.
-    let healthy = text(status_line(&profile, &header(0)));
+    let healthy = text(status_lines(&profile, &header(0), 120));
     assert!(healthy.contains("cached"), "got {healthy:?}");
     assert!(healthy.contains("refresh in"));
     assert!(
@@ -331,7 +666,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
 
     // Failing: the pill names the cause and the countdown becomes a retry
     // ordinal, since it now leads to the next REFRESH attempt, not a poll.
-    let failing = text(status_line(&profile, &header(3)));
+    let failing = text(status_lines(&profile, &header(3), 120));
     assert!(failing.contains("auth failing"), "got {failing:?}");
     assert!(failing.contains("3rd retry in"), "got {failing:?}");
     assert!(
@@ -348,9 +683,9 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
 #[test]
 fn a_streak_pill_turns_red_only_once_it_is_stuck() {
     let pill_style = |profile: &Profile, header: &HeaderState| {
-        status_line(profile, header)
-            .spans
+        status_lines(profile, header, 120)
             .iter()
+            .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains("rate limited") || s.content.contains("auth failing"))
             .map(|s| s.style)
             .expect("a streak pill")
@@ -363,6 +698,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
         tick: 0,
         streaks,
         kick_block: None,
+        diag: DiagFlags::default(),
     };
 
     for (status, axis) in [
@@ -401,13 +737,23 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
 }
 
 /// `refresh_spent_accounts` OFF drops a spent account's countdown (no pending
-/// refresh, `next_refresh_ms` None): the status line renders a `[ spent ]` pill
-/// naming the binding reset instead of the stale "0s" the frozen countdown
-/// showed, while a below-cap idle account with no scheduled refresh still reads
-/// "up to date".
+/// refresh, `next_refresh_ms` None): the status line renders a bare `[ spent ]`
+/// pill instead of the stale "0s" the frozen countdown showed, leaving the reset
+/// to the maxed window's own bar line, while a below-cap idle account with no
+/// scheduled refresh still reads "up to date".
 #[test]
-fn spent_skipped_account_names_its_reset() {
-    let text = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.clone()).collect() };
+fn spent_skipped_account_pill_is_bare() {
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let header = HeaderState {
         account_email: None,
         is_active: false,
@@ -416,6 +762,7 @@ fn spent_skipped_account_names_its_reset() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        diag: DiagFlags::default(),
     };
     let with_window = |util: f64| {
         let mut p = crate::testutil::blank_profile("a");
@@ -430,17 +777,21 @@ fn spent_skipped_account_names_its_reset() {
         p
     };
 
-    let spent = text(status_line(&with_window(100.0), &header));
+    let spent = text(status_lines(&with_window(100.0), &header, 120));
     assert!(
-        spent.contains("[ spent ]") && spent.contains("resets in"),
-        "a spent skipped account renders a pill naming its reset: {spent}"
+        spent.contains("[ spent ]"),
+        "a spent skipped account renders the pill: {spent}"
+    );
+    assert!(
+        !spent.contains("resets in"),
+        "the reset belongs to the bar line, not the pill: {spent}"
     );
     assert!(
         !spent.contains("0s"),
         "must not freeze at a stale 0s: {spent}"
     );
 
-    let below = text(status_line(&with_window(50.0), &header));
+    let below = text(status_lines(&with_window(50.0), &header, 120));
     assert!(
         below.contains("up to date"),
         "a below-cap idle account with no scheduled refresh is up to date: {below}"
@@ -489,7 +840,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
             spend,
             codex_rate_limit_reached: None,
         });
-        collect_stats(&profile)
+        collect_stats(&profile, ResetFmt::default())
     };
     let extra = crate::usage::ExtraUsage {
         is_enabled: true,
@@ -541,6 +892,7 @@ fn usage_header_names_the_linked_account() {
         next_refresh_ms: None,
         tick: 0,
         account_email: email.map(str::to_string),
+        diag: DiagFlags::default(),
     };
     let text = |lines: &[Line<'static>]| -> Vec<String> {
         lines
@@ -551,8 +903,8 @@ fn usage_header_names_the_linked_account() {
 
     let with = text(&header_lines(
         &profile,
-        60,
         &header(Some("x@computelabs.ai")),
+        60,
     ));
     let account = with
         .iter()
@@ -566,7 +918,7 @@ fn usage_header_names_the_linked_account() {
         "account sits between plan and status: {with:?}"
     );
 
-    let without = text(&header_lines(&profile, 60, &header(None)));
+    let without = text(&header_lines(&profile, &header(None), 60));
     assert!(
         !without.iter().any(|l| l.starts_with("account")),
         "no cached email → no account row: {without:?}"

@@ -1239,6 +1239,17 @@ fn clear_profile_api_key_keeps_base_url_and_active_status() {
     )
     .unwrap();
     assert!(!cache.exists(), "stale third-party stats cache dropped");
+
+    // The leak fix drops a base_url at the LOAD boundary, so verify the shell
+    // survives a reload too: a cleared PURE api account (no OAuth pair) keeps its
+    // base_url and is not flipped to an OAuth profile.
+    let reloaded = crate::profile::load_profile("api-acct").expect("reload");
+    assert_eq!(
+        reloaded.base_url.as_deref(),
+        Some("https://api.example.com"),
+        "a cleared api account keeps its base_url shell across a reload"
+    );
+    assert_eq!(reloaded.api_key, None, "still no key after reload");
 }
 
 /// Blanking an active profile drops its credentials + per-account fetch caches

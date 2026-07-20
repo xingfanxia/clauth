@@ -6,6 +6,7 @@
 use super::*;
 use ratatui::style::Modifier;
 
+use crate::fallback::BlockedReason;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName};
 use crate::usage::{FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
 use std::collections::BTreeMap;
@@ -193,6 +194,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,
@@ -228,6 +230,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {
@@ -273,7 +276,7 @@ fn all_exhausted_wrap_mode_shows_resumes_hint() {
     let b = profile("b", 95.0, 100.0, 1800);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60, 20);
+    let lines = fallback_flow_lines(&app, 60);
     let hint =
         resumes_line(&lines).expect("resumes hint must render when the whole chain is exhausted");
     assert!(
@@ -289,9 +292,9 @@ fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
     let a = profile("a", 95.0, 100.0, 900);
     let b = profile("b", 95.0, 100.0, 3600);
     let mut config = config_with(vec![a, b], None, vec!["a", "b"]);
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60, 20);
+    let lines = fallback_flow_lines(&app, 60);
     let hint = resumes_line(&lines)
         .expect("resumes hint must render even with no active profile (wrap-off cleared it)");
     assert!(hint.contains("resumes: a in ~"), "{hint}");
@@ -305,7 +308,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 20.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60, 20);
+    let lines = fallback_flow_lines(&app, 60);
     assert!(
         resumes_line(&lines).is_none(),
         "must not show when the chain isn't fully exhausted"
@@ -319,7 +322,7 @@ fn healthy_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 5.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60, 20);
+    let lines = fallback_flow_lines(&app, 60);
     assert!(resumes_line(&lines).is_none());
 }
 
@@ -547,6 +550,71 @@ fn bell_marker_shows_when_login_is_fine() {
     assert!(!text.contains('×'), "{text}");
 }
 
+/// A dead / mis-filled long-lived token (⊘) outranks bell (!) and active (●):
+/// the next switch would sign sessions out, so it beats a usage alert.
+#[test]
+fn token_danger_marker_outranks_bell_and_active() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec![]); // active
+    let mut app = App::new(config);
+    app.bell_fired.insert("a".into(), true); // bell also fired
+    app.session_tokens
+        .insert("a".into(), crate::claude::SessionTokenStatus::NotLongLived);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
+    let text = line_text(&line);
+    assert!(text.contains('⊘'), "mis-filled token renders ⊘: {text}");
+    assert!(!text.contains('!'), "bell yields to ⊘: {text}");
+    assert!(!text.contains('●'), "active dot yields to ⊘: {text}");
+    let marker = line.spans.iter().find(|s| s.content == "⊘").unwrap();
+    assert_eq!(marker.style.fg, theme::danger().fg);
+}
+
+/// But a broken login (×) still wins over a token-danger marker.
+#[test]
+fn broken_login_outranks_token_danger_marker() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let mut config = config_with(vec![a], Some("a"), vec![]);
+    config.state.auth_broken.push("a".into());
+    let mut app = App::new(config);
+    app.session_tokens
+        .insert("a".into(), crate::claude::SessionTokenStatus::NotLongLived);
+    let widths = OverviewWidths::new(80, &app, false);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
+    assert!(text.contains('×'), "broken login wins: {text}");
+    assert!(!text.contains('⊘'), "token marker yields to ×: {text}");
+}
+
+/// A live long-lived token tags the type column (·token) and raises no marker;
+/// an expired one raises the ⊘ danger marker.
+#[test]
+fn long_lived_token_tags_type_column_and_expired_marks() {
+    use crate::claude::SessionTokenStatus as S;
+    let day = 86_400_000_i64;
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], None, vec![]);
+    let mut app = App::new(config);
+    // Wide terminal so the type column isn't clamped narrow enough to drop the tag.
+    let widths = OverviewWidths::new(120, &app, false);
+
+    app.session_tokens
+        .insert("a".into(), S::LongLived(Some(now_ms() as i64 + 340 * day)));
+    let live = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
+    assert!(
+        live.contains("·token"),
+        "type column tags token mode: {live}"
+    );
+    assert!(
+        !live.contains('⊘'),
+        "a live token raises no danger marker: {live}"
+    );
+
+    app.session_tokens
+        .insert("a".into(), S::LongLived(Some(now_ms() as i64 - day)));
+    let dead = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
+    assert!(dead.contains('⊘'), "expired token raises ⊘: {dead}");
+}
+
 /// The stale-data cue lives on the refresh countdown now — an underlined name
 /// would double-signal, and the bar brackets stay plain dim.
 #[test]
@@ -715,6 +783,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -781,4 +850,214 @@ fn codex_row_renders_harness_tag_and_usage_bars() {
     assert!(text.contains('█'), "usage bar renders: {text}");
     assert!(text.contains('●'), "codex-slot active dot renders: {text}");
     assert!(text.contains("62"), "utilization figure renders: {text}");
+}
+
+// ── fallback chain panel: auto-sizing + row trailers ─────────────────────
+
+/// Content that fits gets exactly its own height (rows + 2 border), leaving the
+/// rest to the accounts table.
+#[test]
+fn chain_panel_height_fits_its_content() {
+    assert_eq!(chain_panel_height(6, 20), 8, "6 rows + 2 border");
+}
+
+/// A long chain is capped so the accounts table keeps its `ACCOUNTS_MIN` rows —
+/// accounts wins the vertical budget.
+#[test]
+fn chain_panel_height_caps_so_accounts_keeps_minimum() {
+    assert_eq!(chain_panel_height(30, 20), 20 - ACCOUNTS_MIN);
+}
+
+/// A terminal too short for both floors the chain at 3 and never panics on the
+/// clamp (max_chain saturates to 0 below the accounts minimum).
+#[test]
+fn chain_panel_height_floors_at_three_without_panicking() {
+    assert_eq!(chain_panel_height(5, 6), 3);
+    assert_eq!(chain_panel_height(0, 0), 3);
+}
+
+/// The projected switch target carries the compact `↩ ~eta` hint on its OWN row
+/// (not a trailing caption), parked at the shared trailer column just past the
+/// content — NOT flung out to the panel's right edge.
+#[test]
+fn chain_row_switch_hint_rides_the_target_row() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let app = App::new(config);
+    let cfg = app.config();
+    let row = chain_row(&cfg, "a", 0, 0, 8, GAUGE_W, 3, None, Some(7200));
+    let base = row.base_width();
+    let line = row.into_line(base + TRAILER_GAP, 60);
+    let text = line_text(&line);
+    assert!(text.contains("↩ ~"), "target row carries the hint: {text}");
+    let hint_w = Span::raw(format!("↩ ~{}", humanize_duration(7200))).width();
+    assert_eq!(
+        line.width(),
+        base + TRAILER_GAP + hint_w,
+        "the hint sits at the trailer column, not the panel edge: {text}",
+    );
+    assert!(
+        line.width() < 60,
+        "a 60-wide panel must leave slack past the hint: {text}",
+    );
+}
+
+/// Every trailer in the panel lands in ONE column, and that column tracks the
+/// widest row's content rather than the panel width. The regression this pins:
+/// padding each row out to `width` stranded the markers at the far right edge of
+/// a wide panel, cells away from the data they mark.
+#[test]
+fn fallback_panel_parks_trailers_next_to_the_content() {
+    // `ghost` sits in the chain with no profile behind it, so its row renders
+    // the short `missing` arm. Leading with it proves the column is measured off
+    // the WIDEST row rather than whichever one happens to come first.
+    let short = profile("ab", 100.0, 10.0, 3600);
+    let long = profile("a-much-longer-name", 100.0, 10.0, 3600);
+    let mut config = config_with(
+        vec![short, long],
+        Some("ab"),
+        vec!["ghost", "ab", "a-much-longer-name"],
+    );
+    config.state.auth_broken.push("ab".into());
+    let app = App::new(config);
+
+    let wide = 120;
+    let lines = fallback_flow_lines(&app, wide);
+    let marked = lines
+        .iter()
+        .find(|l| line_text(l).contains('×'))
+        .expect("the auth-broken member shows its marker");
+    assert!(
+        marked.width() < wide / 2,
+        "the marker parks by the content, not the panel edge: {:?} in a {wide}-wide panel",
+        line_text(marked),
+    );
+    // The marked row carries the SHORTER name, so its marker can only sit past
+    // its own content if the column came from the longer row.
+    let unmarked = lines
+        .iter()
+        .find(|l| line_text(l).contains("a-much-longer-name"))
+        .expect("the longer member renders");
+    let marker_w = reason_marker(&BlockedReason::AuthBroken).width();
+    assert_eq!(
+        marked.width(),
+        unmarked.width() + TRAILER_GAP + marker_w,
+        "the trailer column is measured off the WIDEST row's content:\n{:?}\n{:?}",
+        line_text(marked),
+        line_text(unmarked),
+    );
+}
+
+/// Thresholds of differing digit counts left-pad so the `%` signs stack
+/// (cloudy-tui numeric-column alignment), instead of leaving a ragged edge
+/// between a `95%` row and a `100%` row.
+#[test]
+fn chain_rows_align_the_threshold_percent_column() {
+    let ninety_five = profile("a", 95.0, 10.0, 3600);
+    let hundred = profile("b", 100.0, 10.0, 3600);
+    let config = config_with(vec![ninety_five, hundred], Some("a"), vec!["a", "b"]);
+    let app = App::new(config);
+    let texts: Vec<String> = fallback_flow_lines(&app, 60)
+        .iter()
+        .map(line_text)
+        .collect();
+    let a = texts.iter().find(|t| t.contains(" 95%")).expect("95% row");
+    let b = texts.iter().find(|t| t.contains("100%")).expect("100% row");
+    assert_eq!(
+        a.find(" 95%").map(|i| i + 4),
+        b.find("100%").map(|i| i + 4),
+        "the two rows' `%` signs must land in the same column:\n{a}\n{b}",
+    );
+}
+
+/// A row can be BOTH the projected switch target and blocked: `next_target`'s
+/// headroom walk only prefers a fresh candidate and falls through to a
+/// stale-but-unexhausted one (`is_exhausted` ignores `fetch_status`), so a
+/// stale/soft-blocked member can still be `To`'s pick. With room for both, the
+/// row shows the hint AND the marker rather than silently dropping the
+/// imminent-switch projection.
+#[test]
+fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let app = App::new(config);
+    let cfg = app.config();
+    let row = chain_row(
+        &cfg,
+        "a",
+        0,
+        0,
+        8,
+        GAUGE_W,
+        3,
+        Some(BlockedReason::AuthBroken),
+        Some(7200),
+    );
+    let col = row.base_width() + TRAILER_GAP;
+    let text = line_text(&row.into_line(col, 60));
+    assert!(text.contains('×'), "auth-broken shows the × marker: {text}");
+    assert!(text.contains("↩ ~"), "and the switch hint: {text}");
+}
+
+/// Too narrow for the pair: the marker (the persistent block signal) survives
+/// and the hint drops rather than the row overflowing or the marker vanishing.
+/// Derives the width thresholds from the row's own natural content width
+/// (`base_width`) instead of hand-counting cells, which is brittle against
+/// gauge/figure formatting changes.
+#[test]
+fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let app = App::new(config);
+    let cfg = app.config();
+
+    let build = || {
+        chain_row(
+            &cfg,
+            "a",
+            0,
+            0,
+            8,
+            GAUGE_W,
+            3,
+            Some(BlockedReason::AuthBroken),
+            Some(7200),
+        )
+    };
+    let col = build().base_width() + TRAILER_GAP;
+    let marker_w = reason_marker(&BlockedReason::AuthBroken).width();
+    let hint_w = Span::raw(format!("↩ ~{}", humanize_duration(7200))).width();
+
+    // Room for the marker alone at the trailer column, but not the hint (+1 sep)
+    // beside it.
+    let width = col + marker_w;
+    assert!(
+        width < col + hint_w + 1 + marker_w,
+        "test width must sit strictly below the pair's requirement"
+    );
+    let text = line_text(&build().into_line(col, width));
+    assert!(
+        text.contains('×'),
+        "marker survives at narrow width: {text}"
+    );
+    assert!(!text.contains('↩'), "hint drops first: {text}");
+}
+
+/// End to end: an auth-broken chain member surfaces its × marker in the overview
+/// fallback panel — exercises the kick-lift read + `blocked_reason` wiring.
+#[test]
+fn fallback_panel_marks_a_blocked_member() {
+    let a = profile("a", 95.0, 10.0, 3600);
+    let mut config = config_with(vec![a], Some("a"), vec!["a"]);
+    config.state.auth_broken.push("a".into());
+    let app = App::new(config);
+    let joined = fallback_flow_lines(&app, 60)
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains('×'),
+        "blocked member shows × in the panel:\n{joined}"
+    );
 }

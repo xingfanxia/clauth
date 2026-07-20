@@ -710,11 +710,14 @@ fn fetch_with_rotation(
         match fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity)) {
             Ok(info) => return FetchOutcome::live(name, info, None),
             // 429 on a still-valid token: an endpoint rate limit, not a token problem —
-            // bail to cache (see `token_clock_expired`).
-            Err(FetchError::RateLimited { retry_after })
+            // bail to cache (see `token_clock_expired`). The `/profile` reading the
+            // fetch took despite the 429 rides along so a canceled account's tier flip
+            // still lands (its `/usage` never stops 429ing).
+            Err(FetchError::RateLimited { retry_after, plan })
                 if !token_clock_expired(access_expires_at, now_ms() as i64) =>
             {
-                return FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after);
+                return FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after)
+                    .with_plan(plan);
             }
             // 401, or a 429 on a clock-expired token (AUTH-1): fall through to the
             // rotation leg so a dead refresh token surfaces as `auth_broken` rather
@@ -722,7 +725,9 @@ fn fetch_with_rotation(
             // context rides along so a failed unmask keeps the deferral + streak
             // (see `rotation_bail_context`).
             Err(FetchError::Status(401)) => {}
-            Err(FetchError::RateLimited { retry_after }) => unmask_429 = Some(retry_after),
+            // Clock-expired 429: falls to rotation, which re-fetches `/profile` with
+            // the fresh token — the plan here rode a dead token, so discard it.
+            Err(FetchError::RateLimited { retry_after, .. }) => unmask_429 = Some(retry_after),
             Err(_) => return FetchOutcome::cached(name, FetchStatus::Cached, None, None),
         }
     }
@@ -738,8 +743,9 @@ fn fetch_with_rotation(
         if proactive {
             match fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity)) {
                 Ok(info) => FetchOutcome::live(name, info, None),
-                Err(FetchError::RateLimited { retry_after }) => {
+                Err(FetchError::RateLimited { retry_after, plan }) => {
                     FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after)
+                        .with_plan(plan)
                 }
                 Err(_) => FetchOutcome::cached(name, FetchStatus::Cached, None, None),
             }
@@ -861,16 +867,22 @@ fn fetch_with_rotation(
     let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
     // A refresh mints a new token for the SAME account, so no `/profile` field can
     // change because of it — the hourly TTL governs the plan here exactly as it
-    // does on the plain leg above. The one case worth a pull is holding NO plan
-    // (never fetched, or an earlier `/profile` failed): then this retry is the
-    // chance to get one.
-    let force_profile = prev_plan.is_none();
+    // does on the plain leg above. Force a pull when holding NO plan (never
+    // fetched, or an earlier `/profile` failed), OR when we rotated because
+    // `/usage` 429'd on a clock-expired token: the pre-rotation attempt already
+    // spent this tick's `/profile` slot on the now-dead token (a discarded read),
+    // so without the force the just-written TTL stamp would skip the live-token
+    // pull and a canceled account's flip would wait a full hour.
+    let force_profile = prev_plan.is_none() || unmask_429.is_some();
     match fetch_raw(name, &access, prev_plan, force_profile, Some(activity)) {
         Ok(info) => FetchOutcome::live(name, info, rotated),
-        Err(FetchError::RateLimited { retry_after }) => {
+        Err(FetchError::RateLimited { retry_after, plan }) => {
             // Retry itself rate-limited. Don't push to RefetchQueue — that risks
             // a rotate→429→enqueue→rotate cycle. The retry-after deferral governs.
+            // The fresh-token `/profile` reading still rides along (a canceled
+            // account 429s `/usage` even on a freshly rotated token).
             FetchOutcome::cached(name, FetchStatus::RateLimited, rotated, retry_after)
+                .with_plan(plan)
         }
         Err(_) => {
             // Rotation succeeded but a transient error stopped the retry.
@@ -902,6 +914,12 @@ struct FetchOutcome {
     /// into the profile's `refresh_fail` streak by [`apply_outcome`], which is
     /// what ladders the cadence and names the state on the row.
     refresh_failed: bool,
+    /// A `/profile` reading fetched DESPITE a `/usage` 429 (a canceled account
+    /// 429s `/usage` forever). Overlaid onto the cached snapshot by
+    /// [`apply_outcome`] so only the tier advances — windows stay cached — and
+    /// persisted so the flip survives the next tick. `Some` only on the ~hourly
+    /// tick `/profile` is actually re-pulled, never per masked tick.
+    plan_override: Option<PlanInfo>,
 }
 
 impl FetchOutcome {
@@ -915,6 +933,7 @@ impl FetchOutcome {
             from_fetch: true,
             retry_after: None,
             refresh_failed: false,
+            plan_override: None,
         }
     }
 
@@ -943,7 +962,17 @@ impl FetchOutcome {
             from_fetch: false,
             retry_after,
             refresh_failed: false,
+            plan_override: None,
         }
+    }
+
+    /// Carry a `/profile` plan fetched despite a `/usage` 429 into this cached
+    /// bail. [`apply_outcome`] overlays it onto the cached windows so the tier
+    /// advances (a canceled account flips Pro → Free/canceled) even though the
+    /// windows stay stale. No-op when the plan is absent.
+    fn with_plan(mut self, plan: Option<PlanInfo>) -> Self {
+        self.plan_override = plan;
+        self
     }
 }
 
@@ -1002,18 +1031,47 @@ fn streak_snapshot(streaks: &PollStreaks) -> HashMap<String, StreakCounts> {
     streaks.lock().map(|m| m.clone()).unwrap_or_default()
 }
 
-/// Whether `run_fetch` should open the 5h window before fetching: the window has
-/// lapsed AND we are not mid-429-streak AND the kick's own block (if any) says a
-/// retry is due. A streak means the endpoint is already throttling us, and a
-/// kick on a still-valid access token can neither rotate nor open anything (see
-/// `auto_start_kick`) — re-hitting it every due slot only adds load and can
-/// prolong the limit. The `/usage` retry detects recovery; once a live body
-/// resets the streak, the next lapsed tick opens cleanly. `kick_due` is the
-/// messages-limiter analogue ([`kick_retry_due`]): `/usage` can stay 200 while
-/// `/v1/messages` rejects every kick (observed 2026-07-15), so that block
-/// carries its own decaying retry clock instead of riding the streak.
-fn should_open_window(streak: u32, window_lapsed: bool, kick_due: bool) -> bool {
-    window_lapsed && streak == 0 && kick_due
+/// Whether `run_fetch` should fire the auto-start kick. Never mid-`/usage`
+/// 429-streak (`streak == 0`): the endpoint is already throttling and a kick on a
+/// still-valid token can neither rotate nor open anything (see `auto_start_kick`).
+/// Two firing modes:
+///   * LAPSED window → open it, paced by the kick's own decaying retry clock
+///     (`kick_due`, [`kick_retry_due`]) so a still-dead endpoint isn't re-hit
+///     every due slot.
+///   * LIVE window + a standing block → RE-TEST it, on the POLL cadence (ignoring
+///     the deep `kick_due` backoff). Load-bearing: a live 5h window can be a
+///     Claude-web open while Claude Code's `/v1/messages` stays 429'd for this
+///     account, so window liveness does NOT clear the block — only a landed kick
+///     does (`note_kick_outcome` `opened`). The lapsed-window backoff can ladder
+///     to ~15min; honoring it here would leave the chain refusing to switch back
+///     in long after the account recovered, so a reopened window re-tests every
+///     poll (~one refresh interval) until a kick lands or 429s afresh.
+fn should_open_window(streak: u32, window_lapsed: bool, kick_due: bool, has_block: bool) -> bool {
+    if streak != 0 {
+        return false;
+    }
+    if window_lapsed { kick_due } else { has_block }
+}
+
+/// The auto-start firing decision for `run_fetch`, factored out so it has a test
+/// seam (`run_fetch` itself is HTTP-bound). Reads the streak, window, and kick
+/// block for `name` and applies [`should_open_window`] — the `has_block` wiring
+/// (`block.is_some()`) is the live-window re-test's load-bearing plumbing. Locks
+/// are taken one at a time (never nested), so no rank-order constraint applies.
+fn auto_start_should_kick(
+    streaks: &PollStreaks,
+    store: &UsageStore,
+    kick_blocks: &KickBlocks,
+    name: &str,
+    now_secs: i64,
+) -> bool {
+    let block = kick_block(kick_blocks, name);
+    should_open_window(
+        rate_limit_streak(streaks, name),
+        window_lapsed(store, name, now_secs),
+        kick_retry_due(block.as_ref(), now_secs),
+        block.is_some(),
+    )
 }
 
 /// Copy of `name`'s kick block (`None` when absent or poisoned). Read alone and
@@ -1054,7 +1112,7 @@ fn kick_retry_due(block: Option<&KickBlock>, now_secs: i64) -> bool {
 /// at least two consecutive kicks, with the advertised ceiling still ahead. A
 /// single header-less burst 429 gets the pill and the backoff but never moves
 /// the chain.
-fn kick_block_switch_grade(block: &KickBlock, now_secs: i64) -> bool {
+pub(crate) fn kick_block_switch_grade(block: &KickBlock, now_secs: i64) -> bool {
     block.rejected && block.streak >= 2 && block.until.is_some_and(|u| now_secs < u)
 }
 
@@ -1067,6 +1125,24 @@ fn kick_rejected_names(blocks: &KickBlocks, now_secs: i64) -> Vec<String> {
             m.iter()
                 .filter(|(_, b)| kick_block_switch_grade(b, now_secs))
                 .map(|(n, _)| n.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every switch-grade kick block's advertised lift (epoch secs), keyed by profile
+/// name, read under one leaf lock. Same [`kick_block_switch_grade`] rule the
+/// auto-switch walk routes around, so the Fallback tab's blocked-reason chip
+/// flags a kick-rejected member without re-deriving the predicate. Read before
+/// the Config lock (rank order: KickBlockState 230 < Config 400).
+pub(crate) fn switch_grade_kick_lifts(blocks: &KickBlocks) -> HashMap<String, i64> {
+    let now = now_epoch_secs();
+    blocks
+        .lock()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, b)| kick_block_switch_grade(b, now))
+                .filter_map(|(n, b)| b.until.map(|u| (n.clone(), u)))
                 .collect()
         })
         .unwrap_or_default()
@@ -1141,9 +1217,11 @@ fn sync_kick_blocks_from_cache(blocks: &KickBlocks, names: &[String]) {
 }
 
 /// Fetch one profile's usage on the periodic tick. When the profile opted into
-/// auto-start, open its 5h window first if the last-known window lapsed AND no
-/// 429 streak is in flight — kick (rotating once on 401 OR 429), mark the window
-/// open on success, then fetch with the possibly-rotated token.
+/// auto-start, fire the kick first whenever `should_open_window` says to — to OPEN
+/// a lapsed window, or to RE-TEST a standing kick block on a now-live window (it
+/// may have reopened via the web app while Claude Code stays 429'd) — rotating
+/// once on 401 OR 429, mark the window open on success, then fetch with the
+/// possibly-rotated token.
 fn run_fetch(
     config: &crate::profile::ConfigHandle,
     mut entry: TokenEntry,
@@ -1153,23 +1231,17 @@ fn run_fetch(
     streaks: &PollStreaks,
     kick_blocks: &KickBlocks,
 ) -> FetchOutcome {
-    // Auto-start leg: open a window before fetching when this profile opted in,
-    // its last-known window has lapsed, we aren't already 429-streaking, and the
-    // kick's own 429 block (if any) says a retry is due (see
-    // `should_open_window`). The kick may rotate the chain (401 OR 429 in this
+    // Auto-start leg: fire the kick before fetching when this profile opted in and
+    // `should_open_window` says to — to open a lapsed window, or to re-test a
+    // standing kick block on a live window (its two modes), as long as no 429
+    // streak is in flight. The kick may rotate the chain (401 OR 429 in this
     // branch only); fold its rotated pair into both the local entry (so the
     // fetch below uses the fresh token, never re-spending) and the returned
     // outcome (so the tick syncs it into the live snapshot).
     let mut kick_rotated: Option<RotatedTokens> = None;
     if entry.auto_start {
-        let streak = rate_limit_streak(streaks, &entry.name);
         let now_secs = now_epoch_secs();
-        let block = kick_block(kick_blocks, &entry.name);
-        if should_open_window(
-            streak,
-            window_lapsed(store, &entry.name, now_secs),
-            kick_retry_due(block.as_ref(), now_secs),
-        ) {
+        if auto_start_should_kick(streaks, store, kick_blocks, &entry.name, now_secs) {
             let kicked = crate::oauth::auto_start_kick(
                 config,
                 &entry.name,
@@ -1346,12 +1418,24 @@ fn apply_outcome(
     // so the staleness stays visible.
     let is_fresh = outcome.from_fetch;
 
+    // A `/profile` plan fetched despite a `/usage` 429 (a canceled account 429s
+    // `/usage` forever): the ONLY fresh signal on an otherwise cached bail. The
+    // fetch path carries it only on the ~hourly tick `/profile` is re-pulled, so
+    // persisting it re-stamps the disk mtime at most once an hour — not the
+    // per-tick storm the cached path guards against. Windows stay cached; only
+    // the tier advances.
+    let plan_refresh = outcome.plan_override.clone().filter(|_| !is_fresh);
+
     // For a Fresh body, keep any just-opened live 5h window we already hold so a
     // lagging `/usage` read can't re-close it (see `preserve_live_window`). The
     // prev window is read under a short lock, released before the disk write.
     let merged: Option<UsageInfo> = outcome.info.as_ref().map(|info| {
         if !is_fresh {
-            return info.clone();
+            let mut info = info.clone();
+            if let Some(plan) = &plan_refresh {
+                info.plan = Some(plan.clone());
+            }
+            return info;
         }
         let now_secs = now_epoch_secs();
         let prev = store
@@ -1361,17 +1445,54 @@ fn apply_outcome(
         preserve_live_window(info.clone(), prev.as_ref(), now_secs)
     });
 
-    if is_fresh && let Some(info) = &merged {
+    // A profile added while ALREADY canceled 429s `/usage` from its first poll and
+    // never gets a `usage_cache.json`, so `cached()` yields `info=None` and there
+    // is nothing to overlay onto. Without recording the plan on a windowless entry
+    // the cancellation is dropped every tick AND the fallback walk keeps treating
+    // the dead account as selectable (`is_canceled_from_usage` reads no store
+    // entry). Cold-fill a plan-only body so both surfaces see it. `filter` keeps
+    // this to the same ~hourly cadence as `plan_refresh`, not a per-tick write.
+    let cold_fill = plan_refresh
+        .clone()
+        .filter(|_| merged.is_none())
+        .map(|plan| UsageInfo {
+            plan: Some(plan),
+            ..Default::default()
+        });
+
+    if (is_fresh || plan_refresh.is_some())
+        && let Some(info) = merged.as_ref().or(cold_fill.as_ref())
+    {
         write_profile_cache(&outcome.name, USAGE_CACHE_FILE, info);
     }
 
-    if let Ok(mut s) = store.lock()
-        && let Some(info) = &merged
-    {
-        // Don't clobber newer Fresh data with a Cached fallback snapshot.
-        // Cached only fills the store when no entry exists (cold start).
-        if is_fresh || !s.contains_key(&outcome.name) {
-            s.insert(outcome.name.clone(), info.clone());
+    if let Ok(mut s) = store.lock() {
+        if let Some(info) = &merged {
+            // Don't clobber newer Fresh data with a Cached fallback snapshot.
+            // Cached only fills the store when no entry exists (cold start).
+            if is_fresh || !s.contains_key(&outcome.name) {
+                s.insert(outcome.name.clone(), info.clone());
+            } else if let Some(plan) = &plan_refresh
+                && let Some(existing) = s.get_mut(&outcome.name)
+            {
+                // Advance only the tier on the live entry; its windows stay cached.
+                existing.plan = Some(plan.clone());
+            }
+        } else if let Some(plan) = &plan_refresh {
+            // Cold-miss: advance the tier on any existing (windowless) entry, else
+            // record a plan-only one so the walk can exclude the dead account.
+            match s.get_mut(&outcome.name) {
+                Some(existing) => existing.plan = Some(plan.clone()),
+                None => {
+                    s.insert(
+                        outcome.name.clone(),
+                        UsageInfo {
+                            plan: Some(plan.clone()),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -2163,6 +2284,7 @@ fn tick(state: &SchedulerState) {
         &state.config,
         &state.store,
         &state.status,
+        &state.third_party_status,
         &state.poll_streaks,
         &state.kick_blocks,
         &state.activity,
@@ -2173,6 +2295,7 @@ fn tick(state: &SchedulerState) {
         &state.config,
         &state.store,
         &state.status,
+        &state.third_party_status,
         &state.kick_blocks,
         &state.pending_switch,
     );
@@ -2755,11 +2878,29 @@ pub(crate) fn spawn_refresher(
 /// false switch-away) and a `RateLimited` one may be the synthetic just-kicked
 /// 0% placeholder (which would never switch away, or switch toward a spent
 /// account) — the startup one-shot gates on `Fresh` for the same reason.
-fn decision_fresh(status: &StatusStore, name: &str) -> bool {
+fn decision_fresh<R: crate::lockorder::Rank>(
+    status: &Arc<RankedMutex<HashMap<String, FetchStatus>, R>>,
+    name: &str,
+) -> bool {
     matches!(
         status.lock().ok().and_then(|m| m.get(name).copied()),
         Some(FetchStatus::Fresh)
     )
+}
+
+/// [`decision_fresh`] against EITHER store — the OAuth `StatusStore` or the
+/// third-party one. `Profile.fetch_status` (the UI twin's freshness input) is
+/// filled from both in `App::apply_usage`, so the scheduler twin must read both
+/// too or a fresh third-party member looks stale to it alone, inverting the
+/// fresh-preference on a mixed OAuth+third-party chain (2026-07-17). Consulted
+/// by both `scan_auto_switch` (the walk's fresh-preference) and `scan_recovery`
+/// (the relink gate) so both stay in lockstep with the UI twin.
+fn decision_fresh_any(
+    status: &StatusStore,
+    third_party_status: &ThirdPartyStatusStore,
+    name: &str,
+) -> bool {
+    decision_fresh(status, name) || decision_fresh(third_party_status, name)
 }
 
 /// True when `name`'s last reading is a **deep-slot stuck** `RateLimited`: the
@@ -2795,6 +2936,7 @@ fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     status: &StatusStore,
+    third_party_status: &ThirdPartyStatusStore,
     streaks: &PollStreaks,
     kick_blocks: &KickBlocks,
     _activity: &ActivityStore,
@@ -2835,6 +2977,18 @@ fn scan_auto_switch(
     // switch-grade kick-rejected members and a rejected ACTIVE bypasses the
     // exhaustion gate (its usage reads idle while inference is refused).
     snapshot.kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
+    // Same reason: freshness lives in the status stores, not in config, and
+    // `Profile.fetch_status` (what the UI twin reads) is written only by the UI
+    // thread. Unions BOTH stores (OAuth + third-party) via `decision_fresh_any`,
+    // exactly as the UI twin's `apply_usage` fills `fetch_status`, so a fresh
+    // third-party member isn't invisible to this walk alone. A PREFERENCE for
+    // the headroom walk, never a gate — see `ChainSnapshot::fresh`.
+    snapshot.fresh = snapshot
+        .chain
+        .iter()
+        .filter(|m| decision_fresh_any(status, third_party_status, &m.name))
+        .map(|m| m.name.clone())
+        .collect();
 
     // Only act on a confirmed-live read of the active profile — a stale or
     // synthetic store entry would drive a false switch (see `decision_fresh`).
@@ -2889,6 +3043,7 @@ fn scan_recovery(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     status: &StatusStore,
+    third_party_status: &ThirdPartyStatusStore,
     kick_blocks: &KickBlocks,
     pending_switch: &PendingSwitch,
 ) {
@@ -2935,16 +3090,19 @@ fn scan_recovery(
                         .map(|p| crate::fallback::member_scoped_line(p, weekly_pct))
                         .unwrap_or(weekly_pct),
                     check_scoped: profile.is_none_or(|p| p.check_scoped),
+                    max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
                 }
             })
             .collect()
     };
 
-    // Relink only to a member with a confirmed-live read; a synthetic/stale 0%
-    // entry would relink to an unverified placeholder (see `decision_fresh`).
+    // Relink only to a member with a confirmed-live read in EITHER store; a
+    // synthetic/stale 0% entry would relink to an unverified placeholder (see
+    // `decision_fresh`). Third-party-fresh members count too, so a third-party
+    // fallback is recoverable after switch-off-all instead of frozen out.
     let members: Vec<crate::fallback::ChainMember> = members
         .into_iter()
-        .filter(|m| decision_fresh(status, &m.name))
+        .filter(|m| decision_fresh_any(status, third_party_status, &m.name))
         .collect();
 
     // A switch-grade kick-rejected member is not "recovered" — its idle-looking

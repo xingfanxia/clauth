@@ -41,9 +41,7 @@ pub(crate) fn validate_profile_name(
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '+'));
     if !valid_chars || trimmed.starts_with('.') {
-        bail!(
-            "name must contain only letters, digits, '-', '_', '.', '@', or '+', and cannot start with '.'"
-        );
+        bail!("name: letters, digits and - _ . @ + only, and can't start with '.'");
     }
     // Reserved: these bare single tokens are `clauth` subcommands (`clauth
     // daemon`, `clauth status`, `clauth doctor`, ...) — including the two hidden
@@ -229,9 +227,8 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
                 .to_string()
         };
         print!(
-            "clauth: active profile '{active}' has uncaptured credentials in ~/.claude \
-             (a re-login or token rotation). capture them into '{active}' and \
-             switch to '{canonical}'? [Y/n] "
+            "clauth: '{active}' has a newer login in ~/.claude. save it into '{active}' \
+             and switch to '{canonical}'? [Y/n] "
         );
         use std::io::Write;
         std::io::stdout().flush()?;
@@ -356,16 +353,13 @@ pub(crate) fn switch_profile_noninteractive(
         match on_divergence {
             Some(DivergenceChoice::Overwrite) => switch_profile_reconciled(config, target)?,
             Some(DivergenceChoice::Discard) => switch_profile_discard(config, target)?,
-            Some(DivergenceChoice::NewProfile) => bail!(
-                "active profile has a divergent login and the divergence default is \
-                 'save as new profile', which needs an interactive name prompt; {}",
-                crate::format::RESOLVE_IN_TUI
-            ),
-            None => bail!(
-                "active profile has uncaptured credentials in ~/.claude and no \
-                 divergence default is set; {}",
-                crate::format::RESOLVE_IN_TUI
-            ),
+            Some(DivergenceChoice::NewProfile) | None => {
+                let active = previous.as_deref().unwrap_or_default();
+                bail!(
+                    "'{active}' has a login clauth hasn't saved, {}",
+                    crate::format::RESOLVE_IN_TUI
+                )
+            }
         }
     } else {
         switch_profile(config, target)?;
@@ -583,10 +577,7 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str, force: bool) ->
         // delete is a clean no-op. `--yes` skips the confirm prompt but does NOT
         // override this; only `force` does.
         if !force && crate::runtime::has_live_session(name) {
-            bail!(
-                "profile '{name}' has a live session; refusing to delete it out from under a \
-                 running `clauth start`. Pass --force to override."
-            );
+            bail!("'{name}' is running a session, pass --force to delete it anyway");
         }
 
         let was_active = config.is_active(name);

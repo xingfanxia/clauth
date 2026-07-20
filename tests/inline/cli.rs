@@ -312,6 +312,19 @@ fn collect_api_endpoint_rejects_empty_flag_values() {
     );
 }
 
+#[test]
+fn collect_api_endpoint_rejects_control_chars_in_key() {
+    // The key is minted verbatim into a request header; a CRLF would inject one.
+    assert!(
+        collect_api_endpoint(Some("https://x"), Some("sk-a\r\nX-Evil: 1")).is_err(),
+        "a control-char key must bail at capture, not persist a header-injecting value"
+    );
+    assert!(
+        collect_api_endpoint(Some("https://x"), Some("sk a b")).is_err(),
+        "interior whitespace in a key is a bad paste"
+    );
+}
+
 // ── parse_delete_args ──
 
 #[test]

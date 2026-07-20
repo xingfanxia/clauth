@@ -8,16 +8,15 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigDraft, ConfigFocus, ConfigRow, InputState, MODEL_PRESETS, config_rows,
 };
 use super::super::theme;
 use super::panes::{
-    active_pill, cycle_option, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
-    key_cell, label_style, master_detail, name_color, picker_row, section_box,
-    section_box_verbatim,
+    bold_when, cycle_option, draw_scrolled_lines, draw_selector_list, head_cols,
+    help_tooltip_lines, highlight_row, key_cell, label_style, master_detail, name_color,
+    picker_row, pill, section_box, section_box_verbatim,
 };
 
 const KEY_W: usize = 11;
@@ -82,7 +81,6 @@ struct Snap {
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
     auto_start: bool,
-    is_active: bool,
     /// Whether the profile holds a stored credential — the OAuth token or, for an
     /// API account, the api key. Drives the `Login` row's re-login vs first-login
     /// label and the `DeleteCreds` row's presence.
@@ -122,7 +120,6 @@ impl Snap {
             subagent: String::new(),
             env: Vec::new(),
             auto_start: false,
-            is_active: false,
             logged_in: false,
             login_is_oauth: true,
             captured: false,
@@ -154,7 +151,6 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
     }
     match cfg.profiles.get(app.profile_cursor) {
         Some(p) => Snap {
-            is_active: cfg.is_active(&p.name),
             title: p.name.to_string(),
             name: if with_text {
                 p.name.to_string()
@@ -215,48 +211,65 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_settings_rows(frame, inner, app, &rows, cursor, &snap, actions_focused);
 }
 
-/// CLA-SPLIT status row: a profile carrying a long-lived-token sidecar runs
-/// its sessions on that static login, and the ~1yr horizon is the one thing
-/// about it worth watching — expired means every switch would sign sessions
-/// out, so it escalates to a DANGER re-mint hint (the same wording
-/// `ensure_installable` logs); the last 30 days warn. A mis-filled sidecar
-/// (rotating pair, split disengaged) reads as exactly that, in DANGER — the
-/// operator thinks the split is armed and it isn't.
-fn session_token_line(status: &crate::claude::SessionTokenStatus, now_ms: i64) -> Line<'static> {
+/// CLA-SPLIT status row (`token`): a profile carrying a long-lived-token sidecar
+/// runs its sessions on that static login, and the ~1yr horizon is the one thing
+/// about it worth watching. A comfortable horizon is a plain accent value; the
+/// last 30 days warn as a pill; expired and mis-filled escalate to a DANGER pill
+/// plus a `└` fix line — matching the usage-tab diagnostic shape. Expired means
+/// every switch would sign sessions out; a mis-filled sidecar (rotating pair,
+/// split disengaged) means the operator thinks the split is armed and it isn't.
+///
+/// Returns the row line plus, for the two charged states, an always-on `└` fix
+/// line (this row lives in the non-focusable header block, so the hint can't be
+/// focus-gated — it renders like the usage-tab status hints). `width` sizes the
+/// tooltip wrap.
+fn session_token_lines(
+    status: &crate::claude::SessionTokenStatus,
+    now_ms: i64,
+    width: usize,
+) -> Vec<Line<'static>> {
     use crate::claude::SessionTokenStatus;
-    let (text, style) = match status {
+    let key = || Span::styled(key_cell("token", KEY_W, KEY_GUTTER), theme::label());
+    let plain =
+        |text: String, style: Style| vec![Line::from(vec![key(), Span::styled(text, style)])];
+    let pill_row =
+        |label: String, style: Style| Line::from([vec![key()], pill(label, style)].concat());
+    // A charged state = pill row + a `└ fix` line (reuses the help-tooltip leader).
+    let charged = |label: String, fix: &str| {
+        let mut lines = vec![pill_row(label, theme::danger().bold())];
+        lines.extend(help_tooltip_lines(fix, width));
+        lines
+    };
+
+    match status {
         SessionTokenStatus::LongLived(Some(ms)) => {
-            // Gate expiry on the clock, not the truncated day count: integer
-            // division reads a token expired <24h ago as `days == 0`, which
-            // mislabeled it "~0d" WARNING instead of the DANGER re-mint hint.
-            let days = (ms - now_ms) / 86_400_000;
             if now_ms >= *ms {
-                (
-                    "expired · re-mint: claude setup-token".to_string(),
-                    theme::danger(),
-                )
-            } else if days <= 30 {
-                (
-                    format!("long-lived · expires in ~{days}d"),
-                    theme::warning(),
-                )
+                charged("expired".to_string(), "re-mint with claude setup-token")
             } else {
-                (format!("long-lived · expires in ~{days}d"), theme::accent())
+                // Truncating division: an expiry inside the next 24h reads
+                // "~0d" and still warns; only a past expiry (handled above) is
+                // DANGER, so a sub-day-expired token no longer mislabels as
+                // "~0d / warning" while the install gate already refuses it.
+                let days = (ms - now_ms) / 86_400_000;
+                if days <= 30 {
+                    vec![pill_row(
+                        format!("expires in ~{days}d"),
+                        theme::warning().bold(),
+                    )]
+                } else {
+                    plain(format!("long-lived · ~{days}d left"), theme::accent())
+                }
             }
         }
-        SessionTokenStatus::LongLived(None) => (
+        SessionTokenStatus::LongLived(None) => plain(
             "long-lived · no recorded expiry".to_string(),
             theme::accent(),
         ),
-        SessionTokenStatus::NotLongLived => (
-            "not long-lived (has a refresh token) · ignored".to_string(),
-            theme::danger(),
+        SessionTokenStatus::NotLongLived => charged(
+            "mis-filled".to_string(),
+            "sidecar has a refresh token, split is off",
         ),
-    };
-    Line::from(vec![
-        Span::styled(key_cell("token", KEY_W, KEY_GUTTER), theme::label()),
-        Span::styled(text, style),
-    ])
+    }
 }
 
 fn draw_settings_rows(
@@ -278,26 +291,15 @@ fn draw_settings_rows(
         .trim()
         .is_empty();
     let (type_value, type_style) = if is_api {
-        ("API", theme::accent())
+        ("api", theme::accent())
     } else {
-        ("OAuth", theme::accent())
+        ("oauth", theme::accent())
     };
 
-    let mut type_spans = vec![
+    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
         Span::styled(key_cell("type", KEY_W, KEY_GUTTER), theme::label()),
         Span::styled(type_value, type_style),
-    ];
-    if snap.is_active {
-        // "[ active ]" = 10 chars; left side = key block + type_value chars; pad the gap.
-        let left_w = KEY_W + KEY_GUTTER + type_value.chars().count();
-        let indicator_w = "[ active ]".chars().count(); // 10
-        let pad = (inner.width as usize)
-            .saturating_sub(left_w)
-            .saturating_sub(indicator_w);
-        type_spans.push(Span::raw(" ".repeat(pad)));
-        type_spans.extend(active_pill());
-    }
-    let mut lines: Vec<Line<'static>> = vec![Line::from(type_spans)];
+    ])];
 
     // Provider row — only for recognised third-party providers. Hidden while a
     // draft empties the base-url buffer (`is_api` tracks the draft live).
@@ -325,7 +327,11 @@ fn draw_settings_rows(
     }
 
     if let Some(status) = &snap.session_token {
-        lines.push(session_token_line(status, crate::usage::now_ms() as i64));
+        lines.extend(session_token_lines(
+            status,
+            crate::usage::now_ms() as i64,
+            inner.width as usize,
+        ));
     }
 
     lines.push(Line::from(""));
@@ -336,6 +342,9 @@ fn draw_settings_rows(
     let mut edit_caret: Option<(u16, InputState, ConfigRow)> = None;
     let mut line_idx: u16 = lines.len() as u16;
 
+    // Start + end of the focused row's block (row plus its tooltip lines), so a
+    // wrapped hint can't scroll off the bottom while its row stays visible.
+    let mut focus = (0usize, 1usize);
     for (i, row) in rows.iter().enumerate() {
         let selected = actions_focused && i == cursor;
         let is_editing = editing == Some(*row);
@@ -343,6 +352,9 @@ fn draw_settings_rows(
         let line = detail_row(*row, selected, is_editing, armed_delete, snap, &input);
         if is_editing {
             edit_caret = Some((line_idx, input, *row));
+        }
+        if selected || is_editing {
+            focus.0 = line_idx as usize;
         }
         lines.push(if selected {
             highlight_row(line, inner.width as usize)
@@ -352,22 +364,31 @@ fn draw_settings_rows(
         line_idx += 1;
         if selected
             && !is_editing
-            && let Some(text) = row_hint(*row, !snap.login_is_oauth)
+            && let Some(text) = row_hint(*row, snap)
         {
-            let hint = help_tooltip_lines(text, inner.width as usize);
+            let hint = help_tooltip_lines(&text, inner.width as usize);
             line_idx += hint.len() as u16;
             lines.extend(hint);
         }
+        if selected || is_editing {
+            focus.1 = line_idx as usize;
+        }
     }
 
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+    // The row list outgrows a short terminal (env entries + model overrides are
+    // unbounded), so it scrolls to the focused row rather than clipping its tail.
+    let offset = draw_scrolled_lines(frame, inner, lines, focus);
 
     // Position the native terminal cursor at the caret when a text/model field is active.
-    if let Some((ly, input, row)) = edit_caret {
+    if let Some((ly, input, row)) = edit_caret
+        && let Some(visible) = (ly as usize)
+            .checked_sub(offset)
+            .filter(|v| *v < inner.height as usize)
+    {
         // x = "❯ " (2) + label block (row_label_cols: KEY_W+gutter, or key+gutter for a long env key) + caret cols
         let prefix_cols = 2 + row_label_cols(row, snap) + head_cols(&input);
         let cx = inner.x.saturating_add(prefix_cols as u16);
-        let cy = inner.y.saturating_add(ly);
+        let cy = inner.y.saturating_add(visible as u16);
         frame.set_cursor_position((cx, cy));
     }
 }
@@ -416,41 +437,46 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
     }
 }
 
-/// Inline help for rows whose labels don't self-describe. `api_login` picks the
-/// login/log-out wording: an API account re-enters a base url + api key, an OAuth
-/// account mints tokens through the browser. It's the rows' credential typing,
-/// not the base-url buffer — the copy has to name what ⏎ really does.
-fn row_hint(row: ConfigRow, api_login: bool) -> Option<&'static str> {
-    match row {
-        ConfigRow::BaseUrl => {
-            Some("api endpoint for this account; leave empty for claude.ai OAuth")
+/// Inline help for rows whose labels don't self-describe, phrased for the row's
+/// current value so it re-explains itself as the value changes. `login_is_oauth`
+/// (not the base-url buffer) picks the login/log-out wording — the copy has to
+/// name what ⏎ really does — while `auto_start` / `base_url` flip on their own
+/// value.
+fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
+    let api_login = !snap.login_is_oauth;
+    let hint = match row {
+        ConfigRow::BaseUrl if snap.base_url.trim().is_empty() => {
+            "leave empty for a claude.ai account, or set an api endpoint"
         }
-        ConfigRow::ApiKey => Some("x-api-key sent to the custom endpoint"),
+        ConfigRow::BaseUrl => "the api endpoint this account calls instead of claude.ai",
+        ConfigRow::ApiKey => "api key sent to the endpoint above",
         // The value grammar (`space cycle · ↵ custom`) already lives in the footer.
-        ConfigRow::Model => Some("default model for this account"),
-        ConfigRow::OpusModel => Some("what the `opus` alias resolves to (full model id)"),
-        ConfigRow::SonnetModel => Some("what the `sonnet` alias resolves to (full model id)"),
-        ConfigRow::HaikuModel => Some("what the `haiku` alias resolves to (full model id)"),
-        ConfigRow::SubagentModel => Some("model forced for every subagent in this account"),
-        ConfigRow::EnvEntry(_) => Some("custom env var merged into settings.json while active"),
-        ConfigRow::EnvAdd => Some("add a custom settings.json env var to this account"),
-        ConfigRow::AutoStart => Some("launch a session on idle to arm the 5h window"),
-        ConfigRow::ModelOverrideAdd => {
-            Some("pin what an alias resolves to, or force the subagent model")
+        ConfigRow::Model => "default model for this account",
+        ConfigRow::OpusModel => "what the opus alias resolves to (full model id)",
+        ConfigRow::SonnetModel => "what the sonnet alias resolves to (full model id)",
+        ConfigRow::HaikuModel => "what the haiku alias resolves to (full model id)",
+        ConfigRow::SubagentModel => "model forced for every subagent in this account",
+        ConfigRow::EnvEntry(_) => "env var set for claude code while this account is active",
+        ConfigRow::EnvAdd => "add an env var for this account",
+        ConfigRow::AutoStart if snap.auto_start => {
+            "starts a throwaway session when idle so the 5h window counts"
         }
-        ConfigRow::Login if api_login => Some("re-enter the base url + api key for this account"),
-        ConfigRow::Login => Some("browser OAuth login; mints fresh tokens for this account"),
+        ConfigRow::AutoStart => "never starts a session on its own",
+        ConfigRow::ModelOverrideAdd => "pin what an alias resolves to, or force the subagent model",
+        ConfigRow::Login if api_login => "re-enter the base url + api key for this account",
+        ConfigRow::Login => "browser OAuth login; mints fresh tokens for this account",
         ConfigRow::DeleteCreds if api_login => {
-            Some("clears the stored api key; keeps the account and its settings")
+            "clears the stored api key; keeps the account and its settings"
         }
         ConfigRow::DeleteCreds => {
-            Some("clears the stored OAuth login; keeps the account and its settings")
+            "clears the stored OAuth login; keeps the account and its settings"
         }
         ConfigRow::Delete => {
-            Some("deletes the account and everything stored for it, usage history included")
+            "deletes the account and everything stored for it, usage history included"
         }
-        ConfigRow::Name | ConfigRow::Create => None,
-    }
+        ConfigRow::Name | ConfigRow::Create => return None,
+    };
+    Some(hint.to_string())
 }
 
 fn detail_row(
@@ -488,10 +514,13 @@ fn detail_row(
         }
         // While editing, the typed text is the new key; at rest, the add chip.
         ConfigRow::EnvAdd if editing => kv_field(arrow, "key", input, editing, selected, false),
-        ConfigRow::EnvAdd => Line::from(vec![arrow, Span::styled("+ add env", theme::accent())]),
+        ConfigRow::EnvAdd => Line::from(vec![
+            arrow,
+            Span::styled("+ add env", bold_when(theme::accent(), selected)),
+        ]),
         ConfigRow::ModelOverrideAdd => Line::from(vec![
             arrow,
-            Span::styled("+ model override", theme::accent()),
+            Span::styled("+ model override", bold_when(theme::accent(), selected)),
         ]),
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
@@ -509,21 +538,28 @@ fn detail_row(
             };
             Line::from(vec![arrow, Span::styled(label, theme::danger().bold())])
         }
-        ConfigRow::Create => {
-            Line::from(vec![arrow, Span::styled("create account", theme::accent())])
-        }
+        ConfigRow::Create => Line::from(vec![
+            arrow,
+            Span::styled("create account", bold_when(theme::accent(), selected)),
+        ]),
         ConfigRow::Login => {
             // A draft-held mint renders the done state; ⏎ re-runs the login but
             // confirms first before replacing the stash.
             if snap.captured {
-                Line::from(vec![arrow, Span::styled("✓ logged in", theme::success())])
+                Line::from(vec![
+                    arrow,
+                    Span::styled("✓ logged in", bold_when(theme::success(), selected)),
+                ])
             } else {
                 let label = if snap.logged_in {
                     "re-login"
                 } else {
                     "+ login"
                 };
-                Line::from(vec![arrow, Span::styled(label, theme::accent())])
+                Line::from(vec![
+                    arrow,
+                    Span::styled(label, bold_when(theme::accent(), selected)),
+                ])
             }
         }
         ConfigRow::DeleteCreds => {

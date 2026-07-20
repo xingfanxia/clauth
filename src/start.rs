@@ -2,6 +2,7 @@
 //! runtime directory. See [`crate::runtime`] for the shared-runtime design;
 //! this module is just the thin wrapper that owns the lifetime guard.
 
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 #[cfg(unix)]
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
@@ -9,6 +10,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::thread::JoinHandle;
 #[cfg(unix)]
 use std::time::Duration;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 #[cfg(unix)]
@@ -16,7 +18,6 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
-#[cfg(unix)]
 use crate::logline::logline;
 use crate::profile::AppConfig;
 use crate::runtime::{Isolation, ProfileRuntime};
@@ -30,11 +31,59 @@ struct ChildOutcome {
     signal: Option<i32>,
 }
 
+/// Whether an isolated run's transcripts get lifted into the global store on
+/// teardown. A per-run `--rescue`/`--no-rescue` override (`Some`) beats the
+/// persisted `auto_rescue` toggle; with no override the toggle decides. The
+/// caller still gates this on `isolation == Isolated` — a shared start never
+/// rescues, since its transcripts already live in the global store.
+pub(crate) fn rescue_effective(rescue_override: Option<bool>, auto_rescue: bool) -> bool {
+    rescue_override.unwrap_or(auto_rescue)
+}
+
+/// Lift an exiting isolated session's state into the global store: the
+/// transcripts under `projects/`, then Claude Code's own session sidecar state
+/// (shell snapshots, file history, tasks/plans, …) from the rest of the runtime
+/// root, so a rescued session keeps more than its resumability. Returns
+/// `(transcripts, sidecar files)` moved. Best-effort throughout: an error is
+/// logged, never fails the run.
+///
+/// Gated on being the last live session in `sessions`. The runtime tree is
+/// shared by every session of this profile+flavor, and the discard it races is
+/// refcounted the same way, so an exit while a sibling still runs must move
+/// NOTHING — the sidecar leg would otherwise pull `shell-snapshots/` out from
+/// under a live Claude Code mid-session. Self holds its own marker, hence `> 1`.
+///
+/// The count and the move are not atomic: a sibling can `acquire` in between and
+/// start writing the tree we are moving out of (its own `active == 1` build is
+/// additive, so it does not wipe first). That window is milliseconds against a
+/// whole session, and closing it would mean holding the state flock across
+/// tree-sized IO — the one thing every other path here avoids.
+fn rescue_teardown(iso_root: &Path, sessions: &Path, claude_home: &Path) -> (usize, usize) {
+    if crate::runtime::live_sessions_at(sessions) > 1 {
+        logline!("clauth: skipping rescue, another isolated session is still live");
+        return (0, 0);
+    }
+    let moved = crate::sessions::rescue_isolated_store(
+        &iso_root.join("projects"),
+        &claude_home.join("projects"),
+    );
+    let sidecars = crate::sessions::rescue_isolated_sidecars(iso_root, claude_home);
+    if moved > 0 || sidecars > 0 {
+        logline!(
+            "clauth: rescued {moved} isolated session transcript(s) \
+             + {sidecars} sidecar file(s) into the global store"
+        );
+    }
+    (moved, sidecars)
+}
+
 pub(crate) fn run(
     config: &AppConfig,
     name: &str,
     claude_args: &[String],
     isolation: Isolation,
+    workspace: Option<&Path>,
+    rescue_override: Option<bool>,
 ) -> Result<()> {
     let profile = config.find(name).context("profile not found")?;
 
@@ -64,12 +113,14 @@ pub(crate) fn run(
     // the parent process env. The target's runtime settings.json re-supplies
     // whichever it defines. Mirrors the delegate path (run_delegate).
     crate::runtime::scrub_profile_env(&mut command, &active_env_keys);
-    // `claude` inherits this process's cwd (no `.current_dir()` call here); if
-    // that's the real `$HOME`, its project-tier settings lookup would hit the
-    // real `~/.claude/settings.json` and re-leak the globally active profile's
-    // env, this time outranking the runtime settings.json below.
-    if let Ok(cwd) = std::env::current_dir() {
-        crate::runtime::guard_home_project_settings(&mut command, &cwd);
+    // A resume pins `claude` to the session's workspace; a normal start inherits
+    // this process's cwd. Either way the resolved dir feeds the home-project
+    // settings guard: when it is the real `$HOME`, its project-tier settings
+    // lookup would hit the real `~/.claude/settings.json` and re-leak the
+    // globally active profile's env, outranking the runtime settings.json below.
+    let spawn_cwd = apply_spawn_cwd(&mut command, workspace);
+    if let Some(cwd) = spawn_cwd.as_deref() {
+        crate::runtime::guard_home_project_settings(&mut command, cwd);
     }
     command.env("CLAUDE_CONFIG_DIR", runtime.config_dir());
     // Isolated: also suppress global/project MCP servers wired through
@@ -82,6 +133,9 @@ pub(crate) fn run(
     if isolation == Isolation::Isolated {
         command.arg("--strict-mcp-config");
     }
+    // Marks this run's window: on the shared global store, only sessions touched
+    // at or after this instant are attributed to `name` (see stamp below).
+    let run_start = SystemTime::now();
     let child = command
         .args(claude_args)
         .spawn()
@@ -91,6 +145,34 @@ pub(crate) fn run(
     let outcome = supervise_child(child, &signal_watcher)?;
     #[cfg(not(unix))]
     let outcome = supervise_child(child)?;
+
+    // Record which sessions ran under this profile before teardown — an isolated
+    // store is discarded on drop, so its stamp must happen while `runtime` lives.
+    // Isolated: the store is exclusive, so every transcript maps to `name`.
+    // Shared: transcripts land in the global store, so only this run's window is.
+    // Best-effort; never fails the completed session.
+    let isolated = isolation == Isolation::Isolated;
+    let projects_dir = if isolated {
+        Some(runtime.config_dir().join("projects"))
+    } else {
+        crate::profile::claude_dir()
+            .ok()
+            .map(|d| d.join("projects"))
+    };
+    if let Some(projects_dir) = projects_dir {
+        crate::sessions::stamp_run_sessions(name, &projects_dir, isolated, run_start);
+    }
+
+    // Auto-rescue (isolated only, opt-in): the throwaway isolated store is
+    // discarded on `drop(runtime)`, taking the session's state with it. When
+    // enabled, lift it into the global store first. OFF is a no-op, leaving
+    // teardown byte-for-byte the stock discard path.
+    if isolated
+        && rescue_effective(rescue_override, config.state.auto_rescue)
+        && let Ok(claude_home) = crate::profile::claude_dir()
+    {
+        rescue_teardown(runtime.config_dir(), runtime.sessions_dir(), &claude_home);
+    }
 
     // Drop runtime before process::exit so final sync + refcount cleanup runs.
     drop(runtime);
@@ -162,6 +244,25 @@ fn supervise_child(mut child: std::process::Child) -> Result<ChildOutcome> {
         status: child.wait().context("failed to wait for the child")?,
         signal: None,
     })
+}
+
+/// Resolve the directory the spawned `claude` runs in and pin `command` to it.
+/// `Some(dir)` sets the child's cwd to that workspace (a resume); `None` leaves
+/// `command` inheriting this process's cwd (a normal start), so the `None` path
+/// is byte-for-byte the pre-resume behavior. Returns the resolved dir so the
+/// caller feeds the same path to the home-project settings guard, whose lookup
+/// is cwd-based.
+fn apply_spawn_cwd(
+    command: &mut std::process::Command,
+    workspace: Option<&Path>,
+) -> Option<PathBuf> {
+    match workspace {
+        Some(dir) => {
+            command.current_dir(dir);
+            Some(dir.to_path_buf())
+        }
+        None => std::env::current_dir().ok(),
+    }
 }
 
 fn status_code(status: ExitStatus, signal: Option<i32>) -> i32 {

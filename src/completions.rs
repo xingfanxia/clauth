@@ -11,12 +11,12 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete which status daemon doctor completions" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete which status daemon doctor sessions resume info completions" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--base-url --api-key --model --new --codex --browser --setup-token --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--isolated" -- "${cur}") )
-    elif [ "$prev" = "--isolated" ]; then
+        COMPREPLY=( $(compgen -W "--isolated --rescue --no-rescue" -- "${cur}") )
+    elif [ "$prev" = "--isolated" ] || [ "$prev" = "--profile" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
@@ -28,6 +28,10 @@ const BASH: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "completions" ]; then
         COMPREPLY=( $(compgen -W "bash zsh fish install" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
+        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y --force" -- "${cur}") )
     fi
@@ -51,17 +55,31 @@ _clauth() {
             'daemon[run the headless scheduler (no TUI)]' \
             'doctor[read-only health check of the daemon + macOS wiring]' \
             'completions[print or install shell completions]'
+            'sessions[list Claude Code sessions (add --json)]' \
+            'resume[resume a session under a chosen profile]' \
+            'info[print resume command + storage path for a session]' \
+            'completions[emit shell completion script]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|delete) ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
-        [[ "${words[2]}" == start ]] && _values 'flag' '--isolated[clean isolated runtime; drops operator config]'
+        [[ "${words[2]}" == start ]] && _values 'flag' '--isolated[clean isolated runtime; drops operator config]' \
+            '--rescue[isolated only: lift transcripts + sidecars into the global store]' \
+            '--no-rescue[isolated only: discard the isolated store]'
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == start && "${words[3]}" == --isolated ]]; then
+        local -a profiles
+        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        _describe 'profile' profiles
+    elif (( CURRENT == 4 )) && [[ "${words[2]}" == resume && "${words[3]}" == --profile ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (which|status) ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
+        _values 'flag' '--json[emit the stable machine-readable array]'
+    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
+        _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == completions ]]; then
         _values 'arg' 'bash' 'zsh' 'fish' 'install[install into the shell rc]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
@@ -90,14 +108,22 @@ complete -c clauth -f -n "__fish_seen_subcommand_from start login delete" -a "(_
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from which status" -a --json -d "Emit JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from completions" -a "bash zsh fish install" -d Shell
+complete -c clauth -f -n __fish_is_first_token -a sessions -d "List Claude Code sessions"
+complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session under a chosen profile"
+complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
+complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --rescue -d "Isolated only: lift transcripts + sidecars into the global store"
+complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --no-rescue -d "Isolated only: discard the isolated store"
+complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
+complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "API base url"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --api-key -d "API key (prompted echo-off if omitted)"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --setup-token -d "Capture a claude setup-token mint as a long-lived login"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --yes -d "Replace an existing long-lived token unprompted"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a -y -d "Replace an existing long-lived token unprompted"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --model -d "Set default model before signing in"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --new -d "Refuse to touch an existing profile"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --codex -d "Codex profile: capture the current codex login"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --browser -d "Codex profile: fresh browser sign-in"
-complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --setup-token -d "Capture a claude setup-token mint as a long-lived login"
-complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --yes -d "Replace an existing long-lived token unprompted"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --force -d "Override the live-session guard"

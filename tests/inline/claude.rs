@@ -259,13 +259,16 @@ fn classify_link_linked_to_even_when_target_missing() {
 // fires) and both BRANCHES (confirm overwrites/captures, cancel is a no-op) at
 // the home-derived seam the prompt actually drives, no TTY needed.
 
-#[cfg(unix)]
+// Not `#[cfg(unix)]`: the ungated session-token tests below use HomeSandbox on
+// every platform (it writes only a tempdir + files, no symlinks), so gating the
+// import broke the Windows test build.
 use crate::testutil::HomeSandbox;
 
 /// Seed an active profile `name` with stored credentials, then simulate CC
 /// re-logging into a different account: write a plain (non-symlink) live
 /// `~/.claude/.credentials.json` carrying `live`. Returns the assembled config.
-#[cfg(unix)]
+// Not `#[cfg(unix)]`: writes only plain files, and the ungated session-token
+// tests call it on Windows too.
 fn seed_relogin_scenario(
     name: &str,
     stored: ClaudeCredentials,
@@ -715,6 +718,279 @@ fn quarantine_archive_prunes_to_the_newest_twenty() {
     );
 }
 
+// ── apiKeyHelper for api-key profiles ─────────────────────────────────────────
+//
+// `build_claude_settings_json` swaps `env.ANTHROPIC_AUTH_TOKEN` for CC's
+// top-level `apiKeyHelper` when a profile carries an api_key, so the raw key
+// leaves the settings.json `env` block and the spawned CC process's env. CC
+// runs the helper per request and sends its stdout as both `X-Api-Key` and
+// `Authorization: Bearer` (see `docs/internals.md`).
+
+/// An api-key profile writes `apiKeyHelper` at the top level (NOT under `env`),
+/// keeps the raw key out of the rendered JSON, and clears `env.ANTHROPIC_AUTH_TOKEN`.
+/// The helper string carries the live exe path, the hidden subcommand, and the
+/// profile name — the three tokens CC's shell will re-split.
+#[test]
+fn build_settings_writes_api_key_helper_not_env_token() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json"); // absent → starts from `{}`
+    let profile = crate::profile::Profile::new(
+        "acme".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret-DO-NOT-LEAK".to_string()),
+    );
+    let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
+
+    // Top-level `apiKeyHelper` (not nested under `env`).
+    let helper = v
+        .get("apiKeyHelper")
+        .and_then(|h| h.as_str())
+        .expect("apiKeyHelper must be a top-level string");
+    assert!(
+        v["env"].get("apiKeyHelper").is_none(),
+        "apiKeyHelper must NOT live under `env` (CC reads it only at the top level)"
+    );
+
+    // The helper command carries the exe path, the hidden subcommand, and the
+    // profile name — so CC's shell-invocation of clauth can re-derive the key.
+    let exe = std::env::current_exe().expect("test-bin current_exe");
+    let exe_str = exe.to_string_lossy();
+    assert!(
+        helper.contains(&*exe_str),
+        "helper ({helper}) must carry the current exe path ({exe_str})"
+    );
+    assert!(
+        helper.contains("__api-key"),
+        "helper ({helper}) must carry the hidden subcommand name"
+    );
+    assert!(
+        helper.contains("acme"),
+        "helper ({helper}) must carry the profile name"
+    );
+
+    // The raw key MUST NOT appear anywhere in the rendered settings.json:
+    // not in env, not at the top level, not inside the helper string.
+    assert!(
+        !json.contains("sk-secret-DO-NOT-LEAK"),
+        "raw api_key must not appear in settings.json; got: {json}"
+    );
+    assert!(
+        v["env"].get("ANTHROPIC_AUTH_TOKEN").is_none(),
+        "env.ANTHROPIC_AUTH_TOKEN must be absent (the helper replaces it)"
+    );
+}
+
+/// A profile with no api_key (OAuth, local endpoint) writes NO `apiKeyHelper`
+/// and NO `env.ANTHROPIC_AUTH_TOKEN` — bit-identical to the pre-helper stock
+/// behavior. A switch from an api-key profile must clear both.
+#[test]
+fn build_settings_no_api_key_helper_for_non_api_profile() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json");
+    // Seed the base with stale keys the way a prior api-key profile would leave
+    // behind — the non-api rebuild must strip both.
+    fs::write(
+        &base,
+        r#"{"apiKeyHelper":"/old/bin/helper","env":{"ANTHROPIC_AUTH_TOKEN":"stale","ANTHROPIC_BASE_URL":"https://api.example.com"}}"#,
+    )
+    .expect("seed base settings");
+    // A non-api-key profile: OAuth/login shape. Carries the seeded base_url so
+    // the rebuild preserves it (the assertion below pins that unrelated env
+    // keys survive — base_url would otherwise be cleared by `match base_url`).
+    let profile = crate::profile::Profile::new(
+        "p".to_string(),
+        Some("https://api.example.com".to_string()),
+        None,
+    );
+    let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
+
+    assert!(
+        v.get("apiKeyHelper").is_none(),
+        "non-api profile must not write apiKeyHelper; got: {json}"
+    );
+    assert!(
+        v["env"].get("ANTHROPIC_AUTH_TOKEN").is_none(),
+        "non-api profile must clear env.ANTHROPIC_AUTH_TOKEN"
+    );
+    // Unrelated base settings survive.
+    assert_eq!(
+        v["env"]["ANTHROPIC_BASE_URL"], "https://api.example.com",
+        "unrelated env keys are preserved"
+    );
+}
+
+/// Switching from an api-key profile to a base_url-only profile (no api_key)
+/// must drop `apiKeyHelper` and `env.ANTHROPIC_AUTH_TOKEN` together — a stale
+/// helper pointing at the old profile would route the new session's requests
+/// through the old account.
+#[test]
+fn build_settings_switch_away_from_api_key_clears_helper() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json");
+    fs::write(
+        &base,
+        r#"{"apiKeyHelper":"/old/clauth __api-key oldacct","env":{"ANTHROPIC_AUTH_TOKEN":"sk-old","ANTHROPIC_BASE_URL":"https://old.example.com"}}"#,
+    )
+    .expect("seed api-key base settings");
+    let profile = crate::profile::Profile::new(
+        "new".to_string(),
+        Some("https://new.example.com".to_string()),
+        None,
+    );
+    let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
+    assert!(v.get("apiKeyHelper").is_none());
+    assert!(v["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
+    assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "https://new.example.com");
+}
+
+/// The helper command string shell-quotes a spaces-in-path exe so the system
+/// shell re-splits it into three tokens. Unix-only because the quoter branches
+/// on `cfg(unix)`; Windows quoting is covered structurally (it wraps the same
+/// way) but cmd's grammar is too ambiguous to assert byte-exact.
+#[test]
+fn build_settings_api_key_helper_shell_quotes_exe_path() {
+    #[cfg(unix)]
+    {
+        let quoted = shell_quote("/home/uwu clxdy/bin/clauth");
+        // POSIX single-quote, with `'` inside escaped as `'\''`.
+        assert_eq!(quoted, "'/home/uwu clxdy/bin/clauth'");
+
+        // A safe-char-only path (the cargo-installed default) is left unquoted.
+        let safe = shell_quote("/home/uwuclxdy/.cargo/bin/clauth");
+        assert_eq!(safe, "/home/uwuclxdy/.cargo/bin/clauth");
+
+        // An embedded single-quote closes, escapes, and reopens the outer quote.
+        let tricky = shell_quote("/path/with/'/clauth");
+        assert_eq!(tricky, "'/path/with/'\\''/clauth'");
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-Unix quoter is structurally similar but covered only on Windows
+        // targets; this test exists for the positive-control assertion on Unix.
+    }
+}
+
+/// Profile names are validated to a shell-safe charset, so the helper command
+/// never needs to quote them. This pins the fast-path: a regression that
+/// started escaping profile names would still pass the round-trip but would
+/// drift from CC's documented `/bin/<script>` example shape.
+#[test]
+fn build_settings_api_key_helper_leaves_profile_name_unquoted() {
+    let exe = std::path::Path::new("/usr/local/bin/clauth");
+    let cmd = build_api_key_helper_command(exe, "acme_corp-1.0+@");
+    assert_eq!(
+        cmd, "/usr/local/bin/clauth __api-key acme_corp-1.0+@",
+        "validated profile names must not be over-quoted"
+    );
+}
+
+/// A long-lived process (daemon/TUI) that rebuilds settings after an in-place
+/// self-update reads `env::current_exe()` as `<path> (deleted)` on Linux. The
+/// helper strips that marker so CC execs the installed binary at the same path,
+/// not a dead one — otherwise every mint 401s until a fresh process rebuilds.
+#[test]
+fn build_settings_api_key_helper_strips_deleted_exe_marker() {
+    let exe = std::path::Path::new("/home/uwuclxdy/.cargo/bin/clauth (deleted)");
+    let cmd = build_api_key_helper_command(exe, "acme");
+    assert_eq!(cmd, "/home/uwuclxdy/.cargo/bin/clauth __api-key acme");
+}
+
+// ── profile_name_from_helper: structural parse of the helper command string ──
+//
+// `read_claude_endpoint_config` derives the live api_key by parsing the
+// `apiKeyHelper` string the runtime settings.json carries. The parser must
+// reject anything that isn't exactly `<exe> __api-key <profile>` — a
+// hand-edited helper or a different command shape must NOT trigger a profile
+// lookup, or `capture_snapshot` could pull the wrong account's key.
+
+#[test]
+fn profile_name_from_helper_parses_our_shape() {
+    // The shape `build_api_key_helper_command` emits.
+    assert_eq!(
+        profile_name_from_helper("/usr/local/bin/clauth __api-key acme"),
+        Some("acme".to_string()),
+    );
+    // Exe path with spaces is shell-quoted; split_whitespace still yields
+    // three tokens.
+    assert_eq!(
+        profile_name_from_helper("'/home/uwu clxdy/bin/clauth' __api-key acme"),
+        Some("acme".to_string()),
+    );
+    // Profile name with every validated charset char round-trips.
+    assert_eq!(
+        profile_name_from_helper("/x/clauth __api-key a_b.c@d+e-f"),
+        Some("a_b.c@d+e-f".to_string()),
+    );
+}
+
+#[test]
+fn profile_name_from_helper_rejects_wrong_shape() {
+    // Not enough tokens.
+    assert_eq!(profile_name_from_helper("/x/clauth"), None);
+    assert_eq!(profile_name_from_helper("/x/clauth __api-key"), None);
+    assert_eq!(profile_name_from_helper(""), None);
+    // Too many tokens — a future shape with flags after the name is NOT ours.
+    assert_eq!(
+        profile_name_from_helper("/x/clauth __api-key acme --flag"),
+        None,
+    );
+    // Middle token isn't our subcommand name.
+    assert_eq!(
+        profile_name_from_helper("/custom/helper acme"),
+        None,
+        "a foreign helper must not trigger a profile lookup"
+    );
+    assert_eq!(
+        profile_name_from_helper("/x/clauth __other-hidden-cmd acme"),
+        None,
+    );
+    // Profile name fails `validate_profile_name`'s charset.
+    assert_eq!(
+        profile_name_from_helper("/x/clauth __api-key bad/name"),
+        None,
+        "a path-shaped third token must not parse as a profile name"
+    );
+    assert_eq!(
+        profile_name_from_helper("/x/clauth __api-key .hidden"),
+        None,
+        "a leading-dot profile name is rejected by validate_profile_name"
+    );
+    assert_eq!(
+        profile_name_from_helper("/x/clauth __api-key 'quoted'"),
+        None,
+        "a quoted profile name means it failed validate_profile_name's charset"
+    );
+}
+
+/// A whitespace-only api_key is treated as absent at the build layer (matching
+/// `api_key_for_profile`'s trim-and-filter at the helper end), so the helper
+/// is NOT written for it and `cmd_api_key` will fail closed rather than mint
+/// a blank credential.
+#[test]
+fn build_settings_blank_api_key_writes_no_helper() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json");
+    fs::write(&base, r#"{"apiKeyHelper":"/stale/bin/helper"}"#).expect("seed");
+    let profile = crate::profile::Profile::new(
+        "p".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("   ".to_string()),
+    );
+    let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+    assert!(
+        v.get("apiKeyHelper").is_none(),
+        "a whitespace-only api_key must clear the helper, not write one"
+    );
+    assert!(
+        v["env"].get("ANTHROPIC_AUTH_TOKEN").is_none(),
+        "a whitespace-only api_key must not write the env var either"
+    );
+}
+
 // ── logged-out shell detection ────────────────────────────────────────────────
 //
 // When Claude Code's own token refresh dies it does not delete the live
@@ -976,6 +1252,58 @@ fn validate_setup_token_accepts_a_mint_and_rejects_bad_pastes() {
     assert!(
         validate_setup_token("sk-ant-short").is_err(),
         "truncated paste"
+    );
+    assert!(
+        validate_setup_token(&format!("sk-ant-api03-{}", "z".repeat(48))).is_err(),
+        "an API key must be rejected, not installed as the session bearer",
+    );
+}
+
+/// The helper emits the api key verbatim to stdout, which CC forwards as an
+/// `X-Api-Key`/`Authorization` header. An interior control char would inject or
+/// malform that header, so a poisoned key must be refused, not minted.
+#[test]
+fn validate_api_key_rejects_control_and_whitespace() {
+    assert!(
+        validate_api_key("sk-ant-api03-abc123").is_ok(),
+        "a clean key"
+    );
+    assert!(
+        validate_api_key("sk-ant\r\nX-Evil: 1").is_err(),
+        "CRLF injection"
+    );
+    assert!(validate_api_key("sk-ant\ndaemon").is_err(), "bare newline");
+    assert!(validate_api_key("sk ant key").is_err(), "interior space");
+    assert!(validate_api_key("sk-ant\tkey").is_err(), "tab");
+    assert!(validate_api_key("sk-ant\u{0}key").is_err(), "nul");
+}
+
+/// Force-snapshot (the divergence-modal "overwrite" and the CLI reconciled
+/// switch both reach it) must never capture the live login into a session-token
+/// profile's clauth-private usage OAuth pair. Here the live slot holds a FOREIGN
+/// login; the guard at the shared sink leaves the stored usage pair intact.
+#[test]
+fn force_snapshot_never_clobbers_the_session_token_usage_pair() {
+    let _home = HomeSandbox::new();
+    let mut config = seed_relogin_scenario(
+        "split",
+        creds("usage-access", Some("usage-refresh")),
+        creds("foreign-access", Some("foreign-refresh")),
+    );
+    fill_session_token_by_hand("split", "oat-access");
+
+    force_snapshot_active_credentials(&mut config).expect("force snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("split")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("usage-refresh"),
+        "force-snapshot must leave the clauth-private usage OAuth pair untouched",
     );
 }
 

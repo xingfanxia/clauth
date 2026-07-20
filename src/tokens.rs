@@ -1305,6 +1305,40 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
     out
 }
 
+/// Fold one transcript file into per-model token sums for a per-session annotation
+/// (see [`crate::sessions`]). Deduped WITHIN the file by each usage line's
+/// `tok_key` (`message.id`, or the content composite `parse_file` derives when it
+/// is absent): a resumed or branched session copies its parent's history forward
+/// into the new file, so the same response can appear twice in one transcript —
+/// without this dedup a per-session total double-counts every carried-forward
+/// line. Same token-dedup discipline as [`merge_topup`], scoped to a single file
+/// instead of across the whole sweep. Fail-soft: an unreadable file yields `[]`.
+pub(crate) fn file_model_tokens(path: &Path) -> Vec<ModelTokens> {
+    let recs = parse_file(path);
+    let mut seen_tok: HashSet<&str> = HashSet::new();
+    let mut by_model: HashMap<&str, ModelTokens> = HashMap::new();
+    for r in &recs {
+        if !r.has_usage {
+            continue;
+        }
+        // An empty tok_key can't be keyed, so it counts as-is (matches merge_topup).
+        if !r.tok_key.is_empty() && !seen_tok.insert(r.tok_key.as_str()) {
+            continue;
+        }
+        let e = by_model
+            .entry(r.model.as_str())
+            .or_insert_with(|| ModelTokens {
+                model: r.model.clone(),
+                ..Default::default()
+            });
+        e.input = e.input.saturating_add(r.input);
+        e.output = e.output.saturating_add(r.output);
+        e.cache_read = e.cache_read.saturating_add(r.cache_read);
+        e.cache_create = e.cache_create.saturating_add(r.cache_create);
+    }
+    by_model.into_values().collect()
+}
+
 // ── Background thread ─────────────────────────────────────────────────────────
 
 /// Events emitted by the background loader thread.

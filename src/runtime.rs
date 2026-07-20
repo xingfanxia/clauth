@@ -145,17 +145,18 @@ pub(crate) fn live_session_count(name: &str) -> usize {
 
 /// Live-session count for one isolation flavor; zero when the dir is absent.
 fn live_sessions_in(name: &str, isolation: Isolation) -> usize {
-    match sessions_dir(name, isolation) {
-        Ok(dir) => live_sessions_in_dir(&dir),
-        Err(_) => 0,
-    }
+    let Ok(dir) = sessions_dir(name, isolation) else {
+        return 0;
+    };
+    live_sessions_at(&dir)
 }
 
-/// Live-session count for one lease directory; zero when absent/unreadable.
-/// Shared by the claude flavors above and the codex lease dir below — one
-/// liveness definition (`is_session_alive`: the per-PID flock is still held).
-fn live_sessions_in_dir(dir: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+/// Live sessions holding a marker in `sessions`; zero when the dir is absent.
+/// Read-only (unlike [`prune_stale_sessions`], it drops nothing), so it needs no
+/// state lock — a caller reading its own flavor's dir always counts ITSELF,
+/// since a second fd's `try_lock` conflicts with the one `acquire` holds.
+pub(crate) fn live_sessions_at(sessions: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(sessions) else {
         return 0;
     };
     entries
@@ -176,7 +177,7 @@ pub(crate) fn codex_sessions_dir(name: &str) -> Result<PathBuf> {
 /// CDX-4 walk (PLAN.md §0.14 two-carrier refusals). Missing dir = idle.
 pub(crate) fn has_live_codex_session(name: &str) -> bool {
     codex_sessions_dir(name)
-        .map(|d| live_sessions_in_dir(&d) > 0)
+        .map(|d| live_sessions_at(&d) > 0)
         .unwrap_or(false)
 }
 
@@ -439,6 +440,44 @@ fn gc_one_runtime(name: &str, isolation: Isolation) -> Result<()> {
     })
 }
 
+/// Every profile with a live isolated session, paired with its own
+/// `runtime-isolated/projects/` dir. An isolated runtime's transcripts live
+/// ONLY in this throwaway tree (never symlinked to the global store) and are
+/// discarded on teardown/GC, so the session index can reach them only while the
+/// session is live. Gated on a live *isolated* session specifically (not
+/// [`has_live_session`], which also counts shared sessions) and on the projects
+/// dir existing, so a shared-only or not-yet-written runtime is skipped.
+/// Fail-soft: an unreadable profiles root or entry is skipped, never an error.
+#[allow(
+    dead_code,
+    reason = "consumed by the session index (src/sessions.rs), wired into a surface in a later phase"
+)]
+pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
+    let Ok(root) = profiles_root_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if live_sessions_in(&name, Isolation::Isolated) == 0 {
+            continue;
+        }
+        let Ok(projects) = runtime_dir(&name, Isolation::Isolated).map(|d| d.join("projects"))
+        else {
+            continue;
+        };
+        if projects.is_dir() {
+            out.push((name, projects));
+        }
+    }
+    out
+}
+
 fn canonical_credentials(name: &str) -> Result<PathBuf> {
     // CLA-SPLIT: a `clauth start` session runs on what a switch would install —
     // the static session token when the profile has one. The rotating usage
@@ -627,16 +666,20 @@ impl ProfileRuntime {
         let watchdog_handle = thread::Builder::new()
             .name(format!("clauth-wdog-{name}"))
             .spawn(move || {
-                // One thread, two cadences: `.claude.json` reconciles every
-                // CJSON_INTERVAL; credentials reconcile every ~WATCHDOG_INTERVAL,
-                // counted in cjson ticks. Loop exits on Disconnected (sender
-                // dropped in Drop) or Ok(()).
+                // One thread, two cadences: the config reconcilers
+                // (`.claude.json` + `settings.json`) run every CJSON_INTERVAL;
+                // credentials reconcile every ~WATCHDOG_INTERVAL, counted in
+                // cjson ticks. Loop exits on Disconnected (sender dropped in
+                // Drop) or Ok(()).
                 let cred_every =
                     (WATCHDOG_INTERVAL.as_millis() / CJSON_INTERVAL.as_millis()).max(1);
                 let mut until_cred = cred_every;
                 while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(CJSON_INTERVAL) {
                     if let Err(e) = crate::claude_json::sync_once() {
                         logline!("clauth: .claude.json sync failed: {e}");
+                    }
+                    if let Err(e) = crate::settings_sync::sync_once() {
+                        logline!("clauth: settings.json sync failed: {e}");
                     }
                     until_cred -= 1;
                     if until_cred == 0 {
@@ -672,6 +715,14 @@ impl ProfileRuntime {
     pub(crate) fn config_dir(&self) -> &Path {
         &self.runtime
     }
+
+    /// This session's liveness-marker dir. Its live count gates anything that
+    /// MOVES state out of `config_dir`: the runtime tree is shared by every
+    /// session of this profile+flavor (`runtime_dir` carries no pid), and only
+    /// the last one out sees it discarded.
+    pub(crate) fn sessions_dir(&self) -> &Path {
+        &self.sessions
+    }
 }
 
 impl Drop for ProfileRuntime {
@@ -692,10 +743,14 @@ impl Drop for ProfileRuntime {
             logline!("clauth: final sync failed: {e}");
         }
 
-        // Flush this session's last `.claude.json` changes to the global file
-        // and siblings before a possible teardown removes this runtime copy.
+        // Flush this session's last `.claude.json` / `settings.json` changes to
+        // the global files and siblings before a possible teardown removes this
+        // runtime's copies.
         if let Err(e) = crate::claude_json::sync_once() {
             logline!("clauth: final .claude.json sync failed: {e}");
+        }
+        if let Err(e) = crate::settings_sync::sync_once() {
+            logline!("clauth: final settings.json sync failed: {e}");
         }
 
         if let Err(e) = with_state_lock(|| {
@@ -1016,6 +1071,11 @@ fn prune_dangling_links(runtime: &Path) -> Result<()> {
 /// per profile in `build_claude_settings_json`, so only custom `[env]` needs
 /// this. Callers with no active profile pass empty; starting the active profile
 /// itself passes its own keys, which the merge re-inserts (a no-op strip).
+///
+/// This computes the copy; `crate::settings_sync` then keeps it converged with
+/// the base and every sibling runtime for the session's lifetime. The two agree
+/// by construction: the syncer writes shared fields back into the base, so this
+/// recompute reproduces the same bytes on the next start instead of undoing it.
 fn write_merged_settings(
     runtime: &Path,
     claude_home: &Path,
@@ -1030,10 +1090,13 @@ fn write_merged_settings(
     };
     let merged = build_claude_settings_json(base, profile, active_env_keys)?;
     let settings_dst = runtime.join("settings.json");
-    // This file carries the api-key profile's `ANTHROPIC_AUTH_TOKEN`, so it must
-    // land 0o600 like every other clauth-owned write. The write gate also fires
-    // when only the mode is wrong (a byte-identical file an older build left at
-    // the umask never self-heals otherwise).
+    // This file carries the api-key profile's top-level `apiKeyHelper` command
+    // string (plus the base_url/model env keys), so it must land 0o600 like
+    // every other clauth-owned write. The raw key itself lives in `config.toml`
+    // (minted per request by the helper); the runtime settings.json is still
+    // operator-sensitive. The write gate also fires when only the mode is wrong
+    // (a byte-identical file an older build left at the umask never self-heals
+    // otherwise).
     let needs_write = match std::fs::read(&settings_dst) {
         Ok(existing) => existing != merged.as_bytes() || !is_owner_only(&settings_dst),
         Err(_) => true,
@@ -1499,7 +1562,10 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
                 .with_context(|| format!("failed to create {}", b.display()))?;
         }
         if b_is_dir && !a.exists() {
-            std::fs::create_dir_all(a)
+            // `a` is the canonical `~/.claude/` side (see `mirror_tree`'s callers) —
+            // owner-only like every other dir clauth creates there, not the
+            // process umask, matching the rescue path's `mkdir_700` invariant.
+            crate::profile::mkdir_700(a)
                 .with_context(|| format!("failed to create {}", a.display()))?;
         }
         for name in union_children(a, b) {

@@ -17,15 +17,17 @@
 //! overlaid onto every other file while preserving that file's per-profile
 //! fields. Atomic writes plus write-only-on-change make it convergent and safe
 //! against Claude Code's concurrent in-place writes — a file caught mid-write
-//! fails to parse and is simply skipped until the next tick.
+//! fails to parse and is simply skipped until the next tick. The merge itself
+//! lives in [`crate::jsonsync`], shared with the `settings.json` reconciler.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
+use crate::jsonsync::{KeyPath, KeyRule};
 use crate::profile::{atomic_write, clauth_dir, home_dir};
 
 /// Account-specific keys that must never propagate between profiles.
@@ -43,15 +45,21 @@ const PER_PROFILE_FIELDS: &[&str] = &[
     "modelAccessCache",
     "additionalModelCostsCache",
     "additionalModelOptionsCache",
+    // `/login`-managed API key and the per-key approval ledger. `primaryApiKey`
+    // is a RAW KEY: Claude Code writes it into this file (verified on 2.1.215 —
+    // the same accessor that reads `numStartups` and `oauthAccount`) and reads
+    // it back as an auth source labelled "/login managed key". Propagating it
+    // would hand one account's key to every other profile — the `.claude.json`
+    // twin of the `apiKeyHelper` leak the settings syncer blocks.
+    // `customApiKeyResponses` holds the approved/rejected hashes of those keys,
+    // so it is scoped to the same account.
+    "primaryApiKey",
+    "customApiKeyResponses",
 ];
 
 /// Newest mtime from the last [`sync_once`] that did work. Short-circuits ticks
 /// where no file is newer — no reads, parses, or writes.
 static LAST_SYNCED: Mutex<Option<SystemTime>> = Mutex::new(None);
-
-fn is_per_profile(key: &str) -> bool {
-    PER_PROFILE_FIELDS.contains(&key)
-}
 
 fn known_paths() -> Result<Vec<PathBuf>> {
     let mut paths = vec![home_dir()?.join(".claude.json")];
@@ -71,11 +79,7 @@ fn known_paths() -> Result<Vec<PathBuf>> {
 /// on success, so transient errors retry next tick.
 pub(crate) fn sync_once() -> Result<()> {
     let paths = known_paths()?;
-    let newest = paths
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
-        .max();
-    let Some(newest) = newest else {
+    let Some(newest) = crate::jsonsync::newest_mtime(&paths) else {
         return Ok(());
     };
     {
@@ -89,98 +93,15 @@ pub(crate) fn sync_once() -> Result<()> {
     Ok(())
 }
 
-struct Member {
-    path: PathBuf,
-    mtime: SystemTime,
-    obj: Map<String, Value>,
-}
-
-/// Read and parse each file (skipping missing/partial writes), pick the newest
-/// as winner, rewrite every other as `winner.shared ∪ target.per_profile` —
-/// atomically, only on change. Idempotent after convergence.
+/// Reconcile the given `.claude.json` copies. Every field is shared except
+/// [`PER_PROFILE_FIELDS`], which is a flat top-level set — no `env`-style nested
+/// rule, unlike the `settings.json` reconciler.
 fn sync_paths(paths: &[PathBuf]) -> Result<()> {
-    let mut members: Vec<Member> = Vec::new();
-    for path in paths {
-        let Ok(meta) = std::fs::metadata(path) else {
-            continue;
-        };
-        let Ok(mtime) = meta.modified() else {
-            continue;
-        };
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        // Partial CC in-place write fails to parse — skip until next tick.
-        let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(&bytes) else {
-            continue;
-        };
-        members.push(Member {
-            path: path.clone(),
-            mtime,
-            obj,
-        });
-    }
-    if members.len() < 2 {
-        return Ok(());
-    }
-
-    // Newest mtime wins; path breaks ties for determinism.
-    // Non-empty invariant: callers guard against empty members before calling.
-    #[allow(
-        clippy::expect_used,
-        reason = "non-empty invariant guaranteed by caller"
-    )]
-    let winner = members
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.mtime.cmp(&b.mtime).then_with(|| a.path.cmp(&b.path)))
-        .map(|(i, _)| i)
-        .expect("members is non-empty");
-
-    let shared: Map<String, Value> = members[winner]
-        .obj
-        .iter()
-        .filter(|(k, _)| !is_per_profile(k))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-
-    for (i, member) in members.iter().enumerate() {
-        if i == winner {
-            continue;
-        }
-        // Start from target to preserve key order and per-profile fields;
-        // drop stale shared keys, then upsert winner's shared values.
-        let mut merged = member.obj.clone();
-        merged.retain(|k, _| is_per_profile(k) || shared.contains_key(k));
-        for (k, v) in &shared {
-            merged.insert(k.clone(), v.clone());
-        }
-        if merged == member.obj {
-            continue;
-        }
-        let bytes = serde_json::to_vec_pretty(&Value::Object(merged))
-            .context("failed to serialize merged .claude.json")?;
-        write_member(&member.path, &bytes)
-            .with_context(|| format!("failed to write {}", member.path.display()))?;
-    }
-    Ok(())
-}
-
-/// Write a synced `.claude.json`. The rename swaps the inode, so the mode is the
-/// writer's, not the file's: a runtime copy (clauth-owned, under `~/.clauth`)
-/// gets 0o600 so the syncer can't silently revert the seed's owner-only mode,
-/// while the operator's own `~/.claude.json` keeps Claude Code's posture (clauth
-/// must not restyle a file it doesn't own). Any path that is not the home file
-/// is treated as clauth-owned, the stricter default.
-fn write_member(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let is_home_file = home_dir()
-        .map(|h| path == h.join(".claude.json"))
-        .unwrap_or(false);
-    if is_home_file {
-        atomic_write(path, bytes)
-    } else {
-        crate::profile::atomic_write_600(path, bytes)
-    }
+    let operator_file = home_dir().ok().map(|h| h.join(".claude.json"));
+    crate::jsonsync::sync_paths(paths, operator_file.as_deref(), |path| match path {
+        KeyPath::Top(key) if PER_PROFILE_FIELDS.contains(&key) => KeyRule::PerProfile,
+        _ => KeyRule::Shared,
+    })
 }
 
 /// CC's cached account uuid from `~/.claude.json`'s `oauthAccount.accountUuid`,

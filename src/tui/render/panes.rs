@@ -137,7 +137,10 @@ pub(super) fn select_line(
     }
 }
 
-/// Orange for the active profile, plain text otherwise.
+/// Orange for the active profile, plain text otherwise. This is the app's only
+/// active-account marker: cloudy-tui takes the `ACCENT_2` name and the
+/// `[ active ]` pill as two spellings of one signal, so the detail panes carry
+/// neither, and the selector's orange name speaks for the whole screen.
 pub(super) fn name_color(active: bool) -> Style {
     if active {
         Style::default().fg(theme::accent_2_color())
@@ -146,15 +149,25 @@ pub(super) fn name_color(active: bool) -> Style {
     }
 }
 
-/// `[ active ]` status pill: the active-account marker shared by usage, setup,
-/// and fallback detail panes (cloudy-tui status pill — brackets dim, label
-/// accent + bold).
-pub(super) fn active_pill() -> Vec<Span<'static>> {
+/// cloudy-tui status pill `[ label ]`: brackets in `TEXT_DIM`, the label in the
+/// caller's semantic style (bold for a charged state). Returns the three spans
+/// so a caller can compose them after a key cell; wrap in a `Line` for a
+/// standalone pill.
+pub(super) fn pill(label: String, label_style: Style) -> Vec<Span<'static>> {
     vec![
         Span::styled("[ ", theme::dim()),
-        Span::styled("active", theme::accent().add_modifier(Modifier::BOLD)),
+        Span::styled(label, label_style),
         Span::styled(" ]", theme::dim()),
     ]
+}
+
+/// `[ active ]` — the active-account marker on the usage tab's plan row,
+/// [`pill`] pre-bound to the accent-bold label.
+pub(super) fn active_pill() -> Vec<Span<'static>> {
+    pill(
+        "active".to_string(),
+        theme::accent().add_modifier(Modifier::BOLD),
+    )
 }
 
 pub(super) fn picker_row(
@@ -209,7 +222,7 @@ pub(super) fn draw_scrollbar(
     offset: usize,
     viewport: usize,
 ) {
-    if total <= viewport || viewport == 0 || inner.height == 0 {
+    if total <= viewport || viewport == 0 || inner.height == 0 || inner.width == 0 {
         return;
     }
     // Right-padding column: one cell to the right of the content rect.
@@ -237,6 +250,59 @@ pub(super) fn draw_scrollbar(
             }
         }
     }
+}
+
+/// Rows of context the form scroll keeps past the focused line while content
+/// remains (cloudy-tui: the cursor never rests against the viewport edge).
+const SCROLL_PAD: usize = 3;
+
+/// Render a form pane's assembled lines into `inner`, scrolled so the focused
+/// block `focus.0..focus.1` stays on screen, plus the overflow scrollbar.
+/// Returns the applied offset so a caller placing the native terminal cursor can
+/// shift its row by it.
+///
+/// These panes rebuild one `Vec<Line>` per frame and hold no offset in `App`, so
+/// the scroll is derived from the focused block each draw. Without it a pane
+/// taller than its viewport silently drops its bottom rows — no scrollbar, no
+/// clue anything is missing, which is how a hint tooltip and a whole settings
+/// row went missing on a 24-row terminal.
+pub(super) fn draw_scrolled_lines(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    lines: Vec<Line<'static>>,
+    focus: (usize, usize),
+) -> usize {
+    let total = lines.len();
+    let viewport = inner.height as usize;
+    let offset = scroll_offset(total, viewport, focus);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((offset as u16, 0)),
+        inner,
+    );
+    draw_scrollbar(frame, inner, total, offset, viewport);
+    offset
+}
+
+/// Smallest offset that keeps the focused block (`focus.0` inclusive, `focus.1`
+/// exclusive) plus a [`SCROLL_PAD`] band on screen, clamped to the content.
+///
+/// The block, not just its first line: a row's help tooltip wraps to the pane
+/// width, so a narrow pane can push a 4-line hint past the viewport while the
+/// row it explains sits comfortably on screen. Capping at `focus.0` keeps the
+/// row itself visible when its block is taller than the whole viewport. The
+/// focus alone determines the offset, so no cross-frame state is needed and the
+/// view can never drift out of sync with the cursor.
+pub(super) fn scroll_offset(total: usize, viewport: usize, focus: (usize, usize)) -> usize {
+    if viewport == 0 || total <= viewport {
+        return 0;
+    }
+    let pad = SCROLL_PAD.min(viewport.saturating_sub(1) / 2);
+    (focus.1 + pad)
+        .saturating_sub(viewport)
+        .min(focus.0)
+        .min(total - viewport)
 }
 
 /// Bordered selector list; `build_rows` receives the inner width for the selection bar.
@@ -314,7 +380,7 @@ pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// A `  └ text` help sub-line wrapped to `width`: the `└ ` leader stays `LINE`,
+/// A ` └ text` help sub-line wrapped to `width`: the `└ ` leader stays `LINE`,
 /// the reason renders `faint`; continuation lines indent under the text so the
 /// hint reads as one block instead of clipping off the pane edge.
 pub(super) fn help_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
@@ -333,12 +399,12 @@ fn tooltip_lines(
     leader_style: Style,
     text_style: Style,
 ) -> Vec<Line<'static>> {
-    const LEAD_W: usize = 4; // "  └ " and the matching continuation indent
+    const LEAD_W: usize = 3; // " └ " and the matching continuation indent
     wrap_words(text, width.saturating_sub(LEAD_W).max(8))
         .into_iter()
         .enumerate()
         .map(|(i, seg)| {
-            let lead = if i == 0 { "  └ " } else { "    " };
+            let lead = if i == 0 { " └ " } else { "   " };
             Line::from(vec![
                 Span::styled(lead, leader_style),
                 Span::styled(seg, text_style),

@@ -58,3 +58,20 @@ fn line_and_toast_collapse_to_the_head_when_detail_is_absent() {
 fn resolve_in_tui_names_the_clauth_surface() {
     assert!(RESOLVE_IN_TUI.contains("clauth TUI"));
 }
+
+#[test]
+fn plan_label_renders_the_tier_only_the_canceled_marker_is_on_the_status_line() {
+    let canceled = PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+    };
+    assert_eq!(plan_label(&canceled), "Claude Free");
+
+    // A genuine, never-subscribed free account looks the same here — the
+    // canceled distinction lives on the status line, not the plan label.
+    let free = PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: None,
+    };
+    assert_eq!(plan_label(&free), "Claude Free");
+}

@@ -21,6 +21,7 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {
@@ -798,7 +799,7 @@ fn banner_renders() {
     let mut app = App::new(config);
     app.banner = Some(Banner {
         severity: BannerSeverity::Danger,
-        message: "all accounts spent · switch to a profile to resume".to_string(),
+        message: "all accounts spent · switch to an account to resume".to_string(),
     });
 
     let screen = dump(&app, 90, 20);
@@ -855,5 +856,395 @@ fn tokens_models_view_empty_filter_names_the_filter() {
     assert!(
         !out.contains("no accounts yet"),
         "must not fall back to the accounts empty state:\n{out}"
+    );
+}
+
+// ── Fallback tab blocked-reason chip (weekly-fallback §4) ────────────────────
+
+/// Bare OAuth profile with no usage snapshot — `blocked_reason` then keys purely
+/// off `auth_broken`, so the chip tests need no live windows.
+fn bare(name: &str) -> Profile {
+    Profile {
+        harness: Default::default(),
+        name: name.into(),
+        base_url: None,
+        api_key: None,
+        auto_start: false,
+        env: BTreeMap::new(),
+        models: Default::default(),
+        fallback_threshold: Some(95.0),
+        last_resort: false,
+        max_auto_spend: None,
+        bell_threshold: None,
+        weekly_threshold: None,
+        check_weekly: true,
+        check_scoped: true,
+        credentials: None,
+        usage: None,
+        fetch_status: None,
+        provider: None,
+        third_party_usage: None,
+    }
+}
+
+fn fallback_config(auth_broken: &[&str]) -> AppConfig {
+    let names: Vec<ProfileName> = ["a", "b"].iter().map(|n| (*n).into()).collect();
+    AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: names.clone(),
+            fallback_chain: names,
+            auth_broken: auth_broken.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles: vec![bare("a"), bare("b")],
+    }
+}
+
+// An auth-broken chain member carries its `×` marker in the selector list, so
+// every ineligible member reads at a glance without opening its card. A chain
+// with nothing blocked carries none.
+#[test]
+fn fallback_selector_marks_a_blocked_member() {
+    let mut blocked = App::new(fallback_config(&["b"]));
+    blocked.tab = Tab::Fallback;
+    let out = dump(&blocked, 90, 20);
+    assert!(
+        out.contains('×'),
+        "auth-broken b shows the × marker:\n{out}"
+    );
+
+    let mut healthy = App::new(fallback_config(&[]));
+    healthy.tab = Tab::Fallback;
+    let clean = dump(&healthy, 90, 20);
+    assert!(
+        !clean.contains('×'),
+        "no marker when nothing is blocked:\n{clean}"
+    );
+}
+
+// A typed threshold on a BLOCKED member must still place the native caret on the
+// `rotate at` row: the blocked-reason pill shifts every card row down by 2 (pill
+// + blank), and the cursor math has to follow. Compare against an unblocked edit.
+#[test]
+fn fallback_edit_caret_follows_the_blocked_reason_pill() {
+    let caret_y = |auth_broken: &[&str]| -> u16 {
+        let mut app = App::new(fallback_config(auth_broken));
+        app.tab = Tab::Fallback;
+        app.chain_cursor = 0; // member a
+        app.fallback_focus = crate::tui::app::FallbackFocus::Detail;
+        app.fallback_detail_cursor = 0; // FallbackRow::Threshold
+        app.fallback_threshold_draft = Some(crate::tui::app::InputState::new("90"));
+        let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        term.get_cursor_position().unwrap().y
+    };
+    let unblocked = caret_y(&[]);
+    let blocked = caret_y(&["a"]);
+    assert_eq!(
+        blocked,
+        unblocked + 2,
+        "the blocked-reason pill (2 rows) shifts the edit caret down (unblocked={unblocked}, blocked={blocked})"
+    );
+}
+
+/// The Config and Setup panes rebuild their whole row list every frame into a
+/// fixed-height `Paragraph`. Before they scrolled, anything past the viewport
+/// vanished with no scrollbar and no clue — the last settings row and its hint
+/// were simply absent at 24 rows. Both panes must keep the FOCUSED row (and its
+/// tooltip) on screen at the smallest size the app renders at.
+#[test]
+fn form_panes_keep_the_focused_row_on_screen_when_they_overflow() {
+    use crate::tui::app::{ConfigFocus, GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+
+    // Cursor on the last row: it and its two-line hint sit past an 18-line
+    // viewport, so only a scroll can reveal them.
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS.len() - 1;
+    let bottom = dump(&app, 90, 24);
+    assert!(
+        bottom.contains("extra usage spent"),
+        "the focused last row must not clip:\n{bottom}"
+    );
+    assert!(
+        bottom.contains("extra usage runs out"),
+        "its hint tooltip must not clip either:\n{bottom}"
+    );
+    assert!(
+        bottom.contains('\u{2503}'),
+        "an overflowing pane shows its scrollbar thumb:\n{bottom}"
+    );
+
+    // Cursor back near the top with a hinted row (so the pane still overflows):
+    // the offset really tracks the cursor both ways — the first band header is
+    // back AND the bottom row has gone off screen.
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::DivergenceDefault)
+        .unwrap();
+    let top = dump(&app, 90, 24);
+    assert!(
+        top.contains("APPEARANCE"),
+        "the first band header is back on screen at the top:\n{top}"
+    );
+    assert!(
+        !top.contains("extra usage spent"),
+        "the offset really moved: the bottom row is off screen now:\n{top}"
+    );
+
+    // Setup's detail pane grows with a profile's env entries, so it overflows
+    // the same way — its last row (`delete account`) must stay reachable.
+    let mut p = oauth("uwuclxdy", 10.0, 10.0, false);
+    for i in 0..8 {
+        p.env.insert(format!("CUSTOM_VAR_{i}"), "value".into());
+    }
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("uwuclxdy".into()),
+            profiles: vec!["uwuclxdy".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    });
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    app.config_action_cursor = usize::MAX; // clamped to the last row by `draw_settings`
+    let setup = dump(&app, 90, 24);
+    assert!(
+        setup.contains("delete account"),
+        "Setup's focused last row must not clip:\n{setup}"
+    );
+}
+
+/// Each concern band is separated from the previous one by a blank row, so the
+/// groups read as sections instead of one 12-row wall. The FIRST band opens the
+/// pane, so it must not carry a leading spacer.
+#[test]
+fn config_bands_are_separated_by_one_blank_row() {
+    use crate::tui::app::Tab;
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = 0;
+    let screen = dump(&app, 90, 50);
+    let lines: Vec<&str> = screen.lines().collect();
+    let header = |label: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(label))
+            .unwrap_or_else(|| panic!("{label} renders:\n{screen}"))
+    };
+
+    for label in ["SCHEDULER", "AUTO-SWITCH", "EXTRA USAGE"] {
+        let above = lines[header(label) - 1];
+        assert!(
+            !above.chars().any(char::is_alphanumeric),
+            "{label} opens on a blank spacer row, got {above:?}:\n{screen}"
+        );
+    }
+    let above_first = lines[header("APPEARANCE") - 1];
+    assert!(
+        above_first.contains("SETTINGS"),
+        "the first band sits right under the panel title, no leading spacer: \
+         {above_first:?}\n{screen}"
+    );
+}
+
+/// A row's help tooltip wraps to the pane width, so a narrow pane turns a
+/// one-line hint into four. Scrolling to the focused ROW is not enough — the
+/// scroll has to clear the whole focused BLOCK, or the hint clips off the bottom
+/// while the row it explains sits comfortably on screen.
+#[test]
+fn a_wrapped_hint_scrolls_into_view_with_its_row() {
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            // `allow extra usage` = pay-as-you-go carries the long ON hint, so its
+            // wrapped block overflows a narrow pane and discriminates block-scroll.
+            spend_budget_switching: true,
+            ..AppState::default()
+        },
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    // `allow extra usage` carries a long hint and sits mid-pane, so the tail of
+    // its wrapped block lands past the viewport without pulling the whole pane
+    // to the end the way the last row would.
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SpendBudget)
+        .unwrap();
+
+    // 26 cols is the widest terminal where this hint still wraps to a tail line
+    // that lands past the viewport, so the assertion below keeps discriminating
+    // block-scroll from row-scroll. `scroll_offset_keeps_the_whole_focused_block
+    // _on_screen` pins the same rule off real copy.
+    let screen = dump(&app, 26, 24);
+    assert!(
+        screen.contains("allow extra"),
+        "the focused row renders:\n{screen}"
+    );
+    assert!(
+        !screen.contains("APPEARANCE"),
+        "the pane really scrolled: the first band is off the top:\n{screen}"
+    );
+    // The hint wraps to four lines ending in `its max spend`. That last line is
+    // present only if the scroll cleared the block's tail, not just its row.
+    assert!(
+        screen
+            .lines()
+            .any(|l| l.trim_matches(['│', '┊', '┃', ' ']) == "its max spend"),
+        "the hint's final wrapped line must not clip:\n{screen}"
+    );
+}
+
+/// The block-vs-row scroll rule, pinned off the pure function instead of live
+/// hint copy: the screen test above only discriminates while some real hint
+/// happens to wrap past the viewport, so rewording one silently retires it.
+#[test]
+fn scroll_offset_keeps_the_whole_focused_block_on_screen() {
+    use super::panes::scroll_offset;
+
+    // Block 18..22 in a 20-row viewport. Scrolling to the ROW alone yields 1
+    // (18 + 3 pad - 20) and clips the block's tail at 21.
+    assert_eq!(scroll_offset(30, 20, (18, 22)), 5);
+    // A block taller than the viewport caps at its first line, so the row it
+    // explains survives even though its hint cannot.
+    assert_eq!(scroll_offset(40, 10, (5, 30)), 5);
+    // Content that fits never scrolls, whatever the focus.
+    assert_eq!(scroll_offset(12, 20, (8, 11)), 0);
+    // A block already on screen without scrolling stays put.
+    assert_eq!(scroll_offset(30, 20, (2, 5)), 0);
+}
+
+/// End-to-end wiring for the reset-display setting (issue #39). The formatters
+/// are unit-tested pure; only a real frame proves the operator's choice reaches
+/// the usage-tab bar line — a call site left on `ResetFmt::default()` would keep
+/// every other test green. Asserts a SHAPE, never a literal clock, so the test
+/// holds in any timezone.
+#[test]
+fn usage_tab_reset_follows_the_reset_display_setting() {
+    use crate::profile::ResetDisplay;
+    use crate::tui::app::Tab;
+
+    let mut profile = oauth("a", 40.0, 10.0, false);
+    if let Some(w) = profile.usage.as_mut().and_then(|u| u.five_hour.as_mut()) {
+        w.resets_at = Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + 40 * 60,
+        ));
+    }
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    app.tab = Tab::Usage;
+
+    // The stamp carries a `mon`-style day qualifier when the reset crosses
+    // midnight (a 40m reset from late evening does), so accept both shapes.
+    let stamped =
+        regex::Regex::new(r"resets in \d+m \((?:[a-z]{3} )?\d\d:\d\d\)").expect("valid pattern");
+    let countdown = regex::Regex::new(r"resets in \d+m").expect("valid pattern");
+    // Pin both stamp shapes directly so the test holds at any wall clock, not
+    // just when the fixture's 40m reset happens to stay same-day.
+    assert!(stamped.is_match("resets in 9m (mon 00:09)"));
+    assert!(stamped.is_match("resets in 9m (00:09)"));
+
+    let relative = dump(&app, 100, 30);
+    assert!(
+        countdown.is_match(&relative),
+        "the stock shape is a bare countdown:\n{relative}"
+    );
+    assert!(
+        !stamped.is_match(&relative),
+        "no clock renders until the operator asks for one:\n{relative}"
+    );
+
+    {
+        let mut cfg = app.config();
+        cfg.state.reset_display = Some(ResetDisplay::Both);
+    }
+    let both = dump(&app, 100, 30);
+    assert!(
+        stamped.is_match(&both),
+        "`both` carries the countdown and a 24h stamp:\n{both}"
+    );
+}
+
+/// The overview column is the one reset surface with a width budget, and no
+/// frame test covered it — which is how a first cut shipped that DELETED the
+/// countdown (and the 7d bar with it) at widths between the old and new tiers.
+/// Opting into a clock must never render less than `relative` did at the same
+/// width: worst case the stamp is dropped, never the countdown.
+#[test]
+fn overview_reset_column_never_loses_ground_to_the_clock_setting() {
+    use crate::profile::ResetDisplay;
+    use crate::tui::app::Tab;
+
+    let mut profile = oauth("a", 40.0, 60.0, false);
+    let now = crate::usage::now_epoch_secs();
+    if let Some(u) = profile.usage.as_mut() {
+        if let Some(w) = u.five_hour.as_mut() {
+            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600));
+        }
+        if let Some(w) = u.seven_day.as_mut() {
+            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400));
+        }
+    }
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    app.tab = Tab::Overview;
+
+    // The reset cell is whatever sits in parens after a bar's `%`, so this counts
+    // it in every shape — `(3h 0m)`, `(22:50)`, `(thu 19:50)`, `(3h 0m · 22:50)`.
+    let reset_cell = regex::Regex::new(r"% \([^)]+\)").expect("valid pattern");
+    let stamped = regex::Regex::new(r"· \d\d:\d\d\)").expect("valid pattern");
+
+    // Widths spanning every tier boundary the setting touches, including the
+    // 81-90 and 102-111 bands where moving a threshold used to drop a column.
+    for width in [85, 91, 100, 110, 112, 130, 160] {
+        let relative = dump(&app, width, 20);
+        let base = reset_cell.find_iter(&relative).count();
+
+        for display in [ResetDisplay::Clock, ResetDisplay::Both] {
+            {
+                let mut cfg = app.config();
+                cfg.state.reset_display = Some(display);
+            }
+            let with_clock = dump(&app, width, 20);
+            let kept = reset_cell.find_iter(&with_clock).count();
+            assert!(
+                kept >= base,
+                "at {width} cols {display:?} shows {kept} resets where relative showed \
+                 {base}:\nrelative:\n{relative}\n{display:?}:\n{with_clock}"
+            );
+        }
+        {
+            let mut cfg = app.config();
+            cfg.state.reset_display = None;
+        }
+    }
+
+    // And the wide tier genuinely carries a stamp on BOTH columns once the
+    // terminal can pay for it — the point of the setting.
+    {
+        let mut cfg = app.config();
+        cfg.state.reset_display = Some(ResetDisplay::Both);
+    }
+    let wide = dump(&app, 160, 20);
+    assert_eq!(
+        stamped.find_iter(&wide).count(),
+        2,
+        "a 160-col overview stamps both the 5h and 7d resets:\n{wide}"
     );
 }

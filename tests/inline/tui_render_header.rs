@@ -20,6 +20,7 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: Some(UsageInfo {
@@ -49,6 +50,7 @@ fn provider_profile(name: &str) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage: None,

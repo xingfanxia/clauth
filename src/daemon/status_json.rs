@@ -414,7 +414,9 @@ pub(crate) fn build_status(
             "at": iso_from_ms(at),
             "message": message,
         })),
-        "wrap_off": config.state.wrap_off,
+        // Wire key stays "wrap_off" (ccsbar reads it); the Rust field followed
+        // upstream's switch_off_when_spent rename.
+        "wrap_off": config.state.switch_off_when_spent,
         "weekly_switch_threshold": config.state.weekly_switch_threshold_pct(),
         // Additive (schema stays 1): whether the ACTIVE-side switch decision
         // projects on burn rate (issue #8-b upstream) instead of the static

@@ -665,6 +665,70 @@ fn perform_delete_without_live_session_deletes_immediately() {
     );
 }
 
+/// Rotating a profile a live `clauth start` session owns must not dead-end on a
+/// toast (the old behavior): it arms an acknowledge notice explaining the block,
+/// and confirming is a no-op — the running session owns rotation, and rotating
+/// its already-spent stored token would 400 (`docs/internals.md`, 2026-06-17).
+#[test]
+fn rotate_tokens_with_live_session_arms_acknowledge_modal() {
+    use super::{
+        ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action, run_confirm_action,
+    };
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let _pid_guard = arm_live_session(home.home(), "busy");
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
+    let confirm = app
+        .modals
+        .last()
+        .and_then(|m| match m {
+            Modal::Confirm(s) => Some(s),
+            _ => None,
+        })
+        .expect("a live session arms a confirm modal");
+    assert!(
+        matches!(confirm.on_confirm, ConfirmAction::Acknowledge),
+        "a live-session rotate arms an acknowledge notice, not a rotate action"
+    );
+
+    let action = confirm.on_confirm.clone();
+    run_confirm_action(&mut app, action);
+    assert!(
+        app.config().find("busy").is_some(),
+        "acknowledging the notice leaves the profile untouched"
+    );
+}
+
+/// No live session: the rotate action arms the normal rotate confirm carrying the
+/// per-profile `RotateOne`, not the acknowledge notice.
+#[test]
+fn rotate_tokens_without_live_session_arms_rotate_confirm() {
+    use super::{ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("idle".to_string(), None, None)]);
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
+    let confirm = app
+        .modals
+        .last()
+        .and_then(|m| match m {
+            Modal::Confirm(s) => Some(s),
+            _ => None,
+        })
+        .expect("a rotate arms a confirm modal");
+    assert!(
+        matches!(&confirm.on_confirm, ConfirmAction::RotateOne(n) if n == "idle"),
+        "a non-live rotate carries the RotateOne action for the focused profile"
+    );
+}
+
 /// Minted-credential fixture for the login tests.
 fn login_creds(refresh: &str) -> crate::profile::ClaudeCredentials {
     crate::profile::ClaudeCredentials {
@@ -1805,10 +1869,159 @@ fn burn_aware_space_toggles_and_persists() {
     );
 }
 
+// ── spend budget (real money) ───────────────────────────────────────────────
+
+#[test]
+fn spend_budget_space_toggles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SpendBudget)
+        .unwrap();
+    assert!(
+        !app.config().state.spend_budget_switching,
+        "money is never spent unless asked for: off by default"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(app.config().state.spend_budget_switching, "space arms it");
+
+    let reloaded: crate::profile::AppState = toml::from_str(
+        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+            .expect("read profiles.toml"),
+    )
+    .expect("parse profiles.toml");
+    assert!(reloaded.spend_budget_switching, "toggle persists to disk");
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.spend_budget_switching,
+        "space toggles it back off"
+    );
+}
+
+// `money spent` is its own row, not an alias of `quota spent`: staying is free
+// when quota runs out and costs money when a budget does, so the two must be
+// settable in opposite directions.
+#[test]
+fn budget_wrap_off_space_toggles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SwitchOffWhenBudgetSpent)
+        .unwrap();
+    assert!(
+        app.config().state.switch_off_when_budget_spent,
+        "a spent budget stops spending unless told otherwise: on by default"
+    );
+    assert!(
+        !app.config().state.switch_off_when_spent,
+        "...while `quota spent` defaults the other way, since staying is free there"
+    );
+
+    // `money spent` is inert (dimmed) until spend budget is armed — arm it first,
+    // then space toggles it.
+    {
+        let mut cfg = app.config();
+        cfg.state.spend_budget_switching = true;
+    }
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.switch_off_when_budget_spent,
+        "space flips it to stay on active"
+    );
+    assert!(
+        !app.config().state.switch_off_when_spent,
+        "flipping the budget row must not touch `quota spent`"
+    );
+
+    let reloaded: crate::profile::AppState = toml::from_str(
+        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+            .expect("read profiles.toml"),
+    )
+    .expect("parse profiles.toml");
+    assert!(
+        !reloaded.switch_off_when_budget_spent,
+        "toggle persists to disk"
+    );
+}
+
+// `money spent` decides no halt while spend budget is off (nothing spends), so
+// it renders dimmed AND is a true disabled row: space/⏎ must no-op, or `faint`
+// would stop meaning "inert".
+#[test]
+fn money_spent_is_inert_while_spend_budget_is_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    assert!(
+        !app.config().state.spend_budget_switching,
+        "spend budget off by default — the money-spent row is inert"
+    );
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SwitchOffWhenBudgetSpent)
+        .unwrap();
+    let before = app.config().state.switch_off_when_budget_spent;
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.switch_off_when_budget_spent,
+        before,
+        "space must not cycle an inert row"
+    );
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config().state.switch_off_when_budget_spent,
+        before,
+        "enter must not cycle an inert row either"
+    );
+}
+
+// Same inert guard, but entered through the REAL top-level router (`handle_key`
+// → tab dispatch), the layer a keystroke actually hits. A sub-handler-only test
+// stays green if the inert check ever moves above `handle_global_config_key`.
+#[test]
+fn money_spent_is_inert_through_the_top_level_router() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SwitchOffWhenBudgetSpent)
+        .unwrap();
+    let before = app.config().state.switch_off_when_budget_spent;
+
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.switch_off_when_budget_spent,
+        before,
+        "space through handle_key must not cycle an inert row"
+    );
+
+    // Positive control: arm spend budget and the SAME key path must now cycle the
+    // row — proves `handle_key` actually routes space here, so the inert "no
+    // change" above is the guard doing its job, not a router that never arrives.
+    {
+        let mut cfg = app.config();
+        cfg.state.spend_budget_switching = true;
+    }
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_ne!(
+        app.config().state.switch_off_when_budget_spent,
+        before,
+        "space through handle_key cycles the row once spend budget is armed"
+    );
+}
+
 // ── preemptive rotation (rotation coherence #1) ─────────────────────────────
 
 #[test]
-fn preemptive_rotation_space_toggles_and_persists() {
+fn preemptive_rotation_space_toggles_on_macos_inert_elsewhere() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = Tab::Config;
@@ -1822,25 +2035,34 @@ fn preemptive_rotation_space_toggles_and_persists() {
     );
 
     super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
-    assert!(
-        app.config().state.preemptive_rotation,
-        "space toggles the mode on"
-    );
 
-    // Persisted to profiles.toml — the scheduler reads the flag off the
-    // shared config, but a relaunch must pick it up from disk too.
-    let reloaded: crate::profile::AppState = toml::from_str(
-        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
-            .expect("read profiles.toml"),
-    )
-    .expect("parse profiles.toml");
-    assert!(reloaded.preemptive_rotation, "toggle persists to disk");
+    // Off macOS the Keychain mirror is never live, so preemptive rotation can't
+    // fire and the row is a disabled no-op; on macOS the toggle works + persists.
+    if cfg!(target_os = "macos") {
+        assert!(
+            app.config().state.preemptive_rotation,
+            "space toggles the mode on"
+        );
+        // Persisted to profiles.toml — the scheduler reads the flag off the
+        // shared config, but a relaunch must pick it up from disk too.
+        let reloaded: crate::profile::AppState = toml::from_str(
+            &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+                .expect("read profiles.toml"),
+        )
+        .expect("parse profiles.toml");
+        assert!(reloaded.preemptive_rotation, "toggle persists to disk");
 
-    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
-    assert!(
-        !app.config().state.preemptive_rotation,
-        "space toggles the mode back off"
-    );
+        super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(
+            !app.config().state.preemptive_rotation,
+            "space toggles the mode back off"
+        );
+    } else {
+        assert!(
+            !app.config().state.preemptive_rotation,
+            "inert off macOS — space must not toggle a row that can't fire"
+        );
+    }
 }
 
 // ── refresh interval custom value ──────────────────────────────────────────
@@ -2309,7 +2531,7 @@ fn no_active_banner_without_spent_evidence() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "no active profile · select one to resume"
+        "no active account · select one to resume"
     );
 }
 
@@ -2329,7 +2551,7 @@ fn all_spent_banner_needs_live_spent_window() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "all accounts spent · switch to a profile to resume"
+        "all accounts spent · switch to an account to resume"
     );
 }
 
@@ -2353,7 +2575,7 @@ fn all_spent_banner_ignores_a_soft_blocked_member_that_still_serves() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "no active profile · select one to resume",
+        "no active account · select one to resume",
         "soft-blocked is not spent — the banner must not claim it is"
     );
 }
@@ -2375,7 +2597,7 @@ fn all_spent_banner_fires_at_the_weekly_hard_cap() {
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
-        "all accounts spent · switch to a profile to resume"
+        "all accounts spent · switch to an account to resume"
     );
 }
 
@@ -2409,6 +2631,125 @@ fn fallback_threshold_plus_minus_still_nudge_both_ways() {
         app.config().find("a").and_then(|p| p.fallback_threshold),
         Some(45.0),
         "- still lowers the threshold by 5"
+    );
+}
+
+// ── fallback max auto-spend (real money) ────────────────────────────────────
+
+/// Read the row's position rather than hardcoding it, so inserting a row above
+/// it can't silently point these tests at a different field.
+fn max_spend_row() -> usize {
+    super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::MaxSpend)
+        .expect("max spend row exists")
+}
+
+// `inf` and `nan` parse as perfectly good `f64`s, so a ceiling editor that only
+// checked `>= 0.0` would accept "inf" and hand the chain an unbounded budget
+// (`fallback::spend_room`). The typed editor is one of the two ways a ceiling
+// reaches disk, so it refuses them at the keyboard, exactly like the config
+// loader does for a hand-edited file.
+#[test]
+fn parse_max_spend_refuses_non_finite_and_negative() {
+    assert_eq!(super::parse_max_spend("12.5"), Some(12.5));
+    assert_eq!(super::parse_max_spend("0"), Some(0.0));
+    assert_eq!(super::parse_max_spend("inf"), None);
+    assert_eq!(super::parse_max_spend("-inf"), None);
+    assert_eq!(super::parse_max_spend("NaN"), None);
+    assert_eq!(super::parse_max_spend("-5"), None);
+    assert_eq!(super::parse_max_spend("free"), None);
+}
+
+#[test]
+fn fallback_max_spend_editor_types_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = max_spend_row();
+    // The ceiling is inert (editor won't open) until spend budget is armed.
+    app.config().state.spend_budget_switching = true;
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.max_auto_spend),
+        None,
+        "unset is the never-spend default"
+    );
+
+    // ⏎ opens the editor seeded with the current ceiling.
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_max_spend_draft.is_some(), "⏎ opens the field");
+
+    // The field opens seeded with the current ceiling ("0.00"), so clear it
+    // before typing or the digits append to it.
+    for _ in 0..4 {
+        super::handle_key(&mut app, key(KeyCode::Backspace));
+    }
+    for c in ['2', '5'] {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_max_spend_draft.is_none(), "⏎ closes the field");
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.max_auto_spend),
+        Some(25.0),
+        "the typed ceiling persists"
+    );
+}
+
+// The ceiling is inert (dimmed) while spend budget is off — a typed value would
+// do nothing, so ⏎ must not open the editor.
+#[test]
+fn fallback_max_spend_editor_is_inert_while_spend_budget_is_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = max_spend_row();
+    assert!(
+        !app.config().state.spend_budget_switching,
+        "spend budget off by default — the ceiling row is inert"
+    );
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.fallback_max_spend_draft.is_none(),
+        "⏎ must not open the editor while the row is inert"
+    );
+}
+
+// A rejected value keeps the field open rather than toasting — the same
+// no-toast treatment `rotate at` uses — so the inline invalid styling stays on
+// screen until corrected, and nothing is written.
+#[test]
+fn fallback_max_spend_editor_refuses_an_infinite_ceiling() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = max_spend_row();
+    app.config().state.spend_budget_switching = true;
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    // Seeded with "0.00"; clear it, then type the trap.
+    for _ in 0..4 {
+        super::handle_key(&mut app, key(KeyCode::Backspace));
+    }
+    for c in ['i', 'n', 'f'] {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.fallback_max_spend_draft.is_some(),
+        "an invalid ceiling keeps the field open"
+    );
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.max_auto_spend),
+        None,
+        "an infinite ceiling must never reach disk"
     );
 }
 
@@ -2669,7 +3010,7 @@ fn capture_overwrite_cancel_changes_nothing() {
         identity: crate::actions::CaptureIdentity::LiveLogin,
     };
     app.modals.push(super::Modal::Confirm(super::ConfirmState {
-        message: "Profile 'acme' already exists.".to_string(),
+        message: "account 'acme' already exists.".to_string(),
         detail: None,
         choice: false, // cancel is the default-focused, safe choice
         on_confirm: super::ConfirmAction::CaptureOverwrite(
@@ -3448,4 +3789,347 @@ fn fallback_usage_gate_toggles_persist_and_gate_off_inerts_the_override() {
     let reloaded = crate::profile::load_profile("a").expect("reload profile");
     assert!(!reloaded.check_weekly);
     assert!(!reloaded.check_scoped);
+}
+
+// ── apply_usage Fresh-gate (docs/todo.md #1) ─────────────────────────────────
+//
+// `App::apply_usage` is driven every tick over the shared usage stores. The
+// bell + the burn-rate history JSONL append must fire ONLY when the per-
+// profile status is `FetchStatus::Fresh`. A phantom entry from a
+// `RateLimited` or stale-`Cached` tick survives restart and skews the burn
+// rate; a false bell cries wolf. The three tests below inject the status
+// directly into `usage_status` — the same field the scheduler writes on
+// every fetch — then call `apply_usage` and assert the durable side effects.
+//
+// The seam: `apply_usage` reads each profile's status out of the shared
+// `usage_status` map (`Arc<RankedMutex<HashMap<String, FetchStatus>>>`), so
+// seeding that map from a test is indistinguishable from a real scheduler
+// tick landing a fetch result.
+
+use crate::usage::{FetchStatus, UsageInfo, UsageWindow};
+
+/// Single-profile fixture: "alice" with `bell_threshold = 70.0` and a seeded
+/// `usage_store["alice"]` at 80 % utilization (>= threshold, so the bell
+/// would fire if the gate were removed). The injected `status` lands in
+/// `usage_status["alice"]`.
+const GATE_PROFILE: &str = "alice";
+const GATE_THRESHOLD: f64 = 70.0;
+const GATE_UTIL: f64 = 80.0;
+
+/// Pre-seed `usage_history.jsonl` with one entry at 50 % utilization so the
+/// Fresh case has something to differ from (forcing `changed = true`), and
+/// the RateLimited/Cached cases can assert byte-identical no-op. Returns the
+/// file's bytes after seeding (one line, util 50).
+fn seed_prior_history_entry() -> String {
+    let path = crate::profile::profile_history_path(GATE_PROFILE)
+        .expect("profile_history_path resolves under the sandbox home");
+    std::fs::create_dir_all(path.parent().expect("parent dir"))
+        .expect("create profile dir for seeded history");
+    let old = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 50.0,
+            resets_at: None,
+        }),
+        ..UsageInfo::default()
+    };
+    let usage_json = serde_json::to_string(&old).unwrap_or_default();
+    let name_json = serde_json::to_string(GATE_PROFILE).unwrap_or_default();
+    let line = format!(
+        r#"{{"ts":{},"name":{},"usage":{}}}"#,
+        crate::usage::now_ms().saturating_sub(60_000),
+        name_json,
+        usage_json,
+    );
+    std::fs::write(&path, format!("{line}\n")).expect("seed prior history entry");
+    std::fs::read_to_string(&path).expect("read seeded history")
+}
+
+/// Build a fresh `App` over the caller-held sandbox. Caller owns the
+/// `HomeSandbox` so it outlives the App's disk writes.
+fn gate_app(
+    _home: &crate::testutil::HomeSandbox,
+    status: FetchStatus,
+) -> (App, std::path::PathBuf) {
+    let mut profile = crate::testutil::blank_profile(GATE_PROFILE);
+    profile.bell_threshold = Some(GATE_THRESHOLD);
+    let app = app_with(vec![profile]);
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: GATE_UTIL,
+            resets_at: None,
+        }),
+        ..UsageInfo::default()
+    };
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut store = app.usage_store.lock().expect("usage_store mutex poisoned");
+        store.insert(GATE_PROFILE.to_string(), usage);
+    }
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut s = app
+            .usage_status
+            .lock()
+            .expect("usage_status mutex poisoned");
+        s.insert(GATE_PROFILE.to_string(), status);
+    }
+    let history_path = crate::profile::profile_history_path(GATE_PROFILE)
+        .expect("profile_history_path resolves under the sandbox home");
+    (app, history_path)
+}
+
+#[test]
+fn apply_usage_fresh_status_fires_bell_and_appends_history() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let prior = seed_prior_history_entry();
+    let (mut app, history_path) = gate_app(&_home, FetchStatus::Fresh);
+
+    app.apply_usage();
+
+    // Bell arm: util(80) >= threshold(70), no prior bell_fired entry → fires.
+    assert_eq!(
+        app.bell_fired.get(GATE_PROFILE),
+        Some(&true),
+        "Fresh + util over threshold must ring the bell",
+    );
+
+    // History arm: file gains a new entry carrying the live util.
+    let after =
+        std::fs::read_to_string(&history_path).expect("history file readable after apply_usage");
+    assert!(
+        after.len() > prior.len(),
+        "Fresh must append a new history line (pre {} bytes, post {} bytes)",
+        prior.len(),
+        after.len(),
+    );
+    assert!(
+        after.contains(r#""utilization":"#.to_string().as_str())
+            && after.contains(&format!("{}", GATE_UTIL)),
+        "the appended live sample must carry the seeded utilization {GATE_UTIL} (got: {after})",
+    );
+    assert!(
+        after.starts_with(&prior),
+        "the prior entry must survive intact at the head of the file",
+    );
+}
+
+#[test]
+fn apply_usage_rate_limited_status_skips_bell_and_history_append() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let prior = seed_prior_history_entry();
+    let (mut app, history_path) = gate_app(&_home, FetchStatus::RateLimited);
+
+    app.apply_usage();
+
+    assert!(
+        !app.bell_fired.contains_key(GATE_PROFILE),
+        "RateLimited must not ring the bell (util would have fired on Fresh)",
+    );
+    let after = std::fs::read_to_string(&history_path).expect("history file still readable");
+    assert_eq!(
+        after, prior,
+        "RateLimited must not append a phantom history entry (file must be byte-identical)",
+    );
+}
+
+#[test]
+fn apply_usage_cached_status_skips_bell_and_history_append() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let prior = seed_prior_history_entry();
+    let (mut app, history_path) = gate_app(&_home, FetchStatus::Cached);
+
+    app.apply_usage();
+
+    assert!(
+        !app.bell_fired.contains_key(GATE_PROFILE),
+        "Cached must not ring the bell (util would have fired on Fresh)",
+    );
+    let after = std::fs::read_to_string(&history_path).expect("history file still readable");
+    assert_eq!(
+        after, prior,
+        "Cached must not append a phantom history entry (file must be byte-identical)",
+    );
+}
+
+// ── finish_bootstrap's Fresh-only auto-switch gate ───────────────────────────
+//
+// The startup switch one-shot is a switch DECISION taken off numbers nobody
+// re-verified this run. A Cached / RateLimited / Failed read is unverified in
+// either direction, so acting on it can relink live credentials over a window
+// the account no longer has; those profiles are due on the scheduler's first
+// tick, which fetches first and decides off the corrected numbers.
+//
+// The seam: `usage_store` + `usage_status` are exactly what the bootstrap
+// worker fills before it posts `StartupSignal::BootstrapDone`, and
+// `finish_bootstrap` reads the gate off `apply_usage`'s copy of them — so
+// seeding the maps and sending the signal is indistinguishable from a real
+// bootstrap landing.
+
+const BOOT_SPENT: &str = "spent";
+const BOOT_SPARE: &str = "spare";
+
+/// 5h window at `utilization` with a reset an hour out — the exhaustion
+/// predicates only trust a window they can prove live.
+fn boot_window(utilization: f64) -> UsageWindow {
+    UsageWindow {
+        utilization,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + 3600,
+        )),
+    }
+}
+
+/// Drive one bootstrap tail over the caller-held sandbox with `status` as the
+/// ACTIVE profile's last read. Everything else — chain, windows, credentials,
+/// the spare's own Fresh status — is identical across calls, so `status` is the
+/// only variable between the two directions.
+fn bootstrap_app(_home: &crate::testutil::HomeSandbox, status: FetchStatus) -> App {
+    use super::{StartupSignal, drain_startup_signals};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+
+    let mk = |name: &str| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds_ra(&format!("rt-{name}"), &format!("at-{name}")));
+        save_profile(&p).expect("save profile");
+        p
+    };
+    let spent = mk(BOOT_SPENT);
+    let spare = mk(BOOT_SPARE);
+    // The live file is the ACTIVE account's captured mirror: the relink has no
+    // uncaptured login to strand, so a decided switch actually lands.
+    write_live_creds(spent.credentials.as_ref().expect("spent credentials"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(BOOT_SPENT.into()),
+            profiles: vec![BOOT_SPENT.into(), BOOT_SPARE.into()],
+            fallback_chain: vec![BOOT_SPENT.into(), BOOT_SPARE.into()],
+            ..AppState::default()
+        },
+        profiles: vec![spent, spare],
+    });
+
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut store = app.usage_store.lock().expect("usage_store mutex poisoned");
+        store.insert(
+            BOOT_SPENT.to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(100.0)),
+                ..UsageInfo::default()
+            },
+        );
+        store.insert(
+            BOOT_SPARE.to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(1.0)),
+                ..UsageInfo::default()
+            },
+        );
+    }
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut s = app
+            .usage_status
+            .lock()
+            .expect("usage_status mutex poisoned");
+        s.insert(BOOT_SPENT.to_string(), status);
+        s.insert(BOOT_SPARE.to_string(), FetchStatus::Fresh);
+    }
+
+    // `finish_bootstrap` starts the real scheduler thread. Raise the shutdown
+    // flag it already honours (checked at the loop top, ahead of its first sleep)
+    // so no tick ever runs — nothing fetches, nothing decides. The one-shot under
+    // test never reads the flag.
+    //
+    // What the flag does NOT stop is the worker's pre-loop kick-block seed, which
+    // resolves home ON the worker thread and is never joined, so it can outlive
+    // this sandbox and read against the real home — the escape docs/internals.md's
+    // 2026-06-06 convention exists to prevent. Named, not hidden: the seed only
+    // ever reads, so the escape is inert (it can neither write outside the sandbox
+    // nor reach anything these assertions observe) and stays inert only while that
+    // holds. Tracked in docs/todo.md.
+    app.shutting_down.store(true, Ordering::SeqCst);
+
+    app.startup_sender
+        .send(StartupSignal::BootstrapDone)
+        .expect("send bootstrap signal");
+    drain_startup_signals(&mut app);
+    app
+}
+
+fn toast_bodies(app: &App) -> Vec<String> {
+    app.toasts.iter().map(|t| t.body.clone()).collect()
+}
+
+/// Every `FetchStatus` the gate can see. The skip case iterates this filtered by
+/// [`skips_the_one_shot`] rather than restating its own list, so there is ONE
+/// place to grow when a variant is added. Growing it is comment-enforced, not
+/// compile-enforced — an array length can't be tied to a variant count without a
+/// derive crate — but the match below fails to compile first, which lands
+/// whoever adds a variant here.
+const ALL_STATUSES: [FetchStatus; 4] = [
+    FetchStatus::Fresh,
+    FetchStatus::Cached,
+    FetchStatus::RateLimited,
+    FetchStatus::Failed,
+];
+
+/// Exhaustiveness tripwire over `FetchStatus`. The gate keys on `== Fresh`, so
+/// every variant added later is non-Fresh and must be driven through the skip
+/// case. An unhandled variant fails THIS match to compile, one line from the
+/// [`ALL_STATUSES`] entry it also needs.
+fn skips_the_one_shot(status: FetchStatus) -> bool {
+    match status {
+        FetchStatus::Fresh => false,
+        FetchStatus::Cached | FetchStatus::RateLimited | FetchStatus::Failed => true,
+    }
+}
+
+#[test]
+fn bootstrap_one_shot_switches_off_a_fresh_exhausted_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = bootstrap_app(&_home, FetchStatus::Fresh);
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some(BOOT_SPARE),
+        "a Fresh read of a maxed active must land the startup switch",
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        vec!["auto-switched to 'spare'".to_string()],
+        "the landed switch announces its target",
+    );
+}
+
+#[test]
+fn bootstrap_one_shot_skips_a_non_fresh_active_read() {
+    let skipped: Vec<FetchStatus> = ALL_STATUSES
+        .into_iter()
+        .filter(|s| skips_the_one_shot(*s))
+        .collect();
+    // A derived list can go EMPTY and pass vacuously, so pin its size: everything
+    // but `Fresh` has to reach the loop below.
+    assert_eq!(
+        skipped.len(),
+        ALL_STATUSES.len() - 1,
+        "every non-Fresh variant must be driven through the gate, got {skipped:?}",
+    );
+
+    for status in skipped {
+        let _home = crate::testutil::HomeSandbox::new();
+        let app = bootstrap_app(&_home, status);
+
+        assert_eq!(
+            app.config().state.active_profile.as_deref(),
+            Some(BOOT_SPENT),
+            "{status:?} numbers are unverified — the active must stay put for the first tick",
+        );
+        assert_eq!(
+            toast_bodies(&app),
+            Vec::<String>::new(),
+            "{status:?} must decide nothing, so it announces nothing",
+        );
+    }
 }

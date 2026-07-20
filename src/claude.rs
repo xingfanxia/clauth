@@ -1,3 +1,4 @@
+use std::env;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -49,6 +50,27 @@ pub(crate) enum SessionTokenStatus {
     NotLongLived,
 }
 
+impl SessionTokenStatus {
+    /// Whether this profile actually runs its sessions on a long-lived token —
+    /// the "token mode" the overview type tag marks. A `NotLongLived` sidecar is
+    /// disengaged (sessions run on `credentials.json`), so it is NOT token mode.
+    pub(crate) fn is_long_lived_mode(&self) -> bool {
+        matches!(self, SessionTokenStatus::LongLived(_))
+    }
+
+    /// Whether the sidecar is in a state a switch would install to sessions'
+    /// harm: an expired long-lived token (every switch signs sessions out) or a
+    /// mis-fill the operator believes is armed. Drives the overview `⊘` marker.
+    /// A stamped-but-live or unstamped long-lived token is fine (`false`).
+    pub(crate) fn is_danger(&self, now_ms: i64) -> bool {
+        match self {
+            SessionTokenStatus::LongLived(Some(ms)) => now_ms >= *ms,
+            SessionTokenStatus::LongLived(None) => false,
+            SessionTokenStatus::NotLongLived => true,
+        }
+    }
+}
+
 /// Content-aware read of a profile's sidecar: `None` = no sidecar (or one too
 /// corrupt to parse a login out of — same disengaged outcome either way).
 pub(crate) fn session_token_status(name: &str) -> Option<SessionTokenStatus> {
@@ -91,6 +113,13 @@ pub(crate) fn validate_setup_token(raw: &str) -> Result<String> {
             "that doesn't look like a `claude setup-token` mint (expected an sk-ant-… value)"
         );
     }
+    if token.starts_with("sk-ant-api") {
+        anyhow::bail!(
+            "that looks like an API key (sk-ant-api…), not a `claude setup-token` mint. \
+             Installing it as the session bearer signs sessions out on first use; capture an \
+             API key with `clauth login <name> --base-url <url> --api-key <key>` instead"
+        );
+    }
     if token.chars().any(char::is_whitespace) {
         anyhow::bail!(
             "the pasted token contains whitespace — looks like a partial or padded paste"
@@ -100,6 +129,20 @@ pub(crate) fn validate_setup_token(raw: &str) -> Result<String> {
         anyhow::bail!("the pasted token is too short to be a real mint");
     }
     Ok(token.to_string())
+}
+
+/// Reject an api key that can't be a well-formed HTTP header value. CC forwards
+/// the `apiKeyHelper` stdout verbatim as `X-Api-Key` / `Authorization: Bearer`,
+/// so an interior control char (a CRLF from a bad paste or a hand-edited
+/// `config.toml`) would inject or malform a header. Callers trim first, so any
+/// remaining whitespace or control char is a real defect.
+pub(crate) fn validate_api_key(key: &str) -> Result<()> {
+    if key.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        anyhow::bail!(
+            "api key contains whitespace or control characters — a bad paste or an edited config"
+        );
+    }
+    Ok(())
 }
 
 /// Write `name`'s `session-token.json` from a validated mint, stamping the
@@ -495,14 +538,65 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
         });
     }
     let settings: serde_json::Value = read_json_file(&path)?;
+    // An api-key profile now surfaces its key via the top-level `apiKeyHelper`
+    // (the env-var path is gone except as a stale residual from an un-migrated
+    // settings.json). Derive the value from the helper's profile name, which
+    // pins the key in `config.toml` (the source of truth). A helper string
+    // whose last token fails `validate_profile_name`'s charset yields None —
+    // the function never panics on a hand-edited or corrupted helper.
+    let api_key = settings["env"]["ANTHROPIC_AUTH_TOKEN"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| {
+            settings
+                .get("apiKeyHelper")
+                .and_then(|v| v.as_str())
+                .and_then(profile_name_from_helper)
+                .and_then(|name| crate::profile::load_profile(&name).ok())
+                .and_then(|p| p.api_key)
+        });
     Ok(ClaudeEndpoint {
         base_url: settings["env"]["ANTHROPIC_BASE_URL"]
             .as_str()
             .map(str::to_owned),
-        api_key: settings["env"]["ANTHROPIC_AUTH_TOKEN"]
-            .as_str()
-            .map(str::to_owned),
+        api_key,
     })
+}
+
+/// Extract the profile name from a `apiKeyHelper` command string of the form
+/// `<exe> __api-key <profile>` (each token shell-quoted). The exe may itself
+/// be shell-quoted with internal spaces (`'/home/uwu clxdy/bin/clauth'`), so
+/// `split_whitespace` can yield more than three tokens — the parser locates
+/// the literal `__api-key` subcommand token and takes the NEXT token as the
+/// profile name, requiring it to be the LAST token (no trailing flags) and
+/// to pass `validate_profile_name`'s charset (`[A-Za-z0-9_.@+-]+`, no leading
+/// dot). A foreign helper that happens to contain `__api-key` followed by a
+/// profile-shaped token still parses — acceptable because clauth only writes
+/// this string itself, and the subcommand name is unusual enough not to
+/// collide in practice. A hand-edited or corrupted helper that fails any of
+/// the above yields `None` rather than risk a phantom profile lookup that
+/// returns the wrong account's key into [`capture_snapshot`].
+fn profile_name_from_helper(helper: &str) -> Option<String> {
+    let mut tokens = helper.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        if tok != API_KEY_HELPER_SUBCMD {
+            continue;
+        }
+        // The token immediately after `__api-key` is the profile name; a
+        // following token means the shape is `<exe> __api-key <profile>
+        // <extra>` (a future flag, a typo), which is not ours.
+        let name = tokens.next()?;
+        if tokens.next().is_some() {
+            return None;
+        }
+        let valid = !name.is_empty()
+            && !name.starts_with('.')
+            && name.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'@' | b'+' | b'-')
+            });
+        return valid.then(|| name.to_string());
+    }
+    None
 }
 
 /// The Setup-tab field that owns a clauth-managed env key, phrased for the
@@ -571,6 +665,99 @@ fn apply_profile_to_claude_settings_inner(
     atomic_write_600(&path, content).context("failed to write settings.json")
 }
 
+/// The hidden `clauth __api-key <profile>` subcommand name embedded in CC's
+/// `apiKeyHelper`. The helper string is rebuilt from `env::current_exe()` on
+/// every `build_claude_settings_json` run; a long-lived process (daemon/TUI)
+/// that rebuilds after an in-place self-update sees Linux's `<path> (deleted)`
+/// form, which `build_api_key_helper_command` strips back to the installed path.
+const API_KEY_HELPER_SUBCMD: &str = "__api-key";
+
+/// Build the `apiKeyHelper` command string CC runs per request to mint an auth
+/// value for an api-key profile. The hidden subcommand reads
+/// `Profile::api_key` from `config.toml` (0o600) and prints it to stdout.
+///
+/// CC runs the value through the system shell (`/bin/sh` on macOS/Linux,
+/// `cmd` on Windows — per the Claude Code settings docs), so each token is
+/// shell-escaped by [`shell_quote`]. The profile name is constrained by
+/// `actions::validate_profile_name` to `[A-Za-z0-9_.@+-]+` with no leading
+/// dot — entirely within the safe-char set, so it round-trips unquoted; the
+/// helper-quoting exists for the exe path, which may contain spaces
+/// (`/Applications/...`, `C:\Program Files\...`).
+fn build_api_key_helper_command(exe: &Path, profile_name: &str) -> String {
+    let exe_cow = exe.to_string_lossy();
+    // A long-lived process (daemon/TUI) that rebuilds settings after the
+    // in-place self-updater swapped the binary sees Linux `current_exe()`
+    // return `<path> (deleted)`; the replacement lives at the same `<path>`,
+    // so drop the marker to keep the helper pointing at the installed binary.
+    let exe_str = exe_cow.strip_suffix(" (deleted)").unwrap_or(&exe_cow);
+    format!(
+        "{} {} {}",
+        shell_quote(exe_str),
+        shell_quote(API_KEY_HELPER_SUBCMD),
+        shell_quote(profile_name),
+    )
+}
+
+/// Quote `s` for the shell CC runs `apiKeyHelper` under. A safe-char run
+/// (`[A-Za-z0-9_./:@=,+%-]`, matching everything `validate_profile_name`
+/// allows plus a typical Unix exe path) is left unquoted; everything else is
+/// wrapped — POSIX single-quoting on Unix (with `'\''` for an embedded
+/// `'`), best-effort double-quoting on Windows for `cmd /c`. `cmd`'s quoting
+/// is genuinely ambiguous (it's whitespace-split with `"` as a toggle, not a
+/// real escape grammar); the safe-char fast path sidesteps it for the common
+/// case, and the double-quote branch covers a spaces-in-path exe well enough
+/// for `cmd /c "EXE SUB ARG"` to split three tokens.
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let safe = s.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'_' | b'.' | b'/' | b':' | b'@' | b'=' | b',' | b'+' | b'-' | b'%'
+            )
+    });
+    if safe {
+        return s.to_string();
+    }
+    #[cfg(unix)]
+    {
+        // POSIX single-quote; `'\''` closes, escapes, and reopens the quote.
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('\'');
+        for c in s.chars() {
+            if c == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(c);
+            }
+        }
+        out.push('\'');
+        out
+    }
+    #[cfg(windows)]
+    {
+        // Best-effort cmd quoting — wrap in `"..."`, escaping embedded `"` and
+        // `\`. Good enough for `cmd /c "<exe-with-spaces> <sub> <profile>"`.
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                _ => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        s.to_string()
+    }
+}
+
 /// Build the merged settings.json content. `prev_env_keys` are stripped before
 /// the new profile's env is applied; pass `&[]` on start to leave existing keys.
 /// Also writes the profile's model config — the top-level `model` setting and
@@ -613,14 +800,11 @@ pub(crate) fn build_claude_settings_json(
             env.remove("ANTHROPIC_BASE_URL");
         }
     }
-    match profile.api_key.as_deref() {
-        Some(key) => {
-            env.insert("ANTHROPIC_AUTH_TOKEN".into(), key.into());
-        }
-        None => {
-            env.remove("ANTHROPIC_AUTH_TOKEN");
-        }
-    }
+    // Always clear `env.ANTHROPIC_AUTH_TOKEN`. An api-key profile now mints
+    // the key per request via the top-level `apiKeyHelper` (written below, after
+    // the env borrow ends), and a non-api-key profile must not inherit the
+    // previous profile's token.
+    env.remove("ANTHROPIC_AUTH_TOKEN");
 
     // Model-tier and subagent overrides — clauth-owned env keys, always set or
     // cleared deterministically so a switch never inherits the prior profile's.
@@ -658,6 +842,34 @@ pub(crate) fn build_claude_settings_json(
         None => {
             obj.remove("model");
         }
+    }
+
+    // An api-key profile mints its key via CC's top-level `apiKeyHelper`
+    // instead of `env.ANTHROPIC_AUTH_TOKEN` (cleared above). The key then
+    // leaves the settings.json `env` block AND the spawned CC process's own
+    // env: CC runs the helper per request through the system shell and sends
+    // its stdout as both `X-Api-Key` and `Authorization: Bearer` (see
+    // `docs/internals.md`). The helper reads the key from `config.toml`
+    // (0o600, the source of truth) via a hidden subcommand, so the raw key
+    // never reaches the runtime settings.json. A profile with no api_key (a
+    // whitespace-only or control-char-poisoned key is one `api_key_for_profile`
+    // and `validate_api_key` also refuse to mint) removes any stale helper so a
+    // switch can't inherit it, and never wires a helper that would only fail at
+    // mint — symmetric with the fail-closed behavior at the other end.
+    let has_api_key = profile
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .is_some_and(|k| validate_api_key(k).is_ok());
+    if has_api_key {
+        let exe = env::current_exe().context("resolving current_exe for apiKeyHelper")?;
+        obj.insert(
+            "apiKeyHelper".into(),
+            build_api_key_helper_command(&exe, &profile.name).into(),
+        );
+    } else {
+        obj.remove("apiKeyHelper");
     }
 
     serde_json::to_string_pretty(&settings).context("failed to serialize settings.json")

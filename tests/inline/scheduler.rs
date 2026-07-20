@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::lockorder::RankedMutex;
@@ -447,6 +447,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after,
     };
 
@@ -599,6 +600,7 @@ fn cached_fallback_does_not_clobber_store() {
             rotated: None,
             from_fetch: false,
             refresh_failed: false,
+            plan_override: None,
             retry_after: None,
         },
         &store,
@@ -627,6 +629,7 @@ fn cached_fallback_does_not_clobber_store() {
             rotated: None,
             from_fetch: false,
             refresh_failed: false,
+            plan_override: None,
             retry_after: None,
         },
         &store,
@@ -639,6 +642,126 @@ fn cached_fallback_does_not_clobber_store() {
     assert!(
         store.lock().unwrap().contains_key("b"),
         "a cache fallback still cold-fills an absent entry"
+    );
+}
+
+/// The scheduler half of the /usage-429 decouple: a `/profile` plan fetched
+/// despite the 429 rides the cached bail and advances the STORED tier (Pro →
+/// Free/canceled) while the cached 5h window is preserved, and the overlay
+/// reaches disk so CLI/MCP readers see it too. The 429 status still surfaces.
+#[test]
+fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome};
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // Prior state: a live 5h window under a (now stale) Pro tier, in both the
+    // store and the disk cache the bail loads from.
+    let prior = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 5.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Pro,
+            subscription_status: None,
+        }),
+        ..Default::default()
+    };
+    store.lock().unwrap().insert("a".to_string(), prior.clone());
+    super::write_profile_cache("a", super::USAGE_CACHE_FILE, &prior);
+
+    let canceled = PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+    };
+    apply_outcome(
+        FetchOutcome::cached("a", FetchStatus::RateLimited, None, None).with_plan(Some(canceled)),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+    );
+
+    let got = store.lock().unwrap().get("a").cloned().unwrap();
+    let plan = got.plan.as_ref().unwrap();
+    assert_eq!(plan.tier, PlanTier::Free, "the stored tier flips to Free");
+    assert!(
+        plan.is_canceled(),
+        "the canceled state persists to the store"
+    );
+    assert!(
+        got.five_hour.is_some(),
+        "the cached 5h window is preserved — only the tier advanced"
+    );
+    assert_eq!(
+        status.lock().unwrap().get("a").copied(),
+        Some(FetchStatus::RateLimited),
+        "the account stays visibly rate-limited"
+    );
+
+    let disk = super::load_profile_cache::<UsageInfo>("a", super::USAGE_CACHE_FILE).unwrap();
+    assert!(
+        disk.plan.unwrap().is_canceled(),
+        "the flip persists to usage_cache.json for CLI/MCP readers"
+    );
+}
+
+/// The cold-canceled class: a profile added while ALREADY canceled 429s `/usage`
+/// from its first poll and has no `usage_cache.json`, so the cached bail carries
+/// a plan but `info=None`. The plan must still be recorded — on a windowless,
+/// plan-only entry — in BOTH the store and disk, or the cancellation is dropped
+/// every tick and the dead account stays selectable by the fallback walk.
+#[test]
+fn cold_bail_records_a_plan_only_canceled_entry() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome};
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // No prior store entry and no usage_cache.json: `cached()` yields info=None.
+    let canceled = PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+    };
+    apply_outcome(
+        FetchOutcome::cached("cold", FetchStatus::RateLimited, None, None)
+            .with_plan(Some(canceled)),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+    );
+
+    let got = store.lock().unwrap().get("cold").cloned();
+    assert!(
+        got.as_ref()
+            .and_then(|i| i.plan.as_ref())
+            .is_some_and(|p| p.is_canceled()),
+        "the store records the canceled plan even with no prior snapshot"
+    );
+    assert!(
+        got.unwrap().five_hour.is_none(),
+        "a plan-only entry — no windows to show"
+    );
+
+    let disk = super::load_profile_cache::<UsageInfo>("cold", super::USAGE_CACHE_FILE);
+    assert!(
+        disk.and_then(|i| i.plan).is_some_and(|p| p.is_canceled()),
+        "and persists to usage_cache.json so the flip survives and readers see it"
     );
 }
 
@@ -764,35 +887,97 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
     );
 }
 
-/// The auto-start kick only fires on a lapsed window when no 429 streak is in
-/// flight. Mid-streak the kick is suppressed so it can't re-hit (and prolong) a
-/// throttled endpoint on every due slot; a live `/usage` body clears the streak
-/// and the next lapsed tick opens cleanly.
+/// The auto-start kick's firing rules: never mid-`/usage`-429-streak; a lapsed
+/// window opens on the kick's backoff cadence; a live window re-tests a standing
+/// block on the poll cadence (recovery may be imminent). Mid-streak the kick is
+/// suppressed so it can't re-hit (and prolong) a throttled endpoint every slot; a
+/// live `/usage` body clears the streak and the next due tick kicks cleanly.
 #[test]
 fn kick_suppressed_during_rate_limit_streak() {
     use super::should_open_window;
 
+    // args: (streak, window_lapsed, kick_due, has_block)
     assert!(
-        should_open_window(0, true, true),
+        should_open_window(0, true, true, false),
         "lapsed + no streak → open"
     );
     assert!(
-        !should_open_window(1, true, true),
+        !should_open_window(1, true, true, false),
         "lapsed but 429-streaking → suppress the kick"
     );
     assert!(
-        !should_open_window(5, true, true),
+        !should_open_window(5, true, true, false),
         "deep streak → still suppressed"
     );
     assert!(
-        !should_open_window(0, false, true),
-        "a live window never kicks, streak or not"
+        !should_open_window(0, false, true, false),
+        "a live window with no block never kicks"
     );
     assert!(
-        !should_open_window(0, true, false),
-        "a kick-429 block whose retry isn't due suppresses the kick even with \
-         a clean /usage streak — the messages limiter can reject while /usage \
-         stays 200"
+        should_open_window(0, false, true, true),
+        "a live window WITH a standing block re-tests it — the window can be a \
+         Claude-web open while Claude Code stays 429'd, so only a landed kick \
+         proves the block is gone"
+    );
+    assert!(
+        should_open_window(0, false, false, true),
+        "a live-window block re-tests on the POLL cadence, not the deep kick \
+         backoff — the window reopened (maybe via web), so recovery may be \
+         imminent and we must not wait out the ~15min ladder"
+    );
+    assert!(
+        !should_open_window(1, false, false, true),
+        "but a /usage 429-streak still suppresses even the live-window re-test"
+    );
+    assert!(
+        !should_open_window(0, true, false, true),
+        "a LAPSED-window kick-429 block whose retry isn't due still waits its \
+         backoff — no reopened-window signal, so don't re-hit a dead endpoint"
+    );
+}
+
+// The `run_fetch` wiring seam: a LIVE 5h window with a standing block must
+// re-test (the fix), a healthy live window stays quiet. Guards the
+// `block.is_some()` → `has_block` plumbing `should_open_window`'s own test can't
+// reach, since `run_fetch` is HTTP-bound.
+#[test]
+fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
+    use super::{KickBlock, KickBlocks, PollStreaks, auto_start_should_kick};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso};
+
+    let now = 3_000_000;
+    let streaks: PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let live_store = || -> UsageStore {
+        Arc::new(RankedMutex::new(HashMap::from([(
+            "a".to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: 5.0,
+                    resets_at: Some(epoch_secs_to_iso(now + 3600)),
+                }),
+                ..Default::default()
+            },
+        )])))
+    };
+
+    let blocked: KickBlocks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        KickBlock {
+            streak: 3,
+            rejected: true,
+            until: Some(now + 900),
+            next_retry: now + 600,
+        },
+    )])));
+    assert!(
+        auto_start_should_kick(&streaks, &live_store(), &blocked, "a", now),
+        "a live window with a standing block re-tests it — the fix"
+    );
+
+    let clean: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    assert!(
+        !auto_start_should_kick(&streaks, &live_store(), &clean, "a", now),
+        "a healthy live window with no block must not kick"
     );
 }
 
@@ -1082,6 +1267,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &config_handle(true),
         &store,
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -1105,6 +1291,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &config_handle(false),
         &store,
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -1114,6 +1301,108 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
     assert!(
         pending.lock().unwrap().is_empty(),
         "a merely-stale healthy active must still not drive a switch"
+    );
+}
+
+/// The scan fills `ChainSnapshot::fresh`, which `snapshot_chain` cannot: config
+/// carries no freshness and `Profile.fetch_status` is written by the UI thread
+/// only, so the daemon reads it stale. Without this fill the store twin's
+/// fresh-preference pass matches nothing and silently degrades to walk order.
+#[test]
+fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
+    use super::{FetchStatus, PendingSwitch, StatusStore, scan_auto_switch};
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let live = |utilization: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    // Spent active; both siblings read as headroom, but only c's read is live.
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), live(100.0)),
+        ("b".to_string(), live(10.0)),
+        ("c".to_string(), live(20.0)),
+    ])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), FetchStatus::Fresh),
+        ("b".to_string(), FetchStatus::Cached),
+        ("c".to_string(), FetchStatus::Fresh),
+    ])));
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into(), "c".into()],
+            fallback_chain: vec!["a".into(), "b".into(), "c".into()],
+            ..AppState::default()
+        },
+        profiles: vec![
+            Profile::new("a".to_string(), None, None),
+            Profile::new("b".to_string(), None, None),
+            Profile::new("c".to_string(), None, None),
+        ],
+    }));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(VecDeque::new()));
+    scan_auto_switch(
+        &config,
+        &store,
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &pending,
+        &Arc::new(RankedMutex::new(false)),
+    );
+    let queued = pending.lock().unwrap();
+    assert!(
+        queued.iter().any(|e| e.target == "c"),
+        "the scan must fill `fresh` so the walk prefers c's trusted read; queued: {:?}",
+        *queued
+    );
+    assert!(
+        !queued.iter().any(|e| e.target == "b"),
+        "b is reached first but its read is Cached — walk order must not win"
+    );
+}
+
+/// `decision_fresh_any` unions BOTH status stores. Before the fix the scheduler
+/// twin read only the OAuth `StatusStore`, so a fresh third-party member looked
+/// stale to its fresh-preference/recovery gate while the UI twin (reading
+/// `Profile.fetch_status`, filled from both in `apply_usage`) saw it — the twins
+/// disagreed on a mixed OAuth+third-party chain (2026-07-17).
+#[test]
+fn decision_fresh_any_reads_both_the_oauth_and_third_party_stores() {
+    use super::{FetchStatus, StatusStore, ThirdPartyStatusStore, decision_fresh_any};
+
+    let oauth: StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), FetchStatus::Fresh),
+        ("stale".to_string(), FetchStatus::Cached),
+    ])));
+    let tp: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("b".to_string(), FetchStatus::Fresh),
+        ("tp-stale".to_string(), FetchStatus::Cached),
+    ])));
+
+    assert!(decision_fresh_any(&oauth, &tp, "a"), "OAuth-fresh counts");
+    assert!(
+        decision_fresh_any(&oauth, &tp, "b"),
+        "third-party-fresh must count too — the whole point of the fix"
+    );
+    assert!(
+        !decision_fresh_any(&oauth, &tp, "stale"),
+        "OAuth Cached is not fresh"
+    );
+    assert!(
+        !decision_fresh_any(&oauth, &tp, "tp-stale"),
+        "third-party Cached is not fresh"
+    );
+    assert!(
+        !decision_fresh_any(&oauth, &tp, "unknown"),
+        "absent in both stores is not fresh"
     );
 }
 
@@ -1208,6 +1497,7 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
             &config_handle(),
             &store,
             &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
             &streaks,
             &Arc::new(RankedMutex::new(HashMap::new())),
             &activity,
@@ -1325,6 +1615,7 @@ fn retry_after_defers_next_fetch_slot() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after,
     };
     let stamp = |name: &str| {
@@ -1475,6 +1766,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
 
     let rate_limited = |from_fetch: bool, status: FetchStatus| FetchOutcome {
         refresh_failed: false,
+        plan_override: None,
         name: "a".to_string(),
         info: None,
         status,
@@ -1572,6 +1864,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after: Some(Duration::from_secs(5)),
     };
     let stamp = || {
@@ -1627,6 +1920,7 @@ fn transient_errors_preserve_rate_limit_streak() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after: None,
     };
     let apply = |kind: FetchStatus| {
@@ -2678,6 +2972,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after: None,
     };
 
@@ -2777,6 +3072,7 @@ fn cached_outcome(name: &str) -> super::FetchOutcome {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after: None,
     }
 }
@@ -3635,6 +3931,7 @@ fn scan_recovery_is_a_no_op_while_a_switch_is_pending() {
         &recovery_config(None, &["b"]),
         &store,
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
     );
@@ -3665,6 +3962,7 @@ fn scan_recovery_is_a_no_op_with_an_active_profile_set() {
         &recovery_config(Some("a"), &["b"]),
         &recoverable_store(),
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
     );
@@ -3697,6 +3995,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
             &recovery_config(None, &["b"]),
             &store,
             &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
             &kick_blocks,
             &pending,
         );
@@ -3713,6 +4012,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
         &recovery_config(None, &["b"]),
         &store,
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
     );
@@ -3750,6 +4050,7 @@ fn scan_recovery_never_relinks_to_a_switch_grade_kick_rejected_member() {
         &recovery_config(None, &["b"]),
         &store,
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
     );
@@ -3777,6 +4078,7 @@ fn scan_recovery_queues_a_recovered_chain_member() {
         &recovery_config(None, &["b"]),
         &recoverable_store(),
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
     );

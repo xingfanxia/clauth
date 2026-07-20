@@ -177,11 +177,11 @@ fn set_weekly_threshold_persists_validates_and_noops() {
 fn set_wrap_off_toggles_and_persists() {
     let _h = HomeSandbox::new();
     let mut c = config(&["a"], &["a"]);
-    assert!(!c.state.wrap_off);
+    assert!(!c.state.switch_off_when_spent);
     set_wrap_off(&mut c, true).unwrap();
-    assert!(c.state.wrap_off);
+    assert!(c.state.switch_off_when_spent);
     set_wrap_off(&mut c, false).unwrap();
-    assert!(!c.state.wrap_off);
+    assert!(!c.state.switch_off_when_spent);
 }
 
 #[test]

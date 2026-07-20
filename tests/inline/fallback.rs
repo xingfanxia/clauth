@@ -14,7 +14,10 @@ use std::sync::Arc;
 
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
-use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+use crate::usage::{
+    PlanInfo, PlanTier, SpendInfo, UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso,
+    now_epoch_secs,
+};
 
 /// ISO reset an hour ahead — a live 5h window.
 fn live_reset() -> String {
@@ -40,6 +43,20 @@ fn usage_info(five_hour: Option<UsageWindow>) -> UsageInfo {
     }
 }
 
+/// A canceled account: its `/profile` dropped to Free with a `canceled` status,
+/// yet its cached 5h window still reads as idle headroom (5%) — the exact shape
+/// that made a dead account look like a prime rotation target.
+fn canceled_usage() -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(5.0, Some(live_reset()))),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: Some("canceled".to_string()),
+        }),
+        ..UsageInfo::default()
+    }
+}
+
 fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInfo>) -> Profile {
     use std::collections::BTreeMap;
     Profile {
@@ -55,6 +72,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
         usage,
@@ -80,6 +98,45 @@ fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64
 /// from an incidental threshold value.
 fn mark_last_resort(mut p: Profile) -> Profile {
     p.last_resort = true;
+    p
+}
+
+/// Marks a profile's last usage read as live — the UI twin's freshness input.
+/// The snapshot twin carries the same judgment on `ChainSnapshot::fresh`.
+fn mark_fresh(mut p: Profile) -> Profile {
+    p.fetch_status = Some(FetchStatus::Fresh);
+    p
+}
+
+fn spend_block(enabled: bool, used: f64, limit: Option<f64>) -> SpendInfo {
+    SpendInfo {
+        enabled,
+        used: Some(used),
+        limit,
+        percent: None,
+        currency: None,
+    }
+}
+
+/// A spent 5h window plus a pay-as-you-go block — the shape a member must have
+/// before the spend pass can pick it (every earlier pass needs it exhausted).
+fn usage_spent_with_spend(spend: SpendInfo) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(100.0, Some(live_reset()))),
+        spend: Some(spend),
+        ..UsageInfo::default()
+    }
+}
+
+/// Member whose windows are spent but whose account is billing, with `ceiling`
+/// dollars allowed unattended.
+fn spend_member(name: &str, ceiling: f64, used: f64, limit: Option<f64>) -> Profile {
+    let mut p = profile_with_usage(
+        name,
+        Some(95.0),
+        Some(usage_spent_with_spend(spend_block(true, used, limit))),
+    );
+    p.max_auto_spend = Some(ceiling);
     p
 }
 
@@ -175,7 +232,7 @@ fn no_sink_available_returns_none() {
 
 // ── issue #8 follow-up: threshold no longer implies last_resort ─────────────
 
-// A threshold of 100 alone must NOT act as a sink anymore. With wrap_off on
+// A threshold of 100 alone must NOT act as a sink anymore. With switch_off_when_spent on
 // and NEITHER member marked last_resort, switch-off-all still fires even
 // though the active sits at an unmarked 100% threshold. The OLD
 // `threshold >= 100.0` sentinel treated the active as a sink here and
@@ -189,7 +246,7 @@ fn unmarked_hundred_threshold_active_no_longer_acts_as_sink() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
@@ -206,7 +263,7 @@ fn wrap_off_switches_off_when_unmarked_hundred_threshold_member_present() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
@@ -324,7 +381,7 @@ fn auto_switch_unmarked_hundred_threshold_member_is_not_a_sink() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     let snap = snapshot_chain(&config).expect("snapshot");
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
     assert_eq!(
@@ -372,7 +429,7 @@ fn auto_switch_missing_util_is_not_exhausted() {
 // When no member is marked last_resort and the whole chain is exhausted,
 // wrap-off turns off all accounts instead of staying put.
 
-// next_target: wrap_off on, no last_resort member, all exhausted → Off.
+// next_target: switch_off_when_spent on, no last_resort member, all exhausted → Off.
 #[test]
 fn wrap_off_switches_off_when_chain_spent() {
     let mut config = config_with_chain(
@@ -382,11 +439,11 @@ fn wrap_off_switches_off_when_chain_spent() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
-// next_target: wrap_off on but a last_resort member exists (at an 80%
+// next_target: switch_off_when_spent on but a last_resort member exists (at an 80%
 // threshold, not 100) → migrate there, not Off.
 #[test]
 fn wrap_off_prefers_sink_over_off() {
@@ -397,14 +454,14 @@ fn wrap_off_prefers_sink_over_off() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(
         next_target(&config, None),
         Some(SwitchAction::To("b".to_string()))
     );
 }
 
-// next_target: wrap_off on but active still has headroom → no Off.
+// next_target: switch_off_when_spent on but active still has headroom → no Off.
 #[test]
 fn wrap_off_skips_off_when_active_has_headroom() {
     let mut config = config_with_chain(
@@ -414,12 +471,12 @@ fn wrap_off_skips_off_when_active_has_headroom() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     // a at 50% < 95% → not exhausted → stay
     assert_eq!(next_target(&config, None), None);
 }
 
-// next_target: same spent chain, wrap_off off → legacy None.
+// next_target: same spent chain, switch_off_when_spent off → legacy None.
 #[test]
 fn wrap_off_disabled_stays_put() {
     let config = config_with_chain(
@@ -560,9 +617,9 @@ fn auto_switch_wrap_off_switches_off_when_chain_spent() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     let snap = snapshot_chain(&config).expect("snapshot");
-    assert!(snap.wrap_off);
+    assert!(snap.switch_off_when_spent);
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]); // both over 95% threshold, no sink → Off
     assert_eq!(
         next_auto_switch_target(&snap, &store),
@@ -585,6 +642,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            max_spend: 0.0,
         },
         ChainMember {
             name: "b".into(),
@@ -593,6 +651,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            max_spend: 0.0,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
@@ -618,6 +677,7 @@ fn find_recovered_skips_exhausted_members() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            max_spend: 0.0,
         },
         ChainMember {
             name: "b".into(),
@@ -626,6 +686,7 @@ fn find_recovered_skips_exhausted_members() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            max_spend: 0.0,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
@@ -642,6 +703,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            max_spend: 0.0,
         },
         ChainMember {
             name: "b".into(),
@@ -650,6 +712,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            max_spend: 0.0,
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
@@ -666,6 +729,7 @@ fn find_recovered_uses_threshold_per_member() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            max_spend: 0.0,
         }, // 95% util ≥ 90 → exhausted
         ChainMember {
             name: "b".into(),
@@ -674,6 +738,7 @@ fn find_recovered_uses_threshold_per_member() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            max_spend: 0.0,
         }, // 94% util < 95 → recovered
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
@@ -695,6 +760,7 @@ fn find_recovered_recovers_when_window_expired() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        max_spend: 0.0,
     }];
     let store = store_with_infos(vec![(
         "a",
@@ -717,6 +783,7 @@ fn find_recovered_recovers_when_windowless() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        max_spend: 0.0,
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
@@ -736,6 +803,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        max_spend: 0.0,
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
@@ -783,7 +851,7 @@ fn next_target_accepts_member_with_expired_window() {
     );
 }
 
-// next_auto_switch_target: wrap_off off, spent chain → legacy None.
+// next_auto_switch_target: switch_off_when_spent off, spent chain → legacy None.
 #[test]
 fn auto_switch_wrap_off_disabled_stays_put() {
     let config = config_with_chain(
@@ -872,9 +940,113 @@ fn next_target_broken_sink_wrap_off_switches_off() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     config.set_auth_broken("b", true);
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
+}
+
+// ── canceled subscription: excluded from selection, own blocked-reason chip ───
+//
+// A canceled account keeps a stale low-utilization 5h window (filip2 cached at 5h
+// 5%), so by headroom it looks like a PRIME rotation target — yet every session
+// started there 403s. Treated like `broken`: skipped as a candidate on both
+// walks, and a canceled ACTIVE is itself a switch trigger.
+
+// next_target: a canceled member with idle-looking headroom is skipped; the
+// next viable member wins.
+#[test]
+fn next_target_skips_canceled_member_picks_next() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
+            profile_with_usage("b", Some(95.0), Some(canceled_usage())), // headroom but canceled
+            profile_with_util("c", Some(95.0), Some(20.0)),  // headroom, viable
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".into())),
+    );
+}
+
+// next_target: the only alternative is canceled → nothing viable → None.
+#[test]
+fn next_target_returns_none_when_only_alternative_is_canceled() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_usage("b", Some(95.0), Some(canceled_usage())),
+        ],
+        "a",
+    );
+    assert_eq!(next_target(&config, None), None);
+}
+
+// next_auto_switch_target: the scheduler-side walk skips a canceled member too,
+// reading the canceled state straight off the usage snapshot.
+#[test]
+fn auto_switch_skips_canceled_member_picks_next() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", canceled_usage()),
+        ("c", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".into())),
+    );
+}
+
+// A canceled ACTIVE whose cached window reads as idle headroom still triggers
+// the walk — every request 403s, so staying is fatal (mirrors AUTH-4).
+#[test]
+fn auto_switch_canceled_active_walks_away_despite_headroom() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", canceled_usage()), // active, canceled, 5% (idle headroom)
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".into())),
+    );
+}
+
+// The render-only chip mirrors the walk: a canceled profile reports the
+// dead-first `Canceled` reason, above every quota/limiter block.
+#[test]
+fn blocked_reason_reports_canceled_first() {
+    let config = config_with_chain(
+        vec![profile_with_usage("a", Some(95.0), Some(canceled_usage()))],
+        "a",
+    );
+    let profile = config.find("a").expect("profile");
+    assert_eq!(
+        blocked_reason(&config, profile, None),
+        Some(BlockedReason::Canceled),
+    );
+
+    // A genuine free account (no canceled status) with headroom is NOT blocked.
+    let config = config_with_chain(vec![profile_with_util("a", Some(95.0), Some(20.0))], "a");
+    let profile = config.find("a").expect("profile");
+    assert_eq!(blocked_reason(&config, profile, None), None);
 }
 
 // ── AUTH-4: an auth-broken ACTIVE is itself a switch trigger ──────────────────
@@ -967,8 +1139,836 @@ fn auto_switch_never_targets_a_kick_rejected_member() {
     );
 
     // Same chain with the rejection also covering the last resort: nothing
-    // viable remains and the active stays put (no Off — wrap_off is unset).
+    // viable remains and the active stays put (no Off — switch_off_when_spent is unset).
     snap.kick_rejected = vec!["b".to_string(), "c".to_string()];
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+// Fresh-PREFERENCE walk, asserted on both twins in each direction. The UI twin
+// reads `Profile.fetch_status`, the snapshot twin reads `ChainSnapshot::fresh`
+// (filled by the scheduler's scan from the same `StatusStore` the ACTIVE gate
+// consults), so a drift between them fails here.
+
+// Two members have headroom and the one the walk reaches FIRST is stale: the
+// fresh member wins anyway, since pass 1a outranks walk order.
+#[test]
+fn next_target_prefers_fresh_member_over_earlier_stale_one() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+            mark_fresh(profile_with_util("c", Some(95.0), Some(20.0))),
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string())),
+        "b is reached first but its read is stale — the trusted c must win"
+    );
+}
+
+#[test]
+fn auto_switch_prefers_fresh_member_over_earlier_stale_one() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = vec!["c".to_string()];
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 20.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "b is reached first but is absent from `fresh` — the trusted c must win"
+    );
+}
+
+// The not-a-gate guard: with the only headroom candidate stale, pass 1b still
+// accepts it. Freshness may reorder the walk, never veto it — an exhausted
+// active must keep its escape (2026-06-28 target asymmetry).
+#[test]
+fn next_target_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".to_string())),
+        "freshness is a preference, not a gate: the stale escape must stay open"
+    );
+}
+
+#[test]
+fn auto_switch_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert!(
+        snap.fresh.is_empty(),
+        "snapshot_chain cannot know freshness"
+    );
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "freshness is a preference, not a gate: the stale escape must stay open"
+    );
+}
+
+// ── spend budget: the money math (`spend_room`) ────────────────────────────
+// Pure, and shared by both twins, so the dollar rules are pinned once here and
+// the walk tests below only cover ordering.
+
+// The load-bearing one: `is_visible()` is TRUE for an account carrying a stale
+// limit with billing switched OFF (kerry, observed live 2026-07-17). Arming on
+// it would hop the chain into an account that refuses the request, with money
+// attached. Both halves are asserted so the contrast can't rot: if a later
+// change makes `is_visible` mean "will bill", this test says so out loud.
+#[test]
+fn spend_room_needs_billing_actually_on_not_merely_visible() {
+    // kerry's live shape, verbatim: billing off, a $50 limit still on file,
+    // $31.07 spent under it. The ceiling is deliberately $50 so that arming on
+    // `is_visible` would find real room ($45 - $31.07) and hop — a fixture
+    // whose spend already exceeded the room would pass for the wrong reason.
+    let billing_off = spend_block(false, 31.07, Some(50.0));
+    assert!(
+        billing_off.is_visible(),
+        "precondition: this shape renders a bar — that is exactly the trap"
+    );
+    assert_eq!(spend_room(&billing_off, 50.0), None);
+
+    // Flip billing on and the very same numbers do arm, proving the refusal
+    // above came from `enabled` alone and not from the dollar math.
+    let billing_on = spend_block(true, 31.07, Some(50.0));
+    assert!(spend_room(&billing_on, 50.0).is_some());
+}
+
+// A $0 ceiling can never be entered for spend reasons, whatever the account
+// allows — the "both defaults off = today's behavior" guarantee.
+#[test]
+fn spend_room_zero_or_negative_ceiling_never_arms() {
+    let billing_on = spend_block(true, 0.0, Some(500.0));
+    assert_eq!(spend_room(&billing_on, 0.0), None);
+    assert_eq!(spend_room(&billing_on, -5.0), None);
+}
+
+// A non-finite ceiling is refused rather than treated as "no limit". Both are
+// valid TOML floats: `inf` with no account cap yields infinite room (unlimited
+// unattended spending), and NaN slips every `<= 0.0` test while `f64::min`
+// silently drops it, arming at the account's full limit.
+#[test]
+fn spend_room_non_finite_ceiling_never_arms() {
+    let uncapped = spend_block(true, 0.0, None);
+    assert_eq!(spend_room(&uncapped, f64::INFINITY), None);
+    assert_eq!(spend_room(&uncapped, f64::NAN), None);
+
+    let capped = spend_block(true, 0.0, Some(500.0));
+    assert_eq!(spend_room(&capped, f64::INFINITY), None);
+    assert_eq!(
+        spend_room(&capped, f64::NAN),
+        None,
+        "f64::min(NAN, cap) is the cap — a NaN ceiling must never inherit it"
+    );
+}
+
+// Whichever cap binds first wins: the account's own limit can be lower than the
+// member's ceiling, and then it — not the ceiling — sets the room.
+#[test]
+fn spend_room_binds_on_the_lower_of_account_cap_and_ceiling() {
+    // Account cap $10 under a $100 ceiling → 90% of $10, less $4 spent.
+    assert_eq!(
+        spend_room(&spend_block(true, 4.0, Some(10.0)), 100.0),
+        Some(5.0)
+    );
+    // Ceiling $10 under a $100 account cap → same room, other side binding.
+    assert_eq!(
+        spend_room(&spend_block(true, 4.0, Some(100.0)), 10.0),
+        Some(5.0)
+    );
+    // Billing on with no declared account cap → the ceiling alone bounds it.
+    assert_eq!(spend_room(&spend_block(true, 4.0, None), 10.0), Some(5.0));
+}
+
+// The 10% margin is a hard stop, not a hint: at or past it the member is done.
+// The exact leftover a cent under the line is float noise, so only its sign is
+// asserted; the line itself lands exactly (`0.9 * 10.0 == 9.0` in f64), so the
+// at-the-margin and past-it cases pin an exact `None`.
+#[test]
+fn spend_room_stops_at_the_ninety_percent_margin() {
+    assert!(spend_room(&spend_block(true, 8.99, Some(10.0)), 10.0).is_some());
+    assert_eq!(spend_room(&spend_block(true, 9.0, Some(10.0)), 10.0), None);
+    assert_eq!(spend_room(&spend_block(true, 50.0, Some(10.0)), 10.0), None);
+}
+
+// Unknown spend must refuse, not read as $0 spent. `RawMoney::to_dollars`
+// returns `None` whenever `amount_minor` is absent or renamed, and `used` is the
+// only input that bounds spending — so a wire rename defaulting it to 0 would
+// hand back the full cap on an account that may already be maxed.
+#[test]
+fn spend_room_refuses_when_used_is_unknown() {
+    let unknown = SpendInfo {
+        enabled: true,
+        used: None,
+        limit: Some(50.0),
+        percent: None,
+        currency: None,
+    };
+    assert_eq!(spend_room(&unknown, 20.0), None);
+}
+
+// Two members with budget must not ping-pong. Once the chain is paying on one,
+// every free-quota member has already been passed over, so hopping to the other
+// paying member buys nothing and relinks live credentials every tick. Same loop
+// guard `last_resort` carries, for the same reason.
+#[test]
+fn next_target_does_not_hop_between_two_spend_armed_members() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+            spend_member("c", 20.0, 0.0, Some(50.0)),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "b is paying and still within budget: hopping to c gains nothing"
+    );
+
+    // A member with FREE quota still wins, though — the guard must not strand
+    // the chain on a paying account when someone can serve for nothing.
+    config.profiles[2] = profile_with_util("c", Some(95.0), Some(10.0));
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string())),
+        "free quota always beats staying on a paying active"
+    );
+}
+
+#[test]
+fn auto_switch_does_not_hop_between_two_spend_armed_members() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+            spend_member("c", 20.0, 0.0, Some(50.0)),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "the scheduler must hold the same loop guard as the UI twin"
+    );
+}
+
+// ── spend budget: the ceiling is a CAP, not just an entry gate ──────────────
+
+// The walk skips the ACTIVE member in every pass, so nothing re-checks a
+// spend-armed member once the chain has landed on it. Without a budget-aware
+// halt it settles there and bills to the ACCOUNT's cap — `max_auto_spend` would
+// silently mean "may start paying below this" rather than the ceiling it is
+// named for. Asserted at the steady state (the armed member IS active), which
+// is the tick the entry-side tests never reach.
+#[test]
+fn next_target_over_budget_active_switches_off_by_default() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            // $4.60 spent against a $5 ceiling: past 90% of it, so the budget is
+            // gone even though the ACCOUNT would happily bill to $50.
+            spend_member("b", 5.0, 4.6, Some(50.0)),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    assert!(
+        config.state.switch_off_when_budget_spent,
+        "a spent budget halts by default"
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::Off),
+        "the ceiling must stop the spending, not merely gate entry to it"
+    );
+
+    // Still inside the budget → keeps working, which is the point of the knob.
+    config.profiles[1].usage = Some(usage_spent_with_spend(spend_block(true, 1.0, Some(50.0))));
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "under budget, stay and bill"
+    );
+}
+
+// `switch_off_when_budget_spent` is its own decision, not `switch_off_when_spent`'s: staying costs
+// nothing when free quota runs out and costs money when a budget does, so an
+// operator may want stay-on-active for one and switch-off-all for the other.
+#[test]
+fn next_target_over_budget_active_can_be_told_to_keep_billing() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 5.0, 4.6, Some(50.0)),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    config.state.switch_off_when_budget_spent = false;
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "explicitly told to stay on a spent budget: keeps billing"
+    );
+
+    // ...and `switch_off_when_spent` must not answer for it in either direction: on, it
+    // halts a chain out of QUOTA, and this chain is out of MONEY.
+    config.state.switch_off_when_spent = true;
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "switch_off_when_spent must not halt an over-budget active that was told to stay"
+    );
+}
+
+// A free parking spot beats halting: moving to the sink stops the billing
+// without signing anyone out, so the halt is the last resort, not the first.
+#[test]
+fn next_target_over_budget_active_parks_on_a_sink_before_halting() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 5.0, 4.6, Some(50.0)),
+            mark_last_resort(profile_with_util("c", Some(95.0), Some(100.0))),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string())),
+        "park on the sink to stop billing rather than halting outright"
+    );
+}
+
+// The bit-identical guarantee at the halt gate: with the master toggle off, a
+// billing account over any ceiling must read `switch_off_when_spent` exactly like before.
+#[test]
+fn next_target_over_budget_halt_is_inert_with_the_toggle_off() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 5.0, 4.6, Some(50.0)),
+        ],
+        "b",
+    );
+    assert!(!config.state.spend_budget_switching, "default is off");
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "switch_off_when_spent off + toggle off → stay, exactly like before the budget existed"
+    );
+
+    config.state.switch_off_when_spent = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::Off),
+        "switch_off_when_spent on → Off, decided by switch_off_when_spent alone"
+    );
+}
+
+// A plain subscription active must never reach the budget halt: `budget_spent`
+// is what separates "out of money" from "out of quota", and reading it wrong
+// would halt ordinary accounts that were only ever told to stay on active.
+#[test]
+fn budget_spent_never_fires_on_a_subscription_account() {
+    let plain = usage_info(Some(window(100.0, Some(live_reset()))));
+    assert!(
+        !budget_spent(Some(&plain), true, 5.0),
+        "no spend block at all"
+    );
+
+    let billing_off = usage_spent_with_spend(spend_block(false, 99.0, Some(50.0)));
+    assert!(
+        !budget_spent(Some(&billing_off), true, 5.0),
+        "billing switched off: spending is not what is happening here"
+    );
+
+    let no_ceiling = usage_spent_with_spend(spend_block(true, 99.0, Some(50.0)));
+    assert!(
+        !budget_spent(Some(&no_ceiling), true, 0.0),
+        "a $0 ceiling never opted in, so it can never be over budget"
+    );
+    assert!(
+        !budget_spent(Some(&no_ceiling), false, 5.0),
+        "master toggle off: the whole feature is inert"
+    );
+}
+
+// The uncapped-config predicate behind both the Fallback card's DANGER tooltip
+// and the daemon's boot warning. "Uncapped" is precisely: armed to spend, told
+// to stay once the budget runs out, and no sink to be parked on instead —
+// remove any one of those and something stops the billing.
+#[test]
+fn spend_is_uncapped_only_when_nothing_can_stop_the_billing() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 5.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    config.state.switch_off_when_budget_spent = false;
+    assert!(
+        spend_is_uncapped(&config, 5.0),
+        "armed + stay-on-active + no sink = the ceiling never stops anything"
+    );
+
+    // Each of the three, alone, caps it again.
+    config.state.switch_off_when_budget_spent = true;
+    assert!(
+        !spend_is_uncapped(&config, 5.0),
+        "halting stops the billing"
+    );
+
+    config.state.switch_off_when_budget_spent = false;
+    config.profiles[0].last_resort = true;
+    assert!(
+        !spend_is_uncapped(&config, 5.0),
+        "a sink to park on stops the billing without halting"
+    );
+
+    config.profiles[0].last_resort = false;
+    config.state.spend_budget_switching = false;
+    assert!(!spend_is_uncapped(&config, 5.0), "never armed at all");
+
+    config.state.spend_budget_switching = true;
+    assert!(
+        !spend_is_uncapped(&config, 0.0),
+        "a $0 ceiling never spends"
+    );
+}
+
+// `budget_spent_blocking` (the Usage-tab diagnostic's reader) gates a spent
+// budget behind 5h-exhaustion exactly like `blocked_reason`: a billing member
+// that maxed its money budget but still has free 5h quota serves for FREE and the
+// walk prefers it, so the diagnostic must NOT claim it blocked. Only once the 5h
+// window is also over threshold is the budget the thing stopping it. Guards the
+// render-only invariant against a regression to a raw `budget_spent` read.
+#[test]
+fn budget_spent_blocking_needs_5h_exhaustion_too() {
+    let member = |five_h: f64| {
+        let mut p = profile_with_usage(
+            "a",
+            Some(95.0),
+            Some(UsageInfo {
+                five_hour: Some(window(five_h, Some(live_reset()))),
+                spend: Some(spend_block(true, 99.0, Some(50.0))),
+                ..UsageInfo::default()
+            }),
+        );
+        p.max_auto_spend = Some(5.0);
+        p
+    };
+    let cfg = |p: Profile| {
+        let mut c = config_with_chain(vec![p], "a");
+        c.state.spend_budget_switching = true;
+        c
+    };
+
+    // 5h has headroom (50% < 95%): serves free, so a maxed money budget is moot.
+    let free = cfg(member(50.0));
+    assert!(
+        !budget_spent_blocking(&free, &free.profiles[0]),
+        "free 5h quota → budget is not a block"
+    );
+
+    // 5h over threshold (100% >= 95%): nothing free left, so the budget blocks.
+    let spent = cfg(member(100.0));
+    assert!(
+        budget_spent_blocking(&spent, &spent.profiles[0]),
+        "no free quota + budget maxed → really blocked"
+    );
+}
+
+// ── spend budget: walk ordering ─────────────────────────────────────────────
+
+// Everything is spent and one member is billing with room → the chain pays
+// rather than parking.
+#[test]
+fn next_target_picks_a_spend_armed_member_when_the_chain_is_spent() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+// The bit-identical guard: the SAME fixture with the master toggle off must
+// behave exactly like today — nothing viable, so the walk stays put.
+#[test]
+fn next_target_spend_budget_off_never_spends() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    assert!(!config.state.spend_budget_switching, "default must be off");
+    assert_eq!(next_target(&config, None), None);
+}
+
+// Toggle on, ceiling $0 → identical to the toggle being off. Both halves of the
+// opt-in are required before a cent is spent.
+#[test]
+fn next_target_zero_ceiling_never_spends_even_with_the_toggle_on() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 0.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(next_target(&config, None), None);
+}
+
+// Free quota always beats paying, whatever the walk order says: c has headroom
+// and is reached LAST, b is spend-armed and reached first.
+#[test]
+fn next_target_subscription_headroom_beats_a_spend_armed_member() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string())),
+        "a member with free quota must always win over one that costs money"
+    );
+}
+
+// Pre-last-resort: paying to keep working outranks parking on a spent sink.
+#[test]
+fn next_target_spend_armed_member_outranks_last_resort_parking() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            mark_last_resort(profile_with_util("b", Some(95.0), Some(100.0))),
+            spend_member("c", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string()))
+    );
+
+    // Same chain, toggle off → the sink parks it, exactly like today.
+    config.state.spend_budget_switching = false;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+// ...and outranks wrap-off's halt: an operator who set a ceiling asked to keep
+// working, and Off stops every running claude.
+#[test]
+fn next_target_spend_armed_member_outranks_wrap_off() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.switch_off_when_spent = true;
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".to_string()))
+    );
+
+    // Toggle off → wrap-off halts, exactly like today.
+    config.state.spend_budget_switching = false;
+    assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
+}
+
+// ── finding (2026-07-17): a still-SERVING sink outranks spending real money ──
+//
+// The two `*_outranks_*` tests above use a 5h-MAXED sink (dead — it can't
+// serve), which still ranks below spend. A sink only SOFT-blocked past the
+// weekly line answers every request its live 5h window allows, for free, so it
+// must win over paying. `weekly_soft_profile` is exactly that shape (7d 98.5%,
+// 5h 40%): the soft-line headroom passes skip it, the serving-sink pass catches
+// it before spend.
+
+#[test]
+fn next_target_serving_last_resort_sink_outranks_a_spend_armed_member() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            mark_last_resort(weekly_soft_profile("b")),
+            spend_member("c", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".to_string())),
+        "a sink still serving for free must beat spending money"
+    );
+}
+
+// The active-side facet: a serving-sink active is already parked free, so it
+// stays put rather than hopping to a billing sibling.
+#[test]
+fn next_target_serving_last_resort_active_stays_put_instead_of_paying() {
+    let mut config = config_with_chain(
+        vec![
+            mark_last_resort(weekly_soft_profile("a")),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "a serving-sink active never pays a sibling — it already serves free"
+    );
+}
+
+// Store twin, lockstep: the sink's soft-blocked-but-serving reading rides the
+// `UsageStore`, `ChainMember::last_resort` comes from the marked profile.
+#[test]
+fn auto_switch_serving_last_resort_sink_outranks_a_spend_armed_member() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            mark_last_resort(profile_with_util("b", Some(95.0), None)),
+            spend_member("c", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_both(
+                Some(window(40.0, Some(live_reset()))),
+                Some(window(98.5, Some(live_reset()))),
+            ),
+        ),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "the store twin must also park on a serving sink before paying"
+    );
+}
+
+#[test]
+fn auto_switch_serving_last_resort_active_stays_put_instead_of_paying() {
+    let mut config = config_with_chain(
+        vec![
+            mark_last_resort(profile_with_util("a", Some(95.0), None)),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_both(
+                Some(window(40.0, Some(live_reset()))),
+                Some(window(98.5, Some(live_reset()))),
+            ),
+        ),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a serving-sink active stays parked free in the store twin too"
+    );
+}
+
+// The store twin, in lockstep: same ordering, but the ceiling rides
+// `ChainMember::max_spend` and the spend block rides the `UsageStore`.
+#[test]
+fn auto_switch_picks_a_spend_armed_member_when_the_chain_is_spent() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert_eq!(snap.chain[1].max_spend, 20.0, "ceiling must reach the walk");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+
+    // Toggle off → the same store is inert, exactly like today.
+    config.state.spend_budget_switching = false;
+    let snap_off = snapshot_chain(&config).expect("snapshot");
+    assert_eq!(next_auto_switch_target(&snap_off, &store), None);
+}
+
+#[test]
+fn auto_switch_subscription_headroom_beats_a_spend_armed_member() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+        ("c", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "free quota must win over money on the store walk too"
+    );
+}
+
+// The store twin's steady state, in lockstep with `next_target`: an over-budget
+// active halts on `switch_off_when_budget_spent`, and `switch_off_when_spent` does not answer for it.
+#[test]
+fn auto_switch_over_budget_active_switches_off_by_default() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 5.0, 4.6, Some(50.0)),
+        ],
+        "b",
+    );
+    config.state.spend_budget_switching = true;
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 4.6, Some(50.0))),
+        ),
+    ]);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert!(
+        snap.switch_off_when_budget_spent,
+        "a spent budget halts by default"
+    );
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::Off),
+        "the scheduler must cap the spend exactly like the UI twin"
+    );
+
+    // Told to stay → keeps billing, and `switch_off_when_spent` must not override that.
+    config.state.switch_off_when_budget_spent = false;
+    config.state.switch_off_when_spent = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "switch_off_when_spent must not halt an over-budget active that was told to stay"
+    );
+}
+
+#[test]
+fn auto_switch_zero_ceiling_never_spends_even_with_the_toggle_on() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            spend_member("b", 0.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_spent_with_spend(spend_block(true, 0.0, Some(50.0))),
+        ),
+    ]);
     assert_eq!(next_auto_switch_target(&snap, &store), None);
 }
 
@@ -984,7 +1984,7 @@ fn auto_switch_broken_active_without_viable_member_never_wraps_off() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     config.set_auth_broken("a", true);
     config.set_auth_broken("b", true); // the only sibling is dead too
     let snap = snapshot_chain(&config).expect("snapshot");
@@ -1006,7 +2006,7 @@ fn auto_switch_broken_and_exhausted_active_still_wraps_off() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     config.set_auth_broken("a", true);
     config.set_auth_broken("b", true);
     let snap = snapshot_chain(&config).expect("snapshot");
@@ -1048,36 +2048,123 @@ fn next_target_skips_broken_last_resort_member() {
 
 // ── issue #8 follow-up b: burn-aware auto-switch (opt-in, default off) ─────
 //
-// `is_exhausted_projected`/`is_exhausted_active`/`is_exhausted_active_from_store`
+// `is_exhausted_projected`/`is_exhausted_active`/`is_exhausted_active_from_usage`
 // only ever change the ACTIVE profile's own exhaustion decision; candidate
-// selection stays on the static `is_exhausted`/`is_exhausted_from_store`
+// selection stays on the static `is_exhausted`/`is_exhausted_from_usage`
 // tested above (unchanged by this section).
+
+#[test]
+fn is_exhausted_projected_never_switches_later_than_static() {
+    // Regression: burn-aware may only ever move the switch EARLIER than mode-off,
+    // never later. 96% is over the 95% static threshold, so mode-off switches —
+    // but with the default floor 98 above the threshold, the old predicate
+    // required 96 ≥ 98 and held, running the window LONGER than static. The
+    // static check now always fires here, whatever a slow burn projects.
+    assert!(is_exhausted_projected(
+        96.0,
+        95.0,
+        Some(4.0),
+        90_000,
+        98.0,
+        60_000
+    ));
+}
 
 #[test]
 fn is_exhausted_projected_none_burn_falls_back_to_static_threshold() {
     assert!(
-        is_exhausted_projected(96.0, 95.0, None, 90_000),
-        "over threshold, no rate available → static check fires"
+        is_exhausted_projected(96.0, 95.0, None, 90_000, 98.0, 60_000),
+        "over threshold, no rate available → static check fires (floor/cap unused)"
     );
     assert!(
-        !is_exhausted_projected(90.0, 95.0, None, 90_000),
+        !is_exhausted_projected(90.0, 95.0, None, 90_000, 98.0, 60_000),
         "under threshold, no rate available → static check doesn't fire"
     );
 }
 
 #[test]
-fn is_exhausted_projected_heavy_burn_fires_before_static_threshold() {
-    // 90% is under the 95% static threshold, but a 1200 %/h burn over a 90s
-    // poll projects to 120% — the cap fires ahead of the static check.
-    assert!(is_exhausted_projected(90.0, 95.0, Some(1200.0), 90_000));
+fn is_exhausted_projected_heavy_burn_crosses_cap() {
+    // Guards relaxed (floor 0, cap ≥ interval) and util below threshold so the
+    // static check can't mask it — isolating the raw projection: a 1200 %/h burn
+    // over a 90s poll projects 90 → 120, past the 100% cap.
+    // (The floor's effect on the same burn is a separate test below.)
+    assert!(is_exhausted_projected(
+        90.0,
+        95.0,
+        Some(1200.0),
+        90_000,
+        0.0,
+        90_000
+    ));
 }
 
 #[test]
-fn is_exhausted_projected_light_burn_runs_past_static_threshold() {
-    // 96% is already over the 95% static threshold, but a light 4 %/h burn
-    // over a 90s poll barely moves — nowhere near the 100% cap, so burn-aware
-    // mode keeps running where mode-off would already have switched.
-    assert!(!is_exhausted_projected(96.0, 95.0, Some(4.0), 90_000));
+fn is_exhausted_projected_light_burn_stays_under_cap() {
+    // Inside the sub-threshold early band (floor 90, threshold 98): 96% with a
+    // light 4 %/h burn over a 90s poll barely moves, nowhere near the 100% cap,
+    // so the projection holds. Kept below threshold so the static check can't
+    // mask it — that isolates the hold to the burn being light.
+    assert!(!is_exhausted_projected(
+        96.0,
+        98.0,
+        Some(4.0),
+        90_000,
+        90.0,
+        90_000
+    ));
+}
+
+#[test]
+fn is_exhausted_projected_floor_blocks_a_transient_burst() {
+    // The Pro over-switch fix: a heavy burst (window-relative %/h reads high on a
+    // small window) projects past 100, but the floor (90, below the 95 threshold)
+    // refuses an early switch further from the cap than that — at 88% the window
+    // is not spent yet, so it holds despite the burst.
+    assert!(!is_exhausted_projected(
+        88.0,
+        95.0,
+        Some(1200.0),
+        90_000,
+        90.0,
+        90_000
+    ));
+    // Above the floor but still below threshold, the same burn switches early —
+    // the floor is a lower bound on the switch point, not a veto on switching.
+    assert!(is_exhausted_projected(
+        93.0,
+        95.0,
+        Some(1200.0),
+        90_000,
+        90.0,
+        90_000
+    ));
+}
+
+#[test]
+fn is_exhausted_projected_horizon_cap_tightens_the_margin() {
+    // 98.5% + 80 %/h, inside the sub-threshold band (floor 98, threshold 99) so
+    // the static check can't mask the difference. Over the full 90s interval the
+    // projection reaches 100.5 and fires; capped to a 30s look-ahead it only
+    // reaches ~99.2 and holds — so the cap reclaims the tail a long look-ahead
+    // would switch away early.
+    // Mutation-check: ignoring the cap (using the full interval) flips the
+    // second assertion.
+    assert!(is_exhausted_projected(
+        98.5,
+        99.0,
+        Some(80.0),
+        90_000,
+        98.0,
+        90_000
+    ));
+    assert!(!is_exhausted_projected(
+        98.5,
+        99.0,
+        Some(80.0),
+        90_000,
+        98.0,
+        30_000
+    ));
 }
 
 #[test]
@@ -1092,7 +2179,9 @@ fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
             false,
             90_000,
             None,
-            weekly_blocked(&exhausted, 98.0)
+            weekly_blocked(&exhausted, 98.0),
+            98.0,
+            90_000
         ),
         is_exhausted(&exhausted, 98.0)
     );
@@ -1102,7 +2191,9 @@ fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
             false,
             90_000,
             None,
-            weekly_blocked(&headroom, 98.0)
+            weekly_blocked(&headroom, 98.0),
+            98.0,
+            90_000
         ),
         is_exhausted(&headroom, 98.0)
     );
@@ -1111,14 +2202,18 @@ fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
         false,
         90_000,
         None,
-        weekly_blocked(&exhausted, 98.0)
+        weekly_blocked(&exhausted, 98.0),
+        98.0,
+        90_000
     ));
     assert!(!is_exhausted_active(
         &headroom,
         false,
         90_000,
         None,
-        weekly_blocked(&headroom, 98.0)
+        weekly_blocked(&headroom, 98.0),
+        98.0,
+        90_000
     ));
 }
 
@@ -1138,14 +2233,18 @@ fn is_exhausted_active_burn_aware_falls_back_without_rate() {
         true,
         90_000,
         None,
-        weekly_blocked(&exhausted, 98.0)
+        weekly_blocked(&exhausted, 98.0),
+        98.0,
+        90_000
     ));
     assert!(!is_exhausted_active(
         &headroom,
         true,
         90_000,
         None,
-        weekly_blocked(&headroom, 98.0)
+        weekly_blocked(&headroom, 98.0),
+        98.0,
+        90_000
     ));
 }
 
@@ -1161,7 +2260,7 @@ fn next_target_burn_aware_none_rate_falls_back_to_static_threshold() {
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     config.state.burn_aware_switching = true;
     assert_eq!(
         next_target(&config, None),
@@ -1186,92 +2285,96 @@ fn write_history(_home: &crate::testutil::HomeSandbox, name: &str, entries: &[(u
 }
 
 // End-to-end proof that the UI-thread walk (`next_target`) and the
-// scheduler-side walk (`next_auto_switch_target`) agree: a heavy burn on the
-// active flips the wrap-off decision from "stay" to "switch off" before it
-// ever reaches its 95% static threshold, on both paths.
+// scheduler-side walk (`next_auto_switch_target`) agree, and that burn-aware
+// never holds the active where static would switch (the burn-floor regression):
+// a heavy burn climbs the active to 96%, over the 95% threshold, so static signs
+// everything out. Burn-aware with the default floor 98 once HELD here (96 < 98),
+// running the window longer than static; the static check now always applies, so
+// both walks switch off too.
 //
-// `b` is pinned exhausted (100%, no `last_resort`) on both members so the
-// headroom-walk and last-resort-walk (unaffected by burn-aware mode by
-// design) both come up empty either way; the only thing that can move the
-// outcome is the ACTIVE-only decision this issue changes — the wrap-off
-// Off-check inside `next_target`, and the entry gate inside
-// `next_auto_switch_target`.
+// `b` is pinned exhausted (100%, no `last_resort`) so the headroom-walk and
+// last-resort-walk (unaffected by burn-aware mode by design) both come up empty
+// either way; the only thing that can move the outcome is the ACTIVE-only Off
+// decision — the wrap-off Off-check inside `next_target`, and the entry gate
+// inside `next_auto_switch_target`.
 #[test]
-fn burn_aware_heavy_burn_flips_wrap_off_decision_on_both_walks() {
+fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     let _home = crate::testutil::HomeSandbox::new();
     let now = crate::usage::now_ms();
-    // Perfectly linear climb, 30 → 90 over 6 minutes = 600 %/h.
+    // Perfectly linear climb, 36 → 96 over 6 minutes = 600 %/h.
     write_history(
         &_home,
         "a",
         &[
             (
                 now - 360_000,
-                usage_info(Some(window(30.0, Some(live_reset())))),
+                usage_info(Some(window(36.0, Some(live_reset())))),
             ),
             (
                 now - 240_000,
-                usage_info(Some(window(50.0, Some(live_reset())))),
+                usage_info(Some(window(56.0, Some(live_reset())))),
             ),
             (
                 now - 120_000,
-                usage_info(Some(window(70.0, Some(live_reset())))),
+                usage_info(Some(window(76.0, Some(live_reset())))),
             ),
         ],
     );
 
-    // Static (mode off): 90% is still under the 95% threshold — active isn't
-    // exhausted yet, so wrap-off's Off-check never fires.
+    // Static (mode off): 96% is over the 95% threshold → active exhausted, and
+    // with `b` spent too, wrap-off signs everything out.
     let mut static_config = config_with_chain(
         vec![
-            profile_with_util("a", Some(95.0), Some(90.0)),
+            profile_with_util("a", Some(95.0), Some(96.0)),
             profile_with_util("b", Some(95.0), Some(100.0)),
         ],
         "a",
     );
-    static_config.state.wrap_off = true;
+    static_config.state.switch_off_when_spent = true;
     assert_eq!(
         next_target(&static_config, None),
-        None,
-        "static mode: 90% is still under the 95% threshold, active stays"
+        Some(SwitchAction::Off),
+        "static mode: 96% is over the 95% threshold → Off"
     );
 
     // `next_target` takes the burn rate as a parameter — it never reads disk
     // itself. Source it the same way `burn_rate_for_profile` does here,
     // standing in for the caller's in-memory `history_cache` lookup
     // (`App::active_burn_rate`) that feeds the real UI-thread call site.
-    let active_window = window(90.0, Some(live_reset()));
+    let active_window = window(96.0, Some(live_reset()));
     let rate = burn_rate_for_profile("a", &active_window).expect("rate computed from history");
     assert!((rate - 600.0).abs() < 1.0, "expected ~600 %/h, got {rate}");
 
-    // Burn-aware: 90% + 600 %/h over a 90s poll projects to 105% — the active
-    // is judged exhausted a full 5 points before the static threshold, and
-    // with `b` exhausted too and no sink, wrap-off switches off.
+    // Burn-aware: 96% is over the 95% threshold, so the static check inside the
+    // projection fires and the active switches Off — same as mode-off. Before the
+    // fix the default 98% floor held it here (96 < 98), running the window longer
+    // than static.
     let mut config = config_with_chain(
         vec![
-            profile_with_util("a", Some(95.0), Some(90.0)),
+            profile_with_util("a", Some(95.0), Some(96.0)),
             profile_with_util("b", Some(95.0), Some(100.0)),
         ],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     config.state.burn_aware_switching = true;
     config.state.refresh_interval_ms = 90_000;
     assert_eq!(
         next_target(&config, Some(rate)),
         Some(SwitchAction::Off),
-        "burn-aware mode: heavy burn projects past 100% within one poll, no sink → Off"
+        "burn-aware agrees with static: 96% ≥ 95% threshold → Off"
     );
 
     let snap = snapshot_chain(&config).expect("snapshot");
-    assert!(snap.wrap_off);
+    assert!(snap.switch_off_when_spent);
     assert!(snap.burn_aware);
     assert_eq!(snap.interval_ms, 90_000);
-    let store = store_with_utils(&[("a", 90.0), ("b", 100.0)]);
+    assert_eq!(snap.burn_floor_pct, 98.0);
+    let store = store_with_utils(&[("a", 96.0), ("b", 100.0)]);
     assert_eq!(
         next_auto_switch_target(&snap, &store),
         Some(SwitchAction::Off),
-        "scheduler-side walk agrees with next_target under burn-aware mode"
+        "scheduler-side walk agrees: burn-aware switches off at 96%, same as static"
     );
 }
 
@@ -1334,14 +2437,18 @@ fn weekly_dead_active_is_exhausted_despite_idle_5h() {
         false,
         90_000,
         None,
-        weekly_blocked(&p, 98.0)
+        weekly_blocked(&p, 98.0),
+        98.0,
+        90_000
     ));
     assert!(is_exhausted_active(
         &p,
         true,
         90_000,
         Some(5.0),
-        weekly_blocked(&p, 98.0)
+        weekly_blocked(&p, 98.0),
+        98.0,
+        90_000
     ));
 }
 
@@ -1400,7 +2507,9 @@ fn weekly_soft_exhausted_active_triggers_a_switch_despite_5h_headroom() {
         false,
         90_000,
         None,
-        weekly_blocked(&active, 98.0)
+        weekly_blocked(&active, 98.0),
+        98.0,
+        90_000
     ));
     let config = config_with_chain(
         vec![active, profile_with_util("b", Some(95.0), Some(10.0))],
@@ -1474,6 +2583,7 @@ fn weekly_dead_member_never_recovers() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        max_spend: 0.0,
     }];
     let dead = store_with_infos(vec![(
         "b",
@@ -1585,7 +2695,7 @@ fn wrap_off_keys_on_the_weekly_hard_cap_not_the_soft_line() {
         vec![weekly_soft_profile("a"), weekly_soft_profile("b")],
         "a",
     );
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(
         next_target(&config, None),
         None,
@@ -1602,7 +2712,7 @@ fn wrap_off_keys_on_the_weekly_hard_cap_not_the_soft_line() {
         )),
     );
     let mut config = config_with_chain(vec![dead, weekly_soft_profile("b")], "a");
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
@@ -1625,7 +2735,7 @@ fn wrap_off_keys_on_the_hard_cap_in_the_store_walk_too() {
         )
     };
     let mut config = mk();
-    config.state.wrap_off = true;
+    config.state.switch_off_when_spent = true;
     let snapshot = snapshot_chain(&config).expect("snapshot");
     let store = store_with_infos(vec![("a", soft()), ("b", soft())]);
     assert_eq!(
@@ -1743,6 +2853,7 @@ fn codex_member(name: &str) -> ChainMember {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        max_spend: 0.0,
     }
 }
 
@@ -1966,6 +3077,31 @@ fn usage_with_scoped(
         five_hour: Some(window(five_hour_pct, Some(live_reset()))),
         seven_day: Some(window(seven_day_pct, Some(week_reset()))),
         weekly_scoped: scoped,
+        ..UsageInfo::default()
+    }
+}
+
+// ── blocked_reason: the Fallback tab's per-member chip (render-only) ──────────
+//
+// Dead-first precedence: auth broken › weekly hard (7d ≥ 100) › kick rejected ›
+// budget spent › 5h over threshold › weekly soft (soft ≤ 7d < 100) › stale. Each
+// reason gets a positive test plus, where two can hold at once, a precedence test
+// proving the worse one wins. Assertions match on the variant (not float `==`) so
+// a wrong pct/countdown reds without tripping the float-cmp lint.
+
+/// UsageInfo carrying only a live 7d window at `util`.
+fn weekly_usage(util: f64) -> UsageInfo {
+    UsageInfo {
+        seven_day: Some(window(util, Some(live_reset()))),
+        ..UsageInfo::default()
+    }
+}
+
+/// UsageInfo with both a live 5h window at `five` and a live 7d at `seven`.
+fn both_windows(five: f64, seven: f64) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(five, Some(live_reset()))),
+        seven_day: Some(window(seven, Some(live_reset()))),
         ..UsageInfo::default()
     }
 }
@@ -2322,6 +3458,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            max_spend: 0.0,
         },
         ChainMember {
             name: "c".into(),
@@ -2330,6 +3467,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             weekly_line: 98.0,
             scoped_line: 98.0,
             check_scoped: true,
+            max_spend: 0.0,
         },
     ];
     let store = store_with_infos(vec![
@@ -2364,9 +3502,459 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
+        max_spend: 0.0,
     }];
     assert_eq!(
         find_recovered_member(&chain_b, &store, &[]),
         Some("b".to_string()),
+    );
+}
+
+#[test]
+fn blocked_reason_none_for_a_live_member_with_headroom() {
+    let p = mark_fresh(profile_with_util("a", Some(95.0), Some(40.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    assert_eq!(blocked_reason(&cfg, &cfg.profiles[0], None), None);
+}
+
+#[test]
+fn blocked_reason_auth_broken_outranks_every_other_block() {
+    // 7d at the hard cap AND 5h over threshold — auth still wins.
+    let p = profile_with_usage("a", Some(95.0), Some(both_windows(100.0, 100.0)));
+    let mut cfg = config_with_chain(vec![p], "a");
+    cfg.state.auth_broken.push("a".into());
+    assert_eq!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        Some(BlockedReason::AuthBroken)
+    );
+}
+
+#[test]
+fn blocked_reason_weekly_hard_carries_the_7d_reset_countdown() {
+    let p = profile_with_usage("a", Some(95.0), Some(weekly_usage(100.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(
+        matches!(
+            blocked_reason(&cfg, &cfg.profiles[0], None),
+            Some(BlockedReason::WeeklySpent { resets_in: Some(secs) })
+                if (3500..=3600).contains(&secs)
+        ),
+        "got {:?}",
+        blocked_reason(&cfg, &cfg.profiles[0], None)
+    );
+}
+
+#[test]
+fn blocked_reason_weekly_hard_outranks_a_5h_block() {
+    // 7d at the hard cap AND 5h over threshold — weekly (dead for days) wins.
+    let p = profile_with_usage("a", Some(95.0), Some(both_windows(99.0, 100.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        Some(BlockedReason::WeeklySpent { .. })
+    ));
+}
+
+#[test]
+fn blocked_reason_budget_spent_when_billing_and_over_ceiling() {
+    // spend_member is 5h-spent + billing; ceiling 10, used 20 → over. Budget is
+    // checked before the 5h block, so this also proves budget › 5h.
+    let p = spend_member("a", 10.0, 20.0, None);
+    let mut cfg = config_with_chain(vec![p], "a");
+    cfg.state.spend_budget_switching = true;
+    assert_eq!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        Some(BlockedReason::BudgetSpent)
+    );
+}
+
+#[test]
+fn blocked_reason_budget_spent_is_moot_with_free_5h_quota() {
+    // Billing budget spent but 5h has headroom → the member serves for free and
+    // the walk PREFERS it (headroom pass). No chip may claim a block here — the
+    // invariant this whole fn promises. Reds against an ungated budget arm.
+    let mut p = spend_member("a", 10.0, 20.0, None); // over ceiling → budget spent
+    if let Some(u) = p.usage.as_mut() {
+        u.five_hour = Some(window(30.0, Some(live_reset()))); // free 5h quota
+    }
+    let mut cfg = config_with_chain(vec![p], "a");
+    cfg.state.spend_budget_switching = true;
+    assert_eq!(blocked_reason(&cfg, &cfg.profiles[0], None), None);
+}
+
+#[test]
+fn blocked_reason_five_hour_reports_utilization_and_reset() {
+    let p = profile_with_util("a", Some(95.0), Some(97.0));
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(
+        matches!(
+            blocked_reason(&cfg, &cfg.profiles[0], None),
+            Some(BlockedReason::FiveHour { pct, resets_in: Some(secs) })
+                if (pct - 97.0).abs() < f64::EPSILON && (3500..=3600).contains(&secs)
+        ),
+        "got {:?}",
+        blocked_reason(&cfg, &cfg.profiles[0], None)
+    );
+}
+
+#[test]
+fn blocked_reason_weekly_soft_below_the_hard_cap_still_shows() {
+    // 7d at 99 (≥ default soft 98, < 100) with 5h headroom → soft weekly block.
+    let p = profile_with_usage("a", Some(95.0), Some(both_windows(40.0, 99.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        Some(BlockedReason::WeeklySoft { pct }) if (pct - 99.0).abs() < f64::EPSILON
+    ));
+}
+
+#[test]
+fn blocked_reason_five_hour_outranks_a_soft_weekly_block() {
+    // Both hold: 5h fully stopped now beats the soft week (still serving).
+    let p = profile_with_usage("a", Some(95.0), Some(both_windows(97.0, 99.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        Some(BlockedReason::FiveHour { .. })
+    ));
+}
+
+#[test]
+fn blocked_reason_stale_when_the_last_read_was_cached() {
+    let mut p = profile_with_util("a", Some(95.0), Some(40.0));
+    p.fetch_status = Some(FetchStatus::Cached);
+    let cfg = config_with_chain(vec![p], "a");
+    assert_eq!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        Some(BlockedReason::Stale)
+    );
+}
+
+#[test]
+fn blocked_reason_a_real_block_outranks_stale_data() {
+    // 5h over threshold AND cached — the block wins, stale is only the fallback.
+    let mut p = profile_with_util("a", Some(95.0), Some(97.0));
+    p.fetch_status = Some(FetchStatus::Cached);
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        Some(BlockedReason::FiveHour { .. })
+    ));
+}
+
+#[test]
+fn blocked_reason_failed_fetch_is_not_flagged_stale() {
+    // `Failed` = no data at all (the card already says "no data"); only cached /
+    // rate-limited numbers count as stale.
+    let mut p = profile_with_util("a", Some(95.0), Some(40.0));
+    p.fetch_status = Some(FetchStatus::Failed);
+    let cfg = config_with_chain(vec![p], "a");
+    assert_eq!(blocked_reason(&cfg, &cfg.profiles[0], None), None);
+}
+
+#[test]
+fn blocked_reason_kick_rejected_when_switch_grade_with_headroom() {
+    // Live member with 5h + 7d headroom — its ONLY block is the kick rejection
+    // the walk routes around. `kick_lift` (Some(until)) carries the advertised
+    // lift ceiling; the chip reports it as a countdown.
+    let p = mark_fresh(profile_with_util("a", Some(95.0), Some(40.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    let until = now_epoch_secs() + 3600;
+    assert!(
+        matches!(
+            blocked_reason(&cfg, &cfg.profiles[0], Some(until)),
+            Some(BlockedReason::KickRejected { lifts_in }) if (3500..=3600).contains(&lifts_in)
+        ),
+        "got {:?}",
+        blocked_reason(&cfg, &cfg.profiles[0], Some(until))
+    );
+}
+
+#[test]
+fn blocked_reason_kick_rejected_outranks_a_5h_block() {
+    // 5h over threshold AND kick-rejected: the limiter won't let clauth start the
+    // member at all, so the kick block outranks the usage exhaustion. Reds if the
+    // arm is placed below the 5h block.
+    let p = profile_with_util("a", Some(95.0), Some(97.0));
+    let cfg = config_with_chain(vec![p], "a");
+    let until = now_epoch_secs() + 3600;
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0], Some(until)),
+        Some(BlockedReason::KickRejected { .. })
+    ));
+}
+
+#[test]
+fn blocked_reason_weekly_hard_outranks_a_kick_block() {
+    // 7d at the hard cap (dead for days) beats a kick block that lifts in hours.
+    let p = profile_with_usage("a", Some(95.0), Some(weekly_usage(100.0)));
+    let cfg = config_with_chain(vec![p], "a");
+    let until = now_epoch_secs() + 3600;
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0], Some(until)),
+        Some(BlockedReason::WeeklySpent { .. })
+    ));
+}
+
+// ── weekly fallback §5: spend pass lock consolidation ─────────────────────────
+//
+// `next_auto_switch_target` takes ONE usage-store snapshot per evaluation and
+// drives every pass off it, so a fetch landing mid-evaluation (between the
+// headroom pass and the spend-armed pass) cannot flip a free-sibling decision
+// into a paid one. The pre-snapshot shape locked the store per predicate, so
+// each pass could observe a different state.
+//
+// The tests below pin the new contract:
+//   * exactly one store lock per evaluation (the snapshot);
+//   * the snapshot's content alone drives the decision (mutation after the
+//     snapshot is invisible);
+//   * a real `UsageStore` mutated between simulated passes flips the per-pass
+//     read, but not the snapshot read.
+
+/// Chain: A active + exhausted (the switch trigger), B no fresh + free 5h
+/// headroom (pass-2 candidate; pass 1 skips it for lack of freshness), C
+/// spend-armed (pass-4 candidate). With B viable the walk returns To(B) FREE;
+/// with B exhausted it falls through to To(C) PAID. Three members, no
+/// `last_resort`, no broken, no kick-rejected.
+fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
+    ChainSnapshot {
+        active: "a".into(),
+        chain: vec![
+            ChainMember {
+                name: "a".into(),
+                threshold: 95.0,
+                last_resort: false,
+                weekly_line: 98.0,
+                scoped_line: 98.0,
+                check_scoped: true,
+                max_spend: 0.0,
+            },
+            ChainMember {
+                name: "b".into(),
+                threshold: 95.0,
+                last_resort: false,
+                weekly_line: 98.0,
+                scoped_line: 98.0,
+                check_scoped: true,
+                max_spend: 0.0,
+            },
+            ChainMember {
+                name: "c".into(),
+                threshold: 95.0,
+                last_resort: false,
+                weekly_line: 98.0,
+                scoped_line: 98.0,
+                check_scoped: true,
+                max_spend: 100.0,
+            },
+        ],
+        switch_off_when_spent: true,
+        broken: vec![],
+        burn_aware: false,
+        interval_ms: 60_000,
+        weekly_pct: 98.0,
+        burn_floor_pct: 80.0,
+        burn_horizon_cap_ms: 3_600_000,
+        spend_budget,
+        switch_off_when_budget_spent: false,
+        kick_rejected: vec![],
+        fresh: vec![],
+    }
+}
+
+/// Asserts [`next_auto_switch_target`] takes the `UsageStore` lock exactly once
+/// per evaluation. The pre-snapshot shape took it per predicate (headroom walk
+/// pass 1a + 1b, serving-sink active + sibling, spend-armed active + sibling,
+/// budget-spent active, halt re-check) — six-plus lock windows an interleaved
+/// `App::apply_usage` could mutate between. With the snapshot, the count is
+/// exactly 1, which is the load-bearing guarantee: one lock window means no
+/// mid-evaluation mutation can change the outcome.
+///
+/// This is the deterministic RED-against-old-shape test. Reverting the
+/// snapshot refactor brings the count back above 1 and trips the assert.
+#[test]
+fn next_auto_switch_target_takes_store_lock_exactly_once() {
+    super::NEXT_AUTO_SWITCH_TARGET_STORE_LOCKS.with(|c| c.set(0));
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0)]);
+    let snapshot = snapshot_for_lock_consolidation(false);
+    let _ = next_auto_switch_target(&snapshot, &store);
+    let count = super::NEXT_AUTO_SWITCH_TARGET_STORE_LOCKS.with(|c| c.get());
+    assert_eq!(
+        count, 1,
+        "snapshot mechanism must take the store lock exactly once per evaluation \
+         (pre-snapshot shape locked per predicate — observed {count} > 1)"
+    );
+}
+
+/// Real `UsageStore`, mutated between two simulated predicate reads, returns
+/// different answers per read — reproducing the bug class the snapshot closes.
+/// The snapshot read (a single clone at one instant) is invariant across the
+/// same mutation. Uses the real predicates ([`is_exhausted_from_usage`]) and a
+/// real `Arc<RankedMutex<HashMap<…>>>` store the test mutates by re-locking.
+#[test]
+fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
+    use super::is_exhausted_from_usage;
+
+    // Pre-mutation store: B has live 5h headroom.
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 10.0, Some(100.0))),
+        ),
+    ]);
+
+    let weekly_pct = 98.0;
+    let threshold = 95.0;
+
+    // Per-predicate-lock simulation (the pre-snapshot shape): each call
+    // re-locks the store, so a mutation between two calls IS observable.
+    let read_pre_mutation = {
+        let snap = store.lock().unwrap().clone();
+        !is_exhausted_from_usage("b", threshold, &snap, weekly_pct)
+    };
+    // A fetch lands between predicate calls — B's window crosses the line.
+    {
+        let mut s = store.lock().unwrap();
+        s.insert(
+            "b".into(),
+            usage_info(Some(window(100.0, Some(live_reset())))),
+        );
+    }
+    let read_post_mutation = {
+        let snap = store.lock().unwrap().clone();
+        !is_exhausted_from_usage("b", threshold, &snap, weekly_pct)
+    };
+    assert!(
+        read_pre_mutation && !read_post_mutation,
+        "per-predicate reads must observe the mutation — pre={read_pre_mutation}, \
+         post={read_post_mutation}. If both agree, the test never re-locked the store."
+    );
+
+    // Snapshot evaluation (the new shape): clone once, drive every read off
+    // the same clone. The same mutation after the snapshot leaves the answer
+    // unchanged.
+    let store2 = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 10.0, Some(100.0))),
+        ),
+    ]);
+    let snapshot = store2.lock().unwrap().clone();
+    {
+        let mut s = store2.lock().unwrap();
+        s.insert(
+            "b".into(),
+            usage_info(Some(window(100.0, Some(live_reset())))),
+        );
+    }
+    let snapshot_read = !is_exhausted_from_usage("b", threshold, &snapshot, weekly_pct);
+    assert!(
+        snapshot_read,
+        "snapshot evaluation must ignore the between-pass mutation — \
+         the decision is locked to the snapshot's content"
+    );
+}
+
+/// End-to-end: a single call to [`next_auto_switch_target`] returns To(B) FREE
+/// when B has headroom at snapshot time, and To(C) PAID when B is exhausted at
+/// snapshot time. The store's content at the snapshot instant drives the
+/// decision — the load-bearing semantic the lock-count test above relies on.
+#[test]
+fn next_auto_switch_target_snapshot_content_drives_the_decision() {
+    let snapshot = snapshot_for_lock_consolidation(true);
+
+    // Snapshot state X: B has headroom → To(B) FREE.
+    let store_with_b_headroom = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 10.0, Some(100.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snapshot, &store_with_b_headroom),
+        Some(SwitchAction::To("b".to_string())),
+        "pass 2 must pick the free sibling when it has headroom at snapshot time"
+    );
+
+    // Snapshot state Y: B exhausted → To(C) PAID.
+    let store_with_b_exhausted = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "c",
+            usage_spent_with_spend(spend_block(true, 10.0, Some(100.0))),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snapshot, &store_with_b_exhausted),
+        Some(SwitchAction::To("c".to_string())),
+        "pass 4 must pick the spend-armed sibling when the free one is exhausted \
+         at snapshot time — the bug direction: a fetch landing between the \
+         headroom pass and the spend-armed pass could have caused this flip in \
+         the pre-snapshot shape"
+    );
+}
+
+/// End-to-end bug repro: with the snapshot, a store mutation AFTER the snapshot
+/// instant cannot flip the result. The test takes the snapshot against
+/// state X (B headroom), mutates the live store to state Y (B exhausted + C
+/// spend-armed — the bug-direction flip), and asserts the snapshot-driven
+/// evaluation still returns To(B) FREE. Pre-snapshot, the next predicate
+/// re-lock would observe Y and return To(C) PAID.
+///
+/// Two evaluations run here:
+///   * one with a snapshot taken AFTER the mutation — proves the same store
+///     now yields To(C), so the assertion against the pre-mutation snapshot is
+///     meaningful (not a tautology);
+///   * one with the pre-mutation snapshot — the bug-direction check.
+#[test]
+fn next_auto_switch_target_ignores_store_mutation_after_snapshot() {
+    // State X: B has headroom, C inert.
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    let snapshot = snapshot_for_lock_consolidation(true);
+
+    // Pre-mutation snapshot (mimics what `next_auto_switch_target` clones as
+    // its first and only store read).
+    let pre_mutation: HashMap<String, UsageInfo> = store.lock().unwrap().clone();
+
+    // The fetch lands: B crosses the line, C becomes spend-armed.
+    {
+        let mut s = store.lock().unwrap();
+        s.insert(
+            "b".into(),
+            usage_info(Some(window(100.0, Some(live_reset())))),
+        );
+        s.insert(
+            "c".into(),
+            usage_spent_with_spend(spend_block(true, 10.0, Some(100.0))),
+        );
+    }
+
+    // Snapshot evaluation against the PRE-mutation clone: To(B) FREE.
+    let result_with_pre_snapshot =
+        super::next_auto_switch_target_with_usage(&snapshot, &pre_mutation);
+    assert_eq!(
+        result_with_pre_snapshot,
+        Some(SwitchAction::To("b".to_string())),
+        "the snapshot is immutable — a post-snapshot mutation must not flip the \
+         free-sibling decision into a paid one"
+    );
+
+    // Sanity: the live store HAS mutated, so a fresh snapshot returns To(C).
+    // This proves the assertion above is not vacuous — the store genuinely
+    // changed, the snapshot just refused to re-read it.
+    assert_eq!(
+        next_auto_switch_target(&snapshot, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "a fresh snapshot taken AFTER the mutation must reflect it — To(C) PAID"
     );
 }

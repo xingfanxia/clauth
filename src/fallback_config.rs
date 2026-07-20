@@ -350,11 +350,11 @@ pub(crate) fn set_usage_gate(
 /// Toggle wrap-off mode (switch every account off once the whole chain is spent,
 /// rather than staying on the last one) and persist.
 pub(crate) fn set_wrap_off(config: &mut AppConfig, on: bool) -> Result<bool> {
-    let previous = config.state.wrap_off;
-    config.state.wrap_off = on;
+    let previous = config.state.switch_off_when_spent;
+    config.state.switch_off_when_spent = on;
     // TECH-7: merge the wrap_off delta into the latest on-disk state.
-    if let Err(e) = update_app_state(move |s| s.wrap_off = on) {
-        config.state.wrap_off = previous;
+    if let Err(e) = update_app_state(move |s| s.switch_off_when_spent = on) {
+        config.state.switch_off_when_spent = previous;
         return Err(e);
     }
     Ok(true)

@@ -8,6 +8,7 @@ mod doctor;
 mod fallback;
 mod fallback_config;
 mod format;
+mod jsonsync;
 // macOS-only: Claude Code reads its login from the Keychain, not the credentials
 // file, so a switch must also write there. Gated so non-macOS builds stay clean.
 #[cfg(target_os = "macos")]
@@ -29,6 +30,9 @@ mod profile_json;
 mod providers;
 mod proxy;
 mod runtime;
+mod sessions;
+mod sessions_cli;
+mod settings_sync;
 mod spinner;
 mod start;
 mod status;
@@ -43,7 +47,7 @@ mod which;
 #[cfg(test)]
 mod testutil;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context, Result};
 
 use crate::profile::{AppConfig, ThemeName, load_config};
 use crate::runtime::Isolation;
@@ -55,9 +59,46 @@ fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<String> {
     })
 }
 
-fn main() -> Result<()> {
+fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    dispatch(&args)
+    std::process::exit(exit_code(dispatch(&args)));
+}
+
+/// A usage error (bad flag/args) for the sessions-surface commands. Distinct
+/// from a runtime failure so [`exit_code`] can map it to process exit 2, while a
+/// genuine error (including "no sessions found") stays exit 1.
+#[derive(Debug)]
+pub(crate) struct UsageError(pub(crate) String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+/// Build a [`UsageError`] as an `anyhow::Error` for a dispatch arm to return.
+fn usage_error(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(UsageError(msg.into()))
+}
+
+/// Map a dispatch outcome to a process exit code: 0 on success, 2 for a
+/// [`UsageError`] (bad flag/args), 1 for any other failure. Prints the error
+/// exactly as anyhow's `Result` `Termination` did (`Error: {:?}`), so the
+/// message surface is unchanged now that `main` maps the code itself.
+pub(crate) fn exit_code(result: Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            if e.downcast_ref::<UsageError>().is_some() {
+                2
+            } else {
+                1
+            }
+        }
+    }
 }
 
 fn dispatch(args: &[String]) -> Result<()> {
@@ -89,16 +130,13 @@ fn dispatch(args: &[String]) -> Result<()> {
         [cmd, _, ..] if cmd == "which" => {
             anyhow::bail!("usage: clauth which [--json]");
         }
-        [cmd] if cmd == "start" => {
-            anyhow::bail!("usage: clauth start [--isolated] <profile> [claude args...]");
-        }
-        [cmd, flag] if cmd == "start" && flag == "--isolated" => {
-            anyhow::bail!("usage: clauth start --isolated <profile> [claude args...]");
-        }
-        [cmd, flag, name, rest @ ..] if cmd == "start" && flag == "--isolated" => {
-            cmd_start(name, rest, Isolation::Isolated)
-        }
-        [cmd, name, rest @ ..] if cmd == "start" => cmd_start(name, rest, Isolation::Shared),
+        [cmd, rest @ ..] if cmd == "start" => match parse_start_args(rest) {
+            Some(a) => cmd_start(a.name, a.claude_args, a.isolation, a.rescue_override),
+            None => anyhow::bail!(
+                "usage: clauth start [--isolated] [--rescue|--no-rescue] <profile> [claude args...]\n\
+                 (--rescue/--no-rescue require --isolated)"
+            ),
+        },
         [cmd, rest @ ..] if cmd == "login" => match parse_login_args(rest) {
             Some(args) => cmd_login(args),
             None => anyhow::bail!(
@@ -109,10 +147,6 @@ fn dispatch(args: &[String]) -> Result<()> {
             Some((name, yes, force)) => cmd_delete(name, yes, force),
             None => anyhow::bail!("usage: clauth delete <profile> [--yes] [--force]"),
         },
-        [cmd, name] if cmd == "resume" => cmd_resume(name),
-        [cmd, ..] if cmd == "resume" => {
-            anyhow::bail!("usage: clauth resume <codex-profile>");
-        }
         [cmd, rest @ ..] if cmd == "fallback" => cmd_fallback(rest),
         [cmd, rest @ ..] if cmd == "proxy" => cmd_proxy(rest),
         [cmd, ..] if cmd == "run" => anyhow::bail!(
@@ -123,6 +157,28 @@ fn dispatch(args: &[String]) -> Result<()> {
         // Hidden: the bundled PostToolUse `asyncRewake` hook body. Reads the hook
         // payload on stdin, waits for a background delegate, and wakes the model.
         [cmd] if cmd == "mcp-await-job" => mcp::await_job(),
+        // Hidden: CC's `apiKeyHelper` body for an api-key profile. Reads the
+        // key from `~/.clauth/profiles/<name>/config.toml` (0o600, the source
+        // of truth) and prints it to stdout so the runtime settings.json never
+        // holds the raw key. Fails closed with no stdout if the profile is
+        // missing or has no api_key.
+        [cmd, profile] if cmd == "__api-key" => cmd_api_key(profile),
+        [cmd] if cmd == "sessions" => sessions_cli::run_sessions(false),
+        [cmd, flag] if cmd == "sessions" && flag == "--json" => sessions_cli::run_sessions(true),
+        [cmd, ..] if cmd == "sessions" => Err(usage_error("usage: clauth sessions [--json]")),
+        // One verb, two meanings, split by what the argument names: a KNOWN
+        // codex profile routes to the codex carryover (fork CDX-1c), anything
+        // else is upstream's claude session resume (session id / `latest` —
+        // session ids are UUIDs, so they can't collide with a profile name).
+        [cmd, target] if cmd == "resume" => cmd_resume_dispatch(target),
+        [cmd, target, flag, value] if cmd == "resume" && flag == "--profile" => {
+            sessions_cli::run_resume(target, Some(value))
+        }
+        [cmd, ..] if cmd == "resume" => Err(usage_error(
+            "usage: clauth resume <id|latest> [--profile <name>] | clauth resume <codex-profile>",
+        )),
+        [cmd, target] if cmd == "info" => sessions_cli::run_info(target),
+        [cmd, ..] if cmd == "info" => Err(usage_error("usage: clauth info <id|latest>")),
         [cmd] if cmd == "daemon" => daemon::serve(),
         [cmd] if cmd == "doctor" => doctor::run(),
         [cmd, flag] if cmd == "status" && flag == "--json" => daemon::status_oneshot(),
@@ -131,9 +187,11 @@ fn dispatch(args: &[String]) -> Result<()> {
         }
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
-        _ => anyhow::bail!(
-            "usage: clauth [profile] | clauth start [--isolated] <profile> [args] | clauth login <profile> [--base-url <url>] [--api-key <key>] [--model <id>] [--new] [--codex] | clauth delete <profile> [--yes] [--force] | clauth which [--json] | clauth completions <bash|zsh|fish> | clauth completions install [shell]"
-        ),
+        // Unrecognized invocation: show the full command list, not a stale subset.
+        _ => {
+            print_help();
+            Ok(())
+        }
     }
 }
 
@@ -276,7 +334,12 @@ fn cmd_proxy(rest: &[String]) -> Result<()> {
     }
 }
 
-fn cmd_start(name: &str, rest: &[String], isolation: Isolation) -> Result<()> {
+fn cmd_start(
+    name: &str,
+    rest: &[String],
+    isolation: Isolation,
+    rescue_override: Option<bool>,
+) -> Result<()> {
     platform::init();
     runtime::gc_stale_runtimes();
     let config = load_config()?;
@@ -290,7 +353,57 @@ fn cmd_start(name: &str, rest: &[String], isolation: Isolation) -> Result<()> {
         }
         return start::run_codex(&canonical, rest);
     }
-    start::run(&config, &canonical, rest, isolation)
+    start::run(&config, &canonical, rest, isolation, None, rescue_override)
+}
+
+/// `clauth start`'s parsed args after the `start` token: leading clauth flags
+/// (`--isolated`, and — only under `--isolated` — `--rescue`/`--no-rescue`), the
+/// profile name, then any trailing tokens passed straight through to `claude`.
+/// The clauth flags must precede the name; the first non-flag token is the name
+/// and everything after it is `claude`'s, so a passthrough `--resume`/`-p` is
+/// never mistaken for a clauth flag. `None` on a missing name, or a
+/// `--rescue`/`--no-rescue` without `--isolated` — the caller maps that to one
+/// usage bail. Pure, so the shape is unit-testable without spawning `claude`.
+#[derive(Debug, PartialEq)]
+struct StartArgs<'a> {
+    name: &'a str,
+    isolation: Isolation,
+    rescue_override: Option<bool>,
+    claude_args: &'a [String],
+}
+
+fn parse_start_args(rest: &[String]) -> Option<StartArgs<'_>> {
+    let mut isolated = false;
+    let mut rescue_override: Option<bool> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--isolated" => isolated = true,
+            "--rescue" => rescue_override = Some(true),
+            "--no-rescue" => rescue_override = Some(false),
+            // First non-clauth-flag token is the profile name; everything after
+            // it belongs to `claude`.
+            _ => break,
+        }
+        i += 1;
+    }
+    let name = rest.get(i)?.as_str();
+    // Rescue lifts a throwaway isolated store into the global one; a shared start
+    // already writes there, so the flags without `--isolated` are a user error,
+    // rejected rather than silently no-op'd.
+    if rescue_override.is_some() && !isolated {
+        return None;
+    }
+    Some(StartArgs {
+        name,
+        isolation: if isolated {
+            Isolation::Isolated
+        } else {
+            Isolation::Shared
+        },
+        rescue_override,
+        claude_args: &rest[i + 1..],
+    })
 }
 
 /// `clauth login`'s parsed args after the `login` token: one profile name plus
@@ -556,6 +669,7 @@ fn collect_api_endpoint(
             if k.is_empty() {
                 anyhow::bail!("api key is required for an API account");
             }
+            claude::validate_api_key(k)?;
             eprintln!(
                 "clauth: warning: --api-key is visible in shell history and process listings; prefer the prompt"
             );
@@ -571,6 +685,7 @@ fn collect_api_endpoint(
             if k.is_empty() {
                 anyhow::bail!("api key is required for an API account");
             }
+            claude::validate_api_key(&k)?;
             Some(k)
         }
     };
@@ -1030,8 +1145,9 @@ fn cmd_resume(name: &str) -> Result<()> {
     let canonical = resolve_or_bail(&config, name)?;
     if !config.find(&canonical).is_some_and(|p| p.is_codex()) {
         anyhow::bail!(
-            "'{canonical}' is a claude profile — `clauth resume` is the codex carryover \
-             (a claude switch hot-swaps running sessions already)"
+            "'{canonical}' is a claude profile — `clauth resume <profile>` is the codex \
+             carryover (a claude switch hot-swaps running sessions already; to resume a \
+             claude SESSION, pass its id or `latest`)"
         );
     }
     cmd_switch_codex(config, &canonical)?;
@@ -1040,6 +1156,84 @@ fn cmd_resume(name: &str) -> Result<()> {
         .status()
         .context("failed to launch `codex resume --last` (is codex on PATH?)")?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Routes the bare two-token `clauth resume <target>`: a target naming a KNOWN
+/// codex profile takes the codex carryover; everything else (session id,
+/// `latest`) is the claude session resume. Config-lookup–based, so a claude
+/// profile name still reaches `cmd_resume`'s explanatory bail rather than a
+/// confusing "no such session".
+fn cmd_resume_dispatch(target: &str) -> Result<()> {
+    let is_profile = load_config()
+        .ok()
+        .is_some_and(|c| c.canonical_name(target).is_some());
+    if is_profile {
+        cmd_resume(target)
+    } else {
+        sessions_cli::run_resume(target, None)
+    }
+}
+
+/// `clauth __api-key <profile>` — the body CC's `apiKeyHelper` invokes per
+/// request for an api-key profile. Loads the key from the profile's
+/// `config.toml` (0o600) and prints it to stdout. The key never reaches argv
+/// (the helper command line carries only the profile name) nor the spawned
+/// CC process's env (the runtime `settings.json` writes `apiKeyHelper`, not
+/// `env.ANTHROPIC_AUTH_TOKEN`). Fails closed with no stdout if the profile
+/// is missing or carries no api_key, so a misconfigured helper surfaces as a
+/// 401, not a silent leak of some other value.
+fn cmd_api_key(name: &str) -> Result<()> {
+    let key = api_key_for_profile(name)?;
+    // `api_key_for_profile` returns Ok(Some) only when the key is non-empty;
+    // Ok(None) means the profile has no key to mint, so the helper must fail
+    // closed rather than emit a blank line CC would send as a credential.
+    let Some(key) = key else {
+        anyhow::bail!("profile '{name}' has no api_key");
+    };
+    let mut stdout = std::io::stdout().lock();
+    write_api_key(&mut stdout, &key)
+}
+
+/// Write the api_key verbatim to `writer` — NO trailing newline, NO framing.
+/// CC's `apiKeyHelper` contract does not document whether stdout is trimmed
+/// (the docs say only "any shell command that prints the current credential
+/// to stdout"), so the no-newline form strictly dominates: it is correct
+/// whether CC trims or not, whereas `key + "\n"` would only be correct under
+/// the unverified trim assumption. For a credential path, fail safe — CC
+/// reads the bytes via EOF on process exit, no line-read hang.
+fn write_api_key<W: std::io::Write>(writer: &mut W, key: &str) -> Result<()> {
+    writer
+        .write_all(key.as_bytes())
+        .context("writing api_key to stdout")?;
+    writer.flush().context("flushing api_key to stdout")
+}
+
+/// Read a profile's stored api_key from `config.toml`. Returns `Ok(None)` for
+/// a profile that exists but has no api_key, `Err` for a missing profile or
+/// unreadable config. Kept separate from [`cmd_api_key`] so the load is
+/// unit-testable without capturing stdout. An empty key reads as `None`:
+/// a credential that is whitespace-only is not a credential.
+fn api_key_for_profile(name: &str) -> Result<Option<String>> {
+    // `load_profile` is permissive — a missing `config.toml` reads as the
+    // default profile, so a helper pointing at a typo'd or deleted name would
+    // otherwise return `Ok(None)` indistinguishable from a real no-key
+    // profile. The dir-existence check fails closed with a clearer message
+    // instead; both cases still surface as exit 1 via `cmd_api_key`.
+    if !profile::profile_dir(name)?.exists() {
+        anyhow::bail!("profile '{name}' not found");
+    }
+    let profile = profile::load_profile(name)?;
+    let key = profile
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // Fail closed on a hand-edited config that poisoned the key with control
+    // chars: emitting it verbatim would inject a header, so refuse to mint.
+    if let Some(k) = key {
+        claude::validate_api_key(k)?;
+    }
+    Ok(key.map(str::to_string))
 }
 
 fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
@@ -1059,14 +1253,18 @@ fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
 
 fn print_help() {
     println!(
-        "clauth {ver}: Claude Code account switcher\n\n\
+        "clauth {ver}: launcher and account manager for claude code\n\n\
          Usage:\n  \
-           clauth [--theme=full|compatible] launch the TUI\n  \
+           clauth [--theme=full|compatible]\n                                  \
+         launch the TUI\n  \
            clauth <profile>                switch to profile by name and exit\n  \
-           clauth start [--isolated] <profile> [args]\n                                  \
+           clauth start [--isolated] [--rescue|--no-rescue] <profile> [args]\n                                  \
          launch claude with that profile's settings in a per-profile\n                                  \
          CLAUDE_CONFIG_DIR; --isolated injects creds but drops operator\n                                  \
          memory/plugins/hooks (run in a clean cwd for a blind session);\n                                  \
+         --rescue/--no-rescue (isolated only) override the auto_rescue\n                                  \
+         setting, lifting the run's transcripts + session sidecar state\n                                  \
+         into the global store;\n                                  \
          extra args go to claude. A CODEX profile instead launches\n                                  \
          `codex` in its own CODEX_HOME (profile chain, isolated\n                                  \
          history; always isolated — no --isolated flag)\n  \
@@ -1100,7 +1298,14 @@ fn print_help() {
          account fallback: a mid-conversation 429 rotates to the next\n                                  \
          chain account and replays before codex sees a byte\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
-         credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
+         .credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
+           clauth sessions [--json]        list Claude Code sessions as a table; --json\n                                  \
+         emits a stable newest-first array (exit 0/1/2)\n  \
+           clauth resume <id|latest> [--profile <name>]\n                                  \
+         resume a session under a chosen profile (prompts on a TTY,\n                                  \
+         defaulting to the session's last-ran profile; --profile forces)\n  \
+           clauth info <id|latest>         print the resume command, workspace, and\n                                  \
+         on-disk storage path for a session (never launches)\n  \
            clauth daemon                   run the headless scheduler with no TUI: refresh\n                                  \
          usage, auto-switch on exhaustion, and write ~/.clauth/status.json\n                                  \
          (the read format for the menu-bar app)\n  \
@@ -1108,13 +1313,15 @@ fn print_help() {
          as JSON (same shape the daemon writes)\n  \
            clauth doctor                   read-only health check of the daemon + macOS\n                                  \
          wiring (LaunchAgent, lock, socket, Keychain grant, version skew)\n  \
+           clauth mcp                      run the stdio MCP server (claude code\n                                  \
+         launches this)\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \
            clauth completions install [shell]\n                                  \
          install completions into the user's shell rc\n  \
            clauth --version                print version\n  \
            clauth --help                   show this help\n\n\
          Theme:\n  \
-           --theme=full        force 24-bit truecolor (default when $COLORTERM=truecolor)\n  \
+           --theme=full        force 24-bit truecolor (default when $COLORTERM=truecolor or 24bit)\n  \
            --theme=compatible  force xterm-256 palette (safe on all terminals)\n  \
            Config file:        set `theme = \"full\"` in ~/.clauth/profiles.toml",
         ver = env!("CARGO_PKG_VERSION"),

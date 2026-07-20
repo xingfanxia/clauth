@@ -183,6 +183,12 @@ pub(crate) struct Profile {
     /// headroom (issue #8 follow-up: a threshold no longer doubles as a sink
     /// marker).
     pub(crate) last_resort: bool,
+    /// Ceiling in US dollars on what the auto-switch chain may spend of this
+    /// account's pay-as-you-go budget on its own (fallback chain only, and only
+    /// while `AppState::spend_budget_switching` is on). `None`/`0` — the
+    /// default — means the chain never picks this member for spend reasons, so
+    /// stock behavior costs nothing. See `fallback::spend_armed`.
+    pub(crate) max_auto_spend: Option<f64>,
     /// Utilization % at/above which a bell toast fires in the overview tab.
     /// None = no bell for this profile.
     pub(crate) bell_threshold: Option<f64>,
@@ -211,6 +217,7 @@ impl Profile {
             check_weekly: true,
             check_scoped: true,
             last_resort: false,
+            max_auto_spend: None,
             bell_threshold: None,
             credentials: None,
             usage: None,
@@ -285,6 +292,43 @@ pub(crate) enum ThemeName {
     Compatible,
 }
 
+/// How a usage window's reset renders across the TUI (`AppState.reset_display`,
+/// issue #39). `Relative` is the shipped default and the pre-setting behavior,
+/// byte for byte.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ResetDisplay {
+    /// `resets in 40m` — countdown only.
+    #[default]
+    Relative,
+    /// `resets at 21:20` — wall-clock stamp only.
+    Clock,
+    /// `resets in 40m (21:20)` — both.
+    Both,
+}
+
+impl ResetDisplay {
+    /// Whether this mode renders a wall-clock stamp — the gate on the `clock`
+    /// Config row and on the wider overview reset column.
+    pub(crate) fn shows_clock(self) -> bool {
+        matches!(self, ResetDisplay::Clock | ResetDisplay::Both)
+    }
+}
+
+/// Wall-clock notation for the stamp [`ResetDisplay`] renders
+/// (`AppState.clock_format`). Defaults to 24-hour, matching the only other
+/// clock in the tree (`tui::render::format::clock_label`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ClockFormat {
+    /// `21:20`
+    #[default]
+    #[serde(rename = "24h")]
+    H24,
+    /// `9:20pm`
+    #[serde(rename = "12h")]
+    H12,
+}
+
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
 /// Credentials and endpoint config live in per-profile subdirectories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,10 +337,18 @@ pub(crate) struct AppState {
     pub(crate) profiles: Vec<ProfileName>,
     #[serde(default)]
     pub(crate) fallback_chain: Vec<ProfileName>,
-    /// When true and the whole chain is exhausted, auto-switch clears live
-    /// credentials and unsets the active profile instead of staying put.
-    #[serde(default)]
-    pub(crate) wrap_off: bool,
+    /// When true and the whole chain is exhausted of SUBSCRIPTION quota,
+    /// auto-switch clears live credentials and unsets the active profile
+    /// instead of staying put. Its money twin is
+    /// [`AppState::switch_off_when_budget_spent`] — see that field for why the
+    /// two are separate.
+    ///
+    /// The on-disk key stays `switch_off_when_spent`: it is also a `status.json` field
+    /// (schema 1, `wiki/daemon.md`), so renaming it would break a published read
+    /// contract and every existing profiles.toml. The Rust name says what it
+    /// does; the serde name is the compatibility surface. Don't "align" them.
+    #[serde(rename = "wrap_off", default)]
+    pub(crate) switch_off_when_spent: bool,
     /// Profiles quarantined after a *permanent* OAuth refresh rejection (AUTH-1 /
     /// Incident C) — a transient network/5xx blip never lands here. Excluded from
     /// the fallback chain walk and refused as a switch target so a dead token is
@@ -315,6 +367,33 @@ pub(crate) struct AppState {
     /// either way — see `fallback::is_exhausted_active`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) burn_aware_switching: bool,
+    /// Opt-in master switch for spending real money: when on, the auto-switch
+    /// chain may pick a member whose subscription windows are spent but whose
+    /// account still has pay-as-you-go budget, bounded by that member's
+    /// `Profile::max_auto_spend` ceiling. Off by default, and every ceiling
+    /// defaults to `$0`, so BOTH halves must be set before a cent is spent
+    /// unattended. Spend-armed members rank below every subscription member
+    /// with free quota — see `fallback::next_target`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) spend_budget_switching: bool,
+    /// What to do once a billing account has spent its `max_auto_spend` budget:
+    /// `true` (the default) switches everything off, `false` stays on it.
+    ///
+    /// Separate from [`AppState::switch_off_when_spent`] on purpose. That one
+    /// answers "the chain ran out of SUBSCRIPTION quota", where staying costs
+    /// nothing but rate-limit errors. Here staying IS the spending, so the same
+    /// words mean opposite things and an operator can legitimately want opposite
+    /// answers: stay on active when the quota runs out, switch off when the money
+    /// does. Defaults to switching off so `max auto-spend` is a real cap rather
+    /// than an entry gate. See `fallback::budget_spent`.
+    /// Unlike its `wrap_off` twin this key needs no compatibility spelling: it
+    /// has never shipped, so the on-disk name is just the field name. That is
+    /// why the pair looks lopsided in profiles.toml.
+    #[serde(
+        default = "default_switch_off_when_budget_spent",
+        skip_serializing_if = "is_true"
+    )]
+    pub(crate) switch_off_when_budget_spent: bool,
     /// Opt-in: rotate the ACTIVE, Keychain-installed profile ahead of its
     /// access-token expiry instead of waiting for a 401 (rotation coherence,
     /// #1). Off by default — stock clauth stays strictly lazy. Adoption plus
@@ -323,6 +402,14 @@ pub(crate) struct AppState {
     /// See `usage::scheduler::proactive_rotation_due`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) preemptive_rotation: bool,
+    /// Opt-in: on an `--isolated` `clauth start`, lift the run's transcripts out
+    /// of the throwaway `runtime-isolated/projects/` store into the global
+    /// `~/.claude/projects/` before the runtime is GC'd — so the session stays
+    /// resumable and its tokens count in the Tokens tab. Off by default: stock
+    /// clauth discards an isolated store on teardown, byte-for-byte. A per-run
+    /// `--rescue`/`--no-rescue` flag overrides this toggle. See `start::run`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) auto_rescue: bool,
     /// When false, the background usage fetch skips accounts already pinned at
     /// their 100% window cap (spent) until the window resets — a spent window
     /// can't change until then, so re-polling only burns quota + poll load.
@@ -336,6 +423,17 @@ pub(crate) struct AppState {
     /// detect applies when this is `None` and no flag was passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) theme: Option<ThemeName>,
+    /// Shape of every reset countdown in the TUI. `None` = the
+    /// [`ResetDisplay`] default, so an untouched profiles.toml carries neither
+    /// this key nor [`AppState::clock_format`] and renders exactly as it did
+    /// before the setting existed. Read through [`AppState::reset_display`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reset_display: Option<ResetDisplay>,
+    /// Notation for the wall-clock half of a reset stamp. Inert while
+    /// `reset_display` is `Relative` (nothing renders a clock then). `None` =
+    /// the [`ClockFormat`] default; read through [`AppState::clock_format`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) clock_format: Option<ClockFormat>,
     /// When false, burn-rate estimates ("34.4 %/h · 1h 56m left") are hidden
     /// in the Usage tab even when data is available.
     #[serde(default = "default_show_estimates", skip_serializing_if = "is_true")]
@@ -377,9 +475,36 @@ pub(crate) struct AppState {
     /// otherwise install a profile with no claude credentials.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) codex_fallback_chain: Vec<ProfileName>,
+    /// Burn-aware floor: the lowest 5h utilization at which a projected switch
+    /// may fire (`burn_aware_switching` only). The projection replaces the
+    /// static threshold with "would cross 100% before the next poll", and on a
+    /// small window (Pro) the window-relative burn %/h reads high, so the
+    /// projection trips from well below 100 — this caps the wasted headroom at
+    /// `100 - floor` on every tier. `None` = [`DEFAULT_BURN_FLOOR_PCT`]. Read
+    /// through [`AppState::burn_switch_floor_pct`], which resets a hand-edited
+    /// out-of-band value to the default. Inert unless burn-aware is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) burn_switch_floor_pct: Option<f64>,
+    /// Burn-aware horizon cap (ms): the projection looks ahead by
+    /// `min(refresh_interval, this)` instead of the full refresh interval, so a
+    /// long poll cadence can't balloon the early-switch margin (it scales
+    /// linearly with the look-ahead). `None` = [`DEFAULT_BURN_HORIZON_MS`]. Read
+    /// through [`AppState::burn_horizon_cap_ms`]. Inert unless burn-aware is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) burn_horizon_cap_ms: Option<u64>,
 }
 
 impl AppState {
+    /// The effective reset-countdown shape (unset = the stock relative form).
+    pub(crate) fn reset_display(&self) -> ResetDisplay {
+        self.reset_display.unwrap_or_default()
+    }
+
+    /// The effective wall-clock notation (unset = 24-hour).
+    pub(crate) fn clock_format(&self) -> ClockFormat {
+        self.clock_format.unwrap_or_default()
+    }
+
     /// The effective weekly exhaustion line: the configured value when it sits
     /// inside [`MIN_WEEKLY_SWITCH_PCT`]`..=`[`MAX_WEEKLY_SWITCH_PCT`], else the
     /// DEFAULT (a reset, not a clamp-to-nearest-bound: fail-safe high beats
@@ -391,6 +516,24 @@ impl AppState {
             .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v))
             .unwrap_or(DEFAULT_WEEKLY_SWITCH_PCT)
     }
+
+    /// The effective burn-aware floor, resetting an out-of-band hand-edit to the
+    /// default (same fail-safe reset-not-clamp rationale as
+    /// [`AppState::weekly_switch_threshold_pct`]).
+    pub(crate) fn burn_switch_floor_pct(&self) -> f64 {
+        self.burn_switch_floor_pct
+            .filter(|v| (MIN_BURN_FLOOR_PCT..=MAX_BURN_FLOOR_PCT).contains(v))
+            .unwrap_or(DEFAULT_BURN_FLOOR_PCT)
+    }
+
+    /// The effective burn-aware horizon cap (ms), resetting an out-of-band
+    /// hand-edit to the default. Shares the refresh-interval band since the cap
+    /// is only ever compared against — and floored by — the refresh interval.
+    pub(crate) fn burn_horizon_cap_ms(&self) -> u64 {
+        self.burn_horizon_cap_ms
+            .filter(|v| (MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS).contains(v))
+            .unwrap_or(DEFAULT_BURN_HORIZON_MS)
+    }
 }
 
 fn default_show_estimates() -> bool {
@@ -398,6 +541,13 @@ fn default_show_estimates() -> bool {
 }
 
 fn default_refresh_spent() -> bool {
+    true
+}
+
+/// A spent budget stops spending unless the operator says otherwise, so this
+/// defaults ON — unlike `switch_off_when_spent`, whose default keeps you signed in because
+/// staying costs nothing there.
+fn default_switch_off_when_budget_spent() -> bool {
     true
 }
 
@@ -440,18 +590,44 @@ pub(crate) const MIN_WEEKLY_SWITCH_PCT: f64 = 50.0;
 /// hard-cap behavior (switch only once the API already refuses).
 pub(crate) const MAX_WEEKLY_SWITCH_PCT: f64 = 100.0;
 
+/// Default burn-aware floor (percent). 98 mirrors the weekly default: a safe
+/// backstop that never lets a projected switch waste more than 2% of the
+/// window, while the horizon cap does the common-case reclaiming. Tune up for
+/// tighter margins (more window used, small rate-limit risk), 100 = only ever
+/// switch at the cap.
+pub(crate) const DEFAULT_BURN_FLOOR_PCT: f64 = 98.0;
+
+/// Lowest configurable burn-aware floor. Below this the projection may switch
+/// so far from 100 that the poll-lag margin it exists to protect is gone.
+pub(crate) const MIN_BURN_FLOOR_PCT: f64 = 90.0;
+
+/// Highest configurable burn-aware floor — 100 makes the projection fire only
+/// once utilization is already at the cap.
+pub(crate) const MAX_BURN_FLOOR_PCT: f64 = 100.0;
+
+/// Default burn-aware horizon cap (60 s). Under the default 90 s cadence this
+/// shrinks the projected look-ahead below the full interval, reclaiming most of
+/// the early-switch margin while keeping a poll-lag cushion. Bounded by the
+/// refresh interval either way (`min(interval, cap)`).
+pub(crate) const DEFAULT_BURN_HORIZON_MS: u64 = 60_000;
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
             active_profile: None,
             profiles: Vec::new(),
             fallback_chain: Vec::new(),
-            wrap_off: false,
+            switch_off_when_spent: false,
             auth_broken: Vec::new(),
             burn_aware_switching: false,
+            spend_budget_switching: false,
+            switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: false,
+            auto_rescue: false,
             refresh_spent_accounts: true,
             theme: None,
+            reset_display: None,
+            clock_format: None,
             show_estimates: true,
             show_pace: false,
             count_cache: false,
@@ -460,6 +636,8 @@ impl Default for AppState {
             weekly_switch_threshold: None,
             active_codex_profile: None,
             codex_fallback_chain: Vec::new(),
+            burn_switch_floor_pct: None,
+            burn_horizon_cap_ms: None,
         }
     }
 }
@@ -661,6 +839,8 @@ struct ProfileConfig {
     #[serde(default)]
     last_resort: bool,
     #[serde(default)]
+    max_auto_spend: Option<f64>,
+    #[serde(default)]
     bell_threshold: Option<f64>,
 }
 
@@ -722,9 +902,12 @@ pub(crate) fn app_state_mtime() -> Option<SystemTime> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ReloadFingerprint {
     profiles_toml_mtime: Option<SystemTime>,
-    /// `(profile dir name, config.toml mtime if present)`, sorted by name so
-    /// readdir order can't spuriously flip equality.
-    config_mtimes: Vec<(String, Option<SystemTime>)>,
+    /// `(profile dir name, config.toml mtime, session-token.json mtime)`, each
+    /// mtime `None` when the file is absent, sorted by name so readdir order
+    /// can't spuriously flip equality. The sidecar rides here because a
+    /// `login --setup-token` re-mint touches nothing else — without it the hot
+    /// reload never sees a new/changed long-lived token.
+    config_mtimes: Vec<(String, Option<SystemTime>, Option<SystemTime>)>,
 }
 
 /// Pure filesystem stat of the reload triggers. Holds NO locks — `config` sits
@@ -732,7 +915,7 @@ pub(crate) struct ReloadFingerprint {
 /// readdir/stat error contributes the empty value instead of erroring.
 pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     let profiles_toml_mtime = app_state_mtime();
-    let mut config_mtimes: Vec<(String, Option<SystemTime>)> = Vec::new();
+    let mut config_mtimes: Vec<(String, Option<SystemTime>, Option<SystemTime>)> = Vec::new();
     if let Ok(root) = profiles_root()
         && let Ok(entries) = std::fs::read_dir(&root)
     {
@@ -741,10 +924,16 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            let mtime = std::fs::metadata(entry.path().join("config.toml"))
-                .and_then(|m| m.modified())
-                .ok();
-            config_mtimes.push((name, mtime));
+            let mtime_of = |file: &str| {
+                std::fs::metadata(entry.path().join(file))
+                    .and_then(|m| m.modified())
+                    .ok()
+            };
+            config_mtimes.push((
+                name,
+                mtime_of("config.toml"),
+                mtime_of("session-token.json"),
+            ));
         }
     }
     config_mtimes.sort();
@@ -1045,6 +1234,14 @@ fn load_app_state() -> Result<AppState> {
     if state.weekly_switch_threshold.is_some() {
         state.weekly_switch_threshold = Some(state.weekly_switch_threshold_pct());
     }
+    // Same on-disk normalization for the burn-aware tunables: an out-of-band
+    // hand-edit must not survive to the next save or a direct field read.
+    if state.burn_switch_floor_pct.is_some() {
+        state.burn_switch_floor_pct = Some(state.burn_switch_floor_pct());
+    }
+    if state.burn_horizon_cap_ms.is_some() {
+        state.burn_horizon_cap_ms = Some(state.burn_horizon_cap_ms());
+    }
     Ok(state)
 }
 
@@ -1102,11 +1299,29 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     // Adopt a staged rotation that never committed (crash/failed write between OAuth response and save).
     let credentials = recover_pending_credentials(name, credentials);
 
-    let provider = config.base_url.as_deref().and_then(Provider::from_base_url);
+    // The OAuth-bearer leak needs BOTH a stored pair AND no api key: CC would
+    // send that bearer to the third-party base_url. Gate on the pair so a PURE
+    // api account (no pair) with a cleared key keeps its base_url shell and
+    // stays re-loginable (`clear_profile_api_key`). Normalize at the LOAD
+    // boundary, same discipline as the `max_auto_spend` case below. This governs
+    // the managed base_url FIELD only: clauth never copies `ANTHROPIC_BASE_URL`
+    // into `profile.env`, so an env override is always operator-authored and is
+    // left untouched — normalize the state clauth authors, not an explicit one.
+    let has_usable_key = config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|k| !k.is_empty());
+    let base_url = match config.base_url {
+        Some(_) if credentials.is_some() && !has_usable_key => None,
+        other => other,
+    };
+
+    let provider = base_url.as_deref().and_then(Provider::from_base_url);
     // Seed third-party usage from disk for recognised providers AND generic
     // api-key endpoints (whose discovered usage is cached the same way).
     let third_party_usage =
-        if provider.is_some() || (config.base_url.is_some() && config.api_key.is_some()) {
+        if provider.is_some() || (base_url.is_some() && config.api_key.is_some()) {
             crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
                 name,
                 crate::profile_cache::THIRD_PARTY_CACHE_FILE,
@@ -1118,7 +1333,7 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     let profile = Profile {
         name: name.into(),
         harness: config.harness,
-        base_url: config.base_url,
+        base_url,
         api_key: config.api_key,
         auto_start: config.auto_start,
         env: config.env,
@@ -1128,6 +1343,14 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
         check_weekly: config.check_weekly.unwrap_or(true),
         check_scoped: config.check_scoped.unwrap_or(true),
         last_resort: config.last_resort,
+        // Normalize at the LOAD boundary so the on-disk value is never a live
+        // trap for a direct reader (the 2026-07-14 weekly-line lesson). `inf`
+        // and `nan` are both valid TOML floats, and an infinite ceiling means
+        // unlimited unattended spending — so anything non-finite reads as $0,
+        // the never-spend default.
+        max_auto_spend: config
+            .max_auto_spend
+            .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 }),
         bell_threshold: config.bell_threshold.map(|v| v.clamp(0.0, 100.0)),
         credentials,
         usage: None,
@@ -1164,6 +1387,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 check_weekly: (!profile.check_weekly).then_some(false),
                 check_scoped: (!profile.check_scoped).then_some(false),
                 last_resort: profile.last_resort,
+                max_auto_spend: profile.max_auto_spend,
                 bell_threshold: profile.bell_threshold,
             };
             canonical != on_disk
@@ -1372,6 +1596,19 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("last_resort = true\n");
     } else {
         out.push_str("# last_resort = true\n");
+    }
+    out.push('\n');
+
+    out.push_str("# Ceiling in US dollars on what the fallback chain may spend of this\n");
+    out.push_str("# account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n");
+    out.push_str("# on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n");
+    out.push_str("# default) never spends. The chain stops using this account once its\n");
+    out.push_str("# spend reaches 90% of this or of the account's own cap, whichever is\n");
+    out.push_str("# lower — parking on a `last_resort` member if the chain has one, else\n");
+    out.push_str("# per `switch_off_when_budget_spent`.\n");
+    match profile.max_auto_spend {
+        Some(v) => out.push_str(&format!("max_auto_spend = {v}\n")),
+        None => out.push_str("# max_auto_spend = 5.0\n"),
     }
     out.push('\n');
 
