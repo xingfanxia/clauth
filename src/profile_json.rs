@@ -30,14 +30,7 @@ pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
         .and_then(|u| u.plan)
         .filter(|p| p.tier != PlanTier::Unknown);
     match fetched {
-        Some(plan) => {
-            let short = plan.tier.short_label()?;
-            Some(if plan.is_canceled() {
-                format!("{short} · canceled")
-            } else {
-                short
-            })
-        }
+        Some(plan) => plan.tier.short_label(),
         None => {
             let sub = profile
                 .credentials

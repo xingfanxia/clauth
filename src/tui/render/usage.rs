@@ -771,6 +771,25 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     let w = inner_w as usize;
     let mut rows: Vec<DiagRow> = Vec::new();
 
+    // 0. Canceled subscription DOMINATES (dead-first, above auth-broken): a
+    //    canceled account 429s `/usage` forever, so the fetch line would read
+    //    "rate limited" while the real reason is the dead subscription itself.
+    //    `blocked_reason` ranks it first for the same reason. Sourced from the
+    //    profile's cached plan (no config lock needed), so it's checked inline
+    //    rather than via `DiagFlags`.
+    if profile
+        .usage
+        .as_ref()
+        .and_then(|u| u.plan.as_ref())
+        .is_some_and(|p| p.is_canceled())
+    {
+        rows.push(DiagRow {
+            content: diag_pill_spans("canceled", theme::danger()),
+            hint: Some(diag_fix(UsageDiag::Canceled, &profile.name)),
+        });
+        return render_status_rows(rows, w);
+    }
+
     // 1. Auth-broken leads and DOMINATES (dead-first): a revoked login can't
     //    serve at all, so a kick block, spend state, or freshness/refresh line on
     //    it is moot — re-login is the only action, and `blocked_reason` ranks it
@@ -1044,6 +1063,9 @@ fn rail_hint_lines(text: &str, width: usize, more_follow: bool) -> Vec<Line<'sta
 /// it (mirrors `fallback::blocked_reason`).
 #[derive(Clone, Copy)]
 enum UsageDiag {
+    /// Subscription canceled: the org dropped to `claude_free` and `/v1/messages`
+    /// 403s, so the account can't serve at all — re-login won't fix it.
+    Canceled,
     /// Switch-grade kick block. `auto_start` flips the fix (the flagship
     /// divergence): an auto_start account self-recovers, a manual one won't.
     KickSwitchGrade { auto_start: bool },
@@ -1071,6 +1093,7 @@ enum UsageDiag {
 /// the poll-paced re-test (7bbeae4), a manual one sits until the ceiling.
 fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
     match diag {
+        UsageDiag::Canceled => "this subscription has been canceled".to_string(),
         UsageDiag::KickSwitchGrade { auto_start: true } => {
             "clauth is re-testing periodically".to_string()
         }

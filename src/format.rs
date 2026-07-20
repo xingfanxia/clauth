@@ -101,12 +101,7 @@ pub(crate) fn endpoint_label(profile: &Profile) -> String {
 }
 
 pub(crate) fn plan_label(plan: &PlanInfo) -> String {
-    let tier = plan.tier.display();
-    if plan.is_canceled() {
-        format!("{tier} · canceled")
-    } else {
-        tier
-    }
+    plan.tier.display()
 }
 
 #[cfg(test)]
