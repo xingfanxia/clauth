@@ -448,10 +448,6 @@ fn gc_one_runtime(name: &str, isolation: Isolation) -> Result<()> {
 /// [`has_live_session`], which also counts shared sessions) and on the projects
 /// dir existing, so a shared-only or not-yet-written runtime is skipped.
 /// Fail-soft: an unreadable profiles root or entry is skipped, never an error.
-#[allow(
-    dead_code,
-    reason = "consumed by the session index (src/sessions.rs), wired into a surface in a later phase"
-)]
 pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
     let Ok(root) = profiles_root_dir() else {
         return Vec::new();

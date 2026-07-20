@@ -1474,3 +1474,42 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   layer 1). Rescue layer explicitly kept out of on-mismatch.
 - Waiting on maintainer: #55 re-review (defaults still vetoable), #51 (he
   refactors first), #47 option-shape verdict.
+
+## 2026-07-20 (UPS-2) — sustainable sync: true merge of upstream/mommy (70 commits)
+
+AX call: "重新match一波upstream,不只是cherry pick,要 sustainable". Ended the
+squash-rebase era — fork main now tracks upstream by periodic true merges
+(contract in `docs/fork-sync/SYNC.md`, the durable artifact of this round).
+Merge commit `c112469` on `sync/upstream-2026-07-20` → ff'd to main.
+
+- Divergence at merge time: merge-base `1470147` (07-16), upstream +70 /
+  fork +33. 32 conflicted files, ~90 hunks. Mechanical hunks applied by a
+  per-file decision script; 39 custom hunks hand-composed off 4 parallel
+  subsystem briefs (Workflow, opus) + 3 adversarial verifiers (all CLEAN,
+  audit trails in the session's workflow journals).
+- Adopted upstream wholesale: sessions subsystem (index/resume/info +
+  isolated-session rescue), opt-in spend budget (max_spend, spend-armed
+  passes, `switch_off_when_budget_spent`), single-usage-snapshot scheduler
+  walk (0ba3538 — the free-vs-paid race fix), burn floor/horizon bounds,
+  fresh-read two-pass preference, canceled-subscription exclusion,
+  settings sync + jsonsync + burn.rs, apiKeyHelper, owner-only dirs,
+  wrap_off→switch_off_when_spent rename (status.json key stays `wrap_off`),
+  TUI rework (config banding, block-reason pills, session_token_lines,
+  reset clocks, max-spend editor).
+- Fork re-expressed on the new shapes: SCW-1/2 folded lines ride
+  ChainMember beside max_spend; `scoped_blocked_from_usage` replaces the
+  store twin; walk = headroom(fresh→any, scoped-gated, member soft lines) →
+  serving sink(hard) → spend → dead sink → halt(hard), verified pass-for-pass
+  identical across both twins. THREE upstream literal-100 sites converted to
+  hard predicates (the #55 bug class under fork folding — `blocked_reason`
+  WeeklySpent + both next_target sink sites). `clauth resume` collision:
+  known codex profile → carryover, else upstream session resume
+  (`cmd_resume_dispatch`). settings sync + env-key union skip codex-harness
+  dirs (`is_codex_profile_dir`, new test). Overview route column + usage-tab
+  active pill/account rows + keychain-first ordering + CLA-SPLIT guards all
+  survived (adversarially verified, not assumed).
+- Evidence: 1538 tests green (both parents' suites — upstream's spend tests
+  pass against the composed walk, fork's scoped tests against the snapshot
+  shape), clippy 0, fmt clean; release binary smoke-tested read-only
+  (status.json carries schema 1 + fork fields + 6 profiles; completions
+  carry sessions/resume). Deployed same session (daemon + proxy restart).
