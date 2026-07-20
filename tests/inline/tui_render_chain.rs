@@ -167,18 +167,12 @@ fn usage_gate_rows_hint_the_current_state() {
     let mut p = profile("a", 95.0, 20.0, 3600);
     p.check_weekly = false;
     let off = texts(p, 2);
-    assert!(
-        off.iter().any(|t| t.contains("isn't checked")),
-        "{off:?}"
-    );
+    assert!(off.iter().any(|t| t.contains("isn't checked")), "{off:?}");
 
     // FALLBACK_ROWS[3] == CheckScoped.
     let on = texts(profile("a", 95.0, 20.0, 3600), 3);
     assert!(on.iter().any(|t| t.contains("scoped gate")), "{on:?}");
-    assert!(
-        on.iter().any(|t| t.contains("per-model week")),
-        "{on:?}"
-    );
+    assert!(on.iter().any(|t| t.contains("per-model week")), "{on:?}");
     let mut p = profile("a", 95.0, 20.0, 3600);
     p.check_scoped = false;
     let off = texts(p, 3);
@@ -552,7 +546,19 @@ fn blocked_member_shows_the_worst_reason_pill() {
 fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
     let until = now_epoch_secs() + 7200;
-    let lines = member_detail(&cfg, "a", false, 0, false, None, None, None, 60, Some(until)).0;
+    let lines = member_detail(
+        &cfg,
+        "a",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        60,
+        Some(until),
+    )
+    .0;
     let pill = line_text(&lines[0]);
     // Bare pill + a faint countdown suffix OUTSIDE the brackets (no `·`), the
     // same shape the Usage-tab kick pill renders. The exact bucket stays tolerant
@@ -613,7 +619,8 @@ fn headroom_member_shows_no_reason_pill() {
 #[test]
 fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_height() {
     let at_width = |cfg: &AppConfig, width: usize| -> (usize, usize) {
-        let (lines, rows_start) = member_detail(cfg, "a", false, 0, false, None, None, None, width, None);
+        let (lines, rows_start) =
+            member_detail(cfg, "a", false, 0, false, None, None, None, width, None);
         let first_row_at = lines
             .iter()
             .position(|l| line_text(l).contains("rotate at"))
@@ -974,7 +981,9 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
         .expect("weekly at row renders");
     assert!(row.contains("chain default"), "{row}");
     assert!(
-        unset.iter().any(|t| t.contains("follows the chain-wide weekly limit")),
+        unset
+            .iter()
+            .any(|t| t.contains("follows the chain-wide weekly limit")),
         "{unset:?}"
     );
 
@@ -988,7 +997,8 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
     assert!(row.contains("90%"), "{row}");
     assert!(row.contains("default:"), "{row}");
     assert!(
-        set.iter().any(|t| t.contains("switches away once weekly usage hits 90%")),
+        set.iter()
+            .any(|t| t.contains("switches away once weekly usage hits 90%")),
         "{set:?}"
     );
 

@@ -3223,7 +3223,9 @@ fn fallback_usage_gate_toggles_persist() {
     app.fallback_detail_cursor = 2; // FALLBACK_ROWS[2] == CheckWeekly
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
     assert_eq!(
-        app.config().find("a").map(|p| (p.check_weekly, p.check_scoped)),
+        app.config()
+            .find("a")
+            .map(|p| (p.check_weekly, p.check_scoped)),
         Some((false, true)),
         "space flips only the weekly gate"
     );
@@ -3231,7 +3233,9 @@ fn fallback_usage_gate_toggles_persist() {
     app.fallback_detail_cursor = 3; // FALLBACK_ROWS[3] == CheckScoped
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
     assert_eq!(
-        app.config().find("a").map(|p| (p.check_weekly, p.check_scoped)),
+        app.config()
+            .find("a")
+            .map(|p| (p.check_weekly, p.check_scoped)),
         Some((false, false)),
         "⏎ flips only the scoped gate"
     );
@@ -4340,7 +4344,10 @@ fn fallback_weekly_override_editor_sets_and_clears() {
     }
     super::handle_key(&mut app, key(KeyCode::Enter));
     assert!(app.fallback_weekly_draft.is_some(), "invalid stays open");
-    assert_eq!(app.config().find("a").and_then(|p| p.weekly_threshold), None);
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        None
+    );
 }
 
 // The override row is inert while the member's weekly gate is off — the line

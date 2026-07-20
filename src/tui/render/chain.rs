@@ -2,8 +2,9 @@
 //! chain (plus a trailing `+ add` row), cursor = `❯`, `#n` chain position, active
 //! member name in orange. Right: the selected member's rotation card — labeled
 //! key:value rows (`5h usage` gauge with a threshold tick, `rotate at`
-//! threshold stepper, `weekly gate` + `scoped gate` per-account usage-check
-//! toggles, `last resort` toggle, `max spend` ceiling, `remove`) — or,
+//! threshold stepper, `weekly at` per-account weekly-line override, `weekly
+//! gate` + `scoped gate` per-account usage-check toggles, `last resort`
+//! toggle, `max spend` ceiling, `remove`) — or,
 //! on `+ add`, a candidate picker. Order = priority (reorder with ⇧↑↓). The
 //! chain-global wrap-off and spend-budget settings live on the Config tab, not
 //! here. Editing happens in place: ⏎ on the left drops focus into the right
@@ -782,7 +783,11 @@ fn detail_row(
                 }
                 None => match weekly_override {
                     Some(v) => {
-                        let value_style = if dimmed { theme::faint() } else { theme::accent() };
+                        let value_style = if dimmed {
+                            theme::faint()
+                        } else {
+                            theme::accent()
+                        };
                         spans.push(Span::styled(format!("{v:.0}%"), value_style));
                         spans.push(Span::styled(
                             format!("   default: {weekly_default:.0}%"),

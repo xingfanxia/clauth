@@ -144,10 +144,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             DiagFlags {
                 auth_broken: cfg.is_auth_broken(&profile.name),
                 auto_start: profile.auto_start,
-                weekly_hard: crate::fallback::weekly_blocked(
-                    profile,
-                    crate::fallback::WEEKLY_HARD_BLOCK_PCT,
-                ),
+                weekly_hard: crate::fallback::weekly_hard_blocked(profile),
                 budget_spent: crate::fallback::budget_spent_blocking(&cfg, profile),
                 spend_uncapped: crate::fallback::spend_is_uncapped(&cfg, ceiling),
             }

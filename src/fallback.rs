@@ -1026,15 +1026,10 @@ pub(crate) fn next_target(
     // existing "once on a sink, don't hop to another" rule (a DEAD sink active
     // keeps its stay-put-or-spend behavior below).
     let active_is_last_resort = config.find(active).is_some_and(|p| p.last_resort);
-    if active_is_last_resort
-        && config
-            .find(active)
-            .is_some_and(|p| !is_exhausted(p, WEEKLY_HARD_BLOCK_PCT))
-    {
+    if active_is_last_resort && config.find(active).is_some_and(|p| !is_exhausted_hard(p)) {
         return None;
     }
-    if !active_is_last_resort
-        && let Some(name) = walk(&|p| p.last_resort && !is_exhausted(p, WEEKLY_HARD_BLOCK_PCT))
+    if !active_is_last_resort && let Some(name) = walk(&|p| p.last_resort && !is_exhausted_hard(p))
     {
         return Some(SwitchAction::To(name));
     }
@@ -1230,8 +1225,7 @@ fn next_auto_switch_target_with_usage(
     // gates AND — per the member's own `check_scoped` gate — every per-model
     // weekly window (see `scoped_weekly_blocked_info`).
     let clear = |m: &ChainMember| {
-        !is_exhausted_from_usage(m, usage, m.weekly_line)
-            && !scoped_blocked_from_usage(m, usage)
+        !is_exhausted_from_usage(m, usage, m.weekly_line) && !scoped_blocked_from_usage(m, usage)
     };
 
     if !active_broken && !active_kick_rejected && !active_canceled && !active_exhausted {
@@ -1267,15 +1261,12 @@ fn next_auto_switch_target_with_usage(
     // "don't hop between sinks" rule — a DEAD sink active keeps its
     // stay-put-or-spend behavior below).
     let active_is_last_resort = active.last_resort;
-    if active_is_last_resort
-        && !is_exhausted_from_usage(active, usage, WEEKLY_HARD_BLOCK_PCT)
-    {
+    if active_is_last_resort && !is_exhausted_from_usage(active, usage, WEEKLY_HARD_BLOCK_PCT) {
         return None;
     }
     if !active_is_last_resort
-        && let Some(name) = walk(&|m| {
-            m.last_resort && !is_exhausted_from_usage(m, usage, WEEKLY_HARD_BLOCK_PCT)
-        })
+        && let Some(name) =
+            walk(&|m| m.last_resort && !is_exhausted_from_usage(m, usage, WEEKLY_HARD_BLOCK_PCT))
     {
         return Some(SwitchAction::To(name));
     }
