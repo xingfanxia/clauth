@@ -2259,6 +2259,18 @@ pub(crate) fn spawn_refresher(
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
 ) {
+    // Seed kick blocks from the per-profile cache files on the CALLING thread
+    // so a restart mid-outage resumes the decayed retry clock instead of
+    // hammering. Must happen here, not inside the spawned closure below:
+    // nothing joins that thread, so a home-derived path resolved on it could
+    // outlive a test's `HOME_OVERRIDE` and read the operator's real home. See
+    // the 2026-06-06 convention in docs/internals.md.
+    let names: Vec<String> = tokens
+        .lock()
+        .map(|t| t.iter().map(|e| e.name.clone()).collect())
+        .unwrap_or_default();
+    sync_kick_blocks_from_cache(&kick_blocks, &names);
+
     let state = SchedulerState {
         config,
         tokens,
@@ -2281,18 +2293,17 @@ pub(crate) fn spawn_refresher(
         fetch_lease,
         standdown_active: AtomicBool::new(false),
     };
+    // Same test-skip rationale as the status/tokens/pricing workers in
+    // `tui/app.rs`: a detached tick thread is never joined, so it could run
+    // `tick()` — which itself resolves home-derived paths and makes network
+    // calls — after a test's `HOME_OVERRIDE` sandbox has already unwound.
+    if cfg!(test) {
+        return;
+    }
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
     std::thread::Builder::new()
         .name("clauth-tick".into())
         .spawn(move || {
-            // Seed kick blocks from the per-profile cache files so a restart
-            // mid-outage resumes the decayed retry clock instead of hammering.
-            let names: Vec<String> = state
-                .tokens
-                .lock()
-                .map(|t| t.iter().map(|e| e.name.clone()).collect())
-                .unwrap_or_default();
-            sync_kick_blocks_from_cache(&state.kick_blocks, &names);
             loop {
                 if state.shutting_down.load(Ordering::SeqCst) {
                     break;

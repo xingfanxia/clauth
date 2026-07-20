@@ -3804,18 +3804,12 @@ fn bootstrap_app(_home: &crate::testutil::HomeSandbox, status: FetchStatus) -> A
         s.insert(BOOT_SPARE.to_string(), FetchStatus::Fresh);
     }
 
-    // `finish_bootstrap` starts the real scheduler thread. Raise the shutdown
-    // flag it already honours (checked at the loop top, ahead of its first sleep)
-    // so no tick ever runs — nothing fetches, nothing decides. The one-shot under
-    // test never reads the flag.
-    //
-    // What the flag does NOT stop is the worker's pre-loop kick-block seed, which
-    // resolves home ON the worker thread and is never joined, so it can outlive
-    // this sandbox and read against the real home — the escape docs/internals.md's
-    // 2026-06-06 convention exists to prevent. Named, not hidden: the seed only
-    // ever reads, so the escape is inert (it can neither write outside the sandbox
-    // nor reach anything these assertions observe) and stays inert only while that
-    // holds. Tracked in docs/todo.md.
+    // `finish_bootstrap` starts the real scheduler via `spawn_refresher`, which
+    // now skips spawning the tick thread under `cfg!(test)` (its kick-block
+    // seed already ran synchronously, on this thread, before that check) — so
+    // no tick ever runs and nothing can resolve home past this sandbox. The
+    // flag store below is now belt-and-suspenders: the one-shot under test
+    // never reads it.
     app.shutting_down.store(true, Ordering::SeqCst);
 
     app.startup_sender

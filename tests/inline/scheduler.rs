@@ -3409,3 +3409,70 @@ fn scan_recovery_queues_a_recovered_chain_member() {
         "a recovered chain member must be queued for switch"
     );
 }
+
+/// `spawn_refresher`'s kick-block seed must run on the CALLING thread, not
+/// inside the spawned tick worker: nothing joins that worker, so a home-
+/// derived path resolved on it could outlive a test's `HOME_OVERRIDE` and read
+/// the operator's real home — live the moment the seed grows a write leg
+/// (docs/internals.md's 2026-06-06 convention). Entering through
+/// `spawn_refresher` itself (never `sync_kick_blocks_from_cache` directly) is
+/// the only way to pin WHERE the seed runs; asserting immediately after return,
+/// with no sleep or yield, is what makes the race decide against a broken
+/// version instead of racing it.
+#[test]
+fn spawn_refresher_seeds_kick_blocks_before_returning() {
+    use super::{KickBlock, KickBlocks, spawn_refresher};
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{KICK_BLOCK_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let cached = KickBlock {
+        streak: 3,
+        rejected: true,
+        until: Some(1_700_000_600),
+        next_retry: 1_700_000_100,
+    };
+    write_profile_cache("kitty", KICK_BLOCK_CACHE_FILE, &cached);
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    }));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    spawn_refresher(
+        config,
+        Arc::new(RankedMutex::new(vec![token("kitty")])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::clone(&kick_blocks),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(false)),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        // Pre-armed shutdown: if the `cfg!(test)` spawn-skip is ever removed
+        // while the seed hoist stays, the tick thread this would spawn breaks
+        // at its loop-top check instead of looping past this sandbox teardown.
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(crate::daemon::FetchLease::new()),
+    );
+
+    // `cfg!(test)` makes `spawn_refresher` return without ever spawning the
+    // tick thread, so the seed above is the ONLY thing that could have
+    // populated `kick_blocks` — this is what pins the seed synchronous.
+    assert_eq!(
+        kick_blocks.lock().unwrap().get("kitty").copied(),
+        Some(cached),
+        "the on-disk kick block must be seeded before spawn_refresher returns"
+    );
+}
