@@ -13,7 +13,7 @@ const BASH: &str = r#"_clauth() {
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles} start login delete which status daemon doctor completions" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--base-url --api-key --model --new" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--base-url --api-key --model --new --codex --browser --setup-token --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated" -- "${cur}") )
     elif [ "$prev" = "--isolated" ]; then
@@ -65,7 +65,7 @@ _clauth() {
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == completions ]]; then
         _values 'arg' 'bash' 'zsh' 'fish' 'install[install into the shell rc]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
-        _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--model[set the default model before signing in]' '--new[refuse to touch an existing profile]'
+        _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--model[set the default model before signing in]' '--new[refuse to touch an existing profile]' '--codex[codex profile: capture the current codex login]' '--browser[codex profile: fresh browser sign-in]' '--setup-token[capture a claude setup-token mint as a long-lived login]' '--yes[replace an existing long-lived token unprompted]' '-y[replace an existing long-lived token unprompted]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]'
     fi
@@ -94,6 +94,10 @@ complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "A
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --api-key -d "API key (prompted echo-off if omitted)"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --model -d "Set default model before signing in"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --new -d "Refuse to touch an existing profile"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --codex -d "Codex profile: capture the current codex login"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --browser -d "Codex profile: fresh browser sign-in"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --setup-token -d "Capture a claude setup-token mint as a long-lived login"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --yes -d "Replace an existing long-lived token unprompted"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --force -d "Override the live-session guard"

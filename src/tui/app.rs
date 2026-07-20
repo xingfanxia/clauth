@@ -7001,11 +7001,7 @@ fn update_banner(app: &mut App) {
     // member still serves — calling it spent would be a lie the code disagrees with.
     let cfg = app.config();
     let no_active = !cfg.profiles.is_empty() && cfg.state.active_profile.is_none();
-    let any_spent = no_active
-        && cfg
-            .profiles
-            .iter()
-            .any(|p| crate::fallback::is_exhausted(p, crate::fallback::WEEKLY_HARD_BLOCK_PCT));
+    let any_spent = no_active && cfg.profiles.iter().any(crate::fallback::is_exhausted_hard);
     // A quarantined login was previously INVISIBLE on the Overview (only a
     // switch attempt toasted it): the row's fetch state shows the 429/cached
     // MASK of the dead login, and the operator chased a rate limit while the

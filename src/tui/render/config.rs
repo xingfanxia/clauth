@@ -226,8 +226,11 @@ fn session_token_line(status: &crate::claude::SessionTokenStatus, now_ms: i64) -
     use crate::claude::SessionTokenStatus;
     let (text, style) = match status {
         SessionTokenStatus::LongLived(Some(ms)) => {
+            // Gate expiry on the clock, not the truncated day count: integer
+            // division reads a token expired <24h ago as `days == 0`, which
+            // mislabeled it "~0d" WARNING instead of the DANGER re-mint hint.
             let days = (ms - now_ms) / 86_400_000;
-            if days < 0 {
+            if now_ms >= *ms {
                 (
                     "expired · re-mint: claude setup-token".to_string(),
                     theme::danger(),
@@ -238,10 +241,7 @@ fn session_token_line(status: &crate::claude::SessionTokenStatus, now_ms: i64) -
                     theme::warning(),
                 )
             } else {
-                (
-                    format!("long-lived · expires in ~{days}d"),
-                    theme::accent(),
-                )
+                (format!("long-lived · expires in ~{days}d"), theme::accent())
             }
         }
         SessionTokenStatus::LongLived(None) => (

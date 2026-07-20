@@ -56,7 +56,6 @@ fn model_cycle_appends_a_custom_id_without_brackets() {
     );
 }
 
-
 // ── CLA-SPLIT: the `token` long-lived-login status row ──────────────────────
 
 // The row states the horizon in days and escalates: accent while comfortable,
@@ -69,7 +68,10 @@ fn long_lived_token_row_counts_down_and_escalates() {
     let day = 86_400_000_i64;
     let now = 1_700_000_000_000_i64;
 
-    let comfy = line_text(&session_token_line(&S::LongLived(Some(now + 340 * day)), now));
+    let comfy = line_text(&session_token_line(
+        &S::LongLived(Some(now + 340 * day)),
+        now,
+    ));
     assert!(comfy.contains("token"), "{comfy}");
     assert!(comfy.contains("long-lived · expires in ~340d"), "{comfy}");
 
@@ -89,6 +91,19 @@ fn long_lived_token_row_counts_down_and_escalates() {
     assert!(
         dead.spans.iter().any(|s| s.style == theme::danger()),
         "expired is DANGER"
+    );
+
+    // Sub-day expiry: integer day-division reads this as `days == 0`, which
+    // once mislabeled it "~0d" WARNING — the gate is the clock, not the count.
+    let just_dead = session_token_line(&S::LongLived(Some(now - 1)), now);
+    let just_dead_text = line_text(&just_dead);
+    assert!(
+        just_dead_text.contains("re-mint: claude setup-token"),
+        "expired <24h ago must read expired, not ~0d: {just_dead_text}"
+    );
+    assert!(
+        just_dead.spans.iter().any(|s| s.style == theme::danger()),
+        "sub-day expiry is DANGER, not WARNING"
     );
 
     let unstamped = line_text(&session_token_line(&S::LongLived(None), now));

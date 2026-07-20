@@ -867,6 +867,44 @@ fn session_token_live_is_linked_and_snapshot_keeps_usage_oauth() {
     );
 }
 
+/// The FORCE path is guarded too: a session-side re-login left a rotating
+/// pair in the live slot and the operator confirmed Overwrite (or the CLI
+/// reconciled switch fired). For a session-token profile that capture must be
+/// a no-op — the confirmed Overwrite must not be the one path that can
+/// destroy the clauth-private usage pair.
+#[test]
+fn force_snapshot_never_clobbers_a_session_token_profiles_usage_pair() {
+    let _home = HomeSandbox::new();
+    let mut config = seed_relogin_scenario(
+        "split",
+        creds("usage-access", Some("usage-refresh")),
+        creds("relogin-access", Some("relogin-refresh")),
+    );
+    fill_session_token_by_hand("split", "oat-access");
+
+    force_snapshot_active_credentials(&mut config).expect("force snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("split")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("usage-refresh"),
+        "the confirmed Overwrite must leave the usage OAuth pair untouched",
+    );
+    assert_eq!(
+        config
+            .find("split")
+            .and_then(|p| p.credentials.as_ref())
+            .and_then(|c| c.refresh_token()),
+        Some("usage-refresh"),
+        "the in-memory store must keep the usage pair too",
+    );
+}
+
 /// A switch to a session-token profile links the LIVE slot to
 /// `session-token.json` — the rotating usage pair is never installed, and it
 /// survives the switch on disk byte-for-byte.
@@ -935,7 +973,10 @@ fn validate_setup_token_accepts_a_mint_and_rejects_bad_pastes() {
         validate_setup_token(&format!("Setup token: {good}")).is_err(),
         "paste with prompt text has interior whitespace"
     );
-    assert!(validate_setup_token("sk-ant-short").is_err(), "truncated paste");
+    assert!(
+        validate_setup_token("sk-ant-short").is_err(),
+        "truncated paste"
+    );
 }
 
 /// The capture writes a sidecar the whole CLA-SPLIT machinery recognises:

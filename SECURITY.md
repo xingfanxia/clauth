@@ -25,6 +25,7 @@ clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift
 |------|----------|-----------|
 | `~/.clauth/` (root) | everything below | dir `0700` |
 | `~/.clauth/profiles/<name>/credentials.json` | OAuth token snapshot | file `0600`, dirs `0700` |
+| `~/.clauth/profiles/<name>/session-token.json` | long-lived `claude setup-token` login, if captured (sessions run on this; no refresh token) | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/config.toml` | base URL, API key (endpoint profiles), env block | `0600` |
 | `~/.clauth/profiles/<name>/usage_cache.json` | last-known utilization and plan | `0600` |
 | `~/.clauth/profiles/<name>/runtime/settings.json` | per-session Claude Code settings (an endpoint profile's API key rides here as `ANTHROPIC_AUTH_TOKEN`) | `0600` |

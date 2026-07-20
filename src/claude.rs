@@ -87,10 +87,14 @@ pub(crate) fn validate_setup_token(raw: &str) -> Result<String> {
         anyhow::bail!("no token pasted");
     }
     if !token.starts_with("sk-ant-") {
-        anyhow::bail!("that doesn't look like a `claude setup-token` mint (expected an sk-ant-… value)");
+        anyhow::bail!(
+            "that doesn't look like a `claude setup-token` mint (expected an sk-ant-… value)"
+        );
     }
     if token.chars().any(char::is_whitespace) {
-        anyhow::bail!("the pasted token contains whitespace — looks like a partial or padded paste");
+        anyhow::bail!(
+            "the pasted token contains whitespace — looks like a partial or padded paste"
+        );
     }
     if token.len() < 40 {
         anyhow::bail!("the pasted token is too short to be a real mint");
@@ -780,6 +784,16 @@ pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Resul
         let Some(active) = config.state.active_profile.clone() else {
             return Ok(());
         };
+        // CLA-SPLIT: a profile running on its static long-lived token carries
+        // nothing to snapshot — the live slot holds the token (or a
+        // session-side re-login), and capturing either into
+        // `profile.credentials` would clobber the clauth-private usage OAuth
+        // pair. The non-force snapshot already guards this; the confirmed
+        // Overwrite must not be the one path that can destroy the pair.
+        // `clauth login` is the supported way to refresh the usage pair.
+        if has_session_token(&active) {
+            return Ok(());
+        }
         let live = read_claude_credentials()?;
         let captured_login = live.is_some();
         save_live_credentials(config, &active, live)?;
