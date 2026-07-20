@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::logline::logline;
 use crate::pricing::PriceTable;
-use crate::profile::{atomic_write_600, claude_dir, clauth_dir};
+use crate::profile::{atomic_write_600, claude_dir, clauth_dir, mkdir_700};
 
 /// Bytes read from a file's head to recover its workspace and first user
 /// message. The session id comes from the filename stem, not the head, so this
@@ -749,8 +749,17 @@ pub(crate) fn rescue_move(src: &Path, dst: &Path) -> std::io::Result<()> {
     // and lets the post-rename verify compare the landed bytes against these.
     let bytes = std::fs::read(src)?;
 
+    // Owner-only from birth, matching the files landing inside it: `~/.claude/`
+    // is world-traversable, so a plain `create_dir_all` would leave a rescued
+    // `sessions/`, `paste-cache/`, etc. at the process umask (typically 0755),
+    // letting another local user list session ids even though the files
+    // themselves stay 0600. Birth only, not a retighten: a dir this call finds
+    // already on disk (e.g. left loose by a pre-fix build) keeps its existing
+    // mode, same as `enforce_clauth_perms`'s own no-op-on-existing behavior —
+    // and that retighten walk is scoped to `~/.clauth` only, deliberately never
+    // `~/.claude`, which clauth does not own outright.
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
+        mkdir_700(parent)?;
     }
     let dir = dst.parent().unwrap_or_else(|| Path::new("."));
     let file_name = dst

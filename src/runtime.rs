@@ -1288,7 +1288,10 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
                 .with_context(|| format!("failed to create {}", b.display()))?;
         }
         if b_is_dir && !a.exists() {
-            std::fs::create_dir_all(a)
+            // `a` is the canonical `~/.claude/` side (see `mirror_tree`'s callers) —
+            // owner-only like every other dir clauth creates there, not the
+            // process umask, matching the rescue path's `mkdir_700` invariant.
+            crate::profile::mkdir_700(a)
                 .with_context(|| format!("failed to create {}", a.display()))?;
         }
         for name in union_children(a, b) {

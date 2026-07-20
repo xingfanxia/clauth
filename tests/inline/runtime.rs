@@ -575,6 +575,41 @@ fn mirror_tree_seeds_runtime_only_nested_to_canonical() {
     );
 }
 
+/// A dir `mirror_tree` seeds back onto the canonical `~/.claude/` side (the
+/// runtime side created it first, e.g. CC writing a fresh session-state tree
+/// under the runtime's `CLAUDE_CONFIG_DIR`) must land owner-only like every
+/// other dir clauth creates under `~/.claude/`, not at the process umask
+/// (typically 0755) — same invariant as the rescue path, different trigger
+/// (the Fake-symlink-mode watchdog tick instead of isolated-runtime teardown).
+#[cfg(unix)]
+#[test]
+fn mirror_tree_creates_canonical_side_dir_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(claude.join("projects")).expect("mkdir claude/projects");
+    fs::create_dir_all(runtime.join("projects").join("new")).expect("mkdir runtime nested");
+    fs::write(
+        runtime.join("projects").join("new").join("state.json"),
+        br#"{"step":1}"#,
+    )
+    .expect("write runtime");
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    let mode = fs::metadata(claude.join("projects").join("new"))
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "a dir mirror_tree creates under ~/.claude must not land at the process umask"
+    );
+}
+
 #[test]
 fn mirror_tree_seeds_canonical_only_nested_to_runtime() {
     let tmp = tempfile::tempdir().expect("tempdir");

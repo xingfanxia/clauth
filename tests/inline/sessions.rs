@@ -802,6 +802,33 @@ fn rescue_move_verifies_then_removes_and_noops_same_path() {
     assert!(dst.exists());
 }
 
+/// `rescue_move` creates a not-yet-present parent dir. `~/.claude/sessions/` and
+/// its kin must land owner-only like the files inside them, not at the process
+/// umask (typically 0755) — a world-traversable tree still lets another local
+/// user list session ids even though the files themselves stay 0600.
+#[cfg(unix)]
+#[test]
+fn rescue_move_creates_parent_dir_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sb = HomeSandbox::new();
+    let src = sb.home().join("src/b.jsonl");
+    let dst = sb.home().join("dst/deep/b.jsonl");
+    write_jsonl(&src, &[user_line("b", "/w", "payload")]);
+
+    rescue_move(&src, &dst).unwrap();
+
+    let mode = fs::metadata(dst.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "a parent dir rescue_move creates must not land at the process umask"
+    );
+}
+
 // ── Sidecar rescue: CC's session state next to the transcripts ──
 //
 // Roots here are the runtime ROOT (the CC config dir), not its `projects/`
