@@ -3717,3 +3717,186 @@ fn apply_usage_cached_status_skips_bell_and_history_append() {
         "Cached must not append a phantom history entry (file must be byte-identical)",
     );
 }
+
+// ── finish_bootstrap's Fresh-only auto-switch gate ───────────────────────────
+//
+// The startup switch one-shot is a switch DECISION taken off numbers nobody
+// re-verified this run. A Cached / RateLimited / Failed read is unverified in
+// either direction, so acting on it can relink live credentials over a window
+// the account no longer has; those profiles are due on the scheduler's first
+// tick, which fetches first and decides off the corrected numbers.
+//
+// The seam: `usage_store` + `usage_status` are exactly what the bootstrap
+// worker fills before it posts `StartupSignal::BootstrapDone`, and
+// `finish_bootstrap` reads the gate off `apply_usage`'s copy of them — so
+// seeding the maps and sending the signal is indistinguishable from a real
+// bootstrap landing.
+
+const BOOT_SPENT: &str = "spent";
+const BOOT_SPARE: &str = "spare";
+
+/// 5h window at `utilization` with a reset an hour out — the exhaustion
+/// predicates only trust a window they can prove live.
+fn boot_window(utilization: f64) -> UsageWindow {
+    UsageWindow {
+        utilization,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + 3600,
+        )),
+    }
+}
+
+/// Drive one bootstrap tail over the caller-held sandbox with `status` as the
+/// ACTIVE profile's last read. Everything else — chain, windows, credentials,
+/// the spare's own Fresh status — is identical across calls, so `status` is the
+/// only variable between the two directions.
+fn bootstrap_app(_home: &crate::testutil::HomeSandbox, status: FetchStatus) -> App {
+    use super::{StartupSignal, drain_startup_signals};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+
+    let mk = |name: &str| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds_ra(&format!("rt-{name}"), &format!("at-{name}")));
+        save_profile(&p).expect("save profile");
+        p
+    };
+    let spent = mk(BOOT_SPENT);
+    let spare = mk(BOOT_SPARE);
+    // The live file is the ACTIVE account's captured mirror: the relink has no
+    // uncaptured login to strand, so a decided switch actually lands.
+    write_live_creds(spent.credentials.as_ref().expect("spent credentials"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(BOOT_SPENT.into()),
+            profiles: vec![BOOT_SPENT.into(), BOOT_SPARE.into()],
+            fallback_chain: vec![BOOT_SPENT.into(), BOOT_SPARE.into()],
+            ..AppState::default()
+        },
+        profiles: vec![spent, spare],
+    });
+
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut store = app.usage_store.lock().expect("usage_store mutex poisoned");
+        store.insert(
+            BOOT_SPENT.to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(100.0)),
+                ..UsageInfo::default()
+            },
+        );
+        store.insert(
+            BOOT_SPARE.to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(1.0)),
+                ..UsageInfo::default()
+            },
+        );
+    }
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut s = app
+            .usage_status
+            .lock()
+            .expect("usage_status mutex poisoned");
+        s.insert(BOOT_SPENT.to_string(), status);
+        s.insert(BOOT_SPARE.to_string(), FetchStatus::Fresh);
+    }
+
+    // `finish_bootstrap` starts the real scheduler thread. Raise the shutdown
+    // flag it already honours (checked at the loop top, ahead of its first sleep)
+    // so no tick ever runs — nothing fetches, nothing decides. The one-shot under
+    // test never reads the flag.
+    //
+    // What the flag does NOT stop is the worker's pre-loop kick-block seed, which
+    // resolves home ON the worker thread and is never joined, so it can outlive
+    // this sandbox and read against the real home — the escape docs/internals.md's
+    // 2026-06-06 convention exists to prevent. Named, not hidden: the seed only
+    // ever reads, so the escape is inert (it can neither write outside the sandbox
+    // nor reach anything these assertions observe) and stays inert only while that
+    // holds. Tracked in docs/todo.md.
+    app.shutting_down.store(true, Ordering::SeqCst);
+
+    app.startup_sender
+        .send(StartupSignal::BootstrapDone)
+        .expect("send bootstrap signal");
+    drain_startup_signals(&mut app);
+    app
+}
+
+fn toast_bodies(app: &App) -> Vec<String> {
+    app.toasts.iter().map(|t| t.body.clone()).collect()
+}
+
+/// Every `FetchStatus` the gate can see. The skip case iterates this filtered by
+/// [`skips_the_one_shot`] rather than restating its own list, so there is ONE
+/// place to grow when a variant is added. Growing it is comment-enforced, not
+/// compile-enforced — an array length can't be tied to a variant count without a
+/// derive crate — but the match below fails to compile first, which lands
+/// whoever adds a variant here.
+const ALL_STATUSES: [FetchStatus; 4] = [
+    FetchStatus::Fresh,
+    FetchStatus::Cached,
+    FetchStatus::RateLimited,
+    FetchStatus::Failed,
+];
+
+/// Exhaustiveness tripwire over `FetchStatus`. The gate keys on `== Fresh`, so
+/// every variant added later is non-Fresh and must be driven through the skip
+/// case. An unhandled variant fails THIS match to compile, one line from the
+/// [`ALL_STATUSES`] entry it also needs.
+fn skips_the_one_shot(status: FetchStatus) -> bool {
+    match status {
+        FetchStatus::Fresh => false,
+        FetchStatus::Cached | FetchStatus::RateLimited | FetchStatus::Failed => true,
+    }
+}
+
+#[test]
+fn bootstrap_one_shot_switches_off_a_fresh_exhausted_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = bootstrap_app(&_home, FetchStatus::Fresh);
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some(BOOT_SPARE),
+        "a Fresh read of a maxed active must land the startup switch",
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        vec!["auto-switched to 'spare'".to_string()],
+        "the landed switch announces its target",
+    );
+}
+
+#[test]
+fn bootstrap_one_shot_skips_a_non_fresh_active_read() {
+    let skipped: Vec<FetchStatus> = ALL_STATUSES
+        .into_iter()
+        .filter(|s| skips_the_one_shot(*s))
+        .collect();
+    // A derived list can go EMPTY and pass vacuously, so pin its size: everything
+    // but `Fresh` has to reach the loop below.
+    assert_eq!(
+        skipped.len(),
+        ALL_STATUSES.len() - 1,
+        "every non-Fresh variant must be driven through the gate, got {skipped:?}",
+    );
+
+    for status in skipped {
+        let _home = crate::testutil::HomeSandbox::new();
+        let app = bootstrap_app(&_home, status);
+
+        assert_eq!(
+            app.config().state.active_profile.as_deref(),
+            Some(BOOT_SPENT),
+            "{status:?} numbers are unverified — the active must stay put for the first tick",
+        );
+        assert_eq!(
+            toast_bodies(&app),
+            Vec::<String>::new(),
+            "{status:?} must decide nothing, so it announces nothing",
+        );
+    }
+}
