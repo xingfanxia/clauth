@@ -58,3 +58,19 @@ fn line_and_toast_collapse_to_the_head_when_detail_is_absent() {
 fn resolve_in_tui_names_the_clauth_surface() {
     assert!(RESOLVE_IN_TUI.contains("clauth TUI"));
 }
+
+#[test]
+fn plan_label_marks_a_canceled_subscription() {
+    let canceled = PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+    };
+    assert_eq!(plan_label(&canceled), "Claude Free · canceled");
+
+    // A genuine, never-subscribed free account carries no canceled marker.
+    let free = PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: None,
+    };
+    assert_eq!(plan_label(&free), "Claude Free");
+}

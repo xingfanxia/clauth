@@ -28,10 +28,16 @@ pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
     }
     let fetched = load_profile_cache::<UsageInfo>(profile.name.as_str(), USAGE_CACHE_FILE)
         .and_then(|u| u.plan)
-        .map(|p| p.tier)
-        .filter(|t| *t != PlanTier::Unknown);
+        .filter(|p| p.tier != PlanTier::Unknown);
     match fetched {
-        Some(tier) => tier.short_label(),
+        Some(plan) => {
+            let short = plan.tier.short_label()?;
+            Some(if plan.is_canceled() {
+                format!("{short} · canceled")
+            } else {
+                short
+            })
+        }
         None => {
             let sub = profile
                 .credentials

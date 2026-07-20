@@ -300,6 +300,115 @@ fn a_login_anchor_write_ignores_an_absent_or_blank_uuid() {
     );
 }
 
+// ── canceled subscription: parse + the /usage-429 decouple ───────────────────
+//
+// Ground truth captured 2026-07-20 (CC 2.1.215) via mitmproxy: a canceled Pro
+// account returns /profile 200 with `organization_type:"claude_free"` +
+// `subscription_status:"canceled"` while /usage 429s on every tick. The active
+// control (filip3) stays `claude_pro`/`trialing`. These pin the exact shapes.
+
+/// `plan_from_profile` reads BOTH the tier (a canceled Pro drops to Free) and the
+/// precise canceled status off the real captured bodies, and keeps a canceled
+/// subscription distinct from a never-subscribed free account.
+#[test]
+fn plan_from_profile_reads_tier_and_canceled_status() {
+    // canceled account (filip/filip2 on the wire).
+    let canceled: RawProfile = serde_json::from_str(
+        r#"{"account":{"has_claude_pro":false,"has_claude_max":false},
+            "organization":{"organization_type":"claude_free","subscription_status":"canceled",
+                            "billing_type":"none","rate_limit_tier":"default_claude_ai"}}"#,
+    )
+    .expect("canceled fixture parses");
+    let plan = plan_from_profile(&canceled);
+    assert_eq!(
+        plan.tier,
+        PlanTier::Free,
+        "a canceled Pro reads as the Free tier"
+    );
+    assert!(
+        plan.is_canceled(),
+        "subscription_status canceled is observed"
+    );
+
+    // active control (filip3): claude_pro / trialing.
+    let active: RawProfile = serde_json::from_str(
+        r#"{"account":{"has_claude_pro":true,"has_claude_max":false},
+            "organization":{"organization_type":"claude_pro","subscription_status":"trialing",
+                            "billing_type":"stripe_subscription","rate_limit_tier":"default_claude_ai"}}"#,
+    )
+    .expect("active fixture parses");
+    let plan = plan_from_profile(&active);
+    assert_eq!(plan.tier, PlanTier::Pro);
+    assert!(
+        !plan.is_canceled(),
+        "a trialing Pro account is not canceled"
+    );
+
+    // A genuine, never-subscribed free account (no status field) is Free but
+    // NOT canceled — the two must stay distinguishable.
+    let free: RawProfile =
+        serde_json::from_str(r#"{"organization":{"organization_type":"claude_free"}}"#)
+            .expect("free fixture parses");
+    let plan = plan_from_profile(&free);
+    assert_eq!(plan.tier, PlanTier::Free);
+    assert!(
+        !plan.is_canceled(),
+        "an absent status is never read as canceled"
+    );
+}
+
+/// The load-bearing decouple: when `/usage` 429s, `assemble_usage` STILL runs the
+/// `/profile` leg and the error carries the FRESHLY observed plan — never the
+/// stale prior one. Without this a canceled account (whose `/usage` 429s forever)
+/// stays frozen on its cached Pro tier. A skipped leg (TTL) carries no plan, so
+/// the scheduler doesn't re-persist on every masked tick.
+#[test]
+fn a_usage_429_still_surfaces_a_freshly_fetched_plan() {
+    let prev_pro = PlanInfo {
+        tier: PlanTier::Pro,
+        subscription_status: None,
+    };
+    let canceled = PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+    };
+
+    // /profile observed canceled this tick → the 429 carries canceled, not Pro.
+    let out = assemble_usage(
+        Err(FetchError::RateLimited {
+            retry_after: None,
+            plan: None,
+        }),
+        Some(prev_pro.clone()),
+        || Some(canceled.clone()),
+    );
+    match out {
+        Err(FetchError::RateLimited { plan: Some(p), .. }) => {
+            assert_eq!(p.tier, PlanTier::Free, "the 429 surfaces the Free tier");
+            assert!(
+                p.is_canceled(),
+                "and the canceled state, not the stale prior Pro"
+            );
+        }
+        _ => panic!("a 429 must carry the freshly fetched canceled plan"),
+    }
+
+    // /profile skipped this tick (hourly TTL) → the 429 carries NO plan; the
+    // stale prior plan is never smuggled onto the error.
+    let out = assemble_usage(
+        Err(FetchError::RateLimited {
+            retry_after: None,
+            plan: None,
+        }),
+        Some(prev_pro.clone()),
+        || None,
+    );
+    assert!(
+        matches!(out, Err(FetchError::RateLimited { plan: None, .. })),
+        "a skipped /profile leg carries no plan — the prior one is not smuggled in",
+    );
+}
+
 #[test]
 fn short_label_drops_claude_prefix_and_keeps_max_multiplier() {
     assert_eq!(

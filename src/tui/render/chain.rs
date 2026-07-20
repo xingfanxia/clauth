@@ -237,6 +237,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// full). Absent when the member has headroom.
 pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
     let (glyph, style) = match reason {
+        BlockedReason::Canceled => ("⊗", theme::danger()),
         BlockedReason::AuthBroken => ("×", theme::danger()),
         BlockedReason::WeeklySpent { .. } => ("⊘", theme::danger()),
         BlockedReason::KickRejected { .. } => ("⧗", theme::warning()),
@@ -256,6 +257,7 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
 /// there would claim a precision the estimate doesn't have.
 fn reason_pill(reason: &BlockedReason, fmt: ResetFmt) -> Line<'static> {
     let (label, style) = match reason {
+        BlockedReason::Canceled => ("subscription canceled".to_string(), theme::danger().bold()),
         BlockedReason::AuthBroken => ("auth broken".to_string(), theme::danger().bold()),
         BlockedReason::WeeklySpent { resets_in } => (
             match resets_in {

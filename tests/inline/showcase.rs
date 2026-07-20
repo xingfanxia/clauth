@@ -297,6 +297,7 @@ fn oauth_profile(
         usage: Some(UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::from_profile(Some(plan_type), has_max, has_pro, Some(tier)),
+                subscription_status: None,
             }),
             five_hour,
             seven_day: None,

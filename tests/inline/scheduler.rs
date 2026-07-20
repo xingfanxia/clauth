@@ -447,6 +447,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after,
     };
 
@@ -599,6 +600,7 @@ fn cached_fallback_does_not_clobber_store() {
             rotated: None,
             from_fetch: false,
             refresh_failed: false,
+            plan_override: None,
             retry_after: None,
         },
         &store,
@@ -627,6 +629,7 @@ fn cached_fallback_does_not_clobber_store() {
             rotated: None,
             from_fetch: false,
             refresh_failed: false,
+            plan_override: None,
             retry_after: None,
         },
         &store,
@@ -639,6 +642,126 @@ fn cached_fallback_does_not_clobber_store() {
     assert!(
         store.lock().unwrap().contains_key("b"),
         "a cache fallback still cold-fills an absent entry"
+    );
+}
+
+/// The scheduler half of the /usage-429 decouple: a `/profile` plan fetched
+/// despite the 429 rides the cached bail and advances the STORED tier (Pro →
+/// Free/canceled) while the cached 5h window is preserved, and the overlay
+/// reaches disk so CLI/MCP readers see it too. The 429 status still surfaces.
+#[test]
+fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome};
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // Prior state: a live 5h window under a (now stale) Pro tier, in both the
+    // store and the disk cache the bail loads from.
+    let prior = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 5.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Pro,
+            subscription_status: None,
+        }),
+        ..Default::default()
+    };
+    store.lock().unwrap().insert("a".to_string(), prior.clone());
+    super::write_profile_cache("a", super::USAGE_CACHE_FILE, &prior);
+
+    let canceled = PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+    };
+    apply_outcome(
+        FetchOutcome::cached("a", FetchStatus::RateLimited, None, None).with_plan(Some(canceled)),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+    );
+
+    let got = store.lock().unwrap().get("a").cloned().unwrap();
+    let plan = got.plan.as_ref().unwrap();
+    assert_eq!(plan.tier, PlanTier::Free, "the stored tier flips to Free");
+    assert!(
+        plan.is_canceled(),
+        "the canceled state persists to the store"
+    );
+    assert!(
+        got.five_hour.is_some(),
+        "the cached 5h window is preserved — only the tier advanced"
+    );
+    assert_eq!(
+        status.lock().unwrap().get("a").copied(),
+        Some(FetchStatus::RateLimited),
+        "the account stays visibly rate-limited"
+    );
+
+    let disk = super::load_profile_cache::<UsageInfo>("a", super::USAGE_CACHE_FILE).unwrap();
+    assert!(
+        disk.plan.unwrap().is_canceled(),
+        "the flip persists to usage_cache.json for CLI/MCP readers"
+    );
+}
+
+/// The cold-canceled class: a profile added while ALREADY canceled 429s `/usage`
+/// from its first poll and has no `usage_cache.json`, so the cached bail carries
+/// a plan but `info=None`. The plan must still be recorded — on a windowless,
+/// plan-only entry — in BOTH the store and disk, or the cancellation is dropped
+/// every tick and the dead account stays selectable by the fallback walk.
+#[test]
+fn cold_bail_records_a_plan_only_canceled_entry() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome};
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // No prior store entry and no usage_cache.json: `cached()` yields info=None.
+    let canceled = PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+    };
+    apply_outcome(
+        FetchOutcome::cached("cold", FetchStatus::RateLimited, None, None)
+            .with_plan(Some(canceled)),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+    );
+
+    let got = store.lock().unwrap().get("cold").cloned();
+    assert!(
+        got.as_ref()
+            .and_then(|i| i.plan.as_ref())
+            .is_some_and(|p| p.is_canceled()),
+        "the store records the canceled plan even with no prior snapshot"
+    );
+    assert!(
+        got.unwrap().five_hour.is_none(),
+        "a plan-only entry — no windows to show"
+    );
+
+    let disk = super::load_profile_cache::<UsageInfo>("cold", super::USAGE_CACHE_FILE);
+    assert!(
+        disk.and_then(|i| i.plan).is_some_and(|p| p.is_canceled()),
+        "and persists to usage_cache.json so the flip survives and readers see it"
     );
 }
 
@@ -1480,6 +1603,7 @@ fn retry_after_defers_next_fetch_slot() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after,
     };
     let stamp = |name: &str| {
@@ -1629,6 +1753,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
 
     let rate_limited = |from_fetch: bool, status: FetchStatus| FetchOutcome {
         refresh_failed: false,
+        plan_override: None,
         name: "a".to_string(),
         info: None,
         status,
@@ -1726,6 +1851,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after: Some(Duration::from_secs(5)),
     };
     let stamp = || {
@@ -1781,6 +1907,7 @@ fn transient_errors_preserve_rate_limit_streak() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after: None,
     };
     let apply = |kind: FetchStatus| {
@@ -2803,6 +2930,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after: None,
     };
 
@@ -2901,6 +3029,7 @@ fn cached_outcome(name: &str) -> super::FetchOutcome {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        plan_override: None,
         retry_after: None,
     }
 }

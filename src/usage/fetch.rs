@@ -344,6 +344,23 @@ fn max_multiplier(tier: Option<&str>) -> Option<u16> {
 pub(crate) struct PlanInfo {
     #[serde(default)]
     pub(crate) tier: PlanTier,
+    /// `/profile` `organization.subscription_status` verbatim (`active`,
+    /// `trialing`, `canceled`, …). A canceled subscription drops the org to the
+    /// `claude_free` tier while its 5h window stays cached, so the raw status is
+    /// the only proof the account is dead rather than a genuine free plan. Kept
+    /// as the raw string (not a closed enum) so an unrecognized future status
+    /// never fails the whole `usage_cache.json` parse — same fail-to-refetch
+    /// contract the `PlanTier` serde note carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subscription_status: Option<String>,
+}
+
+impl PlanInfo {
+    /// A precisely canceled subscription — distinct from a never-subscribed Free
+    /// account, whose status is absent or something other than `canceled`.
+    pub(crate) fn is_canceled(&self) -> bool {
+        self.subscription_status.as_deref() == Some("canceled")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -674,6 +691,8 @@ struct RawProfileOrg {
     organization_type: Option<String>,
     #[serde(default)]
     rate_limit_tier: Option<String>,
+    #[serde(default)]
+    subscription_status: Option<String>,
 }
 
 /// HTTP layer error. `Status` carries an HTTP code so the fetch path can
@@ -684,9 +703,14 @@ pub(super) enum FetchError {
     Status(u16),
     /// HTTP 429. `retry_after` is the server's `retry-after` header when
     /// present (delta-seconds or an IMF HTTP-date); an unparseable value is
-    /// absent, and a `0` / past date parses to `ZERO` ("retry now").
+    /// absent, and a `0` / past date parses to `ZERO` ("retry now"). `plan`
+    /// carries a `/profile` reading taken DESPITE the 429: a canceled account
+    /// 429s `/usage` forever, so the profile leg is the only place its
+    /// cancellation is ever observed. `None` from the low-level `get_json`
+    /// (no profile context there); populated by [`fetch_raw`].
     RateLimited {
         retry_after: Option<Duration>,
+        plan: Option<PlanInfo>,
     },
     Network,
     Parse,
@@ -840,7 +864,10 @@ fn get_json(
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after);
-        return Err(FetchError::RateLimited { retry_after });
+        return Err(FetchError::RateLimited {
+            retry_after,
+            plan: None,
+        });
     }
     if status >= 400 {
         return Err(FetchError::Status(status));
@@ -937,11 +964,94 @@ pub(crate) fn take_profile_fetch(name: &str, force: bool, now: u64) -> bool {
     want
 }
 
+/// Map an already-parsed `/profile` body to a [`PlanInfo`] (tier + raw
+/// subscription status). The single place the fetch path turns `/profile` into a
+/// plan, shared by the normal leg and the 429-bail leg.
+fn plan_from_profile(p: &RawProfile) -> PlanInfo {
+    let org = p.organization.as_ref();
+    PlanInfo {
+        tier: PlanTier::from_profile(
+            org.and_then(|o| o.organization_type.as_deref()),
+            p.account.as_ref().is_some_and(|a| a.has_claude_max),
+            p.account.as_ref().is_some_and(|a| a.has_claude_pro),
+            org.and_then(|o| o.rate_limit_tier.as_deref()),
+        ),
+        subscription_status: org.and_then(|o| o.subscription_status.clone()),
+    }
+}
+
+/// The TTL-gated `/profile` leg on its own: `Some(plan)` only when
+/// [`take_profile_fetch`] elects to fetch AND the leg parses; `None` when it's
+/// skipped this round or the fetch/parse fails. Split out of [`fetch_raw`] so
+/// the `/usage` 429 bail can run the SAME leg — a canceled account never returns
+/// a 200 `/usage`, so this is the only path that ever sees its cancellation.
+/// Never bypasses the hourly cap unless `force_profile` (the rotation retry
+/// holding no plan yet).
+fn fetch_profile_plan(
+    name: &str,
+    access_token: &str,
+    force_profile: bool,
+    activity: Option<&ActivityStore>,
+) -> Option<PlanInfo> {
+    if !take_profile_fetch(name, force_profile, now_ms()) {
+        return None;
+    }
+    let text = get_json(
+        PROFILE_ENDPOINT,
+        access_token,
+        activity,
+        name,
+        AuthClient::Profile,
+    )
+    .ok()?;
+    let p: RawProfile = serde_json::from_str(&text).ok()?;
+    seed_identity_anchor(name, &p);
+    Some(plan_from_profile(&p))
+}
+
+/// Combine the `/usage` result with the `/profile` leg. On a 200 `/usage`,
+/// behaves as before — a freshly fetched plan falls back to `prev_plan`. On a
+/// 429, still runs `fetch_plan` and returns the error CARRYING only a freshly
+/// observed plan (never `prev_plan`), so the scheduler persists the tier flip
+/// exactly on the ~hourly tick `/profile` is re-pulled, not on every masked
+/// tick. Split from the HTTP legs so the decouple is testable without live IO.
+fn assemble_usage(
+    usage: std::result::Result<String, FetchError>,
+    prev_plan: Option<PlanInfo>,
+    fetch_plan: impl FnOnce() -> Option<PlanInfo>,
+) -> std::result::Result<UsageInfo, FetchError> {
+    match usage {
+        Ok(text) => {
+            let raw: RawUsage = serde_json::from_str(&text).map_err(|_| FetchError::Parse)?;
+            // A `/profile` failure never drops usage — it falls back to `prev_plan`.
+            let plan = fetch_plan().or(prev_plan);
+            let windows = windows_from_raw(&raw);
+            let spend = raw.spend.as_ref().map(SpendInfo::from_raw);
+            Ok(UsageInfo {
+                plan,
+                five_hour: windows.five_hour,
+                seven_day: windows.seven_day,
+                weekly_scoped: windows.weekly_scoped,
+                window_dollars: windows.window_dollars,
+                extra_usage: raw.extra_usage,
+                spend,
+            })
+        }
+        Err(FetchError::RateLimited { retry_after, .. }) => Err(FetchError::RateLimited {
+            retry_after,
+            plan: fetch_plan(),
+        }),
+        Err(e) => Err(e),
+    }
+}
+
 /// Fetch `/usage`; fetch `/profile` only when [`take_profile_fetch`] says so,
 /// otherwise carry `prev_plan` forward. `force_profile` bypasses the TTL; the
 /// rotation retry sets it only when no plan is held yet, since a refresh mints a
 /// token for the same account and can't change what `/profile` would say. A
-/// `/profile` failure never drops usage — it falls back to `prev_plan`.
+/// `/usage` 429 no longer suppresses `/profile`: the profile leg still runs and
+/// its plan rides the error, so a canceled (`claude_free`) account — which 429s
+/// `/usage` on every tick — is finally observed.
 pub(super) fn fetch_raw(
     name: &str,
     access_token: &str,
@@ -949,55 +1059,15 @@ pub(super) fn fetch_raw(
     force_profile: bool,
     activity: Option<&ActivityStore>,
 ) -> std::result::Result<UsageInfo, FetchError> {
-    let usage_text = get_json(
+    let usage = get_json(
         USAGE_ENDPOINT,
         access_token,
         activity,
         name,
         AuthClient::Usage,
-    )?;
-    let raw: RawUsage = serde_json::from_str(&usage_text).map_err(|_| FetchError::Parse)?;
-
-    let plan = if take_profile_fetch(name, force_profile, now_ms()) {
-        get_json(
-            PROFILE_ENDPOINT,
-            access_token,
-            activity,
-            name,
-            AuthClient::Profile,
-        )
-        .ok()
-        .and_then(|text| serde_json::from_str::<RawProfile>(&text).ok())
-        .map(|p| {
-            seed_identity_anchor(name, &p);
-            let org = p.organization.as_ref();
-            PlanInfo {
-                tier: PlanTier::from_profile(
-                    org.and_then(|o| o.organization_type.as_deref()),
-                    p.account.as_ref().is_some_and(|a| a.has_claude_max),
-                    p.account.as_ref().is_some_and(|a| a.has_claude_pro),
-                    org.and_then(|o| o.rate_limit_tier.as_deref()),
-                ),
-            }
-        })
-        // Profile leg failed (transient / 401 on a stale token) — keep the
-        // prior plan rather than dropping it from the snapshot.
-        .or(prev_plan)
-    } else {
-        prev_plan
-    };
-
-    let windows = windows_from_raw(&raw);
-    let spend = raw.spend.as_ref().map(SpendInfo::from_raw);
-
-    Ok(UsageInfo {
-        plan,
-        five_hour: windows.five_hour,
-        seven_day: windows.seven_day,
-        weekly_scoped: windows.weekly_scoped,
-        window_dollars: windows.window_dollars,
-        extra_usage: raw.extra_usage,
-        spend,
+    );
+    assemble_usage(usage, prev_plan, || {
+        fetch_profile_plan(name, access_token, force_profile, activity)
     })
 }
 

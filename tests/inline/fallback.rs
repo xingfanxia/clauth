@@ -15,7 +15,8 @@ use std::sync::Arc;
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::usage::{
-    SpendInfo, UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs,
+    PlanInfo, PlanTier, SpendInfo, UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso,
+    now_epoch_secs,
 };
 
 /// ISO reset an hour ahead — a live 5h window.
@@ -38,6 +39,20 @@ fn window(utilization: f64, resets_at: Option<String>) -> UsageWindow {
 fn usage_info(five_hour: Option<UsageWindow>) -> UsageInfo {
     UsageInfo {
         five_hour,
+        ..UsageInfo::default()
+    }
+}
+
+/// A canceled account: its `/profile` dropped to Free with a `canceled` status,
+/// yet its cached 5h window still reads as idle headroom (5%) — the exact shape
+/// that made a dead account look like a prime rotation target.
+fn canceled_usage() -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(5.0, Some(live_reset()))),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: Some("canceled".to_string()),
+        }),
         ..UsageInfo::default()
     }
 }
@@ -891,6 +906,110 @@ fn next_target_broken_sink_wrap_off_switches_off() {
     config.state.switch_off_when_spent = true;
     config.set_auth_broken("b", true);
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
+}
+
+// ── canceled subscription: excluded from selection, own blocked-reason chip ───
+//
+// A canceled account keeps a stale low-utilization 5h window (filip2 cached at 5h
+// 5%), so by headroom it looks like a PRIME rotation target — yet every session
+// started there 403s. Treated like `broken`: skipped as a candidate on both
+// walks, and a canceled ACTIVE is itself a switch trigger.
+
+// next_target: a canceled member with idle-looking headroom is skipped; the
+// next viable member wins.
+#[test]
+fn next_target_skips_canceled_member_picks_next() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
+            profile_with_usage("b", Some(95.0), Some(canceled_usage())), // headroom but canceled
+            profile_with_util("c", Some(95.0), Some(20.0)),  // headroom, viable
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".into())),
+    );
+}
+
+// next_target: the only alternative is canceled → nothing viable → None.
+#[test]
+fn next_target_returns_none_when_only_alternative_is_canceled() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_usage("b", Some(95.0), Some(canceled_usage())),
+        ],
+        "a",
+    );
+    assert_eq!(next_target(&config, None), None);
+}
+
+// next_auto_switch_target: the scheduler-side walk skips a canceled member too,
+// reading the canceled state straight off the usage snapshot.
+#[test]
+fn auto_switch_skips_canceled_member_picks_next() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", canceled_usage()),
+        ("c", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".into())),
+    );
+}
+
+// A canceled ACTIVE whose cached window reads as idle headroom still triggers
+// the walk — every request 403s, so staying is fatal (mirrors AUTH-4).
+#[test]
+fn auto_switch_canceled_active_walks_away_despite_headroom() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", canceled_usage()), // active, canceled, 5% (idle headroom)
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".into())),
+    );
+}
+
+// The render-only chip mirrors the walk: a canceled profile reports the
+// dead-first `Canceled` reason, above every quota/limiter block.
+#[test]
+fn blocked_reason_reports_canceled_first() {
+    let config = config_with_chain(
+        vec![profile_with_usage("a", Some(95.0), Some(canceled_usage()))],
+        "a",
+    );
+    let profile = config.find("a").expect("profile");
+    assert_eq!(
+        blocked_reason(&config, profile, None),
+        Some(BlockedReason::Canceled),
+    );
+
+    // A genuine free account (no canceled status) with headroom is NOT blocked.
+    let config = config_with_chain(vec![profile_with_util("a", Some(95.0), Some(20.0))], "a");
+    let profile = config.find("a").expect("profile");
+    assert_eq!(blocked_reason(&config, profile, None), None);
 }
 
 // ── AUTH-4: an auth-broken ACTIVE is itself a switch trigger ──────────────────

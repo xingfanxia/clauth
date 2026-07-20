@@ -236,6 +236,21 @@ pub(crate) fn is_exhausted(profile: &Profile, weekly_pct: f64) -> bool {
         || live_five_hour(profile).is_some_and(|w| w.utilization >= threshold_for(profile))
 }
 
+/// True when `profile`'s last `/profile` read shows a canceled subscription: the
+/// org dropped to `claude_free` while its cached 5h window still reads as idle
+/// headroom, but `/v1/messages` 403s on every request. Kept a SEPARATE axis from
+/// exhaustion (a canceled account is dead, not spent) so the chip wording and the
+/// all-spent banner stay honest — but treated the same by the walk, which skips
+/// it like `broken`/`kick_rejected`. Config-side twin of
+/// [`is_canceled_from_usage`], reading `Profile.usage` (the UI thread's copy).
+fn is_canceled(profile: &Profile) -> bool {
+    profile
+        .usage
+        .as_ref()
+        .and_then(|u| u.plan.as_ref())
+        .is_some_and(|p| p.is_canceled())
+}
+
 /// Recent burn rate (%/h) for `name`'s 5h window: durable per-profile history
 /// (`usage_history.jsonl`, a plain disk read — no shared lock, so this is safe
 /// to call without touching the order in `lockorder.rs`, but never while
@@ -403,6 +418,10 @@ pub(crate) fn soonest_resume(config: &AppConfig) -> Option<(String, i64)> {
 /// serves but won't be picked. [`blocked_reason`] returns the first matching arm.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum BlockedReason {
+    /// Subscription canceled (`/profile` `subscription_status == "canceled"`):
+    /// the org dropped to `claude_free` and `/v1/messages` 403s, so it can't
+    /// serve at all — dead-first, above every quota/limiter block.
+    Canceled,
     /// OAuth refresh revoked/invalid (AUTH-1): needs re-login before anything
     /// else about this member matters.
     AuthBroken,
@@ -453,6 +472,11 @@ pub(crate) fn blocked_reason(
     profile: &Profile,
     kick_lift: Option<i64>,
 ) -> Option<BlockedReason> {
+    // Canceled subscription first (dead-first): a 403-ing account outranks a
+    // login that could still refresh. Mirrors the walk's `is_canceled` skip.
+    if is_canceled(profile) {
+        return Some(BlockedReason::Canceled);
+    }
     if config.is_auth_broken(&profile.name) {
         return Some(BlockedReason::AuthBroken);
     }
@@ -662,6 +686,15 @@ fn is_exhausted_from_usage(
     })
 }
 
+/// Scheduler-side [`is_canceled`] over a usage snapshot — reads the plan from the
+/// single-lock `UsageStore` clone, exactly like [`is_exhausted_from_usage`].
+fn is_canceled_from_usage(name: &str, usage: &HashMap<String, UsageInfo>) -> bool {
+    usage
+        .get(name)
+        .and_then(|i| i.plan.as_ref())
+        .is_some_and(|p| p.is_canceled())
+}
+
 /// Scheduler-side [`is_exhausted_active`] over a usage snapshot: reads the 5h
 /// window from the same single-lock snapshot as [`is_exhausted_from_usage`], so
 /// the scheduler's periodic scan agrees with the UI-thread one-shot
@@ -758,7 +791,11 @@ pub(crate) fn next_target(
     let weekly_pct = config.state.weekly_switch_threshold_pct();
 
     let skip = |i: usize| {
-        chain[i] == active || config.find(&chain[i]).is_none() || config.is_auth_broken(&chain[i])
+        let p = config.find(&chain[i]);
+        chain[i] == active
+            || p.is_none()
+            || config.is_auth_broken(&chain[i])
+            || p.is_some_and(is_canceled)
     };
     let walk = |accept: &dyn Fn(&Profile) -> bool| -> Option<String> {
         let pick = walk_chain(active_idx, len, &skip, &|i| {
@@ -967,6 +1004,12 @@ fn next_auto_switch_target_with_usage(
     // form (limiter-confirmed `rejected`, ≥2 kicks, ceiling ahead) reaches
     // this snapshot at all.
     let active_kick_rejected = snapshot.kick_rejected.iter().any(|k| k == &active.name);
+    // A canceled active is `broken`'s subscription analogue: its cached usage
+    // reads as idle headroom while `/v1/messages` 403s, so exhaustion can't gate
+    // leaving it. Sourced from the usage snapshot (the plan the scheduler holds),
+    // not a snapshot flag — unlike `broken`/`kick_rejected` it needs no separate
+    // channel.
+    let active_canceled = is_canceled_from_usage(&active.name, usage);
     let active_exhausted = is_exhausted_active_from_usage(
         &active.name,
         active.threshold,
@@ -977,7 +1020,7 @@ fn next_auto_switch_target_with_usage(
         snapshot.burn_floor_pct,
         snapshot.burn_horizon_cap_ms,
     );
-    if !active_broken && !active_kick_rejected && !active_exhausted {
+    if !active_broken && !active_kick_rejected && !active_canceled && !active_exhausted {
         return None;
     }
 
@@ -988,6 +1031,7 @@ fn next_auto_switch_target_with_usage(
                 .kick_rejected
                 .iter()
                 .any(|k| k == &snapshot.chain[i].name)
+            || is_canceled_from_usage(&snapshot.chain[i].name, usage)
     };
     let walk = |accept: &dyn Fn(&ChainMember) -> bool| -> Option<String> {
         let pick = walk_chain(active_idx, len, &skip, &|i| accept(&snapshot.chain[i]));
@@ -1164,8 +1208,11 @@ pub(crate) fn auto_switch_if_needed(
         };
         // AUTH-4 parity with the scheduler-side walk: an auth-broken active's
         // usage is frozen-stale (its fetches can't succeed), so exhaustion
-        // cannot be a precondition for leaving it.
+        // cannot be a precondition for leaving it. A canceled active is the same
+        // shape — a dead account whose cached window reads as idle headroom while
+        // every request 403s — so it also bypasses the exhaustion gate.
         if !config.is_auth_broken(active_name)
+            && !is_canceled(active)
             && !is_exhausted_active(
                 active,
                 config.state.burn_aware_switching,
