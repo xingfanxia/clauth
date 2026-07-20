@@ -2368,6 +2368,116 @@ fn rate_limited_unknown_expiry_does_not_rotate() {
     assert!(!super::token_clock_expired(None, 10_000));
 }
 
+// `classify_pre_rotation` is the pure classifier `fetch_with_rotation` extracts
+// its branch selection into — no I/O, no clock read, so the truth table below
+// exercises it without live HTTP. `token_clock_expired` is passed in as an
+// already-computed bool (never re-derived inside the classifier).
+
+#[test]
+fn pre_rotation_serves_a_live_body() {
+    use super::{PreRotationDecision, classify_pre_rotation};
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo};
+
+    let info = UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Pro,
+            subscription_status: None,
+        }),
+        ..UsageInfo::default()
+    };
+    match classify_pre_rotation(Ok(info), false) {
+        PreRotationDecision::Serve(served) => {
+            assert_eq!(served.plan.expect("plan").tier, PlanTier::Pro);
+        }
+        other => panic!("expected Serve, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_rotation_429_on_a_valid_token_bails_rate_limited_with_plan() {
+    use std::time::Duration;
+
+    use super::{FetchError, PreRotationDecision, classify_pre_rotation};
+    use crate::usage::{PlanInfo, PlanTier};
+
+    let err = FetchError::RateLimited {
+        retry_after: Some(Duration::from_secs(30)),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: Some("canceled".to_string()),
+        }),
+    };
+    // token_clock_expired == false: a still-valid token's 429 is a pure
+    // endpoint rate limit — bail to cache, plan and retry_after both intact.
+    match classify_pre_rotation(Err(err), false) {
+        PreRotationDecision::BailRateLimited { retry_after, plan } => {
+            assert_eq!(retry_after, Some(Duration::from_secs(30)));
+            let plan = plan.expect("plan rides along on a live-token 429");
+            assert_eq!(plan.tier, PlanTier::Free);
+            assert_eq!(plan.subscription_status.as_deref(), Some("canceled"));
+        }
+        other => panic!("expected BailRateLimited, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_rotation_401_rotates_without_an_unmask_hint() {
+    use super::{FetchError, PreRotationDecision, classify_pre_rotation};
+
+    match classify_pre_rotation(Err(FetchError::Status(401)), false) {
+        PreRotationDecision::Rotate { unmask_429 } => assert_eq!(unmask_429, None),
+        other => panic!("expected Rotate, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_rotation_429_on_an_expired_token_rotates_and_drops_the_plan() {
+    use std::time::Duration;
+
+    use super::{FetchError, PreRotationDecision, classify_pre_rotation};
+    use crate::usage::{PlanInfo, PlanTier};
+
+    let with_hint = FetchError::RateLimited {
+        retry_after: Some(Duration::from_secs(5)),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Pro,
+            subscription_status: None,
+        }),
+    };
+    // token_clock_expired == true: falls through to rotation. The `Rotate`
+    // variant has no plan field at all — the dead-token plan is dropped by
+    // construction, not just by convention.
+    match classify_pre_rotation(Err(with_hint), true) {
+        PreRotationDecision::Rotate { unmask_429 } => {
+            assert_eq!(unmask_429, Some(Some(Duration::from_secs(5))));
+        }
+        other => panic!("expected Rotate, got {other:?}"),
+    }
+
+    let no_hint = FetchError::RateLimited {
+        retry_after: None,
+        plan: None,
+    };
+    match classify_pre_rotation(Err(no_hint), true) {
+        PreRotationDecision::Rotate { unmask_429 } => assert_eq!(unmask_429, Some(None)),
+        other => panic!("expected Rotate, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_rotation_other_errors_bail_to_cache() {
+    use super::{FetchError, PreRotationDecision, classify_pre_rotation};
+
+    assert!(matches!(
+        classify_pre_rotation(Err(FetchError::Network), false),
+        PreRotationDecision::BailCached
+    ));
+    assert!(matches!(
+        classify_pre_rotation(Err(FetchError::Parse), false),
+        PreRotationDecision::BailCached
+    ));
+}
+
 // `proactive_rotation_due` decides whether the ACTIVE Keychain-installed profile
 // rotates AHEAD of expiry (rotation coherence, #1) instead of waiting for a
 // 401. Opt-in via `AppState.preemptive_rotation` — adoption plus
