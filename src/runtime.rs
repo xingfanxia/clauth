@@ -148,7 +148,15 @@ fn live_sessions_in(name: &str, isolation: Isolation) -> usize {
     let Ok(dir) = sessions_dir(name, isolation) else {
         return 0;
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    live_sessions_at(&dir)
+}
+
+/// Live sessions holding a marker in `sessions`; zero when the dir is absent.
+/// Read-only (unlike [`prune_stale_sessions`], it drops nothing), so it needs no
+/// state lock — a caller reading its own flavor's dir always counts ITSELF,
+/// since a second fd's `try_lock` conflicts with the one `acquire` holds.
+pub(crate) fn live_sessions_at(sessions: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(sessions) else {
         return 0;
     };
     entries
@@ -433,6 +441,14 @@ impl ProfileRuntime {
 
     pub(crate) fn config_dir(&self) -> &Path {
         &self.runtime
+    }
+
+    /// This session's liveness-marker dir. Its live count gates anything that
+    /// MOVES state out of `config_dir`: the runtime tree is shared by every
+    /// session of this profile+flavor (`runtime_dir` carries no pid), and only
+    /// the last one out sees it discarded.
+    pub(crate) fn sessions_dir(&self) -> &Path {
+        &self.sessions
     }
 }
 

@@ -876,7 +876,8 @@ fn print_help() {
          CLAUDE_CONFIG_DIR; --isolated injects creds but drops operator\n                                  \
          memory/plugins/hooks (run in a clean cwd for a blind session);\n                                  \
          --rescue/--no-rescue (isolated only) override the auto_rescue\n                                  \
-         setting, lifting the run's transcripts into the global store;\n                                  \
+         setting, lifting the run's transcripts + session sidecar state\n                                  \
+         into the global store;\n                                  \
          extra args go to claude\n  \
            clauth login <profile> [--base-url <url>] [--api-key <key>] [--setup-token [--yes]] [--model <id>]\n                                  \
          add a new account, or re-authenticate an existing one in place\n                                  \

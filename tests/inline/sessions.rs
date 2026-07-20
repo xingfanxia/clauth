@@ -801,3 +801,374 @@ fn rescue_move_verifies_then_removes_and_noops_same_path() {
     );
     assert!(dst.exists());
 }
+
+// ── Sidecar rescue: CC's session state next to the transcripts ──
+//
+// Roots here are the runtime ROOT (the CC config dir), not its `projects/`
+// subdir: the sidecar leg walks everything else the isolated run wrote.
+
+/// The isolated runtime root under the sandbox — `projects/`'s parent.
+fn iso_root(sb: &HomeSandbox) -> PathBuf {
+    sb.home().join(".clauth/profiles/iso/runtime-isolated")
+}
+
+/// The global CC config dir under the sandbox — `~/.claude/projects`'s parent.
+fn global_root(sb: &HomeSandbox) -> PathBuf {
+    sb.home().join(".claude")
+}
+
+fn write_file(path: &Path, body: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, body).unwrap();
+}
+
+/// The admission rule, pinned directly: the known session-state trees are
+/// rescued, and everything else CC leaves in the config dir is not — including
+/// the secret-bearing (`daemon/control.key`), snapshot-bearing (`backups/`) and
+/// machine-scoped cache trees, which are CC-authored but not session state.
+#[test]
+fn rescuable_sidecar_admits_only_known_session_state_trees() {
+    use std::ffi::OsStr;
+
+    for tree in [
+        "shell-snapshots",
+        "file-history",
+        "tasks",
+        "plans",
+        "sessions",
+        "paste-cache",
+        "session-env",
+        "todos",
+    ] {
+        assert!(
+            rescuable_sidecar(OsStr::new(tree)),
+            "{tree} is session state a rescued session needs"
+        );
+    }
+    for other in [
+        ".claude.json",
+        ".credentials.json",
+        "backups",
+        "daemon",
+        "debug",
+        "history.jsonl",
+        "ide",
+        "projects",
+        "security",
+        "settings.json",
+        "statsig",
+        "stats-cache.json",
+        "telemetry",
+        "some-future-cc-dir",
+    ] {
+        assert!(
+            !rescuable_sidecar(OsStr::new(other)),
+            "{other} must never be rescued"
+        );
+    }
+}
+
+/// A sidecar tree lands in the global store with its nesting and bytes intact,
+/// merged per entry: the operator's own file in the same dir survives.
+#[test]
+fn sidecar_trees_land_in_global_store_with_contents_intact() {
+    let sb = HomeSandbox::new();
+    let iso = iso_root(&sb);
+    let global = global_root(&sb);
+    write_file(&iso.join("shell-snapshots/snapshot-bash-1.sh"), "iso shell");
+    write_file(&iso.join("file-history/sess-a/edit-1.json"), "{\"e\":1}");
+    write_file(&iso.join("plans/p1.md"), "the plan");
+    // The operator's own snapshot dir already exists and must be merged into.
+    write_file(&global.join("shell-snapshots/mine.sh"), "operator shell");
+
+    let moved = rescue_isolated_sidecars(&iso, &global);
+
+    assert_eq!(moved, 3, "three sidecar files moved");
+    assert_eq!(
+        fs::read_to_string(global.join("shell-snapshots/snapshot-bash-1.sh")).unwrap(),
+        "iso shell"
+    );
+    assert_eq!(
+        fs::read_to_string(global.join("file-history/sess-a/edit-1.json")).unwrap(),
+        "{\"e\":1}",
+        "nesting under the tree is preserved"
+    );
+    assert_eq!(
+        fs::read_to_string(global.join("plans/p1.md")).unwrap(),
+        "the plan"
+    );
+    assert_eq!(
+        fs::read_to_string(global.join("shell-snapshots/mine.sh")).unwrap(),
+        "operator shell",
+        "the operator's own entry in a merged dir is untouched"
+    );
+    assert!(
+        !iso.join("shell-snapshots/snapshot-bash-1.sh").exists(),
+        "sources moved, not copied"
+    );
+    assert!(!iso.join("plans/p1.md").exists());
+}
+
+/// Per-entry collision safety: a differing global entry is never overwritten
+/// (the rescue lands beside it), a byte-identical one is deduped, and an
+/// extension-less name keeps its shape.
+#[test]
+fn sidecar_collision_lands_beside_without_clobbering() {
+    let sb = HomeSandbox::new();
+    let iso = iso_root(&sb);
+    let global = global_root(&sb);
+    write_file(&iso.join("tasks/t1.json"), "iso task");
+    write_file(&global.join("tasks/t1.json"), "operator task");
+    write_file(&iso.join("tasks/same.json"), "identical");
+    write_file(&global.join("tasks/same.json"), "identical");
+    write_file(&iso.join("session-env/envfile"), "ISO=1");
+    write_file(&global.join("session-env/envfile"), "OPERATOR=1");
+
+    let moved = rescue_isolated_sidecars(&iso, &global);
+
+    // Counts entries whose state ended up in the global store, matching the
+    // transcript leg — the deduped one is there too, by the copy already present.
+    assert_eq!(moved, 3);
+    assert_eq!(
+        fs::read_to_string(global.join("tasks/t1.json")).unwrap(),
+        "operator task",
+        "an occupied entry is never overwritten"
+    );
+    assert_eq!(
+        fs::read_to_string(global.join("tasks/t1.rescued-0.json")).unwrap(),
+        "iso task",
+        "the rescue lands beside it"
+    );
+    assert_eq!(
+        fs::read_to_string(global.join("session-env/envfile")).unwrap(),
+        "OPERATOR=1"
+    );
+    assert_eq!(
+        fs::read_to_string(global.join("session-env/envfile.rescued-0")).unwrap(),
+        "ISO=1",
+        "an extension-less name gains no invented extension"
+    );
+    // The identical pair collapsed to the one existing copy, no sibling.
+    assert_eq!(
+        fs::read_to_string(global.join("tasks/same.json")).unwrap(),
+        "identical"
+    );
+    assert!(!global.join("tasks/same.rescued-0.json").exists());
+    assert!(!iso.join("tasks/same.json").exists(), "duplicate dropped");
+}
+
+/// The allowlist on disk: clauth-owned state, `projects/` (the transcript
+/// leg's), the secret- and cache-bearing CC trees and the top-level singleton
+/// files all stay in the isolated tree, to be discarded with it.
+#[test]
+fn sidecar_rescue_leaves_everything_off_the_allowlist() {
+    let sb = HomeSandbox::new();
+    let iso = iso_root(&sb);
+    let global = global_root(&sb);
+    let left = [
+        ".credentials.json",
+        "settings.json",
+        ".claude.json",
+        "history.jsonl",
+        "projects/-w-iso/s1.jsonl",
+        "daemon/control.key",
+        "backups/.claude.json.backup.1784537349681",
+        "security/agent-sdk-venv/pyvenv.cfg",
+        "statsig/statsig.session_id.2656965060",
+        "ide/12345.lock",
+        "debug/mcp-logs/log.txt",
+        "telemetry/events.jsonl",
+    ];
+    for path in left {
+        write_file(&iso.join(path), "content");
+    }
+
+    let moved = rescue_isolated_sidecars(&iso, &global);
+
+    assert_eq!(moved, 0, "nothing off the allowlist moves");
+    for path in left {
+        assert!(iso.join(path).exists(), "{path} stays in the isolated tree");
+        assert!(
+            !global.join(path).exists(),
+            "{path} must never land in the global store"
+        );
+    }
+    // Not even the containing dirs are created in the operator's store.
+    for dir in [
+        "daemon",
+        "backups",
+        "security",
+        "statsig",
+        "ide",
+        "telemetry",
+    ] {
+        assert!(!global.join(dir).exists(), "{dir} was created globally");
+    }
+}
+
+/// A SOURCE symlink is skipped, never followed: an isolated runtime links
+/// nothing, so a link is anomalous and walking one could move the operator's own
+/// store out from under them. Both walk levels guard it, so both are exercised —
+/// an allowlisted name at the top, and an entry inside a rescued tree.
+#[cfg(unix)]
+#[test]
+fn sidecar_rescue_never_follows_a_symlink_into_the_global_store() {
+    for link_at in ["sessions", "tasks/link"] {
+        let sb = HomeSandbox::new();
+        let iso = iso_root(&sb);
+        let global = global_root(&sb);
+        write_file(&global.join("projects/-w-real/keep.jsonl"), "operator data");
+        fs::create_dir_all(iso.join("tasks")).unwrap();
+        std::os::unix::fs::symlink(global.join("projects"), iso.join(link_at)).unwrap();
+
+        let moved = rescue_isolated_sidecars(&iso, &global);
+
+        assert_eq!(moved, 0, "a symlinked tree at {link_at} is not walked");
+        assert_eq!(
+            fs::read_to_string(global.join("projects/-w-real/keep.jsonl")).unwrap(),
+            "operator data",
+            "the operator's store is untouched"
+        );
+        assert!(
+            !global.join(link_at).exists(),
+            "nothing lands through the link"
+        );
+    }
+}
+
+/// A DESTINATION entry that is a symlink is left alone: the real `~/.claude`
+/// holds operator links pointing outside the store (`skills -> ~/.agents/…`),
+/// and writing through one would land rescued files in the operator's repos.
+#[cfg(unix)]
+#[test]
+fn sidecar_rescue_never_writes_through_a_symlinked_destination() {
+    let sb = HomeSandbox::new();
+    let iso = iso_root(&sb);
+    let global = global_root(&sb);
+    let outside = sb.home().join("elsewhere");
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(&global).unwrap();
+    // A whole linked-away tree, and a linked single entry inside a real tree.
+    std::os::unix::fs::symlink(&outside, global.join("plans")).unwrap();
+    write_file(&iso.join("plans/p1.md"), "iso plan");
+    write_file(&iso.join("tasks/t1.json"), "iso task");
+    fs::create_dir_all(global.join("tasks")).unwrap();
+    std::os::unix::fs::symlink(outside.join("t1.json"), global.join("tasks/t1.json")).unwrap();
+
+    let moved = rescue_isolated_sidecars(&iso, &global);
+
+    assert_eq!(moved, 0, "neither link is written through");
+    assert!(
+        !outside.join("p1.md").exists() && !outside.join("t1.json").exists(),
+        "nothing escaped the global store"
+    );
+    assert!(iso.join("plans/p1.md").exists(), "sources stay put");
+    assert!(iso.join("tasks/t1.json").exists());
+}
+
+/// The depth cap, both directions: a tree at the deepest ALLOWED nesting still
+/// moves, and one level past it is truncated with a log rather than recursed —
+/// what the cap drops is state in a tree about to be discarded.
+#[test]
+fn sidecar_rescue_moves_up_to_the_depth_cap_and_stops_past_it() {
+    let sb = HomeSandbox::new();
+    let iso = iso_root(&sb);
+    let global = global_root(&sb);
+    // `file-history` itself is level 1, so its deepest reachable leaf sits at
+    // SIDECAR_MAX_DEPTH counting from the runtime root.
+    let mut deepest = iso.join("file-history");
+    for _ in 0..(SIDECAR_MAX_DEPTH - 2) {
+        deepest = deepest.join("d");
+    }
+    write_file(&deepest.join("leaf.json"), "at the cap");
+    write_file(&deepest.join("d/too-deep.json"), "past the cap");
+    write_file(&iso.join("file-history/shallow.json"), "near the top");
+
+    let moved = rescue_isolated_sidecars(&iso, &global);
+
+    assert_eq!(moved, 2, "everything within the cap moves, nothing past it");
+    let landed = deepest
+        .strip_prefix(&iso)
+        .map(|rel| global.join(rel))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(landed.join("leaf.json")).unwrap(),
+        "at the cap",
+        "the deepest allowed leaf still lands"
+    );
+    assert_eq!(
+        fs::read_to_string(global.join("file-history/shallow.json")).unwrap(),
+        "near the top"
+    );
+    assert!(
+        deepest.join("d/too-deep.json").exists(),
+        "one level past the cap is left in the isolated tree"
+    );
+    assert!(!landed.join("d").exists(), "and nothing lands for it");
+}
+
+/// The transcript leg carries modes too — that is where the real store keeps
+/// thousands of 0600 files, and the leg predates the sidecar work.
+#[cfg(unix)]
+#[test]
+fn transcript_rescue_preserves_the_source_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sb = HomeSandbox::new();
+    let iso = iso_projects(&sb);
+    let global = global_projects(&sb);
+    let src = iso.join("-w-iso/s1.jsonl");
+    write_jsonl(&src, &[user_line("s1", "/w/iso", "owner-only transcript")]);
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert_eq!(rescue_isolated_store(&iso, &global), 1);
+
+    let mode = fs::metadata(global.join("-w-iso/s1.jsonl"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "a 0600 transcript must not land world-readable"
+    );
+}
+
+/// Modes are carried over, not recreated: CC writes transcripts and paste-cache
+/// entries 0600, and a umask-masked 0644 would publish them to every account on
+/// the machine.
+#[cfg(unix)]
+#[test]
+fn rescue_preserves_the_source_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sb = HomeSandbox::new();
+    let iso = iso_root(&sb);
+    let global = global_root(&sb);
+    write_file(&iso.join("paste-cache/secret"), "pasted content");
+    write_file(&iso.join("shell-snapshots/snap.sh"), "#!/bin/sh");
+    fs::set_permissions(
+        iso.join("paste-cache/secret"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::set_permissions(
+        iso.join("shell-snapshots/snap.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    assert_eq!(rescue_isolated_sidecars(&iso, &global), 2);
+
+    let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode(global.join("paste-cache/secret")),
+        0o600,
+        "an owner-only source must not land world-readable"
+    );
+    assert_eq!(
+        mode(global.join("shell-snapshots/snap.sh")),
+        0o755,
+        "the mode is copied, not hardcoded"
+    );
+}

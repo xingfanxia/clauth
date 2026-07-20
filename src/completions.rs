@@ -58,8 +58,8 @@ _clauth() {
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
         [[ "${words[2]}" == start ]] && _values 'flag' '--isolated[clean isolated runtime; drops operator config]' \
-            '--rescue[isolated only: lift transcripts into the global store]' \
-            '--no-rescue[isolated only: discard isolated transcripts]'
+            '--rescue[isolated only: lift transcripts + sidecars into the global store]' \
+            '--no-rescue[isolated only: discard the isolated store]'
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == start && "${words[3]}" == --isolated ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
@@ -98,8 +98,8 @@ complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command 
 complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login delete" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
-complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --rescue -d "Isolated only: lift transcripts into the global store"
-complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --no-rescue -d "Isolated only: discard isolated transcripts"
+complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --rescue -d "Isolated only: lift transcripts + sidecars into the global store"
+complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --no-rescue -d "Isolated only: discard the isolated store"
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"

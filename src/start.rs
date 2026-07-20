@@ -40,6 +40,43 @@ pub(crate) fn rescue_effective(rescue_override: Option<bool>, auto_rescue: bool)
     rescue_override.unwrap_or(auto_rescue)
 }
 
+/// Lift an exiting isolated session's state into the global store: the
+/// transcripts under `projects/`, then Claude Code's own session sidecar state
+/// (shell snapshots, file history, tasks/plans, …) from the rest of the runtime
+/// root, so a rescued session keeps more than its resumability. Returns
+/// `(transcripts, sidecar files)` moved. Best-effort throughout: an error is
+/// logged, never fails the run.
+///
+/// Gated on being the last live session in `sessions`. The runtime tree is
+/// shared by every session of this profile+flavor, and the discard it races is
+/// refcounted the same way, so an exit while a sibling still runs must move
+/// NOTHING — the sidecar leg would otherwise pull `shell-snapshots/` out from
+/// under a live Claude Code mid-session. Self holds its own marker, hence `> 1`.
+///
+/// The count and the move are not atomic: a sibling can `acquire` in between and
+/// start writing the tree we are moving out of (its own `active == 1` build is
+/// additive, so it does not wipe first). That window is milliseconds against a
+/// whole session, and closing it would mean holding the state flock across
+/// tree-sized IO — the one thing every other path here avoids.
+fn rescue_teardown(iso_root: &Path, sessions: &Path, claude_home: &Path) -> (usize, usize) {
+    if crate::runtime::live_sessions_at(sessions) > 1 {
+        logline!("clauth: skipping rescue, another isolated session is still live");
+        return (0, 0);
+    }
+    let moved = crate::sessions::rescue_isolated_store(
+        &iso_root.join("projects"),
+        &claude_home.join("projects"),
+    );
+    let sidecars = crate::sessions::rescue_isolated_sidecars(iso_root, claude_home);
+    if moved > 0 || sidecars > 0 {
+        logline!(
+            "clauth: rescued {moved} isolated session transcript(s) \
+             + {sidecars} sidecar file(s) into the global store"
+        );
+    }
+    (moved, sidecars)
+}
+
 pub(crate) fn run(
     config: &AppConfig,
     name: &str,
@@ -131,23 +168,14 @@ pub(crate) fn run(
     }
 
     // Auto-rescue (isolated only, opt-in): the throwaway isolated store is
-    // discarded on `drop(runtime)`, taking its transcripts with it. When enabled
-    // lift them into the global store first, so the session stays resumable and
-    // its tokens count. OFF is a no-op, leaving teardown byte-for-byte the stock
-    // discard path. Best-effort: a rescue error is logged, never fails the run.
-    // Sidecars (todos/shell-snapshots/file-history) are a follow-up — only the
-    // transcripts (`projects/**/*.jsonl`) are rescued here.
+    // discarded on `drop(runtime)`, taking the session's state with it. When
+    // enabled, lift it into the global store first. OFF is a no-op, leaving
+    // teardown byte-for-byte the stock discard path.
     if isolated
         && rescue_effective(rescue_override, config.state.auto_rescue)
-        && let Ok(global_projects) = crate::profile::claude_dir().map(|d| d.join("projects"))
+        && let Ok(claude_home) = crate::profile::claude_dir()
     {
-        let iso_projects = runtime.config_dir().join("projects");
-        let moved = crate::sessions::rescue_isolated_store(&iso_projects, &global_projects);
-        if moved > 0 {
-            logline!(
-                "clauth: rescued {moved} isolated session transcript(s) into the global store"
-            );
-        }
+        rescue_teardown(runtime.config_dir(), runtime.sessions_dir(), &claude_home);
     }
 
     // Drop runtime before process::exit so final sync + refcount cleanup runs.
