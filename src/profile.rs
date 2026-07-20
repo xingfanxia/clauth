@@ -172,6 +172,13 @@ pub(crate) struct Profile {
     /// Utilization % at/above which a bell toast fires in the overview tab.
     /// None = no bell for this profile.
     pub(crate) bell_threshold: Option<f64>,
+    /// USER CHOICE (not the auto-quarantine `AppState::auth_broken`): when
+    /// true, this account is invisible to every operational surface — the
+    /// fallback-chain walk, the usage/rotation scheduler, and the daemon
+    /// status feed by default — while its profile directory and stored
+    /// credentials stay on disk untouched. It still sits in `fallback_chain`
+    /// on disk; only the walk skips it. Default off. See `Profile::is_disabled`.
+    pub(crate) disabled: bool,
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) fetch_status: Option<FetchStatus>,
@@ -195,6 +202,7 @@ impl Profile {
             last_resort: false,
             max_auto_spend: None,
             bell_threshold: None,
+            disabled: false,
             credentials: None,
             usage: None,
             fetch_status: None,
@@ -220,6 +228,12 @@ impl Profile {
 
     pub(crate) fn is_third_party(&self) -> bool {
         self.provider.is_some()
+    }
+
+    /// User-disabled (see [`Profile::disabled`]) — never `auth_broken`'s
+    /// auto-quarantine, always an operator's own choice.
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.disabled
     }
 
     pub(crate) fn refresh_token(&self) -> Option<&str> {
@@ -637,6 +651,14 @@ impl AppConfig {
         self.profiles.iter().map(|p| p.name.as_str()).collect()
     }
 
+    /// Every stored profile with [`Profile::is_disabled`] false — the view every
+    /// operational surface (fallback walk, scheduler, daemon status feed) reads.
+    /// [`AppConfig::profiles`]/[`AppConfig::names`] stay the full list; the TUI
+    /// still needs every profile, disabled ones included.
+    pub(crate) fn enabled_profiles(&self) -> impl Iterator<Item = &Profile> {
+        self.profiles.iter().filter(|p| !p.is_disabled())
+    }
+
     /// Case-insensitive name lookup; returns the canonical-cased name on match.
     pub(crate) fn canonical_name(&self, query: &str) -> Option<String> {
         self.names()
@@ -741,6 +763,8 @@ struct ProfileConfig {
     max_auto_spend: Option<f64>,
     #[serde(default)]
     bell_threshold: Option<f64>,
+    #[serde(default)]
+    disabled: bool,
 }
 
 /// Test-only home-dir override. Redirects all reads/writes away from real `~/.clauth`.
@@ -1189,6 +1213,7 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
             .max_auto_spend
             .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 }),
         bell_threshold: config.bell_threshold.map(|v| v.clamp(0.0, 100.0)),
+        disabled: config.disabled,
         credentials,
         usage: None,
         fetch_status: None,
@@ -1219,6 +1244,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 last_resort: profile.last_resort,
                 max_auto_spend: profile.max_auto_spend,
                 bell_threshold: profile.bell_threshold,
+                disabled: profile.disabled,
             };
             canonical != on_disk
         }
@@ -1407,6 +1433,16 @@ fn render_config_toml(profile: &Profile) -> String {
     match profile.bell_threshold {
         Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
         None => out.push_str("# bell_threshold = 95.0\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# Disable this account: it becomes invisible to the fallback chain, the\n");
+    out.push_str("# usage/rotation scheduler, and the daemon status feed (by default), while\n");
+    out.push_str("# its profile directory and credentials stay on disk untouched.\n");
+    if profile.disabled {
+        out.push_str("disabled = true\n");
+    } else {
+        out.push_str("# disabled = true\n");
     }
     out.push('\n');
 

@@ -17,6 +17,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: format!("at-{name}"),
@@ -45,6 +46,7 @@ fn endpoint_profile(name: &str) -> Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -65,6 +67,7 @@ fn blank_profile(name: &str) -> Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,

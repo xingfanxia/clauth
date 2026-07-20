@@ -293,6 +293,7 @@ fn oauth_profile(
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: Some(UsageInfo {
             plan: Some(PlanInfo {
@@ -326,6 +327,7 @@ fn api_profile(name: &str) -> Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -346,6 +348,7 @@ fn failed_profile(name: &str) -> Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: Some(FetchStatus::Failed),

@@ -63,6 +63,7 @@ pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,

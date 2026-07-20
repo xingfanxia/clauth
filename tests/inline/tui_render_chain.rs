@@ -23,6 +23,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: Some(UsageInfo {
             five_hour: Some(UsageWindow {

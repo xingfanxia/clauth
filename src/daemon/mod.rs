@@ -162,6 +162,26 @@ pub(crate) fn serve() -> Result<()> {
     Ok(())
 }
 
+/// Every chain member armed to spend with nothing to stop it (see
+/// [`crate::fallback::spend_is_uncapped`]) — the pure collection
+/// [`warn_if_spend_is_uncapped`] logs. Pulled out as its own fn so the filter
+/// chain is testable without capturing log output.
+///
+/// A disabled member is excluded: it is never spend-armed by the walk
+/// (`next_target` skips it as a candidate), so it can't actually be the
+/// uncapped spender this names — mirrors the `spend_is_uncapped` fix.
+fn uncapped_spenders(config: &crate::profile::AppConfig) -> Vec<&str> {
+    config
+        .state
+        .fallback_chain
+        .iter()
+        .filter_map(|name| config.find(name))
+        .filter(|p| !p.is_disabled())
+        .filter(|p| crate::fallback::spend_is_uncapped(config, p.max_auto_spend.unwrap_or(0.0)))
+        .map(|p| p.name.as_str())
+        .collect()
+}
+
 /// Say so at boot when a chain member is armed to spend with nothing to stop it:
 /// billing enabled is the operator's to know, but "the ceiling you set only
 /// gates when spending STARTS" is not something a headless run would ever
@@ -170,14 +190,7 @@ pub(crate) fn serve() -> Result<()> {
 /// Names each member rather than counting them — the operator has to know which
 /// account to go fix.
 fn warn_if_spend_is_uncapped(config: &crate::profile::AppConfig) {
-    let uncapped: Vec<&str> = config
-        .state
-        .fallback_chain
-        .iter()
-        .filter_map(|name| config.find(name))
-        .filter(|p| crate::fallback::spend_is_uncapped(config, p.max_auto_spend.unwrap_or(0.0)))
-        .map(|p| p.name.as_str())
-        .collect();
+    let uncapped = uncapped_spenders(config);
     if !uncapped.is_empty() {
         logline!(
             "clauth daemon: {} can spend with no cap. {}. without one, max spend only gates when \
@@ -194,7 +207,9 @@ fn warn_if_spend_is_uncapped(config: &crate::profile::AppConfig) {
 pub(crate) fn status_oneshot() -> Result<()> {
     let config = load_config()?;
     let interval = config.state.refresh_interval_ms;
-    let body = build_status(&config, interval, None);
+    // `false`: hide disabled accounts by default (a later `--all`/`--disabled`
+    // flag is the seam to flip this).
+    let body = build_status(&config, interval, None, false);
     println!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
 }
@@ -503,7 +518,8 @@ impl Daemon {
             let cfg = self.config.lock().expect("config poisoned");
             cfg.clone()
         };
-        let body = build_status(&cfg_snap, interval, Some(&live));
+        // `false`: hide disabled accounts by default, matching `status_oneshot`.
+        let body = build_status(&cfg_snap, interval, Some(&live), false);
         match serde_json::to_vec_pretty(&body) {
             Ok(json) => {
                 if let Err(e) = atomic_write_600(&self.status_path, &json) {

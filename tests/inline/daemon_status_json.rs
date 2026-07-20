@@ -32,7 +32,7 @@ fn build_status_top_level_shape_and_active() {
     config.state.active_profile = Some("work".into());
     config.state.refresh_interval_ms = 300_000;
 
-    let v = build_status(&config, config.state.refresh_interval_ms, None);
+    let v = build_status(&config, config.state.refresh_interval_ms, None, false);
 
     assert_eq!(v["schema"], SCHEMA_VERSION);
     assert_eq!(v["active_profile"], "work");
@@ -116,7 +116,7 @@ fn build_status_fallback_membership_and_armed() {
     config.state.active_profile = Some("a".into());
     config.state.fallback_chain = vec!["a".into(), "b".into()];
 
-    let v = build_status(&config, 300_000, None);
+    let v = build_status(&config, 300_000, None, false);
     let profiles = v["profiles"].as_array().unwrap();
 
     let a = profiles.iter().find(|p| p["name"] == "a").unwrap();
@@ -130,6 +130,79 @@ fn build_status_fallback_membership_and_armed() {
 
     let c = profiles.iter().find(|p| p["name"] == "c").unwrap();
     assert!(c["fallback"].is_null(), "not a chain member → null");
+}
+
+// ── disabled: hidden from the feed by default, surfaced via include_disabled ──
+
+#[test]
+fn build_status_hides_disabled_by_default_and_shows_with_include_disabled() {
+    let _home = HomeSandbox::new();
+    let mut off = oauth_profile("off");
+    off.disabled = true;
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("on"), off],
+    };
+
+    let hidden = build_status(&config, 300_000, None, false);
+    let hidden_names: Vec<&str> = hidden["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        hidden_names,
+        ["on"],
+        "a disabled account must not appear in the default feed"
+    );
+
+    let shown = build_status(&config, 300_000, None, true);
+    let mut shown_names: Vec<&str> = shown["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    shown_names.sort_unstable();
+    assert_eq!(
+        shown_names,
+        ["off", "on"],
+        "include_disabled=true must surface the full set"
+    );
+}
+
+// A disabled ACTIVE must stay visible even under the default hide, or the
+// top-level `active_profile` field names an entry `profiles[]` doesn't carry —
+// a reader following wiki/daemon.md's contract (resolve `active_profile`
+// against `profiles[]`) would find nothing.
+#[test]
+fn build_status_keeps_a_disabled_active_visible_so_active_profile_never_dangles() {
+    let _home = HomeSandbox::new();
+    let mut active_off = oauth_profile("active-off");
+    active_off.disabled = true;
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![active_off, oauth_profile("sibling")],
+    };
+    config.state.active_profile = Some("active-off".into());
+
+    let v = build_status(&config, 300_000, None, false);
+    let names: Vec<&str> = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"active-off"),
+        "the disabled ACTIVE profile must stay visible in profiles[] even under the default hide"
+    );
+    let active_name = v["active_profile"].as_str().unwrap();
+    assert!(
+        names.contains(&active_name),
+        "active_profile must always resolve against an entry in profiles[] — no dangling reference"
+    );
 }
 
 // ── AUTH-2: auth_status + pending_switch contract ─────────────────────────────
@@ -162,7 +235,7 @@ fn build_status_auth_status_ok_expiring_broken() {
     };
     config.set_auth_broken("broken", true);
 
-    let v = build_status(&config, 300_000, None);
+    let v = build_status(&config, 300_000, None, false);
     let profiles = v["profiles"].as_array().unwrap();
     let get = |n: &str| profiles.iter().find(|p| p["name"] == n).unwrap();
     assert_eq!(get("ok")["auth_status"], "ok");
@@ -197,7 +270,7 @@ fn build_status_auth_status_types_the_hybrid_on_its_credential() {
         profiles: vec![hybrid, api_key_only],
     };
 
-    let v = build_status(&config, 300_000, None);
+    let v = build_status(&config, 300_000, None, false);
     let profiles = v["profiles"].as_array().unwrap();
     let get = |n: &str| profiles.iter().find(|p| p["name"] == n).unwrap();
     assert_eq!(
@@ -224,7 +297,7 @@ fn build_status_pending_switch_reflects_live_signal() {
     let empty_streaks = std::collections::HashMap::new();
 
     // single-shot (no daemon) → pending_switch is present-but-null.
-    let none = build_status(&config, 300_000, None);
+    let none = build_status(&config, 300_000, None, false);
     assert!(
         none.get("pending_switch").is_some(),
         "pending_switch key is always present"
@@ -237,7 +310,7 @@ fn build_status_pending_switch_reflects_live_signal() {
         streaks: &empty_streaks,
         pending_switch: Some("home"),
     };
-    let v = build_status(&config, 300_000, Some(&live));
+    let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(v["pending_switch"], "home");
     assert_eq!(
         v["schema"], SCHEMA_VERSION,
@@ -278,7 +351,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     );
 
     // Single-shot: freshness from the third-party cache mtime (just written).
-    let v = build_status(&config, 300_000, None);
+    let v = build_status(&config, 300_000, None, false);
     let p = &v["profiles"].as_array().unwrap()[0];
     assert_eq!(p["fetch_status"], "Fresh");
     assert!(!p["fetched_at"].is_null());
@@ -296,7 +369,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         streaks: &empty_streaks,
         pending_switch: None,
     };
-    let v = build_status(&config, 300_000, Some(&live));
+    let v = build_status(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
     assert_eq!(
         p["fetch_status"], "Fresh",
@@ -334,7 +407,7 @@ fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
     );
 
     // Toggle OFF → skipped-spent → next_refresh_at nulled.
-    let off = build_status(&config(false), 300_000, None);
+    let off = build_status(&config(false), 300_000, None, false);
     let p = &off["profiles"].as_array().unwrap()[0];
     assert!(
         p["next_refresh_at"].is_null(),
@@ -342,7 +415,7 @@ fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
     );
 
     // Toggle ON (default) → still polled → derived countdown present.
-    let on = build_status(&config(true), 300_000, None);
+    let on = build_status(&config(true), 300_000, None, false);
     let p = &on["profiles"].as_array().unwrap()[0];
     assert!(
         !p["next_refresh_at"].is_null(),
@@ -380,7 +453,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     };
 
     // single-shot (no daemon / no streaks) → stale is present-and-false.
-    let none = build_status(&config, 300_000, None);
+    let none = build_status(&config, 300_000, None, false);
     assert_eq!(
         none["schema"], 1,
         "stale is additive — schema must not bump"
@@ -407,7 +480,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         streaks: &streaks,
         pending_switch: None,
     };
-    let v = build_status(&config, 300_000, Some(&live));
+    let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(
         stale_of("work", &v),
         true,
@@ -429,7 +502,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         streaks: &streaks,
         pending_switch: None,
     };
-    let v = build_status(&config, 300_000, Some(&live));
+    let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(
         stale_of("work", &v),
         false,

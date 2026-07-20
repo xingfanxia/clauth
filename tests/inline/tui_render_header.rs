@@ -18,6 +18,7 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: Some(UsageInfo {
             five_hour: Some(UsageWindow {
@@ -44,6 +45,7 @@ fn provider_profile(name: &str) -> Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,

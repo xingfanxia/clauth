@@ -54,6 +54,48 @@ fn last_resort_round_trips_through_config_toml() {
     assert!(parsed.last_resort);
 }
 
+// `disabled` (the per-account exclusion toggle) must default to `false` so
+// every existing config.toml written before this field existed keeps loading
+// unchanged, matching `last_resort`'s guarantee above.
+#[test]
+fn profile_config_disabled_defaults_false() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert!(!cfg.disabled);
+}
+
+#[test]
+fn profile_config_reads_disabled_true() {
+    let toml = "disabled = true\n";
+    let cfg: ProfileConfig = toml::from_str(toml).expect("parse disabled config");
+    assert!(cfg.disabled);
+}
+
+// `disabled` must survive a config.toml render→parse round-trip, matching
+// `last_resort_round_trips_through_config_toml` above. `off` (the default)
+// must render as a comment, not a live key — mirroring every sibling
+// default-off boolean's on-disk shape.
+#[test]
+fn disabled_round_trips_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.disabled = true;
+    let rendered = render_config_toml(&profile);
+    assert!(
+        rendered.contains("disabled = true"),
+        "disabled=true must be a real, uncommented key"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert!(parsed.disabled);
+
+    let off = Profile::new("p".to_string(), None, None);
+    let rendered_off = render_config_toml(&off);
+    assert!(
+        !rendered_off.contains("\ndisabled = true"),
+        "disabled=false (the default) must be omitted entirely, not written as a live key"
+    );
+    let parsed_off: ProfileConfig = toml::from_str(&rendered_off).expect("parse rendered toml");
+    assert!(!parsed_off.disabled);
+}
+
 // `burn_aware_switching` (issue #8 follow-up b) must default to `false` so
 // every existing profiles.toml written before this field existed keeps
 // loading unchanged, matching the `last_resort` guarantee above at the
@@ -832,6 +874,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: Some(creds.clone()),
         usage: None,
         fetch_status: None,
@@ -894,6 +937,62 @@ fn credential_and_cache_files_have_restricted_permissions() {
         "profiles.toml mode should be 0o600, got {:#o}",
         state_mode & 0o777,
     );
+}
+
+/// Disabling an account is a `config.toml`-only edit: flipping it must persist
+/// on reload and never touch the profile directory or stored credentials.
+/// `disabled = false` (the default) leaves stock behaviour bit-identical, so
+/// this pins both halves of the exclusion feature's storage contract.
+#[test]
+fn disabling_persists_and_leaves_credentials_byte_unchanged() {
+    let _home = HomeSandbox::new();
+    let name = "disable-round-trip";
+    let mut profile = Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(oauth_credentials());
+    save_profile(&profile).expect("save_profile (enabled)");
+    assert!(!load_profile(name).expect("load_profile").is_disabled());
+
+    let cred_path = profile_credentials_path(name).expect("cred path");
+    let creds_before = std::fs::read(&cred_path).expect("read credentials.json");
+    let mut dir_entries_before: Vec<_> = std::fs::read_dir(profile_dir(name).expect("profile_dir"))
+        .expect("read_dir")
+        .map(|e| e.expect("dir entry").file_name())
+        .collect();
+    dir_entries_before.sort_unstable();
+
+    profile.disabled = true;
+    save_profile(&profile).expect("save_profile (disabled)");
+
+    let creds_after = std::fs::read(&cred_path).expect("re-read credentials.json");
+    assert_eq!(
+        creds_before, creds_after,
+        "disabling an account must never touch its stored credentials"
+    );
+    let mut dir_entries_after: Vec<_> = std::fs::read_dir(profile_dir(name).expect("profile_dir"))
+        .expect("read_dir")
+        .map(|e| e.expect("dir entry").file_name())
+        .collect();
+    dir_entries_after.sort_unstable();
+    assert_eq!(
+        dir_entries_before, dir_entries_after,
+        "disabling an account must never add or remove files in its profile directory"
+    );
+
+    let raw = std::fs::read_to_string(profile_config_path(name).expect("config path"))
+        .expect("read config.toml");
+    assert!(
+        raw.contains("disabled = true"),
+        "disabled=true must be a real, serialized key in config.toml"
+    );
+
+    let reloaded = load_profile(name).expect("load_profile (disabled)");
+    assert!(reloaded.is_disabled(), "reload must observe the toggle");
+    assert_eq!(
+        reloaded.access_token(),
+        profile.access_token(),
+        "reload must carry the same credentials through unchanged"
+    );
+    assert_eq!(reloaded.refresh_token(), profile.refresh_token());
 }
 
 /// The real usage-cache writer (`profile_cache::write_profile_cache`) must

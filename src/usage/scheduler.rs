@@ -1601,11 +1601,14 @@ pub(crate) fn bootstrap_third_party(
 
 /// Collect api-key profiles for the third-party fetch leg: recognised providers
 /// (typed fetch) plus unrecognised api-key endpoints (generic discovery + scan).
+/// A disabled profile is excluded — it must never enter the scheduler's
+/// per-profile work list (no polling, no rotation).
 pub(crate) fn collect_third_party_entries(
     profiles: &[crate::profile::Profile],
 ) -> Vec<ThirdPartyEntry> {
     profiles
         .iter()
+        .filter(|p| !p.is_disabled())
         .filter_map(|p| {
             let api_key = p.api_key.clone()?;
             let target = if let Some(provider) = p.provider {
@@ -1624,14 +1627,15 @@ pub(crate) fn collect_third_party_entries(
 }
 
 /// Collect the OAuth profiles' token snapshots for the refresher's `TokenList`.
-/// Skips api-key/credential-less profiles (no `claudeAiOauth`). Snapshots the
-/// persisted quarantine flag so the poll partition can widen a flagged
-/// profile's cadence without a config lock. Shared by the TUI (`App::new` /
-/// `refresh_tokens`) and the headless `daemon`.
+/// Skips api-key/credential-less profiles (no `claudeAiOauth`) and disabled
+/// ones (`AppConfig::enabled_profiles`) — a disabled profile must never enter
+/// the scheduler's per-profile work list (no poll, no rotate, no auto-start
+/// kick). Snapshots the persisted quarantine flag so the poll partition can
+/// widen a flagged profile's cadence without a config lock. Shared by the TUI
+/// (`App::new` / `refresh_tokens`) and the headless `daemon`.
 pub(crate) fn collect_tokens(config: &crate::profile::AppConfig) -> Vec<TokenEntry> {
     config
-        .profiles
-        .iter()
+        .enabled_profiles()
         .filter_map(|p| {
             let oauth = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
             Some(TokenEntry {
@@ -2564,6 +2568,12 @@ fn scan_recovery(
             .state
             .fallback_chain
             .iter()
+            // A disabled member is not a recovery target — see the matching
+            // filter in `fallback::snapshot_chain`.
+            .filter(|name| {
+                !cfg.find(name)
+                    .is_some_and(crate::profile::Profile::is_disabled)
+            })
             .map(|name| {
                 let profile = cfg.find(name);
                 crate::fallback::ChainMember {

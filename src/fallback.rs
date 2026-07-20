@@ -166,7 +166,13 @@ pub(crate) fn spend_is_uncapped(config: &AppConfig, ceiling: f64) -> bool {
     config.state.spend_budget_switching
         && ceiling > 0.0
         && !config.state.switch_off_when_budget_spent
-        && !config.profiles.iter().any(|p| p.last_resort)
+        // A disabled `last_resort` member is invisible to the walk, so it is
+        // not a real safety net — counting it would under-report uncapped
+        // spend the moment its operator disables it.
+        && !config
+            .profiles
+            .iter()
+            .any(|p| p.last_resort && !p.is_disabled())
 }
 
 /// The fix list for an uncapped-spend config ([`spend_is_uncapped`]): the two
@@ -631,6 +637,20 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     }
     let chain = chain
         .iter()
+        // A disabled NON-active member is invisible to the scheduler-side walk
+        // (`next_auto_switch_target`) — dropped here rather than carried as a
+        // `ChainMember` flag, so the freshness pass built from `.chain` below
+        // never considers it either. The active slot must stay RESOLVABLE
+        // regardless of its own `disabled` bit — `next_auto_switch_target`
+        // indexes into this vec by `position(|m| m.name == snapshot.active)`,
+        // so dropping a disabled active here would make that `?` return `None`
+        // every tick, wedging auto-switch permanently instead of just skipping
+        // it as a candidate (mirrors `next_target`'s skip closure, which never
+        // skips `chain[i] == active` either — `disabled` is a candidate-only
+        // exclusion, same as `broken`/`canceled`).
+        .filter(|name| {
+            name.as_str() == active.as_str() || !config.find(name).is_some_and(Profile::is_disabled)
+        })
         .map(|name| {
             let profile = config.find(name);
             ChainMember {
@@ -796,6 +816,7 @@ pub(crate) fn next_target(
             || p.is_none()
             || config.is_auth_broken(&chain[i])
             || p.is_some_and(is_canceled)
+            || p.is_some_and(Profile::is_disabled)
     };
     let walk = |accept: &dyn Fn(&Profile) -> bool| -> Option<String> {
         let pick = walk_chain(active_idx, len, &skip, &|i| {

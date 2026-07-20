@@ -70,6 +70,7 @@ fn cue_profile(status: Option<FetchStatus>) -> Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: status,

@@ -8,8 +8,9 @@ use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
     ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, SuppressedGenericStore,
-    ThirdPartyEntry, TokenEntry, clear_activity, clear_orphaned_forced, filter_suppressed,
-    mark_activity, memoized_identity, partition_due, window_lapsed,
+    ThirdPartyEntry, TokenEntry, clear_activity, clear_orphaned_forced,
+    collect_third_party_entries, collect_tokens, filter_suppressed, mark_activity,
+    memoized_identity, partition_due, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -21,6 +22,79 @@ fn token(name: &str) -> TokenEntry {
         access_expires_at: None,
         auth_broken: false,
     }
+}
+
+/// An OAuth-credentialed profile, optionally disabled, for the
+/// `collect_tokens`/`collect_third_party_entries` work-list exclusion tests.
+fn oauth_profile_disabled(name: &str, disabled: bool) -> crate::profile::Profile {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+
+    let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+    p.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: format!("{name}-access"),
+            refresh_token: Some(format!("{name}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    p.disabled = disabled;
+    p
+}
+
+// A disabled account must not enter the scheduler's per-profile work list at
+// all: no polling, no rotation, no auto-start ping, no stuck-429 distrust —
+// all downstream of never appearing in the OAuth `TokenEntry` snapshot.
+#[test]
+fn collect_tokens_excludes_disabled_profiles_includes_enabled_siblings() {
+    use crate::profile::{AppConfig, AppState};
+
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            oauth_profile_disabled("off", true),
+            oauth_profile_disabled("on", false),
+        ],
+    };
+
+    let entries = collect_tokens(&config);
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        !names.contains(&"off"),
+        "a disabled account must never enter the poll/rotate work list"
+    );
+    assert!(
+        names.contains(&"on"),
+        "an enabled sibling must still be collected for polling"
+    );
+}
+
+// Third-party (api-key) leg's own work list must honor the same exclusion.
+#[test]
+fn collect_third_party_entries_excludes_disabled_profiles_includes_enabled_siblings() {
+    let mut off = crate::profile::Profile::new(
+        "off".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    off.disabled = true;
+    let on = crate::profile::Profile::new(
+        "on".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+
+    let entries = collect_third_party_entries(&[off, on]);
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        !names.contains(&"off"),
+        "a disabled third-party account must never enter the poll work list"
+    );
+    assert!(
+        names.contains(&"on"),
+        "an enabled third-party sibling must still be collected"
+    );
 }
 
 /// Every profile uses the same fixed `REFRESH_INTERVAL_MS` cadence: a
@@ -3517,6 +3591,47 @@ fn scan_recovery_queues_a_recovered_chain_member() {
         pending.lock().unwrap().clone(),
         HashSet::from(["b".to_string()]),
         "a recovered chain member must be queued for switch"
+    );
+}
+
+/// Same recovered-usage shape as the happy path above, but the member is
+/// disabled — the scan must never relink to it (mirrors the kick-rejected
+/// exclusion just above).
+#[test]
+fn scan_recovery_never_relinks_to_a_disabled_member() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let mut disabled_b = Profile::new("b".to_string(), None, None);
+    disabled_b.disabled = true;
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![disabled_b],
+    }));
+
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_recovery(
+        &config,
+        &recoverable_store(),
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a disabled member must never be relinked by the recovery scan"
     );
 }
 

@@ -646,3 +646,37 @@ fn backoff_gate_gives_up_when_the_retry_window_closes() {
         "no switch is attempted past the window"
     );
 }
+
+// ── uncapped_spenders (boot-time warning's pure collection) ───────────────────
+
+/// A disabled member is never spend-armed by the walk, so it must never be
+/// named in the "can spend with no cap" warning — only a live, enabled
+/// uncapped sibling should surface.
+#[test]
+fn uncapped_spenders_excludes_disabled_includes_enabled_sibling() {
+    let mut disabled = blank_profile("off");
+    disabled.max_auto_spend = Some(5.0);
+    disabled.disabled = true;
+    let mut enabled = blank_profile("on");
+    enabled.max_auto_spend = Some(5.0);
+
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["off".into(), "on".into()],
+            spend_budget_switching: true,
+            switch_off_when_budget_spent: false,
+            ..AppState::default()
+        },
+        profiles: vec![disabled, enabled],
+    };
+
+    let names = super::uncapped_spenders(&config);
+    assert!(
+        !names.contains(&"off"),
+        "a disabled member must never be named as an uncapped spender"
+    );
+    assert!(
+        names.contains(&"on"),
+        "an enabled uncapped sibling must still be named"
+    );
+}

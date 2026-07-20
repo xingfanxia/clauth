@@ -19,6 +19,7 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: Some(UsageInfo {
             plan: None,
@@ -871,6 +872,7 @@ fn bare(name: &str) -> Profile {
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,

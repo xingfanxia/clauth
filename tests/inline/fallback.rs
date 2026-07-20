@@ -70,6 +70,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         last_resort: false,
         max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage,
         fetch_status: None,
@@ -94,6 +95,13 @@ fn profile_with_util(name: &str, threshold: Option<f64>, utilization: Option<f64
 /// from an incidental threshold value.
 fn mark_last_resort(mut p: Profile) -> Profile {
     p.last_resort = true;
+    p
+}
+
+/// Marks a profile user-disabled (`Profile::disabled = true`) — invisible to
+/// the fallback-chain walk though it still sits in `fallback_chain` on disk.
+fn mark_disabled(mut p: Profile) -> Profile {
+    p.disabled = true;
     p
 }
 
@@ -967,6 +975,118 @@ fn auto_switch_skips_canceled_member_picks_next() {
     assert_eq!(
         next_auto_switch_target(&snap, &store),
         Some(SwitchAction::To("c".into())),
+    );
+}
+
+// ── disabled: USER CHOICE exclusion, broader than auth_broken ────────────────
+//
+// A disabled account stays in `fallback_chain` on disk (the TUI still lists
+// it) but must never be picked as a switch source, target, or last_resort
+// sink by either walk. Treated the same as `broken`/`canceled` by the walk,
+// but never surfaced as a chip reason here (render-only, a later pair's job).
+
+// next_target: chain [a, b(disabled), c] — b has headroom but is disabled, so
+// c (also headroom) is picked instead. Pins the exact spec scenario.
+#[test]
+fn next_target_skips_disabled_member_picks_next() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
+            mark_disabled(profile_with_util("b", Some(95.0), Some(20.0))), // headroom but disabled
+            profile_with_util("c", Some(95.0), Some(20.0)),  // headroom, viable
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".into())),
+    );
+}
+
+// next_target: the only alternative is disabled → nothing viable → None.
+#[test]
+fn next_target_returns_none_when_only_alternative_is_disabled() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            mark_disabled(profile_with_util("b", Some(95.0), Some(20.0))),
+        ],
+        "a",
+    );
+    assert_eq!(next_target(&config, None), None);
+}
+
+// A disabled member marked `last_resort` must never serve as the chain's
+// sink — active (not itself a sink) has nothing viable to migrate to, so the
+// walk returns None instead of parking on the disabled sink.
+#[test]
+fn next_target_disabled_last_resort_is_never_a_sink() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted, not a sink
+            mark_disabled(mark_last_resort(profile_with_util(
+                "b",
+                Some(80.0),
+                Some(100.0),
+            ))),
+        ],
+        "a",
+    );
+    assert_eq!(next_target(&config, None), None);
+}
+
+// next_auto_switch_target: the scheduler-side walk skips a disabled member too
+// (snapshot_chain drops it out of ChainSnapshot.chain entirely).
+#[test]
+fn auto_switch_skips_disabled_member_picks_next() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            mark_disabled(profile_with_util("b", Some(95.0), None)),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    assert!(
+        !snap.chain.iter().any(|m| m.name == "b"),
+        "a disabled member must not enter the snapshot's chain at all"
+    );
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".into())),
+    );
+}
+
+// A disabled ACTIVE must never wedge the scheduler-side walk. Unlike a
+// disabled non-active member (dropped from `.chain` above), the active slot
+// has to stay RESOLVABLE: `next_auto_switch_target_with_usage` looks itself up
+// via `snapshot.chain.iter().position(|m| m.name == snapshot.active)`, and a
+// missing active means that `?` returns `None` every tick forever — no
+// candidate ever gets evaluated again. `disabled` is a candidate-only
+// exclusion (mirrors `next_target`'s skip closure, which never skips
+// `chain[i] == active`), never a reason to drop the active itself.
+#[test]
+fn auto_switch_disabled_active_still_evaluates_instead_of_wedging() {
+    let config = config_with_chain(
+        vec![
+            mark_disabled(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot must resolve even with a disabled active");
+    assert!(
+        snap.chain.iter().any(|m| m.name == "a"),
+        "the active member must stay in the snapshot's chain even when disabled — \
+         next_auto_switch_target_with_usage's position() lookup wedges forever otherwise"
+    );
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".into())),
+        "a disabled active must still be evaluated and walked away from, not stuck forever"
     );
 }
 
