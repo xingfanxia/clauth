@@ -464,7 +464,11 @@ fn per_member_weekly_and_gate_commands_validate_and_enqueue() {
         r#"{"cmd":"set_member_weekly","profile":"work"}"#,
     ] {
         let h = handles(&["work"]);
-        assert_eq!(dispatch(clear, &no_status(), &h), "{\"ok\":true}", "{clear}");
+        assert_eq!(
+            dispatch(clear, &no_status(), &h),
+            "{\"ok\":true}",
+            "{clear}"
+        );
         assert_eq!(
             only_op(&h),
             Some(ConfigOp::SetMemberWeekly("work".into(), None)),

@@ -2950,8 +2950,7 @@ fn scan_recovery(
     // A switch-grade kick-rejected member is not "recovered" — its idle-looking
     // usage is exactly what the messages-limiter rejection freezes it in.
     let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
-    if let Some(name) =
-        crate::fallback::find_recovered_member(&members, store, &kick_rejected)
+    if let Some(name) = crate::fallback::find_recovered_member(&members, store, &kick_rejected)
         && let Ok(mut p) = pending_switch.lock()
     {
         enqueue_pending_switch(

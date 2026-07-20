@@ -1087,15 +1087,39 @@ fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
     let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
     let headroom = profile_with_util("a", Some(95.0), Some(50.0));
     assert_eq!(
-        is_exhausted_active(&exhausted, false, 90_000, None, weekly_blocked(&exhausted, 98.0)),
+        is_exhausted_active(
+            &exhausted,
+            false,
+            90_000,
+            None,
+            weekly_blocked(&exhausted, 98.0)
+        ),
         is_exhausted(&exhausted, 98.0)
     );
     assert_eq!(
-        is_exhausted_active(&headroom, false, 90_000, None, weekly_blocked(&headroom, 98.0)),
+        is_exhausted_active(
+            &headroom,
+            false,
+            90_000,
+            None,
+            weekly_blocked(&headroom, 98.0)
+        ),
         is_exhausted(&headroom, 98.0)
     );
-    assert!(is_exhausted_active(&exhausted, false, 90_000, None, weekly_blocked(&exhausted, 98.0)));
-    assert!(!is_exhausted_active(&headroom, false, 90_000, None, weekly_blocked(&headroom, 98.0)));
+    assert!(is_exhausted_active(
+        &exhausted,
+        false,
+        90_000,
+        None,
+        weekly_blocked(&exhausted, 98.0)
+    ));
+    assert!(!is_exhausted_active(
+        &headroom,
+        false,
+        90_000,
+        None,
+        weekly_blocked(&headroom, 98.0)
+    ));
 }
 
 // Burn-aware ON but no rate available (fresh profile / first tick, or the
@@ -1109,8 +1133,20 @@ fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
 fn is_exhausted_active_burn_aware_falls_back_without_rate() {
     let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
     let headroom = profile_with_util("a", Some(95.0), Some(50.0));
-    assert!(is_exhausted_active(&exhausted, true, 90_000, None, weekly_blocked(&exhausted, 98.0)));
-    assert!(!is_exhausted_active(&headroom, true, 90_000, None, weekly_blocked(&headroom, 98.0)));
+    assert!(is_exhausted_active(
+        &exhausted,
+        true,
+        90_000,
+        None,
+        weekly_blocked(&exhausted, 98.0)
+    ));
+    assert!(!is_exhausted_active(
+        &headroom,
+        true,
+        90_000,
+        None,
+        weekly_blocked(&headroom, 98.0)
+    ));
 }
 
 // Same fallback, exercised through the full `next_target` entry point (wrap-off
@@ -1293,8 +1329,20 @@ fn weekly_dead_active_is_exhausted_despite_idle_5h() {
     let p = weekly_dead_profile("a");
     assert!(is_exhausted(&p, 98.0));
     // Hard block trumps both burn-aware modes (nothing left to project).
-    assert!(is_exhausted_active(&p, false, 90_000, None, weekly_blocked(&p, 98.0)));
-    assert!(is_exhausted_active(&p, true, 90_000, Some(5.0), weekly_blocked(&p, 98.0)));
+    assert!(is_exhausted_active(
+        &p,
+        false,
+        90_000,
+        None,
+        weekly_blocked(&p, 98.0)
+    ));
+    assert!(is_exhausted_active(
+        &p,
+        true,
+        90_000,
+        Some(5.0),
+        weekly_blocked(&p, 98.0)
+    ));
 }
 
 #[test]
@@ -1347,7 +1395,13 @@ fn weekly_soft_exhausted_active_triggers_a_switch_despite_5h_headroom() {
         is_exhausted(&active, 98.0),
         "7d 98.5% triggers despite 5h 40%"
     );
-    assert!(is_exhausted_active(&active, false, 90_000, None, weekly_blocked(&active, 98.0)));
+    assert!(is_exhausted_active(
+        &active,
+        false,
+        90_000,
+        None,
+        weekly_blocked(&active, 98.0)
+    ));
     let config = config_with_chain(
         vec![active, profile_with_util("b", Some(95.0), Some(10.0))],
         "a",

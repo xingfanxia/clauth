@@ -490,7 +490,11 @@ fn detail_row(
                 }
                 None => match weekly_override {
                     Some(v) => {
-                        let value_style = if dimmed { theme::faint() } else { theme::accent() };
+                        let value_style = if dimmed {
+                            theme::faint()
+                        } else {
+                            theme::accent()
+                        };
                         spans.push(Span::styled(format!("{v:.0}%"), value_style));
                         spans.push(Span::styled(
                             format!("   default: {weekly_default:.0}%"),
