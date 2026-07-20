@@ -1426,3 +1426,51 @@ live backend (config paste + real 429 rotation). ToS posture unchanged
   usage"/"Check per-model weekly (7d fable)" gate toggles; FallbackInfo
   decodes the new fields with old-daemon defaults (gates ON); long-lived
   rename across all copy. 210+8 tests; repackaged + redeployed.
+
+## 2026-07-20 (UPS-1) — #53 MERGED · #55 review fixes · proxy advisory-rank · #47 committed
+
+- **PR #53 MERGED upstream** (re-authored on mommy as c01a2f6 backend +
+  d8105e1 TUI; closes #52). Maintainer stacked claude-driven fixes on merge;
+  fork was missing three and has them now (0e3926e): force_snapshot guard
+  (the confirmed divergence-Overwrite could clobber a long-lived profile's
+  clauth-private usage pair — fork's CAP-1 shape guards the force path
+  directly), token-row sub-day-expiry gate (`now >= expiry`, not truncated
+  days — "~0d" WARNING mislabel), login completions full flag set
+  (--codex/--browser/--setup-token/--yes) + SECURITY.md session-token row.
+- **PR #55 CHANGES_REQUESTED → fixed** (eb8394a): 4 hard-cap sites judged at
+  member-resolved soft lines after the member_weekly_line refactor —
+  next_target's serving-sink passes (the MONEY divergence: TUI twin paid a
+  spend-armed sibling while the daemon twin parked free on the sink),
+  usage-tab weekly_hard diag, update_banner any_spent. All → is_exhausted_hard/
+  weekly_hard_blocked. Added the exact-divergence tests (RED-verified on
+  pre-fix code), `weekly at` in ? help modal + chain.rs module doc,
+  cargo fmt reflow (CI red). 1161 green; replied on PR. Fork had ONE
+  exposed site (any_spent banner; no spend/sink-serving passes) — fixed in
+  the same 0e3926e.
+- **Codex Plus→Pro incident root-caused** (x@computelabs.ai / ax-codex-cl):
+  (1) usage stuck 100% = the window between the upgrade and the first
+  DIRECT session — passive JSONL leg had only pre-upgrade events (weekly
+  reset days out); self-healed at 14:09Z once direct sessions wrote fresh
+  rate_limits (status.json now 1%). (2) proxy-mode "usage limit reached" =
+  REAL BUG: cached_exhausted marked members unavailable → all unavailable →
+  synthesized 429 without consulting upstream → and as sole usage writer
+  while serving, the proxy could never observe the correction (wedge).
+  FIXED (82ef6bd): PoolMember.cached_spent is an ADVISORY second tier in
+  select_account/next_after_failure — cache-clear members first, spent
+  members last, only authoritative exclusion (auth_broken/leased/real-429
+  cooldown) 429s the client. proxy-design.md §1.5 synced. (3) tier shows
+  "plus" = STALE AT SOURCE: live ~/.codex/auth.json last_refresh 07-16
+  (pre-upgrade), claims still plus, access token valid to ~Aug 1 so codex
+  won't refresh soon; adopt-back is healthy (stored copy 14 min fresh) —
+  fixes itself on codex's next token mint; NOT a clauth bug.
+- Fork 1309 green, clippy/fmt clean; deployed (cargo install, daemon PID
+  81028 + proxy 81032 restarted, status.json verified). ccsbar 620a321:
+  same sub-day-expiry truncation fix in SessionToken.statusLine + test;
+  218 tests green; repackaged + redeployed (PID 84523).
+- **Issue #47**: maintainer decided daemon should honor `on mismatch`
+  (ask → TUI stays) and pinged for implementation. Replied YES — next PR
+  after #55 lands: honor Overwrite/NewProfile/Discard through the guarded
+  paths, propose 4th option `follow` (proven-sibling switch, port of fork
+  layer 1). Rescue layer explicitly kept out of on-mismatch.
+- Waiting on maintainer: #55 re-review (defaults still vetoable), #51 (he
+  refactors first), #47 option-shape verdict.
