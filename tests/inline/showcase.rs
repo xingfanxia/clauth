@@ -821,7 +821,8 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Enter); // focus the detail pane
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
     assert!(app.config_draft.is_some());
-    press(&mut app, KeyCode::Down); // Name → AutoStart (OAuth row, now right below name)
+    press(&mut app, KeyCode::Down); // Name → Disabled
+    press(&mut app, KeyCode::Down); // Disabled → AutoStart (OAuth row)
     press(&mut app, KeyCode::Down); // AutoStart → BaseUrl
     press(&mut app, KeyCode::Enter); // start capturing the field
     assert_eq!(
@@ -843,8 +844,10 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Up); // 2 → 1 (work)
     press(&mut app, KeyCode::Up); // → 0 (personal)
     press(&mut app, KeyCode::Enter); // focus detail for personal
-    // auto-start sits right below name (OAuth-only); one step down reaches it.
-    press(&mut app, KeyCode::Down); // Name → AutoStart
+    // auto-start sits right below the disabled toggle (OAuth-only); two steps
+    // down reach it.
+    press(&mut app, KeyCode::Down); // Name → Disabled
+    press(&mut app, KeyCode::Down); // Disabled → AutoStart
     press(&mut app, KeyCode::Enter); // flip it
     assert!(
         !auto_start_of(&app, "personal"),
@@ -1140,7 +1143,8 @@ fn tab_key_does_not_leak_past_modal_or_field_capture() {
     assert_eq!(app.tab, Tab::Setup);
     press(&mut app, KeyCode::Enter); // focus detail pane for "personal" (cursor 0)
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
-    press(&mut app, KeyCode::Down); // Name → AutoStart
+    press(&mut app, KeyCode::Down); // Name → Disabled
+    press(&mut app, KeyCode::Down); // Disabled → AutoStart
     press(&mut app, KeyCode::Down); // AutoStart → BaseUrl
     press(&mut app, KeyCode::Enter); // start capturing BaseUrl
     assert_eq!(

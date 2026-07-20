@@ -181,6 +181,31 @@ pub(super) fn picker_row(
     select_line(line, selected, focused, width)
 }
 
+/// A disabled account's picker row: name dims (overriding the usual active/
+/// inactive `name_color`, since a disabled account can never be active) and a
+/// trailing `[ disabled ]` chip, modeled on the blocked-reason status pill
+/// (`chain.rs`'s `reason_pill`) — the closest existing cloudy-tui chip. Shared
+/// by every profile-name picker (Setup's own list, `draw_profile_selector`).
+pub(super) fn disabled_picker_row(
+    selected: bool,
+    focused: bool,
+    name: String,
+    width: u16,
+) -> Line<'static> {
+    let arrow = if selected && focused {
+        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
+    } else {
+        Span::raw("  ")
+    };
+    let mut spans = vec![
+        arrow,
+        Span::styled(name, bold_when(theme::dim(), selected && focused)),
+    ];
+    spans.push(Span::raw("  "));
+    spans.extend(pill("disabled".to_string(), theme::dim().bold()));
+    select_line(Line::from(spans), selected, focused, width)
+}
+
 /// Empty-state widget: rounded frame in `LINE`, hint on first line `TEXT_DIM`,
 /// hotkey `ACCENT` + action on second line.
 pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'static> {
@@ -499,13 +524,17 @@ pub(super) fn draw_profile_selector(
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                picker_row(
-                    i == sel,
-                    focused,
-                    p.name.to_string(),
-                    name_color(cfg.is_active(&p.name)),
-                    w,
-                )
+                if p.is_disabled() {
+                    disabled_picker_row(i == sel, focused, p.name.to_string(), w)
+                } else {
+                    picker_row(
+                        i == sel,
+                        focused,
+                        p.name.to_string(),
+                        name_color(cfg.is_active(&p.name)),
+                        w,
+                    )
+                }
             })
             .collect()
     });

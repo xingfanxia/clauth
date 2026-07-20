@@ -130,6 +130,129 @@ fn setup_hints_follow_the_row_value() {
     assert!(set.contains("calls instead"), "{set}");
 }
 
+// ── `disabled` row (per-account disable toggle) ─────────────────────────────
+
+/// The `disabled` row dims (key + value both faint) while gated — active
+/// account or a live session — mirroring the Fallback tab's `max spend`
+/// dimmed-while-inert treatment (`chain.rs`). Ungated, `off` (the default)
+/// stays the neutral faint value and `on` promotes to accent, matching
+/// `auto-start`'s toggle contract; a gate wins over an armed toggle, so a
+/// disabled-but-somehow-gated row still renders faint, never accent.
+#[test]
+fn disabled_row_dims_while_gated_and_accents_when_armed() {
+    let mut snap = Snap::blank("a");
+    let input = InputState::new("");
+
+    // Ungated + off (default): normal focus styling on the key, faint value.
+    let off = detail_row(ConfigRow::Disabled, true, false, false, &snap, &input);
+    assert_eq!(
+        off.spans[1].style.fg,
+        label_style(true).fg,
+        "ungated key keeps normal focus styling"
+    );
+    assert_eq!(
+        off.spans[2].style.fg,
+        theme::faint().fg,
+        "off value is faint"
+    );
+
+    // Ungated + on (armed): the value promotes to accent.
+    snap.disabled = true;
+    let on = detail_row(ConfigRow::Disabled, true, false, false, &snap, &input);
+    assert_eq!(
+        on.spans[2].style.fg,
+        theme::accent().fg,
+        "an armed, ungated toggle reads accent"
+    );
+
+    // Gated by is_active: the key dims regardless of the toggle's own value.
+    snap.disabled = false;
+    snap.is_active = true;
+    let gated_active = detail_row(ConfigRow::Disabled, true, false, false, &snap, &input);
+    assert_eq!(
+        gated_active.spans[1].style.fg,
+        theme::faint().fg,
+        "the active account's row dims its key"
+    );
+
+    // Gated by has_live_session, independent of is_active.
+    snap.is_active = false;
+    snap.has_live_session = true;
+    let gated_session = detail_row(ConfigRow::Disabled, true, false, false, &snap, &input);
+    assert_eq!(
+        gated_session.spans[1].style.fg,
+        theme::faint().fg,
+        "a live-session row dims its key too"
+    );
+
+    // Gated AND armed: the value stays faint, not accent — the gate wins.
+    snap.disabled = true;
+    let gated_armed = detail_row(ConfigRow::Disabled, true, false, false, &snap, &input);
+    assert_eq!(
+        gated_armed.spans[2].style.fg,
+        theme::faint().fg,
+        "gated + on still renders faint, not accent"
+    );
+}
+
+/// The `disabled` hint is value-aware: each gate names its own CLI-parity fix
+/// first (checked ahead of the plain on/off state, since a gate can only ever
+/// bite the not-yet-disabled state), then the on/off state describes what the
+/// toggle does from here.
+#[test]
+fn disabled_hint_follows_the_gate_then_the_value() {
+    let mut snap = Snap::blank("a");
+
+    let off = row_hint(ConfigRow::Disabled, &snap).unwrap();
+    assert!(off.contains("removes this account"), "{off}");
+
+    snap.disabled = true;
+    let on = row_hint(ConfigRow::Disabled, &snap).unwrap();
+    assert!(on.contains("excluded from auto-switch"), "{on}");
+
+    snap.disabled = false;
+    snap.has_live_session = true;
+    let session = row_hint(ConfigRow::Disabled, &snap).unwrap();
+    assert!(session.contains("open session"), "{session}");
+
+    // The active-account gate outranks the live-session gate.
+    snap.is_active = true;
+    let active = row_hint(ConfigRow::Disabled, &snap).unwrap();
+    assert!(active.contains("active account"), "{active}");
+}
+
+/// The Setup account-list picker row for a disabled account: name dims and a
+/// `[ disabled ]` chip trails it. Shared with `draw_profile_selector` (Usage
+/// tab) via the same `disabled_picker_row` helper (`panes.rs`).
+#[test]
+fn disabled_picker_row_dims_name_and_appends_chip() {
+    let line = disabled_picker_row(false, true, "acct".to_string(), 40);
+    let text = line_text(&line);
+    assert!(text.contains("[ disabled ]"), "chip renders: {text}");
+    let name_span = line
+        .spans
+        .iter()
+        .find(|s| s.content.as_ref() == "acct")
+        .expect("name span renders");
+    assert_eq!(
+        name_span.style.fg,
+        theme::dim().fg,
+        "the picker-row name renders dim"
+    );
+
+    // The pill LABEL (not its brackets) is bold — the cloudy-tui neutral-pill
+    // rule (TEXT_DIM + bold), matching `reason_pill`'s `Stale` arm.
+    let label_span = line
+        .spans
+        .iter()
+        .find(|s| s.content.as_ref() == "disabled")
+        .expect("chip label span renders");
+    assert!(
+        label_span.style.add_modifier.contains(Modifier::BOLD),
+        "the disabled pill's label must be bold"
+    );
+}
+
 // ── CLA-SPLIT: the `token` long-lived-login status row ──────────────────────
 
 // A comfortable horizon is a plain accent value; the last 30 days warn as a

@@ -4,6 +4,8 @@
 use super::*;
 use crate::profile::{AppState, Profile, ProfileName};
 use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use std::collections::BTreeMap;
 
 /// ISO reset `secs` in the future.
@@ -268,6 +270,59 @@ fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
         row(&armed).contains("$25.00"),
         "a set ceiling renders as money: {:?}",
         row(&armed)
+    );
+}
+
+// ── disabled chain member (feature: per-account disable toggle) ─────────────
+
+/// A disabled chain member — still configured in `fallback_chain` on disk,
+/// only the walk skips it (see `Profile::is_disabled` / `docs/internals.md`)
+/// — renders dimmed with a `[ disabled ]` chip in the Fallback tab's own
+/// selector list, in place of the usual blocked-reason marker. The add-picker
+/// exclusion (a disabled account can never be (re-)added) is a pure-logic
+/// concern covered separately in `tests/inline/tui_app.rs`'s
+/// `chain_candidates_excludes_a_disabled_profile`.
+#[test]
+fn disabled_chain_member_dims_and_shows_chip_in_the_selector() {
+    let mut a = profile("xqzacct", 95.0, 10.0, 3600);
+    a.disabled = true;
+    let cfg = config_with(vec![a], None, vec!["xqzacct"]);
+    let app = App::new(cfg);
+
+    let (w, h) = (100u16, 14u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+
+    // The detail pane's own title border also carries the bare name
+    // (`section_box_verbatim`), so require the chip alongside it to land on
+    // the selector's list row specifically.
+    let row_idx = rows
+        .iter()
+        .position(|r| r.contains("xqzacct") && r.contains("disabled"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no row carries both the member name and the chip:\n{}",
+                rows.join("\n")
+            )
+        });
+    let row = &rows[row_idx];
+    let name_col = row.find("xqzacct").expect("name renders");
+    let cell = &buf.content[row_idx * w as usize + name_col];
+    assert_eq!(
+        Some(cell.fg),
+        theme::dim().fg,
+        "the disabled member's name cell renders dim, not name_color's active/inactive branch"
+    );
+
+    // The pill LABEL (not its brackets) is bold — the cloudy-tui neutral-pill
+    // rule (TEXT_DIM + bold), matching `reason_pill`'s `Stale` arm.
+    let label_col = row.find("disabled").expect("chip label renders");
+    let label_cell = &buf.content[row_idx * w as usize + label_col];
+    assert!(
+        label_cell.modifier.contains(ratatui::style::Modifier::BOLD),
+        "the disabled pill's label must be bold"
     );
 }
 

@@ -85,15 +85,29 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                         } else {
                             Span::styled(format!("  {:>2}  ", i + 1), theme::faint())
                         };
-                        let ns = bold_when(name_color(cfg.is_active(&name)), selected && focused);
+                        // A member still sits in `fallback_chain` on disk while
+                        // disabled (only the walk skips it) — render it dimmed
+                        // + a `[disabled]` chip instead of the usual blocked-
+                        // reason marker, so it reads as excluded rather than
+                        // merely blocked. It can never be `is_active`, so dim
+                        // always wins over `name_color`.
+                        let disabled = cfg.find(&name).is_some_and(|p| p.is_disabled());
+                        let ns = if disabled {
+                            bold_when(theme::dim(), selected && focused)
+                        } else {
+                            bold_when(name_color(cfg.is_active(&name)), selected && focused)
+                        };
                         let mut spans = vec![rail, Span::styled(name.clone(), ns)];
-                        // Right-align the 1-cell blocked-reason marker at the
-                        // row's last content column (the scrollbar owns the
-                        // padding cell beyond it, so they never collide).
-                        if let Some(reason) = cfg
+                        if disabled {
+                            spans.push(Span::raw("  "));
+                            spans.extend(pill("disabled".to_string(), theme::dim().bold()));
+                        } else if let Some(reason) = cfg
                             .find(&name)
                             .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(&name).copied()))
                         {
+                            // Right-align the 1-cell blocked-reason marker at the
+                            // row's last content column (the scrollbar owns the
+                            // padding cell beyond it, so they never collide).
                             let used: usize = spans.iter().map(|s| s.width()).sum();
                             let pad = (w as usize).saturating_sub(used + 1);
                             if pad > 0 {

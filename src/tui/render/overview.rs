@@ -263,6 +263,7 @@ fn render_overview_row(
     };
 
     let active = cfg.is_active(&profile.name);
+    let disabled = profile.is_disabled();
     let name_str = profile.name.to_string();
     // Overview rows only: the refresh countdown carries the profile's
     // fetch-state cue (amber = last-known numbers, red = failed) so staleness
@@ -333,7 +334,16 @@ fn render_overview_row(
         spans.push(Span::raw("  "));
     }
     let (nt, np) = fixed_split(&profile.name, widths.name);
-    let ns = bold_when(name_color(active), selected && focused);
+    // A disabled account can never be active (the disable action itself
+    // refuses on an active target), so dim always wins over `name_color`.
+    let ns = bold_when(
+        if disabled {
+            theme::dim()
+        } else {
+            name_color(active)
+        },
+        selected && focused,
+    );
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
     spans.push(gap(widths));
@@ -344,7 +354,20 @@ fn render_overview_row(
     if token_mode {
         label.push_str(" ·token");
     }
-    if profile.credentials.is_some() {
+    if disabled {
+        // A `[ disabled ]` chip replaces the type value — bracket-spaced to
+        // match the pill on the other two surfaces (`chain.rs`, `panes.rs`).
+        // It fully dims and reuses the existing width-safe truncation
+        // (`fixed_split`) rather than the multi-span `pill()` helper, which
+        // doesn't truncate and would bleed into the following columns at the
+        // narrowest `kind` tier. `kind` only ever lands on {6, 12, 16}
+        // (`OverviewWidths`'s tiering + shrink floor, never an in-between
+        // value), so the 12-char spaced form still fits exactly at 12 and
+        // comfortably at 16 — only the 6-wide tier truncates, same as before.
+        let (clamped, pad) = fixed_split("[ disabled ]", widths.kind);
+        spans.push(Span::styled(clamped, theme::dim()));
+        spans.push(Span::raw(pad));
+    } else if profile.credentials.is_some() {
         let (clamped, pad) = fixed_split(&label, widths.kind);
         let elapsed = app.started_at.elapsed().as_millis() as u64;
         let mut pulse = pulse_name_spans(&clamped, theme::dim(), elapsed);

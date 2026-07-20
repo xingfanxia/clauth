@@ -203,6 +203,11 @@ pub(crate) enum ConfigRow {
     EnvEntry(usize),
     /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
+    /// User-disabled toggle (`Profile::disabled`, see `docs/internals.md`).
+    /// Space/⏎ flips it via the shared `actions::disable_profile` /
+    /// `enable_profile`; dimmed and inert while the account is active or holds
+    /// a live `clauth start` session — the same gate the CLI enforces.
+    Disabled,
     AutoStart,
     /// Browser OAuth login: mint fresh tokens into this account (or, on the
     /// `+ new` form, create the account from the login). Async — runs on a worker.
@@ -372,6 +377,7 @@ impl ConfigDraft {
             ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::ModelOverrideAdd
+            | ConfigRow::Disabled
             | ConfigRow::AutoStart
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
@@ -395,6 +401,7 @@ impl ConfigDraft {
             ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::ModelOverrideAdd
+            | ConfigRow::Disabled
             | ConfigRow::AutoStart
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
@@ -623,6 +630,7 @@ pub(crate) enum ActionMenuAction {
     EditMaxSpend,
     RemoveMember,
     // Config detail actions (proxied through run_config_row)
+    ToggleDisabled,
     ToggleAutoStart,
     DeleteProfile,
     CreateProfile,
@@ -727,6 +735,7 @@ impl ActionMenuAction {
             Self::ToggleLastResort => "toggle last resort",
             Self::EditMaxSpend => "edit max auto-spend",
             Self::RemoveMember => "remove member",
+            Self::ToggleDisabled => "toggle disabled",
             Self::ToggleAutoStart => "toggle auto-start",
             Self::DeleteProfile => "delete account",
             Self::CreateProfile => "create account",
@@ -3251,10 +3260,14 @@ fn open_incident_link(app: &mut App) {
 /// Request switch to profile at `idx`; no-ops if already active.
 fn request_switch_to(app: &mut App, idx: usize) {
     let cfg = app.config();
-    let Some(name) = cfg.profiles.get(idx).map(|p| p.name.to_string()) else {
+    let Some(profile) = cfg.profiles.get(idx) else {
         return;
     };
-    if cfg.is_active(&name) {
+    let name = profile.name.to_string();
+    // `switch_profile` already refuses a disabled target (shared guard), but a
+    // disabled row must never even offer the confirm — never selectable, not
+    // just never landed.
+    if cfg.is_active(&name) || profile.is_disabled() {
         return;
     }
     drop(cfg);
@@ -3516,10 +3529,13 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
         .enumerate()
         .map(|(i, _)| ChainItemKind::Member(i))
         .collect();
+    // A disabled, unchained profile is never an add-picker candidate (see
+    // `chain_candidates`) — excluding it here too keeps `+ add` from showing
+    // when it would open onto an empty picker.
     let any_unchained = cfg
         .profiles
         .iter()
-        .any(|p| !cfg.state.fallback_chain.iter().any(|c| c == &p.name));
+        .any(|p| !p.is_disabled() && !cfg.state.fallback_chain.iter().any(|c| c == &p.name));
     if any_unchained {
         items.push(ChainItemKind::Add);
     }
@@ -4235,12 +4251,15 @@ fn selected_chain_member(app: &App) -> Option<usize> {
     }
 }
 
-/// Profiles not yet in the chain (add-picker candidates).
+/// Profiles not yet in the chain (add-picker candidates). A disabled account
+/// is excluded — the fallback-chain editing UI must never offer adding one
+/// (it still sits in `fallback_chain` untouched if it was already a member
+/// before being disabled; only new additions are blocked here).
 pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
     let cfg = app.config();
     cfg.profiles
         .iter()
-        .filter(|p| !cfg.state.fallback_chain.iter().any(|c| c == &p.name))
+        .filter(|p| !p.is_disabled() && !cfg.state.fallback_chain.iter().any(|c| c == &p.name))
         .map(|p| p.name.to_string())
         .collect()
 }
@@ -4616,7 +4635,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                         let cfg = app.config();
                         cfg.profiles
                             .get(idx)
-                            .map(|p| !cfg.is_active(&p.name))
+                            .map(|p| !cfg.is_active(&p.name) && !p.is_disabled())
                             .unwrap_or(false)
                     }
                 })
@@ -4670,6 +4689,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 let rows = config_rows(app);
                 if let Some(&row) = rows.get(app.config_action_cursor) {
                     match row {
+                        ConfigRow::Disabled => actions.push(ActionMenuAction::ToggleDisabled),
                         ConfigRow::AutoStart => actions.push(ActionMenuAction::ToggleAutoStart),
                         ConfigRow::Login => actions.push(ActionMenuAction::LoginAccount),
                         ConfigRow::DeleteCreds => actions.push(ActionMenuAction::ClearCredentials),
@@ -4857,6 +4877,12 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::RemoveMember => {
             run_fallback_row(app, FallbackRow::Remove);
         }
+        ActionMenuAction::ToggleDisabled => {
+            let rows = config_rows(app);
+            if let Some(&row) = rows.get(app.config_action_cursor) {
+                run_config_row(app, row);
+            }
+        }
         ActionMenuAction::ToggleAutoStart => {
             let rows = config_rows(app);
             if let Some(&row) = rows.get(app.config_action_cursor) {
@@ -5014,7 +5040,9 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         Some(d) => !d.base_url.value.trim().is_empty(),
         None => profile.map(|p| !p.is_oauth()).unwrap_or(false),
     };
-    let mut rows = vec![ConfigRow::Name];
+    // `disabled` is universal (both credential types), so it sits right below
+    // name — ahead of the type-dependent branch below.
+    let mut rows = vec![ConfigRow::Name, ConfigRow::Disabled];
     // auto-start sits right below name (OAuth-only; mutually exclusive with api key).
     if !is_api {
         rows.push(ConfigRow::AutoStart);
@@ -5212,6 +5240,11 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         .as_ref()
         .and_then(|d| d.editing_name.clone());
     match row {
+        ConfigRow::Disabled => {
+            if let Some(name) = name {
+                toggle_profile_disabled(app, &name);
+            }
+        }
         ConfigRow::AutoStart => {
             if let Some(name) = name {
                 toggle_auto_start(app, &name);
@@ -5472,6 +5505,7 @@ fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) ->
             .unwrap_or_default(),
         ConfigRow::EnvAdd
         | ConfigRow::ModelOverrideAdd
+        | ConfigRow::Disabled
         | ConfigRow::AutoStart
         | ConfigRow::Login
         | ConfigRow::DeleteCreds
@@ -6121,6 +6155,48 @@ fn finish_delete(app: &mut App, name: &str, force: bool) {
             app.toast(ToastKind::Success, format!("deleted '{name}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("delete failed\n{e}")),
+    }
+}
+
+/// Flip `name`'s `Profile::disabled` flag (Setup `disabled` row). Inert while
+/// `name` is the active profile or holds a live `clauth start` session — the
+/// same gate `actions::disable_profile` itself enforces, checked here TOO so
+/// the row stays truly inert (silent no-op, matching the dimmed-row cloudy-
+/// tui contract): `disable_profile`'s own refusal is a real `bail!`, and
+/// without this early return every press would surface a red danger toast
+/// instead of doing nothing, which is what a dimmed/disabled row is supposed
+/// to mean. `disable_profile`/`enable_profile` persist into the live shared
+/// `AppConfig` directly (`app.config()`), so the flip renders next frame with
+/// no reload round-trip; `refresh_tokens` rebuilds the scheduler's per-profile
+/// work lists (`collect_tokens`/`collect_third_party_entries` both filter on
+/// `is_disabled`) the same way `toggle_auto_start` does, since a per-profile
+/// `config.toml` write doesn't bump the mtime the periodic reload watches.
+fn toggle_profile_disabled(app: &mut App, name: &str) {
+    let currently_disabled = app.config().find(name).is_some_and(Profile::is_disabled);
+    let gated = app.config().is_active(name) || crate::runtime::has_live_session(name);
+    if gated {
+        return;
+    }
+    let result = {
+        let mut cfg = app.config();
+        if currently_disabled {
+            crate::actions::enable_profile(&mut cfg, name)
+        } else {
+            crate::actions::disable_profile(&mut cfg, name)
+        }
+    };
+    match result {
+        Ok(true) => {
+            app.refresh_tokens();
+            let verb = if currently_disabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            app.toast(ToastKind::Success, format!("{verb} '{name}'"));
+        }
+        Ok(false) => {}
+        Err(e) => app.toast(ToastKind::Danger, format!("toggle failed\n{e}")),
     }
 }
 

@@ -631,6 +631,59 @@ fn credentialed_long_label_clamps_to_kind_width() {
     );
 }
 
+// ── disabled accounts (feature: per-account disable toggle) ──────────────
+
+/// A disabled account's row dims its name (never `name_color`'s active/
+/// inactive branch — a disabled account can never be active) and shows a
+/// `[ disabled ]` chip in the type column (bracket-spaced to match the pill
+/// on the other two surfaces), exactly width-truncated like every other
+/// type-column value. A sibling enabled row in the same config keeps its
+/// ordinary styling and shows no chip, proving the treatment is per-profile,
+/// not global.
+#[test]
+fn disabled_row_dims_name_and_shows_disabled_chip() {
+    let mut a = profile("a", 95.0, 10.0, 3600);
+    a.disabled = true;
+    let b = profile("b", 95.0, 10.0, 3600);
+    let config = config_with(vec![a, b], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(80, &app);
+
+    let disabled_line = render_overview_row(&app, 0, &widths, false, true);
+    let name_span = disabled_line
+        .spans
+        .iter()
+        .find(|s| s.content.trim_end() == "a")
+        .expect("name span renders");
+    assert_eq!(
+        name_span.style.fg,
+        theme::dim().fg,
+        "a disabled account's name renders dim, not the active/inactive name_color"
+    );
+    let disabled_text = line_text(&disabled_line);
+    assert!(
+        disabled_text.contains("[ disabled ]"),
+        "bracket-spaced chip renders in the type column: {disabled_text}"
+    );
+
+    let enabled_line = render_overview_row(&app, 1, &widths, false, true);
+    let enabled_name_span = enabled_line
+        .spans
+        .iter()
+        .find(|s| s.content.trim_end() == "b")
+        .expect("name span renders");
+    assert_ne!(
+        enabled_name_span.style.fg,
+        theme::dim().fg,
+        "an enabled account keeps its ordinary name color"
+    );
+    assert!(
+        !line_text(&enabled_line).contains("[ disabled ]"),
+        "an enabled account shows no chip: {}",
+        line_text(&enabled_line)
+    );
+}
+
 // ── fallback chain panel: auto-sizing + row trailers ─────────────────────
 
 /// Content that fits gets exactly its own height (rows + 2 border), leaving the

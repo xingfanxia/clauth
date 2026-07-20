@@ -665,6 +665,154 @@ fn perform_delete_without_live_session_deletes_immediately() {
     );
 }
 
+// ── `disabled` row (per-account disable toggle) ─────────────────────────────
+
+/// Toggling `disabled` persists immediately into the live shared `AppConfig`
+/// (`app.config()` IS what render reads next frame — no reload round-trip) and
+/// to disk under the literal `disabled = true` key (`render_config_toml`), and
+/// toggling again returns the account to full participation with no stale
+/// state (the flag round-trips to exactly `false`, and every other field is
+/// left untouched).
+#[test]
+fn toggle_profile_disabled_persists_to_memory_and_disk_and_round_trips() {
+    use super::toggle_profile_disabled;
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.auto_start = true;
+    let mut app = app_with(vec![profile]);
+
+    toggle_profile_disabled(&mut app, "acct");
+    assert!(
+        app.config().find("acct").unwrap().is_disabled(),
+        "the flag flips in the live shared config"
+    );
+    let on_disk = std::fs::read_to_string(
+        home.home()
+            .join(".clauth")
+            .join("profiles")
+            .join("acct")
+            .join("config.toml"),
+    )
+    .expect("config.toml written");
+    assert!(
+        on_disk.contains("disabled = true"),
+        "the literal on-disk key is written: {on_disk}"
+    );
+
+    toggle_profile_disabled(&mut app, "acct");
+    let p = app.config().find("acct").cloned().unwrap();
+    assert!(!p.is_disabled(), "toggling again re-enables it");
+    assert!(
+        p.auto_start,
+        "no stale state: an unrelated field survives both toggles untouched"
+    );
+}
+
+/// The gate mirrors `actions::disable_profile`'s own CLI-parity refusal
+/// (`is_active` / `has_live_session`): the row's key handler (`run_config_row`
+/// via the Setup `disabled` row) no-ops for both, exactly like the render-side
+/// dim (`tests/inline/tui_render_config.rs`). Asserting `toasts.is_empty()`
+/// is the load-bearing half here: `disable_profile`'s own gate refuses too
+/// (defense in depth), so the flag-unchanged half alone would stay green even
+/// without `toggle_profile_disabled`'s own pre-check — only the ABSENCE of a
+/// surfaced danger toast proves this gate fired before the backend's `bail!`,
+/// keeping the dimmed row truly inert rather than a silent-flag/loud-toast mix.
+#[test]
+fn disabled_row_toggle_is_inert_for_the_active_account() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.config().state.active_profile = Some("acct".into());
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+
+    run_config_row(&mut app, ConfigRow::Disabled);
+
+    assert!(
+        !app.config().find("acct").unwrap().is_disabled(),
+        "the active account's toggle must no-op"
+    );
+    assert!(
+        app.toasts.is_empty(),
+        "a gated toggle must stay silent, not surface the backend's own refusal toast"
+    );
+}
+
+/// Same gate, the other half: a live `clauth start` session also blocks it.
+#[test]
+fn disabled_row_toggle_is_inert_with_a_live_session() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    let _pid_guard = arm_live_session(home.home(), "acct");
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+
+    run_config_row(&mut app, ConfigRow::Disabled);
+
+    assert!(
+        !app.config().find("acct").unwrap().is_disabled(),
+        "a session-holding account's toggle must no-op"
+    );
+    assert!(
+        app.toasts.is_empty(),
+        "a gated toggle must stay silent, not surface the backend's own refusal toast"
+    );
+}
+
+/// The Fallback tab's add-picker (`chain_candidates`) never offers a disabled
+/// account — this is the "excluded from any fallback-chain editing UI" half
+/// of the spec that isn't a render concern (the selector's dim + chip is
+/// covered in `tests/inline/tui_render_chain.rs`).
+#[test]
+fn chain_candidates_excludes_a_disabled_profile() {
+    use super::chain_candidates;
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut disabled = Profile::new("off".to_string(), None, None);
+    disabled.disabled = true;
+    let enabled = Profile::new("on".to_string(), None, None);
+    let app = app_with(vec![disabled, enabled]);
+
+    let candidates = chain_candidates(&app);
+    assert!(
+        !candidates.iter().any(|n| n == "off"),
+        "a disabled profile is never an add-picker candidate: {candidates:?}"
+    );
+    assert!(
+        candidates.iter().any(|n| n == "on"),
+        "an enabled, unchained profile still is: {candidates:?}"
+    );
+}
+
+/// Overview's switch affordance: `request_switch_to` never even offers a
+/// disabled account (no confirm modal), matching `switch_profile`'s own
+/// shared-guard refusal — never selectable, not just never landed.
+#[test]
+fn overview_switch_request_never_opens_a_confirm_for_a_disabled_account() {
+    use super::{Modal, request_switch_to};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut disabled = Profile::new("off".to_string(), None, None);
+    disabled.disabled = true;
+    let mut app = app_with(vec![disabled]);
+
+    request_switch_to(&mut app, 0);
+
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+        "a disabled account never raises the switch confirm"
+    );
+}
+
 /// Rotating a profile a live `clauth start` session owns must not dead-end on a
 /// toast (the old behavior): it arms an acknowledge notice explaining the block,
 /// and confirming is a no-op — the running session owns rotation, and rotating
