@@ -10,12 +10,22 @@ use std::collections::HashMap;
 pub(crate) struct PoolMember {
     pub(crate) name: String,
     /// Epoch-ms until which this account is in cooldown after a 429 (its
-    /// advertised reset, or a 60s floor). `0` = available now.
+    /// advertised reset, or a 60s floor). `0` = available now. Authoritative —
+    /// it came from a real upstream 429.
     pub(crate) cooldown_until_ms: u64,
-    /// True when the member can't currently serve — auth_broken, leased to an
-    /// isolated session, or exhausted by cached usage. Skipped like cooldown
-    /// but without a timer.
+    /// True when the member can't currently serve — auth_broken or leased to
+    /// an isolated session. Authoritative: skipped like cooldown but without
+    /// a timer.
     pub(crate) unavailable: bool,
+    /// True when the member's CACHED usage says it is spent. Advisory only —
+    /// the cache can be arbitrarily stale (a plan upgrade resets real limits
+    /// without touching it, and while the proxy serves, its own header feed
+    /// is the only writer — so refusing to route on cache alone wedges: no
+    /// request, no headers, no correction; observed live 2026-07-20, a
+    /// Plus→Pro upgrade 429'd all proxy traffic for days of cached reset).
+    /// Ranks the member LAST instead of excluding it; upstream's own answer
+    /// is the authority, and a real 429 promotes it to a cooldown stamp.
+    pub(crate) cached_spent: bool,
 }
 
 /// The selector's answer.
@@ -30,42 +40,53 @@ pub(crate) enum Selection {
 /// Pick the account for a request (proxy-design §1.5): sticky to the active
 /// codex profile when it is available, else the first available member in
 /// chain order starting AFTER the active (the CDX-4 walk order), wrapping.
-/// `now_ms` gates cooldowns. Pure.
+/// `now_ms` gates cooldowns. Two tiers: members whose cache says spent rank
+/// LAST (advisory, see [`PoolMember::cached_spent`]) — they are still tried
+/// before giving up, because only upstream's own answer is authoritative.
+/// Pure.
 pub(crate) fn select_account(
     ordered: &[PoolMember],
     active: Option<&str>,
     now_ms: u64,
 ) -> Selection {
-    let available = |m: &PoolMember| !m.unavailable && now_ms >= m.cooldown_until_ms;
+    let routable = |m: &PoolMember| !m.unavailable && now_ms >= m.cooldown_until_ms;
 
-    // Sticky: stay on the active account while it can serve (prompt-cache
-    // affinity — the prior-art lesson).
-    if let Some(active) = active
-        && ordered.iter().any(|m| m.name == active && available(m))
-    {
-        return Selection::Use(active.to_string());
-    }
+    // Tier 1: cache says the member has room. Tier 2: cache says spent — the
+    // least-bad guess when nothing else is routable, never a reason to 429
+    // the client unasked (the cache may simply be stale).
+    for spent_ok in [false, true] {
+        let candidate = |m: &PoolMember| routable(m) && (spent_ok || !m.cached_spent);
 
-    // Rotation: walk from just after the active, wrapping, to the first
-    // available member (chain order = the CDX-4 walk order).
-    let start = active
-        .and_then(|a| ordered.iter().position(|m| m.name == a))
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let len = ordered.len();
-    for offset in 0..len {
-        let m = &ordered[(start + offset) % len];
-        if available(m) {
-            return Selection::Use(m.name.clone());
+        // Sticky: stay on the active account while it can serve (prompt-cache
+        // affinity — the prior-art lesson).
+        if let Some(active) = active
+            && ordered.iter().any(|m| m.name == active && candidate(m))
+        {
+            return Selection::Use(active.to_string());
+        }
+
+        // Rotation: walk from just after the active, wrapping, to the first
+        // candidate (chain order = the CDX-4 walk order).
+        let start = active
+            .and_then(|a| ordered.iter().position(|m| m.name == a))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let len = ordered.len();
+        for offset in 0..len {
+            let m = &ordered[(start + offset) % len];
+            if candidate(m) {
+                return Selection::Use(m.name.clone());
+            }
         }
     }
     Selection::Exhausted
 }
 
 /// The next account to try after `current` failed pre-commit (429/401/5xx
-/// before the first byte) — the same walk as [`select_account`] but excluding
-/// `current` and any member in `already_tried` (so one request walks each
-/// member at most once). Pure.
+/// before the first byte) — the same two-tier walk as [`select_account`]
+/// (cache-clear members first, cache-spent last) but excluding `current` and
+/// any member in `already_tried` (so one request walks each member at most
+/// once). Pure.
 pub(crate) fn next_after_failure(
     ordered: &[PoolMember],
     current: &str,
@@ -78,16 +99,19 @@ pub(crate) fn next_after_failure(
         .map(|i| i + 1)
         .unwrap_or(0);
     let len = ordered.len();
-    for offset in 0..len {
-        let m = &ordered[(start + offset) % len];
-        if m.name == current
-            || m.unavailable
-            || now_ms < m.cooldown_until_ms
-            || already_tried.iter().any(|t| t == &m.name)
-        {
-            continue;
+    for spent_ok in [false, true] {
+        for offset in 0..len {
+            let m = &ordered[(start + offset) % len];
+            if m.name == current
+                || m.unavailable
+                || now_ms < m.cooldown_until_ms
+                || (!spent_ok && m.cached_spent)
+                || already_tried.iter().any(|t| t == &m.name)
+            {
+                continue;
+            }
+            return Selection::Use(m.name.clone());
         }
-        return Selection::Use(m.name.clone());
     }
     Selection::Exhausted
 }

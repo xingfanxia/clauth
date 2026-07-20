@@ -7,7 +7,74 @@ fn member(name: &str) -> PoolMember {
         name: name.to_string(),
         cooldown_until_ms: 0,
         unavailable: false,
+        cached_spent: false,
     }
+}
+
+// ── cached_spent is advisory rank, never exclusion ──────────────────────────
+// A stale cache once wedged the proxy: a Plus→Pro upgrade reset the real
+// limits, but the cached 100% (reset days out) marked every member
+// unavailable, the proxy synthesized 429s, and — being the sole usage writer
+// while serving — could never observe the correction. Spent members must
+// rank last, not vanish.
+
+#[test]
+fn all_cache_spent_still_routes_instead_of_429ing() {
+    let mut pool = vec![member("a"), member("b")];
+    pool[0].cached_spent = true;
+    pool[1].cached_spent = true;
+    assert_eq!(
+        select_account(&pool, Some("a"), 1000),
+        Selection::Use("a".to_string()),
+        "sticky within the spent tier — upstream decides, not the cache"
+    );
+}
+
+#[test]
+fn cache_clear_member_outranks_a_spent_one() {
+    let mut pool = vec![member("a"), member("b"), member("c")];
+    pool[0].cached_spent = true; // active a reads spent
+    assert_eq!(
+        select_account(&pool, Some("a"), 1000),
+        Selection::Use("b".to_string()),
+        "a cache-clear sibling beats staying on a cache-spent active"
+    );
+}
+
+#[test]
+fn spent_tier_still_respects_cooldown_and_unavailable() {
+    let mut pool = vec![member("a"), member("b"), member("c")];
+    pool[0].cached_spent = true;
+    pool[0].cooldown_until_ms = 9000; // a: spent AND cooling — a real 429 said so
+    pool[1].unavailable = true; // b: auth_broken
+    pool[2].cached_spent = true; // c: spent only
+    assert_eq!(
+        select_account(&pool, Some("a"), 1000),
+        Selection::Use("c".to_string()),
+        "the spent tier never overrides authoritative cooldown/unavailable"
+    );
+    pool[2].cooldown_until_ms = 9000;
+    assert_eq!(
+        select_account(&pool, Some("a"), 1000),
+        Selection::Exhausted,
+        "only authoritative exclusion of every member 429s the client"
+    );
+}
+
+#[test]
+fn next_after_failure_prefers_cache_clear_over_spent() {
+    let mut pool = vec![member("a"), member("b"), member("c")];
+    pool[1].cached_spent = true; // b reads spent
+    assert_eq!(
+        next_after_failure(&pool, "a", &["a".to_string()], 1000),
+        Selection::Use("c".to_string()),
+        "after a's real failure, cache-clear c beats cache-spent b"
+    );
+    assert_eq!(
+        next_after_failure(&pool, "c", &["a".to_string(), "c".to_string()], 1000),
+        Selection::Use("b".to_string()),
+        "with the clear tier exhausted, the spent member still gets its try"
+    );
 }
 
 #[test]

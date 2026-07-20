@@ -85,8 +85,13 @@ The pool is `codex_fallback_chain` when non-empty, else every codex profile with
 login. Selection is **sticky to the active codex profile** (prompt-cache affinity — the
 prior-art lesson: cache keys are per-account) and rotates only on signal: upstream 429,
 `x-codex-rate-limit-reached-type` verdict, or 401 after a refresh attempt. Rotation order
-= chain order (the CDX-4 walk's order), skipping auth_broken / leased / exhausted-by-
-cached-usage members. Rotation is **pre-commit only** (prodex's rule): a response that has
+= chain order (the CDX-4 walk's order), skipping auth_broken / leased members. A member
+whose CACHED usage reads spent ranks LAST instead of being skipped (two-tier walk): the
+cache is advisory — it can be arbitrarily stale (a plan upgrade resets real limits without
+touching it, and while the proxy serves it is the sole usage writer, so refusing to route
+on cache alone wedges into synthesized 429s with no correction path; observed live
+2026-07-20). Upstream's own answer is the authority; a real 429 stamps the cooldown.
+Rotation is **pre-commit only** (prodex's rule): a response that has
 streamed any byte to the client is never retried; a 429/401/5xx **before the first byte**
 picks the next account and replays the buffered request. Per-account cooldown after a
 429 = its advertised reset when the `x-codex-*` headers carry one, else 60 s.
@@ -198,7 +203,7 @@ translation · auto-editing codex config · daemon-embedded mode.
 ```
 codex CLI ──POST /backend-api/codex/responses──▶ clauth proxy (127.0.0.1:4517)
   1. read request head + sized body (buffer)
-  2. pick account: sticky active → chain walk (skip broken/leased/cooldown/exhausted)
+  2. pick account: sticky active → chain walk (skip broken/leased/cooldown; cache-spent ranks last)
   3. ensure fresh access token (live-owner: read live; parked: CDX-3 refresh if margin)
   4. strip identity headers, inject Authorization + ChatGPT-Account-ID
   5. ureq POST https://chatgpt.com/backend-api/codex/responses (stream response)

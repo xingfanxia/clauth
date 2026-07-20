@@ -599,9 +599,11 @@ fn parse_reset_header(response: &ureq::http::Response<ureq::Body>) -> Option<u64
 }
 
 /// The pool in chain order (proxy-design §1.5): `codex_fallback_chain` when
-/// non-empty, else every codex profile with a stored login. Each member's
-/// availability = not auth_broken, not leased, not in cooldown, not exhausted
-/// by cached usage.
+/// non-empty, else every codex profile with a stored login. Availability =
+/// not auth_broken, not leased, not in cooldown; cached-usage exhaustion is
+/// carried separately as ADVISORY rank (see [`PoolMember::cached_spent`]) —
+/// it deprioritizes a member but never excludes it, so a stale cache can't
+/// wedge the proxy into 429ing traffic upstream would have served.
 fn pool_snapshot(state: &ProxyState) -> Vec<PoolMember> {
     let Ok(cfg) = state.config.lock() else {
         return Vec::new();
@@ -627,13 +629,14 @@ fn pool_snapshot(state: &ProxyState) -> Vec<PoolMember> {
         .filter(|n| matches!(crate::codex::read_profile_auth(n), Ok(Some(_))))
         .map(|name| {
             let cooldown_until_ms = cooldowns.as_ref().map(|c| c.get(&name)).unwrap_or(0);
-            let unavailable = cfg.is_auth_broken(&name)
-                || crate::runtime::has_live_codex_session(&name)
-                || cached_exhausted(&name, now, &cfg);
+            let unavailable =
+                cfg.is_auth_broken(&name) || crate::runtime::has_live_codex_session(&name);
+            let cached_spent = cached_exhausted(&name, now, &cfg);
             PoolMember {
                 name,
                 cooldown_until_ms,
                 unavailable,
+                cached_spent,
             }
         })
         .collect()
