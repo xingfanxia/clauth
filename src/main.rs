@@ -142,6 +142,12 @@ fn dispatch(args: &[String]) -> Result<()> {
             Some((name, yes, force)) => cmd_delete(name, yes, force),
             None => anyhow::bail!("usage: clauth delete <profile> [--yes] [--force]"),
         },
+        [cmd, rest @ ..] if cmd == "disable" => match parse_disable_args(rest) {
+            Some((name, yes)) => cmd_disable(name, yes),
+            None => anyhow::bail!("usage: clauth disable <profile> [--yes|-y]"),
+        },
+        [cmd, name] if cmd == "enable" => cmd_enable(name),
+        [cmd, ..] if cmd == "enable" => anyhow::bail!("usage: clauth enable <profile>"),
         [cmd, ..] if cmd == "run" => anyhow::bail!(
             "`clauth run` isn't a command; for a headless delegate use \
              `clauth start <profile> -p \"<prompt>\"` (or the MCP `delegate` tool)"
@@ -169,10 +175,10 @@ fn dispatch(args: &[String]) -> Result<()> {
         [cmd, target] if cmd == "info" => sessions_cli::run_info(target),
         [cmd, ..] if cmd == "info" => Err(usage_error("usage: clauth info <id|latest>")),
         [cmd] if cmd == "daemon" => daemon::serve(),
-        [cmd, flag] if cmd == "status" && flag == "--json" => daemon::status_oneshot(),
-        [cmd, ..] if cmd == "status" => {
-            anyhow::bail!("usage: clauth status --json");
-        }
+        [cmd, rest @ ..] if cmd == "status" => match parse_status_args(rest) {
+            Some(include_disabled) => daemon::status_oneshot(include_disabled),
+            None => anyhow::bail!("usage: clauth status --json [--all|--disabled]"),
+        },
         [name] => cmd_switch(name),
         [] => cmd_tui(theme_override),
         // Unrecognized invocation: show the full command list, not a stale subset.
@@ -215,6 +221,7 @@ fn cmd_start(
     runtime::gc_stale_runtimes();
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
+    refuse_if_disabled(&config, &canonical)?;
     start::run(&config, &canonical, rest, isolation, None, rescue_override)
 }
 
@@ -780,10 +787,103 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `clauth disable <name> [--yes|-y]`'s args after the `disable` token: one
+/// profile name plus an optional `--yes`/`-y`. Mirrors [`parse_delete_args`]
+/// minus `--force` — disable's active/session refusal has no override. `None`
+/// on any other shape (missing name, an unrecognized flag, two names). Pure,
+/// so unit-testable without invoking `cmd_disable`, which touches the
+/// filesystem.
+fn parse_disable_args(rest: &[String]) -> Option<(&str, bool)> {
+    let mut name: Option<&str> = None;
+    let mut yes = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--yes" | "-y" => yes = true,
+            a if a.starts_with("--") => return None,
+            a => {
+                if name.is_some() {
+                    return None;
+                }
+                name = Some(a);
+            }
+        }
+    }
+    Some((name?, yes))
+}
+
+/// Refuse `name` as a switch/start target when it's user-disabled, naming the
+/// fix. Shared by [`cmd_switch`] and [`cmd_start`] so the two entry points a
+/// disabled account must never reach can't drift on the message.
+fn refuse_if_disabled(config: &AppConfig, name: &str) -> Result<()> {
+    if config.find(name).is_some_and(|p| p.is_disabled()) {
+        anyhow::bail!("'{name}': account is disabled, run `clauth enable {name}`");
+    }
+    Ok(())
+}
+
+/// `clauth disable <name> [--yes|-y]` — mark `name` as user-disabled
+/// ([`actions::disable_profile`]): invisible to the fallback chain, the usage
+/// scheduler, and the daemon status feed by default, while its dir and
+/// credentials stay on disk untouched. Refuses when `name` is the active
+/// profile or holds a live `clauth start` session (each names its own
+/// blocker). Prompts `[y/N]` on a TTY unless `--yes`; a non-TTY stdin must
+/// pass `--yes`, mirroring [`cmd_delete`]'s confirm policy. Already-disabled
+/// is a no-op — reported, not refused, and never prompted.
+fn cmd_disable(name: &str, yes: bool) -> Result<()> {
+    platform::init();
+    let mut config = load_config()?;
+    let canonical = resolve_or_bail(&config, name)?;
+
+    if config.find(&canonical).is_some_and(|p| p.is_disabled()) {
+        println!("clauth: '{canonical}' is already disabled.");
+        return Ok(());
+    }
+
+    if !yes {
+        use std::io::{IsTerminal as _, Write as _};
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            anyhow::bail!(
+                "refusing to disable '{canonical}' without confirmation; pass --yes for a non-interactive run"
+            );
+        }
+        print!(
+            "clauth: disable profile '{canonical}'? it drops out of auto-switch and usage \
+             polling until re-enabled. [y/N] "
+        );
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !reauth_confirmed(&answer) {
+            println!("clauth: aborted. '{canonical}' left unchanged.");
+            return Ok(());
+        }
+    }
+
+    actions::disable_profile(&mut config, &canonical)?;
+    println!("clauth: disabled '{canonical}'.");
+    Ok(())
+}
+
+/// `clauth enable <name>` — clear `name`'s disabled flag
+/// ([`actions::enable_profile`]), restoring it to every operational surface.
+/// No other side effects. Already-enabled is a no-op — reported, not refused.
+fn cmd_enable(name: &str) -> Result<()> {
+    platform::init();
+    let mut config = load_config()?;
+    let canonical = resolve_or_bail(&config, name)?;
+    if actions::enable_profile(&mut config, &canonical)? {
+        println!("clauth: enabled '{canonical}'.");
+    } else {
+        println!("clauth: '{canonical}' is already enabled.");
+    }
+    Ok(())
+}
+
 fn cmd_switch(name: &str) -> Result<()> {
     platform::init();
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
+    refuse_if_disabled(&config, &canonical)?;
     actions::switch_profile_cli(config, &canonical)
 }
 
@@ -849,6 +949,23 @@ fn api_key_for_profile(name: &str) -> Result<Option<String>> {
     Ok(key.map(str::to_string))
 }
 
+/// `clauth status --json [--all|--disabled]`'s args after the `status` token:
+/// `--json` is mandatory (status has no other output mode); an optional
+/// trailing `--all` or `--disabled` (either spelling accepted) surfaces
+/// disabled accounts in `profiles[]`, which `build_status` hides by default.
+/// Returns the resolved `include_disabled` flag, or `None` on any other
+/// shape. Pure, so unit-testable without invoking `daemon::status_oneshot`,
+/// which reads real config from disk.
+fn parse_status_args(rest: &[String]) -> Option<bool> {
+    match rest {
+        [flag] if flag == "--json" => Some(false),
+        [flag, extra] if flag == "--json" && (extra == "--all" || extra == "--disabled") => {
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
 fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
     platform::init();
     runtime::gc_stale_runtimes();
@@ -891,6 +1008,13 @@ fn print_help() {
            clauth delete <profile> [--yes|-y] [--force]\n                                  \
          remove a profile and all its credentials; --yes (-y) skips the\n                                  \
          confirm, --force overrides the live-session guard\n  \
+           clauth disable <profile> [--yes|-y]\n                                  \
+         hide a profile from auto-switch, usage polling, and the status\n                                  \
+         feed while its dir + credentials stay on disk; refused for the\n                                  \
+         active profile or one with a live session; --yes (-y) skips the\n                                  \
+         confirm\n  \
+           clauth enable <profile>         restore a disabled profile to every\n                                  \
+         operational surface\n  \
            clauth which [--json]           print the profile owning the loaded\n                                  \
          .credentials.json (CLAUDE_CONFIG_DIR-aware); `unknown` on no match\n  \
            clauth sessions [--json]        list Claude Code sessions as a table; --json\n                                  \
@@ -902,8 +1026,10 @@ fn print_help() {
          on-disk storage path for a session (never launches)\n  \
            clauth daemon                   run the headless scheduler with no TUI: refresh\n                                  \
          usage, auto-switch on exhaustion, and write ~/.clauth/status.json\n  \
-           clauth status --json            print the current usage / auto-switch snapshot\n                                  \
-         as JSON (same shape the daemon writes)\n  \
+           clauth status --json [--all|--disabled]\n                                  \
+         print the current usage / auto-switch snapshot as JSON (same shape\n                                  \
+         the daemon writes); --all (or --disabled) also lists disabled\n                                  \
+         profiles, hidden by default\n  \
            clauth mcp                      run the stdio MCP server (claude code\n                                  \
          launches this)\n  \
            clauth completions <shell>      print shell completion script (bash|zsh|fish)\n  \

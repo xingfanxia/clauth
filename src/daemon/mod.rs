@@ -201,15 +201,15 @@ fn warn_if_spend_is_uncapped(config: &crate::profile::AppConfig) {
     }
 }
 
-/// `clauth status --json` — single-shot serializer. Reads the on-disk caches and
-/// prints the same shape the daemon writes, then exits. No scheduler; freshness
-/// and next-refresh are derived from cache mtimes.
-pub(crate) fn status_oneshot() -> Result<()> {
+/// `clauth status --json [--all|--disabled]` — single-shot serializer. Reads
+/// the on-disk caches and prints the same shape the daemon writes, then
+/// exits. No scheduler; freshness and next-refresh are derived from cache
+/// mtimes. `include_disabled` mirrors `build_status`'s flag of the same name
+/// (hidden by default; `dispatch`'s `--all`/`--disabled` flips it).
+pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
     let config = load_config()?;
     let interval = config.state.refresh_interval_ms;
-    // `false`: hide disabled accounts by default (a later `--all`/`--disabled`
-    // flag is the seam to flip this).
-    let body = build_status(&config, interval, None, false);
+    let body = build_status(&config, interval, None, include_disabled);
     println!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
 }

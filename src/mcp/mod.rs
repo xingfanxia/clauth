@@ -717,6 +717,12 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let target = config
         .find(opts.profile)
         .ok_or_else(|| format!("profile not found: {}", opts.profile))?;
+    // Mirrors `disable_profile`'s own live-session refusal from the other
+    // direction: that guard stops disabling a profile mid-session, this one
+    // stops opening a brand-new session on one already disabled.
+    if target.is_disabled() {
+        return Err(format!("profile is disabled: {}", opts.profile));
+    }
 
     if let Some(dir) = opts.cwd
         && !std::path::Path::new(dir).is_dir()

@@ -420,6 +420,39 @@ fn non_diverged_switch_takes_plain_path() {
     assert_eq!(active, "target");
 }
 
+/// The disabled gate lives in `ensure_switch_target_ok`, the chokepoint every
+/// switch primitive calls first — so the MCP `switch` tool's own action
+/// (`switch_profile_noninteractive`) refuses a disabled target even on the
+/// plain, non-diverged path, with no CLI-side pre-check anywhere near it.
+#[test]
+fn non_diverged_switch_refuses_a_disabled_target() {
+    let _home = HomeSandbox::new();
+    let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
+    let mut target_profile = stored_profile("target", Some(creds("target-a", "target-r")));
+    target_profile.disabled = true;
+    crate::claude::force_link_profile_credentials("active").expect("link active");
+
+    let config = handle(AppConfig {
+        state: AppState {
+            active_profile: Some("active".into()),
+            profiles: vec!["active".into(), "target".into()],
+            ..Default::default()
+        },
+        profiles: vec![active_profile, target_profile],
+    });
+
+    let err = switch_profile_noninteractive(&config, "target", None, no_network)
+        .expect_err("a disabled target must be refused");
+    assert_eq!(
+        err.to_string(),
+        "'target': account is disabled, run `clauth enable target`"
+    );
+    assert!(
+        config.lock().unwrap().is_active("active"),
+        "a refused switch must leave the active profile unchanged"
+    );
+}
+
 // ── AUTH-1 gate on the noninteractive path (Incident C, every entry point) ──
 
 /// A dead target must be refused BEFORE any relink — the MCP `switch` (and any

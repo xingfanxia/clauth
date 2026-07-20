@@ -312,6 +312,143 @@ fn parse_delete_args_rejects_unknown_flag_and_second_name() {
     );
 }
 
+// ── parse_disable_args ──
+
+#[test]
+fn parse_disable_args_bare_name_no_yes() {
+    assert_eq!(
+        parse_disable_args(&["acme".to_string()]),
+        Some(("acme", false))
+    );
+}
+
+#[test]
+fn parse_disable_args_accepts_yes_and_short_flag_anywhere() {
+    assert_eq!(
+        parse_disable_args(&["acme".to_string(), "--yes".to_string()]),
+        Some(("acme", true))
+    );
+    assert_eq!(
+        parse_disable_args(&["-y".to_string(), "acme".to_string()]),
+        Some(("acme", true))
+    );
+}
+
+#[test]
+fn parse_disable_args_requires_a_name() {
+    assert_eq!(parse_disable_args(&[]), None);
+    assert_eq!(
+        parse_disable_args(&["--yes".to_string()]),
+        None,
+        "--yes without a name must bail, not disable nothing"
+    );
+}
+
+#[test]
+fn parse_disable_args_rejects_unknown_flag_and_second_name() {
+    assert_eq!(
+        parse_disable_args(&["acme".to_string(), "--force".to_string()]),
+        None,
+        "disable has no --force override, unlike delete"
+    );
+    assert_eq!(
+        parse_disable_args(&["acme".to_string(), "other".to_string()]),
+        None
+    );
+}
+
+// ── parse_status_args ──
+
+#[test]
+fn parse_status_args_bare_json() {
+    assert_eq!(parse_status_args(&["--json".to_string()]), Some(false));
+}
+
+#[test]
+fn parse_status_args_accepts_all_and_disabled_spellings() {
+    assert_eq!(
+        parse_status_args(&["--json".to_string(), "--all".to_string()]),
+        Some(true)
+    );
+    assert_eq!(
+        parse_status_args(&["--json".to_string(), "--disabled".to_string()]),
+        Some(true)
+    );
+}
+
+#[test]
+fn parse_status_args_requires_json() {
+    assert_eq!(parse_status_args(&[]), None);
+    assert_eq!(parse_status_args(&["--all".to_string()]), None);
+}
+
+#[test]
+fn parse_status_args_rejects_unknown_trailing_flag() {
+    assert_eq!(
+        parse_status_args(&["--json".to_string(), "--bogus".to_string()]),
+        None
+    );
+}
+
+// ── cmd_switch / cmd_start refuse a disabled target ─────────────────────────
+
+mod disabled_target_refusal {
+    use super::*;
+    use crate::testutil::HomeSandbox;
+
+    fn seed_disabled_profile(name: &str) {
+        let mut config = crate::profile::AppConfig {
+            state: crate::profile::AppState::default(),
+            profiles: Vec::new(),
+        };
+        crate::actions::create_blank_profile(&mut config, name.to_string(), None, None, None)
+            .expect("create profile");
+        crate::actions::disable_profile(&mut config, name).expect("disable profile");
+    }
+
+    #[test]
+    fn cmd_switch_refuses_disabled_target_with_no_side_effects() {
+        let _home = HomeSandbox::new();
+        seed_disabled_profile("off");
+
+        let err = cmd_switch("off").expect_err("a disabled target must be refused");
+        assert_eq!(
+            err.to_string(),
+            "'off': account is disabled, run `clauth enable off`"
+        );
+
+        let reloaded = crate::profile::load_config().expect("reload");
+        assert_eq!(
+            reloaded.state.active_profile, None,
+            "a refused switch must not change the active profile"
+        );
+    }
+
+    #[test]
+    fn cmd_start_refuses_disabled_target_before_acquiring_a_runtime() {
+        let home = HomeSandbox::new();
+        seed_disabled_profile("off");
+
+        let err = cmd_start("off", &[], crate::runtime::Isolation::Shared, None)
+            .expect_err("a disabled target must be refused");
+        assert_eq!(
+            err.to_string(),
+            "'off': account is disabled, run `clauth enable off`"
+        );
+
+        assert!(
+            !home
+                .home()
+                .join(".clauth")
+                .join("profiles")
+                .join("off")
+                .join("runtime")
+                .exists(),
+            "the refusal must happen before any runtime is acquired"
+        );
+    }
+}
+
 /// End-to-end through `dispatch` for the one login shape that's safe to run
 /// without side effects: an invalid arg shape bails before ever reaching
 /// `cmd_login`.

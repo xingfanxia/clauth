@@ -54,20 +54,36 @@ pub(crate) fn validate_profile_name(
 
 /// Every switch primitive tears the live credentials link down before
 /// `finish_switch` would notice a ghost, and the discard path takes no prior
-/// snapshot — an uncaptured re-login would be gone for good. So existence
-/// FIRST: a caller holding a stale name (a queued auto-switch target, the MCP
-/// switch tool with a divergence default) bounces off before any side effect
-/// instead of stranding the machine half-switched with the live link destroyed.
-fn ensure_profile_exists(config: &AppConfig, name: &str) -> Result<()> {
-    if config.find(name).is_none() {
+/// snapshot — an uncaptured re-login would be gone for good. So this runs
+/// FIRST, before any side effect: a caller holding a stale name (a queued
+/// auto-switch target, the MCP switch tool with a divergence default) bounces
+/// off instead of stranding the machine half-switched with the live link
+/// destroyed, and a disabled target is refused before that same link gets
+/// force-relinked to it.
+///
+/// This is the ONE authoritative "never active while disabled" gate — every
+/// switch primitive that can write `active_profile`
+/// ([`switch_profile`]/[`switch_profile_discard`]/[`switch_profile_reconciled`],
+/// and so [`switch_profile_noninteractive`] and `switch_profile_cli`, which
+/// only ever reach `active_profile` through one of those three) calls this
+/// as its first line, inside the same `with_state_lock` closure that runs
+/// the write at the end. The lock is held continuously from here to that
+/// write, so a concurrent `disable_profile` can't land in the gap — a
+/// pre-lock check in a CLI/MCP wrapper is a friendly early error at best,
+/// never the authoritative one.
+fn ensure_switch_target_ok(config: &AppConfig, name: &str) -> Result<()> {
+    let Some(profile) = config.find(name) else {
         bail!("profile '{name}' not found");
+    };
+    if profile.is_disabled() {
+        bail!("'{name}': account is disabled, run `clauth enable {name}`");
     }
     Ok(())
 }
 
 pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
-        ensure_profile_exists(config, name)?;
+        ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
             return Ok(());
         }
@@ -108,7 +124,7 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
 /// un-captured re-login) precisely because the caller chose to drop it.
 pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &str) -> Result<()> {
     with_state_lock(|| {
-        ensure_profile_exists(config, target)?;
+        ensure_switch_target_ok(config, target)?;
         if config.is_active(target) {
             return Ok(());
         }
@@ -120,7 +136,7 @@ pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &str) -> Re
 /// Force-snapshot the outgoing creds then force the symlink. CLI prompt path only.
 pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
-        ensure_profile_exists(config, name)?;
+        ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
             return Ok(());
         }
@@ -545,6 +561,60 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str, force: bool) ->
     Ok(())
 }
 
+/// `clauth disable <name>` — mark `name` as user-disabled (see
+/// [`Profile::disabled`]): invisible to the fallback-chain walk, the
+/// usage/rotation scheduler, and the daemon status feed by default, while its
+/// profile directory and stored credentials stay on disk untouched. Refuses
+/// when `name` is the global active profile or holds a live `clauth start`
+/// session, naming the blocker — a disabled account must never be reachable
+/// as an active target, so both gates run before any write.
+///
+/// Idempotent: an already-disabled account returns `Ok(false)` with no write
+/// and no error, checked BEFORE the blocker gates so re-running `disable` on
+/// an account that's already off never trips them (e.g. one that's also
+/// currently active from before this feature). Returns `Ok(true)` when it
+/// flips the flag and persists.
+pub(crate) fn disable_profile(config: &mut AppConfig, name: &str) -> Result<bool> {
+    with_state_lock(|| {
+        let profile = config
+            .find(name)
+            .with_context(|| format!("profile '{name}' not found"))?;
+        if profile.is_disabled() {
+            return Ok(false);
+        }
+        if config.is_active(name) {
+            bail!("'{name}' is the active account — switch away first");
+        }
+        if crate::runtime::has_live_session(name) {
+            bail!("'{name}' has an open session — close it first");
+        }
+        let profile = config.find_mut(name).context("profile not found")?;
+        profile.disabled = true;
+        save_profile(profile)?;
+        Ok(true)
+    })
+}
+
+/// `clauth enable <name>` — clear [`Profile::disabled`], restoring `name` to
+/// every operational surface. No other side effects: chain slot, env, model
+/// settings, and stored credentials are untouched.
+///
+/// Idempotent: an already-enabled account returns `Ok(false)` with no write
+/// and no error. Returns `Ok(true)` when it clears the flag and persists.
+pub(crate) fn enable_profile(config: &mut AppConfig, name: &str) -> Result<bool> {
+    with_state_lock(|| {
+        let profile = config
+            .find_mut(name)
+            .with_context(|| format!("profile '{name}' not found"))?;
+        if !profile.is_disabled() {
+            return Ok(false);
+        }
+        profile.disabled = false;
+        save_profile(profile)?;
+        Ok(true)
+    })
+}
+
 pub(crate) fn create_blank_profile(
     config: &mut AppConfig,
     name: String,
@@ -807,7 +877,16 @@ pub(crate) fn overwrite_captured_profile(
             crate::profile_cache::remove_profile_cache(name, file);
         }
 
-        if config.state.active_profile.is_none() {
+        // A disabled profile's creds are still captured above (the operator
+        // asked for that), but it must never become the active account this
+        // way — reachable via login → switch away → disable → delete the
+        // active (clears `active_profile` to None) → `clauth login
+        // <disabled>` (the documented revoked-token recovery) auto-activating
+        // it. `is_disabled` is re-read fresh rather than reusing a stale bool
+        // from before `save_profile` — nothing above this line touches the
+        // flag, but the check must describe the profile as committed.
+        let disabled = config.find(name).is_some_and(Profile::is_disabled);
+        if config.state.active_profile.is_none() && !disabled {
             link_profile_credentials(name)?;
             config.state.active_profile = Some(name.into());
         } else if was_active {

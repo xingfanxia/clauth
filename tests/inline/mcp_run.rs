@@ -88,6 +88,48 @@ fn depth_guard_also_refuses_above_one() {
     assert_eq!(result.is_error, Some(true));
 }
 
+/// Mirrors `disable_profile`'s own live-session refusal from the other
+/// direction: that guard stops disabling a profile mid-session, this one
+/// stops `delegate` from opening a brand-new session on one already
+/// disabled. Drives `run_delegate` directly — no async tool call, no `claude`
+/// binary needed, since the guard fires before `ProfileRuntime::acquire`.
+#[test]
+fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "off".to_string(), None, None, None)
+        .expect("create profile");
+    crate::actions::disable_profile(&mut config, "off").expect("disable profile");
+
+    let err = run_delegate(DelegateOpts {
+        profile: "off",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        timeout: Duration::from_secs(30),
+        isolation: Isolation::Shared,
+        depth: 0,
+    })
+    .expect_err("a disabled target must be refused");
+    assert_eq!(err, "profile is disabled: off");
+
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("off")
+            .join("runtime")
+            .exists(),
+        "the refusal must happen before any runtime is acquired"
+    );
+}
+
 // TODO(manual/integration): the live-spawn paths cannot be unit-tested without a
 // real `claude` on PATH, and we deliberately do NOT fake one (a fake binary
 // would assert nothing about the real envelope contract). Verify by hand:
