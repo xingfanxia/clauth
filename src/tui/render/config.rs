@@ -14,7 +14,7 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    bold_when, cycle_option, draw_scrolled_lines, draw_selector_list, head_cols,
+    DIAG_DISABLED, bold_when, cycle_option, draw_scrolled_lines, draw_selector_list, head_cols,
     help_tooltip_lines, highlight_row, key_cell, label_style, master_detail, name_color,
     picker_row, pill, section_box, section_box_verbatim,
 };
@@ -308,7 +308,7 @@ fn draw_settings_rows(
             key_cell("status", KEY_W, KEY_GUTTER),
             theme::label(),
         )];
-        spans.extend(pill("disabled".to_string(), theme::dim().bold()));
+        spans.extend(pill(DIAG_DISABLED.to_string(), theme::dim().bold()));
         lines.push(Line::from(spans));
     }
 

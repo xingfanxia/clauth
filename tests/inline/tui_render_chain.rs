@@ -447,11 +447,12 @@ fn blocked_member_shows_the_worst_reason_pill() {
     );
     // Tolerant on the exact bucket: the fixture's `now` and `blocked_reason`'s
     // `now` can straddle a whole second (7200 → "1h 59m"), so assert only that a
-    // countdown suffix renders, not its value.
+    // countdown suffix trails the pill, not its value.
     assert!(
-        pill.contains("5h 97% · "),
-        "carries the reset countdown: {pill:?}"
+        pill.contains("[ 5h 97% ]  "),
+        "carries the reset countdown as a trailing suffix: {pill:?}"
     );
+    assert!(!pill.contains('·'), "no middle-dot separator: {pill:?}");
 }
 
 // A switch-grade kick-rejected member — headroom, but the messages limiter won't
@@ -462,13 +463,32 @@ fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
     let until = now_epoch_secs() + 7200;
     let lines = member_detail(&cfg, "a", false, 0, false, None, None, 60, Some(until)).0;
     let pill = line_text(&lines[0]);
-    // Label + a countdown suffix; the exact bucket stays tolerant since the two
-    // `now` reads (fixture vs `blocked_reason`) can straddle a whole second. The
-    // exact `lifts_in` value is range-checked in the `blocked_reason_kick_*` unit
-    // test instead.
+    // Bare pill + a faint countdown suffix OUTSIDE the brackets (no `·`), the
+    // same shape the Usage-tab kick pill renders. The exact bucket stays tolerant
+    // since the two `now` reads (fixture vs `blocked_reason`) can straddle a whole
+    // second. The exact `lifts_in` value is range-checked in the
+    // `blocked_reason_kick_*` unit test instead.
     assert!(
-        pill.contains("claude code blocked · "),
-        "renders the kick pill with a lift countdown: {pill:?}"
+        pill.contains("[ claude code blocked ]  "),
+        "renders the kick pill with a trailing lift countdown: {pill:?}"
+    );
+    assert!(!pill.contains('·'), "no middle-dot separator: {pill:?}");
+}
+
+// The canceled pill reads the short shared label, not the old verbose
+// `subscription canceled`: the `└` hint carries the explanation, and the label
+// comes from the one source both this card and the Usage status block read, so
+// the two tabs can't drift apart again.
+#[test]
+fn canceled_member_shows_the_short_shared_label() {
+    let rendered: String = reason_pill_spans(&BlockedReason::Canceled, ResetFmt::default())
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(rendered, "[ canceled ]", "got {rendered:?}");
+    assert!(
+        !rendered.contains("subscription"),
+        "the verbose wording moved to the hint line: {rendered:?}"
     );
 }
 

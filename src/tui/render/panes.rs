@@ -149,6 +149,20 @@ pub(super) fn name_color(active: bool) -> Style {
     }
 }
 
+/// Canonical `[ label ]` wording for the diagnostic states whose text pill
+/// surfaces on more than one tab (Usage / Fallback / Config; the Overview marker
+/// shares only the `reason_marker` glyph, no text). One source so the same
+/// account state never wears two words on two tabs — `canceled` used to read
+/// `subscription canceled` on the Fallback card. Each pill's `└` hint carries
+/// the explanation, so the label itself stays short. The hint layer stays
+/// per-surface on purpose: `chain::reason_fix` and `usage::diag_fix` map
+/// different enums with different config context.
+pub(super) const DIAG_DISABLED: &str = "disabled";
+pub(super) const DIAG_CANCELED: &str = "canceled";
+pub(super) const DIAG_AUTH_BROKEN: &str = "auth broken";
+pub(super) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
+pub(super) const DIAG_KICK: &str = "claude code blocked";
+
 /// cloudy-tui status pill `[ label ]`: brackets in `TEXT_DIM`, the label in the
 /// caller's semantic style (bold for a charged state). Returns the three spans
 /// so a caller can compose them after a key cell; wrap in a `Line` for a

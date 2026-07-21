@@ -16,8 +16,9 @@ use super::format::{
     ResetFmt, activity_verb, reset_in_secs, reset_phrase, spinner_frame, spinner_style,
 };
 use super::panes::{
-    draw_profile_selector, empty_state, key_cell, master_detail, rail_hint_lines, section_box,
-    section_box_verbatim,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK,
+    draw_profile_selector, empty_state, key_cell, master_detail, pill, rail_hint_lines,
+    section_box, section_box_verbatim,
 };
 use crate::format::{endpoint_label, plan_label};
 use crate::profile::Profile;
@@ -787,7 +788,10 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     let disabled = profile.is_disabled();
     if disabled {
         rows.push(DiagRow {
-            content: diag_pill_spans("disabled", theme::dim()),
+            content: pill(
+                DIAG_DISABLED.to_string(),
+                theme::dim().add_modifier(Modifier::BOLD),
+            ),
             hint: Some(diag_fix(UsageDiag::Disabled, &profile.name)),
         });
     }
@@ -805,7 +809,10 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         .is_some_and(|p| p.is_canceled())
     {
         rows.push(DiagRow {
-            content: diag_pill_spans("canceled", theme::danger()),
+            content: pill(
+                DIAG_CANCELED.to_string(),
+                theme::danger().add_modifier(Modifier::BOLD),
+            ),
             hint: Some(diag_fix(UsageDiag::Canceled, &profile.name)),
         });
         return render_status_rows(rows, w);
@@ -819,7 +826,10 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     //    "refresh in Ns") under a dead login.
     if header.diag.auth_broken {
         rows.push(DiagRow {
-            content: diag_pill_spans("auth broken", theme::danger()),
+            content: pill(
+                DIAG_AUTH_BROKEN.to_string(),
+                theme::danger().add_modifier(Modifier::BOLD),
+            ),
             hint: Some(diag_fix(UsageDiag::AuthBroken, &profile.name)),
         });
         return render_status_rows(rows, w);
@@ -831,15 +841,12 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     //    amber→red escalation as the other streak pills; the suffix names the
     //    limiter's advertised ceiling, an upper bound (it has relented early).
     if let Some(block) = header.kick_block {
-        let mut spans = vec![
-            Span::styled("[ ", theme::dim()),
-            Span::styled("blocked", streak_style(block.streak)),
-            Span::styled(" ]", theme::dim()),
-        ];
+        // `streak_style` already stamps BOLD, so the pill's own style carries it.
+        let mut spans = pill(DIAG_KICK.to_string(), streak_style(block.streak));
         if let Some(until) = block.until {
             let left = until.saturating_sub(now);
             spans.push(Span::styled(
-                format!("  lifts within {}", crate::usage::humanize_duration(left)),
+                format!("  {}", crate::usage::humanize_duration(left)),
                 theme::faint(),
             ));
         }
@@ -863,12 +870,18 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     //    never render together — an uncapped ceiling makes "raise it" meaningless.
     if header.diag.spend_uncapped {
         rows.push(DiagRow {
-            content: diag_pill_spans("uncapped", theme::danger()),
+            content: pill(
+                "uncapped".to_string(),
+                theme::danger().add_modifier(Modifier::BOLD),
+            ),
             hint: Some(diag_fix(UsageDiag::SpendUncapped, &profile.name)),
         });
     } else if header.diag.budget_spent {
         rows.push(DiagRow {
-            content: diag_pill_spans("extra usage spent", theme::warning()),
+            content: pill(
+                DIAG_BUDGET_SPENT.to_string(),
+                theme::warning().add_modifier(Modifier::BOLD),
+            ),
             hint: Some(diag_fix(UsageDiag::BudgetSpent, &profile.name)),
         });
     }
@@ -1049,18 +1062,6 @@ fn render_status_rows(rows: Vec<DiagRow>, width: usize) -> Vec<Line<'static>> {
         }
     }
     lines
-}
-
-/// A `[ label ]` diagnostic pill's content spans (no key cell — added by
-/// [`render_status_rows`] once every row's hint state is known). `label_style`
-/// carries the severity; the fix hint beneath stays faint, so the pill is the
-/// WHAT and the sub-line is the FIX.
-fn diag_pill_spans(label: &'static str, label_style: Style) -> Vec<Span<'static>> {
-    vec![
-        Span::styled("[ ", theme::dim()),
-        Span::styled(label, label_style.add_modifier(Modifier::BOLD)),
-        Span::styled(" ]", theme::dim()),
-    ]
 }
 
 /// A detected Usage-tab diagnostic state paired with the config context that

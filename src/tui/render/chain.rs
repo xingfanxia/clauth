@@ -22,9 +22,10 @@ use super::super::app::{
 use super::super::theme;
 use super::format::{ResetFmt, reset_pill, reset_resume};
 use super::panes::{
-    bold_when, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
-    invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill, rail_hint_lines,
-    section_box, section_box_verbatim, select_line, wrap_words,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, bold_when,
+    draw_selector_list, head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines,
+    key_cell, label_style, master_detail, name_color, pill, rail_hint_lines, section_box,
+    section_box_verbatim, select_line, wrap_words,
 };
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, soonest_resume,
@@ -273,36 +274,44 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
 /// countdown — the limiter relents on its own schedule, so a wall-clock time
 /// there would claim a precision the estimate doesn't have.
 fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>> {
-    let (label, style) = match reason {
-        BlockedReason::Disabled => ("disabled".to_string(), theme::dim().bold()),
-        BlockedReason::Canceled => ("subscription canceled".to_string(), theme::danger().bold()),
-        BlockedReason::AuthBroken => ("auth broken".to_string(), theme::danger().bold()),
+    // Every pill is `[ label ]` with an optional qualifier trailing as a faint
+    // suffix OUTSIDE the brackets (a reset countdown, a lift ETA, "still
+    // serving") — never crammed inside with a `·`, so the whole card and the
+    // Usage-tab pills read one shape.
+    let (label, style, suffix) = match reason {
+        BlockedReason::Disabled => (DIAG_DISABLED.to_string(), theme::dim().bold(), None),
+        BlockedReason::Canceled => (DIAG_CANCELED.to_string(), theme::danger().bold(), None),
+        BlockedReason::AuthBroken => (DIAG_AUTH_BROKEN.to_string(), theme::danger().bold(), None),
         BlockedReason::WeeklySpent { resets_in } => (
-            match resets_in {
-                Some(s) => format!("weekly spent · {}", reset_pill(*s, fmt)),
-                None => "weekly spent".to_string(),
-            },
+            "weekly spent".to_string(),
             theme::danger().bold(),
+            resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
         ),
         BlockedReason::KickRejected { lifts_in } => (
-            format!("claude code blocked · {}", humanize_duration(*lifts_in)),
+            DIAG_KICK.to_string(),
             theme::warning().bold(),
+            Some(humanize_duration(*lifts_in)),
         ),
-        BlockedReason::BudgetSpent => ("extra usage spent".to_string(), theme::warning().bold()),
+        BlockedReason::BudgetSpent => {
+            (DIAG_BUDGET_SPENT.to_string(), theme::warning().bold(), None)
+        }
         BlockedReason::FiveHour { pct, resets_in } => (
-            match resets_in {
-                Some(s) => format!("5h {pct:.0}% · {}", reset_pill(*s, fmt)),
-                None => format!("5h {pct:.0}%"),
-            },
+            format!("5h {pct:.0}%"),
             theme::warning().bold(),
+            resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
         ),
         BlockedReason::WeeklySoft { pct } => (
-            format!("weekly {pct:.0}% · still serving"),
+            format!("weekly {pct:.0}%"),
             theme::warning().bold(),
+            Some("still serving".to_string()),
         ),
-        BlockedReason::Stale => ("stale data".to_string(), theme::dim().bold()),
+        BlockedReason::Stale => ("stale data".to_string(), theme::dim().bold(), None),
     };
-    pill(label, style)
+    let mut spans = pill(label, style);
+    if let Some(suffix) = suffix {
+        spans.push(Span::styled(format!("  {suffix}"), theme::faint()));
+    }
+    spans
 }
 
 /// The `├`/`└` fix line under a blocked-reason pill: what to actually do about

@@ -468,8 +468,8 @@ fn status_lines_stacks_the_health_rungs_under_disabled() {
     );
 
     // The pill label carries the neutral tier, never danger/warning. Only the
-    // fg is worth asserting — `diag_pill_spans` stamps BOLD on every label
-    // unconditionally, so a modifier check would pin the helper, not this call.
+    // fg is worth asserting — every status pill is drawn bold by its caller, so
+    // a modifier check would pin that shared choice, not this arm.
     let label = lines[0]
         .spans
         .iter()
@@ -578,10 +578,13 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
         })),
         120,
     ));
-    assert!(blocked.contains("[ blocked ]"), "got {blocked:?}");
     assert!(
-        blocked.contains("lifts within"),
-        "an advertised ceiling names itself, got {blocked:?}"
+        blocked.contains("[ claude code blocked ]  "),
+        "an advertised ceiling trails the pill as a bare suffix, got {blocked:?}"
+    );
+    assert!(
+        !blocked.contains('·'),
+        "no middle-dot separator, got {blocked:?}"
     );
 
     let no_ceiling = text(status_lines(
@@ -594,10 +597,10 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
         })),
         120,
     ));
-    assert!(no_ceiling.contains("[ blocked ]"));
+    assert!(no_ceiling.contains("[ claude code blocked ]"));
     assert!(
-        !no_ceiling.contains("lifts within"),
-        "no ceiling → no made-up deadline, got {no_ceiling:?}"
+        !no_ceiling.contains("[ claude code blocked ]  "),
+        "no ceiling → no made-up deadline suffix, got {no_ceiling:?}"
     );
 }
 
@@ -652,7 +655,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
         "block pill + fetch pill, got {lines:?}"
     );
     assert!(
-        pill_lines[0].starts_with("status") && pill_lines[0].contains("[ blocked ]"),
+        pill_lines[0].starts_with("status") && pill_lines[0].contains("[ claude code blocked ]"),
         "the block leads, keyed: {:?}",
         pill_lines[0]
     );
@@ -1330,7 +1333,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
         "the dead login leads: {out}"
     );
     assert!(
-        !out.contains("[ blocked ]") && !out.contains("[ uncapped ]"),
+        !out.contains("[ claude code blocked ]") && !out.contains("[ uncapped ]"),
         "kick + spend pills are suppressed on a dead login: {out}"
     );
     assert!(
