@@ -2063,11 +2063,13 @@ fn compact_rearm_after_exit() {
 use super::theme::{self, Tier};
 use super::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, KeyCode, Tab};
 
-use crate::testutil::key;
+use crate::testutil::{TierSandbox, key};
 
 #[test]
 fn theme_set_tier_round_trips() {
-    theme::set_tier(Tier::Full);
+    // The pin's own store is the first leg; the guard exists so the last leg
+    // does not outlive this test.
+    let _tier = TierSandbox::new(Tier::Full);
     assert_eq!(theme::tier(), Tier::Full);
     theme::set_tier(Tier::Compatible);
     assert_eq!(theme::tier(), Tier::Compatible);

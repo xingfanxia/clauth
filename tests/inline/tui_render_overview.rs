@@ -816,9 +816,8 @@ fn disabled_row_type_cell_does_not_pulse() {
     // The wave is a Full-tier effect: `pulse_name_spans` returns flat spans
     // below it. The tier auto-detects from `$COLORTERM`, which CI leaves unset,
     // so an unpinned tier renders every row flat. That makes the assertion
-    // below vacuous and fails its control. nextest runs each test in its own
-    // process, so this pin cannot leak.
-    theme::set_tier(theme::Tier::Full);
+    // below vacuous and fails its control.
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
     a.credentials = Some(oauth_creds());

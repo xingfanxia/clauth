@@ -82,6 +82,25 @@ pub(crate) fn tier() -> Tier {
     Tier::from_code(TIER.load(Ordering::Relaxed)).unwrap_or_else(detect)
 }
 
+/// Serializes tests that pin the tier. Every `tests/inline/*.rs` module compiles
+/// into the one bin target, so under `cargo test` they run as threads sharing
+/// this `TIER`. `testutil::TierSandbox` acquires it as an RAII guard.
+#[cfg(test)]
+pub(crate) static TIER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read the stored pin, `None` for unset. [`tier`] collapses unset into a
+/// detected tier, which a restore would then write back as a real pin.
+#[cfg(test)]
+pub(crate) fn tier_override() -> Option<Tier> {
+    Tier::from_code(TIER.load(Ordering::Relaxed))
+}
+
+/// Put back a [`tier_override`] reading.
+#[cfg(test)]
+pub(crate) fn restore_tier(snapshot: Option<Tier>) {
+    TIER.store(snapshot.map_or(0, Tier::as_code), Ordering::Relaxed);
+}
+
 // ── Palette tables ────────────────────────────────────────────────────────────
 //
 // Each row: (full: Color::Rgb, compatible: Color::Indexed(xterm-256))
