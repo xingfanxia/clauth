@@ -108,6 +108,7 @@ key**: names, tiers, percentages, timestamps only.
 | `profiles[].fallback` | `null` when not in the chain; else 1-based `position`, `threshold` (%), `armed` (this member is the active one the auto-switch watches). |
 | `profiles[].windows[]` | `label` is **derived, not an enum**: `"5h"` and `"7d"` always; the third is a plan-tier label (`"7d Opus"`…). Treat labels as opaque display strings, never keys to switch on. `utilization_pct` 0-100 float; `resets_at` nullable. |
 | `profiles[].third_party` | `{ "available": bool }` for api-key profiles once probed, else `null`, including an api-key profile whose provider has never been reached (no cache yet). Plain reachability; structured balances deliberately deferred. |
+| `profiles[]` membership | A user-disabled account (`clauth disable`) is excluded from `profiles[]` by default; no field marks a profile disabled, absence from the array IS the signal. The active profile is always present regardless of its own disabled flag, so `active_profile` never names a profile missing from `profiles[]`. |
 
 ### Evolution rule (the load-bearing part)
 
@@ -128,3 +129,9 @@ the single-shot form derives `fetch_status` from cache mtimes, so it only ever
 reports `Fresh`/`Cached`/`null`: a profile the live daemon shows as `Failed` or
 `RateLimited` reads as `Cached` here at the same instant. Poll the feed, not the
 CLI, when the fetch outcome matters.
+
+`clauth status --json --all` (or its `--disabled` spelling, equivalent) is the
+one way to reveal disabled accounts in `profiles[]`; the running daemon's own
+published `~/.clauth/status.json` file always hides them (every daemon-side
+`build_status` call passes `include_disabled: false`), so a reader that needs
+the disabled roster must shell out to the single-shot form, never poll the feed file for it.
