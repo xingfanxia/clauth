@@ -14,8 +14,8 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    bold_when, cycle_option, disabled_picker_row, draw_scrolled_lines, draw_selector_list,
-    head_cols, help_tooltip_lines, highlight_row, key_cell, label_style, master_detail, name_color,
+    bold_when, cycle_option, draw_scrolled_lines, draw_selector_list, head_cols,
+    help_tooltip_lines, highlight_row, key_cell, label_style, master_detail, name_color,
     picker_row, pill, section_box, section_box_verbatim,
 };
 
@@ -43,17 +43,13 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                if p.is_disabled() {
-                    disabled_picker_row(i == sel, focused, p.name.to_string(), w)
+                // A disabled account can never be active, so dim wins outright.
+                let ns = if p.is_disabled() {
+                    theme::dim()
                 } else {
-                    picker_row(
-                        i == sel,
-                        focused,
-                        p.name.to_string(),
-                        name_color(cfg.is_active(&p.name)),
-                        w,
-                    )
-                }
+                    name_color(cfg.is_active(&p.name))
+                };
+                picker_row(i == sel, focused, p.name.to_string(), ns, w)
             })
             .collect();
         rows.push(picker_row(
@@ -303,10 +299,23 @@ fn draw_settings_rows(
         ("oauth", theme::accent())
     };
 
-    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Status purity: an enabled account has no status worth a row, so the row
+    // only exists while the account is disabled.
+    if snap.disabled {
+        let mut spans = vec![Span::styled(
+            key_cell("status", KEY_W, KEY_GUTTER),
+            theme::label(),
+        )];
+        spans.extend(pill("disabled".to_string(), theme::dim().bold()));
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::from(vec![
         Span::styled(key_cell("type", KEY_W, KEY_GUTTER), theme::label()),
         Span::styled(type_value, type_style),
-    ])];
+    ]));
 
     // Provider row — only for recognised third-party providers. Hidden while a
     // draft empties the base-url buffer (`is_api` tracks the draft live).
@@ -329,8 +338,8 @@ fn draw_settings_rows(
     lines.push(Line::from(""));
     // Tracks the absolute line index + buffer + row of the active edit row for
     // cursor placement after rendering. The header block above is variable
-    // (type + optional provider + optional session + blank), so the row loop's
-    // base index is simply what has been pushed so far.
+    // (optional status + type + optional provider + optional session + blank),
+    // so the row loop's base index is simply what has been pushed so far.
     let mut edit_caret: Option<(u16, InputState, ConfigRow)> = None;
     let mut line_idx: u16 = lines.len() as u16;
 

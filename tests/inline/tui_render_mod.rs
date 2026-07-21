@@ -918,11 +918,13 @@ fn fallback_selector_marks_a_blocked_member() {
 }
 
 // A typed threshold on a BLOCKED member must still place the native caret on the
-// `rotate at` row: the blocked-reason pill shifts every card row down by 2 (pill
-// + blank), and the cursor math has to follow. Compare against an unblocked edit.
+// `rotate at` row: the blocked-reason pill block shifts every card row down and
+// the cursor math has to follow. Asserted against the RENDERED row rather than a
+// fixed delta — the block's height moved once already (it grew a fix line), and
+// a delta test just re-derives the implementation's own arithmetic.
 #[test]
 fn fallback_edit_caret_follows_the_blocked_reason_pill() {
-    let caret_y = |auth_broken: &[&str]| -> u16 {
+    let check = |auth_broken: &[&str], label: &str| {
         let mut app = App::new(fallback_config(auth_broken));
         app.tab = Tab::Fallback;
         app.chain_cursor = 0; // member a
@@ -931,15 +933,20 @@ fn fallback_edit_caret_follows_the_blocked_reason_pill() {
         app.fallback_threshold_draft = Some(crate::tui::app::InputState::new("90"));
         let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
         term.draw(|f| super::draw(f, &app)).unwrap();
-        term.get_cursor_position().unwrap().y
+        let caret = term.get_cursor_position().unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let rendered_at = rows
+            .iter()
+            .position(|r| r.contains("rotate at"))
+            .unwrap_or_else(|| panic!("[{label}] rotate at renders:\n{}", rows.join("\n")));
+        assert_eq!(
+            caret.y as usize, rendered_at,
+            "[{label}] caret must sit on the rotate-at row (caret={}, row={rendered_at})",
+            caret.y
+        );
     };
-    let unblocked = caret_y(&[]);
-    let blocked = caret_y(&["a"]);
-    assert_eq!(
-        blocked,
-        unblocked + 2,
-        "the blocked-reason pill (2 rows) shifts the edit caret down (unblocked={unblocked}, blocked={blocked})"
-    );
+    check(&[], "unblocked");
+    check(&["a"], "blocked");
 }
 
 /// The Config and Setup panes rebuild their whole row list every frame into a

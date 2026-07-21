@@ -311,35 +311,111 @@ fn disabled_hint_follows_the_gate_then_the_value() {
     assert!(active.contains("active account"), "{active}");
 }
 
-/// The Setup account-list picker row for a disabled account: name dims and a
-/// `[ disabled ]` chip trails it. Shared with `draw_profile_selector` (Usage
-/// tab) via the same `disabled_picker_row` helper (`panes.rs`).
+/// A disabled account's row in the Setup account list carries the dim name and
+/// nothing else — the label itself lives on the Setup header's own `status`
+/// row, not on every list that happens to print the name. Driven through
+/// `draw_selector` rather than `picker_row`, so it pins the CALL SITE's style
+/// choice; handing `picker_row` a style would only re-assert the argument.
 #[test]
-fn disabled_picker_row_dims_name_and_appends_chip() {
-    let line = disabled_picker_row(false, true, "acct".to_string(), 40);
-    let text = line_text(&line);
-    assert!(text.contains("[ disabled ]"), "chip renders: {text}");
-    let name_span = line
-        .spans
-        .iter()
-        .find(|s| s.content.as_ref() == "acct")
-        .expect("name span renders");
+fn disabled_account_only_dims_its_name_in_the_setup_list() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut disabled = crate::testutil::blank_profile("xqzoff");
+    disabled.disabled = true;
+    let enabled = crate::testutil::blank_profile("xqzon");
+    let names: Vec<ProfileName> = vec!["xqzoff".into(), "xqzon".into()];
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            ..AppState::default()
+        },
+        profiles: vec![disabled, enabled],
+    });
+
+    let (w, h) = (40u16, 10u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| draw_selector(f, f.area(), &app, true))
+        .unwrap();
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+
+    let cell_fg = |needle: &str| -> Option<ratatui::style::Color> {
+        let row_idx = rows
+            .iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} renders:\n{}", rows.join("\n")));
+        let byte = rows[row_idx].find(needle).unwrap();
+        let col = rows[row_idx][..byte].chars().count();
+        Some(buf.content[row_idx * w as usize + col].fg)
+    };
+
     assert_eq!(
-        name_span.style.fg,
+        cell_fg("xqzoff"),
         theme::dim().fg,
-        "the picker-row name renders dim"
+        "the disabled account's name renders dim"
+    );
+    assert_ne!(
+        cell_fg("xqzon"),
+        theme::dim().fg,
+        "an enabled sibling keeps its ordinary name color"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("disabled")),
+        "no inline chip anywhere in the list:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// The Setup header's `status` row: the one Setup-tab surface naming the
+/// disabled state, sitting ABOVE `type`. Status purity — an enabled account
+/// renders no row at all rather than a `[ enabled ]` non-status.
+#[test]
+fn setup_status_row_renders_only_while_disabled() {
+    use crate::profile::{AppConfig, AppState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let rows_for = |disabled: bool| -> Vec<String> {
+        let mut snap = Snap::blank("acct");
+        snap.disabled = disabled;
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        term.draw(|f| {
+            draw_settings_rows(f, f.area(), &app, &[], 0, &snap, false);
+        })
+        .unwrap();
+        crate::testutil::buffer_rows(term.backend().buffer())
+    };
+
+    let off = rows_for(false);
+    assert!(
+        !off.iter().any(|r| r.contains("status")),
+        "an enabled account has no status row:\n{}",
+        off.join("\n")
     );
 
-    // The pill LABEL (not its brackets) is bold — the cloudy-tui neutral-pill
-    // rule (TEXT_DIM + bold), matching `reason_pill`'s `Stale` arm.
-    let label_span = line
-        .spans
+    let on = rows_for(true);
+    let status_idx = on
         .iter()
-        .find(|s| s.content.as_ref() == "disabled")
-        .expect("chip label span renders");
+        .position(|r| r.contains("status"))
+        .unwrap_or_else(|| panic!("status row renders while disabled:\n{}", on.join("\n")));
     assert!(
-        label_span.style.add_modifier.contains(Modifier::BOLD),
-        "the disabled pill's label must be bold"
+        on[status_idx].contains("[ disabled ]"),
+        "the status value is the shared pill: {}",
+        on[status_idx]
+    );
+    let type_idx = on
+        .iter()
+        .position(|r| r.contains("type"))
+        .expect("type row renders");
+    assert!(
+        status_idx < type_idx,
+        "status sits ABOVE type (status at {status_idx}, type at {type_idx})"
     );
 }
 

@@ -16,8 +16,8 @@ use super::format::{
     ResetFmt, activity_verb, reset_in_secs, reset_phrase, spinner_frame, spinner_style,
 };
 use super::panes::{
-    draw_profile_selector, empty_state, key_cell, master_detail, section_box, section_box_verbatim,
-    wrap_words,
+    draw_profile_selector, empty_state, key_cell, master_detail, rail_hint_lines, section_box,
+    section_box_verbatim,
 };
 use crate::format::plan_label;
 use crate::profile::Profile;
@@ -748,7 +748,8 @@ struct DiagRow {
     hint: Option<String>,
 }
 
-/// The `status` block: dead-first diagnostic pills (auth-broken → kick → spend),
+/// The `status` block: dead-first diagnostic pills (disabled → canceled →
+/// auth-broken → kick → spend),
 /// then the fetch state / refresh countdown, each carrying a fix hint that
 /// names what's wrong and how to fix it (config-aware; see [`diag_fix`]). Kept
 /// multi-line because at full spread one line runs ~78 cells — the detail pane
@@ -771,7 +772,23 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     let w = inner_w as usize;
     let mut rows: Vec<DiagRow> = Vec::new();
 
-    // 0. Canceled subscription DOMINATES (dead-first, above auth-broken): a
+    // 0. Disabled leads everything, but suppresses only what it makes UNTRUE.
+    //    The scheduler's work list (`AppConfig::enabled_profiles`) skips the
+    //    account, so the fetch-state and refresh-countdown rungs below would lie
+    //    ("up to date" / "refresh in 40s" for a poll that will never run) — those
+    //    are gated off at rung 5. Everything between stays accurate: a canceled
+    //    subscription, a dead login, a kick block and a spent budget are all just
+    //    as true on a disabled account, and hiding them would strand an operator
+    //    who re-enables it. So this rung pushes and falls through.
+    let disabled = profile.is_disabled();
+    if disabled {
+        rows.push(DiagRow {
+            content: diag_pill_spans("disabled", theme::dim()),
+            hint: Some(diag_fix(UsageDiag::Disabled, &profile.name)),
+        });
+    }
+
+    // 1. Canceled subscription DOMINATES (dead-first, above auth-broken): a
     //    canceled account 429s `/usage` forever, so the fetch line would read
     //    "rate limited" while the real reason is the dead subscription itself.
     //    `blocked_reason` ranks it first for the same reason. Sourced from the
@@ -790,7 +807,7 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         return render_status_rows(rows, w);
     }
 
-    // 1. Auth-broken leads and DOMINATES (dead-first): a revoked login can't
+    // 2. Auth-broken DOMINATES the rest (dead-first): a revoked login can't
     //    serve at all, so a kick block, spend state, or freshness/refresh line on
     //    it is moot — re-login is the only action, and `blocked_reason` ranks it
     //    first for the same reason. Return once the pill + its re-login hint are
@@ -804,7 +821,7 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         return render_status_rows(rows, w);
     }
 
-    // 2. Kick-429 block, additive to whatever the fetch state says: `/usage` can
+    // 3. Kick-429 block, additive to whatever the fetch state says: `/usage` can
     //    stay Fresh straight through a messages-limiter outage, so the fetch line
     //    below reads healthy while the 5h window silently never opens. Same
     //    amber→red escalation as the other streak pills; the suffix names the
@@ -838,7 +855,7 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         });
     }
 
-    // 3. Spend: uncapped (DANGER config) outranks a spent budget (WARN); the two
+    // 4. Spend: uncapped (DANGER config) outranks a spent budget (WARN); the two
     //    never render together — an uncapped ceiling makes "raise it" meaningless.
     if header.diag.spend_uncapped {
         rows.push(DiagRow {
@@ -852,12 +869,20 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         });
     }
 
+    // A disabled account is never polled, so the fetch state is frozen at
+    // whatever it was and `next_refresh_ms` counts down to a poll that will
+    // never run. Both would be false claims, so the block ends here — with
+    // nothing else wrong that leaves a single row and a lone `└`.
+    if disabled {
+        return render_status_rows(rows, w);
+    }
+
     let countdown = header.next_refresh_ms.map(|next| {
         let secs = ((next as i64 - now_ms() as i64) / 1000).max(0);
         format!("{secs}s")
     });
 
-    // 4. The fetch row, always last. Its own fix hint (if any) rides beneath it,
+    // 5. The fetch row, always last. Its own fix hint (if any) rides beneath it,
     //    connected into the same rail as the rows above once 2+ hints stack.
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut fetch_hint: Option<UsageDiag> = None;
@@ -1034,35 +1059,13 @@ fn diag_pill_spans(label: &'static str, label_style: Style) -> Vec<Span<'static>
     ]
 }
 
-/// A `├`/`└` fix-hint line: glyph + text at col 0/2, anchored to this status
-/// block's own key column (`status` carries no leading indent, unlike the
-/// generic [`super::panes::help_tooltip_lines`]'s one-cell offset for panes
-/// whose row opens past col 0). `more_follow` picks `├` (another hint follows
-/// in the same rail) vs `└` (closes it, or the lone-hint case with nothing to
-/// connect); wrapped continuation lines keep the text at col 2 and carry `│`
-/// at col 0 while the rail is still open, blank once it has closed (cloudy-tui
-/// Stacked hints).
-fn rail_hint_lines(text: &str, width: usize, more_follow: bool) -> Vec<Line<'static>> {
-    const LEAD_W: usize = 2; // glyph + 1 space, text at col 2
-    let lead = if more_follow { "├ " } else { "└ " };
-    let cont = if more_follow { "│ " } else { "  " };
-    wrap_words(text, width.saturating_sub(LEAD_W).max(8))
-        .into_iter()
-        .enumerate()
-        .map(|(i, seg)| {
-            Line::from(vec![
-                Span::styled(if i == 0 { lead } else { cont }, theme::line()),
-                Span::styled(seg, theme::faint()),
-            ])
-        })
-        .collect()
-}
-
 /// A detected Usage-tab diagnostic state paired with the config context that
 /// shapes its fix. Pure input to [`diag_fix`]; render-only, no decision consumes
 /// it (mirrors `fallback::blocked_reason`).
 #[derive(Clone, Copy)]
 enum UsageDiag {
+    /// Operator disabled the account: the scheduler doesn't poll it at all.
+    Disabled,
     /// Subscription canceled: the org dropped to `claude_free` and `/v1/messages`
     /// 403s, so the account can't serve at all — re-login won't fix it.
     Canceled,
@@ -1093,6 +1096,7 @@ enum UsageDiag {
 /// the poll-paced re-test (7bbeae4), a manual one sits until the ceiling.
 fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
     match diag {
+        UsageDiag::Disabled => "enable it on the setup tab".to_string(),
         UsageDiag::Canceled => "this subscription has been canceled".to_string(),
         UsageDiag::KickSwitchGrade { auto_start: true } => {
             "clauth is re-testing periodically".to_string()

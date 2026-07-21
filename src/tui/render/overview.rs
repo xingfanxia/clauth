@@ -274,7 +274,15 @@ fn render_overview_row(
     } else {
         Span::raw("  ")
     };
-    let timer_span = {
+    // A disabled account is filtered out of the scheduler's polling set
+    // (`AppConfig::enabled_profiles`), so its `next_refresh_per_profile` entry is
+    // frozen at whatever was published before it was disabled: the countdown
+    // ticks to zero and then sits there claiming a refresh that will never run.
+    // Blank the slot rather than lie, keeping its width so no column shifts. The
+    // spinner goes too — nothing can be in flight for a profile nothing polls.
+    let timer_span = if disabled {
+        Span::raw(" ".repeat(TIMER_SLOT))
+    } else {
         let inner = TIMER_SLOT - 1;
         let activity = app
             .activity
@@ -315,20 +323,28 @@ fn render_overview_row(
     let token_mode = token_status.is_some_and(|s| s.is_long_lived_mode());
 
     let mut spans = vec![cursor];
+    // A disabled row flattens every semantic hue to dim — the whole row reads as
+    // one inert unit rather than a live row wearing a dim name. The GLYPHS stay:
+    // cloudy-tui never lets state ride on hue alone, so `×`/`⊘`/`!`/`●` still
+    // distinguish themselves without the color.
+    let hue = |s: Style| if disabled { theme::dim() } else { s };
     // Marker precedence: broken login (×) > token danger (⊘) > bell (!) > active
     // (●). A dead login makes usage alerts moot until re-login; a dead / mis-filled
     // long-lived token signs sessions out on the next switch, so it outranks a bell.
     if cfg.is_auth_broken(&profile.name) {
-        spans.push(Span::styled("×", theme::danger()));
+        spans.push(Span::styled("×", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if token_danger {
-        spans.push(Span::styled("⊘", theme::danger()));
+        spans.push(Span::styled("⊘", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if app.bell_fired.contains_key(&name_str) {
-        spans.push(Span::styled("!", theme::danger()));
+        spans.push(Span::styled("!", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if active {
-        spans.push(Span::styled("●", theme::accent_2_color()));
+        spans.push(Span::styled(
+            "●",
+            hue(Style::default().fg(theme::accent_2_color())),
+        ));
         spans.push(Span::raw(" "));
     } else {
         spans.push(Span::raw("  "));
@@ -354,20 +370,11 @@ fn render_overview_row(
     if token_mode {
         label.push_str(" ·token");
     }
-    if disabled {
-        // A `[ disabled ]` chip replaces the type value — bracket-spaced to
-        // match the pill on the other two surfaces (`chain.rs`, `panes.rs`).
-        // It fully dims and reuses the existing width-safe truncation
-        // (`fixed_split`) rather than the multi-span `pill()` helper, which
-        // doesn't truncate and would bleed into the following columns at the
-        // narrowest `kind` tier. `kind` only ever lands on {6, 12, 16}
-        // (`OverviewWidths`'s tiering + shrink floor, never an in-between
-        // value), so the 12-char spaced form still fits exactly at 12 and
-        // comfortably at 16 — only the 6-wide tier truncates, same as before.
-        let (clamped, pad) = fixed_split("[ disabled ]", widths.kind);
-        spans.push(Span::styled(clamped, theme::dim()));
-        spans.push(Span::raw(pad));
-    } else if profile.credentials.is_some() {
+    // The credentialed identity-wave is ambient MOTION, which reads as "this
+    // thing is live". A disabled account is not, so it renders the same flat dim
+    // cell an uncredentialed row gets — dimming the pulse's crest would still
+    // animate.
+    if profile.credentials.is_some() && !disabled {
         let (clamped, pad) = fixed_split(&label, widths.kind);
         let elapsed = app.started_at.elapsed().as_millis() as u64;
         let mut pulse = pulse_name_spans(&clamped, theme::dim(), elapsed);
@@ -395,26 +402,42 @@ fn render_overview_row(
         )
     };
     let reset_fmt = ResetFmt::from_state(&cfg.state);
-    let five_spans = window_summary_spans_bracketed(
+    // Flatten the bar's threshold colors and drain-colored reset countdown to dim
+    // for a disabled row. The NUMBERS stay — they're the last real reading and
+    // still informative; it's the semantic hue that lies once the data is frozen.
+    // Post-processed here rather than threaded through
+    // `window_summary_spans_bracketed`: that helper lives in the shared
+    // `format.rs`, so restyling its OUTPUT at this one call site cannot reach a
+    // future caller the way a new parameter would. Widths are unaffected (the
+    // pad math counts chars, not styles).
+    let flatten = |mut spans: Vec<Span<'static>>| {
+        if disabled {
+            for s in &mut spans {
+                s.style = theme::dim();
+            }
+        }
+        spans
+    };
+    let five_spans = flatten(window_summary_spans_bracketed(
         five_window.as_ref(),
         widths.five_hour,
         true,
         reset_style(LABEL_5H, five_window.as_ref()),
         reset_fmt,
-    );
+    ));
     let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
     spans.extend(five_spans);
     spans.push(Span::raw(" ".repeat(five_pad)));
     if widths.seven_day > 0 {
         spans.push(gap(widths));
-        let seven_spans = window_summary_spans_bracketed(
+        let seven_spans = flatten(window_summary_spans_bracketed(
             seven_window.as_ref(),
             widths.seven_day,
             widths.seven_day >= 18,
             reset_style(LABEL_7D, seven_window.as_ref()),
             reset_fmt,
-        );
+        ));
         let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
         let seven_pad = widths.seven_day.saturating_sub(seven_len);
         spans.extend(seven_spans);

@@ -181,31 +181,6 @@ pub(super) fn picker_row(
     select_line(line, selected, focused, width)
 }
 
-/// A disabled account's picker row: name dims (overriding the usual active/
-/// inactive `name_color`, since a disabled account can never be active) and a
-/// trailing `[ disabled ]` chip, modeled on the blocked-reason status pill
-/// (`chain.rs`'s `reason_pill`) — the closest existing cloudy-tui chip. Shared
-/// by every profile-name picker (Setup's own list, `draw_profile_selector`).
-pub(super) fn disabled_picker_row(
-    selected: bool,
-    focused: bool,
-    name: String,
-    width: u16,
-) -> Line<'static> {
-    let arrow = if selected && focused {
-        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
-    } else {
-        Span::raw("  ")
-    };
-    let mut spans = vec![
-        arrow,
-        Span::styled(name, bold_when(theme::dim(), selected && focused)),
-    ];
-    spans.push(Span::raw("  "));
-    spans.extend(pill("disabled".to_string(), theme::dim().bold()));
-    select_line(Line::from(spans), selected, focused, width)
-}
-
 /// Empty-state widget: rounded frame in `LINE`, hint on first line `TEXT_DIM`,
 /// hotkey `ACCENT` + action on second line.
 pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'static> {
@@ -349,6 +324,32 @@ pub(super) fn draw_selector_list(
 
     let viewport = inner.height as usize;
     draw_scrollbar(frame, inner, total, state.offset(), viewport);
+}
+
+/// A `├`/`└` fix-hint line: glyph + text at col 0/2, anchored to the caller's
+/// own key column (no leading indent, unlike [`help_tooltip_lines`]'s one-cell
+/// offset for panes whose row opens past col 0). `more_follow` picks `├`
+/// (another hint follows in the same rail) vs `└` (closes it, or the lone-hint
+/// case with nothing to connect); wrapped continuation lines keep the text at
+/// col 2 and carry `│` at col 0 while the rail is still open, blank once it has
+/// closed (cloudy-tui Stacked hints).
+///
+/// The one rail drawer: the Usage tab's `status` block and the Fallback card's
+/// blocked-reason pills both render through it, so the two can't drift apart.
+pub(super) fn rail_hint_lines(text: &str, width: usize, more_follow: bool) -> Vec<Line<'static>> {
+    const LEAD_W: usize = 2; // glyph + 1 space, text at col 2
+    let lead = if more_follow { "├ " } else { "└ " };
+    let cont = if more_follow { "│ " } else { "  " };
+    wrap_words(text, width.saturating_sub(LEAD_W).max(8))
+        .into_iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            Line::from(vec![
+                Span::styled(if i == 0 { lead } else { cont }, theme::line()),
+                Span::styled(seg, theme::faint()),
+            ])
+        })
+        .collect()
 }
 
 /// Greedy word-wrap to `width` chars; long words are hard-split. Shared by the
@@ -524,17 +525,13 @@ pub(super) fn draw_profile_selector(
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                if p.is_disabled() {
-                    disabled_picker_row(i == sel, focused, p.name.to_string(), w)
+                // A disabled account can never be active, so dim wins outright.
+                let ns = if p.is_disabled() {
+                    theme::dim()
                 } else {
-                    picker_row(
-                        i == sel,
-                        focused,
-                        p.name.to_string(),
-                        name_color(cfg.is_active(&p.name)),
-                        w,
-                    )
-                }
+                    name_color(cfg.is_active(&p.name))
+                };
+                picker_row(i == sel, focused, p.name.to_string(), ns, w)
             })
             .collect()
     });

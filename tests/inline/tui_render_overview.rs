@@ -634,14 +634,14 @@ fn credentialed_long_label_clamps_to_kind_width() {
 // ── disabled accounts (feature: per-account disable toggle) ──────────────
 
 /// A disabled account's row dims its name (never `name_color`'s active/
-/// inactive branch — a disabled account can never be active) and shows a
-/// `[ disabled ]` chip in the type column (bracket-spaced to match the pill
-/// on the other two surfaces), exactly width-truncated like every other
-/// type-column value. A sibling enabled row in the same config keeps its
-/// ordinary styling and shows no chip, proving the treatment is per-profile,
-/// not global.
+/// inactive branch — a disabled account can never be active) and that is the
+/// row's ONLY change: the `TYPE` column keeps its real oauth/api/tier value,
+/// since a non-type value under a `TYPE` header both lies about the column and
+/// destroys the tier the operator came to read. The label itself lives on the
+/// Usage `status` row and the Setup `status` row. A sibling enabled row in the
+/// same config proves the dimming is per-profile, not global.
 #[test]
-fn disabled_row_dims_name_and_shows_disabled_chip() {
+fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
     let b = profile("b", 95.0, 10.0, 3600);
@@ -660,11 +660,6 @@ fn disabled_row_dims_name_and_shows_disabled_chip() {
         theme::dim().fg,
         "a disabled account's name renders dim, not the active/inactive name_color"
     );
-    let disabled_text = line_text(&disabled_line);
-    assert!(
-        disabled_text.contains("[ disabled ]"),
-        "bracket-spaced chip renders in the type column: {disabled_text}"
-    );
 
     let enabled_line = render_overview_row(&app, 1, &widths, false, true);
     let enabled_name_span = enabled_line
@@ -677,10 +672,204 @@ fn disabled_row_dims_name_and_shows_disabled_chip() {
         theme::dim().fg,
         "an enabled account keeps its ordinary name color"
     );
+
+    // Same profile shape either side of the `disabled` bit, so the type column
+    // must read identically — and must be the real tier, not an empty slot.
+    let kind_field = |line: &Line<'static>| -> String {
+        let chars: Vec<char> = line_text(line).chars().collect();
+        let start = 2 + 2 + widths.name + widths.gap;
+        chars[start..start + widths.kind].iter().collect()
+    };
+    let disabled_kind = kind_field(&disabled_line);
+    assert_eq!(
+        disabled_kind.trim(),
+        "Pro",
+        "the disabled row keeps its real tier value in the TYPE column"
+    );
+    assert_eq!(
+        disabled_kind,
+        kind_field(&enabled_line),
+        "the `disabled` bit changes nothing about the TYPE column"
+    );
     assert!(
-        !line_text(&enabled_line).contains("[ disabled ]"),
-        "an enabled account shows no chip: {}",
-        line_text(&enabled_line)
+        !line_text(&disabled_line).contains("disabled"),
+        "no chip anywhere on the row: {}",
+        line_text(&disabled_line)
+    );
+}
+
+/// A credentialed OAuth profile, so the type cell takes the pulsing branch.
+fn oauth_creds() -> ClaudeCredentials {
+    ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("max".into()),
+        }),
+    }
+}
+
+/// A disabled row goes inert END TO END, not just its name: the marker glyph,
+/// the type cell, and both window bars all flatten to `theme::dim()`. The
+/// glyphs and numbers stay — cloudy-tui never lets state ride on hue alone, and
+/// the figures are the last real reading — it is only the semantic color that
+/// lies once the data is frozen. An enabled sibling in the same config keeps
+/// every hue, which is what proves the flattening is per-row.
+#[test]
+fn disabled_row_flattens_every_semantic_hue_to_dim() {
+    let mut a = profile("a", 95.0, 90.0, 3600);
+    a.disabled = true;
+    a.credentials = Some(oauth_creds());
+    let mut b = profile("b", 95.0, 90.0, 3600);
+    b.credentials = Some(oauth_creds());
+    // Both rows must actually REACH the marker branch, or the flattening
+    // assertion silently skips it: a disabled, non-active, unbroken profile
+    // falls through to a blank marker with no fg to flatten. Marking both
+    // auth-broken puts the `×` (DANGER) on each.
+    let mut config = config_with(vec![a, b], None, vec![]);
+    config.state.auth_broken.push("a".into());
+    config.state.auth_broken.push("b".into());
+    let app = App::new(config);
+    let widths = OverviewWidths::new(110, &app);
+
+    let non_dim = |line: &Line<'static>| -> Vec<String> {
+        line.spans
+            .iter()
+            .filter(|s| !s.content.trim().is_empty())
+            .filter(|s| s.style.fg.is_some() && s.style.fg != theme::dim().fg)
+            .map(|s| s.content.to_string())
+            .collect()
+    };
+
+    let disabled_line = render_overview_row(&app, 0, &widths, false, true);
+    assert_eq!(
+        non_dim(&disabled_line),
+        Vec::<String>::new(),
+        "every colored span on a disabled row must flatten to dim"
+    );
+
+    // The control row must still carry hue, or the assertion above is vacuous.
+    let enabled_line = render_overview_row(&app, 1, &widths, false, true);
+    assert!(
+        !non_dim(&enabled_line).is_empty(),
+        "control: an enabled row keeps its semantic colors"
+    );
+
+    // The bar figures survive the flattening — dim, not deleted.
+    let text: String = disabled_line
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(
+        text.contains("90%"),
+        "the last-known reading stays readable: {text}"
+    );
+}
+
+/// The credentialed type cell's identity-wave is ambient motion, which reads as
+/// "live". A disabled row must render a flat cell instead — so two frames at
+/// different `started_at` elapsed values must be byte-and-style identical. A
+/// surviving pulse would differ between them.
+#[test]
+fn disabled_row_type_cell_does_not_pulse() {
+    let mut a = profile("a", 95.0, 10.0, 3600);
+    a.disabled = true;
+    a.credentials = Some(oauth_creds());
+    let mut b = profile("b", 95.0, 10.0, 3600);
+    b.credentials = Some(oauth_creds());
+    let config = config_with(vec![a, b], None, vec![]);
+
+    // `pulse_name_spans` keys off `app.started_at.elapsed()`, so two Apps
+    // constructed a real interval apart sample different phases of the wave.
+    let snapshot = |idx: usize| -> Vec<(String, Option<ratatui::style::Color>)> {
+        let mut app = App::new(config.clone());
+        app.started_at =
+            std::time::Instant::now() - std::time::Duration::from_millis(700 * idx as u64);
+        let widths = OverviewWidths::new(110, &app);
+        render_overview_row(&app, 0, &widths, false, true)
+            .spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style.fg))
+            .collect()
+    };
+    assert_eq!(
+        snapshot(0),
+        snapshot(1),
+        "a disabled row must render identically at two wave phases (no pulse)"
+    );
+
+    // Control: the ENABLED sibling does pulse, so the comparison above is real.
+    let enabled_snapshot = |elapsed_ms: u64| -> Vec<Option<ratatui::style::Color>> {
+        let mut app = App::new(config.clone());
+        app.started_at = std::time::Instant::now() - std::time::Duration::from_millis(elapsed_ms);
+        let widths = OverviewWidths::new(110, &app);
+        render_overview_row(&app, 1, &widths, false, true)
+            .spans
+            .iter()
+            .map(|s| s.style.fg)
+            .collect()
+    };
+    assert_ne!(
+        enabled_snapshot(0),
+        enabled_snapshot(700),
+        "control: an enabled credentialed row's type cell really does animate"
+    );
+}
+
+/// A disabled account is never polled, so its refresh countdown would tick to
+/// zero and then claim a refresh forever. The slot renders blank — at full
+/// width, so no column downstream shifts.
+#[test]
+fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
+    let mut a = profile("a", 95.0, 10.0, 3600);
+    a.disabled = true;
+    let b = profile("b", 95.0, 10.0, 3600);
+    let config = config_with(vec![a, b], None, vec![]);
+    let app = App::new(config);
+    // Both profiles carry a live countdown in the shared map.
+    if let Ok(mut m) = app.next_refresh_per_profile.lock() {
+        m.insert("a".to_string(), now_ms() + 42_000);
+        m.insert("b".to_string(), now_ms() + 42_000);
+    }
+    let widths = OverviewWidths::new(110, &app);
+
+    let disabled_line = render_overview_row(&app, 0, &widths, false, true);
+    let enabled_line = render_overview_row(&app, 1, &widths, false, true);
+    let text =
+        |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+
+    // Match the countdown by SHAPE (a digit followed by `s`), never by its exact
+    // value: the seconds figure truncates, so a literal "42s" flips to "41s" the
+    // moment a millisecond passes between the insert and the render. Nothing
+    // else on the row can produce that pair — the bar, `10%` and `(1h 0m)` carry
+    // no `s`, and the names are single letters.
+    let has_countdown = |s: &str| -> bool {
+        s.as_bytes()
+            .windows(2)
+            .any(|w| w[0].is_ascii_digit() && w[1] == b's')
+    };
+    // The control proves the countdown is genuinely reachable in this fixture —
+    // without it a blank slot would pass even if the timer never rendered.
+    assert!(
+        has_countdown(&text(&enabled_line)),
+        "control: the enabled row shows its countdown: {}",
+        text(&enabled_line)
+    );
+    assert!(
+        !has_countdown(&text(&disabled_line)),
+        "the disabled row claims no refresh: {}",
+        text(&disabled_line)
+    );
+
+    // Width is preserved, so nothing downstream shifts: the two rows must be
+    // exactly as wide as each other.
+    assert_eq!(
+        text(&disabled_line).chars().count(),
+        text(&enabled_line).chars().count(),
+        "blanking the timer must not collapse the slot"
     );
 }
 

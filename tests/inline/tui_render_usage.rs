@@ -288,6 +288,134 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
     assert!(!rendered.contains("canceled"), "got {rendered:?}");
 }
 
+/// Shared fixture for the two disabled-rung tests: a header whose lower rungs
+/// are all armed, so each test's assertion is about what the disabled rung does
+/// to them rather than about which rung happened to fire.
+fn disabled_rung_header(kick: bool) -> HeaderState {
+    use crate::usage::KickBlock;
+    HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: kick.then(|| KickBlock {
+            streak: 3,
+            rejected: true,
+            until: Some(now_epoch_secs() + 3600),
+            next_retry: now_epoch_secs() + 30,
+        }),
+        diag: DiagFlags::default(),
+    }
+}
+
+fn status_text(ls: &[Line<'_>]) -> String {
+    ls.iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.clone())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The disabled rung leads but does NOT erase the health rungs beneath it: a
+/// dead login is just as true on a disabled account, and hiding it would strand
+/// an operator who re-enables it. Both facts stack on one `├│└` rail.
+#[test]
+fn status_lines_stacks_the_health_rungs_under_disabled() {
+    let mut profile = crate::testutil::blank_profile("gamma");
+    let header = HeaderState {
+        diag: DiagFlags {
+            auth_broken: true,
+            ..DiagFlags::default()
+        },
+        ..disabled_rung_header(false)
+    };
+
+    // Control: enabled, the auth-broken rung is the whole block.
+    let enabled = status_text(&status_lines(&profile, &header, 120));
+    assert!(
+        !enabled.contains("disabled"),
+        "control: an enabled account shows no disabled pill: {enabled:?}"
+    );
+
+    profile.disabled = true;
+    let lines = status_lines(&profile, &header, 120);
+    assert_eq!(
+        status_text(&lines),
+        "status    [ disabled ]\n\
+         ├ enable it on the setup tab\n\
+         │         [ auth broken ]\n\
+         └ re-login with clauth login gamma",
+        "both facts stack on one rail"
+    );
+
+    // The pill label carries the neutral tier, never danger/warning. Only the
+    // fg is worth asserting — `diag_pill_spans` stamps BOLD on every label
+    // unconditionally, so a modifier check would pin the helper, not this call.
+    let label = lines[0]
+        .spans
+        .iter()
+        .find(|s| s.content.as_ref() == "disabled")
+        .expect("pill label span renders");
+    assert_eq!(
+        label.style.fg,
+        theme::dim().fg,
+        "the disabled pill is neutral (TEXT_DIM), not a fault color"
+    );
+}
+
+/// The other half of the same ruling: the fetch-state and refresh-countdown
+/// rungs ARE suppressed, because polling stops on a disabled account
+/// (`usage::scheduler` filters it out of the work list), so "cached" and
+/// "refresh in Ns" would both be claims about a poll that will never run.
+/// A kick block in the same frame still renders — that one stays true.
+#[test]
+fn status_lines_suppresses_only_the_fetch_and_refresh_rungs_when_disabled() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Cached);
+    let header = disabled_rung_header(true);
+
+    // Control: enabled, both the kick pill and the fetch/countdown rungs render.
+    let enabled = status_text(&status_lines(&profile, &header, 120));
+    assert!(
+        enabled.contains("cached"),
+        "control: an enabled account reports its fetch state: {enabled:?}"
+    );
+    assert!(
+        enabled.contains("blocked"),
+        "control: the kick pill renders too: {enabled:?}"
+    );
+
+    profile.disabled = true;
+    let rendered = status_text(&status_lines(&profile, &header, 120));
+    assert!(
+        rendered.contains("blocked"),
+        "the kick block stays true and stays visible: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("cached"),
+        "the frozen fetch state is suppressed: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("refresh in"),
+        "the countdown to a poll that never runs is suppressed: {rendered:?}"
+    );
+
+    // Disabled with nothing else wrong is a single row and a lone `└`.
+    let clean = crate::profile::Profile {
+        disabled: true,
+        ..crate::testutil::blank_profile("a")
+    };
+    assert_eq!(
+        status_text(&status_lines(&clean, &disabled_rung_header(false), 120)),
+        "status    [ disabled ]\n└ enable it on the setup tab",
+        "no rail when there is nothing to connect"
+    );
+}
+
 /// A kick-429 block pins its own `[ blocked ]` pill on the row, even
 /// while the fetch status reads Fresh — `/usage` stayed 200 through the whole
 /// 2026-07-15 messages-limiter outage, so no fetch-status pill can carry this.

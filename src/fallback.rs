@@ -424,6 +424,10 @@ pub(crate) fn soonest_resume(config: &AppConfig) -> Option<(String, i64)> {
 /// serves but won't be picked. [`blocked_reason`] returns the first matching arm.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum BlockedReason {
+    /// Operator disabled the account: the walk skips it as a candidate no matter
+    /// what its usage says, so this outranks every quota/liveness block — those
+    /// would describe a member nothing is going to pick anyway.
+    Disabled,
     /// Subscription canceled (`/profile` `subscription_status == "canceled"`):
     /// the org dropped to `claude_free` and `/v1/messages` 403s, so it can't
     /// serve at all — dead-first, above every quota/limiter block.
@@ -474,6 +478,28 @@ fn reset_secs(window: &UsageWindow, now: i64) -> Option<i64> {
 /// `Some(until)` epoch secs when the member is switch-grade kick-rejected
 /// ([`crate::usage::switch_grade_kick_lifts`]), else `None`.
 pub(crate) fn blocked_reason(
+    config: &AppConfig,
+    profile: &Profile,
+    kick_lift: Option<i64>,
+) -> Option<BlockedReason> {
+    // Disabled first, and only for a NON-active member: `snapshot_chain` /
+    // `next_target` skip a disabled member as a CANDIDATE but deliberately never
+    // drop a disabled ACTIVE one, so claiming a block on the active profile here
+    // would be the second opinion this function must never be.
+    if profile.is_disabled() && !config.is_active(&profile.name) {
+        return Some(BlockedReason::Disabled);
+    }
+    health_blocked_reason(config, profile, kick_lift)
+}
+
+/// [`blocked_reason`] minus the `Disabled` rung: the worst reason this member's
+/// own HEALTH blocks it, ignoring whether the operator disabled it.
+///
+/// Split out so the Fallback detail card can stack `[ disabled ]` above the
+/// health reason instead of one hiding the other. It is the same ladder in the
+/// same order — [`blocked_reason`] delegates to it rather than repeating it, so
+/// the card and the marker can never disagree about precedence.
+pub(crate) fn health_blocked_reason(
     config: &AppConfig,
     profile: &Profile,
     kick_lift: Option<i64>,
