@@ -373,6 +373,34 @@ fn token_danger_marker_outranks_bell_and_active() {
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
 
+/// A canceled subscription (⊗) is dead-first: the org 403s every request, so it
+/// outranks the broken-login ×, the token ⊘, the bell !, and the active ● all at
+/// once (matching the Fallback ladder where `Canceled` beats `AuthBroken`). The
+/// auth_broken + bell + active fixture proves the canceled arm fires FIRST — if it
+/// yielded, the × would show instead.
+#[test]
+fn canceled_marker_is_dead_first() {
+    use crate::usage::{PlanInfo, PlanTier};
+    let mut a = profile("a", 95.0, 10.0, 3600);
+    a.usage.as_mut().unwrap().plan = Some(PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+    });
+    let mut config = config_with(vec![a], Some("a"), vec![]); // also active
+    config.state.auth_broken.push("a".into()); // also auth-broken
+    let mut app = App::new(config);
+    app.bell_fired.insert("a".into(), true); // bell also fired
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let text = line_text(&line);
+    assert!(text.contains('⊗'), "canceled renders ⊗: {text}");
+    assert!(!text.contains('×'), "broken login yields to ⊗: {text}");
+    assert!(!text.contains('!'), "bell yields to ⊗: {text}");
+    assert!(!text.contains('●'), "active dot yields to ⊗: {text}");
+    let marker = line.spans.iter().find(|s| s.content == "⊗").unwrap();
+    assert_eq!(marker.style.fg, theme::danger().fg);
+}
+
 /// But a broken login (×) still wins over a token-danger marker.
 #[test]
 fn broken_login_outranks_token_danger_marker() {
@@ -644,7 +672,16 @@ fn credentialed_long_label_clamps_to_kind_width() {
 fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
-    let b = profile("b", 95.0, 10.0, 3600);
+    let mut b = profile("b", 95.0, 10.0, 3600);
+    // Give both a real FETCHED Pro tier so the TYPE column reads a genuine tier —
+    // this test is about dimming keeping whatever tier is real, not about the
+    // fallback tier a credential-less profile happens to default to.
+    for p in [&mut a, &mut b] {
+        p.usage.as_mut().unwrap().plan = Some(crate::usage::PlanInfo {
+            tier: crate::usage::PlanTier::Pro,
+            subscription_status: None,
+        });
+    }
     let config = config_with(vec![a, b], None, vec![]);
     let app = App::new(config);
     let widths = OverviewWidths::new(80, &app);
