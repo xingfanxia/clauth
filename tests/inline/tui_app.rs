@@ -766,6 +766,134 @@ fn disabled_row_toggle_is_inert_with_a_live_session() {
     );
 }
 
+/// Disabling (real operational impact) reuses `Delete`'s press-to-arm →
+/// confirm class through the SAME `armed_action` field: the first
+/// `run_config_row` call must only arm the row (no flag flip, no toast), and
+/// the second — with the row still armed — actually disables it. Also pins
+/// the arm/confirm asymmetry fix: unlike `Delete` (whose confirm removes the
+/// row so a stale arm can never resurface), this row survives its own
+/// toggle, so the arm must be cleared after firing or a later disable would
+/// skip straight past the confirm step.
+#[test]
+fn disable_row_arms_on_first_press_confirms_on_second() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+
+    run_config_row(&mut app, ConfigRow::Disabled);
+    assert!(
+        !app.config().find("acct").unwrap().is_disabled(),
+        "the first ⏎ must only arm the row, not flip the flag"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        Some(ConfigRow::Disabled),
+        "the first ⏎ arms this row"
+    );
+    assert!(app.toasts.is_empty(), "arming alone must not toast");
+
+    run_config_row(&mut app, ConfigRow::Disabled);
+    assert!(
+        app.config().find("acct").unwrap().is_disabled(),
+        "the second ⏎, while armed, confirms the disable"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("disabled")),
+        "the confirmed disable toasts"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        None,
+        "the arm must clear after firing — this row survives its own toggle, \
+         unlike `Delete`, so a stale arm would let a later disable skip the confirm step"
+    );
+}
+
+/// Enabling is harmless, so it fires immediately on the first ⏎ — never
+/// arms, never needs a second press.
+#[test]
+fn enable_row_fires_immediately_no_arm() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.disabled = true;
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+
+    run_config_row(&mut app, ConfigRow::Disabled);
+
+    assert!(
+        !app.config().find("acct").unwrap().is_disabled(),
+        "a single ⏎ enables immediately"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("enabled")),
+        "the immediate enable toasts"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        None,
+        "enabling never arms the row"
+    );
+}
+
+/// The `a` action-menu entry for the `disabled` row flips with the account's
+/// state — "disable account" while enabled, "enable account" while disabled
+/// — mirroring the row's own label, and still dispatches through
+/// `run_config_row` so it obeys the same arm/confirm and immediate-enable
+/// rules as pressing ⏎ directly on the row.
+#[test]
+fn action_menu_labels_the_disabled_row_by_current_state() {
+    use super::{
+        ActionMenuAction, ConfigFocus, ConfigRow, Tab, build_action_menu, build_draft_existing,
+        config_rows, dispatch_action_menu_action,
+    };
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    app.config_focus = ConfigFocus::Actions;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::Disabled)
+        .expect("disable row always present");
+
+    // Enabled account: the menu offers "disable account" and dispatching it
+    // only arms the row (same as a direct ⏎), it does not flip the flag yet.
+    let menu = build_action_menu(&app);
+    assert_eq!(menu.items.len(), 1);
+    assert_eq!(menu.items[0].label, "disable account");
+    dispatch_action_menu_action(&mut app, ActionMenuAction::DisableProfile);
+    assert!(!app.config().find("acct").unwrap().is_disabled());
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        Some(ConfigRow::Disabled),
+        "the menu selection arms exactly like a direct ⏎"
+    );
+
+    // Confirm via a direct ⏎ on the now-armed row, then reopen the menu: the
+    // label must have flipped to "enable account".
+    super::run_config_row(&mut app, ConfigRow::Disabled);
+    assert!(app.config().find("acct").unwrap().is_disabled());
+    let menu = build_action_menu(&app);
+    assert_eq!(menu.items[0].label, "enable account");
+    dispatch_action_menu_action(&mut app, ActionMenuAction::EnableProfile);
+    assert!(
+        !app.config().find("acct").unwrap().is_disabled(),
+        "the menu selection enables immediately, same as a direct ⏎"
+    );
+}
+
 /// The Fallback tab's add-picker (`chain_candidates`) never offers a disabled
 /// account — this is the "excluded from any fallback-chain editing UI" half
 /// of the spec that isn't a render concern (the selector's dim + chip is
@@ -2445,6 +2573,40 @@ mod env_editor {
             *rows.last().unwrap(),
             ConfigRow::Delete,
             "delete stays last"
+        );
+    }
+
+    /// `Disabled` lives in the account-actions group at the bottom (with
+    /// `Login`/`DeleteCreds`/`Delete`), one severity notch above `Delete` —
+    /// not right below `Name` as a top toggle anymore. Locks the row builder
+    /// order so a future edit can't silently drag it back to the top.
+    #[test]
+    fn disable_row_sits_in_the_account_actions_group_not_at_the_top() {
+        let app = app_with_env(BTreeMap::new()); // OAuth, no stored creds, no custom env
+
+        let rows = config_rows(&app);
+        assert_eq!(
+            rows[1],
+            ConfigRow::AutoStart,
+            "auto-start, not disabled, sits right after name"
+        );
+        assert!(
+            !rows.contains(&ConfigRow::DeleteCreds),
+            "sanity check for this fixture: no stored credential yet"
+        );
+        let pos = |row: ConfigRow| rows.iter().position(|r| *r == row);
+        let login = pos(ConfigRow::Login).expect("login row always present");
+        let disabled = pos(ConfigRow::Disabled).expect("disable row always present");
+        let delete = pos(ConfigRow::Delete).expect("delete row always present");
+        assert!(
+            login < disabled,
+            "disable sits in the tail account-actions group, after login"
+        );
+        assert!(disabled < delete, "disable is one notch above delete");
+        assert_eq!(
+            *rows.last().unwrap(),
+            ConfigRow::Delete,
+            "delete stays the very last row"
         );
     }
 

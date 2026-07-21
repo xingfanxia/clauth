@@ -77,8 +77,8 @@ fn action_rows_bold_on_select_and_keep_their_color() {
         (ConfigRow::Login, theme::accent()),
     ];
     for (row, want) in cases {
-        let blurred = detail_row(row, false, false, false, &snap, &input);
-        let focused = detail_row(row, true, false, false, &snap, &input);
+        let blurred = detail_row(row, false, false, None, &snap, &input);
+        let focused = detail_row(row, true, false, None, &snap, &input);
         let (b, f) = (&blurred.spans[1], &focused.spans[1]);
         assert_eq!(
             b.content, f.content,
@@ -101,8 +101,8 @@ fn action_rows_bold_on_select_and_keep_their_color() {
 
     // The `✓ logged in` state is the same row in SUCCESS — same promotion rule.
     snap.captured = true;
-    let blurred = detail_row(ConfigRow::Login, false, false, false, &snap, &input);
-    let focused = detail_row(ConfigRow::Login, true, false, false, &snap, &input);
+    let blurred = detail_row(ConfigRow::Login, false, false, None, &snap, &input);
+    let focused = detail_row(ConfigRow::Login, true, false, None, &snap, &input);
     assert!(line_text(&focused).contains("✓ logged in"));
     assert!(!blurred.spans[1].style.add_modifier.contains(Modifier::BOLD));
     assert!(focused.spans[1].style.add_modifier.contains(Modifier::BOLD));
@@ -130,68 +130,158 @@ fn setup_hints_follow_the_row_value() {
     assert!(set.contains("calls instead"), "{set}");
 }
 
-// ── `disabled` row (per-account disable toggle) ─────────────────────────────
+// ── `disabled` row (account-action button, same class as `Delete`) ─────────
 
-/// The `disabled` row dims (key + value both faint) while gated — active
-/// account or a live session — mirroring the Fallback tab's `max spend`
-/// dimmed-while-inert treatment (`chain.rs`). Ungated, `off` (the default)
-/// stays the neutral faint value and `on` promotes to accent, matching
-/// `auto-start`'s toggle contract; a gate wins over an armed toggle, so a
-/// disabled-but-somehow-gated row still renders faint, never accent.
+/// Disabling is the real-impact direction: it renders in the exact same
+/// button class as `Delete` — a single label span, DANGER + bold
+/// unconditionally (not just when focused), and the label flips to the
+/// "press again" copy once `armed_action` names this row. Mirrors
+/// `ConfigRow::Delete`'s own rendering one-for-one so a reviewer can diff the
+/// two match arms directly.
 #[test]
-fn disabled_row_dims_while_gated_and_accents_when_armed() {
+fn disable_button_is_delete_class_danger_and_arms_on_second_press() {
+    let snap = Snap::blank("a"); // disabled: false → the disable direction
+    let input = InputState::new("");
+
+    for selected in [false, true] {
+        let arrow = if selected { "❯ " } else { "  " };
+        let unarmed = detail_row(ConfigRow::Disabled, selected, false, None, &snap, &input);
+        assert_eq!(
+            line_text(&unarmed),
+            format!("{arrow}disable account"),
+            "unarmed label reads 'disable account' regardless of focus (selected={selected})"
+        );
+        assert_eq!(
+            unarmed.spans[1].style.fg,
+            theme::danger().fg,
+            "unarmed disable renders DANGER"
+        );
+        assert!(
+            unarmed.spans[1].style.add_modifier.contains(Modifier::BOLD),
+            "disable is always bold, unlike the accent bold-on-select class (selected={selected})"
+        );
+
+        let armed = detail_row(
+            ConfigRow::Disabled,
+            selected,
+            false,
+            Some(ConfigRow::Disabled),
+            &snap,
+            &input,
+        );
+        assert_eq!(
+            line_text(&armed),
+            format!("{arrow}press again to disable"),
+            "arming (this row named in armed_action) swaps to the confirm copy"
+        );
+        assert_eq!(armed.spans[1].style.fg, theme::danger().fg);
+        assert!(armed.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    // `armed_action` naming a DIFFERENT row (e.g. `Delete`) must not bleed
+    // into this row's confirm copy — only its own row name arms it.
+    let cross_armed = detail_row(
+        ConfigRow::Disabled,
+        true,
+        false,
+        Some(ConfigRow::Delete),
+        &snap,
+        &input,
+    );
+    assert_eq!(line_text(&cross_armed), "❯ disable account");
+}
+
+/// Enabling is harmless — it takes the accent, bold-only-when-selected class
+/// shared with `Login`/`Create`/`+ add env` instead of Delete's always-bold
+/// DANGER, and it never shows a "press again" confirm copy (immediate, never
+/// armed).
+#[test]
+fn enable_button_is_accent_class_bold_only_on_select() {
+    let mut snap = Snap::blank("a");
+    snap.disabled = true; // currently disabled → the enable direction
+    let input = InputState::new("");
+
+    let blurred = detail_row(ConfigRow::Disabled, false, false, None, &snap, &input);
+    let focused = detail_row(ConfigRow::Disabled, true, false, None, &snap, &input);
+    assert_eq!(line_text(&blurred), "  enable account");
+    assert_eq!(line_text(&focused), "❯ enable account");
+    assert_eq!(blurred.spans[1].style.fg, theme::accent().fg);
+    assert_eq!(focused.spans[1].style.fg, theme::accent().fg);
+    assert!(
+        !blurred.spans[1].style.add_modifier.contains(Modifier::BOLD),
+        "blurred enable is not bold"
+    );
+    assert!(
+        focused.spans[1].style.add_modifier.contains(Modifier::BOLD),
+        "selected enable promotes to bold"
+    );
+
+    // An armed_action left over from the disable direction must not surface
+    // a "press again" copy once the account is actually disabled — enabling
+    // never arms, so it has nothing to confirm.
+    let stale_armed = detail_row(
+        ConfigRow::Disabled,
+        true,
+        false,
+        Some(ConfigRow::Disabled),
+        &snap,
+        &input,
+    );
+    assert_eq!(line_text(&stale_armed), "❯ enable account");
+}
+
+/// Dimmed/inert while gated (active account or a live session), matching the
+/// Fallback tab's `max spend` treatment: the whole row — arrow and label —
+/// renders faint, the label falls back to the plain (non-armed) copy even if
+/// `armed_action` names this row, and the gate wins over both directions.
+/// The differential half: a gated row's color must not match a normal,
+/// ungated action row's (`Login`) — proving the dim is a real style change,
+/// not just a coincidental faint that also happens to be accent/danger.
+#[test]
+fn disable_button_dims_while_gated_and_ignores_a_stale_arm() {
     let mut snap = Snap::blank("a");
     let input = InputState::new("");
 
-    // Ungated + off (default): normal focus styling on the key, faint value.
-    let off = detail_row(ConfigRow::Disabled, true, false, false, &snap, &input);
-    assert_eq!(
-        off.spans[1].style.fg,
-        label_style(true).fg,
-        "ungated key keeps normal focus styling"
-    );
-    assert_eq!(
-        off.spans[2].style.fg,
-        theme::faint().fg,
-        "off value is faint"
-    );
-
-    // Ungated + on (armed): the value promotes to accent.
-    snap.disabled = true;
-    let on = detail_row(ConfigRow::Disabled, true, false, false, &snap, &input);
-    assert_eq!(
-        on.spans[2].style.fg,
-        theme::accent().fg,
-        "an armed, ungated toggle reads accent"
-    );
-
-    // Gated by is_active: the key dims regardless of the toggle's own value.
-    snap.disabled = false;
     snap.is_active = true;
-    let gated_active = detail_row(ConfigRow::Disabled, true, false, false, &snap, &input);
+    let gated_active = detail_row(
+        ConfigRow::Disabled,
+        true,
+        false,
+        Some(ConfigRow::Disabled),
+        &snap,
+        &input,
+    );
     assert_eq!(
-        gated_active.spans[1].style.fg,
+        line_text(&gated_active),
+        "❯ disable account",
+        "gated ignores the stale arm, showing the plain label"
+    );
+    assert_eq!(gated_active.spans[1].style.fg, theme::faint().fg);
+    assert_eq!(
+        gated_active.spans[0].style.fg,
         theme::faint().fg,
-        "the active account's row dims its key"
+        "the arrow dims too while gated and selected"
     );
 
-    // Gated by has_live_session, independent of is_active.
     snap.is_active = false;
     snap.has_live_session = true;
-    let gated_session = detail_row(ConfigRow::Disabled, true, false, false, &snap, &input);
-    assert_eq!(
-        gated_session.spans[1].style.fg,
-        theme::faint().fg,
-        "a live-session row dims its key too"
-    );
+    let gated_session = detail_row(ConfigRow::Disabled, true, false, None, &snap, &input);
+    assert_eq!(gated_session.spans[1].style.fg, theme::faint().fg);
 
-    // Gated AND armed: the value stays faint, not accent — the gate wins.
+    // Gated while already disabled reads "enable account", still faint.
     snap.disabled = true;
-    let gated_armed = detail_row(ConfigRow::Disabled, true, false, false, &snap, &input);
-    assert_eq!(
-        gated_armed.spans[2].style.fg,
-        theme::faint().fg,
-        "gated + on still renders faint, not accent"
+    let gated_enable = detail_row(ConfigRow::Disabled, true, false, None, &snap, &input);
+    assert_eq!(line_text(&gated_enable), "❯ enable account");
+    assert_eq!(gated_enable.spans[1].style.fg, theme::faint().fg);
+
+    // Differential: the gated row's color must differ from a normal,
+    // ungated action row's — proves the dim is a real style branch, not an
+    // accident of the two colors overlapping.
+    let normal_snap = Snap::blank("a");
+    let normal_action = detail_row(ConfigRow::Login, true, false, None, &normal_snap, &input);
+    assert_ne!(
+        gated_session.spans[1].style.fg, normal_action.spans[1].style.fg,
+        "a gated account-action row must render distinctly from a normal one"
     );
 }
 

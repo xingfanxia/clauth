@@ -290,7 +290,7 @@ fn draw_settings_rows(
 ) {
     let draft = app.config_draft.as_ref();
     let editing = draft.and_then(|d| d.active);
-    let armed_delete = draft.map(|d| d.armed_delete).unwrap_or(false);
+    let armed_action = draft.and_then(|d| d.armed_action);
 
     // Derived from the base-url buffer so it tracks the draft live.
     let is_api = !row_input(draft, snap, ConfigRow::BaseUrl)
@@ -341,7 +341,7 @@ fn draw_settings_rows(
         let selected = actions_focused && i == cursor;
         let is_editing = editing == Some(*row);
         let input = row_input(draft, snap, *row);
-        let line = detail_row(*row, selected, is_editing, armed_delete, snap, &input);
+        let line = detail_row(*row, selected, is_editing, armed_action, snap, &input);
         if is_editing {
             edit_caret = Some((line_idx, input, *row));
         }
@@ -491,7 +491,7 @@ fn detail_row(
     row: ConfigRow,
     selected: bool,
     editing: bool,
-    armed_delete: bool,
+    armed_action: Option<ConfigRow>,
     snap: &Snap,
     input: &InputState,
 ) -> Line<'static> {
@@ -530,10 +530,16 @@ fn detail_row(
             arrow,
             Span::styled("+ model override", bold_when(theme::accent(), selected)),
         ]),
-        // Dimmed/inert while active or a session is open — cloudy-tui disabled
-        // row (mirrors the Fallback tab's `max spend`, `dimmed_cycle_row`):
-        // the whole row (arrow, key, value) renders faint and the key handler
-        // no-ops (`run_config_row`'s gate in `app.rs`).
+        // Same button CLASS as `Delete`: a state-flipped label, not a
+        // key/value toggle. Disabling has real operational impact (drops the
+        // account from auto-switch/polling/status mid-flight), so it renders
+        // DANGER and always-bold, and arms on the first ⏎ like `Delete`
+        // ("press again to disable"). Enabling is harmless and immediate, so
+        // it takes the accent, bold-on-select treatment shared with
+        // `Login`/`Create` instead. Dimmed/inert while active or a session is
+        // open — cloudy-tui disabled row (mirrors the Fallback tab's `max
+        // spend`): the whole row renders faint and the key handler no-ops
+        // (`run_config_row`'s gate in `app.rs`).
         ConfigRow::Disabled => {
             let gated = snap.is_active || snap.has_live_session;
             let row_arrow = if gated && selected {
@@ -541,28 +547,24 @@ fn detail_row(
             } else {
                 arrow
             };
-            let key_style = if gated {
-                theme::faint()
-            } else {
-                label_style(selected)
-            };
-            let (value, value_style) = if snap.disabled {
+            let (label, style) = if gated {
+                let label = if snap.disabled {
+                    "enable account"
+                } else {
+                    "disable account"
+                };
+                (label.to_string(), theme::faint())
+            } else if snap.disabled {
                 (
-                    theme::toggle_on().to_string(),
-                    if gated {
-                        theme::faint()
-                    } else {
-                        theme::accent()
-                    },
+                    "enable account".to_string(),
+                    bold_when(theme::accent(), selected),
                 )
+            } else if armed_action == Some(ConfigRow::Disabled) {
+                ("press again to disable".to_string(), theme::danger().bold())
             } else {
-                (theme::toggle_off().to_string(), theme::faint())
+                ("disable account".to_string(), theme::danger().bold())
             };
-            Line::from(vec![
-                row_arrow,
-                Span::styled(key_cell("disabled", KEY_W, KEY_GUTTER), key_style),
-                Span::styled(value, value_style),
-            ])
+            Line::from(vec![row_arrow, Span::styled(label, style)])
         }
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
@@ -573,7 +575,7 @@ fn detail_row(
             kv_static(arrow, "auto-start", value, style, selected)
         }
         ConfigRow::Delete => {
-            let label = if armed_delete {
+            let label = if armed_action == Some(ConfigRow::Delete) {
                 "press again to delete".to_string()
             } else {
                 "delete account".to_string()

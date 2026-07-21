@@ -486,8 +486,8 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("space", "cycle the model preset (model row)"),
                 ("env", "+ add env · \u{21b5} edits a value · a removes"),
                 (
-                    "disabled",
-                    "\u{21b5}/space toggles it \u{b7} inert while active or a session is open",
+                    "disable / enable",
+                    "\u{21b5} arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a session is open",
                 ),
                 ("delete", "\u{21b5} once to arm, again to confirm"),
                 ("esc", "stop editing / back to account list"),

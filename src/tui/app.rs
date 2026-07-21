@@ -203,10 +203,12 @@ pub(crate) enum ConfigRow {
     EnvEntry(usize),
     /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
-    /// User-disabled toggle (`Profile::disabled`, see `docs/internals.md`).
-    /// Space/⏎ flips it via the shared `actions::disable_profile` /
-    /// `enable_profile`; dimmed and inert while the account is active or holds
-    /// a live `clauth start` session — the same gate the CLI enforces.
+    /// User-disabled account-action row (`Profile::disabled`, see
+    /// `docs/internals.md`), same class as `Delete`: enabling fires the shared
+    /// `actions::enable_profile` immediately (harmless), disabling arms on the
+    /// first Space/⏎ and confirms on the second, via `actions::disable_profile`.
+    /// Dimmed and inert while the account is active or holds a live `clauth
+    /// start` session — the same gate the CLI enforces.
     Disabled,
     AutoStart,
     /// Browser OAuth login: mint fresh tokens into this account (or, on the
@@ -341,8 +343,11 @@ pub(crate) struct ConfigDraft {
     pub(crate) env_new_key: InputState,
     /// `Some(row)` while a text row (or the `model` custom field) owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
-    /// First ⏎ on delete arms it; second confirms. Any cursor move disarms.
-    pub(crate) armed_delete: bool,
+    /// The account-action row (`Delete`, or `Disabled` in the disable
+    /// direction only — enabling is immediate, never armed) currently armed by
+    /// a first ⏎; a second ⏎ on that same row confirms. Any cursor move, or
+    /// the confirm itself, disarms back to `None`.
+    pub(crate) armed_action: Option<ConfigRow>,
     /// API-account re-login is in flight: committing the base-url field advances
     /// to the api-key field (re-enter both, mirroring `login --base-url --api-key`)
     /// instead of ending the edit. Cleared on the api-key commit or any ⎋.
@@ -630,7 +635,8 @@ pub(crate) enum ActionMenuAction {
     EditMaxSpend,
     RemoveMember,
     // Config detail actions (proxied through run_config_row)
-    ToggleDisabled,
+    DisableProfile,
+    EnableProfile,
     ToggleAutoStart,
     DeleteProfile,
     CreateProfile,
@@ -735,7 +741,8 @@ impl ActionMenuAction {
             Self::ToggleLastResort => "toggle last resort",
             Self::EditMaxSpend => "edit max auto-spend",
             Self::RemoveMember => "remove member",
-            Self::ToggleDisabled => "toggle disabled",
+            Self::DisableProfile => "disable account",
+            Self::EnableProfile => "enable account",
             Self::ToggleAutoStart => "toggle auto-start",
             Self::DeleteProfile => "delete account",
             Self::CreateProfile => "create account",
@@ -4689,7 +4696,18 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 let rows = config_rows(app);
                 if let Some(&row) = rows.get(app.config_action_cursor) {
                     match row {
-                        ConfigRow::Disabled => actions.push(ActionMenuAction::ToggleDisabled),
+                        ConfigRow::Disabled => {
+                            let currently_disabled = app
+                                .config()
+                                .profiles
+                                .get(app.profile_cursor)
+                                .is_some_and(Profile::is_disabled);
+                            actions.push(if currently_disabled {
+                                ActionMenuAction::EnableProfile
+                            } else {
+                                ActionMenuAction::DisableProfile
+                            });
+                        }
                         ConfigRow::AutoStart => actions.push(ActionMenuAction::ToggleAutoStart),
                         ConfigRow::Login => actions.push(ActionMenuAction::LoginAccount),
                         ConfigRow::DeleteCreds => actions.push(ActionMenuAction::ClearCredentials),
@@ -4877,7 +4895,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::RemoveMember => {
             run_fallback_row(app, FallbackRow::Remove);
         }
-        ActionMenuAction::ToggleDisabled => {
+        ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
             let rows = config_rows(app);
             if let Some(&row) = rows.get(app.config_action_cursor) {
                 run_config_row(app, row);
@@ -4980,7 +4998,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
             app.config_action_cursor = app.config_action_cursor.min(last);
             match key.code {
                 KeyCode::Up => {
-                    disarm_delete(app);
+                    disarm_armed_action(app);
                     app.config_action_cursor = if app.config_action_cursor == 0 {
                         last
                     } else {
@@ -4988,7 +5006,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                     };
                 }
                 KeyCode::Down => {
-                    disarm_delete(app);
+                    disarm_armed_action(app);
                     app.config_action_cursor = if app.config_action_cursor >= last {
                         0
                     } else {
@@ -5040,9 +5058,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         Some(d) => !d.base_url.value.trim().is_empty(),
         None => profile.map(|p| !p.is_oauth()).unwrap_or(false),
     };
-    // `disabled` is universal (both credential types), so it sits right below
-    // name — ahead of the type-dependent branch below.
-    let mut rows = vec![ConfigRow::Name, ConfigRow::Disabled];
+    let mut rows = vec![ConfigRow::Name];
     // auto-start sits right below name (OAuth-only; mutually exclusive with api key).
     if !is_api {
         rows.push(ConfigRow::AutoStart);
@@ -5108,6 +5124,9 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     if has_creds {
         rows.push(ConfigRow::DeleteCreds);
     }
+    // The account-actions group's tail: disable/enable (reversible) one severity
+    // notch below delete (irreversible), which always stays the very last row.
+    rows.push(ConfigRow::Disabled);
     rows.push(ConfigRow::Delete);
     rows
 }
@@ -5148,7 +5167,7 @@ fn build_draft_new() -> ConfigDraft {
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         active: None,
-        armed_delete: false,
+        armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
         captured_login: None,
@@ -5172,7 +5191,7 @@ fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         active: None,
-        armed_delete: false,
+        armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
         captured_login: None,
@@ -5197,10 +5216,10 @@ fn leave_config_detail(app: &mut App) {
     }
 }
 
-/// Disarm delete when the cursor moves off the row.
-fn disarm_delete(app: &mut App) {
+/// Disarm whichever account-action row is armed when the cursor moves off it.
+fn disarm_armed_action(app: &mut App) {
     if let Some(d) = app.config_draft.as_mut() {
-        d.armed_delete = false;
+        d.armed_action = None;
     }
 }
 
@@ -5242,7 +5261,29 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
     match row {
         ConfigRow::Disabled => {
             if let Some(name) = name {
-                toggle_profile_disabled(app, &name);
+                let gated =
+                    app.config().is_active(&name) || crate::runtime::has_live_session(&name);
+                if gated {
+                    return;
+                }
+                let currently_disabled = app.config().find(&name).is_some_and(Profile::is_disabled);
+                let armed = app
+                    .config_draft
+                    .as_ref()
+                    .is_some_and(|d| d.armed_action == Some(ConfigRow::Disabled));
+                // Enabling is harmless — immediate, no arm. Disabling has real
+                // operational impact (drops the account from auto-switch/
+                // polling/status mid-flight), so it reuses Delete's
+                // press-to-arm → confirm class instead of firing on one ⏎.
+                if currently_disabled || armed {
+                    toggle_profile_disabled(app, &name);
+                    // Clear rather than leave a stale arm: unlike Delete (whose
+                    // confirm removes the row entirely), this row survives its
+                    // own toggle, so a later disable must re-arm from scratch.
+                    disarm_armed_action(app);
+                } else {
+                    arm_action(app, ConfigRow::Disabled);
+                }
             }
         }
         ConfigRow::AutoStart => {
@@ -5254,11 +5295,10 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
             let armed = app
                 .config_draft
                 .as_ref()
-                .map(|d| d.armed_delete)
-                .unwrap_or(false);
+                .is_some_and(|d| d.armed_action == Some(ConfigRow::Delete));
             match (armed, name) {
                 (true, Some(name)) => perform_delete(app, &name),
-                _ => disarm_delete_inverse(app),
+                _ => arm_action(app, ConfigRow::Delete),
             }
         }
         ConfigRow::Create => commit_new_account(app),
@@ -5426,10 +5466,11 @@ fn close_login_modal(app: &mut App) {
     app.modals.retain(|m| !matches!(m, Modal::Login));
 }
 
-/// Arm the delete row (first ⏎).
-fn disarm_delete_inverse(app: &mut App) {
+/// Arm an account-action row (`Delete`, or `Disabled` in the disable
+/// direction) on its first ⏎.
+fn arm_action(app: &mut App, row: ConfigRow) {
     if let Some(d) = app.config_draft.as_mut() {
-        d.armed_delete = true;
+        d.armed_action = Some(row);
     }
 }
 
