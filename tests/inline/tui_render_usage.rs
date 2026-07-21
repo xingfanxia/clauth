@@ -209,6 +209,85 @@ fn empty_msg_pending_fetch_loads() {
     assert_eq!(oauth_empty_msg(&profile), "loading");
 }
 
+/// The canceled pill is sourced purely from `profile.usage` (populated at
+/// startup by `bootstrap_fetch`'s on-disk cache seed, see
+/// `usage::scheduler::try_seed_cache`), never a live fetch. A profile carrying
+/// a prior session's canceled plan must show the pill from the cached state
+/// alone, before any network call.
+#[test]
+fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo};
+
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.usage = Some(UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: Some("canceled".to_string()),
+        }),
+        ..Default::default()
+    });
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags::default(),
+    };
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let rendered = text(status_lines(&profile, &header, 120));
+    assert!(rendered.contains("canceled"), "got {rendered:?}");
+}
+
+/// Regression guard the other direction: an un-canceled cached plan never
+/// paints the canceled pill.
+#[test]
+fn status_lines_no_canceled_pill_when_subscription_is_active() {
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo};
+
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.usage = Some(UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: None,
+        }),
+        ..Default::default()
+    });
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags::default(),
+    };
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let rendered = text(status_lines(&profile, &header, 120));
+    assert!(!rendered.contains("canceled"), "got {rendered:?}");
+}
+
 /// A kick-429 block pins its own `[ blocked ]` pill on the row, even
 /// while the fetch status reads Fresh — `/usage` stayed 200 through the whole
 /// 2026-07-15 messages-limiter outage, so no fetch-status pill can carry this.

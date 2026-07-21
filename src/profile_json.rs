@@ -7,7 +7,7 @@
 
 use crate::profile::Profile;
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
-use crate::usage::{PlanTier, UsageInfo};
+use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
 /// Display provider for a profile: a recognised third-party name, else
 /// `anthropic` for an OAuth profile.
@@ -20,15 +20,22 @@ pub(crate) fn provider_label(profile: &Profile) -> String {
 
 /// Human account-tier label for an OAuth profile, preferring the fetched plan
 /// tier (carries the Max multiplier, e.g. `Max 5x`) over the bare OAuth
-/// `subscription_type` token (`max`). `None` for third-party/api-key profiles
-/// and when neither a fetched plan nor a token hint is on disk.
+/// `subscription_type` token (`max`). A `canceled` plan (read straight off the
+/// on-disk `/profile` cache, so this holds even before this session's first
+/// live fetch) overrides the tier outright — the org's tier already reads
+/// `claude_free` post-cancellation, so showing it plain would misreport a dead
+/// account as a genuine free one. `None` for third-party/api-key profiles and
+/// when neither a fetched plan nor a token hint is on disk.
 pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
     if profile.is_third_party() {
         return None;
     }
-    let fetched = load_profile_cache::<UsageInfo>(profile.name.as_str(), USAGE_CACHE_FILE)
-        .and_then(|u| u.plan)
-        .filter(|p| p.tier != PlanTier::Unknown);
+    let cached = load_profile_cache::<UsageInfo>(profile.name.as_str(), USAGE_CACHE_FILE)
+        .and_then(|u| u.plan);
+    if cached.as_ref().is_some_and(PlanInfo::is_canceled) {
+        return Some("canceled".to_string());
+    }
+    let fetched = cached.filter(|p| p.tier != PlanTier::Unknown);
     match fetched {
         Some(plan) => plan.tier.short_label(),
         None => {
@@ -64,3 +71,7 @@ pub(crate) fn windows_json(name: &str) -> serde_json::Value {
         .collect();
     serde_json::Value::Array(windows)
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/profile_json.rs"]
+mod tests;
