@@ -249,7 +249,7 @@ pub(crate) fn is_exhausted(profile: &Profile, weekly_pct: f64) -> bool {
 /// all-spent banner stay honest — but treated the same by the walk, which skips
 /// it like `broken`/`kick_rejected`. Config-side twin of
 /// [`is_canceled_from_usage`], reading `Profile.usage` (the UI thread's copy).
-/// `pub(crate)` so the Overview row's dead-first `⊗` marker reads the same
+/// `pub(crate)` so the Overview row's dead-first `⊖` marker reads the same
 /// predicate the walk does, never a second opinion.
 pub(crate) fn is_canceled(profile: &Profile) -> bool {
     profile

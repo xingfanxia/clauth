@@ -325,17 +325,17 @@ fn render_overview_row(
     let mut spans = vec![cursor];
     // A disabled row flattens every semantic hue to dim — the whole row reads as
     // one inert unit rather than a live row wearing a dim name. The GLYPHS stay:
-    // cloudy-tui never lets state ride on hue alone, so `⊗`/`×`/`⊘`/`!`/`●` still
+    // cloudy-tui never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/`●` still
     // distinguish themselves without the color.
     let hue = |s: Style| if disabled { theme::dim() } else { s };
-    // Marker precedence: canceled subscription (⊗) > broken login (×) > token
+    // Marker precedence: canceled subscription (⊖) > broken login (×) > token
     // danger (⊘) > bell (!) > active (●). Canceled is dead-first (the org 403s
     // every request, matching the Fallback ladder where `Canceled` outranks
     // `AuthBroken`); a dead login makes usage alerts moot until re-login; a dead /
     // mis-filled long-lived token signs sessions out on the next switch, so it
     // outranks a bell.
     if crate::fallback::is_canceled(profile) {
-        spans.push(Span::styled("⊗", hue(theme::danger())));
+        spans.push(Span::styled("⊖", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if cfg.is_auth_broken(&profile.name) {
         spans.push(Span::styled("×", hue(theme::danger())));

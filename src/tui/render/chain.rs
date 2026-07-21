@@ -244,10 +244,17 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// 1-cell selector marker for a member's worst blocked reason: color bands the
 /// severity, the glyph shape names the reason (the detail pill spells it out in
 /// full). Absent when the member has headroom.
+///
+/// `Disabled` and `Canceled` deliberately SHARE `⊖` and split on hue alone
+/// (faint vs danger), the one place this app departs from cloudy-tui's
+/// shape-names-the-state rule: the two co-occur on nearly every real account
+/// (an operator disables a subscription once it's canceled), and the Overview
+/// account row picks the canceled arm where this ladder picks the disabled one,
+/// so distinct shapes made the same account wear two glyphs on one screen.
 pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
     let (glyph, style) = match reason {
         BlockedReason::Disabled => ("⊖", theme::faint()),
-        BlockedReason::Canceled => ("⊗", theme::danger()),
+        BlockedReason::Canceled => ("⊖", theme::danger()),
         BlockedReason::AuthBroken => ("×", theme::danger()),
         BlockedReason::WeeklySpent { .. } => ("⊘", theme::danger()),
         BlockedReason::KickRejected { .. } => ("⧗", theme::warning()),

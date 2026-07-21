@@ -373,11 +373,12 @@ fn token_danger_marker_outranks_bell_and_active() {
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
 
-/// A canceled subscription (⊗) is dead-first: the org 403s every request, so it
+/// A canceled subscription (⊖) is dead-first: the org 403s every request, so it
 /// outranks the broken-login ×, the token ⊘, the bell !, and the active ● all at
 /// once (matching the Fallback ladder where `Canceled` beats `AuthBroken`). The
 /// auth_broken + bell + active fixture proves the canceled arm fires FIRST — if it
-/// yielded, the × would show instead.
+/// yielded, the × would show instead. `⊖` is shared with `Disabled` and split on
+/// hue, so the danger assertion below is what pins the canceled arm.
 #[test]
 fn canceled_marker_is_dead_first() {
     use crate::usage::{PlanInfo, PlanTier};
@@ -393,11 +394,11 @@ fn canceled_marker_is_dead_first() {
     let widths = OverviewWidths::new(80, &app);
     let line = render_overview_row(&app, 0, &widths, false, true);
     let text = line_text(&line);
-    assert!(text.contains('⊗'), "canceled renders ⊗: {text}");
-    assert!(!text.contains('×'), "broken login yields to ⊗: {text}");
-    assert!(!text.contains('!'), "bell yields to ⊗: {text}");
-    assert!(!text.contains('●'), "active dot yields to ⊗: {text}");
-    let marker = line.spans.iter().find(|s| s.content == "⊗").unwrap();
+    assert!(text.contains('⊖'), "canceled renders ⊖: {text}");
+    assert!(!text.contains('×'), "broken login yields to ⊖: {text}");
+    assert!(!text.contains('!'), "bell yields to ⊖: {text}");
+    assert!(!text.contains('●'), "active dot yields to ⊖: {text}");
+    let marker = line.spans.iter().find(|s| s.content == "⊖").unwrap();
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
 

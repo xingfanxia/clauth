@@ -277,6 +277,21 @@ fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
 
 // ── disabled chain member (feature: per-account disable toggle) ─────────────
 
+/// `Disabled` and `Canceled` share the `⊖` shape and split on hue alone — the
+/// one deliberate departure from cloudy-tui's shape-names-the-state rule (see
+/// `reason_marker`). Pinned here because giving either arm its own shape puts
+/// the same account under two glyphs across the Overview's two panels: the
+/// account row picks the canceled arm where this ladder picks the disabled one.
+#[test]
+fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
+    let dis = reason_marker(&BlockedReason::Disabled);
+    let can = reason_marker(&BlockedReason::Canceled);
+    assert_eq!(dis.content, "⊖", "disabled marker shape");
+    assert_eq!(can.content, "⊖", "canceled marker shape");
+    assert_eq!(dis.style.fg, theme::faint().fg, "disabled reads uncharged");
+    assert_eq!(can.style.fg, theme::danger().fg, "canceled reads dead");
+}
+
 /// A disabled chain member — still configured in `fallback_chain` on disk,
 /// only the walk skips it (see `Profile::is_disabled` / `docs/internals.md`)
 /// — dims its name in the Fallback selector and carries the `⊖` blocked-reason
@@ -330,6 +345,13 @@ fn disabled_chain_member_dims_its_name_and_takes_the_blocked_reason_marker() {
         Some(marker_cell.fg),
         theme::faint().fg,
         "the ⊖ marker is uncharged, matching ⋯ stale"
+    );
+    // ⊖ is shared with `Canceled` (see `reason_marker`), so the hue is the only
+    // thing telling the two apart on this row.
+    assert_ne!(
+        Some(marker_cell.fg),
+        theme::danger().fg,
+        "a disabled member must not wear the canceled arm's danger hue"
     );
 
     // Both panes share this physical row, so split at the seam: the selector
