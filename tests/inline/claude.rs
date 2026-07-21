@@ -487,9 +487,11 @@ fn build_settings_writes_api_key_helper_not_env_token() {
     // profile name — so CC's shell-invocation of clauth can re-derive the key.
     let exe = std::env::current_exe().expect("test-bin current_exe");
     let exe_str = exe.to_string_lossy();
+    // Compared through `shell_quote`: on windows it escapes every `\`, so an
+    // absolute exe path never appears literally in the helper.
     assert!(
-        helper.contains(&*exe_str),
-        "helper ({helper}) must carry the current exe path ({exe_str})"
+        helper.contains(&shell_quote(&exe_str)),
+        "helper ({helper}) must carry the quoted current exe path ({exe_str})"
     );
     assert!(
         helper.contains("__api-key"),
