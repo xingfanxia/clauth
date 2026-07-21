@@ -1521,27 +1521,48 @@ fn feed_install_gate(
             Err(e) => return AuthGate::Transient(e),
         }
     }
-    let fresh = |st: Option<SessionTokenStatus>| matches!(st, Some(SessionTokenStatus::LongLived(exp)) if !expiring(exp, false));
-    if fresh(crate::claude::session_token_status(name)) {
+    // Freshness is FED-shaped freshness: an hours-horizon LongLived token
+    // with real life left. A static MINT (~1yr stamp) is deliberately NOT
+    // "fresh" here — on a feed profile it is the live *fallback*, and the
+    // gate's job is to supersede it with a Fable-capable fed bearer (the
+    // deploy-day bug: the mint's far-future expiry read as fresh, so arming
+    // never fed anything). A live mint also means the profile is ARMED
+    // (`has_session_token` true), so every degrade path below can fall back
+    // to Ready on it rather than deferring the switch.
+    let now = now_ms() as i64;
+    let fed_fresh = |st: Option<SessionTokenStatus>| {
+        matches!(st, Some(SessionTokenStatus::LongLived(Some(e)))
+            if !expiring(Some(e), false) && e < now + crate::claude::MINT_HORIZON_MS)
+    };
+    let sidecar_live = |st: Option<SessionTokenStatus>| matches!(st, Some(SessionTokenStatus::LongLived(exp)) if !expiring(exp, false));
+    if fed_fresh(crate::claude::session_token_status(name)) {
         return AuthGate::Ready;
     }
-    // Stale or absent: everything below mutates the sidecar or the chain, so
-    // it serializes with rotations on the profile's cross-process guard.
+    // Mint-shaped, stale, or absent: everything below mutates the sidecar or
+    // the chain, so it serializes with rotations on the cross-process guard.
     let Ok(guard) = RotationGuard::acquire(name) else {
         return AuthGate::Transient(anyhow::anyhow!(
             "'{name}' rotation lock busy; retry after the in-flight refresh"
         ));
     };
     // The rotation we just serialized with may have re-fed it already.
-    if fresh(crate::claude::session_token_status(name)) {
+    if fed_fresh(crate::claude::session_token_status(name)) {
         return AuthGate::Ready;
     }
     match feed_from_stored_chain(config, name, &guard) {
         FeedAttempt::Fed => return AuthGate::Ready,
-        // A healthy chain whose feed WRITE failed must not fall anywhere: the
-        // sidecar is stale and the refresh leg would early-Ready on the
-        // comfortable chain without re-feeding.
-        FeedAttempt::WriteFailed(e) => return AuthGate::Transient(e),
+        // A feed WRITE failure with a live mint still installs the mint
+        // (degraded but serving — the next rotation retries the feed); with
+        // no live sidecar it must not fall anywhere (the refresh leg would
+        // early-Ready on the comfortable chain without feeding anything).
+        FeedAttempt::WriteFailed(e) => {
+            return if sidecar_live(crate::claude::session_token_status(name)) {
+                logline!("clauth: '{name}' feed write failed ({e:#}); installing the mint");
+                AuthGate::Ready
+            } else {
+                AuthGate::Transient(e)
+            };
+        }
         FeedAttempt::ChainStale => {}
     }
     // A live session with NO armed sidecar was started on the rotating pair
@@ -1554,18 +1575,44 @@ fn feed_install_gate(
         ));
     }
     let gate = gate_under_guard(config, name, refresher, &guard);
-    // A terminally dead usage chain degrades to the preserved static mint
-    // (Sonnet-cap service) instead of benching an account whose sessions
-    // could still run.
-    if matches!(gate, AuthGate::Broken) && crate::claude::restore_static_mint(name).unwrap_or(false)
-    {
-        logline!(
-            "clauth: '{name}' usage chain is dead — restored the static long-lived mint \
-             (sessions degrade to it; `clauth login {name}` revives the chain and the feed)"
-        );
-        return AuthGate::Ready;
+    match gate {
+        // The refresh persisted through the rotation hook, which fed the
+        // sidecar as a side effect.
+        AuthGate::Refreshed => AuthGate::Refreshed,
+        // A terminally dead usage chain degrades to the static mint —
+        // restored from backup, or already sitting in the sidecar — instead
+        // of benching an account whose sessions could still run.
+        AuthGate::Broken => {
+            if crate::claude::restore_static_mint(name).unwrap_or(false)
+                || sidecar_live(crate::claude::session_token_status(name))
+            {
+                logline!(
+                    "clauth: '{name}' usage chain is dead — sessions degrade to the static \
+                     long-lived mint (`clauth login {name}` revives the chain and the feed)"
+                );
+                AuthGate::Ready
+            } else {
+                AuthGate::Broken
+            }
+        }
+        // Transient chain trouble with a live mint: install the mint now
+        // (degraded but serving) rather than deferring a switch a healthy
+        // static token could carry; the feed self-heals on a later rotation.
+        AuthGate::Transient(e) => {
+            if sidecar_live(crate::claude::session_token_status(name)) {
+                logline!(
+                    "clauth: '{name}' chain refresh hit a transient failure ({e:#}); \
+                     installing the mint while the feed retries"
+                );
+                AuthGate::Ready
+            } else {
+                AuthGate::Transient(e)
+            }
+        }
+        // Ready from the vanilla leg = a sibling refreshed under the guard
+        // window; its persist ran the feed hook.
+        AuthGate::Ready => AuthGate::Ready,
     }
-    gate
 }
 
 /// CLA-FEED: arm or re-stamp `name`'s fed sidecar right now — the CLI-enable

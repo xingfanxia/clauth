@@ -98,6 +98,14 @@ pub(crate) const SETUP_TOKEN_ASSUMED_LIFETIME_MS: i64 = 365 * 24 * 60 * 60 * 100
 /// usage pair stays separate). Recorded in the sidecar for the record.
 const SETUP_TOKEN_SCOPES: [&str; 2] = ["user:inference", "user:sessions:claude_code"];
 
+/// CLA-FEED: the mint-vs-fed horizon discriminator. A genuine `setup-token`
+/// mint is stamped ~1 year out; a fed access token dies in hours. An expiry
+/// under this horizon is FED-shaped; at or beyond it, MINT-shaped. Shared by
+/// [`preserve_static_mint`] (never back up a fed value as "the mint") and the
+/// install gate (a mint on a feed profile is a live fallback to be
+/// superseded, not a fresh fed token).
+pub(crate) const MINT_HORIZON_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
 /// Shape-check a pasted `claude setup-token` mint before anything is written:
 /// trimmed, non-empty, `sk-ant-` prefixed, no interior whitespace (a partial
 /// paste or a paste-with-prompt both fail loud here instead of producing a
@@ -230,7 +238,6 @@ fn preserve_static_mint(name: &str) -> Result<()> {
     // year out; a fed access token dies in hours. A stamp under 30 days (or a
     // sidecar already expired) is not a mint worth preserving — backing up a
     // dies-in-hours value would make a later restore install a dead token.
-    const MINT_HORIZON_MS: i64 = 30 * 24 * 60 * 60 * 1000;
     let now = crate::usage::now_ms() as i64;
     if oauth
         .expires_at

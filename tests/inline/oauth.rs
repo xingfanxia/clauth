@@ -2034,16 +2034,54 @@ fn feed_gate_heals_a_misfilled_sidecar_when_a_backup_exists() {
         ensure_installable(&handle, name, never_refresh),
         AuthGate::Ready
     ));
+    // Healed AND re-armed in one pass: the restored mint is immediately
+    // superseded by a fed bearer from the comfortable chain (no spend).
     let oauth = sidecar_oauth(name).expect("sidecar");
     assert_eq!(
-        oauth.access_token, "sk-ant-oat01-mint",
-        "healed to the mint"
+        oauth.access_token, "at-old",
+        "healed then re-fed from the chain"
     );
     assert!(oauth.refresh_token.is_none());
     let source = crate::claude::install_source_path(name).expect("source");
     assert!(
         source.ends_with("session-token.json"),
         "the pair is never the install source after a heal"
+    );
+}
+
+/// A static MINT on a feed profile is a fallback, not a fresh fed token — the
+/// gate supersedes it from the comfortable chain (no spend) and the mint
+/// lands in the degrade backup. Regression for the deploy-day bug where the
+/// mint's ~1yr stamp read as "fresh" and arming never fed anything.
+#[test]
+fn feed_gate_supersedes_a_static_mint_with_a_fed_bearer() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-mint-supersede";
+    let config = feed_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::write_session_token(name, "sk-ant-oat01-mint", crate::usage::now_ms() as i64)
+        .expect("mint");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "at-old", "fed from the stored chain");
+    assert!(oauth.refresh_token.is_none());
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(
+            profile_dir(name)
+                .expect("dir")
+                .join("session-token.static.json"),
+        )
+        .expect("backup"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-mint"),
+        "the superseded mint became the degrade backup"
     );
 }
 
