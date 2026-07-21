@@ -813,6 +813,12 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
 /// surviving pulse would differ between them.
 #[test]
 fn disabled_row_type_cell_does_not_pulse() {
+    // The wave is a Full-tier effect: `pulse_name_spans` returns flat spans
+    // below it. The tier auto-detects from `$COLORTERM`, which CI leaves unset,
+    // so an unpinned tier renders every row flat. That makes the assertion
+    // below vacuous and fails its control. nextest runs each test in its own
+    // process, so this pin cannot leak.
+    theme::set_tier(theme::Tier::Full);
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
     a.credentials = Some(oauth_creds());
@@ -822,10 +828,13 @@ fn disabled_row_type_cell_does_not_pulse() {
 
     // `pulse_name_spans` keys off `app.started_at.elapsed()`, so two Apps
     // constructed a real interval apart sample different phases of the wave.
+    // 450ms is the crest of the 900ms sweep, where the envelope peaks: the
+    // phase furthest from the flat 0ms frame, so a surviving pulse shows up at
+    // its widest rather than at some near-zero lean that rounds back to base.
     let snapshot = |idx: usize| -> Vec<(String, Option<ratatui::style::Color>)> {
         let mut app = App::new(config.clone());
         app.started_at =
-            std::time::Instant::now() - std::time::Duration::from_millis(700 * idx as u64);
+            std::time::Instant::now() - std::time::Duration::from_millis(450 * idx as u64);
         let widths = OverviewWidths::new(110, &app);
         render_overview_row(&app, 0, &widths, false, true)
             .spans
@@ -852,7 +861,7 @@ fn disabled_row_type_cell_does_not_pulse() {
     };
     assert_ne!(
         enabled_snapshot(0),
-        enabled_snapshot(700),
+        enabled_snapshot(450),
         "control: an enabled credentialed row's type cell really does animate"
     );
 }
