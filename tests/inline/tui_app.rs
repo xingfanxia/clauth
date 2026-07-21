@@ -475,6 +475,53 @@ fn app_with(profiles: Vec<crate::profile::Profile>) -> App {
     })
 }
 
+// ── lock-order regression ───────────────────────────────────────────────────
+
+/// `reload_if_state_changed` must NOT hold the config guard while it writes the
+/// `usage_tokens` / `third_party_tokens` mutexes: those rank OUTSIDE `Config`
+/// (`Tokens` 250, `ThirdParty` 260, both `< Config` 400), so nesting them under
+/// config inverts the global lock order. In debug builds the ranked-mutex
+/// assertion panics ("lock-order violation: acquiring rank 250 while holding
+/// [400]") the instant the inverted acquire runs, so this test reds if the fix
+/// is reverted to the nested shape. The `assert!(reloaded)` is load-bearing: it
+/// proves the reload branch actually ran and reached the token-mutex writes, so
+/// a green here is never vacuous.
+#[test]
+fn reload_if_state_changed_does_not_invert_config_over_token_locks() {
+    use crate::profile::{AppState, Profile, save_app_state, save_profile};
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let home = crate::testutil::HomeSandbox::new();
+
+    // Persist a real profile so `load_config()` inside the reload succeeds.
+    let profile = Profile::new("acct".to_string(), None, None);
+    save_app_state(&AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&profile).expect("persist profile config");
+
+    let mut app = app_with(vec![profile]);
+
+    // Force the fingerprint to differ from the one captured at construction so
+    // `reload_if_state_changed` takes the reload branch instead of early-out.
+    let config_toml = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("acct")
+        .join("config.toml");
+    set_mtime(&config_toml, UNIX_EPOCH + Duration::from_secs(1_000_000));
+
+    let reloaded = app.reload_if_state_changed();
+    assert!(
+        reloaded,
+        "the reload branch must run so the token-mutex writes are exercised"
+    );
+}
+
 #[test]
 fn config_rows_hybrid_shows_the_logout_row_for_its_oauth_pair() {
     use super::{ConfigRow, config_rows};

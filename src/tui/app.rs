@@ -2091,23 +2091,28 @@ impl App {
         if let Ok(fresh) = load_config() {
             *self.config() = fresh;
             self.last_reload_fp = current;
-            let names: Vec<String> = {
+            // Collect under the config guard, then DROP it before locking the
+            // token mutexes — TOKENS/THIRD_PARTY rank OUTSIDE CONFIG, so writing
+            // them while config is held inverts the global lock order (same shape
+            // as `refresh_tokens`).
+            let (tokens, third_party, names) = {
                 let cfg = self.config();
-                #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-                {
-                    *self
-                        .usage_tokens
-                        .lock()
-                        .expect("usage_tokens mutex poisoned") = collect_tokens(&cfg);
-                    *self
-                        .third_party_tokens
-                        .lock()
-                        .expect("third_party_tokens mutex poisoned") =
-                        collect_third_party_entries(&cfg.profiles);
-                }
-                cfg.profiles.iter().map(|p| p.name.to_string()).collect()
+                let tokens = collect_tokens(&cfg);
+                let third_party = collect_third_party_entries(&cfg.profiles);
+                let names: Vec<String> = cfg.profiles.iter().map(|p| p.name.to_string()).collect();
+                (tokens, third_party, names)
             };
-            // Sidecar reads happen with the config guard dropped (above scope).
+            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+            {
+                *self
+                    .usage_tokens
+                    .lock()
+                    .expect("usage_tokens mutex poisoned") = tokens;
+                *self
+                    .third_party_tokens
+                    .lock()
+                    .expect("third_party_tokens mutex poisoned") = third_party;
+            }
             self.session_tokens = collect_session_tokens(&names);
             true
         } else {
