@@ -1513,3 +1513,45 @@ Merge commit `c112469` on `sync/upstream-2026-07-20` → ff'd to main.
   shape), clippy 0, fmt clean; release binary smoke-tested read-only
   (status.json carries schema 1 + fork fields + 6 profiles; completions
   carry sessions/resume). Deployed same session (daemon + proxy restart).
+
+## 2026-07-21 (CLA-SPLIT-3) — mis-filled sidecar incident: "Login expired" while ccsbar read healthy
+
+Live incident (AX report, ~03:29Z): claude sessions died "Login expired ·
+Please run /login" while ccsbar showed ax-main Fresh + "Long-lived token ·
+expires in ~342d". Root cause chain, forensically pinned:
+
+1. 07-18 10:05:45Z batch fill wrote all THREE session-token.json as full
+   credential-shaped JSON — the RIGHT mints (hash-verified vs
+   ~/.claude-fleet/claude_long_live_tokens.env: 1f1b7d5a/d59c050e/fb740963)
+   but with a spurious refreshToken + scopes + subscriptionType template.
+2. 07-19 genuinely-long-lived detection (159224e, the #53 maintainer ask)
+   classifies refresh-token-present sidecars NotLongLived → silently
+   DISENGAGED the split on all three profiles retroactively.
+3. Switches then fell back to rotating pairs (daemon loglines 07-20 07:41Z
+   ax-backup, 14:02Z ax-main) — CC sessions and clauth's usage leg back on
+   ONE single-use refresh chain, the exact class CLA-SPLIT exists to kill.
+4. 21:19:58Z: the shared pair's access token expired; clauth's usage leg
+   rotated first (stored+live-symlink updated — the mtimes are
+   microsecond-identical because ~/.claude/.credentials.json is a SYMLINK
+   into the profile store); CC's copy of the chain was left spent → its next
+   refresh attempt died → Login expired. AX /login'd at 03:30:36Z (Keychain
+   acct=xingfanxia mdat matches to the second).
+5. ccsbar could not surface any of this: SessionToken.state decoded ONLY
+   expiresAt, so a mis-filled sidecar displayed as a healthy ~342d countdown.
+
+Fixes (all deployed 07-21):
+- Sidecars re-captured via `clauth login <p> --setup-token --yes` (stdin
+  pipe from the fleet env, values never printed); verified pure-mint shape
+  {accessToken, expiresAt, scopes} + hash match. Split arms at each
+  profile's next switch (AX-manual). Meanwhile the /login chain is safe:
+  has_session_token=true now short-circuits the rotation Keychain-mirror.
+- ccsbar 7ebe3f9: new SessionTokenState.misfilled (mirrors clauth's
+  refresh-token check) → DANGER "mis-filled (rotating pair) — not in
+  effect; re-capture", never the stamped countdown. 210+11 tests green,
+  deployed + relaunched.
+
+Forensic facts worth keeping: CC on this Mac reads/writes Keychain item
+acct=xingfanxia svce="Claude Code-credentials" (an acct=unknown shell from
+05-31 is a dead item — ignore it in future forensics); the live credentials
+file is a clauth-owned symlink, so "live file == stored" is definitional,
+not evidence of a write.
