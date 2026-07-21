@@ -287,14 +287,16 @@ impl PlanTier {
     }
 
     /// Map the OAuth token's `subscription_type` so a not-yet-fetched profile
-    /// still shows a sane tier label. A missing value defaults to `Pro`,
-    /// matching the old `endpoint_label` fallback (`unwrap_or("pro")`).
+    /// still shows a sane tier label. A missing claim (a credential-less or
+    /// never-fetched profile) or an unrecognized value → `Unknown`, never a
+    /// fabricated paid tier: `Unknown` renders neutrally (`short_label` omits it,
+    /// `display` shows the bare "Claude") instead of a "Pro" out of thin air.
     pub(crate) fn from_subscription_type(s: Option<&str>) -> Self {
-        match s.unwrap_or("pro") {
-            "pro" => PlanTier::Pro,
-            "max" => PlanTier::Max(None),
-            "team" | "teams" => PlanTier::Team,
-            "enterprise" => PlanTier::Enterprise,
+        match s {
+            Some("pro") => PlanTier::Pro,
+            Some("max") => PlanTier::Max(None),
+            Some("team") | Some("teams") => PlanTier::Team,
+            Some("enterprise") => PlanTier::Enterprise,
             _ => PlanTier::Unknown,
         }
     }
