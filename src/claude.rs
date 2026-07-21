@@ -311,6 +311,24 @@ fn is_first_login_at(link: &Path, expected: &Path) -> bool {
         .is_some_and(|creds| creds.claude_ai_oauth.is_some())
 }
 
+/// True when the live `.credentials.json` is clauth's own symlink into a
+/// profile store. Whatever it points at, that login is saved by construction —
+/// the target IS a profile's store file — so the archive-before-discard
+/// machinery has nothing to preserve and must not gate a switch on it.
+/// `Diverged` + symlink arises legitimately when a profile's INSTALL SOURCE
+/// changes under a live link (CLA-SPLIT-3: repairing a mis-filled sidecar
+/// flips the expected source from `credentials.json` to `session-token.json`
+/// while the old link still points at the former) — a stale link to re-point,
+/// not an unsaved login to protect. Treating it as unsaved deadlocked every
+/// switch: the archive refuses symlinks by design (observed 2026-07-21,
+/// "deferring switch … nothing unsaved to archive").
+pub(crate) fn live_login_is_clauth_symlink() -> bool {
+    claude_credentials_path()
+        .ok()
+        .and_then(|p| p.symlink_metadata().ok())
+        .is_some_and(|m| m.file_type().is_symlink())
+}
+
 pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
     let path = claude_credentials_path()?;
     if !path.exists() {

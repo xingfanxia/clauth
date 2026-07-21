@@ -232,13 +232,18 @@ pub(crate) fn status_oneshot() -> Result<()> {
 /// login is not "unsaved credentials", and deferring on it wedges every
 /// headless switch behind a TUI decision about nothing while running sessions
 /// sit at "Login expired" (observed 2026-07-15). An unreadable/torn live file
-/// still defers — it may be a CC write in progress.
+/// still defers — it may be a CC write in progress. A clauth-owned SYMLINK is
+/// exempt too ([`crate::claude::live_login_is_clauth_symlink`]): its content
+/// is a profile store by construction, so there is nothing unsaved — and the
+/// archive refuses symlinks, so gating on one deadlocks the switch
+/// (CLA-SPLIT-3, observed 2026-07-21).
 fn active_diverged_unsaved(active: &str) -> bool {
     matches!(
         classify_credentials_link(active).ok(),
         Some(LinkState::Diverged)
     ) && !is_first_login(active).unwrap_or(false)
         && !live_credentials_are_shell()
+        && !crate::claude::live_login_is_clauth_symlink()
 }
 
 /// Owns the shared `Arc` stores (cloned into the scheduler) plus main-loop-only

@@ -3449,13 +3449,19 @@ where
 
 /// True when the live credentials diverge from the stored chain and it's not a
 /// first-login adoption (must be reconciled before clearing/relinking). A
-/// logged-out shell is exempt — an empty login needs no reconciling.
+/// logged-out shell is exempt — an empty login needs no reconciling. A
+/// clauth-owned symlink is exempt too — its content is a profile store by
+/// construction, nothing unsaved to reconcile (CLA-SPLIT-3: a repaired
+/// sidecar flips the install source under a live link; prompting on that
+/// stale link wedged switches, daemon parity in
+/// `daemon::active_diverged_unsaved`).
 fn active_diverged_unsaved(active: &str) -> bool {
     matches!(
         classify_credentials_link(active).ok(),
         Some(LinkState::Diverged)
     ) && !is_first_login(active).unwrap_or(false)
         && !live_credentials_are_shell()
+        && !crate::claude::live_login_is_clauth_symlink()
 }
 
 /// Toast and raise the Divergence prompt for `active` (`verb` = blocked action).
