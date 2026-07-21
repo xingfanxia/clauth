@@ -812,8 +812,10 @@ fn parse_disable_args(rest: &[String]) -> Option<(&str, bool)> {
 }
 
 /// Refuse `name` as a switch/start target when it's user-disabled, naming the
-/// fix. Shared by [`cmd_switch`] and [`cmd_start`] so the two entry points a
-/// disabled account must never reach can't drift on the message.
+/// fix. Called by [`cmd_switch`] and [`cmd_start`] as a friendly early check,
+/// and by `start::run` — the authoritative chokepoint every session-spawn path
+/// (`cmd_start`, `sessions_cli::run_resume`) funnels through — so all three
+/// callers share one message instead of drifting.
 fn refuse_if_disabled(config: &AppConfig, name: &str) -> Result<()> {
     if config.find(name).is_some_and(|p| p.is_disabled()) {
         anyhow::bail!("'{name}': account is disabled, run `clauth enable {name}`");

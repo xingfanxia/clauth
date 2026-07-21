@@ -157,13 +157,33 @@ fn resolve_profile_name(config: &AppConfig, chosen: &str) -> Result<String> {
     })
 }
 
-/// Interactive profile prompt: list the profiles (the default marked), read a
-/// line, and take the default on empty input. TTY-only — reached only when
-/// [`resume_profile_choice`] returns `should_prompt`.
+/// The candidate list [`prompt_profile`] offers, plus the resolved default:
+/// every enabled profile name ([`AppConfig::enabled_profiles`], the same view
+/// `which`/`status` read), with `default` swapped for the first enabled name
+/// when the caller's default is itself disabled — a stale `last_ran_profile`
+/// that's since been disabled must not show as the bracketed default for a
+/// name that isn't even listed. Pure so the disabled-exclusion is
+/// unit-testable without a terminal.
+fn resume_candidates<'a>(config: &'a AppConfig, default: &'a str) -> (Vec<&'a str>, &'a str) {
+    let enabled: Vec<&str> = config.enabled_profiles().map(|p| p.name.as_str()).collect();
+    let resolved = if enabled.contains(&default) {
+        default
+    } else {
+        enabled.first().copied().unwrap_or(default)
+    };
+    (enabled, resolved)
+}
+
+/// Interactive profile prompt: list the enabled profiles (the default
+/// marked), read a line, and take the default on empty input. TTY-only —
+/// reached only when [`resume_profile_choice`] returns `should_prompt`. An
+/// explicit `--profile <disabled>` skips this prompt entirely and is still
+/// caught by `start::run`'s authoritative refusal.
 fn prompt_profile(config: &AppConfig, default: &str) -> Result<String> {
     use std::io::Write as _;
+    let (enabled, default) = resume_candidates(config, default);
     println!("resume under which account?");
-    for name in config.names() {
+    for name in enabled.iter().copied() {
         let marker = if name == default { "  (default)" } else { "" };
         println!("  {name}{marker}");
     }

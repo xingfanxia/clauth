@@ -242,3 +242,85 @@ fn resume_unknown_id_errors_naming_it_at_exit_one() {
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
+
+// ── resume refuses a disabled target ─────────────────────────────────────
+//
+// `run_resume` never spawns directly — it always funnels through
+// `crate::start::run`, whose first line is the authoritative
+// "never a live session for a disabled account" gate (mirrors
+// `cli.rs::disabled_target_refusal`'s `cmd_start` regression test).
+
+/// Seed `enabled` as plain profiles and `disabled` as disabled ones, all
+/// under one `AppConfig` so each `create_blank_profile` call's
+/// `save_app_state` persists the growing name list instead of a fresh call
+/// clobbering an earlier profile's entry.
+fn seed_profiles(enabled: &[&str], disabled: &[&str]) {
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    for name in enabled.iter().chain(disabled.iter()) {
+        crate::actions::create_blank_profile(&mut config, (*name).to_string(), None, None, None)
+            .expect("create profile");
+    }
+    for name in disabled {
+        crate::actions::disable_profile(&mut config, name).expect("disable profile");
+    }
+}
+
+#[test]
+fn resume_refuses_an_explicit_disabled_profile_before_any_spawn() {
+    let sb = HomeSandbox::new();
+    seed_profiles(&[], &["off"]);
+
+    let ws = sb.home().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let ws_str = ws.to_string_lossy().into_owned();
+    let path = sb.home().join(".claude/projects/-w/known-session.jsonl");
+    write_jsonl(&path, &[user_line("known-session", &ws_str, "hi")]);
+
+    let err =
+        run_resume("known-session", Some("off")).expect_err("a disabled target must be refused");
+    assert_eq!(
+        err.to_string(),
+        "'off': account is disabled, run `clauth enable off`"
+    );
+    assert!(
+        !sb.home().join(".clauth/profiles/off/runtime").exists(),
+        "the refusal must happen before any runtime is acquired"
+    );
+}
+
+// ── resume_candidates: the interactive picker never offers a disabled account ──
+
+#[test]
+fn resume_candidates_excludes_disabled_accounts() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["acme"], &["off"]);
+    let config = crate::profile::load_config().expect("reload");
+
+    let (enabled, _) = resume_candidates(&config, "acme");
+
+    assert_eq!(
+        enabled,
+        vec!["acme"],
+        "a disabled account must never be an offered candidate"
+    );
+}
+
+#[test]
+fn resume_candidates_falls_back_when_the_default_is_disabled() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["acme"], &["off"]);
+    let config = crate::profile::load_config().expect("reload");
+
+    // A stale last-ran profile that's since been disabled must not be shown
+    // as the bracketed default for a name that isn't even in the list.
+    let (enabled, default) = resume_candidates(&config, "off");
+
+    assert_eq!(enabled, vec!["acme"]);
+    assert_eq!(
+        default, "acme",
+        "a disabled default must fall back to an enabled name"
+    );
+}
