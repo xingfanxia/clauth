@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -782,6 +782,7 @@ pub(crate) fn rescue_move(src: &Path, dst: &Path) -> std::io::Result<()> {
         // after the write loses the race against anyone holding the fd open.
         #[cfg(unix)]
         let mut f = {
+            use std::fs::OpenOptions;
             use std::os::unix::fs::OpenOptionsExt;
             OpenOptions::new()
                 .write(true)

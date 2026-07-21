@@ -442,10 +442,11 @@ fn rename_carries_auth_broken_entry() {
     );
 }
 
-#[cfg(unix)]
+// Ungated on purpose, unlike the mode assertions around them:
+// `disabling_persists_and_leaves_credentials_byte_unchanged` asserts bytes and
+// dir entries rather than modes, so it runs on windows too.
 use crate::testutil::HomeSandbox;
 
-#[cfg(unix)]
 fn oauth_credentials() -> ClaudeCredentials {
     ClaudeCredentials {
         claude_ai_oauth: Some(OAuthToken {
