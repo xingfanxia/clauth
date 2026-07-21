@@ -1141,6 +1141,17 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
     })
 }
 
+/// A hand-editable percent field, normalized at the LOAD boundary so the
+/// on-disk value is never a live trap for a direct reader (the 2026-07-14
+/// weekly-line lesson). `nan` and `inf` are both valid TOML floats and both
+/// survive `clamp`; a `NaN` threshold then reads false against every `>=` it
+/// gates, silently disabling itself, and renders back out as `NaN`, which TOML
+/// rejects. That bricks the next load of the file this module just rewrote, so
+/// anything non-finite reads as unset (same shape as `max_auto_spend`'s guard).
+fn finite_pct(raw: Option<f64>) -> Option<f64> {
+    raw.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 100.0))
+}
+
 pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
@@ -1202,7 +1213,7 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
         auto_start: config.auto_start,
         env: config.env,
         models: config.models,
-        fallback_threshold: config.fallback_threshold.map(|v| v.clamp(0.0, 100.0)),
+        fallback_threshold: finite_pct(config.fallback_threshold),
         last_resort: config.last_resort,
         // Normalize at the LOAD boundary so the on-disk value is never a live
         // trap for a direct reader (the 2026-07-14 weekly-line lesson). `inf`
@@ -1212,7 +1223,7 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
         max_auto_spend: config
             .max_auto_spend
             .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 }),
-        bell_threshold: config.bell_threshold.map(|v| v.clamp(0.0, 100.0)),
+        bell_threshold: finite_pct(config.bell_threshold),
         disabled: config.disabled,
         credentials,
         usage: None,

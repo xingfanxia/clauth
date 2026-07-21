@@ -576,6 +576,42 @@ fn non_finite_max_auto_spend_reads_as_zero_at_load() {
     );
 }
 
+/// `nan` is a valid TOML float that survives `clamp`, and every `>=` against a
+/// NaN threshold reads false, so a hand-edited one silently disables the gate
+/// it was meant to set. Worse, `render_config_toml` writes it back out as
+/// `NaN`, which TOML rejects, so the next `load_profile` fails on the file
+/// clauth itself just rewrote. Non-finite reads as unset on both percent
+/// fields, matching `max_auto_spend`'s guard above.
+#[cfg(unix)]
+#[test]
+fn non_finite_percent_fields_read_as_unset_at_load() {
+    let _home = HomeSandbox::new();
+    let name = "finite-pct-test";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+
+    for raw in ["nan", "inf", "-inf"] {
+        std::fs::write(&config_path, format!("fallback_threshold = {raw}\n"))
+            .expect("write config.toml");
+        assert_eq!(
+            load_profile(name).expect("load_profile").fallback_threshold,
+            None,
+            "fallback_threshold = {raw} must not survive the load boundary"
+        );
+        // The rewrite that load just performed has to still be parseable.
+        load_profile(name).expect("re-load after the fallback_threshold rewrite");
+
+        std::fs::write(&config_path, format!("bell_threshold = {raw}\n"))
+            .expect("write config.toml");
+        assert_eq!(
+            load_profile(name).expect("load_profile").bell_threshold,
+            None,
+            "bell_threshold = {raw} must not survive the load boundary"
+        );
+        load_profile(name).expect("re-load after the bell_threshold rewrite");
+    }
+}
+
 /// The load boundary drops a base_url ONLY when a stored OAuth pair could leak
 /// to it (pair present + no usable key). A pure api account with a cleared key
 /// keeps its base_url shell so `clear_profile_api_key` stays re-loginable — the
