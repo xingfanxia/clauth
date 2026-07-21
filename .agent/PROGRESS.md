@@ -1567,3 +1567,12 @@ symlinks in both unsaved gates (daemon + TUI) — a symlink's content is a
 profile store by construction, nothing unsaved; regular-file live logins
 (a real CC /login) archive exactly as before. Regression test pins the
 Diverged-but-not-unsaved transition state. 1539 tests, deployed.
+
+CLA-SPLIT-3 upstreamed: the stale-symlink switch-deadlock fix ported onto
+upstream/mommy (upstream shares the full shape via merged #53 — their daemon
+retries "unsaved credentials" to TTL and the TUI false-prompts; repro is
+their own `--setup-token` on the active profile) and opened as PR
+[#58](https://github.com/uwuclxdy/clauth/pull/58)
+(`fix/stale-sidecar-symlink-divergence`, 1237 tests green). #51/#55/#47
+needed no update: #51's head is fork main (auto-updated by today's pushes),
+#55 still awaits re-review, #47 unchanged.
