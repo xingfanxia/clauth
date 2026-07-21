@@ -53,8 +53,8 @@ use crate::usage::{
     ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
     UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
-    collect_third_party_entries, collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher,
-    switch_gate_in_flight,
+    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle, mark_activity,
+    now_ms, spawn_refresher, switch_gate_in_flight,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -1778,10 +1778,15 @@ impl App {
                 let _ = link_profile_credentials(&active);
             }
 
-            let (snapshot, third_party) = {
+            // `seed_names` is the display superset (disabled included) for the
+            // cache seed; `snapshot` is the enabled-only work-list that drives
+            // the `Queued` marking below — a disabled profile is seeded but never
+            // queued for a fetch it will never get.
+            let (seed_names, snapshot, third_party) = {
                 #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
                 let cfg = config.lock().expect("config mutex poisoned");
                 (
+                    collect_oauth_seed_names(&cfg),
                     collect_tokens(&cfg),
                     collect_third_party_entries(&cfg.profiles),
                 )
@@ -1791,7 +1796,7 @@ impl App {
                 &usage_store,
                 &usage_status,
                 &last_fetched,
-                &snapshot,
+                &seed_names,
                 interval_ms,
             );
             bootstrap_third_party(

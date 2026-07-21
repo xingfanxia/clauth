@@ -1481,16 +1481,18 @@ fn mark_window_open(store: &UsageStore, name: &str, now_secs: i64) {
 /// older than one interval is seeded `Cached` and refreshed in the background on the
 /// first tick; one younger is `Fresh` and left be. A profile with no cache at all is
 /// left unseeded and unstamped, so the scheduler fetches it fresh on its first tick.
+/// `seed_names` is the display superset ([`collect_oauth_seed_names`], disabled
+/// included) — seeding a disabled profile's cache never adds it to the work-list.
 pub(crate) fn bootstrap_fetch(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
-    tokens: &[TokenEntry],
+    seed_names: &[String],
     interval_ms: u64,
 ) {
     let now = now_ms();
-    for entry in tokens {
-        try_seed_cache(store, status, last_fetched, &entry.name, now, interval_ms);
+    for name in seed_names {
+        try_seed_cache(store, status, last_fetched, name, now, interval_ms);
     }
 }
 
@@ -1647,6 +1649,31 @@ pub(crate) fn collect_tokens(config: &crate::profile::AppConfig) -> Vec<TokenEnt
                 auth_broken: config.is_auth_broken(&p.name),
             })
         })
+        .collect()
+}
+
+/// Profile names to SEED from on-disk usage caches at startup / standby: every
+/// OAuth-credentialed profile, **disabled ones included**. The startup seed is a
+/// DISPLAY concern (last-known tier / windows for the UI), so it is deliberately
+/// WIDER than [`collect_tokens`]'s work-list — a disabled profile is seeded so
+/// its cached numbers render, but it never enters the poll / rotate / auto-start
+/// work-list (that stays `collect_tokens`, enabled-only). This can't make a
+/// disabled profile pollable: seeding only loads a cache that already exists
+/// (`try_seed_cache` is a no-op otherwise), and no work-driving code enumerates
+/// the store's keys — every poll/rotate/switch decision sources its candidates
+/// from `state.tokens` or the disabled-filtered fallback chain, reading the
+/// store only per known name.
+pub(crate) fn collect_oauth_seed_names(config: &crate::profile::AppConfig) -> Vec<String> {
+    config
+        .profiles
+        .iter()
+        .filter(|p| {
+            p.credentials
+                .as_ref()
+                .and_then(|c| c.claude_ai_oauth.as_ref())
+                .is_some()
+        })
+        .map(|p| p.name.to_string())
         .collect()
 }
 
@@ -2202,6 +2229,13 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         .lock()
         .map(|t| t.clone())
         .unwrap_or_default();
+    // Seed the DISPLAY superset (disabled included) so a stood-down TUI shows a
+    // disabled account's cached numbers; the work-list stays `oauth_snapshot`.
+    let oauth_seed_names = state
+        .config
+        .lock()
+        .map(|cfg| collect_oauth_seed_names(&cfg))
+        .unwrap_or_default();
 
     hydrate_from_daemon_caches(
         &state.store,
@@ -2209,7 +2243,7 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         &state.third_party_usage_store,
         &state.third_party_status,
         &state.last_fetched,
-        &oauth_snapshot,
+        &oauth_seed_names,
         &tp_snapshot,
         interval_ms,
     );
@@ -2277,13 +2311,13 @@ fn hydrate_from_daemon_caches(
     tp_store: &ThirdPartyUsageStore,
     tp_status: &ThirdPartyStatusStore,
     last_fetched: &LastFetchedAt,
-    oauth: &[TokenEntry],
+    oauth_seed_names: &[String],
     third_party: &[ThirdPartyEntry],
     interval_ms: u64,
 ) {
     let now = now_ms();
-    for entry in oauth {
-        try_seed_cache(store, status, last_fetched, &entry.name, now, interval_ms);
+    for name in oauth_seed_names {
+        try_seed_cache(store, status, last_fetched, name, now, interval_ms);
     }
     bootstrap_third_party(tp_store, tp_status, last_fetched, third_party, interval_ms);
 }

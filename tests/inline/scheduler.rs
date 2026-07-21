@@ -8,7 +8,7 @@ use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
     ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, SuppressedGenericStore,
-    ThirdPartyEntry, TokenEntry, clear_activity, clear_orphaned_forced,
+    ThirdPartyEntry, TokenEntry, clear_activity, clear_orphaned_forced, collect_oauth_seed_names,
     collect_third_party_entries, collect_tokens, filter_suppressed, mark_activity,
     memoized_identity, partition_due, window_lapsed,
 };
@@ -67,6 +67,77 @@ fn collect_tokens_excludes_disabled_profiles_includes_enabled_siblings() {
     assert!(
         names.contains(&"on"),
         "an enabled sibling must still be collected for polling"
+    );
+}
+
+// The DISPLAY seed is the complement of `collect_tokens`: it INCLUDES a disabled
+// OAuth profile (so its cached tier/windows render) — the exact hole behind the
+// stale-tier bug — while the work-list above still excludes it. End-to-end: a
+// disabled profile's on-disk usage cache lands in the live store via
+// `bootstrap_fetch(collect_oauth_seed_names(..))`, and seeding it never widens
+// the poll list. A credential-less profile has no oauth cache, so it is not seeded.
+#[test]
+fn collect_oauth_seed_names_includes_disabled_and_bootstrap_seeds_its_cache() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::{UsageInfo, UsageWindow};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut credless = crate::profile::Profile::new("credless".to_string(), None, None);
+    credless.disabled = true;
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            oauth_profile_disabled("off", true),
+            oauth_profile_disabled("on", false),
+            credless,
+        ],
+    };
+
+    let seed = collect_oauth_seed_names(&config);
+    assert!(
+        seed.contains(&"off".to_string()),
+        "the display seed must include a disabled OAuth profile: {seed:?}"
+    );
+    assert!(
+        seed.contains(&"on".to_string()),
+        "and its enabled sibling: {seed:?}"
+    );
+    assert!(
+        !seed.contains(&"credless".to_string()),
+        "a credential-less profile has no oauth cache to seed: {seed:?}"
+    );
+
+    // End-to-end: the disabled profile's on-disk cache lands in the live store.
+    let info = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..UsageInfo::default()
+    };
+    write_profile_cache("off", USAGE_CACHE_FILE, &info);
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    super::bootstrap_fetch(&store, &status, &last_fetched, &seed, REFRESH_INTERVAL_MS);
+
+    let seeded = store.lock().unwrap().get("off").cloned();
+    assert_eq!(
+        seeded.and_then(|i| i.five_hour.map(|w| w.utilization)),
+        Some(42.0),
+        "a disabled profile's cached window is seeded for display"
+    );
+
+    // Invariant preserved: seeding the store never widens the poll work-list.
+    let poll_names: Vec<String> = collect_tokens(&config)
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    assert!(
+        !poll_names.contains(&"off".to_string()),
+        "seeding a disabled profile must not make it pollable: {poll_names:?}"
     );
 }
 
@@ -2684,7 +2755,7 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         &tp_store,
         &tp_status,
         &last_fetched,
-        &[token("kitty"), token("cacheless")],
+        &["kitty".to_string(), "cacheless".to_string()],
         &[],
         REFRESH_INTERVAL_MS,
     );
@@ -2735,23 +2806,23 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
     let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let hydrate = |snapshot: &[TokenEntry]| {
+    let hydrate = |seed_names: &[String]| {
         super::hydrate_from_daemon_caches(
             &store,
             &status,
             &tp_store,
             &tp_status,
             &last_fetched,
-            snapshot,
+            seed_names,
             &[],
             REFRESH_INTERVAL_MS,
         )
     };
 
     write_profile_cache("kitty", USAGE_CACHE_FILE, &at(10.0));
-    hydrate(&[token("kitty")]);
+    hydrate(&["kitty".to_string()]);
     write_profile_cache("kitty", USAGE_CACHE_FILE, &at(55.0));
-    hydrate(&[token("kitty")]);
+    hydrate(&["kitty".to_string()]);
 
     let seeded = store.lock().unwrap().get("kitty").cloned();
     assert_eq!(
@@ -2776,9 +2847,11 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
 
     write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
 
+    // The standby seed sources names from config (the display superset), so the
+    // profile whose cache is hydrated must live there — as it does in production.
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
-        profiles: vec![],
+        profiles: vec![oauth_profile_disabled("kitty", false)],
     }));
     let state = super::SchedulerState {
         config,
@@ -2854,9 +2927,11 @@ fn standdown_sweeps_bootstrap_queued_marks() {
 
     write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
 
+    // The standby seed sources names from config (the display superset), so the
+    // profile whose cache is hydrated must live there — as it does in production.
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
-        profiles: vec![],
+        profiles: vec![oauth_profile_disabled("kitty", false)],
     }));
     let state = super::SchedulerState {
         config,
@@ -2930,9 +3005,11 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
     assert!(other.acquire(), "the first instance wins the lease");
 
     write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
+    // The standby seed sources names from config (the display superset), so the
+    // profile whose cache is hydrated must live there — as it does in production.
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
-        profiles: vec![],
+        profiles: vec![oauth_profile_disabled("kitty", false)],
     }));
     let state = super::SchedulerState {
         config,

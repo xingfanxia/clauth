@@ -19,7 +19,7 @@ use super::panes::{
     draw_profile_selector, empty_state, key_cell, master_detail, rail_hint_lines, section_box,
     section_box_verbatim,
 };
-use crate::format::plan_label;
+use crate::format::{endpoint_label, plan_label};
 use crate::profile::Profile;
 use crate::providers::StatRowKind;
 use crate::usage::{
@@ -722,9 +722,13 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
                 .and_then(|u| u.plan.as_ref())
                 .map(plan_label)
         })
+        // With no fetched plan, show the OAuth token's tier (what the Overview
+        // shows) instead of a bare "oauth"; api-key profiles keep "api".
+        // `is_oauth` gates out the base-url branch of `endpoint_label`, so it
+        // only ever resolves to a tier here, never a raw endpoint url.
         .unwrap_or_else(|| {
             if profile.is_oauth() {
-                "oauth".to_string()
+                endpoint_label(profile)
             } else {
                 "api".to_string()
             }
@@ -1145,8 +1149,9 @@ fn ordinal(n: u32) -> String {
 
 /// Terminal message for an OAuth profile with nothing renderable. "loading"
 /// only while a fetch can still land: a credential-less profile is never
-/// scheduled (`collect_tokens` skips it) and a terminal `Failed` already tried
-/// — mirror `build_tp_rows`, never spin on "loading" forever (issue #2).
+/// scheduled (`collect_tokens` skips it), a disabled one is likewise skipped, and
+/// a terminal `Failed` already tried — mirror `build_tp_rows`, never spin on
+/// "loading" forever (issue #2).
 fn oauth_empty_msg(profile: &Profile) -> &'static str {
     let has_oauth = profile
         .credentials
@@ -1154,7 +1159,8 @@ fn oauth_empty_msg(profile: &Profile) -> &'static str {
         .is_some_and(|c| c.claude_ai_oauth.is_some());
     if !has_oauth {
         "not logged in, use + login on the setup tab"
-    } else if profile.fetch_status == Some(FetchStatus::Failed) {
+    } else if profile.is_disabled() || profile.fetch_status == Some(FetchStatus::Failed) {
+        // Disabled: never scheduled, so with no seeded cache no fetch will land.
         "no usage available"
     } else {
         "loading"
@@ -1177,10 +1183,15 @@ fn build_tp_rows(
         // terminal Failed status means we tried and the provider has nothing to
         // show, and a RateLimited one means the provider throttled us with
         // nothing cached — never spin on "loading" forever (the original z.ai bug).
-        let msg = match profile.fetch_status {
-            Some(FetchStatus::Failed) => "no usage available",
-            Some(FetchStatus::RateLimited) => "rate limited, retrying",
-            _ => "loading",
+        // A disabled profile is never scheduled either, so it never loads.
+        let msg = if profile.is_disabled() {
+            "no usage available"
+        } else {
+            match profile.fetch_status {
+                Some(FetchStatus::Failed) => "no usage available",
+                Some(FetchStatus::RateLimited) => "rate limited, retrying",
+                _ => "loading",
+            }
         };
         lines.push(Line::from(Span::styled(msg, theme::faint())));
         return lines;

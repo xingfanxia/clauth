@@ -47,8 +47,8 @@ use crate::usage::{
     ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, PendingSwitch,
     PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore, SuppressedGenericStore,
     ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList, UsageStore,
-    bootstrap_fetch, bootstrap_third_party, collect_third_party_entries, collect_tokens,
-    spawn_refresher,
+    bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries,
+    collect_tokens, spawn_refresher,
 };
 use status_json::{LiveSignals, build_status};
 
@@ -324,14 +324,14 @@ impl Daemon {
             let _ = link_profile_credentials(&active);
         }
 
-        let (snapshot, third_party) = {
+        let (seed_names, third_party) = {
             #[allow(
                 clippy::expect_used,
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let cfg = self.config.lock().expect("config mutex poisoned");
             (
-                collect_tokens(&cfg),
+                collect_oauth_seed_names(&cfg),
                 collect_third_party_entries(&cfg.profiles),
             )
         };
@@ -340,7 +340,7 @@ impl Daemon {
             &self.usage_store,
             &self.usage_status,
             &self.last_fetched,
-            &snapshot,
+            &seed_names,
             interval,
         );
         bootstrap_third_party(

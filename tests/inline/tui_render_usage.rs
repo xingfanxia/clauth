@@ -209,6 +209,121 @@ fn empty_msg_pending_fetch_loads() {
     assert_eq!(oauth_empty_msg(&profile), "loading");
 }
 
+/// A disabled profile is never scheduled (`collect_tokens` skips it), so with no
+/// seeded cache a fetch never lands — the body must be terminal, not spin
+/// "loading" forever. The sibling `empty_msg_pending_fetch_loads` (identical but
+/// enabled → "loading") proves it's the `disabled` flag that flips the outcome.
+#[test]
+fn empty_msg_disabled_profile_is_terminal() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    profile.disabled = true;
+    assert_eq!(oauth_empty_msg(&profile), "no usage available");
+}
+
+/// The third-party body has the same never-scheduled hole: a disabled api-key
+/// profile is dropped by `collect_third_party_entries`, so it never loads and
+/// must read "no usage available" instead of spinning "loading" forever.
+#[test]
+fn tp_rows_disabled_profile_is_terminal() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.disabled = true;
+    // No `third_party_usage`, no fetch_status → the un-fixed path returns "loading".
+    let rendered: Vec<String> = build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+    assert!(
+        rendered.iter().any(|l| l.contains("no usage available")),
+        "disabled tp body is terminal, got {rendered:?}"
+    );
+    assert!(
+        !rendered.iter().any(|l| l.contains("loading")),
+        "disabled tp body must not spin loading, got {rendered:?}"
+    );
+}
+
+/// With no fetched plan, the Usage `plan` row must match the Overview's tier
+/// label (`endpoint_label`) instead of a bare "oauth"/"api", so the two surfaces
+/// never disagree. A `subscription_type` claim renders as its tier.
+#[test]
+fn header_lines_plan_falls_back_to_endpoint_label() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("max".into()),
+        }),
+    });
+    // No `usage`, no `third_party_usage` → the plan-label fallback is exercised.
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags::default(),
+    };
+    let plan_row: String = header_lines(&profile, &header, 52)
+        .first()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .unwrap_or_default();
+    let expected = crate::format::endpoint_label(&profile);
+    assert_eq!(expected, "Claude Max", "sanity: the tier label under test");
+    assert!(
+        plan_row.contains(&expected),
+        "plan row shows the endpoint tier, got {plan_row:?}"
+    );
+    assert!(
+        !plan_row.contains("oauth"),
+        "plan row must not fall back to the bare 'oauth' literal, got {plan_row:?}"
+    );
+}
+
+/// The `endpoint_label` fallback is gated to OAuth profiles: an api-key profile
+/// with no plan keeps "api", never its raw endpoint url (which `endpoint_label`
+/// returns base-url-first). Pins the regression a blanket `endpoint_label` swap
+/// would cause on DeepSeek/z.ai/generic rows.
+#[test]
+fn header_lines_plan_keeps_api_for_api_key_profiles() {
+    let profile = crate::profile::Profile::new(
+        "a".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags::default(),
+    };
+    let plan_row: String = header_lines(&profile, &header, 52)
+        .first()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .unwrap_or_default();
+    assert!(
+        plan_row.contains("api"),
+        "api-key plan row stays 'api', got {plan_row:?}"
+    );
+    assert!(
+        !plan_row.contains("deepseek"),
+        "must not leak the raw endpoint url into the plan row, got {plan_row:?}"
+    );
+}
+
 /// The canceled pill is sourced purely from `profile.usage` (populated at
 /// startup by `bootstrap_fetch`'s on-disk cache seed, see
 /// `usage::scheduler::try_seed_cache`), never a live fetch. A profile carrying
