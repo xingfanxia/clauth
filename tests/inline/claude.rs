@@ -1090,3 +1090,65 @@ fn a_rotating_pair_in_the_sidecar_never_engages_the_split() {
         "switches keep installing the rotating pair from credentials.json"
     );
 }
+
+/// Capturing a `setup-token` sidecar for the ACTIVE profile flips the install
+/// source from `credentials.json` to `session-token.json` while the live slot
+/// still holds the OLD symlink — classify rightly reads Diverged (the link no
+/// longer points at what a switch installs), but that state carries NOTHING
+/// unsaved: a clauth-owned symlink's content is a profile store by
+/// construction. `live_login_is_clauth_symlink` is the predicate the
+/// unsaved-credentials gates use to tell the two apart; without it every
+/// unattended switch fails "unsaved credentials" until its retry TTL and the
+/// TUI prompts about credentials that are fully saved.
+#[cfg(unix)]
+#[test]
+fn captured_sidecar_under_stale_live_link_is_diverged_but_not_unsaved() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("split".to_string(), None, None);
+    profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    // The pre-capture state: live symlink → the profile's rotating store.
+    let live = claude_credentials_path().expect("creds path");
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    let store = crate::profile::profile_dir("split")
+        .expect("dir")
+        .join("credentials.json");
+    std::os::unix::fs::symlink(&store, &live).expect("symlink live");
+    assert!(
+        matches!(
+            classify_credentials_link("split").expect("classify"),
+            LinkState::LinkedTo
+        ),
+        "before the capture the link points at the install source"
+    );
+
+    // The capture: a long-lived sidecar appears; the install source flips
+    // underneath the live link.
+    fill_session_token_by_hand("split", "oat-access");
+    assert!(
+        matches!(
+            classify_credentials_link("split").expect("classify"),
+            LinkState::Diverged
+        ),
+        "the stale link no longer points at what a switch installs"
+    );
+    assert!(
+        live_login_is_clauth_symlink(),
+        "…but a clauth-owned symlink holds nothing unsaved"
+    );
+
+    // A regular-file live login (a CC /login) is the state the gates exist
+    // for — the predicate must NOT claim that one.
+    fs::remove_file(&live).expect("drop link");
+    fs::write(
+        &live,
+        serde_json::to_vec(&creds("cc-relogin", Some("cc-rt"))).expect("ser"),
+    )
+    .expect("write regular live");
+    assert!(!live_login_is_clauth_symlink());
+
+    // Absent live slot: nothing there, certainly not a symlink.
+    fs::remove_file(&live).expect("drop file");
+    assert!(!live_login_is_clauth_symlink());
+}

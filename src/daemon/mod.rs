@@ -214,6 +214,7 @@ fn active_diverged_unsaved(active: &str) -> bool {
         Some(LinkState::Diverged)
     ) && !is_first_login(active).unwrap_or(false)
         && !live_credentials_are_shell()
+        && !crate::claude::live_login_is_clauth_symlink()
 }
 
 /// Owns the shared `Arc` stores (cloned into the scheduler) plus main-loop-only

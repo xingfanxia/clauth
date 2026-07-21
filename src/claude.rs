@@ -281,6 +281,26 @@ fn is_first_login_at(link: &Path, expected: &Path) -> bool {
         .is_some_and(|creds| creds.claude_ai_oauth.is_some())
 }
 
+/// True when the live `.credentials.json` is clauth's own symlink into a
+/// profile store. Whatever it points at, that login is saved by construction —
+/// the target IS a profile's store file — so the unsaved-credentials gates
+/// have nothing to protect and must not defer a switch (or raise the
+/// divergence prompt) on it. `Diverged` + symlink arises legitimately when a
+/// profile's INSTALL SOURCE changes under a live link: capturing a
+/// `setup-token` sidecar for the ACTIVE profile flips
+/// [`install_source_path`] from `credentials.json` to `session-token.json`
+/// while the old link still points at the former — a stale link the next
+/// switch re-points, not an unsaved login. Without this exemption every
+/// unattended switch fails "unsaved credentials; resolve in the TUI" until
+/// its retry TTL, and the TUI prompts about credentials that are fully
+/// saved (observed live 2026-07-21 on the macOS fork).
+pub(crate) fn live_login_is_clauth_symlink() -> bool {
+    claude_credentials_path()
+        .ok()
+        .and_then(|p| p.symlink_metadata().ok())
+        .is_some_and(|m| m.file_type().is_symlink())
+}
+
 pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
     let path = claude_credentials_path()?;
     if !path.exists() {
