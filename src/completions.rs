@@ -11,7 +11,7 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete which status daemon doctor sessions resume info completions" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete which status daemon doctor sessions resume info feed completions" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--base-url --api-key --model --new --codex --browser --setup-token --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
@@ -54,6 +54,7 @@ _clauth() {
             'status[print the usage / auto-switch snapshot]' \
             'daemon[run the headless scheduler (no TUI)]' \
             'doctor[read-only health check of the daemon + macOS wiring]' \
+            'feed[feed the session token from the usage chain (on|off)]' \
             'completions[print or install shell completions]'
             'sessions[list Claude Code sessions (add --json)]' \
             'resume[resume a session under a chosen profile]' \
@@ -103,6 +104,7 @@ complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning
 complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot"
 complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler (no TUI)"
 complete -c clauth -f -n __fish_is_first_token -a doctor -d "Read-only health check of the daemon + macOS wiring"
+complete -c clauth -f -n __fish_is_first_token -a feed -d "Feed the session token from the usage chain (on|off)"
 complete -c clauth -f -n __fish_is_first_token -a completions -d "Print or install shell completions"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login delete" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"

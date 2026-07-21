@@ -194,6 +194,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
@@ -230,6 +231,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
@@ -783,6 +785,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(ClaudeCredentials {

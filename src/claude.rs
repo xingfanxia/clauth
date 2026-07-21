@@ -168,6 +168,244 @@ pub(crate) fn write_session_token(name: &str, token: &str, now_ms: i64) -> Resul
     Ok(expires_at)
 }
 
+/// CLA-FEED: write `name`'s `session-token.json` from the usage chain's
+/// just-persisted OAuth fields — the access token as a Fable-capable bearer
+/// with the chain's REAL expiry, full scopes, and `subscriptionType`, and NO
+/// refresh token (the classifier stays [`SessionTokenStatus::LongLived`], so
+/// every split guard keeps working unmodified; sessions get nothing to rotate,
+/// the refresh chain stays clauth-private). The honest expiry is deliberate: a
+/// dead feed must LOOK dead on every surface (the CLA-SPLIT-3 display-gap
+/// lesson), never a far-future stamp over a dies-in-hours token.
+///
+/// Before the FIRST feed overwrites a genuine static mint, the mint is
+/// preserved at `session-token.static.json` ([`preserve_static_mint`]) so
+/// disabling the feed — or a terminally dead chain — can restore Sonnet-cap
+/// service instead of signing sessions out.
+pub(crate) fn feed_session_token(name: &str, chain: &crate::profile::OAuthToken) -> Result<()> {
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: chain.access_token.clone(),
+            refresh_token: None,
+            expires_at: chain.expires_at,
+            scopes: chain.scopes.clone(),
+            subscription_type: chain.subscription_type.clone(),
+        }),
+    };
+    let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize fed session token")?;
+    let path = profile_dir(name)?.join("session-token.json");
+    with_state_lock(|| {
+        preserve_static_mint(name)?;
+        atomic_write_600(&path, &bytes).context("write fed session-token.json")?;
+        Ok(())
+    })
+}
+
+/// Copy a genuine static mint aside to `session-token.static.json` before the
+/// feed first overwrites it. Idempotent: an existing backup is never replaced
+/// (the first preserved mint is the real one — later sidecar contents are fed
+/// values), and a sidecar that is absent or holds a fed/mis-filled value has
+/// no mint to preserve. Callers hold the state flock.
+fn preserve_static_mint(name: &str) -> Result<()> {
+    let dir = profile_dir(name)?;
+    let sidecar = dir.join("session-token.json");
+    let backup = dir.join("session-token.static.json");
+    if backup.exists() || !sidecar.exists() {
+        return Ok(());
+    }
+    // Only a long-lived sidecar that was NOT produced by the feed is a mint
+    // worth preserving. Fed sidecars carry the chain's `subscriptionType`;
+    // `write_session_token` mints never do — that asymmetry plus the scope
+    // list distinguishes them without a marker key (the sidecar shape is a
+    // wire contract with CC and ccsbar and stays unmarked).
+    let Ok(creds) = read_json_file::<ClaudeCredentials>(&sidecar) else {
+        return Ok(());
+    };
+    let Some(oauth) = creds.claude_ai_oauth.as_ref() else {
+        return Ok(());
+    };
+    if oauth.refresh_token.is_some() || oauth.subscription_type.is_some() {
+        return Ok(());
+    }
+    // Horizon check, the robust discriminator: a genuine mint is stamped ~1
+    // year out; a fed access token dies in hours. A stamp under 30 days (or a
+    // sidecar already expired) is not a mint worth preserving — backing up a
+    // dies-in-hours value would make a later restore install a dead token.
+    const MINT_HORIZON_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+    let now = crate::usage::now_ms() as i64;
+    if oauth
+        .expires_at
+        .is_some_and(|exp| exp < now + MINT_HORIZON_MS)
+    {
+        return Ok(());
+    }
+    let bytes = std::fs::read(&sidecar).context("read static mint for preservation")?;
+    atomic_write_600(&backup, bytes).context("write session-token.static.json")
+}
+
+/// CLA-FEED: capture a fresh mint into the sidecar AND stamp it as the static
+/// backup, in ONE state-flock section from the SAME serialized bytes — the
+/// re-mint path on a feed-enabled profile. A two-step (write sidecar, then
+/// read it back into the backup) leaves a window where a concurrent rotation
+/// feed replaces the mint with an hours-horizon token that then gets
+/// snapshotted as "the mint" (review round 1: the poisoned-degrade-backup
+/// TOCTOU). Returns the stamped expiry like [`write_session_token`].
+pub(crate) fn write_session_token_with_backup(name: &str, token: &str, now_ms: i64) -> Result<i64> {
+    let expires_at = now_ms + SETUP_TOKEN_ASSUMED_LIFETIME_MS;
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: token.to_string(),
+            refresh_token: None,
+            expires_at: Some(expires_at),
+            scopes: Some(SETUP_TOKEN_SCOPES.iter().map(|s| s.to_string()).collect()),
+            subscription_type: None,
+        }),
+    };
+    let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
+    let dir = profile_dir(name)?;
+    with_state_lock(|| {
+        atomic_write_600(&dir.join("session-token.json"), &bytes)
+            .context("write session-token.json")?;
+        atomic_write_600(&dir.join("session-token.static.json"), &bytes)
+            .context("write session-token.static.json")?;
+        Ok(())
+    })?;
+    Ok(expires_at)
+}
+
+/// CLA-FEED: heal a mis-filled sidecar on a FEED profile — quarantine the
+/// evidence (`~/.clauth/quarantine/…-<name>.session-token.json`), restore the
+/// preserved static mint over it. `Ok(true)` = healed; `Ok(false)` = no
+/// backup to restore (the caller keeps the disengaged-vanilla posture) OR the
+/// sidecar is not actually mis-filled (re-checked under the lock — a
+/// concurrent repair may have beaten us).
+pub(crate) fn heal_misfilled_sidecar(name: &str) -> Result<bool> {
+    let dir = profile_dir(name)?;
+    let sidecar = dir.join("session-token.json");
+    let backup = dir.join("session-token.static.json");
+    with_state_lock(|| {
+        if !backup.exists()
+            || !matches!(
+                session_token_status(name),
+                Some(SessionTokenStatus::NotLongLived)
+            )
+        {
+            return Ok(false);
+        }
+        quarantine_sidecar_locked(name, &sidecar)?;
+        let bytes = std::fs::read(&backup).context("read session-token.static.json")?;
+        atomic_write_600(&sidecar, bytes).context("restore session-token.json")?;
+        std::fs::remove_file(&backup).context("remove consumed static backup")?;
+        Ok(true)
+    })
+}
+
+/// CLA-FEED: quarantine a mis-filled sidecar and REMOVE it (leaving the
+/// sidecar absent) — the CLI `clauth feed <p> on` pre-clear, where overwriting
+/// is explicit operator intent but the evidence still goes to quarantine
+/// first. `Ok(true)` when a mis-fill was cleared.
+pub(crate) fn quarantine_misfilled_sidecar(name: &str) -> Result<bool> {
+    let dir = profile_dir(name)?;
+    let sidecar = dir.join("session-token.json");
+    with_state_lock(|| {
+        if !matches!(
+            session_token_status(name),
+            Some(SessionTokenStatus::NotLongLived)
+        ) {
+            return Ok(false);
+        }
+        quarantine_sidecar_locked(name, &sidecar)?;
+        std::fs::remove_file(&sidecar).context("remove mis-filled session-token.json")?;
+        Ok(true)
+    })
+}
+
+/// Copy the sidecar's bytes into the quarantine dir (same naming scheme as
+/// [`archive_live_credentials`], `.session-token.json` suffixed). Callers hold
+/// the state flock.
+fn quarantine_sidecar_locked(name: &str, sidecar: &Path) -> Result<()> {
+    let bytes = std::fs::read(sidecar).context("read mis-filled sidecar for quarantine")?;
+    let dir = crate::profile::clauth_dir()?.join("quarantine");
+    std::fs::create_dir_all(&dir).context("failed to create quarantine dir")?;
+    static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = QUARANTINE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dest = dir.join(format!(
+        "{}-{seq:04}-{name}.session-token.json",
+        crate::usage::now_ms()
+    ));
+    atomic_write_600(&dest, bytes).context("write quarantined sidecar")
+}
+
+/// CLA-FEED: best-effort arming at session start (`clauth start` resolves its
+/// credentials through [`install_source_path`], never `ensure_installable`) —
+/// a feed profile whose sidecar is absent or stale is fed from the
+/// DISK-loaded chain when comfortably live, so a session launched inside an
+/// arming window never copies the rotating pair (review round 1: the
+/// pinned-pair double-spend). Never touches a NotLongLived mis-fill, never
+/// spends a refresh, and never fails the caller — a feed hiccup must not
+/// block a session start (the vanilla fallback still works; the daemon heals
+/// the sidecar on its next rotation).
+pub(crate) fn arm_feed_from_disk(name: &str) {
+    const FEED_ARM_GRACE_MS: i64 = 30 * 60 * 1000;
+    let Ok(profile) = crate::profile::load_profile(name) else {
+        return;
+    };
+    if !profile.session_feed {
+        return;
+    }
+    let now = crate::usage::now_ms() as i64;
+    match session_token_status(name) {
+        // Mis-fill: evidence stays; NotLongLived semantics apply elsewhere.
+        Some(SessionTokenStatus::NotLongLived) => return,
+        // A comfortably live fed token (or a healthy mint) needs nothing.
+        Some(SessionTokenStatus::LongLived(exp))
+            if exp.is_none_or(|e| now + FEED_ARM_GRACE_MS < e) =>
+        {
+            return;
+        }
+        _ => {}
+    }
+    let Some(oauth) = profile
+        .credentials
+        .as_ref()
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+    else {
+        return;
+    };
+    if oauth
+        .expires_at
+        .is_none_or(|e| now + FEED_ARM_GRACE_MS >= e)
+    {
+        return; // chain itself stale — the daemon's guarded refresh will feed
+    }
+    // Serialize the read-and-restamp with rotations; a busy guard means a
+    // rotation is arming it right now.
+    let Ok(_guard) = crate::runtime::RotationGuard::acquire(name) else {
+        return;
+    };
+    if let Err(e) = feed_session_token(name, oauth) {
+        crate::logline::logline!("clauth: start-time feed arming for '{name}' failed: {e:#}");
+    }
+}
+
+/// Restore the preserved static mint over the fed sidecar (feed disabled, or
+/// the usage chain died terminally). `Ok(true)` when a backup existed and was
+/// restored; `Ok(false)` when there was nothing to restore (the sidecar is
+/// left as-is — a last fed token keeps serving until its real expiry).
+pub(crate) fn restore_static_mint(name: &str) -> Result<bool> {
+    let dir = profile_dir(name)?;
+    let backup = dir.join("session-token.static.json");
+    let sidecar = dir.join("session-token.json");
+    with_state_lock(|| {
+        if !backup.exists() {
+            return Ok(false);
+        }
+        let bytes = std::fs::read(&backup).context("read session-token.static.json")?;
+        atomic_write_600(&sidecar, bytes).context("restore session-token.json")?;
+        std::fs::remove_file(&backup).context("remove consumed static backup")?;
+        Ok(true)
+    })
+}
+
 /// The file a switch INSTALLS as the live login: the profile's
 /// `session-token.json` when present ([`has_session_token`]), else its
 /// `credentials.json` — which is exactly the pre-split behavior, so profiles

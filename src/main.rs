@@ -148,6 +148,7 @@ fn dispatch(args: &[String]) -> Result<()> {
             None => anyhow::bail!("usage: clauth delete <profile> [--yes] [--force]"),
         },
         [cmd, rest @ ..] if cmd == "fallback" => cmd_fallback(rest),
+        [cmd, rest @ ..] if cmd == "feed" => cmd_feed(rest),
         [cmd, rest @ ..] if cmd == "proxy" => cmd_proxy(rest),
         [cmd, ..] if cmd == "run" => anyhow::bail!(
             "`clauth run` isn't a command; for a headless delegate use \
@@ -222,6 +223,108 @@ fn peel_theme_flag(args: &[String]) -> (Option<tui::theme::Tier>, &[String]) {
 /// the matching chain, so this one surface edits BOTH chains). The daemon
 /// picks external `profiles.toml` edits up on its mtime watch, exactly like a
 /// hand edit; nothing here needs the socket.
+/// CLA-FEED: `clauth feed <profile> <on|off>` — feed the profile's session
+/// token from its clauth-private usage chain (sessions get full-scope,
+/// `subscriptionType`-stamped bearers → Fable-capable) or restore the static
+/// long-lived mint. See `docs/cla-feed/DESIGN.md`.
+fn cmd_feed(rest: &[String]) -> Result<()> {
+    const USAGE: &str = "usage: clauth feed <profile> <on|off>";
+    let [name, onoff] = rest else {
+        anyhow::bail!("{USAGE}");
+    };
+    let on = match onoff.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => anyhow::bail!("{USAGE}"),
+    };
+    let mut config = load_config()?;
+    let Some(canonical) = config.canonical_name(name) else {
+        anyhow::bail!("unknown profile '{name}'");
+    };
+    let Some(profile) = config.find(&canonical) else {
+        anyhow::bail!("unknown profile '{name}'");
+    };
+    if profile.is_codex() {
+        anyhow::bail!("'{canonical}' is a codex profile — the session feed is claude-only");
+    }
+
+    if !on {
+        // The whole disable (flag flip + mint restore) serializes on the
+        // profile's rotation guard: without it, a concurrent rotation that
+        // still sees feed=on can re-feed the sidecar AFTER the restore,
+        // leaving feed=off + an hours-horizon live credential + no backup
+        // (review round 1: the orphaned-backup sign-out).
+        let _guard = runtime::RotationGuard::acquire(&canonical)
+            .map_err(|_| anyhow::anyhow!("'{canonical}' rotation lock busy — retry in a moment"))?;
+        if let Some(profile) = config.find_mut(&canonical) {
+            profile.session_feed = false;
+            profile::save_profile(profile)?;
+        }
+        let is_active = config.is_active(&canonical);
+        if claude::restore_static_mint(&canonical)? {
+            println!("clauth: feed off for '{canonical}' — static long-lived mint restored.");
+            if is_active {
+                claude::force_link_profile_credentials(&canonical)?;
+                println!("clauth: reinstalled live (Keychain updated).");
+            }
+        } else {
+            println!(
+                "clauth: feed off for '{canonical}' — no static backup to restore; the last \
+                 fed token serves until its expiry. Re-mint with `clauth login {canonical} \
+                 --setup-token`."
+            );
+        }
+        return Ok(());
+    }
+
+    let Some(oauth) = profile
+        .credentials
+        .as_ref()
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+    else {
+        anyhow::bail!(
+            "'{canonical}' has no usage OAuth chain to feed from — `clauth login {canonical}` \
+             first"
+        );
+    };
+    let fable_capable = oauth
+        .scopes
+        .as_ref()
+        .is_some_and(|s| s.iter().any(|x| x == "user:profile"))
+        && oauth.subscription_type.is_some();
+    if !fable_capable {
+        println!(
+            "clauth: warning — '{canonical}''s chain is missing the user:profile scope or a \
+             subscriptionType stamp; fed tokens may not unlock plan-gated models. A fresh \
+             `clauth login {canonical}` browser sign-in fixes the mint."
+        );
+    }
+    // A mis-filled sidecar is pre-cleared here, where overwriting is explicit
+    // operator intent — the evidence still goes to quarantine first.
+    if claude::quarantine_misfilled_sidecar(&canonical)? {
+        println!(
+            "clauth: '{canonical}' had a mis-filled sidecar (rotating pair) — quarantined \
+             under ~/.clauth/quarantine/ before arming."
+        );
+    }
+    if let Some(profile) = config.find_mut(&canonical) {
+        profile.session_feed = true;
+        profile::save_profile(profile)?;
+    }
+    let is_active = config.is_active(&canonical);
+    let handle: profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+    oauth::arm_session_feed(&handle, &canonical, oauth::refresh_result)?;
+    println!("clauth: feed on for '{canonical}' — session token armed from the usage chain.");
+    if is_active {
+        claude::force_link_profile_credentials(&canonical)?;
+        println!("clauth: installed live (Keychain updated) — new sessions run on the fed token.");
+    } else {
+        println!("clauth: it installs on the next switch:  clauth {canonical}");
+    }
+    Ok(())
+}
+
 fn cmd_fallback(rest: &[String]) -> Result<()> {
     const USAGE: &str = "usage: clauth fallback list | add <profile> | remove <profile> | \
                          up <profile> | down <profile> | threshold <profile> <pct> | \
@@ -992,12 +1095,29 @@ fn cmd_login_setup_token(
         actions::set_profile_default_model(config, target, model)?;
     }
 
-    let expires_at = claude::write_session_token(target, &token, crate::usage::now_ms() as i64)?;
+    // CLA-FEED: on a feed-enabled profile the next rotation overwrites this
+    // mint with a fed value — capture the mint into the sidecar AND the
+    // degrade backup atomically (one flock section, same bytes; a two-step
+    // write-then-copy can snapshot a concurrent rotation's fed token as "the
+    // mint").
+    let feed_on = config.find(target).is_some_and(|p| p.session_feed);
+    let now = crate::usage::now_ms() as i64;
+    let expires_at = if feed_on {
+        claude::write_session_token_with_backup(target, &token, now)?
+    } else {
+        claude::write_session_token(target, &token, now)?
+    };
     let days = (expires_at - crate::usage::now_ms() as i64) / 86_400_000;
     println!(
         "clauth: long-lived token installed for '{target}' · assumed to expire in ~{days}d \
          (`claude setup-token` mints last about a year)."
     );
+    if feed_on {
+        println!(
+            "clauth: the session feed is on for '{target}' — this mint is preserved as the \
+             degrade fallback; rotations keep feeding the live token."
+        );
+    }
     println!(
         "clauth: it takes effect on the next switch:  clauth {target}{}",
         if exists {
@@ -1293,6 +1413,9 @@ fn print_help() {
          threshold <profile> <pct> | last-resort <profile> on|off\n                                  \
          edit the auto-switch chains; membership ops route by the\n                                  \
          profile's harness (claude chain vs codex chain)\n  \
+           clauth feed <profile> on|off    feed the profile's session token from its\n                                  \
+         clauth-private usage chain (full-scope bearers — plan-gated\n                                  \
+         models work in sessions) or restore the static long-lived mint\n  \
            clauth proxy [--port N]         run the codex injection proxy — point codex at\n                                  \
          it (clauth proxy --print-config) for true in-session codex\n                                  \
          account fallback: a mid-conversation 429 rotates to the next\n                                  \

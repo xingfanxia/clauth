@@ -318,6 +318,12 @@ pub(crate) fn build_status(
                 // credentials belong to. Absent in pre-CDX writers — readers
                 // default to "claude".
                 "harness": if p.is_codex() { "codex" } else { "claude" },
+                // Additive (CLA-FEED): the session-token feed — the sidecar's
+                // hours-scale countdown is routine maintenance while true
+                // (daemon re-stamps on rotation), a dying credential while
+                // false. Readers (ccsbar) key their token-row rendering off
+                // this so a fed token never displays as an expiring mint.
+                "session_feed": p.session_feed,
                 "provider": provider_label(p),
                 "base_url": p.base_url,
                 "tier": tier_label(p),

@@ -1576,3 +1576,78 @@ their own `--setup-token` on the active profile) and opened as PR
 (`fix/stale-sidecar-symlink-divergence`, 1237 tests green). #51/#55/#47
 needed no update: #51's head is fork main (auto-updated by today's pushes),
 #55 still awaits re-review, #47 unchanged.
+
+## 2026-07-21 (CLA-FEED-1) — daemon-fed session token: Fable-capable long-lived slot
+
+Why: the CLA-SPLIT static setup-token carries only `user:inference
+user:sessions:claude_code`, no `subscriptionType` — Claude Code's Fable 5
+gate refuses it ("requires usage credits"). AX's "前两天还可以" window was the
+mis-fill regression running vanilla (Fable + race deaths); the durable answer
+is CLA-FEED (AX picked option B, then the design simplified past dual-grant
+when the usage chain turned out to already BE a full-scope max mint — see
+docs/cla-feed/DESIGN.md).
+
+Design in one line: the daemon feeds session-token.json with the usage
+chain's current access token (real expiry, full scopes, subscriptionType, NO
+refresh token) — sessions get Fable-capable bearers, the classifier stays
+LongLived so every split guard is unchanged, the refresh chain never leaves
+clauth custody, and CC picks up re-stamps because it re-reads the Keychain
+per request (verified on-device 2026-07-07, oauth.rs rotation-coherence #1).
+
+Shipped (fork main):
+- `Profile.session_feed` (config.toml, default off) + `clauth feed <p> on|off`
+  (validates chain Fable-capability, arms immediately, installs live when
+  active; off restores the static mint).
+- Rotation hook in `apply_rotated_tokens_locked`'s CLA-SPLIT quiet branch:
+  feeds on EVERY rotation (parked included; absent sidecar arms; NotLongLived
+  mis-fill never overwritten); active profiles ship the fed sidecar through
+  the existing post-flock `mirror` Keychain write. State flock is re-entrant
+  per-thread (lock.rs:10) so the nested feed write is safe.
+- `ensure_installable` feed branches: fresh fed sidecar Ready; stale one
+  re-feeds from the stored chain (no spend) or the guarded refresh leg (its
+  persist re-feeds via the hook); absent sidecar arms instead of falling
+  through to the vanilla-pair install; terminal chain death restores the
+  static mint (Ready, degraded) else Broken. `has_live_session` bail exempted
+  for feed (fed sessions never advance the chain).
+- Static-mint preservation: first feed copies a genuine mint (no refresh, no
+  subscriptionType, ≥30d horizon) to `session-token.static.json`; re-mint on
+  a feed profile refreshes the backup; `restore_static_mint` round-trips.
+- Scheduler: `proactive_rotation_due` feed override (active feed profiles
+  rotate inside the lead window regardless of the global toggle or Keychain
+  mirror — off macOS the symlinked sidecar IS live).
+- Surfaces: status.json additive per-profile `session_feed`; TUI token row
+  renders `fed · refreshes in ~Nh` (accent) vs the mint's 30d warning ramp,
+  `feed stalled` DANGER when expired; help/completions.
+- Tests: 1554 green (feed gate truth table, rotation hook, mint
+  preservation/restore, config round-trip, proactive truth-table rows,
+  status key inventory). clippy 0, fmt clean.
+
+ccsbar (CLA-FEED-2, pending): render `session_feed` from status.json so a fed
+token shows as maintenance, not an expiring mint.
+
+CLA-FEED-1 review round (adversarial workflow, 3 opus dimensions × sonnet
+refuters; 10 findings, 9 confirmed, all fixed):
+- ensure_installable restructured: feed profiles dispatch to a single
+  `feed_install_gate` (vanilla gate restored byte-identical) — a mis-filled
+  sidecar HEALS (evidence quarantined to ~/.clauth/quarantine/, static mint
+  restored) when a backup exists; without one the disengaged-vanilla posture
+  stands, loudly (pinned by two new gate tests).
+- Pinned-pair double-spend closed twice: the scheduler's live-session bail
+  exemption now requires an ARMED sidecar (`session_feed &&
+  has_session_token`), and `clauth start` arms the feed from disk
+  (`arm_feed_from_disk` in canonical_credentials, guard-serialized,
+  best-effort) so a session can no longer be launched onto the rotating pair
+  inside an arming window.
+- TOCTOU class: `write_session_token_with_backup` stamps mint+backup from one
+  serialized byte buffer in one flock section (re-mint path; replaces the
+  read-back `refresh_static_backup`); `feed_from_stored_chain` takes the
+  RotationGuard as witness; `clauth feed off` (flag flip + mint restore)
+  serializes under the guard.
+- `feed_install_gate` refuses to spend when a live session holds an un-armed
+  profile (Transient, actionable message); `arm_session_feed` reports arming
+  failure instead of a false OK when the sidecar didn't arm.
+- Keychain mirror hardening staged: refresh-none content belt on the fed
+  mirror; absent-sidecar feed profiles never ship the pair (NotLongLived
+  mis-fills deliberately keep the vanilla mirror — that's what keeps CC alive
+  while disengaged, CLA-SPLIT-3).
+Post-fix gate: 1557 tests green, clippy 0, fmt clean.

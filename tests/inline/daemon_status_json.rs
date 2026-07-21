@@ -74,6 +74,7 @@ fn build_status_top_level_shape_and_active() {
             "name",
             "next_refresh_at",
             "provider",
+            "session_feed",
             "stale",
             "third_party",
             "tier",

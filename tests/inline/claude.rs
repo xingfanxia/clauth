@@ -1459,3 +1459,221 @@ fn repaired_sidecar_under_stale_live_link_is_diverged_but_not_unsaved() {
     fs::remove_file(&live).expect("drop file");
     assert!(!live_login_is_clauth_symlink());
 }
+
+// ── CLA-FEED: feed writer + static-mint preservation primitives ──────────────
+
+/// The fed sidecar carries the chain's access token, real expiry, scopes, and
+/// subscriptionType — and NEVER a refresh token, so the classifier stays
+/// LongLived and every split guard keeps working unmodified.
+#[test]
+fn feed_session_token_writes_a_refreshless_long_lived_shape() {
+    let _home = HomeSandbox::new();
+    let name = "feed-shape";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let exp = crate::usage::now_ms() as i64 + 8 * 3_600_000;
+    feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-chain".to_string(),
+            refresh_token: Some("rt-chain".to_string()),
+            expires_at: Some(exp),
+            scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let status = session_token_status(name).expect("sidecar");
+    assert_eq!(status, SessionTokenStatus::LongLived(Some(exp)));
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let creds: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    let oauth = creds.claude_ai_oauth.expect("oauth");
+    assert_eq!(oauth.access_token, "at-chain");
+    assert!(
+        oauth.refresh_token.is_none(),
+        "the pair never reaches the sidecar"
+    );
+    assert_eq!(oauth.subscription_type.as_deref(), Some("max"));
+    assert_eq!(
+        oauth.scopes.as_deref(),
+        Some(&["user:profile".to_string(), "user:inference".to_string()][..])
+    );
+}
+
+/// First feed preserves a genuine mint exactly once; later feeds leave the
+/// backup alone, and a fed (hours-horizon) sidecar is never mistaken for one.
+#[test]
+fn first_feed_preserves_the_mint_once_and_only_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "feed-preserve";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
+    let fed = |token: &str| OAuthToken {
+        access_token: token.to_string(),
+        refresh_token: None,
+        expires_at: Some(now + 8 * 3_600_000),
+        scopes: None,
+        subscription_type: Some("max".into()),
+    };
+    feed_session_token(name, &fed("at-1")).expect("feed 1");
+    feed_session_token(name, &fed("at-2")).expect("feed 2");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(dir.join("session-token.static.json")).expect("backup exists"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-genuine-mint-value-1234567890"),
+        "the backup is the ORIGINAL mint, not a fed value"
+    );
+
+    // A fed sidecar with the backup consumed is never re-preserved as a mint
+    // (subscriptionType + hours horizon both disqualify it).
+    std::fs::remove_file(dir.join("session-token.static.json")).expect("consume");
+    feed_session_token(name, &fed("at-3")).expect("feed 3");
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "a fed value must never become the degrade fallback"
+    );
+}
+
+/// Restore round-trip: the mint comes back byte-identical, the backup is
+/// consumed, and a second restore is a no-op `false`.
+#[test]
+fn restore_static_mint_round_trip() {
+    let _home = HomeSandbox::new();
+    let name = "feed-restore";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let mint_bytes = std::fs::read(dir.join("session-token.json")).expect("mint bytes");
+    feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    assert!(restore_static_mint(name).expect("restore"));
+    assert_eq!(
+        std::fs::read(dir.join("session-token.json")).expect("sidecar"),
+        mint_bytes,
+        "mint restored byte-identical"
+    );
+    assert!(
+        !restore_static_mint(name).expect("second restore"),
+        "backup consumed"
+    );
+}
+
+/// `write_session_token_with_backup` stamps the fresh mint into the sidecar
+/// AND the degrade backup from the same bytes (one flock section — the
+/// re-mint-on-a-feed-profile path, immune to a concurrent rotation feed
+/// landing between a write and a read-back).
+#[test]
+fn write_session_token_with_backup_stamps_both_from_the_same_mint() {
+    let _home = HomeSandbox::new();
+    let name = "feed-remint";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint 1");
+    feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed preserves mint 1");
+    write_session_token_with_backup(name, "sk-ant-oat01-fresher-mint-value-0987654321", now)
+        .expect("re-mint");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let sidecar = std::fs::read(dir.join("session-token.json")).expect("sidecar");
+    let backup = std::fs::read(dir.join("session-token.static.json")).expect("backup");
+    assert_eq!(sidecar, backup, "one mint, two byte-identical copies");
+    let parsed: ClaudeCredentials = serde_json::from_slice(&backup).expect("parse");
+    assert_eq!(
+        parsed.access_token(),
+        Some("sk-ant-oat01-fresher-mint-value-0987654321"),
+        "the FRESH mint is the degrade fallback now"
+    );
+}
+
+/// A feed profile's mis-filled sidecar heals when a backup exists: evidence
+/// lands in quarantine, the mint comes back, the backup is consumed. Without
+/// a backup nothing is touched (`Ok(false)` — the disengaged-vanilla posture).
+#[test]
+fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "feed-heal";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let mint_bytes = std::fs::read(dir.join("session-token.json")).expect("mint bytes");
+    feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed preserves mint");
+    // Something scribbles a rotating pair into the sidecar (the mis-fill).
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("at-misfill", Some("rt-misfill"))).expect("ser"),
+    )
+    .expect("misfill");
+    assert!(heal_misfilled_sidecar(name).expect("heal"));
+    assert_eq!(
+        std::fs::read(dir.join("session-token.json")).expect("sidecar"),
+        mint_bytes,
+        "mint restored"
+    );
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "backup consumed"
+    );
+    let quarantine = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("quarantine");
+    let quarantined = std::fs::read_dir(&quarantine)
+        .expect("quarantine dir")
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with(&format!("{name}.session-token.json"))
+        });
+    assert!(quarantined, "mis-fill evidence preserved in quarantine");
+
+    // Second mis-fill, no backup left: nothing healed, nothing touched.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("at-misfill-2", Some("rt-misfill-2"))).expect("ser"),
+    )
+    .expect("misfill 2");
+    assert!(!heal_misfilled_sidecar(name).expect("no-backup heal"));
+    assert!(
+        matches!(
+            session_token_status(name),
+            Some(SessionTokenStatus::NotLongLived)
+        ),
+        "mis-fill left in place without a backup"
+    );
+}

@@ -834,6 +834,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         bell_threshold: None,
         credentials: Some(creds.clone()),
@@ -1498,4 +1499,23 @@ fn burn_tunables_round_trip_and_omit_when_unset() {
         !off.contains("burn_switch_floor_pct") && !off.contains("burn_horizon_cap_ms"),
         "unset burn tunables must be omitted, got:\n{off}"
     );
+}
+
+/// CLA-FEED: `session_feed` round-trips through config.toml — `true` renders
+/// an explicit key, off renders the commented example (absent = false).
+#[test]
+fn session_feed_flag_round_trips_through_config_toml() {
+    let _home = HomeSandbox::new();
+    let name = "feed-toml";
+    let mut profile = Profile::new(name.to_string(), None, None);
+    profile.session_feed = true;
+    save_profile(&profile).expect("save");
+    let loaded = load_profile(name).expect("load");
+    assert!(loaded.session_feed, "explicit true survives the round-trip");
+
+    let mut profile = Profile::new("feed-toml-off".to_string(), None, None);
+    profile.session_feed = false;
+    save_profile(&profile).expect("save");
+    let loaded = load_profile("feed-toml-off").expect("load");
+    assert!(!loaded.session_feed, "absent key reads false");
 }

@@ -2395,6 +2395,7 @@ fn preemptive_rotation_is_opt_in_and_off_by_default() {
     assert!(!crate::profile::AppState::default().preemptive_rotation);
     assert!(!super::proactive_rotation_due(
         false,
+        false,
         true,
         false,
         true,
@@ -2412,6 +2413,7 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     // from ever expiring under the running claude.
     assert!(super::proactive_rotation_due(
         true,
+        false,
         true,
         false,
         true,
@@ -2421,6 +2423,7 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     ));
     assert!(super::proactive_rotation_due(
         true,
+        false,
         true,
         false,
         true,
@@ -2431,6 +2434,7 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     // Beyond the lead window → plain poll; nothing at stake yet.
     assert!(!super::proactive_rotation_due(
         true,
+        false,
         true,
         false,
         true,
@@ -2465,6 +2469,7 @@ fn proactive_rotation_requires_active_and_keychain() {
         true,
         false,
         false,
+        false,
         true,
         Some(0),
         10_000,
@@ -2474,6 +2479,7 @@ fn proactive_rotation_requires_active_and_keychain() {
     // the live credential — there is no second chain to race.
     assert!(!super::proactive_rotation_due(
         true,
+        false,
         true,
         false,
         false,
@@ -2491,6 +2497,7 @@ fn proactive_rotation_never_fires_while_the_active_link_diverged() {
     // `oauth::rotation_candidates`. Everything else here says "rotate now".
     assert!(!super::proactive_rotation_due(
         true,
+        false,
         true,
         true,
         true,
@@ -2504,7 +2511,65 @@ fn proactive_rotation_never_fires_while_the_active_link_diverged() {
 fn proactive_rotation_never_fires_on_unknown_expiry() {
     // Never spend a single-use refresh on a token whose expiry we can't prove.
     assert!(!super::proactive_rotation_due(
-        true, true, false, true, None, 10_000, 90_000
+        true, false, true, false, true, None, 10_000, 90_000
+    ));
+    // CLA-FEED: the feed override does NOT relax this — an unknown expiry
+    // still never spends a single-use refresh proactively.
+    assert!(!super::proactive_rotation_due(
+        false, true, true, false, true, None, 10_000, 90_000
+    ));
+}
+
+#[test]
+fn session_feed_forces_the_preemptive_leg() {
+    let interval = 90_000u64;
+    let lead = super::active_rotate_lead_ms(interval);
+    // Toggle off + feed on → rotates inside the lead window (the fed session
+    // token has a live claude behind it), even without the Keychain mirror
+    // (off macOS the fed sidecar IS the live credential via the symlink).
+    assert!(super::proactive_rotation_due(
+        false,
+        true,
+        true,
+        false,
+        false,
+        Some(10_000 + lead),
+        10_000,
+        interval
+    ));
+    // Parked profiles never rotate proactively, feed or not.
+    assert!(!super::proactive_rotation_due(
+        false,
+        true,
+        false,
+        false,
+        true,
+        Some(10_000),
+        10_000,
+        interval
+    ));
+    // A diverged live login still stands the feed down (never spend under a
+    // login clauth doesn't own).
+    assert!(!super::proactive_rotation_due(
+        false,
+        true,
+        true,
+        true,
+        true,
+        Some(10_000),
+        10_000,
+        interval
+    ));
+    // Feed off + toggle off stays inert outside the feed (stock behavior).
+    assert!(!super::proactive_rotation_due(
+        false,
+        false,
+        true,
+        false,
+        true,
+        Some(10_000),
+        10_000,
+        interval
     ));
 }
 

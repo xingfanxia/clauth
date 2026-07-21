@@ -475,6 +475,12 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
 }
 
 fn canonical_credentials(name: &str) -> Result<PathBuf> {
+    // CLA-FEED: arm a feed profile's sidecar BEFORE resolving the source —
+    // a session launched inside an arming window (flag on, sidecar not yet
+    // fed) would otherwise copy the rotating pair, and the daemon's later
+    // rotations (feed-exempted from the live-session bail only for ARMED
+    // sidecars) could still race a hand-armed state. Best-effort by design.
+    crate::claude::arm_feed_from_disk(name);
     // CLA-SPLIT: a `clauth start` session runs on what a switch would install —
     // the static session token when the profile has one. The rotating usage
     // pair in `credentials.json` must never be handed to a session (it would

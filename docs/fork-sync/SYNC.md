@@ -66,6 +66,15 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   RESCUE-1 dead-live-login reclaim, CLA-SPLIT hardening on top of merged #53
   (genuinely-long-lived engagement gate, force-snapshot guard), auth-broken
   quarantine surfaces, `--new` / `--codex` / `--browser` login flags.
+- **CLA-FEED session-token feed** (`docs/cla-feed/DESIGN.md`): per-profile
+  `session_feed` flag; the daemon re-stamps `session-token.json` from the
+  usage chain's access token on every rotation (full scopes +
+  `subscriptionType`, no refresh token → plan-gated models work in sessions
+  while the refresh chain stays clauth-private); switch-in gate re-feeds or
+  arms (`ensure_installable` feed branches), terminal chain death restores
+  the preserved static mint (`session-token.static.json`); `clauth feed
+  <p> on|off`; status.json additive `session_feed` key; scheduler
+  proactive-rotation feed override.
 - **Sessions/settings gating**: codex-harness profiles are invisible to
   upstream's settings sync and claude session machinery.
 

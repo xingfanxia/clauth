@@ -25,6 +25,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         check_weekly: true,
         check_scoped: true,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         bell_threshold: None,
         credentials: None,
