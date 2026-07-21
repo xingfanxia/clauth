@@ -87,7 +87,7 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                         };
                         // A member still sits in `fallback_chain` on disk while
                         // disabled (only the walk skips it) — render it dimmed
-                        // + a `[disabled]` chip instead of the usual blocked-
+                        // + a `[ disabled ]` chip instead of the usual blocked-
                         // reason marker, so it reads as excluded rather than
                         // merely blocked. It can never be `is_active`, so dim
                         // always wins over `name_color`.
