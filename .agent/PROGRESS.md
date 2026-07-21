@@ -1555,3 +1555,15 @@ acct=xingfanxia svce="Claude Code-credentials" (an acct=unknown shell from
 05-31 is a dead item — ignore it in future forensics); the live credentials
 file is a clauth-owned symlink, so "live file == stored" is definitional,
 not evidence of a write.
+
+CLA-SPLIT-3 addendum (60f99ea): the sidecar repair itself exposed a second
+predicate deadlock — with the install source flipped to session-token.json,
+the STALE live symlink (→ credentials.json) classifies Diverged, the
+unsaved-credentials gates routed the switch through archive_live_credentials,
+and the archive refuses symlinks by design → every switch failed "nothing
+unsaved to archive" and deferred forever (AX's ccsbar switch to ax-backup
+hung live). Fix: live_login_is_clauth_symlink() exempts clauth-owned
+symlinks in both unsaved gates (daemon + TUI) — a symlink's content is a
+profile store by construction, nothing unsaved; regular-file live logins
+(a real CC /login) archive exactly as before. Regression test pins the
+Diverged-but-not-unsaved transition state. 1539 tests, deployed.
