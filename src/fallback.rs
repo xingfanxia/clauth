@@ -1385,7 +1385,12 @@ fn fully_clear_target(config: &AppConfig, weekly_pct: f64) -> Option<String> {
 /// (has recovered headroom after switch-off-all). Returns the member name.
 /// Safe to call without holding the config lock — reads from [`UsageStore`].
 /// `kick_rejected` members are never "recovered": their idle-looking usage is
-/// exactly the shape a messages-limiter rejection freezes them in.
+/// exactly the shape a messages-limiter rejection freezes them in. A canceled
+/// member is the same twin of that bug `next_auto_switch_target_with_usage`
+/// already guards via `is_canceled_from_usage`: `/v1/messages` 403s no matter
+/// how idle its cached window reads, so it never recovers either. Auth-broken
+/// members carry no plan/usage marker to catch here — the caller filters them
+/// out of `chain` before this runs (mirrors the `is_disabled` filter).
 pub(crate) fn find_recovered_member(
     chain: &[ChainMember],
     store: &UsageStore,
@@ -1401,9 +1406,12 @@ pub(crate) fn find_recovered_member(
         // An absent entry (never fetched) stays undecidable. A weekly-dead
         // member NEVER recovers — its 5h window lapsing every few hours is
         // exactly what made it look reborn while the 7d cap still blocks it.
+        // Nor does a canceled one — its plan flips to `claude_free` while the
+        // cached 5h window keeps reading idle.
         match store.lock() {
             Ok(s) => s.get(&member.name).map(|info| {
-                !weekly_blocked_info(info, now, member.weekly_line)
+                !info.plan.as_ref().is_some_and(|p| p.is_canceled())
+                    && !weekly_blocked_info(info, now, member.weekly_line)
                     && (!require_scoped_clear
                         || !member.check_scoped
                         || !scoped_weekly_blocked_info(info, now, member.scoped_line))

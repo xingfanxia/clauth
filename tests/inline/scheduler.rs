@@ -3712,6 +3712,93 @@ fn scan_recovery_never_relinks_to_a_disabled_member() {
     );
 }
 
+/// Same recovered-usage shape as the happy path, but the member's plan reads
+/// canceled — `/v1/messages` 403s no matter how idle its cached 5h window
+/// looks, so it must never be a relink target (mirrors the disabled/kick-
+/// rejected exclusions above; twin of the `fully_clear_target` canceled fix
+/// on the target-side walk).
+#[test]
+fn scan_recovery_never_relinks_to_a_canceled_member() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::usage::{PlanInfo, PlanTier};
+
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                subscription_status: Some("canceled".to_string()),
+            }),
+            ..Default::default()
+        },
+    )])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_recovery(
+        &recovery_config(None, &["b"]),
+        &store,
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a canceled member must never be relinked by the recovery scan"
+    );
+}
+
+/// Same recovered-usage shape as the happy path, but the member is flagged
+/// auth-broken (AUTH-1 quarantine) — its store entry is frozen at the last
+/// successful read while every refresh is permanently rejected, so it must
+/// never be a relink target (mirrors the disabled exclusion above).
+#[test]
+fn scan_recovery_never_relinks_to_an_auth_broken_member() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["b".into()],
+            auth_broken: vec!["b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("b".to_string(), None, None)],
+    }));
+
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_recovery(
+        &config,
+        &recoverable_store(),
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "an auth-broken member must never be relinked by the recovery scan"
+    );
+}
+
 /// `spawn_refresher`'s kick-block seed must run on the CALLING thread, not
 /// inside the spawned tick worker: nothing joins that worker, so a home-
 /// derived path resolved on it could outlive a test's `HOME_OVERRIDE` and read

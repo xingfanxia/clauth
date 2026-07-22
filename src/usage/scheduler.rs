@@ -2601,11 +2601,13 @@ fn scan_recovery(
         cfg.state
             .fallback_chain
             .iter()
-            // A disabled member is not a recovery target — see the matching
-            // filter in `fallback::snapshot_chain`.
+            // A disabled or auth-broken member is not a recovery target — see
+            // the matching filters in `fallback::snapshot_chain` /
+            // `fallback::fully_clear_target`.
             .filter(|name| {
                 !cfg.find(name)
                     .is_some_and(crate::profile::Profile::is_disabled)
+                    && !cfg.is_auth_broken(name)
             })
             .map(|name| {
                 let profile = cfg.find(name);
