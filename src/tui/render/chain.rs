@@ -736,7 +736,7 @@ fn detail_row(
     editing: Option<&InputState>,
 ) -> Line<'static> {
     let arrow = if editing.is_some() {
-        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent())
+        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
         Span::styled("❯ ", theme::accent().bold())
     } else {
@@ -817,7 +817,11 @@ fn detail_row(
                             theme::accent()
                         };
                         spans.push(Span::styled(format!("{v:.0}%"), value_style));
-                        spans.push(default_reminder(format!("{weekly_default:.0}%")));
+                        // Mirrors `rotate at`: only remind of the default once the
+                        // value actually differs from it (else it's noise).
+                        if (v - weekly_default).abs() > f64::EPSILON {
+                            spans.push(default_reminder(format!("{weekly_default:.0}%")));
+                        }
                     }
                     // Unset follows the chain-wide line — show that value, but
                     // faint, so a member-set figure stays visually distinct.

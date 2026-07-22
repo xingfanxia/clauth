@@ -629,7 +629,7 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
         Style::default().fg(theme::text_color())
     };
     let gutter = if focused {
-        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent())
+        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else {
         Span::raw("  ")
     };

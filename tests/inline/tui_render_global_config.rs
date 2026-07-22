@@ -77,6 +77,34 @@ fn every_blurred_row_starts_its_value_at_the_shared_column() {
     }
 }
 
+// Bug 6 sibling: the selection caret pairs ACCENT + bold in every other card
+// (chain.rs, overview.rs, panes.rs) — this card rendered it accent-only.
+#[test]
+fn selection_caret_is_bold_like_every_other_card() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let line = detail_row(
+        GlobalConfigRow::Theme,
+        true,
+        toggles(),
+        60_000,
+        95.0,
+        98.0,
+        60_000,
+        None,
+        None,
+    );
+    let caret = &line.spans[0];
+    assert!(
+        caret.style.add_modifier.contains(Modifier::BOLD),
+        "selection caret must be bold: {caret:?}"
+    );
+    assert_eq!(
+        caret.style.fg,
+        theme::accent().fg,
+        "selection caret stays accent"
+    );
+}
+
 /// The regression the screenshot caught: a key exactly `KEY_W` chars wide (now
 /// `extra usage spent`) must not let a `saturating_sub(..).max(1)` pad widen its
 /// block by a cell and push the value column right.

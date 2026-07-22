@@ -1053,3 +1053,80 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
         "{gated:?}"
     );
 }
+
+// `weekly at`'s "default: N%" reminder must mirror `rotate at`: render only
+// when the override actually differs from the chain default, not
+// unconditionally (it used to always render once a value was set).
+#[test]
+fn weekly_at_default_reminder_only_shows_when_value_differs_from_default() {
+    let row_texts = |p: Profile| -> Vec<String> {
+        let cfg = config_with(vec![p], Some("a"), vec!["a"]);
+        member_detail(&cfg, "a", true, 1, false, None, None, None, 80, None)
+            .0
+            .iter()
+            .map(line_text)
+            .collect()
+    };
+
+    // Chain-wide default is 98% (`DEFAULT_WEEKLY_SWITCH_PCT`); an override set
+    // to exactly that value must not carry the reminder.
+    let mut at_default = profile("a", 95.0, 20.0, 3600);
+    at_default.weekly_threshold = Some(98.0);
+    let lines = row_texts(at_default);
+    let row = lines
+        .iter()
+        .find(|t| t.contains("weekly at"))
+        .expect("weekly at row renders");
+    assert!(row.contains("98%"), "{row}");
+    assert!(
+        !row.contains("default:"),
+        "no reminder when the override equals the chain default: {row}"
+    );
+
+    let mut off_default = profile("a", 95.0, 20.0, 3600);
+    off_default.weekly_threshold = Some(90.0);
+    let lines = row_texts(off_default);
+    let row = lines
+        .iter()
+        .find(|t| t.contains("weekly at"))
+        .expect("weekly at row renders");
+    assert!(
+        row.contains("default:"),
+        "reminder renders when the override differs from the chain default: {row}"
+    );
+}
+
+// Bug 6 class fix: the edit-mode glyph pairs ACCENT + bold, matching the
+// selection caret `❯` — this card rendered it accent-only.
+#[test]
+fn edit_glyph_is_bold_like_the_selection_caret() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let input = InputState::new("80");
+    let line = detail_row(
+        FallbackRow::Threshold,
+        true,
+        80.0,
+        None,
+        98.0,
+        true,
+        true,
+        false,
+        0.0,
+        false,
+        false,
+        Some(&input),
+    );
+    let glyph = &line.spans[0];
+    assert!(
+        glyph
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD),
+        "edit glyph must be bold: {glyph:?}"
+    );
+    assert_eq!(
+        glyph.style.fg,
+        theme::accent().fg,
+        "edit glyph stays accent"
+    );
+}

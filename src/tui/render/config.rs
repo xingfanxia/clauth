@@ -505,9 +505,9 @@ fn detail_row(
     input: &InputState,
 ) -> Line<'static> {
     let arrow = if editing {
-        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent())
+        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
-        Span::styled("❯ ", theme::accent())
+        Span::styled("❯ ", theme::accent().bold())
     } else {
         Span::raw("  ")
     };

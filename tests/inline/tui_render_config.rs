@@ -58,6 +58,47 @@ fn model_cycle_appends_a_custom_id_without_brackets() {
     );
 }
 
+// The edit-mode `✎` glyph pairs `ACCENT + bold`, matching the cloudy-tui
+// canonical pairing shared with the selection caret `❯` — this card rendered
+// it accent-only (class bug, fixed at all four edit-glyph render sites).
+#[test]
+fn edit_glyph_is_bold_like_the_selection_caret() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let snap = Snap::blank("acct");
+    let input = InputState::new("x");
+    let editing = detail_row(ConfigRow::Name, true, true, None, &snap, &input);
+    let glyph = &editing.spans[0];
+    assert!(
+        glyph.style.add_modifier.contains(Modifier::BOLD),
+        "edit glyph must be bold: {glyph:?}"
+    );
+    assert_eq!(
+        glyph.style.fg,
+        theme::accent().fg,
+        "edit glyph stays accent"
+    );
+}
+
+// The selection caret pairs ACCENT + bold in every other card (chain.rs,
+// overview.rs, panes.rs) — this card rendered it accent-only.
+#[test]
+fn selection_caret_is_bold_like_every_other_card() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let snap = Snap::blank("acct");
+    let input = InputState::new("x");
+    let line = detail_row(ConfigRow::Name, true, false, None, &snap, &input);
+    let caret = &line.spans[0];
+    assert!(
+        caret.style.add_modifier.contains(Modifier::BOLD),
+        "selection caret must be bold: {caret:?}"
+    );
+    assert_eq!(
+        caret.style.fg,
+        theme::accent().fg,
+        "selection caret stays accent"
+    );
+}
+
 /// The pane's color-identity action rows take the `+ new`-row promotion: bold
 /// when the cursor is on it, and the accent (or success) color held throughout,
 /// since the color is the row's identity and never promotes to `TEXT`. Before
