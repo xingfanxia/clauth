@@ -27,7 +27,8 @@ static STAMP: AtomicBool = AtomicBool::new(false);
 static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Turn on timestamp prefixes for [`logline!`] — called once at the top of
-/// `daemon::serve()` (covering the lock-holder AND the standing-by path).
+/// `daemon::serve()`, so the lock-holder, the standing-by instance, and a
+/// redundant one that exits immediately all say so on stderr, TTY or not.
 /// Sticky for the process lifetime; never flipped back.
 pub(crate) fn enable_timestamps() {
     STAMP.store(true, Ordering::Relaxed);

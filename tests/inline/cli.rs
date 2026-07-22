@@ -466,6 +466,33 @@ fn dispatch_login_model_flag_without_value_errors_with_usage() {
     );
 }
 
+/// `clauth daemon`'s flag surface, both shapes that never start a scheduler:
+/// an unknown flag is a usage error (exit 2), and `--status` with no daemon up
+/// is a plain failure (exit 1) so a spawner can branch on the code alone.
+#[test]
+fn dispatch_daemon_rejects_an_unknown_flag_and_reports_an_absent_daemon() {
+    let args = ["daemon".to_string(), "--nope".to_string()];
+    let err = dispatch(&args).expect_err("an unknown daemon flag must error");
+    assert!(
+        err.to_string().contains("usage"),
+        "error must be a usage message, got: {err}"
+    );
+    assert_eq!(crate::exit_code(Err(err)), 2, "bad flags exit 2");
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let args = ["daemon".to_string(), "--status".to_string()];
+    let err = dispatch(&args).expect_err("no daemon is running in the sandbox");
+    assert!(
+        err.to_string().contains("no clauth daemon is running"),
+        "the failure must name the absence, not some incidental error: {err}"
+    );
+    assert_eq!(
+        crate::exit_code(Err(err)),
+        1,
+        "an absent daemon exits 1, not the usage code"
+    );
+}
+
 // ── login_route: `clauth login <existing>` re-authenticates instead of bailing ──
 
 fn config_with(names: &[&str]) -> crate::profile::AppConfig {

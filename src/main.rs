@@ -174,7 +174,14 @@ fn dispatch(args: &[String]) -> Result<()> {
         )),
         [cmd, target] if cmd == "info" => sessions_cli::run_info(target),
         [cmd, ..] if cmd == "info" => Err(usage_error("usage: clauth info <id|latest>")),
-        [cmd] if cmd == "daemon" => daemon::serve(),
+        [cmd] if cmd == "daemon" => daemon::serve(daemon::Standby::Wait),
+        [cmd, flag] if cmd == "daemon" && flag == "--no-standby" => {
+            daemon::serve(daemon::Standby::Never)
+        }
+        [cmd, flag] if cmd == "daemon" && flag == "--status" => daemon::status_probe(),
+        [cmd, ..] if cmd == "daemon" => {
+            Err(usage_error("usage: clauth daemon [--no-standby|--status]"))
+        }
         [cmd, rest @ ..] if cmd == "status" => match parse_status_args(rest) {
             Some(include_disabled) => daemon::status_oneshot(include_disabled),
             None => anyhow::bail!("usage: clauth status --json [--all|--disabled]"),
@@ -1026,8 +1033,16 @@ fn print_help() {
          defaulting to the session's last-ran profile; --profile forces)\n  \
            clauth info <id|latest>         print the resume command, workspace, and\n                                  \
          on-disk storage path for a session (never launches)\n  \
-           clauth daemon                   run the headless scheduler with no TUI: refresh\n                                  \
-         usage, auto-switch on exhaustion, and write ~/.clauth/status.json\n  \
+           clauth daemon [--no-standby|--status]\n                                  \
+         run the headless scheduler with no TUI: refresh usage,\n                                  \
+         auto-switch on exhaustion, and write ~/.clauth/status.json.\n                                  \
+         With one already running a second instance stands by and\n                                  \
+         takes over when it exits; any further one exits at once.\n                                  \
+         --no-standby never stands by, for a spawner that fires\n                                  \
+         repeatedly (not for a supervisor unit: an instance that\n                                  \
+         loses the race exits 0 and is never restarted).\n                                  \
+         --status prints the running daemon, or exits 1 with no\n                                  \
+         output when none is running\n  \
            clauth status --json [--all|--disabled]\n                                  \
          print the current usage / auto-switch snapshot as JSON (same shape\n                                  \
          the daemon writes); --all (or --disabled) also lists disabled\n                                  \

@@ -18,6 +18,7 @@ mod status_json;
 mod tick;
 mod types;
 
+use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header dot's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
 pub(crate) use probe::{DaemonHealth, FetchLease, daemon_health};
@@ -61,6 +62,9 @@ const TICK: Duration = Duration::from_secs(1);
 const LOG_ROTATE_EVERY_TICKS: u64 = 300;
 const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "clauthd.lock";
+/// The standby slot's flock (#57). A peer of [`LOCK_FILE`]; held by the single
+/// instance allowed to park on the singleton lock. See [`probe::Claim`].
+const STANDBY_LOCK_FILE: &str = "clauthd-standby.lock";
 /// The single-fetcher lease file (#27). A peer of [`LOCK_FILE`] in `~/.clauth`,
 /// held for life by whichever instance (daemon or a TUI) is the current usage
 /// fetcher. See [`FetchLease`](probe::FetchLease).
@@ -114,41 +118,58 @@ fn migrate_clauth_perms_700(dir: &std::path::Path) {
     crate::profile::enforce_clauth_perms(dir);
 }
 
+/// Whether a `clauth daemon` that loses the singleton race parks in the standby
+/// slot or exits on the spot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Standby {
+    /// The default. A supervisor's instance takes over the moment a manually run
+    /// one exits, which is the only reason parking exists.
+    Wait,
+    /// `--no-standby`, for a spawner that fires repeatedly and only wants a
+    /// daemon to exist. NOT for a supervisor unit: a launchd
+    /// `KeepAlive{SuccessfulExit=false}` instance that loses the race exits 0,
+    /// is never restarted, and leaves nothing behind when the winner quits —
+    /// the same "no daemon and no recovery" end state #57 was about.
+    Never,
+}
+
 /// `clauth daemon` — build the shared stores, run the scheduler headless, and
 /// loop executing auto-switches + rewriting `status.json` until killed.
-pub(crate) fn serve() -> Result<()> {
+pub(crate) fn serve(standby: Standby) -> Result<()> {
     // First thing, before any output (including the standing-by line below):
     // daemon stderr IS daemon.log, and undated lines cost real forensics time
     // (2026-07-09 — see `logline`).
     crate::logline::enable_timestamps();
-    log_rotate::warn_if_log_cap_defeated();
     crate::platform::init();
-    crate::runtime::gc_stale_runtimes();
 
     let dir = clauth_dir()?;
-    // Create ~/.clauth at 0o700 (was create_dir_all → umask 0o755),
-    // then tighten an existing looser tree (older builds / CLI umask left it 0o755).
+    // Create ~/.clauth at 0o700 (was create_dir_all → umask 0o755). Above the
+    // singleton claim because the lock files live in the dir; it no-ops for
+    // every instance after the first.
     mkdir_700(&dir).context("failed to create ~/.clauth")?;
-    migrate_clauth_perms_700(&dir);
 
-    // Single-instance guard as STANDBY: hold an exclusive advisory lock
-    // for our lifetime so two daemons can't both run a scheduler. A second
-    // instance BLOCKS on the lock rather than exiting clean — so when a manually
-    // run `clauth daemon` holds it, the launchd instance parks here and takes
-    // over the instant the manual one exits, keeping the plist's
-    // `KeepAlive{SuccessfulExit=false}` valid (a clean exit must never have to be
-    // restarted). A dead holder's advisory flock auto-releases, so standby is
+    // Single-instance guard, claimed BEFORE any shared-tree work below: a
+    // redundant instance must not GC the live daemon's runtime forest or walk
+    // its modes. One waiter may stand by so a supervisor's instance can take
+    // over from a manually run one (a clean exit is never restarted under
+    // launchd `KeepAlive{SuccessfulExit=false}`); the rest exit rather than pile
+    // up (#57). A dead holder's advisory flock auto-releases, so standby is
     // never orphaned.
-    let lock_file = crate::profile::open_state_file(&dir.join(LOCK_FILE))
-        .context("failed to open the clauth daemon lock file")?;
-    if lock_file.try_lock().is_err() {
-        logline!("clauth daemon: another instance holds the lock: standing by until it exits");
-        lock_file
-            .lock()
-            .context("failed to acquire the clauth daemon lock")?;
-    }
-    // Held for the process lifetime; the flock releases when the process exits.
-    let _lock = lock_file;
+    let _lock = match claim_singleton(&dir, standby == Standby::Wait)? {
+        Claim::Active(lock) => lock,
+        Claim::Standby(slot) => stand_by(&dir, slot)?,
+        Claim::Redundant => {
+            logline!("clauth daemon: {}; exiting", redundant_reason(standby));
+            return Ok(());
+        }
+    };
+
+    log_rotate::warn_if_log_cap_defeated();
+    // Tighten an existing looser tree (older builds / CLI umask left it 0o755)
+    // before `load_config` runs its own walk. Idempotent, so the standby path
+    // running it twice costs one stat walk.
+    migrate_clauth_perms_700(&dir);
+    crate::runtime::gc_stale_runtimes();
 
     let config = load_config()?;
     warn_if_spend_is_uncapped(&config);
@@ -160,6 +181,21 @@ pub(crate) fn serve() -> Result<()> {
     );
     daemon.run();
     Ok(())
+}
+
+/// The [`Claim::Standby`] arm of [`serve`]: tighten the tree, say so, then park
+/// until the holder exits. Extracted because the ORDER inside it is the whole
+/// point and a park is unbounded in time, so nothing reachable through `serve`
+/// can observe it.
+///
+/// The perms walk runs before the park rather than after the promotion: launchd
+/// opens `StandardErrorPath` at the umask (0o644) BEFORE `exec`, so the
+/// standing-by line would otherwise sit in a world-readable `daemon.log` naming
+/// accounts for the whole wait.
+fn stand_by(dir: &std::path::Path, slot: StandbySlot) -> Result<DaemonLock> {
+    migrate_clauth_perms_700(dir);
+    logline!("clauth daemon: another instance holds the lock: standing by until it exits");
+    slot.promote()
 }
 
 /// Every chain member armed to spend with nothing to stop it (see
@@ -204,6 +240,44 @@ fn warn_if_spend_is_uncapped(config: &crate::profile::AppConfig) {
             crate::fallback::uncapped_spend_fix(),
         );
     }
+}
+
+/// Why this instance has nothing to do, worded so the operator can tell a
+/// full queue apart from a deliberate `--no-standby`.
+fn redundant_reason(standby: Standby) -> &'static str {
+    match standby {
+        Standby::Wait => "a daemon and its standby are already running",
+        Standby::Never => "another instance already holds the lock (--no-standby)",
+    }
+}
+
+/// `clauth daemon --status` — presence probe for a supervisor or a menu-bar app,
+/// so "is one already up?" costs a try-lock instead of a spawn. One line on
+/// stdout while a daemon is up (exit 0); exit 1 with nothing on stdout when
+/// none is, matching the sessions surface's convention.
+pub(crate) fn status_probe() -> Result<()> {
+    // The presence DECISION goes through `singleton_held`, not the header dot's
+    // `daemon_health`: the dot maps an unusable lock to `Absent` so it can hide
+    // rather than assert a daemon that may not be there, and a `--status ||
+    // spawn` supervisor reading that as "none running" respawns forever on a
+    // filesystem without working locks. Here the same condition is an error the
+    // caller sees. `daemon_health` still owns the freshness word below.
+    if !probe::singleton_held()? {
+        anyhow::bail!("no clauth daemon is running");
+    }
+    let pid = probe::holder_pid().map_or_else(|| "unknown".to_string(), |p| p.to_string());
+    let feed = if daemon_health() == DaemonHealth::Fresh {
+        "fresh"
+    } else {
+        "stale"
+    };
+    let standby = if probe::standby_waiting() {
+        ", standby waiting"
+    } else {
+        ""
+    };
+    println!("running (pid {pid}, feed {feed}{standby})");
+    Ok(())
 }
 
 /// `clauth status --json [--all|--disabled]` — single-shot serializer. Reads

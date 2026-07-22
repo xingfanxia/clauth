@@ -1,12 +1,18 @@
 //! Daemon presence + the single-fetcher lease (dual-scheduler dedup, #27).
 //!
-//! Two `~/.clauth` flock files, peers in the same dir:
+//! Three `~/.clauth` flock files, peers in the same dir:
 //!   * `clauthd.lock` — the daemon singleton + **presence beacon**. Held for
 //!     life by the running daemon; a display-only try-lock tells the TUI header
 //!     whether a daemon is up (an advisory lock auto-releases on process death,
 //!     so a dead daemon reads as absent on the next probe). Paired with
 //!     `status.json`'s freshness it drives the `● daemon` health dot
-//!     ([`daemon_health`]).
+//!     ([`daemon_health`]). [`singleton_held`] reads the same lock as a decision
+//!     for `clauth daemon --status`, where not knowing has to be an error rather
+//!     than a hidden dot.
+//!   * `clauthd-standby.lock` — the **standby slot** ([`StandbySlot`], #57). One
+//!     waiter may park on the singleton lock; every later instance is
+//!     [`Claim::Redundant`] and exits, so a spawner that fires repeatedly can no
+//!     longer pile up parked daemons.
 //!   * `usage-fetch.lock` — the **single-fetcher lease** ([`FetchLease`]).
 //!     Exactly one instance (daemon OR a TUI) holds it at a time and does all
 //!     usage fetching / rotation / switch decisions while it does; every other
@@ -15,7 +21,12 @@
 //!     never thrashes between processes.
 
 use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
 
 use crate::profile::clauth_dir;
 
@@ -29,8 +40,10 @@ const DAEMON_STALE_MS: u64 = 30_000;
 
 /// The `● daemon` header dot's three display states, derived from the daemon
 /// singleton flock (presence) + the `generated_at` stamp inside `status.json`
-/// (health — the daemon's own write time, not the file's mtime). Display-only:
-/// nothing here gates fetching — that is [`FetchLease`].
+/// (health — the daemon's own write time, not the file's mtime). Nothing here
+/// gates fetching — that is [`FetchLease`] — but `clauth daemon --status` does
+/// answer a caller's spawn-or-not off it, and the probe TAKES the flock it
+/// tests, so a concurrent claim must survive that (see [`CLAIM_ATTEMPTS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DaemonHealth {
     /// No daemon: `clauthd.lock` is free (never started, or the holder died).
@@ -96,6 +109,232 @@ pub(crate) fn status_is_fresh(body: &str, now_ms: u64) -> bool {
     }
     let generated_ms = (secs as u64).saturating_mul(1000);
     now_ms.saturating_sub(generated_ms) <= DAEMON_STALE_MS
+}
+
+/// What a starting `clauth daemon` is allowed to become (#57).
+///
+/// Standby exists because a supervisor's instance must be able to take over
+/// from a manually-run one without a clean exit it would never be restarted
+/// from (launchd `KeepAlive{SuccessfulExit=false}`). It is capped at ONE waiter:
+/// before the cap, every `clauth daemon` a repeat-firing spawner started parked
+/// forever, which is how one box collected two dozen of them.
+pub(crate) enum Claim {
+    /// Took `clauthd.lock`. Run the scheduler; hold the guard for life.
+    Active(DaemonLock),
+    /// Another daemon holds the lock and this process took the one standby
+    /// slot. [`StandbySlot::promote`] blocks until the holder exits.
+    Standby(StandbySlot),
+    /// A daemon is up and the standby slot is taken (or standby was declined):
+    /// there is nothing left for this process to do.
+    Redundant,
+}
+
+/// The held singleton lock. Kept for the process lifetime; the flock releases
+/// when the process exits, so a crashed daemon frees it with no pidfile cleanup.
+pub(crate) struct DaemonLock {
+    _file: File,
+}
+
+impl DaemonLock {
+    /// Take ownership of the just-locked file and stamp the holder's pid into
+    /// it. The pid is informational (it answers "which of these is the live
+    /// one?" in a `ps` dump); presence is proven by the flock alone, so a stale
+    /// pid left by a dead holder can never read as a running daemon.
+    fn active(file: File) -> Self {
+        let _ = stamp_pid(&file);
+        Self { _file: file }
+    }
+}
+
+/// The one standby slot: the (still unlocked) singleton handle this process
+/// will block on, plus the `clauthd-standby.lock` flock that keeps every later
+/// instance out of the queue.
+pub(crate) struct StandbySlot {
+    active: File,
+    slot: File,
+}
+
+impl StandbySlot {
+    /// Block until the running daemon exits, then take over. Both flocks are
+    /// held across the wait, so the slot reopens for the next arrival only once
+    /// this process is the daemon — never mid-promotion.
+    pub(crate) fn promote(self) -> Result<DaemonLock> {
+        self.active
+            .lock()
+            .context("failed to acquire the clauth daemon lock")?;
+        drop(self.slot);
+        Ok(DaemonLock::active(self.active))
+    }
+}
+
+/// How many times a non-[`Claim::Active`] outcome is re-tried before it stands.
+/// **All three presence probes TAKE the flock they test** — [`daemon_health`]
+/// (TUI header, 1 Hz), [`singleton_held`] (`clauth daemon --status`, at whatever
+/// rate a supervisor polls) and [`standby_waiting`] (the slot file) try-lock a
+/// free file and release it microseconds later — so a single lost try-lock does
+/// not prove a daemon is there. A real holder keeps its lock for the process
+/// lifetime, so anything that clears on the next attempt was a reader. Without
+/// this, a µs-long probe could push a starting daemon into `Redundant`, and
+/// under launchd `KeepAlive{SuccessfulExit=false}` that clean exit is never
+/// restarted.
+const CLAIM_ATTEMPTS: u32 = 3;
+/// Spacing between those attempts. Two orders of magnitude above a probe's hold,
+/// far below any human-visible startup delay.
+const CLAIM_RETRY: Duration = Duration::from_millis(100);
+// A single attempt, or a zero gap between attempts, is the pre-fix behaviour:
+// the whole window collapses inside one probe's hold and a starting daemon exits
+// for good. Every schedule-injecting test still passes with either, so the guard
+// is here rather than in one.
+const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
+
+/// Claim a role in the daemon singleton, re-trying a lost race past a transient
+/// probe hold (see [`CLAIM_ATTEMPTS`]).
+pub(crate) fn claim_singleton(dir: &Path, standby: bool) -> Result<Claim> {
+    claim_singleton_with(dir, standby, CLAIM_ATTEMPTS, CLAIM_RETRY)
+}
+
+/// [`claim_singleton`] with the retry schedule injected, so a test can pin the
+/// probe-collision recovery without sleeping for it.
+pub(crate) fn claim_singleton_with(
+    dir: &Path,
+    standby: bool,
+    attempts: u32,
+    retry: Duration,
+) -> Result<Claim> {
+    let mut claim = claim_once(dir, standby)?;
+    for _ in 1..attempts.max(1) {
+        // Only a `Redundant` is worth re-testing. A won slot is a real outcome:
+        // re-taking it would leave the one standby seat free for most of the
+        // window and delay a standby by a wait it has no use for.
+        if matches!(claim, Claim::Active(_) | Claim::Standby(_)) {
+            break;
+        }
+        debug_assert!(
+            matches!(claim, Claim::Redundant),
+            "only a Redundant reaches the retry: a won claim still owns its flocks here, because \
+             assignment drops the old value AFTER claim_once has already run — the next attempt \
+             would race its own slot lock and read itself as a foreign holder"
+        );
+        std::thread::sleep(retry);
+        claim = claim_once(dir, standby)?;
+    }
+    Ok(claim)
+}
+
+/// One claim attempt. `standby` false (`--no-standby`) turns a lost race straight
+/// into [`Claim::Redundant`] without so much as creating the slot file.
+///
+/// An io error from either try-lock propagates instead of reading as "somebody
+/// holds it": on a filesystem without working locks (NFS/CIFS `ENOLCK`) every
+/// instance would otherwise announce a daemon that isn't there and exit 0. A
+/// hard failure exits non-zero, which a supervisor retries and an operator sees.
+fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
+    let active = crate::profile::open_state_file(&dir.join(super::LOCK_FILE))
+        .context("failed to open the clauth daemon lock file")?;
+    match active.try_lock() {
+        Ok(()) => return Ok(Claim::Active(DaemonLock::active(active))),
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(e).context("failed to lock the clauth daemon lock file");
+        }
+    }
+    if !standby {
+        return Ok(Claim::Redundant);
+    }
+    let slot = crate::profile::open_state_file(&dir.join(super::STANDBY_LOCK_FILE))
+        .context("failed to open the clauth daemon standby lock file")?;
+    match slot.try_lock() {
+        Ok(()) => Ok(Claim::Standby(StandbySlot { active, slot })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(Claim::Redundant),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).context("failed to lock the clauth daemon standby lock file")
+        }
+    }
+}
+
+/// Overwrite the lock file with the current pid. Truncating a file whose opener
+/// documents the opposite ([`crate::profile::open_state_file`] never truncates,
+/// so a sibling's held lock survives an open race) is sound only here: the
+/// caller holds the exclusive flock, so no sibling is mid-anything. The trailing
+/// newline is the commit marker [`holder_pid`] requires — a reader that catches
+/// the write half-done sees no newline and reports nothing rather than parsing a
+/// truncated pid into a live unrelated process. Best-effort: a daemon that can't
+/// write its own pid still runs (the empty file then reads as "unknown").
+fn stamp_pid(mut file: &File) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    writeln!(file, "{}", std::process::id())?;
+    file.flush()
+}
+
+/// The pid the running daemon stamped into `clauthd.lock`, when one is fully
+/// written. Informational only — its one caller reaches it past a true
+/// [`singleton_held`], and the header dot answers off [`daemon_health`], so
+/// presence is proven by the flock either way and a pid left behind by a dead
+/// daemon is never read as one being up.
+///
+/// One residual, accepted: the newline sentinel rules out a TORN stamp, not a
+/// complete stale one. Between a successor winning the flock and its
+/// [`stamp_pid`] reaching `set_len(0)` — a handful of instructions — the dead
+/// predecessor's pid is still whole and readable, so `--status` can print a pid
+/// the OS has since recycled onto something unrelated. Truncate-first is still
+/// the narrowest form of that window: it blanks the stale bytes at the winner's
+/// first instruction, where a separate atomically-renamed pid file would keep
+/// them fully readable until the replacement is written.
+pub(crate) fn holder_pid() -> Option<u32> {
+    let dir = clauth_dir().ok()?;
+    let body = std::fs::read_to_string(dir.join(super::LOCK_FILE)).ok()?;
+    // No terminating newline → the stamp is torn or absent. Never guess.
+    body.strip_suffix('\n')?.trim().parse().ok()
+}
+
+/// Whether a daemon holds the singleton lock, as a DECISION rather than a
+/// display: every way of not knowing is an error instead of a "no". Filesystems
+/// without working locks (NFS/CIFS `ENOLCK`) are the case that matters — there
+/// [`daemon_health`] deliberately reads `Absent`, and a `--status || spawn`
+/// supervisor built on that answer respawns forever with the cause visible only
+/// in `daemon.log`. Never creates the file: a missing one is a real "no daemon
+/// has ever started here".
+pub(crate) fn singleton_held() -> Result<bool> {
+    let dir = clauth_dir()?;
+    let path = dir.join(super::LOCK_FILE);
+    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to open the clauth daemon lock file {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    match file.try_lock() {
+        // We took it → nobody holds it. Dropping releases it.
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).context("failed to test the clauth daemon lock file")
+        }
+    }
+}
+
+/// True when a second `clauth daemon` is parked in the standby slot. Never
+/// creates the file: a missing one means nobody has ever stood by here.
+pub(crate) fn standby_waiting() -> bool {
+    let Ok(dir) = clauth_dir() else {
+        return false;
+    };
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(super::STANDBY_LOCK_FILE))
+    else {
+        return false;
+    };
+    // Took it → free → nobody is standing by. Dropping releases it.
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
 /// The single-fetcher lease over `usage-fetch.lock` (#27). Once acquired the

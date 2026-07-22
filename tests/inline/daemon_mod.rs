@@ -680,3 +680,110 @@ fn uncapped_spenders_excludes_disabled_includes_enabled_sibling() {
         "an enabled uncapped sibling must still be named"
     );
 }
+
+/// The standby arm tightens the tree BEFORE it parks, never after the takeover.
+/// launchd creates `daemon.log` at the umask (0o644) before exec and a park is
+/// unbounded in time, so a walk deferred to the promotion leaves a
+/// world-readable log naming accounts for the whole wait.
+#[cfg(unix)]
+#[test]
+fn stand_by_tightens_the_tree_before_parking_not_after_promotion() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // A loose dir standing in for the log: the pre-park walk tightens it.
+    let loose = dir.join("loose");
+    std::fs::create_dir_all(&loose).expect("mkdir loose");
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // Stand in for the running daemon so the claim below really parks.
+    let held = crate::profile::open_state_file(&dir.join(super::LOCK_FILE)).expect("open lock");
+    held.try_lock().expect("hold the singleton lock");
+
+    let super::Claim::Standby(slot) = super::claim_singleton(&dir, true).expect("claim") else {
+        panic!("the second instance takes the one standby slot");
+    };
+    let parked = std::thread::spawn({
+        let dir = dir.clone();
+        move || super::stand_by(&dir, slot)
+    });
+
+    let mode = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .expect("stat loose")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mode(&loose) != 0o700 {
+        assert!(
+            !parked.is_finished(),
+            "stand_by returned instead of parking"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the tree stayed 0o755 across 5s of parking: the walk runs only after the promotion, \
+             so a standby's whole wait sits in a world-readable tree"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // Holder exits → the standby takes over.
+    drop(held);
+    let promoted = parked
+        .join()
+        .expect("stand_by thread")
+        .expect("the standby promotes once the holder exits");
+    drop(promoted);
+}
+
+/// A `clauth daemon` that loses the singleton race must exit having touched
+/// nothing shared. The pile-up in #57 was 25 of these, each having already run
+/// the runtime GC and the tree-wide chmod walk against the live daemon's state
+/// before parking forever.
+#[test]
+fn a_redundant_instance_exits_without_touching_the_shared_tree() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    // A runtime tree with no live session: `gc_stale_runtimes` deletes it.
+    let ghost = dir.join("profiles").join("ghost").join("runtime");
+    std::fs::create_dir_all(&ghost).expect("mkdir ghost runtime");
+    // A loose dir: `migrate_clauth_perms_700` tightens it to 0o700.
+    let loose = dir.join("loose");
+    std::fs::create_dir_all(&loose).expect("mkdir loose");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    // Stand in for the running daemon: hold the singleton lock for the call.
+    let held = crate::profile::open_state_file(&dir.join(super::LOCK_FILE)).expect("open lock");
+    held.try_lock().expect("hold the singleton lock");
+
+    super::serve(super::Standby::Never).expect("a redundant instance exits clean");
+
+    assert!(
+        ghost.exists(),
+        "the redundant instance ran the runtime GC against the live daemon's tree"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&loose)
+            .expect("stat loose")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "the redundant instance walked the tree's modes before exiting"
+        );
+    }
+}

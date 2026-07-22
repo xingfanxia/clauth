@@ -1080,8 +1080,9 @@ pub(crate) fn mkdir_700(path: &Path) -> std::io::Result<()> {
 
 /// Open an owner-only advisory-lock/state file (`read+write`, create without
 /// truncating so a sibling's held lock survives the race) at mode 0o600. Every
-/// `~/.clauth` lock file (`.lock`, `clauthd.lock`, `usage-fetch.lock`, session
-/// PID files, `rotation.lock`) routes through here so no lock is born at the
+/// `~/.clauth` lock file (`.lock`, `clauthd.lock`, `clauthd-standby.lock`,
+/// `usage-fetch.lock`, session PID files, `rotation.lock`) routes through here
+/// so no lock is born at the
 /// process umask — the file itself carries nothing secret, but a blanket
 /// owner-only tree is the invariant the perms test can check without an
 /// exceptions list.

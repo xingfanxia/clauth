@@ -83,6 +83,9 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             // other one stands down and hydrates from the shared cache.
             "standdown_",
             "one_holder_at_a_time",
+            // singleton ceiling (#57): one active + one standby, no pile-up.
+            "third_instance_is_redundant",
+            "no_standby_exits_rather_than",
             "tick_stands_down_when_another",
             "held_lock_with_fresh_status",
         ],
