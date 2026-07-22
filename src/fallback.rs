@@ -239,9 +239,15 @@ pub(crate) fn member_weekly_line(profile: &Profile, chain_soft: f64) -> f64 {
 
 /// The line a member's per-model (`weekly_scoped`) windows are judged at: the
 /// same per-account `weekly_threshold` override, else the chain-wide line.
-/// The `check_weekly` gate does NOT apply — that gate governs the aggregate
-/// judgment; scoped windows have their own (`check_scoped`).
+/// The override rides the `weekly gate` exactly like [`member_weekly_line`]:
+/// with `check_weekly` off the `weekly at` row renders dimmed and its editor
+/// refuses to open, so a stored value must not keep judging windows the UI
+/// says it doesn't. Scoped judgment itself stays on — `check_scoped` is its
+/// gate — only the LINE falls back to the chain-wide default.
 pub(crate) fn member_scoped_line(profile: &Profile, chain_soft: f64) -> f64 {
+    if !profile.check_weekly {
+        return chain_soft;
+    }
     profile.weekly_threshold.unwrap_or(chain_soft)
 }
 
@@ -293,9 +299,22 @@ pub(crate) fn scoped_weekly_blocked_info(
     now_secs: i64,
     weekly_pct: f64,
 ) -> bool {
+    worst_scoped_window(info, now_secs, weekly_pct).is_some()
+}
+
+/// The worst LIVE per-model window at/over `weekly_pct`, or `None` when the
+/// member is scoped-clear — [`scoped_weekly_blocked_info`] IS this judgment,
+/// so a display surface naming the offending window (the `ScopedSpent` chip)
+/// reads the same predicate rather than inlining a second opinion.
+pub(crate) fn worst_scoped_window(
+    info: &crate::usage::UsageInfo,
+    now_secs: i64,
+    weekly_pct: f64,
+) -> Option<&crate::usage::ScopedWindow> {
     info.weekly_scoped
         .iter()
-        .any(|s| window_live(&s.window, now_secs) && s.window.utilization >= weekly_pct)
+        .filter(|s| window_live(&s.window, now_secs) && s.window.utilization >= weekly_pct)
+        .max_by(|a, b| a.window.utilization.total_cmp(&b.window.utilization))
 }
 
 /// [`scoped_weekly_blocked_info`] over a profile's own usage snapshot, gated
@@ -666,16 +685,11 @@ pub(crate) fn health_blocked_reason(
     // headroom accept skips it), though other models still serve. Worst such
     // window names the chip. Above `WeeklySoft` — same still-serving band,
     // but this one is model-dead rather than merely dispreferred.
-    let scoped_line = member_scoped_line(profile, soft);
     if profile.check_scoped
         && let Some(worst) = profile
             .usage
             .as_ref()
-            .map(|u| &u.weekly_scoped)
-            .into_iter()
-            .flatten()
-            .filter(|s| window_live(&s.window, now) && s.window.utilization >= scoped_line)
-            .max_by(|a, b| a.window.utilization.total_cmp(&b.window.utilization))
+            .and_then(|u| worst_scoped_window(u, now, member_scoped_line(profile, soft)))
     {
         return Some(BlockedReason::ScopedSpent {
             label: worst.label.clone(),
@@ -1233,7 +1247,12 @@ fn next_auto_switch_target_with_usage(
         // otherwise-healthy active (its `check_scoped` gate on) hops ONLY
         // when a clear member exists. When every sibling is equally blocked
         // the hop buys nothing and the chain would ping-pong — stay put.
-        if scoped_blocked_from_usage(active, usage)
+        // A pinned sink stays parked: `last_resort` means "serve here for
+        // free until dead", and a scoped hop off it re-enters the rotation
+        // it was deliberately parked out of — oscillating on the sibling's
+        // 5h period. Same precedence the serving-sink pass gives it below.
+        if !active.last_resort
+            && scoped_blocked_from_usage(active, usage)
             && let Some(name) = walk(&clear)
         {
             return Some(SwitchAction::To(name));
@@ -1452,7 +1471,9 @@ pub(crate) fn auto_switch_if_needed(
             // a per-model weekly line crossed on an otherwise-healthy active
             // (its `check_scoped` gate on) hops ONLY onto a clear member —
             // hopping between equally model-blocked members buys nothing.
-            if scoped_weekly_blocked(active, weekly_pct)
+            // Parity with the scheduler walk: a pinned sink stays parked.
+            if !active.last_resort
+                && scoped_weekly_blocked(active, weekly_pct)
                 && let Some(target) = fully_clear_target(config, weekly_pct)
             {
                 switch_profile(config, &target)?;

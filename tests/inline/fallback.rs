@@ -3720,6 +3720,233 @@ fn auto_switch_scoped_blocked_active_stays_put_when_no_fully_clear_member() {
 }
 
 #[test]
+fn scoped_active_trigger_stays_parked_on_a_pinned_sink() {
+    // Active is a `last_resort` sink, healthy on every aggregate gate, fable
+    // week spent, clear sibling waiting. A sink is parked ON PURPOSE ("serve
+    // here for free until dead") — the scoped hop must not un-park it, or the
+    // chain oscillates on the sibling's 5h period: hop off, sibling's 5h
+    // spends, serving-sink pass returns, sibling resets, hop again.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[0].last_resort = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_with_scoped(
+                20.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        ("b", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a pinned sink must stay parked through a scoped block"
+    );
+}
+
+// ── weekly gate off × non-empty weekly_scoped: the override and the line ─────
+//
+// `member_scoped_line` must ride the `weekly gate` (the `weekly at` row
+// renders dimmed and refuses its editor while the gate is off, so a stored
+// override must not keep judging) — but scoped judgment itself stays on at
+// the CHAIN line (`check_scoped` is its gate). Both directions pinned, so
+// neither "the override always applies" nor "scoped_line == weekly_line"
+// (which goes to the hard cap on gate-off) survives the suite.
+
+#[test]
+fn scoped_line_ignores_the_override_while_the_weekly_gate_is_off() {
+    // b: override 60, weekly gate OFF, fable at 70. The override is inert —
+    // b's fable window sits under the chain line (98), so b is fully clear
+    // and the walk leaves a spent active for it.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].weekly_threshold = Some(60.0);
+    config.profiles[1].check_weekly = false;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                30.0,
+                vec![scoped_window("7d fable", 70.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "a gated-off override must not judge the scoped windows"
+    );
+}
+
+#[test]
+fn scoped_windows_judge_the_chain_line_while_the_weekly_gate_is_off() {
+    // b: weekly gate OFF, no override, fable at 99 — still judged at the
+    // CHAIN line (98), so b stays out of rotation. If gate-off routed the
+    // scoped line to the hard cap the way it does the aggregate one, 99
+    // would pass and this would hop.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].check_weekly = false;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                30.0,
+                vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "gate-off scoped judgment stays on the chain line, not the hard cap"
+    );
+}
+
+#[test]
+fn blocked_reason_scoped_override_is_inert_while_weekly_gate_is_off() {
+    // Chip twin of the walk pair above: override 60 + gate off + fable at 70
+    // → no chip (the walk keeps rotating here); fable at 99 → `ScopedSpent`
+    // at the chain line (the walk skips it), even with the gate off.
+    let mut under = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_with_scoped(
+            10.0,
+            30.0,
+            vec![scoped_window("7d fable", 70.0, Some(week_reset()))],
+        )),
+    );
+    under.weekly_threshold = Some(60.0);
+    under.check_weekly = false;
+    let cfg = config_with_chain(vec![under], "a");
+    assert_eq!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        None,
+        "a gated-off override must not put the chip on the card"
+    );
+
+    let mut over = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_with_scoped(
+            10.0,
+            30.0,
+            vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+        )),
+    );
+    over.check_weekly = false;
+    let cfg = config_with_chain(vec![over], "a");
+    assert!(
+        matches!(
+            blocked_reason(&cfg, &cfg.profiles[0], None),
+            Some(BlockedReason::ScopedSpent { .. })
+        ),
+        "gate-off scoped judgment holds the chain line on the chip too"
+    );
+}
+
+#[test]
+fn blocked_reason_five_hour_outranks_scoped_spent() {
+    // Both blocks live at once: the 5h window over its rotate threshold AND a
+    // spent fable week. 5h ranks worse — it blocks every model right now,
+    // while scoped still serves the others.
+    let p = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_with_scoped(
+            100.0,
+            30.0,
+            vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+        )),
+    );
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        Some(BlockedReason::FiveHour { .. })
+    ));
+}
+
+// ── fully_clear_target: the UI-thread twin of the scoped trigger's walk ──────
+
+#[test]
+fn fully_clear_target_skips_blocked_members_and_finds_the_clear_one() {
+    // b: scoped-blocked (skipped), c: auth-broken (skipped), d: clear (the
+    // pick). Exercised directly — this is the only walk `auto_switch_if_needed`
+    // runs for the scoped trigger.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_usage("a", Some(95.0), Some(both_windows(20.0, 40.0))),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_with_scoped(
+                    5.0,
+                    30.0,
+                    vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+                )),
+            ),
+            profile_with_usage("c", Some(95.0), Some(both_windows(5.0, 30.0))),
+            profile_with_usage("d", Some(95.0), Some(both_windows(5.0, 30.0))),
+        ],
+        "a",
+    );
+    config.state.auth_broken.push("c".into());
+    assert_eq!(
+        fully_clear_target(&config, 98.0),
+        Some("d".to_string()),
+        "the walk must skip the scoped-blocked and broken members"
+    );
+}
+
+#[test]
+fn fully_clear_target_none_when_every_member_is_blocked() {
+    let config = config_with_chain(
+        vec![
+            profile_with_usage("a", Some(95.0), Some(both_windows(20.0, 40.0))),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_with_scoped(
+                    5.0,
+                    30.0,
+                    vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+                )),
+            ),
+            // c: 5h over its threshold — exhausted, not fully clear.
+            profile_with_usage("c", Some(95.0), Some(both_windows(96.0, 30.0))),
+        ],
+        "a",
+    );
+    assert_eq!(fully_clear_target(&config, 98.0), None);
+}
+
+#[test]
 fn scoped_gate_off_active_never_fires_the_scoped_hop() {
     // Active is model-blocked but its own `check_scoped` gate is off: no
     // scoped trigger, even with a clear sibling waiting.
