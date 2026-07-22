@@ -105,8 +105,12 @@ fn last_resort_hint_wraps_on_a_narrow_pane() {
     let b = profile("b", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    // Focused on the `last resort` row (FALLBACK_ROWS[1]) at 28 cols.
-    let lines = member_detail(&cfg, "a", true, 1, false, None, None, None, 28, None).0;
+    // Focused on the `last resort` row at 28 cols.
+    let lr = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::LastResort)
+        .unwrap();
+    let lines = member_detail(&cfg, "a", true, lr, false, None, None, None, 28, None).0;
     let texts: Vec<String> = lines.iter().map(line_text).collect();
     let lead = texts
         .iter()
@@ -732,13 +736,15 @@ fn typed_threshold_caret_lands_on_the_rotate_at_row_at_every_header_height() {
     check(two_pills(), "2 pills, hard-wrapped", 26, 40);
 }
 
-/// The card does not scroll, and the header block can now push `rotate at` off
-/// a short pane entirely (two pills, each dragging a fix line that wraps). The
-/// caret must NOT be placed then: `set_cursor_position` takes an absolute row,
-/// and a real terminal clamps an out-of-range one onto the last line rather
-/// than dropping it — parking a visible caret on a border or the pane below.
+/// A short pane can no longer strand a typed row: the focused card SCROLLS the
+/// cursored row into view (the header block alone can outgrow the pane — two
+/// pills, each dragging a fix line that wraps), and the caret math subtracts
+/// the same scroll, so the caret lands on the row's RENDERED position rather
+/// than its absolute index. `set_cursor_position` takes an absolute row and a
+/// real terminal clamps an out-of-range one onto the last line, so the caret
+/// must also never be set past the pane.
 #[test]
-fn typed_threshold_caret_is_not_set_when_the_row_is_clipped_off_the_pane() {
+fn typed_threshold_row_scrolls_into_view_and_carries_the_caret() {
     let mut d = profile("a", 95.0, 10.0, 7200);
     d.disabled = true;
     let mut cfg = config_with(vec![d], Some("other"), vec!["a"]);
@@ -752,22 +758,57 @@ fn typed_threshold_caret_is_not_set_when_the_row_is_clipped_off_the_pane() {
         .unwrap();
     app.fallback_threshold_draft = Some(InputState::new("80"));
 
-    // 26x17: the two wrapped fix lines push the rows past the pane's last line.
+    // 26x17: without the scroll, the two wrapped fix lines pushed the rows
+    // past the pane's last line (the pre-scroll revision of this test pinned
+    // exactly that clip).
     let (w, h) = (26u16, 17u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
 
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
-    assert!(
-        !rows.iter().any(|r| r.contains("rotate at")),
-        "fixture must actually clip the row, else this pins nothing:\n{}",
-        rows.join("\n")
-    );
+    let rendered_at = rows
+        .iter()
+        .position(|r| r.contains("rotate at"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the typed row must scroll into view on a short pane:\n{}",
+                rows.join("\n")
+            )
+        });
     let caret = term.get_cursor_position().unwrap();
+    assert_eq!(
+        caret.y as usize, rendered_at,
+        "caret must sit on the row's rendered (scrolled) position",
+    );
     assert!(
         (caret.y as usize) < h as usize,
         "caret must never be set past the terminal's last row (y={}, h={h})",
         caret.y
+    );
+}
+
+/// Finding shape from review round 2: a 40x24 terminal (~14 inner rows after
+/// borders and the left chain) with a blocked member fills the card past the
+/// pane, and the card has no scrollbar — the LAST rows must stay reachable by
+/// walking the cursor down, not fall off the bottom.
+#[test]
+fn remove_row_stays_reachable_on_a_40x24_pane() {
+    // One blocked member: the pill block + fix line eat header rows.
+    let cfg = config_with(vec![profile("a", 95.0, 100.0, 7200)], Some("a"), vec!["a"]);
+    let mut app = App::new(cfg);
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Remove)
+        .unwrap();
+
+    let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|r| r.contains("remove")),
+        "the cursored last row must scroll into view at 40x24:\n{}",
+        rows.join("\n")
     );
 }
 

@@ -23,6 +23,7 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::format::{ResetFmt, reset_pill, reset_resume};
+use super::global_config::default_reminder;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, bold_when,
     draw_selector_list, head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines,
@@ -197,7 +198,28 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+    // The header block + seven rows + a tooltip outgrow a short pane (a 40x24
+    // terminal leaves ~14 inner rows, and a blocked member's pill block eats
+    // two more), and the card has no scrollbar — so a FOCUSED card scrolls the
+    // cursored row (plus up to a 2-line tooltip) into view instead of clipping
+    // `max spend` and `remove` off the bottom. Unfocused keeps the top
+    // anchored: while browsing the left chain the identity header is the
+    // payload, not the rows.
+    let content_h = lines.len();
+    let scroll = if detail_focused && matches!(selected, Some(ChainItemKind::Member(_))) {
+        let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
+        (rows_start + cursor + 3)
+            .saturating_sub(inner.height as usize)
+            .min(content_h.saturating_sub(inner.height as usize))
+    } else {
+        0
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((scroll as u16, 0)),
+        inner,
+    );
 
     // Position the native terminal cursor for whichever field is being typed,
     // matching the post-draw cursor path the other edit screens use. This is not
@@ -230,22 +252,25 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     .into_iter()
     .find_map(|(row, draft, unit_cols)| draft.map(|d| (row, d, unit_cols)));
 
-    // The row must actually be ON the pane before its caret is placed. This card
-    // does not scroll, and the header block above the rows is now tall enough to
-    // push them off a short pane on its own (two stacked pills, each dragging a
-    // fix line that wraps on a narrow one) — an unguarded set parks a visible
-    // caret on a border or the pane below, since a real terminal clamps the row
-    // rather than dropping it. Mirrors the `config.rs` edit-caret guard.
+    // The row must actually be ON the pane before its caret is placed. The
+    // scroll above chases the CURSORED row, which is the row being typed on
+    // every real path — but a degenerate pane (height smaller than the
+    // lookahead) can still leave it off, and an unguarded set parks a visible
+    // caret on a border or the pane below, since a real terminal clamps the
+    // row rather than dropping it. Mirrors the `config.rs` edit-caret guard.
     if detail_focused
         && let Some(ChainItemKind::Member(_)) = selected
         && let Some((row, draft, unit_cols)) = typing
         && let Some(row_idx) = FALLBACK_ROWS.iter().position(|r| *r == row)
-        && rows_start + row_idx < inner.height as usize
+        && rows_start + row_idx >= scroll
+        && rows_start + row_idx - scroll < inner.height as usize
     {
         // x = "❯ " (2) + key block (KEY_W + KEY_GUTTER cols) + unit + cols before caret.
         let prefix_cols = 2 + KEY_W + KEY_GUTTER + unit_cols + head_cols(draft);
         let cx = inner.x.saturating_add(prefix_cols as u16);
-        let cy = inner.y.saturating_add((rows_start + row_idx) as u16);
+        let cy = inner
+            .y
+            .saturating_add((rows_start + row_idx - scroll) as u16);
         frame.set_cursor_position((cx, cy));
     }
 }
@@ -269,7 +294,10 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
         BlockedReason::KickRejected { .. } => ("⧗", theme::warning()),
         BlockedReason::BudgetSpent => ("$", theme::warning()),
         BlockedReason::FiveHour { .. } => ("◔", theme::warning()),
-        BlockedReason::ScopedSpent { .. } => ("◇", theme::warning()),
+        // `⊘` = a weekly window is spent; hue splits scope exactly like `⊖`
+        // splits disabled/canceled: danger = the aggregate week (dead for
+        // days), warning = one model's week (still serves the rest).
+        BlockedReason::ScopedSpent { .. } => ("⊘", theme::warning()),
         BlockedReason::WeeklySoft { .. } => ("~", theme::warning()),
         BlockedReason::Stale => ("⋯", theme::faint()),
     };
@@ -642,7 +670,7 @@ fn threshold_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
 /// Sub-line under the `weekly at` field while typing: the valid range plus
 /// the empty-clears rule, DANGER when the buffer parses invalid.
 fn weekly_override_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
-    let range = "0-100 % · empty follows the chain default";
+    let range = "50-100 % · empty follows the chain default";
     if parse_weekly_override(input.trimmed()).is_none() {
         invalid_tooltip_lines(range, width)
     } else {
@@ -789,10 +817,7 @@ fn detail_row(
                             theme::accent()
                         };
                         spans.push(Span::styled(format!("{v:.0}%"), value_style));
-                        spans.push(Span::styled(
-                            format!("   default: {weekly_default:.0}%"),
-                            theme::faint(),
-                        ));
+                        spans.push(default_reminder(format!("{weekly_default:.0}%")));
                     }
                     // Unset follows the chain-wide line — show that value, but
                     // faint, so a member-set figure stays visually distinct.

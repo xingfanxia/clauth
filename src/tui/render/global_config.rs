@@ -433,7 +433,7 @@ fn detail_row(
 /// live value is off the shipped default — the operator sees the default at the
 /// moment they've moved away from it, and never as noise otherwise (the chain
 /// `rotate at` idiom).
-fn default_reminder(value: String) -> Span<'static> {
+pub(super) fn default_reminder(value: String) -> Span<'static> {
     Span::styled(format!("   default: {value}"), theme::faint())
 }
 
