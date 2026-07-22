@@ -1699,3 +1699,12 @@ Shipped (fork main):
   SYNC.md CDX-1..6.
 - Tests: 4 parse + 4 tick orchestration (offline, injected poll seam);
   1566 green, clippy 0.
+
+CDX-6 addendum (live-shape + plan tier): first deploy revealed the REAL wham
+dialect (reset_at / reset_after_seconds / limit_window_seconds, verdict
+top-level) — parser now accepts both dialects, live shape pinned as fixture
+(a0a5766). Second AX report: tier label stale after a plan upgrade (plus→pro;
+the id_token claim only re-mints on codex's own refresh) — wham's top-level
+plan_type now rides the poll into CODEX_PLAN_CACHE_FILE (written on change
+only) and tier_label prefers it over the claim. Verified live: xfx 7d=0%
+(the reset the stale cache hid), cl 11%, all Fresh at 60s cadence.

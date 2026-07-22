@@ -32,7 +32,8 @@ fn parses_the_live_backend_shape() {
         "rate_limit_reached_type": null,
         "rate_limit_reset_credits": {"available_count": 0}
     }"#;
-    let info = parse_wham_usage(body.as_bytes(), now).expect("parse");
+    let polled = parse_wham_usage(body.as_bytes(), now).expect("parse");
+    let info = polled.info;
     let seven_day = info
         .seven_day
         .expect("604800s window routes to the weekly slot");
@@ -45,6 +46,11 @@ fn parses_the_live_backend_shape() {
     );
     assert!(info.five_hour.is_none(), "no session window in this shape");
     assert!(info.codex_rate_limit_reached.is_none());
+    assert_eq!(
+        polled.plan_type.as_deref(),
+        Some("pro"),
+        "the live plan tier rides the same response"
+    );
 }
 
 /// A top-level verdict (the live shape's spelling) reaches the published
@@ -58,7 +64,8 @@ fn top_level_verdict_is_adopted() {
         },
         "rate_limit_reached_type": "primary"
     }"#;
-    let info = parse_wham_usage(body.as_bytes(), now).expect("parse");
+    let polled = parse_wham_usage(body.as_bytes(), now).expect("parse");
+    let info = polled.info;
     // "primary" names the raw window, which routed WEEKLY — route_windows
     // republishes it as the slot-equivalent verdict.
     assert_eq!(info.codex_rate_limit_reached.as_deref(), Some("secondary"));
@@ -80,7 +87,8 @@ fn parses_the_jsonl_side_spellings() {
         r1 = now + 3600,
         r2 = now + 5 * 86_400
     );
-    let info = parse_wham_usage(body.as_bytes(), now).expect("parse");
+    let polled = parse_wham_usage(body.as_bytes(), now).expect("parse");
+    let info = polled.info;
     assert!((info.five_hour.expect("short slot").utilization - 12.0).abs() < f64::EPSILON);
     assert!((info.seven_day.expect("weekly slot").utilization - 88.0).abs() < f64::EPSILON);
     assert_eq!(info.codex_rate_limit_reached.as_deref(), Some("secondary"));
@@ -96,7 +104,8 @@ fn relative_reset_normalizes_to_absolute() {
             "primary_window": {"used_percent": 5.0, "resets_in_seconds": 86400, "window_minutes": 10080}
         }
     }"#;
-    let info = parse_wham_usage(body.as_bytes(), now).expect("parse");
+    let polled = parse_wham_usage(body.as_bytes(), now).expect("parse");
+    let info = polled.info;
     let iso = info
         .seven_day
         .expect("weekly")

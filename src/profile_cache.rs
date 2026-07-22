@@ -39,6 +39,15 @@ pub(crate) const PROFILE_FETCHED_CACHE_FILE: &str = "profile_fetched.json";
 /// doesn't forget a live block mid-outage; removed the moment a kick lands.
 pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 
+/// CDX-6: the codex plan tier (`pro`/`plus`/`free`/…) as the LIVE backend
+/// last reported it (`wham/usage` top-level `plan_type`). The stored
+/// id_token's `chatgpt_plan_type` claim goes stale the moment the account
+/// upgrades (it only re-mints when codex itself refreshes) — `tier_label`
+/// prefers this cache over the claim so an upgrade shows within a poll
+/// interval (AX report 2026-07-22: ax-codex-cl upgraded plus→pro, label
+/// stuck on plus).
+pub(crate) const CODEX_PLAN_CACHE_FILE: &str = "codex_plan.json";
+
 /// Resolve `<profile_dir>/<file>` for `name`. `None` only when the per-profile
 /// dir itself can't be resolved (matches the prior per-layer `cache_path`).
 pub(crate) fn profile_cache_path(name: &str, file: &str) -> Option<PathBuf> {

@@ -2542,8 +2542,10 @@ pub(super) fn codex_poll_tick(
     poll_fn: &dyn Fn(
         &str,
         Option<&str>,
-    )
-        -> std::result::Result<crate::usage::UsageInfo, crate::codex::poll::PollError>,
+    ) -> std::result::Result<
+        crate::codex::poll::PolledUsage,
+        crate::codex::poll::PollError,
+    >,
 ) {
     // Candidates under one short config-lock window; the polls themselves
     // must never hold the lock.
@@ -2596,10 +2598,24 @@ pub(super) fn codex_poll_tick(
         }
         let account_id = auth.account_id();
         match poll_fn(&token, account_id.as_deref()) {
-            Ok(info) => {
-                write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+            Ok(polled) => {
+                write_profile_cache(&name, USAGE_CACHE_FILE, &polled.info);
+                // The live plan tier rides along — `tier_label` prefers it
+                // over the stored id_token claim, which goes stale on a plan
+                // change until codex re-mints. Written only on change (the
+                // steady state must not churn a disk write per minute).
+                if let Some(plan) = polled.plan_type
+                    && crate::profile_cache::load_profile_cache::<String>(
+                        &name,
+                        crate::profile_cache::CODEX_PLAN_CACHE_FILE,
+                    )
+                    .as_deref()
+                        != Some(plan.as_str())
+                {
+                    write_profile_cache(&name, crate::profile_cache::CODEX_PLAN_CACHE_FILE, &plan);
+                }
                 if let Ok(mut s) = store.lock() {
-                    s.insert(name.clone(), info);
+                    s.insert(name.clone(), polled.info);
                 }
                 if let Ok(mut st) = status.lock() {
                     st.insert(name.clone(), FetchStatus::Fresh);

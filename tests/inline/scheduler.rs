@@ -4172,13 +4172,16 @@ fn poll_stores() -> (super::UsageStore, super::StatusStore) {
     )
 }
 
-fn poll_info(pct: f64) -> crate::usage::UsageInfo {
-    crate::usage::UsageInfo {
-        seven_day: Some(crate::usage::UsageWindow {
-            utilization: pct,
-            resets_at: None,
-        }),
-        ..Default::default()
+fn poll_info(pct: f64) -> crate::codex::poll::PolledUsage {
+    crate::codex::poll::PolledUsage {
+        info: crate::usage::UsageInfo {
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: pct,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+        plan_type: Some("pro".to_string()),
     }
 }
 
@@ -4210,6 +4213,16 @@ fn codex_poll_publishes_a_parked_profiles_usage() {
     );
 
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // CDX-6 live plan tier: the polled plan_type lands in the plan cache the
+    // tier label prefers (the stored id_token claim goes stale on upgrades).
+    assert_eq!(
+        crate::profile_cache::load_profile_cache::<String>(
+            "cdx-poll",
+            crate::profile_cache::CODEX_PLAN_CACHE_FILE
+        )
+        .as_deref(),
+        Some("pro")
+    );
     let published = store
         .lock()
         .unwrap()

@@ -61,6 +61,11 @@ struct WhamUsage {
     rate_limit: Option<WhamRateLimit>,
     #[serde(default)]
     rate_limit_reached_type: Option<String>,
+    /// Top-level plan tier (`pro`/`plus`/`free`/…) — the LIVE counterpart of
+    /// the stored id_token's `chatgpt_plan_type` claim, which goes stale on a
+    /// plan change until codex re-mints.
+    #[serde(default)]
+    plan_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -106,10 +111,17 @@ impl WhamWindow {
     }
 }
 
+/// What one successful poll yields: the usage snapshot plus the live plan
+/// tier riding the same response.
+pub(crate) struct PolledUsage {
+    pub(crate) info: UsageInfo,
+    pub(crate) plan_type: Option<String>,
+}
+
 /// Parse a `wham/usage` body into the shared usage shape, through the same
 /// duration-based [`route_windows`] slotting the passive leg uses — one
 /// mapping, whichever leg carried the data.
-pub(crate) fn parse_wham_usage(body: &[u8], now_secs: i64) -> Result<UsageInfo, PollError> {
+pub(crate) fn parse_wham_usage(body: &[u8], now_secs: i64) -> Result<PolledUsage, PollError> {
     let parsed: WhamUsage = serde_json::from_slice(body)
         .map_err(|e| PollError::Other(format!("unrecognized wham/usage shape: {e}")))?;
     let top_verdict = parsed.rate_limit_reached_type;
@@ -130,11 +142,14 @@ pub(crate) fn parse_wham_usage(body: &[u8], now_secs: i64) -> Result<UsageInfo, 
             "wham/usage rate_limit block carries no windows".to_string(),
         ));
     }
-    Ok(UsageInfo {
-        five_hour,
-        seven_day,
-        codex_rate_limit_reached: verdict,
-        ..UsageInfo::default()
+    Ok(PolledUsage {
+        info: UsageInfo {
+            five_hour,
+            seven_day,
+            codex_rate_limit_reached: verdict,
+            ..UsageInfo::default()
+        },
+        plan_type: parsed.plan_type.filter(|p| !p.trim().is_empty()),
     })
 }
 
@@ -145,7 +160,7 @@ pub(crate) fn parse_wham_usage(body: &[u8], now_secs: i64) -> Result<UsageInfo, 
 pub(crate) fn fetch_wham_usage(
     access_token: &str,
     account_id: Option<&str>,
-) -> Result<UsageInfo, PollError> {
+) -> Result<PolledUsage, PollError> {
     let mut req = crate::usage::http_agent()
         .get(WHAM_USAGE_URL)
         .header("Authorization", &format!("Bearer {access_token}"))

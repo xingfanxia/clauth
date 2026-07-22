@@ -26,9 +26,19 @@ pub(crate) fn provider_label(profile: &Profile) -> String {
 /// `subscription_type` token (`max`). `None` for third-party/api-key profiles
 /// and when neither a fetched plan nor a token hint is on disk.
 pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
-    // Codex plan tier lives in the stored auth.json's id_token claims, not
-    // the claude usage cache (CDX-1).
+    // Codex plan tier: prefer the LIVE `plan_type` the CDX-6 poll cached
+    // (fresh within a poll interval of a plan change) over the stored
+    // id_token claim, which only re-mints when codex itself refreshes —
+    // stale for days after an upgrade (observed: plus→pro, 2026-07-22).
     if profile.is_codex() {
+        if let Some(plan) = load_profile_cache::<String>(
+            profile.name.as_str(),
+            crate::profile_cache::CODEX_PLAN_CACHE_FILE,
+        )
+        .filter(|p| !p.trim().is_empty())
+        {
+            return Some(plan);
+        }
         let bytes = crate::codex::read_profile_auth(profile.name.as_str())
             .ok()
             .flatten()?;
