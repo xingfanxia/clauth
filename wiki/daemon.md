@@ -14,9 +14,11 @@ stays the only resolution surface.
 ## Process model
 
 - **Singleton**: one advisory lock (`~/.clauth/clauthd.lock`) held for the
-  process lifetime, with the holder's pid written into it for `ps`-level
-  diagnosis (informational: the flock, never the number, is what proves
-  presence). A second `clauth daemon` blocks in standby and takes over the
+  process lifetime, with the holder's pid written to an unlocked sidecar
+  (`~/.clauth/clauthd.pid`) for `ps`-level diagnosis (informational: the flock,
+  never the number, is what proves presence). The pid stays out of the lock file
+  because Windows locks are mandatory, so a `--status` reader in another process
+  couldn't read bytes held inside the daemon's exclusive lock. A second `clauth daemon` blocks in standby and takes over the
   moment the holder exits, so a supervisor's instance can queue behind a
   manually run one under launchd `KeepAlive{SuccessfulExit=false}`, which never
   restarts a clean exit. That queue is **one deep**: a second flock
