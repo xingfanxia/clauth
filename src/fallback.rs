@@ -960,6 +960,28 @@ fn walk_chain(
     None
 }
 
+/// Config-side exclusions every fallback-chain walk applies before it weighs
+/// usage headroom: an unresolvable, auth-broken, or user-disabled member is
+/// never a candidate. Pure state (no usage read), so it holds in both the UI
+/// and daemon contexts. Shared by `next_target`, `fully_clear_target`, and
+/// `scan_recovery` so their skip lists can't drift apart. The `== active`
+/// guard is walk-structural and stays at the call site; canceled is
+/// usage-derived and split by data source (see `candidate_excluded`).
+pub(crate) fn walk_excluded(config: &AppConfig, name: &str) -> bool {
+    let p = config.find(name);
+    p.is_none() || config.is_auth_broken(name) || p.is_some_and(Profile::is_disabled)
+}
+
+/// [`walk_excluded`] plus canceled, for the UI-thread selection walks
+/// (`next_target`, `fully_clear_target`) that read `Profile.usage` — kept fresh
+/// by `App::apply_usage`. `is_canceled` reads that config-cached plan; the
+/// daemon recovery walk can't (its `Profile.usage` is never written headless),
+/// so it excludes canceled via the store-native `plan.is_canceled()` inside
+/// `find_recovered_member` instead and must NOT call this.
+fn candidate_excluded(config: &AppConfig, name: &str) -> bool {
+    walk_excluded(config, name) || config.find(name).is_some_and(is_canceled)
+}
+
 /// Picks the next chain member to switch to, starting one slot after the active
 /// profile and wrapping. Returns None when nothing is viable.
 ///
@@ -989,14 +1011,7 @@ pub(crate) fn next_target(
     let len = chain.len();
     let weekly_pct = config.state.weekly_switch_threshold_pct();
 
-    let skip = |i: usize| {
-        let p = config.find(&chain[i]);
-        chain[i] == active
-            || p.is_none()
-            || config.is_auth_broken(&chain[i])
-            || p.is_some_and(is_canceled)
-            || p.is_some_and(Profile::is_disabled)
-    };
+    let skip = |i: usize| chain[i] == active || candidate_excluded(config, &chain[i]);
     let walk = |accept: &dyn Fn(&Profile) -> bool| -> Option<String> {
         let pick = walk_chain(active_idx, len, &skip, &|i| {
             config.find(&chain[i]).is_some_and(&accept)
@@ -1365,14 +1380,7 @@ fn fully_clear_target(config: &AppConfig, weekly_pct: f64) -> Option<String> {
     let active = config.state.active_profile.as_deref()?;
     let chain = &config.state.fallback_chain;
     let active_idx = chain.iter().position(|n| n == active)?;
-    let skip = |i: usize| {
-        let p = config.find(&chain[i]);
-        chain[i] == active
-            || p.is_none()
-            || config.is_auth_broken(&chain[i])
-            || p.is_some_and(is_canceled)
-            || p.is_some_and(Profile::is_disabled)
-    };
+    let skip = |i: usize| chain[i] == active || candidate_excluded(config, &chain[i]);
     let pick = walk_chain(active_idx, chain.len(), &skip, &|i| {
         config
             .find(&chain[i])

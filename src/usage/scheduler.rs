@@ -2601,14 +2601,13 @@ fn scan_recovery(
         cfg.state
             .fallback_chain
             .iter()
-            // A disabled or auth-broken member is not a recovery target — see
-            // the matching filters in `fallback::snapshot_chain` /
-            // `fallback::fully_clear_target`.
-            .filter(|name| {
-                !cfg.find(name)
-                    .is_some_and(crate::profile::Profile::is_disabled)
-                    && !cfg.is_auth_broken(name)
-            })
+            // A disabled or auth-broken member is not a recovery target. Shares
+            // `fallback::walk_excluded` with `next_target`/`fully_clear_target`
+            // so the skip list can't drift; canceled is caught store-side inside
+            // `find_recovered_member` (this walk's `Profile.usage` is stale
+            // headless, so the config-plan `is_canceled` the selection walks use
+            // would read empty here).
+            .filter(|name| !crate::fallback::walk_excluded(&cfg, name))
             .map(|name| {
                 let profile = cfg.find(name);
                 crate::fallback::ChainMember {

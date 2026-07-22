@@ -3712,6 +3712,59 @@ fn scan_recovery_never_relinks_to_a_disabled_member() {
     );
 }
 
+/// A chain name with no backing profile is not a relink target. The store can
+/// still hold a live, recovered-looking entry under that name (a hand-edited
+/// chain, or a profile deleted out from under one), and queueing it would
+/// dispatch a switch to a profile that cannot be resolved. `walk_excluded`
+/// drops it before the member list is built; without that term the entry below
+/// reads exactly like the happy path and gets queued.
+#[test]
+fn scan_recovery_never_relinks_to_a_chain_member_with_no_profile() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["ghost".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("b".to_string(), None, None)],
+    }));
+
+    // Same recovered shape the happy path queues on, keyed to the ghost name.
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "ghost".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        },
+    )])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "ghost".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+
+    scan_recovery(
+        &config,
+        &store,
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a chain member with no backing profile must never be relinked"
+    );
+}
+
 /// Same recovered-usage shape as the happy path, but the member's plan reads
 /// canceled — `/v1/messages` 403s no matter how idle its cached 5h window
 /// looks, so it must never be a relink target (mirrors the disabled/kick-
