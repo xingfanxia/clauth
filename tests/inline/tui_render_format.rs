@@ -88,6 +88,7 @@ fn cue_window(util: f64) -> UsageWindow {
 
 #[test]
 fn cue_amber_on_cached_and_rate_limited() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     assert_eq!(
         fetch_cue_color(&cue_profile(Some(FetchStatus::Cached))),
         Some(theme::warning_color())
@@ -100,6 +101,7 @@ fn cue_amber_on_cached_and_rate_limited() {
 
 #[test]
 fn cue_red_on_failed() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     assert_eq!(
         fetch_cue_color(&cue_profile(Some(FetchStatus::Failed))),
         Some(theme::danger_color())
@@ -126,6 +128,7 @@ fn cue_absent_for_api_key_profiles() {
 
 #[test]
 fn brackets_stay_dim_regardless_of_fetch_state() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let w = cue_window(50.0);
     let spans = window_summary_spans_bracketed(Some(&w), 17, true, None, ResetFmt::default());
     assert_eq!(spans[0].content, "[");
@@ -138,6 +141,7 @@ fn brackets_stay_dim_regardless_of_fetch_state() {
 /// other no-data cell — the cue lives on the overview countdown instead.
 #[test]
 fn no_data_dash_stays_faint() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let spans = window_summary_spans_bracketed(None, 17, true, None, ResetFmt::default());
     assert_eq!(spans[0].content, "—");
     assert_eq!(spans[0].style.fg, theme::faint().fg);

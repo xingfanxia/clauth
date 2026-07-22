@@ -137,6 +137,7 @@ fn focus_wraps_the_active_option_in_brackets() {
 /// only on focus.
 #[test]
 fn cycle_row_renders_the_contract_shape() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
     let options = [("off", true), ("basic", false), ("strict", false)];
     // Key column is `arrow (2) + KEY_W + KEY_GUTTER` wide; derive the pad so the
     // shape assertion tracks KEY_W instead of rebreaking on a width change.
@@ -174,6 +175,7 @@ fn edit_line_buffer_starts_at_the_value_column() {
 /// not a 2-option cycle row (`[on]  off`).
 #[test]
 fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let on = line_text(&detail_row(
         GlobalConfigRow::RefreshSpentAccounts,
         false,
@@ -221,6 +223,7 @@ fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
 /// reads as an armed setting; flip the toggle on and it becomes a live cycle.
 #[test]
 fn money_spent_dims_when_spend_budget_is_off() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let dimmed = detail_row(
         GlobalConfigRow::SwitchOffWhenBudgetSpent,
         false,
@@ -349,6 +352,7 @@ fn value_rows_interpolate_the_live_value_into_their_hint() {
 /// while burn-aware is off, and become live cycles once it is on.
 #[test]
 fn burn_tunables_dim_when_burn_aware_is_off() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     for r in [GlobalConfigRow::BurnFloor, GlobalConfigRow::BurnHorizon] {
         let dimmed = detail_row(r, false, toggles(), 60_000, 95.0, 98.0, 60_000, None, None);
         assert!(
@@ -381,6 +385,7 @@ fn burn_tunables_dim_when_burn_aware_is_off() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn rotation_dims_off_macos() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let dimmed = detail_row(
         GlobalConfigRow::PreemptiveRotation,
         false,
@@ -443,6 +448,7 @@ fn config_bands_stay_contiguous() {
 /// or underlining a band with no row focused, is the bug this pins.
 #[test]
 fn band_header_underlines_only_the_focused_band() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let blurred = band_header("auto-switch", false);
     let focused = band_header("auto-switch", true);
     for line in [&blurred, &focused] {
@@ -511,6 +517,7 @@ fn reset_display_row_shows_all_three_shapes() {
 /// row is a cloudy-tui disabled row until a clock shows — and live after.
 #[test]
 fn clock_row_dims_until_a_reset_renders_a_clock() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let dimmed = detail_row(
         GlobalConfigRow::ClockNotation,
         false,

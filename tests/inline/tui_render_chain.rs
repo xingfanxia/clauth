@@ -284,6 +284,7 @@ fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
 /// account row picks the canceled arm where this ladder picks the disabled one.
 #[test]
 fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let dis = reason_marker(&BlockedReason::Disabled);
     let can = reason_marker(&BlockedReason::Canceled);
     assert_eq!(dis.content, "⊖", "disabled marker shape");
@@ -301,6 +302,7 @@ fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
 /// `tests/inline/tui_app.rs`'s `chain_candidates_excludes_a_disabled_profile`.
 #[test]
 fn disabled_chain_member_dims_its_name_and_takes_the_blocked_reason_marker() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("xqzacct", 95.0, 10.0, 3600);
     a.disabled = true;
     let cfg = config_with(vec![a], None, vec!["xqzacct"]);
@@ -834,6 +836,7 @@ fn span_style(line: &Line<'static>, needle: &str) -> Option<ratatui::style::Styl
 // ceiling renders in ACCENT.
 #[test]
 fn max_spend_dims_when_spend_budget_is_off() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut cfg = config_with(vec![profile("a", 95.0, 40.0, 3600)], Some("a"), vec!["a"]);
     cfg.profiles[0].max_auto_spend = Some(25.0);
 

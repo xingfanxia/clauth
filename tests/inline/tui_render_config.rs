@@ -67,6 +67,7 @@ fn model_cycle_appends_a_custom_id_without_brackets() {
 /// persist whether or not the row is focused.
 #[test]
 fn action_rows_bold_on_select_and_keep_their_color() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut snap = Snap::blank("+ new account");
     let input = InputState::new("");
     // (row, the style the label holds in both states)
@@ -140,6 +141,7 @@ fn setup_hints_follow_the_row_value() {
 /// two match arms directly.
 #[test]
 fn disable_button_is_delete_class_danger_and_arms_on_second_press() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let snap = Snap::blank("a"); // disabled: false → the disable direction
     let input = InputState::new("");
 
@@ -197,6 +199,7 @@ fn disable_button_is_delete_class_danger_and_arms_on_second_press() {
 /// armed).
 #[test]
 fn enable_button_is_accent_class_bold_only_on_select() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut snap = Snap::blank("a");
     snap.disabled = true; // currently disabled → the enable direction
     let input = InputState::new("");
@@ -239,6 +242,7 @@ fn enable_button_is_accent_class_bold_only_on_select() {
 /// not just a coincidental faint that also happens to be accent/danger.
 #[test]
 fn disable_button_dims_while_gated_and_ignores_a_stale_arm() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut snap = Snap::blank("a");
     let input = InputState::new("");
 
@@ -318,6 +322,7 @@ fn disabled_hint_follows_the_gate_then_the_value() {
 /// choice; handing `picker_row` a style would only re-assert the argument.
 #[test]
 fn disabled_account_only_dims_its_name_in_the_setup_list() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::profile::{AppConfig, AppState, ProfileName};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -426,6 +431,7 @@ fn setup_status_row_renders_only_while_disabled() {
 // (the operator thinks the split is armed and it isn't). Unstamped says so.
 #[test]
 fn long_lived_token_row_counts_down_and_escalates() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::claude::SessionTokenStatus as S;
     let day = 86_400_000_i64;
     let now = 1_700_000_000_000_i64;

@@ -276,6 +276,7 @@ fn row2_is_tabs_only() {
 
 #[test]
 fn daemon_dot_maps_health_to_color_and_hides_when_absent() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::daemon::DaemonHealth;
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
 

@@ -440,6 +440,7 @@ fn status_text(ls: &[Line<'_>]) -> String {
 /// an operator who re-enables it. Both facts stack on one `├│└` rail.
 #[test]
 fn status_lines_stacks_the_health_rungs_under_disabled() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut profile = crate::testutil::blank_profile("gamma");
     let header = HeaderState {
         diag: DiagFlags {
@@ -991,6 +992,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
 /// borrows the red that means a dead login and trains the user to ignore it.
 #[test]
 fn a_streak_pill_turns_red_only_once_it_is_stuck() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let pill_style = |profile: &Profile, header: &HeaderState| {
         status_lines(profile, header, 120)
             .iter()

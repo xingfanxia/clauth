@@ -21,6 +21,7 @@ fn reset_in(secs: i64) -> String {
 /// runs-dry WARNING escalation.
 #[test]
 fn drain_reset_style_low_drain_is_dim_hue() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let w = crate::usage::UsageWindow {
         utilization: 50.0,
         resets_at: Some(reset_in(3_600)), // resets in 1h
@@ -43,6 +44,7 @@ fn drain_reset_style_low_drain_is_dim_hue() {
 /// flat WARNING tint regardless of the rate's own `util_color` band.
 #[test]
 fn drain_reset_style_runs_dry_first_is_warning() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let w = crate::usage::UsageWindow {
         utilization: 50.0,
         resets_at: Some(reset_in(360_000)), // resets in 100h
@@ -81,6 +83,7 @@ fn drain_reset_style_none_without_a_positive_rate() {
 /// and paint an idle weekly window amber.
 #[test]
 fn drain_reset_style_reads_a_7d_rate_as_per_day() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let w = crate::usage::UsageWindow {
         utilization: 50.0,
         resets_at: Some(reset_in(2 * 86_400)), // resets in 2d
@@ -103,6 +106,7 @@ fn drain_reset_style_reads_a_7d_rate_as_per_day() {
 /// 40 %/d from 50% → ~1.25d to 100%, before the 2d reset → runs dry.
 #[test]
 fn drain_reset_style_7d_runs_dry_first_is_warning() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let w = crate::usage::UsageWindow {
         utilization: 50.0,
         resets_at: Some(reset_in(2 * 86_400)),
@@ -326,6 +330,7 @@ fn healthy_chain_hides_resumes_hint() {
 /// active dot (●) — usage alerts are moot until re-login.
 #[test]
 fn broken_login_marker_outranks_bell_and_active() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let a = profile("a", 95.0, 10.0, 3600);
     let mut config = config_with(vec![a], Some("a"), vec![]);
     config.state.auth_broken.push("a".into());
@@ -357,6 +362,7 @@ fn bell_marker_shows_when_login_is_fine() {
 /// the next switch would sign sessions out, so it beats a usage alert.
 #[test]
 fn token_danger_marker_outranks_bell_and_active() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], Some("a"), vec![]); // active
     let mut app = App::new(config);
@@ -381,6 +387,7 @@ fn token_danger_marker_outranks_bell_and_active() {
 /// hue, so the danger assertion below is what pins the canceled arm.
 #[test]
 fn canceled_marker_is_dead_first() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::usage::{PlanInfo, PlanTier};
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.usage.as_mut().unwrap().plan = Some(PlanInfo {
@@ -451,6 +458,7 @@ fn long_lived_token_tags_type_column_and_expired_marks() {
 /// would double-signal, and the bar brackets stay plain dim.
 #[test]
 fn cached_row_colors_countdown_amber_and_underlines_nothing() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.fetch_status = Some(FetchStatus::Cached);
     let config = config_with(vec![a], None, vec![]);
@@ -483,6 +491,7 @@ fn cached_row_colors_countdown_amber_and_underlines_nothing() {
 
 #[test]
 fn failed_row_colors_countdown_red() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.fetch_status = Some(FetchStatus::Failed);
     let config = config_with(vec![a], None, vec![]);
@@ -521,6 +530,7 @@ fn reset_suffixes(line: &Line<'static>) -> Vec<Span<'static>> {
 /// third-party row's countdowns stayed faint however fast the window drained.
 #[test]
 fn third_party_row_drain_colors_both_countdowns() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let config = config_with(vec![third_party_profile(60.0, 30.0)], None, vec![]);
     let app = App::new(config);
     let widths = OverviewWidths::new(200, &app);
@@ -544,6 +554,7 @@ fn third_party_row_drain_colors_both_countdowns() {
 /// average pace, so it colors even though the 5h burn history is empty.
 #[test]
 fn oauth_row_drain_colors_the_seven_day_countdown() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 60.0, 9_000);
     a.usage.as_mut().unwrap().seven_day = Some(UsageWindow {
         utilization: 30.0,
@@ -671,6 +682,7 @@ fn credentialed_long_label_clamps_to_kind_width() {
 /// same config proves the dimming is per-profile, not global.
 #[test]
 fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
     let mut b = profile("b", 95.0, 10.0, 3600);
@@ -757,6 +769,7 @@ fn oauth_creds() -> ClaudeCredentials {
 /// every hue, which is what proves the flattening is per-row.
 #[test]
 fn disabled_row_flattens_every_semantic_hue_to_dim() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 90.0, 3600);
     a.disabled = true;
     a.credentials = Some(oauth_creds());

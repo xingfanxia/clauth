@@ -496,6 +496,7 @@ fn capture_name_caret_follows_edit_position() {
 
 #[test]
 fn status_selected_row_tint_spans_both_lines() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let config = AppConfig {
         state: AppState::default(),
         profiles: Vec::new(),
