@@ -355,6 +355,97 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
     assert!(config.is_active("b"));
 }
 
+/// Twin of the hop-off test above, but the only sibling is canceled: its
+/// cached 5h window reads as idle headroom (the exact shape `is_canceled`
+/// exists to catch), yet every request against it 403s. `fully_clear_target`
+/// — the scoped trigger's only walk — must skip it same as `next_target`
+/// does, so the trigger finds nothing and leaves the scoped-blocked active in
+/// place rather than relinking onto a dead account.
+#[test]
+fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_member() {
+    use crate::fallback::auto_switch_if_needed;
+    use crate::usage::{
+        PlanInfo, PlanTier, ScopedWindow, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs,
+    };
+    let _home = HomeSandbox::new();
+
+    let creds = |name: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let mut a = Profile::new("a".to_string(), None, None);
+    a.credentials = Some(creds("a"));
+    a.usage = Some(UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 40.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+        }),
+        weekly_scoped: vec![ScopedWindow {
+            label: "7d fable".into(),
+            window: UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+            },
+        }],
+        ..Default::default()
+    });
+    crate::profile::save_profile(&a).expect("save profile");
+
+    let mut b = Profile::new("b".to_string(), None, None);
+    b.credentials = Some(creds("b"));
+    b.usage = Some(UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 5.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: Some("canceled".to_string()),
+        }),
+        ..Default::default()
+    });
+    crate::profile::save_profile(&b).expect("save profile");
+
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(a.credentials.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let mut config = AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+
+    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    assert_eq!(
+        action, None,
+        "a scoped-blocked active must not hop onto a canceled member reading idle headroom"
+    );
+    assert!(
+        config.is_active("a"),
+        "active must stay put when the only sibling is canceled"
+    );
+}
+
 /// The pinned-sink guard on the same one-shot: identical shape, but the
 /// active is `last_resort` — parked on purpose, so the scoped hop must not
 /// un-park it (the scheduler-walk twin is

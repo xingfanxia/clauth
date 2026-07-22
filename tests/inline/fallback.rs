@@ -3947,6 +3947,32 @@ fn fully_clear_target_none_when_every_member_is_blocked() {
 }
 
 #[test]
+fn fully_clear_target_skips_canceled_and_disabled_members() {
+    // b: canceled (idle-looking usage, skipped), c: disabled (skipped),
+    // d: clear (the pick). Its `skip` closure must mirror `next_target`'s —
+    // a canceled or disabled member sorting first must not shadow a genuinely
+    // clear one further down the chain.
+    let config = config_with_chain(
+        vec![
+            profile_with_usage("a", Some(95.0), Some(both_windows(20.0, 40.0))),
+            profile_with_usage("b", Some(95.0), Some(canceled_usage())),
+            mark_disabled(profile_with_usage(
+                "c",
+                Some(95.0),
+                Some(both_windows(5.0, 30.0)),
+            )),
+            profile_with_usage("d", Some(95.0), Some(both_windows(5.0, 30.0))),
+        ],
+        "a",
+    );
+    assert_eq!(
+        fully_clear_target(&config, 98.0),
+        Some("d".to_string()),
+        "the walk must skip the canceled and disabled members"
+    );
+}
+
+#[test]
 fn scoped_gate_off_active_never_fires_the_scoped_hop() {
     // Active is model-blocked but its own `check_scoped` gate is off: no
     // scoped trigger, even with a clear sibling waiting.

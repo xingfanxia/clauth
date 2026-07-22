@@ -1366,7 +1366,12 @@ fn fully_clear_target(config: &AppConfig, weekly_pct: f64) -> Option<String> {
     let chain = &config.state.fallback_chain;
     let active_idx = chain.iter().position(|n| n == active)?;
     let skip = |i: usize| {
-        chain[i] == active || config.find(&chain[i]).is_none() || config.is_auth_broken(&chain[i])
+        let p = config.find(&chain[i]);
+        chain[i] == active
+            || p.is_none()
+            || config.is_auth_broken(&chain[i])
+            || p.is_some_and(is_canceled)
+            || p.is_some_and(Profile::is_disabled)
     };
     let pick = walk_chain(active_idx, chain.len(), &skip, &|i| {
         config
