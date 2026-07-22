@@ -4,36 +4,64 @@
 
 use super::*;
 
-/// The shape the sibling projects document: `rate_limit` with
-/// `primary_window`/`secondary_window`, weekly identified by its own
-/// duration (10080 min), epoch-seconds resets.
+/// The LIVE backend shape, captured verbatim (scrubbed) 2026-07-22:
+/// `limit_window_seconds` (not minutes), `reset_at` (not resets_at), the
+/// verdict at the TOP level, `secondary_window: null`, plus the credit and
+/// spend blocks the parser must ignore. The weekly 604800s window must route
+/// to the 7d slot with its absolute reset.
 #[test]
-fn parses_the_documented_backend_shape() {
-    let now = 1_700_000_000i64;
-    let body = format!(
-        r#"{{
-            "rate_limit": {{
-                "primary_window": {{
-                    "used_percent": 37.5,
-                    "resets_at": {reset},
-                    "window_minutes": 10080
-                }}
-            }},
-            "some_future_field": {{"ignored": true}}
-        }}"#,
-        reset = now + 3 * 86_400
-    );
+fn parses_the_live_backend_shape() {
+    let now = 1_785_000_000i64;
+    let body = r#"{
+        "user_id": "user-x", "account_id": "user-x", "email": "x@example.com",
+        "plan_type": "pro",
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary_window": {
+                "used_percent": 11,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 572214,
+                "reset_at": 1785258152
+            },
+            "secondary_window": null
+        },
+        "additional_rate_limits": [{"limit_name": "GPT-5.3-Codex-Spark"}],
+        "credits": {"has_credits": false, "balance": "0"},
+        "spend_control": {"reached": false},
+        "rate_limit_reached_type": null,
+        "rate_limit_reset_credits": {"available_count": 0}
+    }"#;
     let info = parse_wham_usage(body.as_bytes(), now).expect("parse");
-    let seven_day = info.seven_day.expect("weekly window routed by duration");
-    assert!((seven_day.utilization - 37.5).abs() < f64::EPSILON);
-    assert!(
-        seven_day
-            .resets_at
-            .as_deref()
-            .is_some_and(|iso| iso.starts_with("20")),
-        "epoch reset published as ISO"
+    let seven_day = info
+        .seven_day
+        .expect("604800s window routes to the weekly slot");
+    assert!((seven_day.utilization - 11.0).abs() < f64::EPSILON);
+    let secs = crate::usage::iso_to_epoch_secs(seven_day.resets_at.as_deref().expect("reset"))
+        .expect("iso");
+    assert_eq!(
+        secs, 1_785_258_152,
+        "absolute reset_at wins over the relative delta"
     );
     assert!(info.five_hour.is_none(), "no session window in this shape");
+    assert!(info.codex_rate_limit_reached.is_none());
+}
+
+/// A top-level verdict (the live shape's spelling) reaches the published
+/// snapshot when the block itself carries none.
+#[test]
+fn top_level_verdict_is_adopted() {
+    let now = 1_785_000_000i64;
+    let body = r#"{
+        "rate_limit": {
+            "primary_window": {"used_percent": 100, "limit_window_seconds": 604800, "reset_at": 1785258152}
+        },
+        "rate_limit_reached_type": "primary"
+    }"#;
+    let info = parse_wham_usage(body.as_bytes(), now).expect("parse");
+    // "primary" names the raw window, which routed WEEKLY — route_windows
+    // republishes it as the slot-equivalent verdict.
+    assert_eq!(info.codex_rate_limit_reached.as_deref(), Some("secondary"));
 }
 
 /// The JSONL-side spellings (`rate_limits`/`primary`/`secondary`) parse too —

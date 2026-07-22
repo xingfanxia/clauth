@@ -48,15 +48,19 @@ pub(crate) enum PollError {
 }
 
 /// The `wham/usage` response, parsed tolerantly: only the limiter block is
-/// read, every unknown field ignored. Field spellings differ between the
-/// JSONL snapshot (`rate_limits`/`primary`) and the backend response
-/// (`rate_limit`/`primary_window` observed in sibling projects) — aliases
-/// accept both so a shape drift on either side degrades to "unrecognized"
-/// only when the limiter block is genuinely gone.
+/// read, every unknown field ignored. The LIVE shape (captured 2026-07-22
+/// against the real backend): `rate_limit.{primary_window,secondary_window}`
+/// with `{used_percent, limit_window_seconds, reset_after_seconds, reset_at}`
+/// and a TOP-LEVEL `rate_limit_reached_type`. Aliases also accept the JSONL
+/// snapshot spellings (`rate_limits`/`primary`/`resets_at`/`window_minutes`)
+/// so either dialect parses; a genuine shape drift degrades to a loud
+/// "unrecognized" error, never a zeros publish.
 #[derive(Deserialize)]
 struct WhamUsage {
     #[serde(alias = "rate_limits")]
     rate_limit: Option<WhamRateLimit>,
+    #[serde(default)]
+    rate_limit_reached_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -69,19 +73,23 @@ struct WhamRateLimit {
     rate_limit_reached_type: Option<String>,
 }
 
-/// A limiter window as the backend spells it. `resets_in_seconds` (relative)
-/// is accepted alongside `resets_at` (absolute) — whichever the shape du jour
-/// carries, [`WhamWindow::into_limiter`] normalizes to absolute epoch secs.
+/// A limiter window in either dialect. Absolute `reset_at`/`resets_at` wins;
+/// a relative `reset_after_seconds`/`resets_in_seconds` normalizes to
+/// now + delta. Duration arrives as `limit_window_seconds` (live shape) or
+/// `window_minutes` (JSONL shape) — [`WhamWindow::into_limiter`] normalizes
+/// to minutes for [`route_windows`]'s slotting.
 #[derive(Deserialize)]
 struct WhamWindow {
     #[serde(default)]
     used_percent: f64,
-    #[serde(default)]
+    #[serde(default, alias = "reset_at")]
     resets_at: Option<i64>,
-    #[serde(default)]
+    #[serde(default, alias = "reset_after_seconds")]
     resets_in_seconds: Option<i64>,
     #[serde(default)]
     window_minutes: Option<i64>,
+    #[serde(default)]
+    limit_window_seconds: Option<i64>,
 }
 
 impl WhamWindow {
@@ -91,7 +99,9 @@ impl WhamWindow {
             resets_at: self
                 .resets_at
                 .or_else(|| self.resets_in_seconds.map(|s| now_secs + s)),
-            window_minutes: self.window_minutes,
+            window_minutes: self
+                .window_minutes
+                .or(self.limit_window_seconds.map(|s| s / 60)),
         }
     }
 }
@@ -102,6 +112,7 @@ impl WhamWindow {
 pub(crate) fn parse_wham_usage(body: &[u8], now_secs: i64) -> Result<UsageInfo, PollError> {
     let parsed: WhamUsage = serde_json::from_slice(body)
         .map_err(|e| PollError::Other(format!("unrecognized wham/usage shape: {e}")))?;
+    let top_verdict = parsed.rate_limit_reached_type;
     let Some(rl) = parsed.rate_limit else {
         return Err(PollError::Other(
             "wham/usage response carries no rate_limit block".to_string(),
@@ -110,7 +121,9 @@ pub(crate) fn parse_wham_usage(body: &[u8], now_secs: i64) -> Result<UsageInfo, 
     let (five_hour, seven_day, verdict) = route_windows(
         rl.primary_window.map(|w| w.into_limiter(now_secs)),
         rl.secondary_window.map(|w| w.into_limiter(now_secs)),
-        rl.rate_limit_reached_type,
+        // The live shape stamps the verdict at the TOP level; the JSONL
+        // dialect inside the block. Block-level wins when both exist.
+        rl.rate_limit_reached_type.or(top_verdict),
     );
     if five_hour.is_none() && seven_day.is_none() {
         return Err(PollError::Other(
