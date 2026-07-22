@@ -330,6 +330,24 @@ pub(crate) fn live_credentials_are_shell() -> bool {
     )
 }
 
+/// The unsaved-credentials gate shared by every switch / defer / divergence-prompt
+/// path: the live login diverges from what a switch to `active` installs AND holds
+/// a login worth protecting. Three diverging states carry nothing unsaved and are
+/// exempt — a first-login adoption (captured on switch, not stranded), a logged-out
+/// shell (blank tokens, see [`live_credentials_are_shell`]), and a clauth-owned
+/// symlink (its target IS a profile store, so re-pointing it loses no login, see
+/// [`live_login_is_clauth_symlink`]). Routing every gate through this one predicate
+/// keeps the exemptions from drifting apart. The underlying reads propagate their
+/// error; a boolean gate maps that to `false` with `.unwrap_or(false)`.
+pub(crate) fn live_diverged_and_unsaved(active: &str) -> Result<bool> {
+    Ok(
+        matches!(classify_credentials_link(active)?, LinkState::Diverged)
+            && !is_first_login(active)?
+            && !live_credentials_are_shell()
+            && !live_login_is_clauth_symlink(),
+    )
+}
+
 /// macOS: mirror a profile's stored OAuth login into the Keychain so Claude Code
 /// (which reads the Keychain, not the file) actually switches account. No-op when
 /// the profile has no stored `credentials.json` (a base_url profile, whose

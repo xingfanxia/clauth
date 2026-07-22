@@ -3352,12 +3352,7 @@ where
 /// first-login adoption (must be reconciled before clearing/relinking). A
 /// logged-out shell is exempt — an empty login needs no reconciling.
 fn active_diverged_unsaved(active: &str) -> bool {
-    matches!(
-        classify_credentials_link(active).ok(),
-        Some(LinkState::Diverged)
-    ) && !is_first_login(active).unwrap_or(false)
-        && !live_credentials_are_shell()
-        && !crate::claude::live_login_is_clauth_symlink()
+    crate::claude::live_diverged_and_unsaved(active).unwrap_or(false)
 }
 
 /// Toast and raise the Divergence prompt for `active` (`verb` = blocked action).
@@ -7241,6 +7236,14 @@ fn poll_credentials_divergence(app: &mut App) {
             }
             Err(e) => app.toast(ToastKind::Danger, format!("adopt failed\n{e}")),
         }
+        return;
+    }
+    // A clauth-owned symlink holds nothing unsaved — the next switch re-points it,
+    // losing no login — so it must not raise the banner. The switch/defer gates
+    // apply the same exemption through `live_diverged_and_unsaved`; the poll must
+    // adopt a first login before this point, so it checks the atomic here instead.
+    if crate::claude::live_login_is_clauth_symlink() {
+        app.divergence_pending = None;
         return;
     }
     resolve_or_note_divergence(app, &active);

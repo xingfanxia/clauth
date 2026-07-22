@@ -11,8 +11,9 @@ use anyhow::{Context, Result, bail};
 use crate::claude::{
     ClaudeEndpoint, LinkState, apply_profile_to_claude_settings, classify_credentials_link,
     clear_claude_credentials, force_link_profile_credentials, force_snapshot_active_credentials,
-    is_first_login, link_profile_credentials, live_credentials_are_shell, managed_env_key_label,
-    read_claude_credentials, read_claude_endpoint_config, snapshot_active_credentials,
+    is_first_login, link_profile_credentials, live_credentials_are_shell,
+    live_diverged_and_unsaved, managed_env_key_label, read_claude_credentials,
+    read_claude_endpoint_config, snapshot_active_credentials,
 };
 use crate::lock::with_state_lock;
 use crate::lockorder::RankedMutex;
@@ -140,11 +141,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     // exempt: capturing its blank tokens would destroy the outgoing profile's
     // stored login.
     let reconciled = match outgoing.as_deref() {
-        Some(active) => {
-            matches!(classify_credentials_link(active)?, LinkState::Diverged)
-                && !is_first_login(active)?
-                && !live_credentials_are_shell()
-        }
+        Some(active) => live_diverged_and_unsaved(active)?,
         None => false,
     };
 
@@ -275,11 +272,7 @@ pub(crate) fn switch_profile_noninteractive(
     // A logged-out shell is no divergence to resolve: skip the default and take
     // the plain switch, which replaces the empty file.
     let diverged = match previous.as_deref() {
-        Some(active) => {
-            matches!(classify_credentials_link(active)?, LinkState::Diverged)
-                && !is_first_login(active)?
-                && !live_credentials_are_shell()
-        }
+        Some(active) => live_diverged_and_unsaved(active)?,
         None => false,
     };
 

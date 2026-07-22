@@ -1383,6 +1383,59 @@ fn divergence_poll_ignores_a_logged_out_shell() {
     );
 }
 
+/// A clauth-owned symlink in the live slot is never "unsaved credentials": a
+/// long-lived `session-token.json` for the active profile flips its install
+/// source, so the live symlink classifies Diverged though re-pointing it loses
+/// no login. The 1Hz poll must NOT flag the banner — it repainted it every second.
+#[cfg(unix)]
+#[test]
+fn divergence_poll_ignores_a_stale_clauth_symlink() {
+    use crate::profile::{
+        AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, save_profile,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    // The live slot is clauth's own symlink into work's rotating store.
+    crate::claude::force_link_profile_credentials("work").expect("link work");
+    // A long-lived session token (no refresh token) flips work's install source;
+    // the stale symlink still points at credentials.json, so classify reads
+    // Diverged with nothing unsaved behind it.
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat-work".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let work_dir = crate::profile::profile_dir("work").expect("work dir");
+    std::fs::write(
+        work_dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("ser sidecar"),
+    )
+    .expect("write session-token sidecar");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into()],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_none(),
+        "a clauth-owned symlink is nothing to resolve — no 1Hz banner"
+    );
+    assert!(app.modals.is_empty(), "and certainly no modal");
+}
+
 /// The banner and the resolver both identify the live login's OWNER when it is
 /// a stored sibling — by exact token match here (the half-landed-switch shape)
 /// — and the resolver leads with the "switch to it" action.

@@ -283,6 +283,63 @@ fn drain_pending_switch_proceeds_over_a_logged_out_shell() {
     );
 }
 
+/// A clauth-owned symlink in the live slot is never "unsaved credentials":
+/// capturing a long-lived `setup-token` sidecar for the ACTIVE profile flips its
+/// install source from `credentials.json` to `session-token.json`, so the live
+/// symlink — still pointing at the old `credentials.json` store — classifies
+/// Diverged, yet re-pointing it on the next switch loses no login. The queued
+/// switch must PROCEED; deferring failed every unattended switch "unsaved
+/// credentials" until its retry TTL (observed live 2026-07-21 on the macOS fork).
+#[cfg(unix)]
+#[test]
+fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    // The live slot is clauth's own symlink into alpha's rotating store — clean.
+    link_active_clean("alpha");
+    // A long-lived session token appears for alpha (no refresh token → never
+    // rotates), flipping its install source to session-token.json while the live
+    // symlink still points at credentials.json — classify now reads Diverged
+    // though the symlink holds nothing unsaved.
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat-alpha".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let alpha_dir = crate::profile::profile_dir("alpha").expect("alpha dir");
+    std::fs::write(
+        alpha_dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("serialize sidecar"),
+    )
+    .expect("write session-token sidecar");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "a clauth-owned symlink holds nothing unsaved — the switch must proceed"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the executed switch leaves nothing queued"
+    );
+}
+
 /// A live file that does not PARSE is not a shell — it may be a CC write in
 /// progress, i.e. possibly a login. The divergence deferral stays armed for
 /// it, exactly like a real diverged login.
