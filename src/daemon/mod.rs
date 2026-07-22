@@ -168,8 +168,13 @@ pub(crate) fn serve() -> Result<()> {
 /// chain is testable without capturing log output.
 ///
 /// A disabled member is excluded: it is never spend-armed by the walk
-/// (`next_target` skips it as a candidate), so it can't actually be the
-/// uncapped spender this names — mirrors the `spend_is_uncapped` fix.
+/// (`next_target` skips it as a candidate), so it can't be the uncapped
+/// spender this names. Auth-broken and canceled members stay named even though
+/// that same walk skips them too: both clear on their own (a re-login, a
+/// re-subscribe), so going quiet about a member one re-auth away from billing
+/// errs the wrong way. `spend_is_uncapped` excludes them for the opposite
+/// reason: there they would count as a SINK catching the spend, where a
+/// hopeful read invents a safety net that isn't there.
 fn uncapped_spenders(config: &crate::profile::AppConfig) -> Vec<&str> {
     config
         .state

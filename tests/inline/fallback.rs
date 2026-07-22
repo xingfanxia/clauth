@@ -1698,6 +1698,44 @@ fn spend_is_uncapped_only_when_nothing_can_stop_the_billing() {
     );
 }
 
+// A parking spot the walk cannot reach is not a parking spot. The sink has to
+// be a chain member the target walk would actually accept, so a scan of every
+// profile on disk reads an unreachable sink as safety that isn't there and
+// leaves the DANGER tooltip and the daemon boot warning silent while the chain
+// bills.
+#[test]
+fn spend_is_uncapped_ignores_a_sink_the_walk_cannot_reach() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            spend_member("b", 5.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.state.spend_budget_switching = true;
+    config.state.switch_off_when_budget_spent = false;
+    config.profiles[0].last_resort = true;
+    assert!(
+        !spend_is_uncapped(&config, 5.0),
+        "a reachable sink stops the billing"
+    );
+
+    // Same sink, now auth-broken: the walk skips it, so it parks nothing.
+    config.state.auth_broken = vec!["a".into()];
+    assert!(
+        spend_is_uncapped(&config, 5.0),
+        "an auth-broken sink is not a parking spot"
+    );
+
+    // Same sink, off the chain entirely: unreachable for the same reason.
+    config.state.auth_broken.clear();
+    config.state.fallback_chain.retain(|n| n.as_str() != "a");
+    assert!(
+        spend_is_uncapped(&config, 5.0),
+        "a sink outside the chain is not a parking spot"
+    );
+}
+
 // `budget_spent_blocking` (the Usage-tab diagnostic's reader) gates a spent
 // budget behind 5h-exhaustion exactly like `blocked_reason`: a billing member
 // that maxed its money budget but still has free 5h quota serves for FREE and the

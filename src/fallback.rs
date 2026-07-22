@@ -166,13 +166,15 @@ pub(crate) fn spend_is_uncapped(config: &AppConfig, ceiling: f64) -> bool {
     config.state.spend_budget_switching
         && ceiling > 0.0
         && !config.state.switch_off_when_budget_spent
-        // A disabled `last_resort` member is invisible to the walk, so it is
-        // not a real safety net — counting it would under-report uncapped
-        // spend the moment its operator disables it.
-        && !config
-            .profiles
-            .iter()
-            .any(|p| p.last_resort && !p.is_disabled())
+        // A parking spot only counts if the walk could actually send work
+        // there: the same `candidate_excluded` the target walks skip on, read
+        // over the CHAIN rather than every profile on disk. A sink that is
+        // disabled, auth-broken, canceled, or was never added to the chain is
+        // unreachable, and counting it reports "something will stop the
+        // billing" while nothing can.
+        && !config.state.fallback_chain.iter().any(|name| {
+            !candidate_excluded(config, name) && config.find(name).is_some_and(|p| p.last_resort)
+        })
 }
 
 /// The fix list for an uncapped-spend config ([`spend_is_uncapped`]): the two
