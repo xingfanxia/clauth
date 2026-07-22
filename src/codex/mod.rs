@@ -11,6 +11,7 @@
 pub(crate) mod auth;
 pub(crate) mod login;
 pub(crate) mod oauth;
+pub(crate) mod poll;
 pub(crate) mod usage;
 
 use std::path::PathBuf;

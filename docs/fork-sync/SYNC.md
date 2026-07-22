@@ -48,12 +48,14 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
 
 ## Fork-delta inventory (what upstream does not have)
 
-- **Codex engine** (CDX-1..5): harness axis on `Profile`, isolated
+- **Codex engine** (CDX-1..6): harness axis on `Profile`, isolated
   CODEX_HOME starts + lease/adopt-back runtime, standby OAuth refresh,
   codex fallback chain + session-boundary walk, passive JSONL usage reader,
   localhost injection proxy (`src/proxy/*`, advisory-rank two-tier selection),
   `clauth resume <codex-profile>` carryover (dispatch-shared with upstream's
-  session resume), codex TUI rungs/tokens dashboard/route column.
+  session resume), codex TUI rungs/tokens dashboard/route column, CDX-6
+  read-only `wham/usage` polling per profile (60s, parked accounts included;
+  AX reversal 2026-07-22, kill switch `codex_usage_poll`).
 - **Scheduler hardening**: SCW-1 per-model scoped weekly windows in both
   walks, SCW-2 per-member gates + `weekly at` override (folded into
   `ChainMember.weekly_line/scoped_line/check_scoped`), RLS-1 stuck-rate-limit

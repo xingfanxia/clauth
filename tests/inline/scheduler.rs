@@ -2044,7 +2044,7 @@ fn try_seed_cache_seeds_any_cache_and_resumes_timer() {
     assert!(!store.lock().unwrap().contains_key("missing"));
     assert_eq!(
         status.lock().unwrap().get("idle").copied(),
-        Some(FetchStatus::Fresh),
+        Some(super::FetchStatus::Fresh),
         "a cache younger than one interval is Fresh",
     );
     assert_eq!(
@@ -2207,7 +2207,7 @@ fn bootstrap_third_party_seeds_any_cache() {
     );
     assert_eq!(
         status.lock().unwrap().get("cached").copied(),
-        Some(FetchStatus::Fresh),
+        Some(super::FetchStatus::Fresh),
         "a third-party cache younger than one interval surfaces as Fresh"
     );
     assert_eq!(
@@ -2726,6 +2726,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
         codex_standby: std::sync::Mutex::new(super::CodexStandbyPacing::default()),
+        codex_poll: std::sync::Mutex::new(super::CodexPollPacing::default()),
     };
 
     // A manual `r` landed just before this tick: forced name + Queued mark.
@@ -2805,6 +2806,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
         codex_standby: std::sync::Mutex::new(super::CodexStandbyPacing::default()),
+        codex_poll: std::sync::Mutex::new(super::CodexPollPacing::default()),
     };
 
     // Bootstrap pre-marked a cache-due profile; a rotate worker from the last
@@ -2884,6 +2886,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
         codex_standby: std::sync::Mutex::new(super::CodexStandbyPacing::default()),
+        codex_poll: std::sync::Mutex::new(super::CodexPollPacing::default()),
     };
 
     // Stamp `kitty` as just-fetched so it is NOT due this tick: an armed tick
@@ -3123,6 +3126,7 @@ fn completion_order_state() -> super::SchedulerState {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
         codex_standby: std::sync::Mutex::new(super::CodexStandbyPacing::default()),
+        codex_poll: std::sync::Mutex::new(super::CodexPollPacing::default()),
     }
 }
 
@@ -3344,7 +3348,6 @@ fn codex_profiles_are_excluded_from_both_fetch_legs() {
 // (the attribution gate).
 #[test]
 fn codex_passive_tick_publishes_an_attributable_snapshot() {
-    use crate::usage::FetchStatus;
     let _home = crate::testutil::HomeSandbox::new();
 
     // A codex profile holding the codex active slot.
@@ -3404,7 +3407,7 @@ fn codex_passive_tick_publishes_an_attributable_snapshot() {
     assert!((published.seven_day.as_ref().unwrap().utilization - 7.25).abs() < f64::EPSILON);
     assert_eq!(
         status.lock().unwrap().get("cdx-a").copied(),
-        Some(FetchStatus::Fresh)
+        Some(super::FetchStatus::Fresh)
     );
     assert!(
         last_fetched.lock().unwrap().contains_key("cdx-a"),
@@ -3826,7 +3829,6 @@ fn scan_codex_auto_switch_enqueues_past_a_pending_claude_entry() {
 // down (the proxy's per-account header feed is the sole usage writer).
 #[test]
 fn codex_passive_tick_stands_down_while_the_proxy_is_active() {
-    use crate::usage::FetchStatus;
     let _home = crate::testutil::HomeSandbox::new();
     let mut p = crate::testutil::blank_profile("cdx-a");
     p.harness = crate::profile::Harness::Codex;
@@ -3876,7 +3878,7 @@ fn codex_passive_tick_stands_down_while_the_proxy_is_active() {
     super::codex_passive_tick(&config, &store, &status, &last_fetched, &HashSet::new(), 0);
     assert_eq!(
         status.lock().unwrap().get("cdx-a").copied(),
-        Some(FetchStatus::Fresh),
+        Some(super::FetchStatus::Fresh),
         "passive leg resumes when the proxy heartbeat goes stale"
     );
 }
@@ -4155,4 +4157,164 @@ fn scan_recovery_queues_a_recovered_chain_member() {
         "a recovered chain member must be queued for switch"
     );
     assert_eq!(q[0].target, "b");
+}
+
+// ── CDX-6: active codex usage polling (`codex_poll_tick`) ────────────────────
+//
+// All offline — the poll closure is injected; the orchestration under test is
+// toggle → candidates → due gate → publish/widen. Uses the standby fixtures
+// (a codex profile with a stored, clock-live access token).
+
+fn poll_stores() -> (super::UsageStore, super::StatusStore) {
+    (
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+    )
+}
+
+fn poll_info(pct: f64) -> crate::usage::UsageInfo {
+    crate::usage::UsageInfo {
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: pct,
+            resets_at: None,
+        }),
+        ..Default::default()
+    }
+}
+
+/// A due codex profile polls with ITS stored token + account id and the
+/// result publishes through cache + store + status — per-account exact, no
+/// live session anywhere.
+#[test]
+fn codex_poll_publishes_a_parked_profiles_usage() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = codex_profile_config(&["cdx-poll"]);
+    crate::codex::write_profile_auth("cdx-poll", &standby_codex_fixture("acct-1", "rt", 3600))
+        .unwrap();
+    let (store, status) = poll_stores();
+    let pacing = std::sync::Mutex::new(super::CodexPollPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    super::codex_poll_tick(
+        &config,
+        &store,
+        &status,
+        &pacing,
+        now,
+        &|_token, account| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(account, Some("acct-1"), "polls with the stored account id");
+            Ok(poll_info(41.0))
+        },
+    );
+
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let published = store
+        .lock()
+        .unwrap()
+        .get("cdx-poll")
+        .cloned()
+        .expect("store");
+    assert!((published.seven_day.expect("7d").utilization - 41.0).abs() < f64::EPSILON);
+    assert!(matches!(
+        status.lock().unwrap().get("cdx-poll"),
+        Some(super::FetchStatus::Fresh)
+    ));
+    let cached: crate::usage::UsageInfo = crate::profile_cache::load_profile_cache(
+        "cdx-poll",
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .expect("cache");
+    assert!((cached.seven_day.expect("7d").utilization - 41.0).abs() < f64::EPSILON);
+
+    // Within the 60s cadence: a second tick is a no-op.
+    super::codex_poll_tick(&config, &store, &status, &pacing, now + 1_000, &|_, _| {
+        panic!("inside the poll gap — must not poll again")
+    });
+    // Past the cadence: due again.
+    super::codex_poll_tick(&config, &store, &status, &pacing, now + 61_000, &|_, _| {
+        Ok(poll_info(42.0))
+    });
+    assert!(
+        (store
+            .lock()
+            .unwrap()
+            .get("cdx-poll")
+            .unwrap()
+            .seven_day
+            .as_ref()
+            .unwrap()
+            .utilization
+            - 42.0)
+            .abs()
+            < f64::EPSILON
+    );
+}
+
+/// The kill switch: `codex_usage_poll = false` polls nothing.
+#[test]
+fn codex_poll_respects_the_kill_switch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = codex_profile_config(&["cdx-off"]);
+    crate::codex::write_profile_auth("cdx-off", &standby_codex_fixture("acct", "rt", 3600))
+        .unwrap();
+    config.lock().unwrap().state.codex_usage_poll = false;
+    let (store, status) = poll_stores();
+    let pacing = std::sync::Mutex::new(super::CodexPollPacing::default());
+    super::codex_poll_tick(
+        &config,
+        &store,
+        &status,
+        &pacing,
+        crate::usage::now_ms(),
+        &|_, _| panic!("toggle off — must not poll"),
+    );
+    assert!(store.lock().unwrap().is_empty());
+}
+
+/// A clock-expired stored token is a doomed request: no poll, wait for the
+/// CDX-3 standby refresh (read-only invariant — the poller NEVER renews).
+#[test]
+fn codex_poll_stands_down_on_a_clock_expired_token() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = codex_profile_config(&["cdx-exp"]);
+    crate::codex::write_profile_auth("cdx-exp", &standby_codex_fixture("acct", "rt", -60)).unwrap();
+    let (store, status) = poll_stores();
+    let pacing = std::sync::Mutex::new(super::CodexPollPacing::default());
+    super::codex_poll_tick(
+        &config,
+        &store,
+        &status,
+        &pacing,
+        crate::usage::now_ms(),
+        &|_, _| panic!("expired token — must not poll"),
+    );
+    assert!(store.lock().unwrap().is_empty());
+}
+
+/// A rejected token (server-side revocation the clock can't see) publishes
+/// nothing, keeps the cached numbers, and widens to the unauthorized pace.
+#[test]
+fn codex_poll_unauthorized_keeps_cache_and_widens() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = codex_profile_config(&["cdx-401"]);
+    crate::codex::write_profile_auth("cdx-401", &standby_codex_fixture("acct", "rt", 3600))
+        .unwrap();
+    let (store, status) = poll_stores();
+    let pacing = std::sync::Mutex::new(super::CodexPollPacing::default());
+    let now = crate::usage::now_ms();
+    super::codex_poll_tick(&config, &store, &status, &pacing, now, &|_, _| {
+        Err(crate::codex::poll::PollError::Unauthorized)
+    });
+    assert!(store.lock().unwrap().is_empty(), "nothing published");
+    // Still inside the widened window at +5min: no retry.
+    super::codex_poll_tick(
+        &config,
+        &store,
+        &status,
+        &pacing,
+        now + 5 * 60_000,
+        &|_, _| panic!("unauthorized widening — must not retry yet"),
+    );
 }

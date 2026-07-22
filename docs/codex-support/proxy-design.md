@@ -114,7 +114,8 @@ Every upstream response carries `x-codex-primary-*`/`x-codex-secondary-*`/
 `codex::usage`) and writes the owning profile's usage cache file — per-ACCOUNT live usage
 with zero extra requests, better attribution than the passive JSONL leg (which only ever
 sees the live account). The daemon's cache hydrate/status.json pick it up unchanged.
-`wham/usage` stays never-called.
+`wham/usage` stays never-called *by the proxy* — since 2026-07-22 the daemon's CDX-6 leg
+polls it read-only per profile (AX reversal; see feasibility §2.5's dated note).
 
 **Passive-leg handoff (review finding, 2026-07-16 — the two feeds are NOT benignly
 concurrent):** once the proxy rotates a request to account Y, codex logs **Y's** rate-limit

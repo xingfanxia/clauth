@@ -1,9 +1,10 @@
 //! Passive codex usage (CDX-2): the rate-limit snapshot codex embeds in its
 //! own session logs (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` — every
 //! `token_count` event carries a `rate_limits` block: 5h/7d windows with
-//! `used_percent` + `resets_at`). Zero network, zero credentials — the ONLY
-//! sanctioned codex usage source (feasibility §2.5: the out-of-band
-//! `wham/usage` endpoint is the ToS-detection path and is never called).
+//! `used_percent` + `resets_at`). Zero network, zero credentials. Originally
+//! the ONLY sanctioned codex usage source; since 2026-07-22 the CDX-6 poll
+//! leg (`codex::poll`) also asks `wham/usage` directly — this leg remains the
+//! zero-network fallback and the in-session freshness source.
 //!
 //! Ported from ccu's proven reader (`~/projects/devtools/ccu/src/codex.rs`),
 //! including its hard-won bound shape: session files are large (multi-MB is

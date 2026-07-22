@@ -2130,6 +2130,9 @@ pub(crate) struct SchedulerState {
     /// retry widening. Tick-thread-only state; a plain leaf mutex acquired
     /// while holding nothing else (never nested — outside `lockorder` ranks).
     codex_standby: std::sync::Mutex<CodexStandbyPacing>,
+    /// CDX-6 poll pacing: per-profile next-due stamps + error-dedup memos.
+    /// Same leaf-mutex discipline as `codex_standby`.
+    codex_poll: std::sync::Mutex<CodexPollPacing>,
 }
 
 /// Pacing state for the CDX-3 standby scan — cheap in-memory throttles so the
@@ -2265,6 +2268,19 @@ fn tick(state: &SchedulerState) {
         &state.codex_standby,
         now_ms(),
         &crate::codex::oauth::refresh,
+    );
+
+    // CDX-6: active usage polling for EVERY codex profile with a stored
+    // token — the leg that sees parked accounts (passive/proxy only see
+    // accounts that run). Read-only by invariant; 60s cadence per profile
+    // (codex CLI's own); lease-holder only, like the legs above.
+    codex_poll_tick(
+        &state.config,
+        &state.store,
+        &state.status,
+        &state.codex_poll,
+        now_ms(),
+        &|token, account_id| crate::codex::poll::fetch_wham_usage(token, account_id),
     );
 
     // Names actually scheduled this tick across both legs. A forced name absent
@@ -2479,6 +2495,161 @@ pub(super) fn codex_passive_tick(
                 );
             }
         }
+    }
+}
+
+/// CDX-6 per-profile poll cadence — codex CLI's own (~60s, openai/codex#10869),
+/// per AX 2026-07-22 ("那我们也每分钟刷新"). Traffic-shaped like the official
+/// client's own polling.
+const CODEX_POLL_GAP_MS: u64 = 60 * 1000;
+/// Widening after a failed poll: transient trouble retries in minutes, an
+/// Unauthorized token waits for CDX-3's standby refresh (~scan cadence), and
+/// a shape-drift error backs off hard — hammering a moved private API buys
+/// nothing but log spam.
+const CODEX_POLL_RETRY_MS: u64 = 5 * 60 * 1000;
+const CODEX_POLL_UNAUTHORIZED_MS: u64 = 15 * 60 * 1000;
+const CODEX_POLL_SHAPE_DRIFT_MS: u64 = 60 * 60 * 1000;
+
+/// Pacing for the CDX-6 poll: per-profile next-due stamps plus a last-error
+/// memo so a persistently failing profile logs the SAME error once, not every
+/// retry. In-memory only — losing it on restart costs one immediate poll.
+#[derive(Default)]
+pub(super) struct CodexPollPacing {
+    next_ms: HashMap<String, u64>,
+    last_error: HashMap<String, String>,
+}
+
+/// CDX-6 active poll leg. For each codex profile with a stored access token,
+/// GET `wham/usage` with THAT profile's token — per-account exact attribution
+/// (stronger than the identity-less JSONL leg), no live session required —
+/// and publish through the same cache/store/status channels as every other
+/// leg. Never refreshes anything: a clock-expired or rejected token stands
+/// down and waits for CDX-3.
+///
+/// `poll_fn` is injected (production: `codex::poll::fetch_wham_usage`) so the
+/// orchestration — toggle → candidates → due → publish/widen — is testable
+/// offline; only the injected closure ever touches the network.
+#[allow(
+    clippy::type_complexity,
+    reason = "injected poll seam, named at both call sites"
+)]
+pub(super) fn codex_poll_tick(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &StatusStore,
+    pacing: &std::sync::Mutex<CodexPollPacing>,
+    now: u64,
+    poll_fn: &dyn Fn(
+        &str,
+        Option<&str>,
+    )
+        -> std::result::Result<crate::usage::UsageInfo, crate::codex::poll::PollError>,
+) {
+    // Candidates under one short config-lock window; the polls themselves
+    // must never hold the lock.
+    let candidates: Vec<String> = {
+        let Ok(cfg) = config.lock() else { return };
+        if !cfg.state.codex_usage_poll {
+            return;
+        }
+        cfg.profiles
+            .iter()
+            .filter(|p| p.is_codex())
+            .map(|p| p.name.as_str().to_string())
+            .collect()
+    };
+    for name in candidates {
+        {
+            let Ok(p) = pacing.lock() else { return };
+            if p.next_ms.get(&name).is_some_and(|&t| now < t) {
+                continue;
+            }
+        }
+        let auth = match crate::codex::read_profile_auth(&name) {
+            Ok(Some(bytes)) => match crate::codex::auth::CodexAuthFile::parse(&bytes) {
+                Ok(a) => a,
+                Err(_) => {
+                    // Unparseable store — the capture/adopt paths own that
+                    // problem; poll again at the normal cadence in case it heals.
+                    defer_poll(pacing, &name, now + CODEX_POLL_RETRY_MS);
+                    continue;
+                }
+            },
+            // No codex login stored (or unreadable): nothing to poll with.
+            _ => {
+                defer_poll(pacing, &name, now + CODEX_POLL_RETRY_MS);
+                continue;
+            }
+        };
+        let Some(token) = auth.access_token().map(str::to_string) else {
+            defer_poll(pacing, &name, now + CODEX_POLL_RETRY_MS);
+            continue;
+        };
+        // A clock-expired token is a doomed request — stand down for CDX-3's
+        // standby refresh instead of collecting a 401.
+        if auth
+            .access_token_exp_ms()
+            .is_some_and(|exp| (now as i64) >= exp)
+        {
+            defer_poll(pacing, &name, now + CODEX_POLL_UNAUTHORIZED_MS);
+            continue;
+        }
+        let account_id = auth.account_id();
+        match poll_fn(&token, account_id.as_deref()) {
+            Ok(info) => {
+                write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+                if let Ok(mut s) = store.lock() {
+                    s.insert(name.clone(), info);
+                }
+                if let Ok(mut st) = status.lock() {
+                    st.insert(name.clone(), FetchStatus::Fresh);
+                }
+                if let Ok(mut p) = pacing.lock() {
+                    p.last_error.remove(&name);
+                    p.next_ms.insert(name, now + CODEX_POLL_GAP_MS);
+                }
+            }
+            Err(e) => {
+                let (delay, msg) = match &e {
+                    crate::codex::poll::PollError::Unauthorized => (
+                        CODEX_POLL_UNAUTHORIZED_MS,
+                        format!(
+                            "'{name}' wham/usage rejected the stored token (standby refresh will renew it)"
+                        ),
+                    ),
+                    crate::codex::poll::PollError::RateLimited => (
+                        CODEX_POLL_RETRY_MS,
+                        format!("'{name}' wham/usage rate-limited"),
+                    ),
+                    crate::codex::poll::PollError::Other(detail) => {
+                        let drift =
+                            detail.contains("unrecognized") || detail.contains("no rate_limit");
+                        (
+                            if drift {
+                                CODEX_POLL_SHAPE_DRIFT_MS
+                            } else {
+                                CODEX_POLL_RETRY_MS
+                            },
+                            format!("'{name}' codex usage poll failed: {detail}"),
+                        )
+                    }
+                };
+                if let Ok(mut p) = pacing.lock() {
+                    // Same error as last time = already logged; new text = loud once.
+                    if p.last_error.get(&name).map(String::as_str) != Some(msg.as_str()) {
+                        logline!("clauth: {msg}");
+                        p.last_error.insert(name.clone(), msg);
+                    }
+                    p.next_ms.insert(name, now + delay);
+                }
+            }
+        }
+    }
+}
+
+fn defer_poll(pacing: &std::sync::Mutex<CodexPollPacing>, name: &str, until: u64) {
+    if let Ok(mut p) = pacing.lock() {
+        p.next_ms.insert(name.to_string(), until);
     }
 }
 
@@ -2861,6 +3032,7 @@ pub(crate) fn spawn_refresher(
         fetch_lease,
         standdown_active: AtomicBool::new(false),
         codex_standby: std::sync::Mutex::new(CodexStandbyPacing::default()),
+        codex_poll: std::sync::Mutex::new(CodexPollPacing::default()),
     };
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
     std::thread::Builder::new()

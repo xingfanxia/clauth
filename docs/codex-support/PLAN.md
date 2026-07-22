@@ -584,8 +584,10 @@ tag + usage bar present), not eyeballing.
 ## Non-goals (standing)
 
 Live-session hot-swap via **file** (impossible — but CDX-5's proxy delivers true in-session
-fallback the other way, shipped); `wham/usage` or any backend polling (never — the proxy's
-usage comes only from flow-through response headers); keyring store mode; auto-start kick for
+fallback the other way, shipped); ~~`wham/usage` or any backend polling~~ (REVERSED
+2026-07-22, AX — CDX-6 polls `wham/usage` read-only per profile at codex's own 60s cadence;
+the proxy's usage still comes only from flow-through headers; feasibility §2.5 carries the
+full reversal note); keyring store mode; auto-start kick for
 codex; cross-harness fallback chains (each chain is single-harness by construction);
 `clauth which` stays claude-only (codex has no `CLAUDE_CONFIG_DIR`-style session
 classification — `clauth start <codex-profile>` isolates via `CODEX_HOME` instead, CDX-1b).

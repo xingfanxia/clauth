@@ -1670,3 +1670,32 @@ proxy, AND any long-lived TUI (tmux windows!); pgrep by image age, not by
 role. (2) config.toml unknown-key wipe by old binaries is a standing hazard —
 follow-up: preserve unknown keys in maybe_rewrite_config_toml (toml_edit
 round-trip) so future flags survive stale writers.
+
+## 2026-07-22 (CDX-6) — read-only wham/usage polling: parked codex accounts get live usage
+
+AX report: parked codex accounts' usage froze at their last live session
+(ax-codex-xfx wore "week spent" days after its weekly reset). Investigation
+(3 sibling projects source-read): everyone polls
+`GET chatgpt.com/backend-api/wham/usage` with the stored access token — no
+live session needed — and codex CLI itself polls the same endpoint ~60s
+(openai/codex#10869). AX REVERSED the feasibility §2.5 ban (option A;
+cadence "那我们也每分钟刷新"). Bounding fixes shipped first: walk was already
+reset-aware; ccsbar spent-pill made reset-aware (b702841).
+
+Shipped (fork main):
+- `src/codex/poll.rs`: tolerant wham parse (rate_limit|rate_limits,
+  primary_window|primary aliases, resets_at|resets_in_seconds normalize)
+  through the SAME route_windows slotting as the passive leg; PollError
+  {Unauthorized, RateLimited, Other}; bare headers (Authorization + Accept +
+  ChatGPT-Account-Id — no invented UA). READ-ONLY invariant: never refreshes,
+  never writes auth; 401 waits for CDX-3.
+- `codex_poll_tick` in the scheduler (lease-holder leg after standby): all
+  codex profiles, 60s/profile cadence, clock-expired tokens stand down,
+  Unauthorized widens 15m, shape-drift widens 1h, same-error log dedup;
+  publishes via cache+store+status like every leg.
+- `AppState.codex_usage_poll` kill switch, default ON.
+- Docs: feasibility §2.5 dated reversal note (accounts/credit endpoints stay
+  banned), proxy-design + PLAN non-goal annotations, usage.rs module doc,
+  SYNC.md CDX-1..6.
+- Tests: 4 parse + 4 tick orchestration (offline, injected poll seam);
+  1566 green, clippy 0.

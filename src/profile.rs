@@ -409,6 +409,14 @@ pub(crate) struct AppState {
     /// See `usage::scheduler::proactive_rotation_due`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) preemptive_rotation: bool,
+    /// CDX-6: poll `wham/usage` for codex profiles' rate-limit windows with
+    /// their stored access tokens — per-account live usage without a running
+    /// session (the passive JSONL/proxy legs only see accounts that run).
+    /// Default ON (AX decision 2026-07-22, reversing feasibility §2.5's ban —
+    /// see `codex::poll`); the off switch exists because the endpoint is a
+    /// private API that may change or gate without notice.
+    #[serde(default = "default_codex_usage_poll", skip_serializing_if = "is_true")]
+    pub(crate) codex_usage_poll: bool,
     /// Opt-in: on an `--isolated` `clauth start`, lift the run's transcripts out
     /// of the throwaway `runtime-isolated/projects/` store into the global
     /// `~/.claude/projects/` before the runtime is GC'd — so the session stays
@@ -551,6 +559,12 @@ fn default_refresh_spent() -> bool {
     true
 }
 
+/// CDX-6 codex usage polling defaults ON (AX decision 2026-07-22); the flag
+/// exists as the kill switch for a private-API dependency.
+fn default_codex_usage_poll() -> bool {
+    true
+}
+
 /// A spent budget stops spending unless the operator says otherwise, so this
 /// defaults ON — unlike `switch_off_when_spent`, whose default keeps you signed in because
 /// staying costs nothing there.
@@ -630,6 +644,7 @@ impl Default for AppState {
             spend_budget_switching: false,
             switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: false,
+            codex_usage_poll: default_codex_usage_poll(),
             auto_rescue: false,
             refresh_spent_accounts: true,
             theme: None,

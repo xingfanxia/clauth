@@ -277,8 +277,15 @@ zero network.
   older releases used resets-in-seconds — tolerate both).
 - **Every `token_count` JSONL event embeds the full snapshot** (§2.6) → the passive source.
 - Out-of-band endpoints `GET chatgpt.com/backend-api/wham/usage` and `/backend-api/accounts`
-  exist and are used by third-party tools — **the ToS-detection-risk path; community READMEs
-  themselves warn about it. Do not use.**
+  exist and are used by third-party tools — originally classified **the ToS-detection-risk
+  path; do not use** (following loongphy/codex-auth's own README warning).
+  **REVERSED for `wham/usage` only (2026-07-22, AX, CDX-6)**: re-investigation found codex
+  CLI itself polls that endpoint ~every 60s (openai/codex#10869) and three sibling projects
+  (steipete/CodexBar, mryll/codexbar, MacSteini/Codex-Usage) ship it with no reported
+  incidents — the risk re-classified as "private API may change without notice", not
+  detection. `codex::poll` now polls it read-only per profile at codex's own cadence
+  (stored access token, never a refresh; CDX-3 remains the sole renewer; kill switch
+  `codex_usage_poll = false`). `/backend-api/accounts` and the credit endpoints stay banned.
 - Local freshness measurement (2026-07-12): newest session's rate_limits snapshot was 14 s old
   while codex was active. Idle accounts go stale, but idle accounts aren't burning — staleness
   only over-estimates `used_percent` (conservative for headroom walks), and `resets_at < now`
@@ -346,7 +353,8 @@ a claude one).
 - **CDX-4 fallback chain + tokens feed**: codex chain with session-boundary semantics; JSONL
   usage into tokens.json with a source dimension (ccsbar/ccu follow).
 
-**Explicit non-goals**: live-session hot-swap; `wham/usage` polling; keyring store mode
+**Explicit non-goals**: live-session hot-swap; ~~`wham/usage` polling~~ (adopted 2026-07-22
+as CDX-6 — see the reversal note above); keyring store mode
 (detect `cli_auth_credentials_store = "keyring"` in config.toml and refuse with a clear
 message); auto-start kick.
 
