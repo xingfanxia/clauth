@@ -14,12 +14,38 @@ stays the only resolution surface.
 ## Process model
 
 - **Singleton**: one advisory lock (`~/.clauth/clauthd.lock`) held for the
-  process lifetime. A second `clauth daemon` blocks in standby and takes over
-  the moment the holder exits; a dead holder's flock auto-releases, so a
-  supervisor (`launchd`/`systemd`) with restart-on-crash keeps exactly one
-  scheduler alive without pidfile bookkeeping. The TUI header's `● daemon` dot
-  reads this lock (presence) plus `status.json` freshness (green = fresh feed,
-  amber = stalling, hidden = no daemon) to show whether one is running.
+  process lifetime, with the holder's pid written into it for `ps`-level
+  diagnosis (informational: the flock, never the number, is what proves
+  presence). A second `clauth daemon` blocks in standby and takes over the
+  moment the holder exits, so a supervisor's instance can queue behind a
+  manually run one under launchd `KeepAlive{SuccessfulExit=false}`, which never
+  restarts a clean exit. That queue is **one deep**: a second flock
+  (`clauthd-standby.lock`) holds the slot, and any further `clauth daemon` logs
+  one line and exits 0 rather than parking, so a spawner that fires repeatedly
+  can't pile up idle daemons. A dead holder's flock auto-releases, so a
+  supervisor with restart-on-crash keeps exactly one scheduler alive without
+  pidfile bookkeeping. The TUI header's `● daemon` dot reads this lock
+  (presence) plus `status.json` freshness (green = fresh feed, amber = stalling,
+  hidden = no daemon) to show whether one is running.
+- **Asking before spawning**: `clauth daemon --status` prints
+  `running (pid <n>, feed fresh|stale[, standby waiting])` and exits 0 when a
+  daemon is up. No daemon: exit 1, nothing on stdout. It creates nothing, so a
+  menu-bar app or a wrapper script can gate its spawn on the exit code instead
+  of starting a process to find out. A lock file it cannot test at all (no
+  working `flock`, e.g. some NFS/CIFS mounts) is its own failure with the io
+  error attached, never an exit 1 that reads as "none running" and sends a
+  supervisor into a respawn loop. The header dot answers the same question by
+  hiding instead, which is why the two read the lock through different paths.
+  `clauth daemon --no-standby` suits the same callers: it exits the moment it
+  loses the race rather than taking the standby slot. Keep it out of a supervisor
+  unit, though. An instance that loses the race
+  exits 0, launchd `KeepAlive{SuccessfulExit=false}` never restarts it, and
+  nothing is left to take over when the winner quits.
+- **Probes take the lock they read**, briefly: both the header dot's
+  `daemon_health` and `--status` try-lock a free file and release it. A starting
+  daemon therefore re-tries a lost race (3 attempts, 100 ms apart) before it
+  accepts that another instance is up. A real holder keeps its lock for life, so
+  anything that clears on a retry was a reader.
 - **Watchdog**: a wedged tick can freeze the single-threaded loop. The
   cross-process state flock a tick may block on is capped at 25 s, so a
   flock-blocked tick times out and retries rather than hanging; if no tick
