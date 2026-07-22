@@ -191,7 +191,18 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             FallbackHint::DetailThresholdEdit => {
                 &[("↵", "save"), ("←→", "caret"), ("esc", "cancel")]
             }
-            FallbackHint::DetailLastResort => &[
+            FallbackHint::DetailWeeklyAt => &[
+                ("↑↓", "row"),
+                ("↵", "type"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
+            FallbackHint::DetailWeeklyAtEdit => {
+                &[("↵", "save"), ("←→", "caret"), ("esc", "cancel")]
+            }
+            FallbackHint::DetailCheckWeekly
+            | FallbackHint::DetailCheckScoped
+            | FallbackHint::DetailLastResort => &[
                 ("↑↓", "row"),
                 ("space/↵", "toggle"),
                 ("a", "actions"),
@@ -228,6 +239,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             fallback_hint(app),
             FallbackHint::DetailThresholdEdit
                 | FallbackHint::DetailMaxSpendEdit
+                | FallbackHint::DetailWeeklyAtEdit
                 | FallbackHint::DetailRemoveArmed
         ))
         || (app.tab == Tab::Config && app.refresh_interval_draft.is_some()));

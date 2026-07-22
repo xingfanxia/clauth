@@ -2939,6 +2939,35 @@ fn all_spent_banner_ignores_a_soft_blocked_member_that_still_serves() {
     );
 }
 
+/// A member weekly line UNDER the hard cap is a switch line, not death: 7d at
+/// 95 with a `weekly at 90` override is past ITS line (the walk rotates off
+/// it) but still serves. The banner keys on [`is_exhausted_hard`] — folding
+/// the member line here would claim "all accounts spent" over a member that
+/// answers requests fine. The fixture's override is what makes this test
+/// discriminate: with no override the member line IS the hard cap, and the
+/// folding revision passes it too.
+#[test]
+fn all_spent_banner_ignores_a_member_line_under_the_hard_cap() {
+    use super::update_banner;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mut overridden = crate::testutil::blank_profile("a");
+    overridden.weekly_threshold = Some(90.0);
+    overridden.usage = Some(UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 95.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 86_400)),
+        }),
+        ..UsageInfo::default()
+    });
+    let mut app = app_with_unlinked_profiles(vec![overridden]);
+    update_banner(&mut app);
+    assert_eq!(
+        app.banner.as_ref().expect("banner").message,
+        "no active account · select one to resume",
+        "past the member line but under the cap still serves — not spent"
+    );
+}
+
 /// The same member at the hard cap IS spent.
 #[test]
 fn all_spent_banner_fires_at_the_weekly_hard_cap() {
@@ -3139,7 +3168,7 @@ fn fallback_last_resort_toggle_persists_and_refreshes_tokens() {
     app.tab = Tab::Fallback;
     app.fallback_focus = super::FallbackFocus::Detail;
     app.chain_cursor = 0;
-    app.fallback_detail_cursor = 1; // FALLBACK_ROWS[1] == LastResort
+    app.fallback_detail_cursor = 4; // FALLBACK_ROWS[4] == LastResort
 
     assert!(
         !app.config().find("a").is_some_and(|p| p.last_resort),
@@ -3185,7 +3214,7 @@ fn fallback_last_resort_is_exclusive_across_the_chain() {
     app.tab = Tab::Fallback;
     app.fallback_focus = super::FallbackFocus::Detail;
     app.chain_cursor = 0; // member "a"
-    app.fallback_detail_cursor = 1; // FALLBACK_ROWS[1] == LastResort
+    app.fallback_detail_cursor = 4; // FALLBACK_ROWS[4] == LastResort
 
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
 
@@ -3208,6 +3237,43 @@ fn fallback_last_resort_is_exclusive_across_the_chain() {
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
     assert_eq!(app.config().find("a").map(|p| p.last_resort), Some(false));
     assert_eq!(app.config().find("b").map(|p| p.last_resort), Some(false));
+}
+
+// The per-account usage gates flip and persist through their toggle rows,
+// independently of each other.
+#[test]
+fn fallback_usage_gate_toggles_persist() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+
+    app.fallback_detail_cursor = 2; // FALLBACK_ROWS[2] == CheckWeekly
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config()
+            .find("a")
+            .map(|p| (p.check_weekly, p.check_scoped)),
+        Some((false, true)),
+        "space flips only the weekly gate"
+    );
+
+    app.fallback_detail_cursor = 3; // FALLBACK_ROWS[3] == CheckScoped
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config()
+            .find("a")
+            .map(|p| (p.check_weekly, p.check_scoped)),
+        Some((false, false)),
+        "⏎ flips only the scoped gate"
+    );
+
+    // The off states survive a config reload from disk (persisted, not
+    // just in-memory).
+    let reloaded = crate::profile::load_profile("a").expect("reload profile");
+    assert!(!reloaded.check_weekly);
+    assert!(!reloaded.check_scoped);
 }
 
 // ── tokens tab: model filter via the action menu ─────────────────────────────
@@ -4252,4 +4318,83 @@ fn bootstrap_one_shot_skips_a_non_fresh_active_read() {
             "{status:?} must decide nothing, so it announces nothing",
         );
     }
+}
+
+/// FALLBACK_ROWS index of the `weekly at` override editor.
+fn weekly_at_row() -> usize {
+    super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::WeeklyAt)
+        .expect("WeeklyAt row exists")
+}
+
+// The per-member weekly override: ⏎ opens seeded with the current override
+// (empty when following the chain default), a typed value persists, and an
+// EMPTY commit clears back to the default. Inert while the weekly gate is off.
+#[test]
+fn fallback_weekly_override_editor_sets_and_clears() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    // ⏎ opens the editor with an EMPTY seed (no override yet).
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_weekly_draft.is_some(), "⏎ opens the field");
+    for c in ['9', '0'] {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_weekly_draft.is_none(), "⏎ closes the field");
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(90.0),
+        "the typed override persists"
+    );
+
+    // Re-open: seeded with "90"; clear it and commit EMPTY → back to default.
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    for _ in 0..2 {
+        super::handle_key(&mut app, key(KeyCode::Backspace));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        None,
+        "an empty commit clears the override"
+    );
+
+    // Out-of-range keeps the field open, writes nothing (no-toast contract).
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    for c in ['1', '5', '0'] {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.fallback_weekly_draft.is_some(), "invalid stays open");
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        None
+    );
+}
+
+// The override row is inert while the member's weekly gate is off — the line
+// isn't judged there, so ⏎ must not open the editor.
+#[test]
+fn fallback_weekly_override_editor_is_inert_while_gate_is_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut a = crate::testutil::blank_profile("a");
+    a.check_weekly = false;
+    let mut app = app_with_unlinked_profiles(vec![a]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.fallback_weekly_draft.is_none(),
+        "⏎ must not open the editor while the weekly gate is off"
+    );
 }

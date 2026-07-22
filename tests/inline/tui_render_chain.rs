@@ -22,8 +22,11 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: Some(threshold),
+        weekly_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: None,
@@ -69,11 +72,11 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
     let b = profile("b", 95.0, 100.0, 1800);
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let on_a = member_detail(&cfg, "a", false, 0, false, None, None, 60, None).0;
+    let on_a = member_detail(&cfg, "a", false, 0, false, None, None, None, 60, None).0;
     let hint_a = resumes_line(&on_a).expect("resumes hint renders while viewing member a");
     assert!(hint_a.contains("resumes: b in ~"), "{hint_a}");
 
-    let on_b = member_detail(&cfg, "b", false, 0, false, None, None, 60, None).0;
+    let on_b = member_detail(&cfg, "b", false, 0, false, None, None, None, 60, None).0;
     let hint_b = resumes_line(&on_b).expect("resumes hint renders while viewing member b");
     assert!(hint_b.contains("resumes: b in ~"), "{hint_b}");
 }
@@ -85,7 +88,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let lines = member_detail(&cfg, "a", false, 0, false, None, None, 60, None).0;
+    let lines = member_detail(&cfg, "a", false, 0, false, None, None, None, 60, None).0;
     assert!(
         resumes_line(&lines).is_none(),
         "must not show when the chain isn't fully exhausted"
@@ -102,8 +105,12 @@ fn last_resort_hint_wraps_on_a_narrow_pane() {
     let b = profile("b", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    // Focused on the `last resort` row (FALLBACK_ROWS[1]) at 28 cols.
-    let lines = member_detail(&cfg, "a", true, 1, false, None, None, 28, None).0;
+    // Focused on the `last resort` row at 28 cols.
+    let lr = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::LastResort)
+        .unwrap();
+    let lines = member_detail(&cfg, "a", true, lr, false, None, None, None, 28, None).0;
     let texts: Vec<String> = lines.iter().map(line_text).collect();
     let lead = texts
         .iter()
@@ -131,13 +138,93 @@ fn last_resort_hint_names_the_currently_marked_member() {
     b.last_resort = true;
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let lines = member_detail(&cfg, "a", true, 1, false, None, None, 80, None).0;
+    let lines = member_detail(&cfg, "a", true, 4, false, None, None, None, 80, None).0;
     let hint = lines
         .iter()
         .map(line_text)
         .find(|t| t.contains("└"))
         .expect("hint renders");
     assert!(hint.contains("instead of 'b'"), "{hint}");
+}
+
+// The per-account usage-gate rows render as toggles whose hint states the
+// CURRENT walk behavior for this account, flipping wording with the gate.
+#[test]
+fn usage_gate_rows_hint_the_current_state() {
+    let texts = |p: Profile, cursor: usize| -> Vec<String> {
+        let cfg = config_with(vec![p], Some("a"), vec!["a"]);
+        member_detail(&cfg, "a", true, cursor, false, None, None, None, 80, None)
+            .0
+            .iter()
+            .map(line_text)
+            .collect()
+    };
+
+    // FALLBACK_ROWS[2] == CheckWeekly.
+    let on = texts(profile("a", 95.0, 20.0, 3600), 2);
+    assert!(on.iter().any(|t| t.contains("weekly gate")), "{on:?}");
+    assert!(
+        on.iter()
+            .any(|t| t.contains("out of rotation") && t.contains("weekly usage")),
+        "{on:?}"
+    );
+    let mut p = profile("a", 95.0, 20.0, 3600);
+    p.check_weekly = false;
+    let off = texts(p, 2);
+    assert!(off.iter().any(|t| t.contains("isn't checked")), "{off:?}");
+
+    // FALLBACK_ROWS[3] == CheckScoped.
+    let on = texts(profile("a", 95.0, 20.0, 3600), 3);
+    assert!(on.iter().any(|t| t.contains("scoped gate")), "{on:?}");
+    assert!(on.iter().any(|t| t.contains("per-model week")), "{on:?}");
+    let mut p = profile("a", 95.0, 20.0, 3600);
+    p.check_scoped = false;
+    let off = texts(p, 3);
+    assert!(
+        off.iter()
+            .any(|t| t.contains("stays in rotation for other models")),
+        "{off:?}"
+    );
+}
+
+// A gated-on per-model week over the line pills the detail card with its
+// label; the gate off drops it (chip and walk must not drift).
+#[test]
+fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
+    let scoped = |check_scoped: bool| -> Profile {
+        let mut p = profile("a", 95.0, 20.0, 3600);
+        p.check_scoped = check_scoped;
+        if let Some(u) = p.usage.as_mut() {
+            u.seven_day = Some(UsageWindow {
+                utilization: 40.0,
+                resets_at: Some(reset_in(5 * 86_400)),
+            });
+            u.weekly_scoped = vec![crate::usage::ScopedWindow {
+                label: "7d fable".to_string(),
+                window: UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some(reset_in(5 * 86_400)),
+                },
+            }];
+        }
+        p
+    };
+
+    let cfg = config_with(vec![scoped(true)], Some("a"), vec!["a"]);
+    let lines = member_detail(&cfg, "a", false, 0, false, None, None, None, 80, None).0;
+    let pill = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("7d fable"))
+        .expect("scoped pill renders");
+    assert!(pill.contains("other models ok"), "{pill}");
+
+    let cfg = config_with(vec![scoped(false)], Some("a"), vec!["a"]);
+    let lines = member_detail(&cfg, "a", false, 0, false, None, None, None, 80, None).0;
+    assert!(
+        !lines.iter().map(line_text).any(|t| t.contains("7d fable")),
+        "gate off must drop the scoped pill"
+    );
 }
 
 // The `max spend` hint names whichever half of the opt-in is holding spending
@@ -203,7 +290,7 @@ fn value_col(key: &str, rendered: &str) -> usize {
 fn last_resort_value_aligns_with_other_rows() {
     let a = profile("a", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a], Some("a"), vec!["a"]);
-    let texts: Vec<String> = member_detail(&cfg, "a", true, 1, false, None, None, 60, None)
+    let texts: Vec<String> = member_detail(&cfg, "a", true, 1, false, None, None, None, 60, None)
         .0
         .iter()
         .map(line_text)
@@ -252,7 +339,7 @@ fn last_resort_value_aligns_with_other_rows() {
 fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
     let cfg = config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
     let row = |c: &crate::profile::AppConfig| -> String {
-        member_detail(c, "a", true, 1, false, None, None, 60, None)
+        member_detail(c, "a", true, 1, false, None, None, None, 60, None)
             .0
             .iter()
             .map(line_text)
@@ -440,7 +527,7 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
 #[test]
 fn blocked_member_shows_the_worst_reason_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 97.0, 7200)], Some("a"), vec!["a"]);
-    let lines = member_detail(&cfg, "a", false, 0, false, None, None, 60, None).0;
+    let lines = member_detail(&cfg, "a", false, 0, false, None, None, None, 60, None).0;
     let pill = line_text(&lines[0]);
     assert!(pill.contains('['), "renders as a status pill: {pill:?}");
     assert!(
@@ -463,7 +550,19 @@ fn blocked_member_shows_the_worst_reason_pill() {
 fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
     let until = now_epoch_secs() + 7200;
-    let lines = member_detail(&cfg, "a", false, 0, false, None, None, 60, Some(until)).0;
+    let lines = member_detail(
+        &cfg,
+        "a",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        60,
+        Some(until),
+    )
+    .0;
     let pill = line_text(&lines[0]);
     // Bare pill + a faint countdown suffix OUTSIDE the brackets (no `·`), the
     // same shape the Usage-tab kick pill renders. The exact bucket stays tolerant
@@ -500,7 +599,7 @@ fn canceled_member_shows_the_short_shared_label() {
 #[test]
 fn headroom_member_shows_no_reason_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
-    let lines = member_detail(&cfg, "a", false, 0, false, None, None, 60, None).0;
+    let lines = member_detail(&cfg, "a", false, 0, false, None, None, None, 60, None).0;
     let first = line_text(&lines[0]);
     assert!(
         !first.contains('['),
@@ -524,7 +623,8 @@ fn headroom_member_shows_no_reason_pill() {
 #[test]
 fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_height() {
     let at_width = |cfg: &AppConfig, width: usize| -> (usize, usize) {
-        let (lines, rows_start) = member_detail(cfg, "a", false, 0, false, None, None, width, None);
+        let (lines, rows_start) =
+            member_detail(cfg, "a", false, 0, false, None, None, None, width, None);
         let first_row_at = lines
             .iter()
             .position(|l| line_text(l).contains("rotate at"))
@@ -636,13 +736,15 @@ fn typed_threshold_caret_lands_on_the_rotate_at_row_at_every_header_height() {
     check(two_pills(), "2 pills, hard-wrapped", 26, 40);
 }
 
-/// The card does not scroll, and the header block can now push `rotate at` off
-/// a short pane entirely (two pills, each dragging a fix line that wraps). The
-/// caret must NOT be placed then: `set_cursor_position` takes an absolute row,
-/// and a real terminal clamps an out-of-range one onto the last line rather
-/// than dropping it — parking a visible caret on a border or the pane below.
+/// A short pane can no longer strand a typed row: the focused card SCROLLS the
+/// cursored row into view (the header block alone can outgrow the pane — two
+/// pills, each dragging a fix line that wraps), and the caret math subtracts
+/// the same scroll, so the caret lands on the row's RENDERED position rather
+/// than its absolute index. `set_cursor_position` takes an absolute row and a
+/// real terminal clamps an out-of-range one onto the last line, so the caret
+/// must also never be set past the pane.
 #[test]
-fn typed_threshold_caret_is_not_set_when_the_row_is_clipped_off_the_pane() {
+fn typed_threshold_row_scrolls_into_view_and_carries_the_caret() {
     let mut d = profile("a", 95.0, 10.0, 7200);
     d.disabled = true;
     let mut cfg = config_with(vec![d], Some("other"), vec!["a"]);
@@ -656,22 +758,57 @@ fn typed_threshold_caret_is_not_set_when_the_row_is_clipped_off_the_pane() {
         .unwrap();
     app.fallback_threshold_draft = Some(InputState::new("80"));
 
-    // 26x17: the two wrapped fix lines push the rows past the pane's last line.
+    // 26x17: without the scroll, the two wrapped fix lines pushed the rows
+    // past the pane's last line (the pre-scroll revision of this test pinned
+    // exactly that clip).
     let (w, h) = (26u16, 17u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
 
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
-    assert!(
-        !rows.iter().any(|r| r.contains("rotate at")),
-        "fixture must actually clip the row, else this pins nothing:\n{}",
-        rows.join("\n")
-    );
+    let rendered_at = rows
+        .iter()
+        .position(|r| r.contains("rotate at"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the typed row must scroll into view on a short pane:\n{}",
+                rows.join("\n")
+            )
+        });
     let caret = term.get_cursor_position().unwrap();
+    assert_eq!(
+        caret.y as usize, rendered_at,
+        "caret must sit on the row's rendered (scrolled) position",
+    );
     assert!(
         (caret.y as usize) < h as usize,
         "caret must never be set past the terminal's last row (y={}, h={h})",
         caret.y
+    );
+}
+
+/// Finding shape from review round 2: a 40x24 terminal (~14 inner rows after
+/// borders and the left chain) with a blocked member fills the card past the
+/// pane, and the card has no scrollbar — the LAST rows must stay reachable by
+/// walking the cursor down, not fall off the bottom.
+#[test]
+fn remove_row_stays_reachable_on_a_40x24_pane() {
+    // One blocked member: the pill block + fix line eat header rows.
+    let cfg = config_with(vec![profile("a", 95.0, 100.0, 7200)], Some("a"), vec!["a"]);
+    let mut app = App::new(cfg);
+    app.fallback_focus = FallbackFocus::Detail;
+    app.fallback_detail_cursor = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Remove)
+        .unwrap();
+
+    let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|r| r.contains("remove")),
+        "the cursored last row must scroll into view at 40x24:\n{}",
+        rows.join("\n")
     );
 }
 
@@ -689,7 +826,7 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     // Both pills on one `├│└` rail, each with its own fix line. The first row
     // carries the `status` key so the rail has a column to anchor against; the
     // second bridges with `│` at col 0 while the rail is still open.
-    let (lines, _) = member_detail(&cfg, "a", false, 0, false, None, None, 60, None);
+    let (lines, _) = member_detail(&cfg, "a", false, 0, false, None, None, None, 60, None);
     let block: Vec<String> = lines.iter().take(4).map(line_text).collect();
     assert_eq!(
         block,
@@ -707,7 +844,7 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     e.disabled = false;
     let mut enabled = config_with(vec![e], Some("other"), vec!["a"]);
     enabled.state.auth_broken.push("a".into());
-    let (lines, _) = member_detail(&enabled, "a", false, 0, false, None, None, 60, None);
+    let (lines, _) = member_detail(&enabled, "a", false, 0, false, None, None, None, 60, None);
     assert_eq!(
         lines.iter().take(2).map(line_text).collect::<Vec<_>>(),
         vec![
@@ -840,7 +977,7 @@ fn max_spend_dims_when_spend_budget_is_off() {
     let mut cfg = config_with(vec![profile("a", 95.0, 40.0, 3600)], Some("a"), vec!["a"]);
     cfg.profiles[0].max_auto_spend = Some(25.0);
 
-    let off = member_detail(&cfg, "a", true, 2, false, None, None, 60, None).0;
+    let off = member_detail(&cfg, "a", true, 2, false, None, None, None, 60, None).0;
     let off_val = off
         .iter()
         .find_map(|l| span_style(l, "$25.00"))
@@ -852,7 +989,7 @@ fn max_spend_dims_when_spend_budget_is_off() {
     );
 
     cfg.state.spend_budget_switching = true;
-    let on = member_detail(&cfg, "a", true, 2, false, None, None, 60, None).0;
+    let on = member_detail(&cfg, "a", true, 2, false, None, None, None, 60, None).0;
     let on_val = on
         .iter()
         .find_map(|l| span_style(l, "$25.00"))
@@ -861,5 +998,58 @@ fn max_spend_dims_when_spend_budget_is_off() {
         on_val.fg,
         crate::tui::theme::accent().fg,
         "an armed ceiling (spend budget on) renders in accent"
+    );
+}
+
+// The `weekly at` row reads as a state: the chain default faint when unset, a
+// member-set figure in accent with the default alongside, and the whole row
+// dimmed (inert) while the member's weekly gate is off.
+#[test]
+fn weekly_at_row_distinguishes_default_override_and_gated_off() {
+    let row_texts = |p: Profile| -> Vec<String> {
+        let cfg = config_with(vec![p], Some("a"), vec!["a"]);
+        member_detail(&cfg, "a", true, 1, false, None, None, None, 80, None)
+            .0
+            .iter()
+            .map(line_text)
+            .collect()
+    };
+
+    let unset = row_texts(profile("a", 95.0, 20.0, 3600));
+    let row = unset
+        .iter()
+        .find(|t| t.contains("weekly at"))
+        .expect("weekly at row renders");
+    assert!(row.contains("chain default"), "{row}");
+    assert!(
+        unset
+            .iter()
+            .any(|t| t.contains("follows the chain-wide weekly limit")),
+        "{unset:?}"
+    );
+
+    let mut p = profile("a", 95.0, 20.0, 3600);
+    p.weekly_threshold = Some(90.0);
+    let set = row_texts(p);
+    let row = set
+        .iter()
+        .find(|t| t.contains("weekly at"))
+        .expect("weekly at row renders");
+    assert!(row.contains("90%"), "{row}");
+    assert!(row.contains("default:"), "{row}");
+    assert!(
+        set.iter()
+            .any(|t| t.contains("switches away once weekly usage hits 90%")),
+        "{set:?}"
+    );
+
+    let mut p = profile("a", 95.0, 20.0, 3600);
+    p.check_weekly = false;
+    let gated = row_texts(p);
+    assert!(
+        gated
+            .iter()
+            .any(|t| t.contains("weekly gate is off — this line isn't checked")),
+        "{gated:?}"
     );
 }

@@ -2,7 +2,9 @@
 //! chain (plus a trailing `+ add` row), cursor = `❯`, `#n` chain position, active
 //! member name in orange. Right: the selected member's rotation card — labeled
 //! key:value rows (`5h usage` gauge with a threshold tick, `rotate at`
-//! threshold stepper, `last resort` toggle, `max spend` ceiling, `remove`) — or,
+//! threshold stepper, `weekly at` per-account weekly-line override, `weekly
+//! gate` + `scoped gate` per-account usage-check toggles, `last resort`
+//! toggle, `max spend` ceiling, `remove`) — or,
 //! on `+ add`, a candidate picker. Order = priority (reorder with ⇧↑↓). The
 //! chain-global wrap-off and spend-budget settings live on the Config tab, not
 //! here. Editing happens in place: ⏎ on the left drops focus into the right
@@ -17,10 +19,11 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ChainItemKind, FALLBACK_ROWS, FallbackFocus, FallbackRow, InputState, chain_candidates,
-    chain_items, parse_max_spend, parse_threshold,
+    chain_items, parse_max_spend, parse_threshold, parse_weekly_override,
 };
 use super::super::theme;
 use super::format::{ResetFmt, reset_pill, reset_resume};
+use super::global_config::default_reminder;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, bold_when,
     draw_selector_list, head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines,
@@ -173,6 +176,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     app.fallback_armed_remove,
                     app.fallback_threshold_draft.as_ref(),
                     app.fallback_max_spend_draft.as_ref(),
+                    app.fallback_weekly_draft.as_ref(),
                     inner_w,
                     kick_lift,
                 );
@@ -194,7 +198,28 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+    // The header block + seven rows + a tooltip outgrow a short pane (a 40x24
+    // terminal leaves ~14 inner rows, and a blocked member's pill block eats
+    // two more), and the card has no scrollbar — so a FOCUSED card scrolls the
+    // cursored row (plus up to a 2-line tooltip) into view instead of clipping
+    // `max spend` and `remove` off the bottom. Unfocused keeps the top
+    // anchored: while browsing the left chain the identity header is the
+    // payload, not the rows.
+    let content_h = lines.len();
+    let scroll = if detail_focused && matches!(selected, Some(ChainItemKind::Member(_))) {
+        let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
+        (rows_start + cursor + 3)
+            .saturating_sub(inner.height as usize)
+            .min(content_h.saturating_sub(inner.height as usize))
+    } else {
+        0
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((scroll as u16, 0)),
+        inner,
+    );
 
     // Position the native terminal cursor for whichever field is being typed,
     // matching the post-draw cursor path the other edit screens use. This is not
@@ -218,26 +243,34 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app.fallback_max_spend_draft.as_ref(),
             1usize,
         ),
+        (
+            FallbackRow::WeeklyAt,
+            app.fallback_weekly_draft.as_ref(),
+            0usize,
+        ),
     ]
     .into_iter()
     .find_map(|(row, draft, unit_cols)| draft.map(|d| (row, d, unit_cols)));
 
-    // The row must actually be ON the pane before its caret is placed. This card
-    // does not scroll, and the header block above the rows is now tall enough to
-    // push them off a short pane on its own (two stacked pills, each dragging a
-    // fix line that wraps on a narrow one) — an unguarded set parks a visible
-    // caret on a border or the pane below, since a real terminal clamps the row
-    // rather than dropping it. Mirrors the `config.rs` edit-caret guard.
+    // The row must actually be ON the pane before its caret is placed. The
+    // scroll above chases the CURSORED row, which is the row being typed on
+    // every real path — but a degenerate pane (height smaller than the
+    // lookahead) can still leave it off, and an unguarded set parks a visible
+    // caret on a border or the pane below, since a real terminal clamps the
+    // row rather than dropping it. Mirrors the `config.rs` edit-caret guard.
     if detail_focused
         && let Some(ChainItemKind::Member(_)) = selected
         && let Some((row, draft, unit_cols)) = typing
         && let Some(row_idx) = FALLBACK_ROWS.iter().position(|r| *r == row)
-        && rows_start + row_idx < inner.height as usize
+        && rows_start + row_idx >= scroll
+        && rows_start + row_idx - scroll < inner.height as usize
     {
         // x = "❯ " (2) + key block (KEY_W + KEY_GUTTER cols) + unit + cols before caret.
         let prefix_cols = 2 + KEY_W + KEY_GUTTER + unit_cols + head_cols(draft);
         let cx = inner.x.saturating_add(prefix_cols as u16);
-        let cy = inner.y.saturating_add((rows_start + row_idx) as u16);
+        let cy = inner
+            .y
+            .saturating_add((rows_start + row_idx - scroll) as u16);
         frame.set_cursor_position((cx, cy));
     }
 }
@@ -261,6 +294,10 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
         BlockedReason::KickRejected { .. } => ("⧗", theme::warning()),
         BlockedReason::BudgetSpent => ("$", theme::warning()),
         BlockedReason::FiveHour { .. } => ("◔", theme::warning()),
+        // `⊘` = a weekly window is spent; hue splits scope exactly like `⊖`
+        // splits disabled/canceled: danger = the aggregate week (dead for
+        // days), warning = one model's week (still serves the rest).
+        BlockedReason::ScopedSpent { .. } => ("⊘", theme::warning()),
         BlockedReason::WeeklySoft { .. } => ("~", theme::warning()),
         BlockedReason::Stale => ("⋯", theme::faint()),
     };
@@ -300,6 +337,11 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
             theme::warning().bold(),
             resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
         ),
+        BlockedReason::ScopedSpent { label, pct } => (
+            format!("{label} {pct:.0}%"),
+            theme::warning().bold(),
+            Some("other models ok".to_string()),
+        ),
         BlockedReason::WeeklySoft { pct } => (
             format!("weekly {pct:.0}%"),
             theme::warning().bold(),
@@ -329,6 +371,9 @@ fn reason_fix(reason: &BlockedReason, name: &str) -> String {
         BlockedReason::KickRejected { .. } => "claude code is refusing to start it".to_string(),
         BlockedReason::BudgetSpent => "raise max spend below".to_string(),
         BlockedReason::FiveHour { .. } => "5h quota is spent, it resets on its own".to_string(),
+        BlockedReason::ScopedSpent { .. } => {
+            "that model's weekly window is spent, other models still serve".to_string()
+        }
         BlockedReason::WeeklySoft { .. } => {
             "past the weekly switch line, still serving".to_string()
         }
@@ -380,6 +425,7 @@ fn member_detail(
     armed_remove: bool,
     editing: Option<&InputState>,
     max_spend_editing: Option<&InputState>,
+    weekly_editing: Option<&InputState>,
     width: usize,
     kick_lift: Option<i64>,
 ) -> (Vec<Line<'static>>, usize) {
@@ -462,12 +508,17 @@ fn member_detail(
         let row_editing = match *row {
             FallbackRow::Threshold => editing,
             FallbackRow::MaxSpend => max_spend_editing,
+            FallbackRow::WeeklyAt => weekly_editing,
             _ => None,
         };
         let line = detail_row(
             *row,
             selected,
             threshold,
+            profile.weekly_threshold,
+            cfg.state.weekly_switch_threshold_pct(),
+            profile.check_weekly,
+            profile.check_scoped,
             profile.last_resort,
             profile.max_auto_spend.unwrap_or(0.0),
             cfg.state.spend_budget_switching,
@@ -491,6 +542,50 @@ fn member_detail(
                 )),
                 None => {}
             }
+        }
+        // `weekly at` mirrors `rotate at`: a range tooltip while typing, else
+        // a hint naming what the current value does — including the inert
+        // state while the member's weekly gate is off.
+        if *row == FallbackRow::WeeklyAt {
+            match row_editing {
+                Some(input) => lines.extend(weekly_override_range_tooltip(input, width)),
+                None if selected => {
+                    let chain_default = cfg.state.weekly_switch_threshold_pct();
+                    let hint = if !profile.check_weekly {
+                        "weekly gate is off — this line isn't checked for this account".to_string()
+                    } else {
+                        match profile.weekly_threshold {
+                            Some(v) => format!(
+                                "switches away once weekly usage hits {v:.0}% here (chain default {chain_default:.0}%)"
+                            ),
+                            None => format!(
+                                "follows the chain-wide weekly limit ({chain_default:.0}%); type a value to override"
+                            ),
+                        }
+                    };
+                    lines.extend(help_tooltip_lines(&hint, width));
+                }
+                None => {}
+            }
+        }
+        // The gate toggles hint the CURRENT state — what the walk does with
+        // this account right now — so flipping reads as choosing the other
+        // sentence.
+        if *row == FallbackRow::CheckWeekly && selected {
+            let hint = if profile.check_weekly {
+                "weekly usage past the limit takes this account out of rotation"
+            } else {
+                "weekly usage isn't checked when auto-switching; only the 100% cap blocks"
+            };
+            lines.extend(help_tooltip_lines(hint, width));
+        }
+        if *row == FallbackRow::CheckScoped && selected {
+            let hint = if profile.check_scoped {
+                "a spent per-model week (e.g. 7d fable) takes this account out of rotation"
+            } else {
+                "per-model weeks aren't checked; stays in rotation for other models"
+            };
+            lines.extend(help_tooltip_lines(hint, width));
         }
         if *row == FallbackRow::LastResort && selected {
             lines.extend(help_tooltip_lines(
@@ -572,6 +667,17 @@ fn threshold_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
     }
 }
 
+/// Sub-line under the `weekly at` field while typing: the valid range plus
+/// the empty-clears rule, DANGER when the buffer parses invalid.
+fn weekly_override_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
+    let range = "50-100 % · empty follows the chain default";
+    if parse_weekly_override(input.trimmed()).is_none() {
+        invalid_tooltip_lines(range, width)
+    } else {
+        help_tooltip_lines(range, width)
+    }
+}
+
 /// Sub-line under the `max spend` field while typing — the ceiling twin of
 /// [`threshold_range_tooltip`]. `inf` parses as a float, so the rejection is a
 /// money guard, not input hygiene (see `app::parse_max_spend`).
@@ -619,6 +725,10 @@ fn detail_row(
     row: FallbackRow,
     selected: bool,
     threshold: f64,
+    weekly_override: Option<f64>,
+    weekly_default: f64,
+    check_weekly: bool,
+    check_scoped: bool,
     last_resort: bool,
     max_spend: f64,
     spend_budget: bool,
@@ -669,18 +779,73 @@ fn detail_row(
             }
             Line::from(spans)
         }
-        FallbackRow::LastResort => {
-            let (value, style) = if last_resort {
+        FallbackRow::WeeklyAt => {
+            // Inert while the member's weekly gate is off: the line isn't
+            // judged, so render the whole row faint (the key handler no-ops
+            // it) — same disabled-row contract as the budget-off ceiling.
+            let dimmed = !check_weekly && editing.is_none();
+            let arrow = if dimmed && selected {
+                Span::styled("❯ ", theme::faint())
+            } else {
+                arrow
+            };
+            let key_style = if dimmed {
+                theme::faint()
+            } else {
+                label_style(selected)
+            };
+            let mut spans = vec![
+                arrow,
+                Span::styled(key_cell("weekly at", KEY_W, KEY_GUTTER), key_style),
+            ];
+            match editing {
+                Some(input) => {
+                    let invalid = parse_weekly_override(input.trimmed()).is_none();
+                    spans.extend(value_caret(input, invalid));
+                    let pct_style = if invalid {
+                        theme::danger()
+                    } else {
+                        theme::faint()
+                    };
+                    spans.push(Span::styled(" %", pct_style));
+                }
+                None => match weekly_override {
+                    Some(v) => {
+                        let value_style = if dimmed {
+                            theme::faint()
+                        } else {
+                            theme::accent()
+                        };
+                        spans.push(Span::styled(format!("{v:.0}%"), value_style));
+                        spans.push(default_reminder(format!("{weekly_default:.0}%")));
+                    }
+                    // Unset follows the chain-wide line — show that value, but
+                    // faint, so a member-set figure stays visually distinct.
+                    None => {
+                        spans.push(Span::styled(
+                            format!("{weekly_default:.0}%"),
+                            theme::faint(),
+                        ));
+                        spans.push(Span::styled("   chain default", theme::faint()));
+                    }
+                },
+            }
+            Line::from(spans)
+        }
+        FallbackRow::CheckWeekly | FallbackRow::CheckScoped | FallbackRow::LastResort => {
+            let (key, on) = match row {
+                FallbackRow::CheckWeekly => ("weekly gate", check_weekly),
+                FallbackRow::CheckScoped => ("scoped gate", check_scoped),
+                _ => ("last resort", last_resort),
+            };
+            let (value, style) = if on {
                 (theme::toggle_on().to_string(), theme::accent())
             } else {
                 (theme::toggle_off().to_string(), theme::faint())
             };
             Line::from(vec![
                 arrow,
-                Span::styled(
-                    key_cell("last resort", KEY_W, KEY_GUTTER),
-                    label_style(selected),
-                ),
+                Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(selected)),
                 Span::styled(value, style),
             ])
         }

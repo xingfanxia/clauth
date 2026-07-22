@@ -16,8 +16,11 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: Some(80.0),
+        weekly_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: None,
@@ -599,6 +602,55 @@ fn narrow_app() -> App {
     app
 }
 
+/// The usage tab's "weekly limit is spent" teach keys on the HARD cap, not
+/// the member line: 7d at 95 over a `weekly at 90` override is a switch
+/// trigger, not a spent week — teaching "spent" there claims a state the
+/// account isn't in. The override is what makes this discriminate: with no
+/// override the member line IS the cap, and a folding revision stays green.
+#[test]
+fn usage_weekly_teach_keys_on_the_hard_cap_not_the_member_line() {
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mk_app = |seven_day: f64| {
+        let mut p = crate::testutil::blank_profile("a");
+        p.weekly_threshold = Some(90.0);
+        // 5h spent (past its rotate threshold, live reset) so the `spent`
+        // pill — the teach's gate — renders at all.
+        p.usage = Some(UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: seven_day,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+            }),
+            ..UsageInfo::default()
+        });
+        p.fetch_status = Some(FetchStatus::Fresh);
+        let config = AppConfig {
+            state: AppState {
+                profiles: vec!["a".into()],
+                ..AppState::default()
+            },
+            profiles: vec![p],
+        };
+        let mut app = App::new(config);
+        app.tab = Tab::Usage;
+        app
+    };
+
+    let over_line = dump(&mk_app(95.0), 100, 40);
+    assert!(
+        !over_line.contains("weekly limit is spent"),
+        "95% over a 90 override still serves — no spent teach:\n{over_line}"
+    );
+    let at_cap = dump(&mk_app(100.0), 100, 40);
+    assert!(
+        at_cap.contains("weekly limit is spent"),
+        "the literal cap earns the teach:\n{at_cap}"
+    );
+}
+
 #[test]
 fn narrow_master_detail_stacks_wide_stays_side_by_side() {
     let mut app = narrow_app();
@@ -870,8 +922,11 @@ fn bare(name: &str) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: Some(95.0),
+        weekly_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: None,

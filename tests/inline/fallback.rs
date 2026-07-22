@@ -67,8 +67,11 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: threshold,
+        weekly_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: None,
@@ -644,21 +647,27 @@ fn find_recovered_returns_first_member_below_threshold() {
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
+            weekly_line: 98.0,
+            scoped_line: 98.0,
+            check_scoped: true,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
+            weekly_line: 98.0,
+            scoped_line: 98.0,
+            check_scoped: true,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &[]),
+        find_recovered_member(&members, &store, &[]),
         Some("b".to_string()),
     );
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &["b".to_string()]),
+        find_recovered_member(&members, &store, &["b".to_string()]),
         None,
         "a kick-rejected member's idle usage is not recovery — its account \
          still refuses inference"
@@ -673,16 +682,22 @@ fn find_recovered_skips_exhausted_members() {
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
+            weekly_line: 98.0,
+            scoped_line: 98.0,
+            check_scoped: true,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
+            weekly_line: 98.0,
+            scoped_line: 98.0,
+            check_scoped: true,
         },
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
-    assert_eq!(find_recovered_member(&members, &store, 98.0, &[]), None);
+    assert_eq!(find_recovered_member(&members, &store, &[]), None);
 }
 
 #[test]
@@ -693,16 +708,22 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
+            weekly_line: 98.0,
+            scoped_line: 98.0,
+            check_scoped: true,
         },
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
+            weekly_line: 98.0,
+            scoped_line: 98.0,
+            check_scoped: true,
         },
     ];
     let store = store_with_utils(&[]); // no usage data for any member
-    assert_eq!(find_recovered_member(&members, &store, 98.0, &[]), None);
+    assert_eq!(find_recovered_member(&members, &store, &[]), None);
 }
 
 #[test]
@@ -713,17 +734,23 @@ fn find_recovered_uses_threshold_per_member() {
             threshold: 90.0,
             last_resort: false,
             max_spend: 0.0,
+            weekly_line: 98.0,
+            scoped_line: 98.0,
+            check_scoped: true,
         }, // 95% util ≥ 90 → exhausted
         ChainMember {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
             max_spend: 0.0,
+            weekly_line: 98.0,
+            scoped_line: 98.0,
+            check_scoped: true,
         }, // 94% util < 95 → recovered
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &[]),
+        find_recovered_member(&members, &store, &[]),
         Some("b".to_string()),
     );
 }
@@ -738,13 +765,16 @@ fn find_recovered_recovers_when_window_expired() {
         threshold: 95.0,
         last_resort: false,
         max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
     }];
     let store = store_with_infos(vec![(
         "a",
         usage_info(Some(window(100.0, Some(expired_reset())))),
     )]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &[]),
+        find_recovered_member(&members, &store, &[]),
         Some("a".to_string()),
     );
 }
@@ -758,10 +788,13 @@ fn find_recovered_recovers_when_windowless() {
         threshold: 95.0,
         last_resort: false,
         max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &[]),
+        find_recovered_member(&members, &store, &[]),
         Some("a".to_string()),
     );
 }
@@ -775,10 +808,13 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
         threshold: 95.0,
         last_resort: false,
         max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
-        find_recovered_member(&members, &store, 98.0, &[]),
+        find_recovered_member(&members, &store, &[]),
         Some("a".to_string()),
     );
 }
@@ -2257,18 +2293,46 @@ fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
     let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
     let headroom = profile_with_util("a", Some(95.0), Some(50.0));
     assert_eq!(
-        is_exhausted_active(&exhausted, false, 90_000, None, 98.0, 98.0, 90_000),
+        is_exhausted_active(
+            &exhausted,
+            false,
+            90_000,
+            None,
+            weekly_blocked(&exhausted, 98.0),
+            98.0,
+            90_000
+        ),
         is_exhausted(&exhausted, 98.0)
     );
     assert_eq!(
-        is_exhausted_active(&headroom, false, 90_000, None, 98.0, 98.0, 90_000),
+        is_exhausted_active(
+            &headroom,
+            false,
+            90_000,
+            None,
+            weekly_blocked(&headroom, 98.0),
+            98.0,
+            90_000
+        ),
         is_exhausted(&headroom, 98.0)
     );
     assert!(is_exhausted_active(
-        &exhausted, false, 90_000, None, 98.0, 98.0, 90_000
+        &exhausted,
+        false,
+        90_000,
+        None,
+        weekly_blocked(&exhausted, 98.0),
+        98.0,
+        90_000
     ));
     assert!(!is_exhausted_active(
-        &headroom, false, 90_000, None, 98.0, 98.0, 90_000
+        &headroom,
+        false,
+        90_000,
+        None,
+        weekly_blocked(&headroom, 98.0),
+        98.0,
+        90_000
     ));
 }
 
@@ -2284,10 +2348,22 @@ fn is_exhausted_active_burn_aware_falls_back_without_rate() {
     let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
     let headroom = profile_with_util("a", Some(95.0), Some(50.0));
     assert!(is_exhausted_active(
-        &exhausted, true, 90_000, None, 98.0, 98.0, 90_000
+        &exhausted,
+        true,
+        90_000,
+        None,
+        weekly_blocked(&exhausted, 98.0),
+        98.0,
+        90_000
     ));
     assert!(!is_exhausted_active(
-        &headroom, true, 90_000, None, 98.0, 98.0, 90_000
+        &headroom,
+        true,
+        90_000,
+        None,
+        weekly_blocked(&headroom, 98.0),
+        98.0,
+        90_000
     ));
 }
 
@@ -2476,14 +2552,20 @@ fn weekly_dead_active_is_exhausted_despite_idle_5h() {
     assert!(is_exhausted(&p, 98.0));
     // Hard block trumps both burn-aware modes (nothing left to project).
     assert!(is_exhausted_active(
-        &p, false, 90_000, None, 98.0, 98.0, 90_000
+        &p,
+        false,
+        90_000,
+        None,
+        weekly_blocked(&p, 98.0),
+        98.0,
+        90_000
     ));
     assert!(is_exhausted_active(
         &p,
         true,
         90_000,
         Some(5.0),
-        98.0,
+        weekly_blocked(&p, 98.0),
         98.0,
         90_000
     ));
@@ -2540,7 +2622,13 @@ fn weekly_soft_exhausted_active_triggers_a_switch_despite_5h_headroom() {
         "7d 98.5% triggers despite 5h 40%"
     );
     assert!(is_exhausted_active(
-        &active, false, 90_000, None, 98.0, 98.0, 90_000
+        &active,
+        false,
+        90_000,
+        None,
+        weekly_blocked(&active, 98.0),
+        98.0,
+        90_000
     ));
     let config = config_with_chain(
         vec![active, profile_with_util("b", Some(95.0), Some(10.0))],
@@ -2612,19 +2700,22 @@ fn weekly_dead_member_never_recovers() {
         threshold: 95.0,
         last_resort: false,
         max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
     }];
     let dead = store_with_infos(vec![(
         "b",
         usage_both(None, Some(window(100.0, Some(live_reset())))),
     )]);
-    assert_eq!(find_recovered_member(&members, &dead, 98.0, &[]), None);
+    assert_eq!(find_recovered_member(&members, &dead, &[]), None);
     // Same member with the weekly reset in the past HAS recovered.
     let renewed = store_with_infos(vec![(
         "b",
         usage_both(None, Some(window(100.0, Some(expired_reset())))),
     )]);
     assert_eq!(
-        find_recovered_member(&members, &renewed, 98.0, &[]),
+        find_recovered_member(&members, &renewed, &[]),
         Some("b".to_string())
     );
 }
@@ -2846,7 +2937,8 @@ fn weekly_accessor_pins_the_band_and_resets_garbage_to_default() {
 // ── blocked_reason: the Fallback tab's per-member chip (render-only) ──────────
 //
 // Dead-first precedence: auth broken › weekly hard (7d ≥ 100) › kick rejected ›
-// budget spent › 5h over threshold › weekly soft (soft ≤ 7d < 100) › stale. Each
+// budget spent › 5h over threshold › scoped spent (gated per-model week) ›
+// weekly soft (soft ≤ 7d < 100) › stale. Each
 // reason gets a positive test plus, where two can hold at once, a precedence test
 // proving the worse one wins. Assertions match on the variant (not float `==`) so
 // a wrong pct/countdown reds without tripping the float-cmp lint.
@@ -2978,6 +3070,70 @@ fn blocked_reason_five_hour_outranks_a_soft_weekly_block() {
 }
 
 #[test]
+fn blocked_reason_scoped_spent_names_the_worst_gated_window() {
+    // 5h + 7d headroom, but two per-model weeks over the line (gate on by
+    // default): the chip names the worse one. Outranks the soft weekly band
+    // (same still-serving band, but model-dead beats dispreferred).
+    let p = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_with_scoped(
+            10.0,
+            99.0,
+            vec![
+                scoped_window("7d fable", 98.5, Some(week_reset())),
+                scoped_window("7d opus", 100.0, Some(week_reset())),
+            ],
+        )),
+    );
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(
+        matches!(
+            blocked_reason(&cfg, &cfg.profiles[0], None),
+            Some(BlockedReason::ScopedSpent { label, pct })
+                if label == "7d opus" && (pct - 100.0).abs() < f64::EPSILON
+        ),
+        "got {:?}",
+        blocked_reason(&cfg, &cfg.profiles[0], None)
+    );
+}
+
+#[test]
+fn blocked_reason_scoped_gate_off_never_claims_a_scoped_block() {
+    // Same shape with the gate off: the walk keeps this member in rotation,
+    // so the chip may not claim a scoped block — the soft week shows instead.
+    let mut p = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_with_scoped(
+            10.0,
+            99.0,
+            vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+        )),
+    );
+    p.check_scoped = false;
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        Some(BlockedReason::WeeklySoft { .. })
+    ));
+}
+
+#[test]
+fn blocked_reason_weekly_gate_off_drops_the_soft_chip() {
+    // 7d at 99 with `check_weekly` off: the walk keeps rotating here, so no
+    // soft-weekly chip either — chip and walk must not drift.
+    let mut p = mark_fresh(profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(both_windows(40.0, 99.0)),
+    ));
+    p.check_weekly = false;
+    let cfg = config_with_chain(vec![p], "a");
+    assert_eq!(blocked_reason(&cfg, &cfg.profiles[0], None), None);
+}
+
+#[test]
 fn blocked_reason_stale_when_the_last_read_was_cached() {
     let mut p = profile_with_util("a", Some(95.0), Some(40.0));
     p.fetch_status = Some(FetchStatus::Cached);
@@ -3083,25 +3239,33 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 threshold: 95.0,
                 last_resort: false,
                 max_spend: 0.0,
+                weekly_line: 98.0,
+                scoped_line: 98.0,
+                check_scoped: true,
             },
             ChainMember {
                 name: "b".into(),
                 threshold: 95.0,
                 last_resort: false,
                 max_spend: 0.0,
+                weekly_line: 98.0,
+                scoped_line: 98.0,
+                check_scoped: true,
             },
             ChainMember {
                 name: "c".into(),
                 threshold: 95.0,
                 last_resort: false,
                 max_spend: 100.0,
+                weekly_line: 98.0,
+                scoped_line: 98.0,
+                check_scoped: true,
             },
         ],
         switch_off_when_spent: true,
         broken: vec![],
         burn_aware: false,
         interval_ms: 60_000,
-        weekly_pct: 98.0,
         burn_floor_pct: 80.0,
         burn_horizon_cap_ms: 3_600_000,
         spend_budget,
@@ -3155,13 +3319,21 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
     ]);
 
     let weekly_pct = 98.0;
-    let threshold = 95.0;
+    let member_b = ChainMember {
+        name: "b".into(),
+        threshold: 95.0,
+        last_resort: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+    };
 
     // Per-predicate-lock simulation (the pre-snapshot shape): each call
     // re-locks the store, so a mutation between two calls IS observable.
     let read_pre_mutation = {
         let snap = store.lock().unwrap().clone();
-        !is_exhausted_from_usage("b", threshold, &snap, weekly_pct)
+        !is_exhausted_from_usage(&member_b, &snap, weekly_pct)
     };
     // A fetch lands between predicate calls — B's window crosses the line.
     {
@@ -3173,7 +3345,7 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
     }
     let read_post_mutation = {
         let snap = store.lock().unwrap().clone();
-        !is_exhausted_from_usage("b", threshold, &snap, weekly_pct)
+        !is_exhausted_from_usage(&member_b, &snap, weekly_pct)
     };
     assert!(
         read_pre_mutation && !read_post_mutation,
@@ -3200,7 +3372,7 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
             usage_info(Some(window(100.0, Some(live_reset())))),
         );
     }
-    let snapshot_read = !is_exhausted_from_usage("b", threshold, &snapshot, weekly_pct);
+    let snapshot_read = !is_exhausted_from_usage(&member_b, &snapshot, weekly_pct);
     assert!(
         snapshot_read,
         "snapshot evaluation must ignore the between-pass mutation — \
@@ -3305,5 +3477,814 @@ fn next_auto_switch_target_ignores_store_mutation_after_snapshot() {
         next_auto_switch_target(&snapshot, &store),
         Some(SwitchAction::To("c".to_string())),
         "a fresh snapshot taken AFTER the mutation must reflect it — To(C) PAID"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-model weekly windows ("7d fable") in the chain walk, gated by each
+// member's `check_scoped` toggle (on by default).
+// Live shape that motivated it (2026-07-18): a member at 7d 65% / 5h 0% but
+// "7d fable" 100% — the aggregate-only walk called it the healthiest target
+// and stranded every fable session landed on it.
+// ---------------------------------------------------------------------------
+
+/// A weekly reset days ahead — live for both 7d and per-model windows.
+fn week_reset() -> String {
+    epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)
+}
+
+fn scoped_window(
+    label: &str,
+    utilization: f64,
+    resets_at: Option<String>,
+) -> crate::usage::ScopedWindow {
+    crate::usage::ScopedWindow {
+        label: label.to_string(),
+        window: window(utilization, resets_at),
+    }
+}
+
+/// UsageInfo with a live 5h window, a live aggregate 7d window, and the given
+/// per-model weekly windows.
+fn usage_with_scoped(
+    five_hour_pct: f64,
+    seven_day_pct: f64,
+    scoped: Vec<crate::usage::ScopedWindow>,
+) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(five_hour_pct, Some(live_reset()))),
+        seven_day: Some(window(seven_day_pct, Some(week_reset()))),
+        weekly_scoped: scoped,
+        ..UsageInfo::default()
+    }
+}
+
+#[test]
+fn auto_switch_prefers_member_clear_of_every_weekly_window() {
+    // Active maxed. B is the ax-cl shape (agg clear, fable 100). C is clear
+    // everywhere. Chain order favors B — the tier-1 pass must still pick C.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                65.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        (
+            "c",
+            usage_with_scoped(
+                10.0,
+                18.0,
+                vec![scoped_window("7d fable", 12.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "fully-clear member beats an earlier model-blocked one"
+    );
+}
+
+#[test]
+fn auto_switch_never_lands_on_a_gate_on_model_blocked_member() {
+    // Only sibling is model-blocked with its `check_scoped` gate on (the
+    // default): it is out of rotation, so a spent active stays put rather
+    // than stranding the next session of the capped model there.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                65.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+#[test]
+fn auto_switch_scoped_gate_off_keeps_a_model_blocked_member_in_rotation() {
+    // Same shape, but the operator flipped b's `check_scoped` gate off ("I
+    // run other models on it") — b rotates normally despite its fable week.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].check_scoped = false;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                65.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+#[test]
+fn auto_switch_weekly_gate_off_ignores_the_soft_line_but_not_the_hard_cap() {
+    // b rides the soft weekly band (99% > the default 98 line) with its
+    // `check_weekly` gate off: still a rotation target. At the 100% hard cap
+    // the gate no longer helps — the account cannot serve at all.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].check_weekly = false;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_with_scoped(0.0, 99.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "gate off drops the soft weekly line"
+    );
+
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_with_scoped(0.0, 100.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "the 100% hard cap blocks regardless of the gate"
+    );
+}
+
+#[test]
+fn auto_switch_scoped_blocked_active_hops_to_fully_clear_member() {
+    // Active is healthy by every aggregate gate but its fable window crossed
+    // the line — with a fully-clear sibling, hop.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_with_scoped(
+                20.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        (
+            "b",
+            usage_with_scoped(
+                5.0,
+                30.0,
+                vec![scoped_window("7d fable", 10.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+    );
+}
+
+#[test]
+fn auto_switch_scoped_blocked_active_stays_put_when_no_fully_clear_member() {
+    // Every sibling is equally model-blocked: hopping buys nothing and would
+    // ping-pong — stay put.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_with_scoped(
+                20.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        (
+            "b",
+            usage_with_scoped(
+                5.0,
+                30.0,
+                vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+#[test]
+fn scoped_active_trigger_stays_parked_on_a_pinned_sink() {
+    // Active is a `last_resort` sink, healthy on every aggregate gate, fable
+    // week spent, clear sibling waiting. A sink is parked ON PURPOSE ("serve
+    // here for free until dead") — the scoped hop must not un-park it, or the
+    // chain oscillates on the sibling's 5h period: hop off, sibling's 5h
+    // spends, serving-sink pass returns, sibling resets, hop again.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[0].last_resort = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_with_scoped(
+                20.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        ("b", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a pinned sink must stay parked through a scoped block"
+    );
+}
+
+// ── weekly gate off × non-empty weekly_scoped: the override and the line ─────
+//
+// `member_scoped_line` must ride the `weekly gate` (the `weekly at` row
+// renders dimmed and refuses its editor while the gate is off, so a stored
+// override must not keep judging) — but scoped judgment itself stays on at
+// the CHAIN line (`check_scoped` is its gate). Both directions pinned, so
+// neither "the override always applies" nor "scoped_line == weekly_line"
+// (which goes to the hard cap on gate-off) survives the suite.
+
+#[test]
+fn scoped_line_ignores_the_override_while_the_weekly_gate_is_off() {
+    // b: override 60, weekly gate OFF, fable at 70. The override is inert —
+    // b's fable window sits under the chain line (98), so b is fully clear
+    // and the walk leaves a spent active for it.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].weekly_threshold = Some(60.0);
+    config.profiles[1].check_weekly = false;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                30.0,
+                vec![scoped_window("7d fable", 70.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "a gated-off override must not judge the scoped windows"
+    );
+}
+
+#[test]
+fn scoped_windows_judge_the_chain_line_while_the_weekly_gate_is_off() {
+    // b: weekly gate OFF, no override, fable at 99 — still judged at the
+    // CHAIN line (98), so b stays out of rotation. If gate-off routed the
+    // scoped line to the hard cap the way it does the aggregate one, 99
+    // would pass and this would hop.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].check_weekly = false;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                30.0,
+                vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+            ),
+        ),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "gate-off scoped judgment stays on the chain line, not the hard cap"
+    );
+}
+
+#[test]
+fn blocked_reason_scoped_override_is_inert_while_weekly_gate_is_off() {
+    // Chip twin of the walk pair above: override 60 + gate off + fable at 70
+    // → no chip (the walk keeps rotating here); fable at 99 → `ScopedSpent`
+    // at the chain line (the walk skips it), even with the gate off.
+    let mut under = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_with_scoped(
+            10.0,
+            30.0,
+            vec![scoped_window("7d fable", 70.0, Some(week_reset()))],
+        )),
+    );
+    under.weekly_threshold = Some(60.0);
+    under.check_weekly = false;
+    let cfg = config_with_chain(vec![under], "a");
+    assert_eq!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        None,
+        "a gated-off override must not put the chip on the card"
+    );
+
+    let mut over = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_with_scoped(
+            10.0,
+            30.0,
+            vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+        )),
+    );
+    over.check_weekly = false;
+    let cfg = config_with_chain(vec![over], "a");
+    assert!(
+        matches!(
+            blocked_reason(&cfg, &cfg.profiles[0], None),
+            Some(BlockedReason::ScopedSpent { .. })
+        ),
+        "gate-off scoped judgment holds the chain line on the chip too"
+    );
+}
+
+#[test]
+fn blocked_reason_five_hour_outranks_scoped_spent() {
+    // Both blocks live at once: the 5h window over its rotate threshold AND a
+    // spent fable week. 5h ranks worse — it blocks every model right now,
+    // while scoped still serves the others.
+    let p = profile_with_usage(
+        "a",
+        Some(95.0),
+        Some(usage_with_scoped(
+            100.0,
+            30.0,
+            vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+        )),
+    );
+    let cfg = config_with_chain(vec![p], "a");
+    assert!(matches!(
+        blocked_reason(&cfg, &cfg.profiles[0], None),
+        Some(BlockedReason::FiveHour { .. })
+    ));
+}
+
+// ── fully_clear_target: the UI-thread twin of the scoped trigger's walk ──────
+
+#[test]
+fn fully_clear_target_skips_blocked_members_and_finds_the_clear_one() {
+    // b: scoped-blocked (skipped), c: auth-broken (skipped), d: clear (the
+    // pick). Exercised directly — this is the only walk `auto_switch_if_needed`
+    // runs for the scoped trigger.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_usage("a", Some(95.0), Some(both_windows(20.0, 40.0))),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_with_scoped(
+                    5.0,
+                    30.0,
+                    vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+                )),
+            ),
+            profile_with_usage("c", Some(95.0), Some(both_windows(5.0, 30.0))),
+            profile_with_usage("d", Some(95.0), Some(both_windows(5.0, 30.0))),
+        ],
+        "a",
+    );
+    config.state.auth_broken.push("c".into());
+    assert_eq!(
+        fully_clear_target(&config, 98.0),
+        Some("d".to_string()),
+        "the walk must skip the scoped-blocked and broken members"
+    );
+}
+
+#[test]
+fn fully_clear_target_none_when_every_member_is_blocked() {
+    let config = config_with_chain(
+        vec![
+            profile_with_usage("a", Some(95.0), Some(both_windows(20.0, 40.0))),
+            profile_with_usage(
+                "b",
+                Some(95.0),
+                Some(usage_with_scoped(
+                    5.0,
+                    30.0,
+                    vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+                )),
+            ),
+            // c: 5h over its threshold — exhausted, not fully clear.
+            profile_with_usage("c", Some(95.0), Some(both_windows(96.0, 30.0))),
+        ],
+        "a",
+    );
+    assert_eq!(fully_clear_target(&config, 98.0), None);
+}
+
+#[test]
+fn fully_clear_target_skips_canceled_and_disabled_members() {
+    // b: canceled (idle-looking usage, skipped), c: disabled (skipped),
+    // d: clear (the pick). Its `skip` closure must mirror `next_target`'s —
+    // a canceled or disabled member sorting first must not shadow a genuinely
+    // clear one further down the chain.
+    let config = config_with_chain(
+        vec![
+            profile_with_usage("a", Some(95.0), Some(both_windows(20.0, 40.0))),
+            profile_with_usage("b", Some(95.0), Some(canceled_usage())),
+            mark_disabled(profile_with_usage(
+                "c",
+                Some(95.0),
+                Some(both_windows(5.0, 30.0)),
+            )),
+            profile_with_usage("d", Some(95.0), Some(both_windows(5.0, 30.0))),
+        ],
+        "a",
+    );
+    assert_eq!(
+        fully_clear_target(&config, 98.0),
+        Some("d".to_string()),
+        "the walk must skip the canceled and disabled members"
+    );
+}
+
+#[test]
+fn scoped_gate_off_active_never_fires_the_scoped_hop() {
+    // Active is model-blocked but its own `check_scoped` gate is off: no
+    // scoped trigger, even with a clear sibling waiting.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[0].check_scoped = false;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_with_scoped(
+                20.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        ("b", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+#[test]
+fn lapsed_scoped_window_never_blocks() {
+    // A fable window at 100 whose reset has PASSED is stale — no hop.
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_with_scoped(
+                20.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(expired_reset()))],
+            ),
+        ),
+        ("b", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+#[test]
+fn next_target_prefers_fully_clear_member() {
+    // UI-side twin of the tier-1 preference: B model-blocked, C clear.
+    let mk = |name: &str, info: UsageInfo| profile_with_usage(name, Some(95.0), Some(info));
+    let config = config_with_chain(
+        vec![
+            mk("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+            mk(
+                "b",
+                usage_with_scoped(
+                    0.0,
+                    65.0,
+                    vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+                ),
+            ),
+            mk("c", usage_with_scoped(10.0, 18.0, vec![])),
+        ],
+        "a",
+    );
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("c".to_string())),
+    );
+}
+
+#[test]
+fn find_recovered_prefers_member_clear_of_scoped_windows() {
+    let chain = vec![
+        ChainMember {
+            name: "b".into(),
+            threshold: 95.0,
+            last_resort: false,
+            max_spend: 0.0,
+            weekly_line: 98.0,
+            scoped_line: 98.0,
+            check_scoped: true,
+        },
+        ChainMember {
+            name: "c".into(),
+            threshold: 95.0,
+            last_resort: false,
+            max_spend: 0.0,
+            weekly_line: 98.0,
+            scoped_line: 98.0,
+            check_scoped: true,
+        },
+    ];
+    let store = store_with_infos(vec![
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        ("c", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        find_recovered_member(&chain, &store, &[]),
+        Some("c".to_string()),
+        "recovery relinks the fully-clear member first"
+    );
+    // With ONLY the model-blocked member recovered, it is still taken.
+    let store = store_with_infos(vec![(
+        "b",
+        usage_with_scoped(
+            0.0,
+            40.0,
+            vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+        ),
+    )]);
+    let chain_b = vec![ChainMember {
+        name: "b".into(),
+        threshold: 95.0,
+        last_resort: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+    }];
+    assert_eq!(
+        find_recovered_member(&chain_b, &store, &[]),
+        Some("b".to_string()),
+    );
+}
+
+#[test]
+fn recovery_respects_each_members_gates() {
+    // b is model-blocked but its scoped gate is off — it counts as clear in
+    // the first recovery pass. c rides the soft weekly band with its weekly
+    // gate off — clear too; chain order picks b.
+    let member = |name: &str, check_weekly: bool, check_scoped: bool| ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        max_spend: 0.0,
+        // Snapshot-folded shape: a gate-off weekly reads as the hard cap.
+        weekly_line: if check_weekly { 98.0 } else { 100.0 },
+        scoped_line: 98.0,
+        check_scoped,
+    };
+    let chain = vec![member("b", true, false), member("c", false, true)];
+    let store = store_with_infos(vec![
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        ("c", usage_with_scoped(0.0, 99.0, vec![])),
+    ]);
+    assert_eq!(
+        find_recovered_member(&chain, &store, &[]),
+        Some("b".to_string()),
+    );
+    // c alone: its weekly-gate-off soft-band week recovers; at the hard cap
+    // it never does.
+    let chain_c = vec![member("c", false, true)];
+    assert_eq!(
+        find_recovered_member(&chain_c, &store, &[]),
+        Some("c".to_string()),
+    );
+    let store = store_with_infos(vec![("c", usage_with_scoped(0.0, 100.0, vec![]))]);
+    assert_eq!(find_recovered_member(&chain_c, &store, &[]), None);
+}
+
+#[test]
+fn weekly_override_tightens_and_loosens_the_member_line() {
+    // b overrides the chain-wide 98 line DOWN to 50: at weekly 60 it is out
+    // of rotation even though the chain line would accept it.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].weekly_threshold = Some(50.0);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_with_scoped(0.0, 60.0, vec![])),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+
+    // Overridden UP to 100: b at weekly 99 keeps rotating where the chain
+    // line (98) would have blocked it.
+    config.profiles[1].weekly_threshold = Some(100.0);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_with_scoped(0.0, 99.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+#[test]
+fn weekly_override_governs_the_actives_scoped_windows_too() {
+    // One per-account line for both judgments: active's fable week at 90 is
+    // under the chain line (98) but over its own override (85) — the scoped
+    // trigger fires and hops to the clear sibling.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[0].weekly_threshold = Some(85.0);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        (
+            "a",
+            usage_with_scoped(
+                20.0,
+                40.0,
+                vec![scoped_window("7d fable", 90.0, Some(week_reset()))],
+            ),
+        ),
+        ("b", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string()))
+    );
+}
+
+#[test]
+fn weekly_override_never_softens_the_hard_sink_and_halt_judgments() {
+    // A last-resort sink whose week is at 99 with an override of 50: the
+    // serving-sink pass keys on the HARD cap, so the sink still parks —
+    // a member's soft-line taste must not bench a literally-usable account.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.profiles[1].last_resort = true;
+    config.profiles[1].weekly_threshold = Some(50.0);
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_with_scoped(0.0, 99.0, vec![])),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "the sink pass judges at the hard cap, not the member's soft line"
+    );
+}
+
+#[test]
+fn weekly_override_on_a_sink_never_makes_the_ui_twin_pay() {
+    // The UI-thread twin of the case above: a `last_resort` sink carrying a
+    // weekly override of 50 with its week at 98.5 (soft-blocked at its own
+    // line, hard-clear, 5h idle) still serves every request for free. The
+    // serving-sink pass must park there instead of paying the spend-armed
+    // sibling — judging the sink at its member-resolved soft line would make
+    // `next_target` spend real money while `next_auto_switch_target` parks.
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            mark_last_resort(weekly_soft_profile("b")),
+            spend_member("c", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.profiles[1].weekly_threshold = Some(50.0);
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        Some(SwitchAction::To("b".to_string())),
+        "a hard-clear sink parks free regardless of its soft-line override"
+    );
+}
+
+#[test]
+fn weekly_override_on_a_sink_active_still_stays_put_over_paying() {
+    // Active-side facet: the serving-sink ACTIVE carries the override. Its
+    // own soft line says "exhausted", but it still answers for free — the
+    // stay-put guard keys on the hard cap, so no switch (and no spend) fires.
+    let mut config = config_with_chain(
+        vec![
+            mark_last_resort(weekly_soft_profile("a")),
+            spend_member("b", 20.0, 0.0, Some(50.0)),
+        ],
+        "a",
+    );
+    config.profiles[0].weekly_threshold = Some(50.0);
+    config.state.spend_budget_switching = true;
+    assert_eq!(
+        next_target(&config, None),
+        None,
+        "a serving-sink active stays parked free regardless of its override"
     );
 }

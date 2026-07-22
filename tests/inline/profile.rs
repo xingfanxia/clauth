@@ -96,6 +96,34 @@ fn disabled_round_trips_through_config_toml() {
     assert!(!parsed_off.disabled);
 }
 
+// The per-account usage gates must default ON (unset = `None` = checked) so
+// every config.toml written before they existed keeps its stock gating.
+#[test]
+fn profile_config_usage_gates_default_unset() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.check_weekly, None);
+    assert_eq!(cfg.check_scoped, None);
+}
+
+// Only the non-default (`false`) value renders uncommented, and it must
+// survive a render→parse round-trip; the default renders as a commented
+// example that parses back to unset.
+#[test]
+fn usage_gates_round_trip_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.check_weekly = false;
+    profile.check_scoped = false;
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.check_weekly, Some(false));
+    assert_eq!(parsed.check_scoped, Some(false));
+
+    let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
+    let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
+    assert_eq!(parsed.check_weekly, None);
+    assert_eq!(parsed.check_scoped, None);
+}
+
 // `burn_aware_switching` (issue #8 follow-up b) must default to `false` so
 // every existing profiles.toml written before this field existed keeps
 // loading unchanged, matching the `last_resort` guarantee above at the
@@ -908,8 +936,11 @@ fn credential_and_cache_files_have_restricted_permissions() {
         env: std::collections::BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
+        weekly_threshold: None,
         last_resort: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
         disabled: false,
         credentials: Some(creds.clone()),
@@ -1445,4 +1476,109 @@ fn burn_tunables_round_trip_and_omit_when_unset() {
         !off.contains("burn_switch_floor_pct") && !off.contains("burn_horizon_cap_ms"),
         "unset burn tunables must be omitted, got:\n{off}"
     );
+}
+
+// The per-account weekly-line override must default unset (follow the chain)
+// and round-trip through config.toml. Its LOAD normalization is reset-not-
+// clamp, pinned separately by
+// `weekly_threshold_out_of_band_resets_to_unset_at_load` — through the real
+// disk boundary, where the normalization actually lives.
+#[test]
+fn weekly_threshold_round_trips_through_config_toml() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.weekly_threshold, None);
+
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.weekly_threshold = Some(90.0);
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.weekly_threshold, Some(90.0));
+
+    let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
+    let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
+    assert_eq!(parsed.weekly_threshold, None);
+}
+
+/// The override RESETS to unset out of band, mirroring the chain-wide line it
+/// overrides (never clamps — a `0.98` fraction-vs-percent typo clamped to the
+/// band's floor would weekly-block the account from about 1% into its week,
+/// chipped as a plausible-looking `WeeklySoft`). Through the real disk
+/// boundary: `load_profile` is where the normalization lives.
+#[cfg(unix)]
+#[test]
+fn weekly_threshold_out_of_band_resets_to_unset_at_load() {
+    let _home = HomeSandbox::new();
+    let name = "weekly-reset-test";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+
+    for (raw, expect, why) in [
+        (
+            "weekly_threshold = 0.98
+",
+            None,
+            "fraction typo resets",
+        ),
+        (
+            "weekly_threshold = 40.0
+",
+            None,
+            "under-band resets, never clamps to MIN",
+        ),
+        (
+            "weekly_threshold = 150.0
+",
+            None,
+            "over-band resets, never clamps to MAX",
+        ),
+        (
+            "weekly_threshold = nan
+",
+            None,
+            "nan is valid TOML and must not survive",
+        ),
+        (
+            "weekly_threshold = 98.0
+",
+            Some(98.0),
+            "in-band survives",
+        ),
+    ] {
+        std::fs::write(&config_path, raw).expect("write config.toml");
+        assert_eq!(
+            load_profile(name).expect("load_profile").weekly_threshold,
+            expect,
+            "{why}: {raw:?}"
+        );
+    }
+}
+
+/// The usage gates default ON through the REAL load boundary — an absent key
+/// in a config.toml written before the gates existed keeps stock gating.
+/// `profile_config_usage_gates_default_unset` stops at `ProfileConfig` (the
+/// unset is `None` there); this pins the `unwrap_or(true)` resolution where
+/// it lives, so flipping it to `unwrap_or(false)` cannot stay green.
+#[cfg(unix)]
+#[test]
+fn usage_gates_default_on_through_the_load_boundary() {
+    let _home = HomeSandbox::new();
+    let name = "gate-default-test";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    std::fs::write(&config_path, "").expect("write empty config.toml");
+
+    let loaded = load_profile(name).expect("load_profile");
+    assert!(loaded.check_weekly, "absent check_weekly loads as ON");
+    assert!(loaded.check_scoped, "absent check_scoped loads as ON");
+
+    std::fs::write(
+        &config_path,
+        "check_weekly = false
+check_scoped = false
+",
+    )
+    .expect("write config.toml");
+    let loaded = load_profile(name).expect("load_profile");
+    assert!(!loaded.check_weekly, "an explicit false survives the load");
+    assert!(!loaded.check_scoped, "an explicit false survives the load");
 }
