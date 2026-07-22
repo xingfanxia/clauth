@@ -137,11 +137,12 @@ pub(crate) struct DaemonLock {
 
 impl DaemonLock {
     /// Take ownership of the just-locked file and stamp the holder's pid into
-    /// it. The pid is informational (it answers "which of these is the live
-    /// one?" in a `ps` dump); presence is proven by the flock alone, so a stale
-    /// pid left by a dead holder can never read as a running daemon.
+    /// the unlocked [`PID_FILE`] sidecar. The pid is informational (it answers
+    /// "which of these is the live one?" in a `ps` dump); presence is proven by
+    /// the flock alone, so a stale pid left by a dead holder can never read as a
+    /// running daemon.
     fn active(file: File) -> Self {
-        let _ = stamp_pid(&file);
+        let _ = stamp_pid();
         Self { _file: file }
     }
 }
@@ -252,23 +253,27 @@ fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
     }
 }
 
-/// Overwrite the lock file with the current pid. Truncating a file whose opener
-/// documents the opposite ([`crate::profile::open_state_file`] never truncates,
-/// so a sibling's held lock survives an open race) is sound only here: the
-/// caller holds the exclusive flock, so no sibling is mid-anything. The trailing
-/// newline is the commit marker [`holder_pid`] requires — a reader that catches
-/// the write half-done sees no newline and reports nothing rather than parsing a
-/// truncated pid into a live unrelated process. Best-effort: a daemon that can't
-/// write its own pid still runs (the empty file then reads as "unknown").
-fn stamp_pid(mut file: &File) -> std::io::Result<()> {
+/// Overwrite the unlocked [`PID_FILE`] sidecar with the current pid. The pid
+/// deliberately does NOT live in `clauthd.lock`: Windows locks are mandatory
+/// (`LockFileEx`), so a `--status` reader in another process cannot read bytes
+/// the daemon holds under its exclusive lock — the sidecar is the one place
+/// every platform can read. Only ever one writer (the single Active daemon),
+/// but readers race it, so truncate-first: the trailing newline is the commit
+/// marker [`holder_pid`] requires — a reader that catches the write half-done
+/// sees no newline and reports nothing rather than parsing a truncated pid into
+/// a live unrelated process. Best-effort: a daemon that can't write its own pid
+/// still runs (the sidecar then reads as "unknown").
+fn stamp_pid() -> std::io::Result<()> {
+    let dir = clauth_dir().map_err(std::io::Error::other)?;
+    let mut file = crate::profile::open_state_file(&dir.join(super::PID_FILE))?;
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
     writeln!(file, "{}", std::process::id())?;
     file.flush()
 }
 
-/// The pid the running daemon stamped into `clauthd.lock`, when one is fully
-/// written. Informational only — its one caller reaches it past a true
+/// The pid the running daemon stamped into the [`PID_FILE`] sidecar, when one is
+/// fully written. Informational only — its one caller reaches it past a true
 /// [`singleton_held`], and the header dot answers off [`daemon_health`], so
 /// presence is proven by the flock either way and a pid left behind by a dead
 /// daemon is never read as one being up.
@@ -277,13 +282,13 @@ fn stamp_pid(mut file: &File) -> std::io::Result<()> {
 /// complete stale one. Between a successor winning the flock and its
 /// [`stamp_pid`] reaching `set_len(0)` — a handful of instructions — the dead
 /// predecessor's pid is still whole and readable, so `--status` can print a pid
-/// the OS has since recycled onto something unrelated. Truncate-first is still
-/// the narrowest form of that window: it blanks the stale bytes at the winner's
-/// first instruction, where a separate atomically-renamed pid file would keep
-/// them fully readable until the replacement is written.
+/// the OS has since recycled onto something unrelated. The sidecar is never read
+/// unless [`singleton_held`] is already true, so a lingering pid from a fully
+/// dead daemon is out of reach; only this in-handover window can surface a stale
+/// one, and truncate-first keeps it to a handful of instructions.
 pub(crate) fn holder_pid() -> Option<u32> {
     let dir = clauth_dir().ok()?;
-    let body = std::fs::read_to_string(dir.join(super::LOCK_FILE)).ok()?;
+    let body = std::fs::read_to_string(dir.join(super::PID_FILE)).ok()?;
     // No terminating newline → the stamp is torn or absent. Never guess.
     body.strip_suffix('\n')?.trim().parse().ok()
 }

@@ -62,6 +62,12 @@ const TICK: Duration = Duration::from_secs(1);
 const LOG_ROTATE_EVERY_TICKS: u64 = 300;
 const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "clauthd.lock";
+/// The live daemon's pid, an UNLOCKED peer of [`LOCK_FILE`]. Kept out of the
+/// lock file itself because Windows locks are mandatory (`LockFileEx`): a
+/// `--status` reader in another process cannot read bytes inside the daemon's
+/// held exclusive lock, so the pid has to live somewhere unlocked. Informational
+/// only — presence is the flock, never this file. See [`probe::holder_pid`].
+const PID_FILE: &str = "clauthd.pid";
 /// The standby slot's flock (#57). A peer of [`LOCK_FILE`]; held by the single
 /// instance allowed to park on the singleton lock. See [`probe::Claim`].
 const STANDBY_LOCK_FILE: &str = "clauthd-standby.lock";

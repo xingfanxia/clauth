@@ -229,10 +229,12 @@ fn third_instance_is_redundant_and_the_promoted_standby_frees_the_slot() {
         "a third instance exits instead of parking — this is the #57 pile-up"
     );
 
-    // A decoy pid, planted while the holder is still up: this process would
-    // stamp its own pid either way, so without it a promotion that never
-    // re-stamps reads as correct.
-    std::fs::write(dir.join(super::super::LOCK_FILE), b"999\n").expect("plant a decoy pid");
+    // A decoy pid in the sidecar, planted while the holder is still up: this
+    // process would stamp its own pid either way, so without it a promotion that
+    // never re-stamps reads as correct. Written to PID_FILE, not LOCK_FILE —
+    // the active handle holds LOCK_FILE's mandatory flock on Windows, so a
+    // foreign write there would fault, and the pid no longer lives there anyway.
+    std::fs::write(dir.join(super::super::PID_FILE), b"999\n").expect("plant a decoy pid");
 
     // The daemon exits: the standby takes over, off a thread so a promotion
     // that never unblocks fails the test instead of wedging the suite.
@@ -249,7 +251,7 @@ fn third_instance_is_redundant_and_the_promoted_standby_frees_the_slot() {
     assert_eq!(
         holder_pid(),
         Some(std::process::id()),
-        "the takeover re-stamps the lock, so the decoy pid can't outlive the handover"
+        "the takeover re-stamps the sidecar, so the decoy pid can't outlive the handover"
     );
     assert!(
         !standby_waiting(),
