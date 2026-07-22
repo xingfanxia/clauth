@@ -309,6 +309,48 @@ fn config_rows_login_and_delete_creds_visibility() {
     );
 }
 
+/// `ConfigRow` derives no `Ord`/`EnumIter`, so nothing but this render order is
+/// observable — pin the account-actions tail's exact RUNTIME sequence
+/// (`config_rows`'s own row order) so a future reorder there reds instead of
+/// silently drifting from the enum's declaration order.
+#[test]
+fn config_rows_account_actions_tail_matches_runtime_order() {
+    use super::{ConfigRow, config_rows};
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some("ref".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![acct],
+    });
+    app.profile_cursor = 0;
+    app.config_draft = None;
+
+    let rows = config_rows(&app);
+    let tail = &rows[rows.len() - 4..];
+    assert_eq!(
+        tail,
+        [
+            ConfigRow::Login,
+            ConfigRow::DeleteCreds,
+            ConfigRow::Disabled,
+            ConfigRow::Delete,
+        ],
+        "account-actions tail must render login, delete-creds, disabled, delete in that order: {rows:?}"
+    );
+}
+
 /// The API-account re-login row walks a two-step inline chain: base url first,
 /// then api key, persisting both like `login --base-url --api-key`. ⎋ at either
 /// step abandons the whole chain.

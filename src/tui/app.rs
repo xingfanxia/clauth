@@ -218,6 +218,12 @@ pub(crate) enum ConfigRow {
     EnvEntry(usize),
     /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
+    AutoStart,
+    /// Browser OAuth login: mint fresh tokens into this account (or, on the
+    /// `+ new` form, create the account from the login). Async — runs on a worker.
+    Login,
+    /// Drop this account's stored OAuth credentials, keeping the profile shell.
+    DeleteCreds,
     /// User-disabled account-action row (`Profile::disabled`, see
     /// `docs/internals.md`), same class as `Delete`: enabling fires the shared
     /// `actions::enable_profile` immediately (harmless), disabling arms on the
@@ -225,12 +231,6 @@ pub(crate) enum ConfigRow {
     /// Dimmed and inert while the account is active or holds a live `clauth
     /// start` session — the same gate the CLI enforces.
     Disabled,
-    AutoStart,
-    /// Browser OAuth login: mint fresh tokens into this account (or, on the
-    /// `+ new` form, create the account from the login). Async — runs on a worker.
-    Login,
-    /// Drop this account's stored OAuth credentials, keeping the profile shell.
-    DeleteCreds,
     Delete,
     Create,
 }
