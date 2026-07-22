@@ -262,11 +262,25 @@ pub(crate) fn switch_profile_noninteractive(
         Option<&str>,
     ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
 ) -> Result<(Option<String>, String)> {
-    let previous = {
+    let (previous, target_disabled) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
-        cfg.state.active_profile.as_deref().map(str::to_string)
+        (
+            cfg.state.active_profile.as_deref().map(str::to_string),
+            cfg.find(target).is_some_and(|p| p.is_disabled()),
+        )
     };
+
+    // Friendly early refuse, unconditional like `refuse_if_disabled` (no
+    // active-exempt — a disabled profile can never be the active one, since
+    // `disable_profile` itself refuses the active target). Placed BEFORE the
+    // AUTH-1 gate below so a disabled, clock-expired target is refused before
+    // its single-use refresh token ever gets rotated over HTTP; the
+    // authoritative `ensure_switch_target_ok` gate inside `switch_profile`
+    // stays the backstop, this only prevents the spurious rotation.
+    if target_disabled {
+        bail!("'{target}': account is disabled, run `clauth enable {target}`");
+    }
 
     // AUTH-1 (Incident C): gate the target before its credentials land in the
     // Keychain — the same gate as the CLI switch, so "a quarantined account is
