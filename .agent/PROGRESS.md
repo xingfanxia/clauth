@@ -1708,3 +1708,46 @@ the id_token claim only re-mints on codex's own refresh) — wham's top-level
 plan_type now rides the poll into CODEX_PLAN_CACHE_FILE (written on change
 only) and tier_label prefers it over the claim. Verified live: xfx 7d=0%
 (the reset the stale cache hid), cl 11%, all Fresh at 60s cadence.
+
+## UPS-3 — upstream review rounds served: #58 r2, #55 r2 (rebase), #51 design answer (2026-07-21)
+
+All three open upstream threads carried CHANGES_REQUESTED / questions; both
+fix rounds pushed + replied, standing contribute-back authorization.
+
+#58 (fix/stale-sidecar-symlink-divergence, b53226d append, no force):
+- reviewer: exemption reached 2 of 5 gates + no defer regression test.
+- one `claude::live_diverged_and_unsaved(active)` owns the triple + symlink
+  term; daemon/TUI gates + switch_profile_cli + switch_profile_noninteractive
+  route through it. poll_credentials_divergence keeps its cascade with the
+  atomic symlink early-return (adopt side-effect interleave + 1Hz read cost)
+  — deviation disclosed in the reply.
+- drain_pending_switch_proceeds_over_a_stale_clauth_symlink +
+  divergence_poll_ignores_a_stale_clauth_symlink; both mutation-checked red.
+  Delegated to a worktree agent; 1239 green.
+
+#55 (feat/scoped-weekly-walk, eb8394a → 51338fb, force-with-lease after the
+requested REBASE onto moved mommy — 4 commits replayed over the store→usage
+snapshot rework, ROWS_BEFORE→rows_start, ⊖ consolidation, canceled axis):
+- rebase ports: scoped_blocked_from_store→_from_usage, member-based
+  is_exhausted_from_usage(member, usage, line), active_canceled joins the
+  trigger condition, member_detail 10-arg signature sweep (19 call sites).
+- findings fixed on top (3 commits): member_scoped_line rides check_weekly
+  (override inert when gate off; scoped stays judged at chain line);
+  !active.last_resort parking guard on BOTH scoped triggers (oscillation);
+  chip routes worst_scoped_window (= scoped_weekly_blocked_info, no second
+  opinion); parse_weekly_override→parse_weekly_pct (50..=100); load boundary
+  RESETS out-of-band weekly_threshold to unset (never clamps — 0.98 typo
+  class) + kills nan; focused member card scrolls cursored row into view
+  (caret subtracts scroll; 40x24 remove-row reachable); ScopedSpent rides ⊘
+  warning (◇ retired); edit weekly at naming; default_reminder reuse.
+- every discriminator mutation-checked red (6 mutations); 1368 green,
+  clippy 0, fmt clean. Both rounds' replies posted as issue comments.
+
+#51: maintainer asked for a clauth mode-switcher design (c codex/c claude).
+Answered from fork experience: harness = PROFILE AXIS not app mode;
+per-harness active/chain/pending-queue; dispatch points (switch mechanics
+session-boundary vs link, single-use rotating refresh single-writer, wham
+usage dialect, feature GATING not porting); flagged isolated-CODEX_HOME
+auto-start as the missed item; offered incremental upstreaming (axis first)
+after #55/#58 land. #47 follow-up (daemon honors on-mismatch + follow)
+stays queued behind #55. No new PR opened — nothing else is ripe.
