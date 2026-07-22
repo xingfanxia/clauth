@@ -614,6 +614,91 @@ fn soonest_resume_none_when_chain_member_missing_profile() {
     assert_eq!(soonest_resume(&config), None);
 }
 
+// A disabled member is never a switch candidate, so its idle cached 5h
+// window must not bail the whole caption to None: the reachable, genuinely
+// hard-exhausted member still reports its reset.
+#[test]
+fn soonest_resume_skips_a_disabled_member_holding_an_idle_window() {
+    let config = config_with_chain(
+        vec![
+            profile_with_usage(
+                "reachable",
+                Some(95.0),
+                Some(usage_info(Some(window(100.0, Some(reset_in(1800)))))),
+            ),
+            mark_disabled(profile_with_util("dead", Some(95.0), Some(5.0))),
+        ],
+        "reachable",
+    );
+    let (name, eta) = soonest_resume(&config).expect("reachable member is hard-exhausted");
+    assert_eq!(name, "reachable", "the disabled member must be skipped");
+    assert!((1700..=1800).contains(&eta), "eta ~1800s, got {eta}");
+}
+
+// Same shape, auth-broken instead of disabled — the other `candidate_excluded`
+// axis that isn't usage-derived.
+#[test]
+fn soonest_resume_skips_an_auth_broken_member_holding_an_idle_window() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_usage(
+                "reachable",
+                Some(95.0),
+                Some(usage_info(Some(window(100.0, Some(reset_in(1800)))))),
+            ),
+            profile_with_util("dead", Some(95.0), Some(5.0)),
+        ],
+        "reachable",
+    );
+    config.set_auth_broken("dead", true);
+    let (name, eta) = soonest_resume(&config).expect("reachable member is hard-exhausted");
+    assert_eq!(name, "reachable", "the auth-broken member must be skipped");
+    assert!((1700..=1800).contains(&eta), "eta ~1800s, got {eta}");
+}
+
+// Same shape, canceled instead of disabled — the exact regression fixture:
+// a canceled account whose cached 5h window still reads idle headroom.
+#[test]
+fn soonest_resume_skips_a_canceled_member_holding_an_idle_window() {
+    let config = config_with_chain(
+        vec![
+            profile_with_usage(
+                "reachable",
+                Some(95.0),
+                Some(usage_info(Some(window(100.0, Some(reset_in(1800)))))),
+            ),
+            profile_with_usage("dead", Some(95.0), Some(canceled_usage())),
+        ],
+        "reachable",
+    );
+    let (name, eta) = soonest_resume(&config).expect("reachable member is hard-exhausted");
+    assert_eq!(name, "reachable", "the canceled member must be skipped");
+    assert!((1700..=1800).contains(&eta), "eta ~1800s, got {eta}");
+}
+
+// Guard: a chain of just ONE dead member, sitting at/over its own
+// threshold — it would read as hard-exhausted if the skip didn't apply, so
+// an unfixed/reverted loop would happily report it as the soonest-resume
+// answer. A disabled member is never a candidate at all, so the correct
+// result is None (nothing left to report), not Some(dead, eta). This is the
+// fixture that actually discriminates the fix from a revert: an EARLIER
+// version of this guard put a real-headroom "reachable" member first in the
+// chain, which returns None on its own (already pinned by
+// `soonest_resume_none_when_one_member_recovered`) regardless of whether the
+// dead-member skip exists at all.
+#[test]
+fn soonest_resume_none_when_the_only_chain_member_is_a_dead_one_over_threshold() {
+    let config = config_with_chain(
+        vec![mark_disabled(profile_with_util(
+            "dead",
+            Some(95.0),
+            Some(100.0),
+        ))],
+        "dead",
+    );
+    assert_eq!(soonest_resume(&config), None);
+}
+
 // next_auto_switch_target: scheduler-side wrap-off → Off when chain spent.
 #[test]
 fn auto_switch_wrap_off_switches_off_when_chain_spent() {

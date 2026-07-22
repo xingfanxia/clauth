@@ -488,17 +488,24 @@ pub(crate) fn is_exhausted_active(
 
 /// Name + seconds-until-reset of the chain member that resumes soonest — the
 /// all-exhausted caption's data source (issue #10: the implicit
-/// resume-at-soonest-reset behavior, made explicit). Valid only when the
-/// WHOLE chain is currently exhausted, covering both wrap-off's
-/// switch-off-all (active cleared) and wrap mode's stalled-active equivalent
-/// (`next_target` returns `None` with every member maxed). Reuses
+/// resume-at-soonest-reset behavior, made explicit). Valid only when every
+/// member that could actually be switched TO is currently exhausted, covering
+/// both wrap-off's switch-off-all (active cleared) and wrap mode's
+/// stalled-active equivalent (`next_target` returns `None` with every member
+/// maxed). A dead member — disabled, auth-broken, or canceled
+/// ([`candidate_excluded`]) — is never a switch candidate in the first
+/// place, so its usage (however idle a cached window it holds) says nothing
+/// about the chain's premise and is SKIPPED, not counted. An unresolvable
+/// member is the one exception: it can't be proven exhausted at all, so it
+/// still bails the WHOLE result to `None` rather than being skipped around
+/// (see the loop's `config.find` below). Reuses
 /// [`is_exhausted`]'s wall-clock gates (`five_hour_live` and the weekly
-/// `seven_day_live` block): a member exhausted in neither window
-/// already has headroom — `find_recovered_member` /
-/// `scan_recovery` would relink it on the very next tick — so that member's
-/// presence bails the WHOLE result to `None` rather than being skipped around;
-/// the caption's premise is that NOTHING in the chain is currently usable.
-/// Ties on `resets_at` keep the earlier chain-order member.
+/// `seven_day_live` block) for every OTHER member: one exhausted in neither
+/// window already has headroom — `find_recovered_member` / `scan_recovery`
+/// would relink it on the very next tick — so THAT member's presence bails
+/// the WHOLE result to `None` rather than being skipped around; the
+/// caption's premise is that nothing reachable in the chain is currently
+/// usable. Ties on `resets_at` keep the earlier chain-order member.
 ///
 /// Weekly-wise the premise keys on the HARD cap ([`WEEKLY_HARD_BLOCK_PCT`]),
 /// not the soft line (2026-07-10 triage): a member past the line still serves
@@ -516,7 +523,15 @@ pub(crate) fn soonest_resume(config: &AppConfig) -> Option<(String, i64)> {
     let weekly_pct = config.state.weekly_switch_threshold_pct();
     let mut best: Option<(&str, i64)> = None;
     for name in chain {
+        // An unresolvable member can't be proven exhausted — bail rather
+        // than pick around it, same as before this member-skip existed.
         let profile = config.find(name)?;
+        // A dead member is never a switch candidate, so skip it around
+        // instead of letting its (possibly idle) cached usage bail the
+        // whole caption to None.
+        if candidate_excluded(config, name) {
+            continue;
+        }
         if !is_exhausted_hard(profile) {
             return None;
         }
