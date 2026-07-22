@@ -1247,7 +1247,15 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
         env: config.env,
         models: config.models,
         fallback_threshold: finite_pct(config.fallback_threshold),
-        weekly_threshold: config.weekly_threshold.map(|v| v.clamp(0.0, 100.0)),
+        // Reset-not-clamp, mirroring the chain-wide line this overrides
+        // (`AppState::weekly_switch_threshold_pct`): an out-of-band hand-edit
+        // (`0.98` — the fraction-vs-percent typo — or `nan`, `120`) follows
+        // the chain default instead of clamping into a plausible-looking
+        // near-zero line that silently weekly-blocks the account from about
+        // 1% into its week.
+        weekly_threshold: config
+            .weekly_threshold
+            .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v)),
         last_resort: config.last_resort,
         // Normalize at the LOAD boundary so the on-disk value is never a live
         // trap for a direct reader (the 2026-07-14 weekly-line lesson). `inf`

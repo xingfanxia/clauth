@@ -1478,10 +1478,13 @@ fn burn_tunables_round_trip_and_omit_when_unset() {
     );
 }
 
-// The per-account weekly-line override must default unset (follow the chain),
-// round-trip through config.toml, and clamp like the other percent fields.
+// The per-account weekly-line override must default unset (follow the chain)
+// and round-trip through config.toml. Its LOAD normalization is reset-not-
+// clamp, pinned separately by
+// `weekly_threshold_out_of_band_resets_to_unset_at_load` — through the real
+// disk boundary, where the normalization actually lives.
 #[test]
-fn weekly_threshold_round_trips_and_clamps() {
+fn weekly_threshold_round_trips_through_config_toml() {
     let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
     assert_eq!(cfg.weekly_threshold, None);
 
@@ -1494,4 +1497,88 @@ fn weekly_threshold_round_trips_and_clamps() {
     let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
     let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
     assert_eq!(parsed.weekly_threshold, None);
+}
+
+/// The override RESETS to unset out of band, mirroring the chain-wide line it
+/// overrides (never clamps — a `0.98` fraction-vs-percent typo clamped to the
+/// band's floor would weekly-block the account from about 1% into its week,
+/// chipped as a plausible-looking `WeeklySoft`). Through the real disk
+/// boundary: `load_profile` is where the normalization lives.
+#[cfg(unix)]
+#[test]
+fn weekly_threshold_out_of_band_resets_to_unset_at_load() {
+    let _home = HomeSandbox::new();
+    let name = "weekly-reset-test";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+
+    for (raw, expect, why) in [
+        (
+            "weekly_threshold = 0.98
+",
+            None,
+            "fraction typo resets",
+        ),
+        (
+            "weekly_threshold = 40.0
+",
+            None,
+            "under-band resets, never clamps to MIN",
+        ),
+        (
+            "weekly_threshold = 150.0
+",
+            None,
+            "over-band resets, never clamps to MAX",
+        ),
+        (
+            "weekly_threshold = nan
+",
+            None,
+            "nan is valid TOML and must not survive",
+        ),
+        (
+            "weekly_threshold = 98.0
+",
+            Some(98.0),
+            "in-band survives",
+        ),
+    ] {
+        std::fs::write(&config_path, raw).expect("write config.toml");
+        assert_eq!(
+            load_profile(name).expect("load_profile").weekly_threshold,
+            expect,
+            "{why}: {raw:?}"
+        );
+    }
+}
+
+/// The usage gates default ON through the REAL load boundary — an absent key
+/// in a config.toml written before the gates existed keeps stock gating.
+/// `profile_config_usage_gates_default_unset` stops at `ProfileConfig` (the
+/// unset is `None` there); this pins the `unwrap_or(true)` resolution where
+/// it lives, so flipping it to `unwrap_or(false)` cannot stay green.
+#[cfg(unix)]
+#[test]
+fn usage_gates_default_on_through_the_load_boundary() {
+    let _home = HomeSandbox::new();
+    let name = "gate-default-test";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    std::fs::write(&config_path, "").expect("write empty config.toml");
+
+    let loaded = load_profile(name).expect("load_profile");
+    assert!(loaded.check_weekly, "absent check_weekly loads as ON");
+    assert!(loaded.check_scoped, "absent check_scoped loads as ON");
+
+    std::fs::write(
+        &config_path,
+        "check_weekly = false
+check_scoped = false
+",
+    )
+    .expect("write config.toml");
+    let loaded = load_profile(name).expect("load_profile");
+    assert!(!loaded.check_weekly, "an explicit false survives the load");
+    assert!(!loaded.check_scoped, "an explicit false survives the load");
 }

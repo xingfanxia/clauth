@@ -2939,6 +2939,35 @@ fn all_spent_banner_ignores_a_soft_blocked_member_that_still_serves() {
     );
 }
 
+/// A member weekly line UNDER the hard cap is a switch line, not death: 7d at
+/// 95 with a `weekly at 90` override is past ITS line (the walk rotates off
+/// it) but still serves. The banner keys on [`is_exhausted_hard`] — folding
+/// the member line here would claim "all accounts spent" over a member that
+/// answers requests fine. The fixture's override is what makes this test
+/// discriminate: with no override the member line IS the hard cap, and the
+/// folding revision passes it too.
+#[test]
+fn all_spent_banner_ignores_a_member_line_under_the_hard_cap() {
+    use super::update_banner;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mut overridden = crate::testutil::blank_profile("a");
+    overridden.weekly_threshold = Some(90.0);
+    overridden.usage = Some(UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 95.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 86_400)),
+        }),
+        ..UsageInfo::default()
+    });
+    let mut app = app_with_unlinked_profiles(vec![overridden]);
+    update_banner(&mut app);
+    assert_eq!(
+        app.banner.as_ref().expect("banner").message,
+        "no active account · select one to resume",
+        "past the member line but under the cap still serves — not spent"
+    );
+}
+
 /// The same member at the hard cap IS spent.
 #[test]
 fn all_spent_banner_fires_at_the_weekly_hard_cap() {

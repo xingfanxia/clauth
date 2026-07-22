@@ -756,7 +756,7 @@ impl ActionMenuAction {
             Self::ReorderUp => "reorder up",
             Self::ReorderDown => "reorder down",
             Self::EditThreshold => "edit threshold",
-            Self::EditWeeklyAt => "edit weekly line",
+            Self::EditWeeklyAt => "edit weekly at",
             Self::ToggleCheckWeekly => "toggle weekly gate",
             Self::ToggleCheckScoped => "toggle scoped gate",
             Self::ToggleLastResort => "toggle last resort",
@@ -4479,7 +4479,7 @@ pub(crate) fn parse_weekly_override(raw: &str) -> Option<Option<f64>> {
     if raw.is_empty() {
         return Some(None);
     }
-    parse_threshold(raw).map(Some)
+    parse_weekly_pct(raw).map(Some)
 }
 
 /// The selected member's `(weekly_threshold override, check_weekly)`, or
