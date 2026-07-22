@@ -777,7 +777,10 @@ static HOME_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(
 /// `testutil::HomeSandbox` and runtime's `with_fake_home` acquire it as RAII
 /// guards.
 #[cfg(test)]
-pub(crate) static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static HOME_TEST_LOCK: crate::lockorder::RankedMutex<
+    (),
+    crate::lockorder::rank::HomeTest,
+> = crate::lockorder::RankedMutex::new(());
 
 #[cfg(test)]
 pub(crate) fn set_home_override(path: PathBuf) {

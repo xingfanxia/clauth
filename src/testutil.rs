@@ -17,7 +17,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub(crate) struct HomeSandbox {
     // Drop order: tempdir first, then the shared lock.
     _tmp: tempfile::TempDir,
-    _guard: std::sync::MutexGuard<'static, ()>,
+    _guard: crate::lockorder::RankedGuard<'static, ()>,
     home: PathBuf,
 }
 
@@ -56,7 +56,7 @@ impl Drop for HomeSandbox {
 pub(crate) struct TierSandbox {
     // Drop order: this type's `drop` restores under the lock, which the field
     // then releases.
-    _guard: std::sync::MutexGuard<'static, ()>,
+    _guard: crate::lockorder::RankedGuard<'static, ()>,
     prev: Option<crate::tui::theme::Tier>,
 }
 

@@ -86,7 +86,10 @@ pub(crate) fn tier() -> Tier {
 /// into the one bin target, so under `cargo test` they run as threads sharing
 /// this `TIER`. `testutil::TierSandbox` acquires it as an RAII guard.
 #[cfg(test)]
-pub(crate) static TIER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static TIER_TEST_LOCK: crate::lockorder::RankedMutex<
+    (),
+    crate::lockorder::rank::TierTest,
+> = crate::lockorder::RankedMutex::new(());
 
 /// Read the stored pin, `None` for unset. [`tier`] collapses unset into a
 /// detected tier, which a restore would then write back as a real pin.

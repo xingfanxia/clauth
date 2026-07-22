@@ -38,7 +38,7 @@ fn showcase() {
 
 /// Redirect home into a tempdir so all disk ops land on scratch space.
 struct ShowcaseHome {
-    _home_lock: std::sync::MutexGuard<'static, ()>,
+    _home_lock: crate::lockorder::RankedGuard<'static, ()>,
     _tmp: TempDir,
 }
 
@@ -578,7 +578,8 @@ fn seed_history_yields_burn_rates() {
 fn headless_showcase_renders() {
     // Home redirected into a tempdir + disk history seeded; held for the whole
     // fn so on_tick writes land on scratch. Acquired BEFORE App::new so no
-    // RankedMutex is ever held while taking the (untracked) HOME_TEST_LOCK.
+    // RankedMutex is ever held while taking HOME_TEST_LOCK, now the outermost
+    // rank — the lock-order check enforces that ordering.
     let _home = ShowcaseHome::new();
     let mut app = app::App::new(demo_config());
     seed_usage(&app);
