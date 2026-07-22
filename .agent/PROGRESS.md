@@ -1651,3 +1651,22 @@ refuters; 10 findings, 9 confirmed, all fixed):
   mis-fills deliberately keep the vanilla mirror — that's what keeps CC alive
   while disengaged, CLA-SPLIT-3).
 Post-fix gate: 1557 tests green, clippy 0, fmt clean.
+
+CLA-FEED-1 deploy incident (2026-07-22 01:30Z, AX report "切backup失败+被登出"):
+a STALE-BINARY WRITER wiped `session_feed` from all three config.tomls hours
+after enablement — a `clauth` TUI running since 07-18 (tmux, pre-CLA-FEED
+image; binary replaced under it 07-21) plus the un-restarted proxy. Old
+ProfileConfig doesn't know the key, so any of its config rewrites drops it
+(wipe mtimes 20:11Z/21:23Z/01:31Z each match a daemon "external change"
+logline). Flag off → nobody re-fed → ax-backup's fed token expired under the
+live session → CC 401 with no refresh token → "Login expired" (AX /login'd);
+daemon benched backup ("long-lived token has expired" — the vanilla gate
+reading the dead fed token as an expired mint) and auto-switched to ax-main
+(static mint → Fable gone). RECOVERY: killed the stale TUI, restarted the
+proxy (new image), re-ran `clauth feed on` for backup/cl (re-fed 7h/2h
+tokens), re-set ax-main's flag by hand (daemon arms it on next rotation).
+LESSONS: (1) binary replacement must restart EVERY clauth process — daemon,
+proxy, AND any long-lived TUI (tmux windows!); pgrep by image age, not by
+role. (2) config.toml unknown-key wipe by old binaries is a standing hazard —
+follow-up: preserve unknown keys in maybe_rewrite_config_toml (toml_edit
+round-trip) so future flags survive stale writers.
