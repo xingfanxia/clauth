@@ -1802,3 +1802,41 @@ stays queued behind #55. No new PR opened — nothing else is ripe.
   for back-compat, offer `-cx` over `-c`. Awaiting maintainer.
 - **#47 follow-up** (daemon honors on-mismatch + `follow`) now fully
   unblocked (#55 and #58 both landed). Not started.
+
+## UPS-6 — fork↔upstream sync: v0.13.0 + v0.13.1 merged (2026-07-23)
+
+- **True merge `45f2f43`** (sync/upstream-2026-07-23 → ff main, pushed; PR #51
+  head auto-updated). ~60 upstream commits, 34 conflicted files.
+- **Reconciled to merged forms**: #55 (fork's SCW hand-port → upstream's
+  ChainMember snapshot shape, `is_exhausted_from_usage(member, usage, line)`,
+  `worst_scoped_window`, parse_weekly_pct band, weekly-at scoped-line gate
+  semantics) and #58 (fork's round-1 `live_login_is_clauth_symlink` DELETED →
+  upstream's final `live_login_is_stored` + `live_diverged_and_unsaved`
+  everywhere).
+- **Adopted upstream features, gated through fork axes**: account-disable
+  toggle (codex backstop lives in `ensure_switch_target_ok` — codex bail
+  BEFORE disabled check; fork route/email cells joined the disabled dim
+  flatten), daemon singleton cap (`--status`/`--standby`/`--replace`, pid
+  sidecar; fork per-harness switch_backoff map kept), clap-derive CLI
+  (`src/cli.rs` extended with Fallback/Feed/Proxy/Doctor variants + login
+  `--new`/`--codex`/`--browser`; hand parsers deleted; print_help deleted),
+  d954fb6 non-login capture guards PORTED into fork's CAP-1 shape (non-force
+  None leg no longer clears the store; force path skips absent/shell; CAP-1
+  first-login leg now requires a non-empty token — upstream's 92c56e7),
+  5h post-reset repoll, walk_excluded shared skip predicate, finite_pct /
+  weekly reset-not-clamp load normalization.
+- **Test reconciliation strategy** (the bulk of the work): per-file whole-file
+  rebuilds — upstream base + fork-only blocks (claude, cli, fallback, oauth,
+  profile, tui_render_format/overview/usage) or FORK base + upstream blocks
+  where src kept fork shapes (daemon_mod, daemon_status_json); scheduler
+  recovery tests adapted HashSet→VecDeque; upstream tests adapted to fork
+  signatures (render_overview_row 6-arg, OverviewWidths 3-arg, HeaderState
+  is_active/account_email, LiveSignals last_error/last_switch, build_status
+  4-arg, per-harness stage_switch). Superseded fork tests dropped (round-1
+  #58 suite, hand-parser CLI suite, blocked_pill PILL_LINES test).
+- **Deploy**: plist template + live LaunchAgent now run `daemon --standby`
+  (upstream's new exit-if-running default would strand a launchd respawn race
+  as a clean exit KeepAlive never restarts). Binary replaced via fresh inode
+  (in-place cp = SIGKILL, macOS signature kill). Daemon (pid --standby) +
+  proxy restarted, status.json fresh, all fork wire keys verified present.
+- Gates: 1773 green, clippy 0, fmt clean, hard-cap sweep clean.
