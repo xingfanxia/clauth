@@ -767,7 +767,7 @@ fn a_redundant_instance_exits_without_touching_the_shared_tree() {
     let held = crate::profile::open_state_file(&dir.join(super::LOCK_FILE)).expect("open lock");
     held.try_lock().expect("hold the singleton lock");
 
-    super::serve(super::Standby::Never).expect("a redundant instance exits clean");
+    super::serve(super::StartMode::ExitIfRunning).expect("a redundant instance exits clean");
 
     assert!(
         ghost.exists(),
@@ -786,4 +786,35 @@ fn a_redundant_instance_exits_without_touching_the_shared_tree() {
             "the redundant instance walked the tree's modes before exiting"
         );
     }
+}
+
+/// The default's redundant line names the holder's pid so a `ps` dump ties back
+/// to it; `--standby` reports a full queue instead. Pins the operator-facing
+/// wording (`serve` logs it and exits, which a test can't easily capture).
+#[test]
+fn redundant_reason_names_the_pid_for_the_default_and_the_queue_for_standby() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    // No pid sidecar staged: the default still reads "already running", pid unknown.
+    let default = super::redundant_reason(super::StartMode::ExitIfRunning);
+    assert!(
+        default.starts_with("already running (pid "),
+        "the default's redundant reason must read 'already running (pid …)', got {default:?}"
+    );
+
+    // With a pid stamped, it surfaces the number.
+    std::fs::write(dir.join(super::PID_FILE), "4242\n").expect("stamp pid");
+    let with_pid = super::redundant_reason(super::StartMode::ExitIfRunning);
+    assert!(
+        with_pid.contains("4242"),
+        "the default's redundant reason must name the holder pid, got {with_pid:?}"
+    );
+
+    let standby = super::redundant_reason(super::StartMode::Standby);
+    assert!(
+        standby.contains("standby"),
+        "the --standby redundant reason must mention the full queue, got {standby:?}"
+    );
 }

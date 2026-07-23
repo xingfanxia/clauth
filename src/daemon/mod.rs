@@ -124,24 +124,29 @@ fn migrate_clauth_perms_700(dir: &std::path::Path) {
     crate::profile::enforce_clauth_perms(dir);
 }
 
-/// Whether a `clauth daemon` that loses the singleton race parks in the standby
-/// slot or exits on the spot.
+/// What a starting `clauth daemon` does when another instance already holds the
+/// singleton lock (#57).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Standby {
-    /// The default. A supervisor's instance takes over the moment a manually run
-    /// one exits, which is the only reason parking exists.
-    Wait,
-    /// `--no-standby`, for a spawner that fires repeatedly and only wants a
-    /// daemon to exist. NOT for a supervisor unit: a launchd
-    /// `KeepAlive{SuccessfulExit=false}` instance that loses the race exits 0,
-    /// is never restarted, and leaves nothing behind when the winner quits —
-    /// the same "no daemon and no recovery" end state #57 was about.
-    Never,
+pub(crate) enum StartMode {
+    /// The default (and the `--no-standby` spelling). Exit 0 the moment the lock
+    /// is lost: a daemon is already running, which is the desired end state. A
+    /// pure supervisor never reaches this — it wins the boot race alone and
+    /// `KeepAlive{SuccessfulExit=false}` restarts it on crash.
+    ExitIfRunning,
+    /// `--standby`. Park in the one standby slot and take over the moment the
+    /// holder exits. The launchd/systemd-paired-with-a-manual-run mix is the
+    /// only setup that needs it: a supervisor's instance has to queue behind a
+    /// manually run one it could never be restarted behind after a clean exit.
+    Standby,
+    /// `--replace`. Terminate the running daemon, wait for its flock to release
+    /// on death, then take over. For an in-place upgrade, where the operator
+    /// wants the new binary running now rather than on the next restart.
+    Replace,
 }
 
 /// `clauth daemon` — build the shared stores, run the scheduler headless, and
 /// loop executing auto-switches + rewriting `status.json` until killed.
-pub(crate) fn serve(standby: Standby) -> Result<()> {
+pub(crate) fn serve(mode: StartMode) -> Result<()> {
     // First thing, before any output (including the standing-by line below):
     // daemon stderr IS daemon.log, and undated lines cost real forensics time
     // (2026-07-09 — see `logline`).
@@ -156,16 +161,21 @@ pub(crate) fn serve(standby: Standby) -> Result<()> {
 
     // Single-instance guard, claimed BEFORE any shared-tree work below: a
     // redundant instance must not GC the live daemon's runtime forest or walk
-    // its modes. One waiter may stand by so a supervisor's instance can take
-    // over from a manually run one (a clean exit is never restarted under
-    // launchd `KeepAlive{SuccessfulExit=false}`); the rest exit rather than pile
-    // up (#57). A dead holder's advisory flock auto-releases, so standby is
-    // never orphaned.
-    let _lock = match claim_singleton(&dir, standby == Standby::Wait)? {
+    // its modes. The default exits the moment the lock is lost; only `--standby`
+    // parks a lone waiter so a supervisor's instance can take over from a
+    // manually run one (a clean exit is never restarted under launchd
+    // `KeepAlive{SuccessfulExit=false}`); `--replace` terminates the holder and
+    // takes over (#57). A dead holder's advisory flock auto-releases, so neither
+    // a standby nor a replace is ever orphaned.
+    let claim = match mode {
+        StartMode::Replace => probe::claim_by_replacing(&dir)?,
+        _ => claim_singleton(&dir, mode == StartMode::Standby)?,
+    };
+    let _lock = match claim {
         Claim::Active(lock) => lock,
         Claim::Standby(slot) => stand_by(&dir, slot)?,
         Claim::Redundant => {
-            logline!("clauth daemon: {}; exiting", redundant_reason(standby));
+            logline!("clauth daemon: {}; exiting", redundant_reason(mode));
             return Ok(());
         }
     };
@@ -248,12 +258,19 @@ fn warn_if_spend_is_uncapped(config: &crate::profile::AppConfig) {
     }
 }
 
-/// Why this instance has nothing to do, worded so the operator can tell a
-/// full queue apart from a deliberate `--no-standby`.
-fn redundant_reason(standby: Standby) -> &'static str {
-    match standby {
-        Standby::Wait => "a daemon and its standby are already running",
-        Standby::Never => "another instance already holds the lock (--no-standby)",
+/// Why this instance has nothing to do, worded so the operator can tell a full
+/// queue apart from the default's "one is already up". The default names the
+/// holder's pid so a `ps` dump ties back to a line here; `--standby` reaches
+/// this only when the slot is already taken. `--replace` never reaches it (it
+/// terminates the holder and claims, or errors), so its arm is defensive.
+fn redundant_reason(mode: StartMode) -> String {
+    match mode {
+        StartMode::ExitIfRunning => {
+            let pid = probe::holder_pid().map_or_else(|| "unknown".to_string(), |p| p.to_string());
+            format!("already running (pid {pid})")
+        }
+        StartMode::Standby => "a daemon and its standby are already running".to_string(),
+        StartMode::Replace => "another instance already holds the lock".to_string(),
     }
 }
 

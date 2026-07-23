@@ -8,6 +8,8 @@
 //!   * `singleton_held` asks the same presence question as a DECISION rather
 //!     than a display: where the dot hides an unreadable lock, `--status` fails
 //!     on it instead of telling a supervisor to spawn.
+//!   * `claim_by_replacing` (`--replace`) terminates the running daemon and takes
+//!     over, refusing to signal a pid it can't confirm is a running clauth daemon.
 //!   * `FetchLease` is the single-fetcher lease over `usage-fetch.lock`: exactly
 //!     one holder at a time, held for life, released on drop so a waiter takes
 //!     over.
@@ -370,6 +372,117 @@ fn singleton_held_separates_a_missing_lock_a_free_one_and_a_held_one() {
     assert!(
         !singleton_held().expect("a released lock"),
         "a released flock means the holder died → no daemon, still not an error"
+    );
+}
+
+// ── claim_by_replacing (--replace, #57) ───────────────────────────────────────
+
+/// `--replace` with nothing running is just a normal start: it takes the free
+/// lock rather than erroring on "no daemon to replace".
+#[test]
+fn replace_starts_clean_when_no_daemon_is_running() {
+    let _home = HomeSandbox::new();
+    let dir = sandbox_dir();
+    let claim = claim_by_replacing_with(
+        &dir,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_millis(10),
+    )
+    .expect("replace with no daemon just starts");
+    assert!(
+        matches!(claim, Claim::Active(_)),
+        "no holder to replace → take the lock like any first start"
+    );
+}
+
+/// A running daemon whose pid can't be read (a torn or absent sidecar) is never
+/// signalled: `--replace` bails and leaves the kill to the operator.
+#[test]
+fn replace_refuses_a_holder_whose_pid_is_unreadable() {
+    let _home = HomeSandbox::new();
+    let dir = sandbox_dir();
+    let _held = hold_daemon_lock(); // holds the lock, stamps no pid sidecar
+    let err = claim_by_replacing_with(
+        &dir,
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(10),
+    )
+    .expect_err("an unreadable pid must not be signalled");
+    assert!(
+        err.to_string().contains("unreadable"),
+        "the bail flags the unreadable pid, got {err}"
+    );
+}
+
+/// The identity guard refuses to signal a pid that is not a running `clauth
+/// daemon` (the recycled / in-handover window). pid 1 (init/systemd) is a
+/// never-a-daemon stand-in; asserting the bail proves the guard fired before any
+/// signal reached it. Unix-only: it reads argv, which the Windows probe can't.
+#[cfg(unix)]
+#[test]
+fn replace_refuses_a_pid_that_is_not_the_running_daemon() {
+    let _home = HomeSandbox::new();
+    let dir = sandbox_dir();
+    let _held = hold_daemon_lock();
+    std::fs::write(dir.join(super::super::PID_FILE), "1\n").expect("stamp pid 1");
+    let err = claim_by_replacing_with(
+        &dir,
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(10),
+    )
+    .expect_err("a pid that is not the running daemon must not be signalled");
+    assert!(
+        err.to_string().contains("not a running clauth daemon"),
+        "the bail flags the pid as not the daemon, got {err}"
+    );
+}
+
+/// `wait_for_active` claims the lock the moment a holder releases it — the poll
+/// loop bridges the gap between a killed daemon's death and its flock
+/// auto-releasing. Removing the loop reds this: the first attempt still reads
+/// the lock held.
+#[test]
+fn wait_for_active_claims_once_the_holder_releases() {
+    let _home = HomeSandbox::new();
+    let dir = sandbox_dir();
+    let held = hold_daemon_lock();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        drop(held);
+    });
+    let lock = wait_for_active(
+        &dir,
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(10),
+    );
+    assert!(
+        lock.is_some(),
+        "wait_for_active must poll until the freed flock is claimable"
+    );
+    releaser.join().expect("releaser thread");
+}
+
+/// The wait is bounded: a holder that never releases makes `wait_for_active`
+/// time out and return None rather than block forever, so `--replace` can
+/// escalate SIGTERM → SIGKILL and, past that, give up with an error.
+#[test]
+fn wait_for_active_times_out_while_the_lock_stays_held() {
+    let _home = HomeSandbox::new();
+    let dir = sandbox_dir();
+    let _held = hold_daemon_lock(); // never released
+    let started = std::time::Instant::now();
+    let lock = wait_for_active(
+        &dir,
+        std::time::Duration::from_millis(80),
+        std::time::Duration::from_millis(10),
+    );
+    assert!(
+        lock.is_none(),
+        "a never-released lock must time out, not block"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(80),
+        "it waited the full window before giving up"
     );
 }
 

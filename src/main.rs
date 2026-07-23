@@ -174,14 +174,22 @@ fn dispatch(args: &[String]) -> Result<()> {
         )),
         [cmd, target] if cmd == "info" => sessions_cli::run_info(target),
         [cmd, ..] if cmd == "info" => Err(usage_error("usage: clauth info <id|latest>")),
-        [cmd] if cmd == "daemon" => daemon::serve(daemon::Standby::Wait),
+        [cmd] if cmd == "daemon" => daemon::serve(daemon::StartMode::ExitIfRunning),
+        [cmd, flag] if cmd == "daemon" && flag == "--standby" => {
+            daemon::serve(daemon::StartMode::Standby)
+        }
+        // Kept as the default's spelling now that exit-when-running is the
+        // default; a spawner or unit still passing it behaves unchanged.
         [cmd, flag] if cmd == "daemon" && flag == "--no-standby" => {
-            daemon::serve(daemon::Standby::Never)
+            daemon::serve(daemon::StartMode::ExitIfRunning)
+        }
+        [cmd, flag] if cmd == "daemon" && flag == "--replace" => {
+            daemon::serve(daemon::StartMode::Replace)
         }
         [cmd, flag] if cmd == "daemon" && flag == "--status" => daemon::status_probe(),
-        [cmd, ..] if cmd == "daemon" => {
-            Err(usage_error("usage: clauth daemon [--no-standby|--status]"))
-        }
+        [cmd, ..] if cmd == "daemon" => Err(usage_error(
+            "usage: clauth daemon [--standby|--no-standby|--replace|--status]",
+        )),
         [cmd, rest @ ..] if cmd == "status" => match parse_status_args(rest) {
             Some(include_disabled) => daemon::status_oneshot(include_disabled),
             None => anyhow::bail!("usage: clauth status --json [--all|--disabled]"),
@@ -1033,14 +1041,14 @@ fn print_help() {
          defaulting to the session's last-ran profile; --profile forces)\n  \
            clauth info <id|latest>         print the resume command, workspace, and\n                                  \
          on-disk storage path for a session (never launches)\n  \
-           clauth daemon [--no-standby|--status]\n                                  \
+           clauth daemon [--standby|--no-standby|--replace|--status]\n                                  \
          run the headless scheduler with no TUI: refresh usage,\n                                  \
          auto-switch on exhaustion, and write ~/.clauth/status.json.\n                                  \
-         With one already running a second instance stands by and\n                                  \
-         takes over when it exits; any further one exits at once.\n                                  \
-         --no-standby never stands by, for a spawner that fires\n                                  \
-         repeatedly (not for a supervisor unit: an instance that\n                                  \
-         loses the race exits 0 and is never restarted).\n                                  \
+         Exits at once when a daemon is already running.\n                                  \
+         --standby instead waits and takes over when it exits,\n                                  \
+         for a launchd/systemd unit paired with a manual run.\n                                  \
+         --replace terminates the running daemon and takes over,\n                                  \
+         for an in-place upgrade. --no-standby is the default.\n                                  \
          --status prints the running daemon, or exits 1 with no\n                                  \
          output when none is running\n  \
            clauth status --json [--all|--disabled]\n                                  \

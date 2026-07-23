@@ -24,7 +24,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -118,6 +118,7 @@ pub(crate) fn status_is_fresh(body: &str, now_ms: u64) -> bool {
 /// from (launchd `KeepAlive{SuccessfulExit=false}`). It is capped at ONE waiter:
 /// before the cap, every `clauth daemon` a repeat-firing spawner started parked
 /// forever, which is how one box collected two dozen of them.
+#[derive(Debug)]
 pub(crate) enum Claim {
     /// Took `clauthd.lock`. Run the scheduler; hold the guard for life.
     Active(DaemonLock),
@@ -131,6 +132,7 @@ pub(crate) enum Claim {
 
 /// The held singleton lock. Kept for the process lifetime; the flock releases
 /// when the process exits, so a crashed daemon frees it with no pidfile cleanup.
+#[derive(Debug)]
 pub(crate) struct DaemonLock {
     _file: File,
 }
@@ -150,6 +152,7 @@ impl DaemonLock {
 /// The one standby slot: the (still unlocked) singleton handle this process
 /// will block on, plus the `clauthd-standby.lock` flock that keeps every later
 /// instance out of the queue.
+#[derive(Debug)]
 pub(crate) struct StandbySlot {
     active: File,
     slot: File,
@@ -187,6 +190,15 @@ const CLAIM_RETRY: Duration = Duration::from_millis(100);
 // for good. Every schedule-injecting test still passes with either, so the guard
 // is here rather than in one.
 const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
+
+/// How long `--replace` waits for a terminated holder's flock to auto-release on
+/// death before it escalates (SIGTERM → SIGKILL) and, after the escalation,
+/// before it gives up. A dying process releases its advisory flock within a
+/// handful of scheduler ticks; 5 s is generous headroom over that.
+const REPLACE_WAIT: Duration = Duration::from_secs(5);
+/// Poll spacing while `--replace` waits for the freed flock. Two orders of
+/// magnitude below [`REPLACE_WAIT`], well under any human-visible delay.
+const REPLACE_POLL: Duration = Duration::from_millis(50);
 
 /// Claim a role in the daemon singleton, re-trying a lost race past a transient
 /// probe hold (see [`CLAIM_ATTEMPTS`]).
@@ -251,6 +263,195 @@ fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
             Err(e).context("failed to lock the clauth daemon standby lock file")
         }
     }
+}
+
+/// `clauth daemon --replace`: terminate the running daemon and take the
+/// singleton lock, for an in-place upgrade (#57). Always yields [`Claim::Active`]
+/// on success; every failure mode is an `Err`, never a silent stand-down.
+///
+/// Nothing running (a free or missing lock) means nothing to replace: take the
+/// lock like a normal start. A running daemon whose pid can't be read (a torn or
+/// in-handover [`PID_FILE`] sidecar) bails rather than signal a pid it can't
+/// confirm. Otherwise it SIGTERMs the holder, waits for the flock to
+/// auto-release on death (bounded), escalates to SIGKILL once, then claims. The
+/// identity guard narrows the recycled-pid window [`holder_pid`] documents by
+/// requiring the pid to still be a running `clauth daemon` (not merely a clauth
+/// process — `clauth start`/`mcp`/`tui` share the binary name), so a stale pid
+/// recycled onto an unrelated process, or onto another clauth subcommand, is
+/// never signalled.
+pub(crate) fn claim_by_replacing(dir: &Path) -> Result<Claim> {
+    claim_by_replacing_with(dir, REPLACE_WAIT, REPLACE_POLL)
+}
+
+/// [`claim_by_replacing`] with the wait schedule injected, so a test can pin the
+/// poll loop and the escalation without sleeping the full [`REPLACE_WAIT`].
+/// Always yields [`Claim::Active`] on success; every failure mode is an `Err`,
+/// never a silent [`Claim::Redundant`] that would log-and-exit-0 on the caller.
+pub(crate) fn claim_by_replacing_with(dir: &Path, wait: Duration, poll: Duration) -> Result<Claim> {
+    // Fast path: no daemon → a normal start. If a daemon wins the lock in the
+    // instant between the presence check and the claim, fall through and replace
+    // it rather than returning a silent `Redundant` (which `serve` would log and
+    // exit 0 on, leaving the operator's upgrade un-started).
+    if !singleton_held()?
+        && let Claim::Active(lock) = claim_once(dir, false)?
+    {
+        return Ok(Claim::Active(lock));
+    }
+    let Some(pid) = holder_pid() else {
+        anyhow::bail!(
+            "a clauth daemon is running but its pid is unreadable; kill it manually, then start"
+        );
+    };
+    if !pid_is_clauth_daemon(pid) {
+        anyhow::bail!(
+            "the recorded daemon pid {pid} is not a running clauth daemon (it exited during \
+             handover or was recycled); re-run once it settles, or kill the daemon manually"
+        );
+    }
+    let sent_term = terminate_pid(pid, false);
+    if let Some(lock) = wait_for_active(dir, wait, poll) {
+        return Ok(Claim::Active(lock));
+    }
+    // A graceful term didn't free the lock in time: force-kill, wait once more.
+    let sent_kill = terminate_pid(pid, true);
+    if let Some(lock) = wait_for_active(dir, wait, poll) {
+        return Ok(Claim::Active(lock));
+    }
+    if !sent_term && !sent_kill {
+        anyhow::bail!(
+            "could not signal the running clauth daemon (pid {pid}): the `kill` command is not on \
+             PATH; kill it manually, then start"
+        );
+    }
+    anyhow::bail!(
+        "the running clauth daemon (pid {pid}) did not release the lock within {}s of SIGKILL; \
+         it may be wedged uninterruptibly",
+        wait.as_secs()
+    )
+}
+
+/// Poll the singleton lock until this process can claim it, up to `wait`. Returns
+/// the held [`DaemonLock`] on success (its pid stamped by [`DaemonLock::active`]),
+/// or `None` on timeout. The flock a dying holder released is what this waits on,
+/// so the loop is load-bearing: the first attempt races the death and normally
+/// still reads the lock held.
+fn wait_for_active(dir: &Path, wait: Duration, poll: Duration) -> Option<DaemonLock> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Ok(Claim::Active(lock)) = claim_once(dir, false) {
+            return Some(lock);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Send SIGTERM (`hard` false) or SIGKILL (`hard` true) to `pid`, returning
+/// whether the signal command actually ran (`false` = it could not even be
+/// spawned, e.g. `kill` off PATH — which the caller distinguishes from "signalled
+/// but the process survived"). Shelling out keeps `unsafe_code = "forbid"` intact
+/// (`libc::kill` would need `unsafe`, and `signal_hook` only *receives*), matching
+/// the `/usr/bin/security` shell-out pattern already in the crate. A non-zero exit
+/// (a dead pid's `ESRCH`) still counts as run: the caller polls the flock either
+/// way. Long-form flags so the call site documents itself.
+#[cfg(unix)]
+fn terminate_pid(pid: u32, hard: bool) -> bool {
+    let signal = if hard { "KILL" } else { "TERM" };
+    std::process::Command::new("kill")
+        .args(["-s", signal, &pid.to_string()])
+        .status()
+        .is_ok()
+}
+
+#[cfg(windows)]
+fn terminate_pid(pid: u32, hard: bool) -> bool {
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string()]);
+    // A console daemon has no window to accept the graceful WM_CLOSE, so the
+    // first (soft) pass usually no-ops and the caller escalates here with /F.
+    if hard {
+        cmd.arg("/F");
+    }
+    cmd.status().is_ok()
+}
+
+/// Confirm `pid` is still a running `clauth daemon` before `--replace` signals
+/// it, narrowing the recycled-pid window [`holder_pid`] documents. The check is
+/// on the daemon ROLE, not the binary name: `clauth start` (resident around a
+/// live Claude Code session), `clauth mcp`, and `clauth tui` all share
+/// `comm == "clauth"`, so a name-only guard would let `--replace` SIGKILL one of
+/// them if the stale pid recycled onto it. Requiring argv `clauth daemon …`
+/// excludes every other subcommand and every non-clauth process. A pid that has
+/// exited (the in-handover window: recorded pid gone, successor holds the lock)
+/// or that can't be verified reads as false, so `--replace` bails and the
+/// operator re-runs against the settled successor rather than signalling blind.
+#[cfg(target_os = "linux")]
+fn pid_is_clauth_daemon(pid: u32) -> bool {
+    // `/proc/<pid>/cmdline` is NUL-separated argv; a gone pid fails the read.
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    cmdline_is_daemon(
+        raw.split(|&b| b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| a.to_vec()),
+    )
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pid_is_clauth_daemon(pid: u32) -> bool {
+    // macOS/BSD: `ps -p <pid> -o command=` prints the full argv, space-joined. A
+    // missing pid prints nothing; a failed `ps` reads false so a broken probe
+    // never green-lights a signal.
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let cmd = String::from_utf8_lossy(&out.stdout);
+    cmdline_is_daemon(cmd.split_whitespace().map(|t| t.as_bytes().to_vec()))
+}
+
+#[cfg(windows)]
+fn pid_is_clauth_daemon(pid: u32) -> bool {
+    // `tasklist` gives the image name but not the full argv, so this confirms
+    // only that the pid is a clauth image (rejecting a recycle onto an unrelated
+    // process). It can't tell the daemon from another clauth subcommand here — a
+    // documented residual on Windows, where the recycle window is a handful of
+    // instructions wide. A failed probe reads false: never signal unverified.
+    let Ok(out) = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+    else {
+        return false;
+    };
+    out.status.success()
+        && String::from_utf8_lossy(&out.stdout)
+            .to_ascii_lowercase()
+            .contains("clauth")
+}
+
+/// Shared argv test for the unix identity guards: argv[0]'s basename is `clauth`
+/// and argv[1] is `daemon`. Takes owned tokens so both the `/proc` (NUL-split
+/// bytes) and `ps` (whitespace-split str) callers feed one predicate.
+#[cfg(unix)]
+fn cmdline_is_daemon(mut args: impl Iterator<Item = Vec<u8>>) -> bool {
+    let argv0_is_clauth = args
+        .next()
+        .and_then(|a| String::from_utf8(a).ok())
+        .map(|a| a.rsplit('/').next().unwrap_or(&a) == "clauth")
+        .unwrap_or(false);
+    let argv1_is_daemon = args
+        .next()
+        .and_then(|a| String::from_utf8(a).ok())
+        .is_some_and(|a| a == "daemon");
+    argv0_is_clauth && argv1_is_daemon
 }
 
 /// Overwrite the unlocked [`PID_FILE`] sidecar with the current pid. The pid
