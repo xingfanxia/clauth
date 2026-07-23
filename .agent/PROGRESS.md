@@ -1751,3 +1751,28 @@ usage dialect, feature GATING not porting); flagged isolated-CODEX_HOME
 auto-start as the missed item; offered incremental upstreaming (axis first)
 after #55/#58 land. #47 follow-up (daemon honors on-mismatch + follow)
 stays queued behind #55. No new PR opened — nothing else is ripe.
+
+## UPS-4 — #55 MERGED; #58 round-3 (macOS regular-file mirror) (2026-07-22)
+
+- **#55 MERGED into mommy 2026-07-22T13:12Z** (per-model weekly windows +
+  per-account gates + `weekly at` override). Fork main already carries the
+  feature (SCW-1/2 hand-port); next fork↔upstream sync reconciles to the
+  merged form per docs/fork-sync/SYNC.md. #53, #49 previously merged.
+- **#58 round-3** (e66b9cb append, no force): maintainer traced a deeper
+  macOS steady-state bug — the round-2 exemption keyed on `is_symlink()`, but
+  CC rewrites the live slot as a regular-file Keychain mirror after every run,
+  so once a sidecar flip makes classify read Diverged the switch defers again.
+  Fix: `live_login_is_clauth_symlink` → `live_login_is_stored(active)` =
+  content match against BOTH stored files (credentials.json + session-token.json;
+  covers both flip directions) OR a structural symlink clause (dangling case).
+  SECOND site found via an end-to-end daemon test: `switch_profile`'s
+  `uncaptured_relogin` ran the same triple WITHOUT the exemption → macOS mirror
+  took the guarded-link path and byte-rejected the switch even after the gate
+  passed. Routed it through `live_diverged_and_unsaved` too. Regression: cross-
+  platform regular-file-mirror cases on helper + daemon-drain + 1Hz-poll (all
+  red without the content half; daemon also reds if uncaptured_relogin keeps the
+  raw triple), symlink cases kept, dangling-symlink assertion added. 1242 green,
+  clippy/fmt clean. Replied disclosing the both-stores deviation + the second
+  site. Awaiting re-review.
+- **#51** still awaiting maintainer on the mode-switcher design answer (harness
+  = profile axis). No new PR ripe.
