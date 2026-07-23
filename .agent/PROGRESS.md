@@ -1776,3 +1776,29 @@ stays queued behind #55. No new PR opened — nothing else is ripe.
   site. Awaiting re-review.
 - **#51** still awaiting maintainer on the mode-switcher design answer (harness
   = profile axis). No new PR ripe.
+
+## UPS-5 — #58 MERGED; #51 codex-mode proposals answered (2026-07-23)
+
+- **#58 APPROVED + MERGED 2026-07-23T09:08Z** ("This is it... lgtm ✅").
+  Maintainer endorsed the round-3 content-based rework verbatim, including
+  the both-stores deviation ("strictly wider, same cost") and the
+  uncaptured_relogin second-site fix he'd waved through as fine in R1/R2.
+  Both #55 and #58 now in mommy → fork↔upstream sync is DUE (true merge,
+  reconcile #55 to merged form + #58 to merged form, hard-cap sweep) per
+  docs/fork-sync/SYNC.md. Not started.
+- **#51: maintainer moved the codex-mode design forward** (2026-07-23):
+  proposed CODEX_HOME repoint to profile dirs + `clauth start {codex
+  account}`, asked to rebase the branch on v0.14 when it lands, asked us to
+  review his codex-mode changes, and proposed `{name}-cc`/`{name}-c` dir
+  suffixes. Answered from CDX-1b experience
+  (https://github.com/uwuclxdy/clauth/pull/51#issuecomment-5063434276):
+  CODEX_HOME → `profiles/{name}/codex-home/` subdir (auth.json seeded from
+  store, config.toml COPY not symlink, isolated sessions/) + the sharp edges
+  (canonicalize, env scrub, file-store-mode check, TWO-CARRIER refusal,
+  60s adopt-back watchdog); v0.14 rebase agreed via a dedicated branch cut
+  from v0.14 ported incrementally (PR head is fork main — never rewritten in
+  place); suffixes: keep typed `harness` field authoritative (suffix =
+  naming convention, not parsed discriminator), suffix only the codex side
+  for back-compat, offer `-cx` over `-c`. Awaiting maintainer.
+- **#47 follow-up** (daemon honors on-mismatch + `follow`) now fully
+  unblocked (#55 and #58 both landed). Not started.
