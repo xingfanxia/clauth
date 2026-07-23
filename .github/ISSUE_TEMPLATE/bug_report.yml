@@ -9,7 +9,7 @@ body:
         **Before you paste any output or config here: redact secrets.** Strip OAuth
         tokens, API keys, and the contents of `~/.claude/.credentials.json` or any
         `~/.clauth/profiles/*` file. Watch for `sk-ant-*` strings in logs or error
-        output — those are live credentials, not IDs.
+        output. Those are live credentials, not IDs.
 
   - type: textarea
     id: what-happened
@@ -76,3 +76,24 @@ body:
       render: shell
     validations:
       required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Notes
+      description: Anything else worth knowing.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: ai
+    attributes:
+      label: AI
+      description: Using AI is fine as long as you're transparent about it.
+      options:
+        - no AI
+        - AI-assisted, I reviewed everything
+        - AI did most of it under my direction
+        - autonomous agent (use the "Bug report (agent)" form instead)
+    validations:
+      required: true
