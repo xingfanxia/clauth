@@ -11,11 +11,15 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable which sessions resume info completions" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable which sessions resume info daemon status mcp completions --theme" -- "${cur}") )
+    elif [ "$prev" = "--theme" ]; then
+        COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--base-url --api-key --setup-token --yes -y --model" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated --rescue --no-rescue" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status" -- "${cur}") )
     elif [ "$prev" = "--isolated" ] || [ "$prev" = "--profile" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
@@ -58,7 +62,13 @@ _clauth() {
             'sessions[list Claude Code sessions (add --json)]' \
             'resume[resume a session under a chosen profile]' \
             'info[print resume command + storage path for a session]' \
+            'daemon[run the headless scheduler with no TUI]' \
+            'status[print the usage / auto-switch snapshot as JSON]' \
+            'mcp[run the stdio MCP server]' \
             'completions[emit shell completion script]'
+        _values 'option' '--theme[force a color depth instead of auto-detecting]'
+    elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
+        _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|delete|disable|enable) ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
@@ -86,6 +96,12 @@ _clauth() {
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == disable ]]; then
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
+    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == daemon ]]; then
+        _values 'flag' \
+            '--standby[wait and take over when the running daemon exits]' \
+            '--no-standby[explicit spelling of the default]' \
+            '--replace[terminate the running daemon and take over]' \
+            '--status[print the running daemon, or exit 1 when none is]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == status ]]; then
         _values 'flag' '--json[print the status snapshot as JSON]' '--all[also list disabled profiles]' '--disabled[also list disabled profiles]'
     fi
@@ -108,6 +124,11 @@ complete -c clauth -f -n __fish_is_first_token -a sessions -d "List Claude Code 
 complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session under a chosen profile"
 complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
 complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
+complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
+complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
+complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
+complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
+complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login delete disable enable" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --rescue -d "Isolated only: lift transcripts + sidecars into the global store"
@@ -129,6 +150,10 @@ complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a -y -d "Skip th
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --json -d "Print the status snapshot as JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --all -d "Also list disabled profiles"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --disabled -d "Also list disabled profiles"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --standby -d "Wait and take over when the running daemon exits"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --no-standby -d "Explicit spelling of the default"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --replace -d "Terminate the running daemon and take over"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --status -d "Print the running daemon, or exit 1 when none is"
 "#;
 
 pub(crate) fn print_script(shell: &str) -> Result<()> {

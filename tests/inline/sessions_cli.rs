@@ -166,14 +166,13 @@ fn no_sessions_found_maps_to_exit_one() {
 
 #[test]
 fn sessions_bad_flag_maps_to_exit_two() {
-    // Through the real dispatch arm: an unknown `sessions` flag is a usage error.
-    let args = ["sessions".to_string(), "--bogus".to_string()];
-    let err = crate::dispatch(&args).expect_err("bad flag must error");
-    assert!(
-        err.downcast_ref::<crate::UsageError>().is_some(),
-        "a bad flag must be a UsageError"
-    );
-    assert_eq!(crate::exit_code(Err(err)), 2);
+    // Through the real grammar: an unknown `sessions` flag never reaches
+    // dispatch, and clap's own parse-failure code is the same 2 the
+    // sessions-surface `UsageError` maps to, so the contract holds either way.
+    use clap::Parser as _;
+    let err = crate::cli::Cli::try_parse_from(["clauth", "sessions", "--bogus"])
+        .expect_err("bad flag must error");
+    assert_eq!(err.exit_code(), 2);
 }
 
 #[test]
