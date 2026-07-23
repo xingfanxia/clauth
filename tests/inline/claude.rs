@@ -220,6 +220,56 @@ fn first_login_false_when_oauth_block_absent() {
     assert!(!is_first_login_at(&link, &expected));
 }
 
+/// A logged-out CC shell keeps `claudeAiOauth` (just with blanked tokens) plus
+/// unrelated keys like `mcpOAuth` — it must NOT classify as a first login, or
+/// `adopt_first_login` deletes the live file (no install source to relink a
+/// blank profile back to) and `mcpOAuth` is lost with it. Regression for the
+/// gap PR #46's shell-awareness left in `is_first_login_at` specifically.
+#[test]
+fn first_login_false_when_live_is_a_logged_out_shell() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    fs::write(
+        &link,
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": null,
+                "expiresAt": 0,
+            },
+            "mcpOAuth": { "some-server": { "accessToken": "mcp-tok" } },
+        })
+        .to_string(),
+    )
+    .expect("write shell");
+    assert!(!is_first_login_at(&link, &expected));
+}
+
+/// Companion to the shell case above, same seam: a completed login (non-blank
+/// access token) with the same foreign `mcpOAuth` key still classifies as a
+/// first login, so the shell fix can't over-correct and strand a real login.
+#[test]
+fn first_login_true_when_live_is_a_completed_login_with_foreign_keys() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    fs::write(
+        &link,
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "real-access",
+                "refreshToken": "real-refresh",
+                "expiresAt": 1_700_000_000_000_i64,
+            },
+            "mcpOAuth": { "some-server": { "accessToken": "mcp-tok" } },
+        })
+        .to_string(),
+    )
+    .expect("write completed login");
+    assert!(is_first_login_at(&link, &expected));
+}
+
 #[cfg(unix)]
 #[test]
 fn first_login_false_when_link_is_symlink() {
@@ -857,6 +907,62 @@ fn force_snapshot_skips_shell_but_still_captures_real_divergence() {
         stored.refresh_token(),
         Some("relogin-refresh"),
         "a real diverged login must still be captured by the guard",
+    );
+}
+
+/// `reconcile_startup`'s non-diverged sink, `snapshot_active_credentials`,
+/// used to route a blank (credential-less) active profile's shell-shaped live
+/// file through `is_first_login` -> `adopt_first_login`, which deletes the
+/// live file to relink it — but a blank profile has no install source, so
+/// nothing gets relinked and the live file (with `mcpOAuth`) is simply gone.
+/// The 1Hz poll and the divergence prompt both already guard their own adopt
+/// call with `live_credentials_are_shell()`; this pins the startup sink to
+/// the same behavior via the shared `is_first_login` classification.
+#[test]
+fn snapshot_skips_shell_on_blank_profile_and_preserves_live_file() {
+    let _home = HomeSandbox::new();
+
+    let profile = crate::profile::Profile::new("blank-active".to_string(), None, None);
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.active_profile = Some("blank-active".into());
+    config.state.profiles = vec!["blank-active".into()];
+
+    let live = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    let shell_json = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "",
+            "refreshToken": null,
+            "expiresAt": 0,
+        },
+        "mcpOAuth": { "some-server": { "accessToken": "mcp-tok" } },
+    })
+    .to_string();
+    fs::write(&live, &shell_json).expect("write shell");
+
+    snapshot_active_credentials(&mut config).expect("snapshot");
+
+    assert!(
+        live.exists(),
+        "a logged-out shell must not be adopted as a first login, so the live file survives",
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&live).expect("read live")).expect("parse");
+    assert_eq!(
+        after["mcpOAuth"]["some-server"]["accessToken"], "mcp-tok",
+        "mcpOAuth must survive untouched — the sink never adopts, so it never rewrites the slot",
+    );
+    assert!(
+        config
+            .find("blank-active")
+            .expect("profile")
+            .credentials
+            .is_none(),
+        "nothing was adopted into the blank profile",
     );
 }
 

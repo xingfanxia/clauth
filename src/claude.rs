@@ -264,7 +264,11 @@ pub(crate) fn is_first_login(active: &str) -> Result<bool> {
 }
 
 /// Path-based core of [`is_first_login`], split for testing. The OAuth check
-/// rejects partial writes (e.g. `{}`) so adoption waits for a completed login.
+/// rejects partial writes (e.g. `{}`) and a logged-out shell (blank tokens,
+/// see [`live_login_is_empty`]) so adoption waits for a completed login —
+/// otherwise a shell's `claudeAiOauth` block alone would pass, and adopting
+/// it later strands `force_link_profile_credentials` with no install source
+/// to relink, deleting the live file (and its unrelated `mcpOAuth`) outright.
 fn is_first_login_at(link: &Path, expected: &Path) -> bool {
     if expected.exists() {
         return false;
@@ -278,7 +282,7 @@ fn is_first_login_at(link: &Path, expected: &Path) -> bool {
     std::fs::read(link)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<ClaudeCredentials>(&bytes).ok())
-        .is_some_and(|creds| creds.claude_ai_oauth.is_some())
+        .is_some_and(|creds| !live_login_is_empty(&creds))
 }
 
 /// True when the live `.credentials.json` login is already saved in `active`'s
