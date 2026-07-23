@@ -9,7 +9,8 @@
 #   dist/macos/daemon-install.sh uninstall  # stop + remove
 #
 # Logs go to ~/.clauth/daemon.log. The daemon holds a single-instance lock, so
-# it's safe if you also run `clauth daemon` by hand (the second one just exits).
+# it's safe if you also run `clauth daemon` by hand: the unit runs `--standby`,
+# so it parks and takes over when your manual run exits.
 set -euo pipefail
 
 label="com.clauth.daemon"
