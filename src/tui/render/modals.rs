@@ -532,7 +532,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                     "\u{21b5}",
                     "open \u{00b7} edit threshold \u{00b7} edit weekly at \u{00b7} edit max spend \u{00b7} toggle gates / last resort \u{00b7} remove \u{00b7} add",
                 ),
-                ("+ / -", "step threshold by 5"),
+                ("+ / -", "step rotate at / weekly at by 5"),
                 ("\u{21b5} on rotate at", "type a value, \u{21b5} saves"),
                 (
                     "\u{21b5} on weekly at",

@@ -3146,11 +3146,12 @@ fn all_spent_banner_fires_at_the_weekly_hard_cap() {
     );
 }
 
-// ── fallback threshold: continuous row, unchanged grammar ────────────────────
+// ── fallback continuous rows: `rotate at` + `weekly at` ──────────────────────
 //
-// The `rotate at` threshold is the one CONTINUOUS row: unlike the enumerated
-// Config-tab rows, it keeps `+`/`-` for ±5 nudges alongside the `⏎` typed
-// editor. This must survive the enumerated-row grammar unification untouched.
+// Both are CONTINUOUS rows: unlike the enumerated Config-tab rows, they keep
+// `+`/`-` for ±5 nudges alongside the `⏎` typed editor. `max spend` (a dollar
+// ceiling) has no natural step unit and stays typed-only — see the no-op test
+// below, next to the max-spend editor tests.
 
 #[test]
 fn fallback_threshold_plus_minus_still_nudge_both_ways() {
@@ -3176,6 +3177,164 @@ fn fallback_threshold_plus_minus_still_nudge_both_ways() {
         app.config().find("a").and_then(|p| p.fallback_threshold),
         Some(45.0),
         "- still lowers the threshold by 5"
+    );
+}
+
+// `weekly at` joins `rotate at` as the second CONTINUOUS row (owner call,
+// 2026-07-23): it now takes the same ±5 nudge alongside its existing `⏎`
+// typed editor. `max spend` (a dollar ceiling) has no natural step unit and
+// stays typed-only — see `fallback_max_spend_plus_minus_is_a_no_op` below.
+#[test]
+fn fallback_weekly_at_plus_minus_nudge_both_ways() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    // 70 sits away from every default/bound (98 default, 50/100 bounds), so a
+    // no-op bug (stays 70) and a mis-stepped nudge (anything but ±5) both
+    // fail the exact-value assert below instead of accidentally landing on it.
+    profile.weekly_threshold = Some(70.0);
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(75.0),
+        "+ raises the weekly override by exactly 5"
+    );
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(65.0),
+        "- lowers the weekly override by exactly 5"
+    );
+}
+
+#[test]
+fn fallback_weekly_at_nudge_clamps_at_upper_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.weekly_threshold = Some(99.0);
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(100.0),
+        "+ past MAX_WEEKLY_SWITCH_PCT clamps at 100"
+    );
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(100.0),
+        "a further + stays pinned at the bound"
+    );
+}
+
+#[test]
+fn fallback_weekly_at_nudge_clamps_at_lower_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.weekly_threshold = Some(51.0);
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(50.0),
+        "- past MIN_WEEKLY_SWITCH_PCT clamps at 50"
+    );
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(50.0),
+        "a further - stays pinned at the bound"
+    );
+}
+
+// Mirrors the dimmed-row contract `run_fallback_row`'s ⏎ already enforces:
+// a gate-off weekly-at row isn't judged, so +/- must no-op exactly like ⏎
+// does, instead of quietly arming an override nobody can see take effect.
+#[test]
+fn fallback_weekly_at_nudge_is_inert_while_gate_is_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.weekly_threshold = Some(70.0);
+    profile.check_weekly = false;
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(70.0),
+        "+/- must no-op on a dimmed (gate-off) weekly-at row"
+    );
+}
+
+// An unset override follows the chain-wide resolved line (rendered dimmed —
+// see `detail_row`'s `weekly_default`); the first nudge must set an explicit
+// override derived from THAT value, not from 0 or the hardcoded 98 default,
+// so the on-screen number visibly moves by exactly 5 from what it showed.
+#[test]
+fn fallback_weekly_at_nudge_from_unset_bases_on_resolved_default() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::blank_profile("a"); // weekly_threshold: None
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.config().state.weekly_switch_threshold = Some(80.0); // resolved chain default
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(85.0),
+        "first + on an unset override sets an explicit one at resolved-default + 5"
+    );
+}
+
+// `space` still opens both the weekly-at and max-spend typed editors —
+// unchanged by the `+`/`-` dispatch-by-row rewrite of `handle_fallback_detail_key`.
+#[test]
+fn fallback_weekly_at_and_max_spend_editors_still_open_via_space() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.config().state.spend_budget_switching = true; // arm max spend so its row isn't inert
+
+    app.fallback_detail_cursor = weekly_at_row();
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        app.fallback_weekly_draft.is_some(),
+        "space still opens the weekly-at editor"
+    );
+    super::handle_key(&mut app, key(KeyCode::Esc));
+
+    app.fallback_detail_cursor = max_spend_row();
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        app.fallback_max_spend_draft.is_some(),
+        "space still opens the max-spend editor"
     );
 }
 
@@ -3295,6 +3454,30 @@ fn fallback_max_spend_editor_refuses_an_infinite_ceiling() {
         app.config().find("a").and_then(|p| p.max_auto_spend),
         None,
         "an infinite ceiling must never reach disk"
+    );
+}
+
+// A dollar ceiling has no natural step unit (unlike a bounded percent), so
+// `max spend` stays typed-only — `+`/`-` fall through to the dispatcher's
+// `_ => {}` arm. Armed (spend budget on) so a real nudge would be observable.
+#[test]
+fn fallback_max_spend_plus_minus_is_a_no_op() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.max_auto_spend = Some(10.0);
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = max_spend_row();
+    app.config().state.spend_budget_switching = true;
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.max_auto_spend),
+        Some(10.0),
+        "max spend stays typed-only — +/- must never touch it"
     );
 }
 

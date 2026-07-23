@@ -4238,7 +4238,7 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
     }
     let last = FALLBACK_ROWS.len() - 1;
     app.fallback_detail_cursor = app.fallback_detail_cursor.min(last);
-    let on_threshold = FALLBACK_ROWS[app.fallback_detail_cursor] == FallbackRow::Threshold;
+    let row = FALLBACK_ROWS[app.fallback_detail_cursor];
     match key.code {
         KeyCode::Up => {
             app.fallback_armed_remove = false;
@@ -4256,10 +4256,14 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
                 app.fallback_detail_cursor + 1
             };
         }
-        KeyCode::Char('+' | '=') if on_threshold => adjust_threshold(app, 5.0),
-        KeyCode::Char('-' | '_') if on_threshold => adjust_threshold(app, -5.0),
+        // Continuous fields only — `max spend` (a dollar ceiling) has no
+        // natural step unit and stays typed-only.
+        KeyCode::Char('+' | '=') if row == FallbackRow::Threshold => adjust_threshold(app, 5.0),
+        KeyCode::Char('-' | '_') if row == FallbackRow::Threshold => adjust_threshold(app, -5.0),
+        KeyCode::Char('+' | '=') if row == FallbackRow::WeeklyAt => adjust_weekly(app, 5.0),
+        KeyCode::Char('-' | '_') if row == FallbackRow::WeeklyAt => adjust_weekly(app, -5.0),
         KeyCode::Enter | KeyCode::Char(' ') => {
-            run_fallback_row(app, FALLBACK_ROWS[app.fallback_detail_cursor]);
+            run_fallback_row(app, row);
         }
         _ => {}
     }
@@ -4617,6 +4621,24 @@ fn adjust_threshold(app: &mut App, delta: f64) {
     if let Some(current) = selected_threshold(app) {
         write_threshold(app, (current + delta).clamp(0.0, 100.0));
     }
+}
+
+/// Step the selected member's `weekly at` override by `delta`, clamped to
+/// `MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT`, and persist. Mirrors
+/// `run_fallback_row`'s `check_weekly` guard: inert while the member's weekly
+/// gate is off (rendered dimmed), same no-op contract as a dimmed row's ⏎.
+/// An unset override bases the nudge on the chain-wide resolved default so
+/// the value visibly moves off what the dimmed-default row already shows.
+fn adjust_weekly(app: &mut App, delta: f64) {
+    let Some((override_pct, check_weekly)) = selected_weekly_override(app) else {
+        return;
+    };
+    if !check_weekly {
+        return;
+    }
+    let base = override_pct.unwrap_or_else(|| app.config().state.weekly_switch_threshold_pct());
+    let next = (base + delta).clamp(MIN_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT);
+    write_weekly_override(app, Some(next));
 }
 
 /// ⏎/space on the `last resort` row: flip `Profile::last_resort` and persist.
