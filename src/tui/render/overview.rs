@@ -10,8 +10,8 @@ use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
-    ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split, reset_resume,
-    spinner_frame, spinner_style, window_summary_spans_bracketed,
+    ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split, is_past_reset,
+    reset_resume, spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
 use super::header::pulse_name_spans;
 use super::panes::{
@@ -433,6 +433,7 @@ fn render_overview_row(
     } else {
         cfg.is_active(&profile.name)
     };
+    let disabled = profile.is_disabled();
     let name_str = profile.name.to_string();
     // Overview rows only: the refresh countdown carries the profile's
     // fetch-state cue (amber = last-known numbers, red = failed) so staleness
@@ -443,7 +444,15 @@ fn render_overview_row(
     } else {
         Span::raw("  ")
     };
-    let timer_span = {
+    // A disabled account is filtered out of the scheduler's polling set
+    // (`AppConfig::enabled_profiles`), so its `next_refresh_per_profile` entry is
+    // frozen at whatever was published before it was disabled: the countdown
+    // ticks to zero and then sits there claiming a refresh that will never run.
+    // Blank the slot rather than lie, keeping its width so no column shifts. The
+    // spinner goes too — nothing can be in flight for a profile nothing polls.
+    let timer_span = if disabled {
+        Span::raw(" ".repeat(TIMER_SLOT))
+    } else {
         let inner = TIMER_SLOT - 1;
         let activity = app
             .activity
@@ -484,26 +493,49 @@ fn render_overview_row(
     let token_mode = token_status.is_some_and(|s| s.is_long_lived_mode());
 
     let mut spans = vec![cursor];
-    // Marker precedence: broken login (×) > token danger (⊘) > bell (!) > active
-    // (●). A dead login makes usage alerts moot until re-login; a dead / mis-filled
-    // long-lived token signs sessions out on the next switch, so it outranks a bell.
-    if cfg.is_auth_broken(&profile.name) {
-        spans.push(Span::styled("×", theme::danger()));
+    // A disabled row flattens every semantic hue to dim — the whole row reads as
+    // one inert unit rather than a live row wearing a dim name. The GLYPHS stay:
+    // cloudy-tui never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/`●` still
+    // distinguish themselves without the color.
+    let hue = |s: Style| if disabled { theme::dim() } else { s };
+    // Marker precedence: canceled subscription (⊖) > broken login (×) > token
+    // danger (⊘) > bell (!) > active (●). Canceled is dead-first (the org 403s
+    // every request, matching the Fallback ladder where `Canceled` outranks
+    // `AuthBroken`); a dead login makes usage alerts moot until re-login; a dead /
+    // mis-filled long-lived token signs sessions out on the next switch, so it
+    // outranks a bell.
+    if crate::fallback::is_canceled(profile) {
+        spans.push(Span::styled("⊖", hue(theme::danger())));
+        spans.push(Span::raw(" "));
+    } else if cfg.is_auth_broken(&profile.name) {
+        spans.push(Span::styled("×", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if token_danger {
-        spans.push(Span::styled("⊘", theme::danger()));
+        spans.push(Span::styled("⊘", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if app.bell_fired.contains_key(&name_str) {
-        spans.push(Span::styled("!", theme::danger()));
+        spans.push(Span::styled("!", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if active {
-        spans.push(Span::styled("●", theme::accent_2_color()));
+        spans.push(Span::styled(
+            "●",
+            hue(Style::default().fg(theme::accent_2_color())),
+        ));
         spans.push(Span::raw(" "));
     } else {
         spans.push(Span::raw("  "));
     }
     let (nt, np) = fixed_split(&profile.name, widths.name);
-    let ns = bold_when(name_color(active), selected && focused);
+    // A disabled account can never be active (the disable action itself
+    // refuses on an active target), so dim always wins over `name_color`.
+    let ns = bold_when(
+        if disabled {
+            theme::dim()
+        } else {
+            name_color(active)
+        },
+        selected && focused,
+    );
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
     spans.push(gap(widths));
@@ -514,7 +546,11 @@ fn render_overview_row(
     if token_mode {
         label.push_str(" ·token");
     }
-    if profile.credentials.is_some() {
+    // The credentialed identity-wave is ambient MOTION, which reads as "this
+    // thing is live". A disabled account is not, so it renders the same flat dim
+    // cell an uncredentialed row gets — dimming the pulse's crest would still
+    // animate.
+    if profile.credentials.is_some() && !disabled {
         let (clamped, pad) = fixed_split(&label, widths.kind);
         let elapsed = app.started_at.elapsed().as_millis() as u64;
         let mut pulse = pulse_name_spans(&clamped, theme::dim(), elapsed);
@@ -533,6 +569,8 @@ fn render_overview_row(
             None if profile.is_oauth() => ("—", theme::faint()),
             None => ("", theme::faint()),
         };
+        // Disabled flatten covers the fork email cell's faint dash too.
+        let style = if disabled { theme::dim() } else { style };
         spans.push(Span::styled(fixed(text, widths.account), style));
     }
     spans.push(narrow_gap(widths));
@@ -554,26 +592,44 @@ fn render_overview_row(
         )
     };
     let reset_fmt = ResetFmt::from_state(&cfg.state);
-    let five_spans = window_summary_spans_bracketed(
+    // Flatten the bar's threshold colors and drain-colored reset countdown to dim
+    // for a disabled row. The NUMBERS stay — they're the last real reading and
+    // still informative; it's the semantic hue that lies once the data is frozen.
+    // Post-processed here rather than threaded through
+    // `window_summary_spans_bracketed`: that helper lives in the shared
+    // `format.rs`, so restyling its OUTPUT at this one call site cannot reach a
+    // future caller the way a new parameter would. Widths are unaffected (the
+    // pad math counts chars, not styles).
+    let flatten = |mut spans: Vec<Span<'static>>| {
+        if disabled {
+            for s in &mut spans {
+                s.style = theme::dim();
+            }
+        }
+        spans
+    };
+    let five_spans = flatten(window_summary_spans_bracketed(
         five_window.as_ref(),
         widths.five_hour,
         true,
         reset_style(LABEL_5H, five_window.as_ref()),
         reset_fmt,
-    );
+        five_window.as_ref().is_some_and(is_past_reset),
+    ));
     let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
     spans.extend(five_spans);
     spans.push(Span::raw(" ".repeat(five_pad)));
     if widths.seven_day > 0 {
         spans.push(gap(widths));
-        let seven_spans = window_summary_spans_bracketed(
+        let seven_spans = flatten(window_summary_spans_bracketed(
             seven_window.as_ref(),
             widths.seven_day,
             widths.seven_day >= 18,
             reset_style(LABEL_7D, seven_window.as_ref()),
             reset_fmt,
-        );
+            seven_window.as_ref().is_some_and(is_past_reset),
+        ));
         let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
         let seven_pad = widths.seven_day.saturating_sub(seven_len);
         spans.extend(seven_spans);
@@ -582,6 +638,9 @@ fn render_overview_row(
     if widths.route > 0 {
         spans.push(gap(widths));
         let (chain, chain_style) = chain_summary(&cfg, profile);
+        // The disabled flatten covers the fork route cell too — a disabled row
+        // reads as one flat dim line, headroom hues and the faint dash included.
+        let chain_style = if disabled { theme::dim() } else { chain_style };
         spans.push(Span::styled(fixed(&chain, widths.route), chain_style));
     }
 

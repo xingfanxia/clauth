@@ -149,6 +149,20 @@ pub(super) fn name_color(active: bool) -> Style {
     }
 }
 
+/// Canonical `[ label ]` wording for the diagnostic states whose text pill
+/// surfaces on more than one tab (Usage / Fallback / Config; the Overview marker
+/// shares only the `reason_marker` glyph, no text). One source so the same
+/// account state never wears two words on two tabs — `canceled` used to read
+/// `subscription canceled` on the Fallback card. Each pill's `└` hint carries
+/// the explanation, so the label itself stays short. The hint layer stays
+/// per-surface on purpose: `chain::reason_fix` and `usage::diag_fix` map
+/// different enums with different config context.
+pub(super) const DIAG_DISABLED: &str = "disabled";
+pub(super) const DIAG_CANCELED: &str = "canceled";
+pub(super) const DIAG_AUTH_BROKEN: &str = "auth broken";
+pub(super) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
+pub(super) const DIAG_KICK: &str = "claude code blocked";
+
 /// cloudy-tui status pill `[ label ]`: brackets in `TEXT_DIM`, the label in the
 /// caller's semantic style (bold for a charged state). Returns the three spans
 /// so a caller can compose them after a key cell; wrap in a `Line` for a
@@ -335,6 +349,32 @@ pub(super) fn draw_selector_list(
     draw_scrollbar(frame, inner, total, state.offset(), viewport);
 }
 
+/// A `├`/`└` fix-hint line: glyph + text at col 0/2, anchored to the caller's
+/// own key column (no leading indent, unlike [`help_tooltip_lines`]'s one-cell
+/// offset for panes whose row opens past col 0). `more_follow` picks `├`
+/// (another hint follows in the same rail) vs `└` (closes it, or the lone-hint
+/// case with nothing to connect); wrapped continuation lines keep the text at
+/// col 2 and carry `│` at col 0 while the rail is still open, blank once it has
+/// closed (cloudy-tui Stacked hints).
+///
+/// The one rail drawer: the Usage tab's `status` block and the Fallback card's
+/// blocked-reason pills both render through it, so the two can't drift apart.
+pub(super) fn rail_hint_lines(text: &str, width: usize, more_follow: bool) -> Vec<Line<'static>> {
+    const LEAD_W: usize = 2; // glyph + 1 space, text at col 2
+    let lead = if more_follow { "├ " } else { "└ " };
+    let cont = if more_follow { "│ " } else { "  " };
+    wrap_words(text, width.saturating_sub(LEAD_W).max(8))
+        .into_iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            Line::from(vec![
+                Span::styled(if i == 0 { lead } else { cont }, theme::line()),
+                Span::styled(seg, theme::faint()),
+            ])
+        })
+        .collect()
+}
+
 /// Greedy word-wrap to `width` chars; long words are hard-split. Shared by the
 /// status-tab timeline, the tooltip sub-lines, and the chain add-pane prose.
 pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
@@ -508,13 +548,13 @@ pub(super) fn draw_profile_selector(
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                picker_row(
-                    i == sel,
-                    focused,
-                    p.name.to_string(),
-                    name_color(cfg.is_active(&p.name)),
-                    w,
-                )
+                // A disabled account can never be active, so dim wins outright.
+                let ns = if p.is_disabled() {
+                    theme::dim()
+                } else {
+                    name_color(cfg.is_active(&p.name))
+                };
+                picker_row(i == sel, focused, p.name.to_string(), ns, w)
             })
             .collect()
     });

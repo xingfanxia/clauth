@@ -126,6 +126,25 @@ fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
     serde_json::from_str(&content).ok()
 }
 
+/// [`resolve_profile_candidate`] filtered so a user-disabled account is never
+/// attributed, no matter which tier matched it — including a stale token
+/// match against creds that predate the disable (a disabled profile's stored
+/// files are left untouched on disk, so its old refresh token can still sit
+/// there). Shared by `clauth which` and the MCP `which` tool via
+/// [`resolve_active`], the only caller of this function.
+fn resolve_profile<'a>(
+    config: &'a AppConfig,
+    creds: Option<&ClaudeCredentials>,
+    in_session: bool,
+    session_profile: Option<&str>,
+) -> Option<(&'a str, Source)> {
+    let (name, source) = resolve_profile_candidate(config, creds, in_session, session_profile)?;
+    if config.find(name).is_some_and(Profile::is_disabled) {
+        return None;
+    }
+    Some((name, source))
+}
+
 /// Resolve loaded credentials to a stored profile.
 ///
 /// Order: (1) exact refresh-token match; (2) inside a `clauth start` runtime,
@@ -135,7 +154,7 @@ fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
 ///
 /// A `CLAUDE_CONFIG_DIR` that isn't a clauth runtime gets step 1 only — its
 /// credentials don't belong to the global active profile.
-fn resolve_profile<'a>(
+fn resolve_profile_candidate<'a>(
     config: &'a AppConfig,
     creds: Option<&ClaudeCredentials>,
     in_session: bool,

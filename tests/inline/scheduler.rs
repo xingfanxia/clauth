@@ -7,9 +7,11 @@ use crate::oauth::RefreshError;
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
-    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, SuppressedGenericStore,
-    ThirdPartyEntry, TokenEntry, clear_activity, clear_orphaned_forced, filter_suppressed,
-    mark_activity, memoized_identity, partition_due, window_lapsed,
+    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, RESET_ANCHOR_GRACE_MS,
+    SuppressedGenericStore, ThirdPartyEntry, TokenEntry, anchor_post_reset_oauth, clear_activity,
+    clear_orphaned_forced, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
+    filter_suppressed, mark_activity, memoized_identity, partition_due, should_anchor_fetch,
+    window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -21,6 +23,150 @@ fn token(name: &str) -> TokenEntry {
         access_expires_at: None,
         auth_broken: false,
     }
+}
+
+/// An OAuth-credentialed profile, optionally disabled, for the
+/// `collect_tokens`/`collect_third_party_entries` work-list exclusion tests.
+fn oauth_profile_disabled(name: &str, disabled: bool) -> crate::profile::Profile {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+
+    let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+    p.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: format!("{name}-access"),
+            refresh_token: Some(format!("{name}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    p.disabled = disabled;
+    p
+}
+
+// A disabled account must not enter the scheduler's per-profile work list at
+// all: no polling, no rotation, no auto-start ping, no stuck-429 distrust —
+// all downstream of never appearing in the OAuth `TokenEntry` snapshot.
+#[test]
+fn collect_tokens_excludes_disabled_profiles_includes_enabled_siblings() {
+    use crate::profile::{AppConfig, AppState};
+
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            oauth_profile_disabled("off", true),
+            oauth_profile_disabled("on", false),
+        ],
+    };
+
+    let entries = collect_tokens(&config);
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        !names.contains(&"off"),
+        "a disabled account must never enter the poll/rotate work list"
+    );
+    assert!(
+        names.contains(&"on"),
+        "an enabled sibling must still be collected for polling"
+    );
+}
+
+// The DISPLAY seed is the complement of `collect_tokens`: it INCLUDES a disabled
+// OAuth profile (so its cached tier/windows render) — the exact hole behind the
+// stale-tier bug — while the work-list above still excludes it. End-to-end: a
+// disabled profile's on-disk usage cache lands in the live store via
+// `bootstrap_fetch(collect_oauth_seed_names(..))`, and seeding it never widens
+// the poll list. A credential-less profile has no oauth cache, so it is not seeded.
+#[test]
+fn collect_oauth_seed_names_includes_disabled_and_bootstrap_seeds_its_cache() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::{UsageInfo, UsageWindow};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut credless = crate::profile::Profile::new("credless".to_string(), None, None);
+    credless.disabled = true;
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            oauth_profile_disabled("off", true),
+            oauth_profile_disabled("on", false),
+            credless,
+        ],
+    };
+
+    let seed = collect_oauth_seed_names(&config);
+    assert!(
+        seed.contains(&"off".to_string()),
+        "the display seed must include a disabled OAuth profile: {seed:?}"
+    );
+    assert!(
+        seed.contains(&"on".to_string()),
+        "and its enabled sibling: {seed:?}"
+    );
+    assert!(
+        !seed.contains(&"credless".to_string()),
+        "a credential-less profile has no oauth cache to seed: {seed:?}"
+    );
+
+    // End-to-end: the disabled profile's on-disk cache lands in the live store.
+    let info = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..UsageInfo::default()
+    };
+    write_profile_cache("off", USAGE_CACHE_FILE, &info);
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    super::bootstrap_fetch(&store, &status, &last_fetched, &seed, REFRESH_INTERVAL_MS);
+
+    let seeded = store.lock().unwrap().get("off").cloned();
+    assert_eq!(
+        seeded.and_then(|i| i.five_hour.map(|w| w.utilization)),
+        Some(42.0),
+        "a disabled profile's cached window is seeded for display"
+    );
+
+    // Invariant preserved: seeding the store never widens the poll work-list.
+    let poll_names: Vec<String> = collect_tokens(&config)
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    assert!(
+        !poll_names.contains(&"off".to_string()),
+        "seeding a disabled profile must not make it pollable: {poll_names:?}"
+    );
+}
+
+// Third-party (api-key) leg's own work list must honor the same exclusion.
+#[test]
+fn collect_third_party_entries_excludes_disabled_profiles_includes_enabled_siblings() {
+    let mut off = crate::profile::Profile::new(
+        "off".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    off.disabled = true;
+    let on = crate::profile::Profile::new(
+        "on".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+
+    let entries = collect_third_party_entries(&[off, on]);
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        !names.contains(&"off"),
+        "a disabled third-party account must never enter the poll work list"
+    );
+    assert!(
+        names.contains(&"on"),
+        "an enabled third-party sibling must still be collected"
+    );
 }
 
 /// Every profile uses the same fixed `REFRESH_INTERVAL_MS` cadence: a
@@ -72,6 +218,131 @@ fn partition_due_uses_fixed_interval() {
         &HashMap::new(),
     );
     assert_eq!(due.len(), 1, "due once the fixed interval has elapsed");
+}
+
+// Post-reset fire-once anchoring. `now` is a realistic epoch-ms.
+const ANCHOR_NOW: u64 = 1_700_000_000_000;
+
+/// `should_anchor_fetch`: fires exactly once when a reset has crossed since our
+/// last fetch and the grace has elapsed, and stays quiet otherwise.
+#[test]
+fn should_anchor_fetch_fires_once_after_reset_plus_grace() {
+    let now = ANCHOR_NOW;
+    let reset = now - RESET_ANCHOR_GRACE_MS; // reset landed exactly GRACE ago
+    let last = reset - 60_000; // fetched a minute before the reset
+
+    assert!(
+        should_anchor_fetch(Some(reset), last, now, RESET_ANCHOR_GRACE_MS),
+        "reset crossed since last fetch, grace elapsed → fire",
+    );
+    assert!(
+        should_anchor_fetch(
+            Some(now - RESET_ANCHOR_GRACE_MS),
+            last,
+            now,
+            RESET_ANCHOR_GRACE_MS
+        ),
+        "the now == reset + grace boundary still fires",
+    );
+    assert!(
+        !should_anchor_fetch(
+            Some(now - RESET_ANCHOR_GRACE_MS + 1),
+            last,
+            now,
+            RESET_ANCHOR_GRACE_MS
+        ),
+        "grace not yet elapsed → hold",
+    );
+    assert!(
+        !should_anchor_fetch(Some(reset), reset, now, RESET_ANCHOR_GRACE_MS),
+        "already fetched at/after the reset → self-limited, no re-fire",
+    );
+    assert!(
+        !should_anchor_fetch(None, last, now, RESET_ANCHOR_GRACE_MS),
+        "no reset stamp → never",
+    );
+}
+
+/// `anchor_post_reset_oauth` schedules only the eligible profile: it lands in
+/// `due` with its countdown stamped to `now`, while an excluded one, one already
+/// fetched post-reset, and one with no reset stamp are all left alone, and a
+/// profile already in `due` is not duplicated. This reds if the due-push, the
+/// exclusion, or the dedup is dropped.
+#[test]
+fn anchor_post_reset_oauth_schedules_only_eligible_profiles() {
+    let now = ANCHOR_NOW;
+    let reset = now - RESET_ANCHOR_GRACE_MS - 1_000; // reset + grace comfortably passed
+    let last_before = EpochMs::from_millis(reset - 60_000); // fetched before the reset
+    let last_after = EpochMs::from_millis(reset + 1_000); // already fetched post-reset
+
+    let snapshot = vec![
+        token("due"),
+        token("excluded"),
+        token("already"),
+        token("fetched"),
+        token("noreset"),
+    ];
+    let resets = HashMap::from([
+        ("due".to_string(), reset),
+        ("excluded".to_string(), reset),
+        ("already".to_string(), reset),
+        ("fetched".to_string(), reset),
+        // "noreset" carries no stamp.
+    ]);
+    let last_fetched = HashMap::from([
+        ("due".to_string(), last_before),
+        ("excluded".to_string(), last_before),
+        ("already".to_string(), last_before),
+        ("fetched".to_string(), last_after),
+        ("noreset".to_string(), last_before),
+    ]);
+    let excluded = HashSet::from(["excluded".to_string()]);
+    let mut due = vec![token("already")]; // already scheduled by partition_due
+    let mut next: HashMap<String, u64> = HashMap::new();
+
+    anchor_post_reset_oauth(
+        &snapshot,
+        &resets,
+        &last_fetched,
+        &excluded,
+        &mut due,
+        &mut next,
+        now,
+    );
+
+    let due_names: HashSet<&str> = due.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        due_names.contains("due"),
+        "eligible post-reset profile is scheduled"
+    );
+    assert_eq!(
+        next.get("due").copied(),
+        Some(now),
+        "its countdown is stamped to now"
+    );
+    assert!(
+        !due_names.contains("excluded"),
+        "Refreshing/Switching profile is not scheduled"
+    );
+    assert!(
+        !due_names.contains("fetched"),
+        "a profile already fetched post-reset is not re-scheduled",
+    );
+    assert!(
+        !due_names.contains("noreset"),
+        "a profile with no reset stamp is not scheduled"
+    );
+    assert_eq!(
+        due.iter().filter(|e| e.name == "already").count(),
+        1,
+        "an already-due profile is not duplicated",
+    );
+    assert!(
+        !next.contains_key("excluded")
+            && !next.contains_key("fetched")
+            && !next.contains_key("noreset"),
+        "skipped profiles get no countdown stamp",
+    );
 }
 
 /// `spent_skip_set` (the `refresh_spent_accounts` OFF gate): only an unforced,
@@ -2381,6 +2652,116 @@ fn rate_limited_unknown_expiry_does_not_rotate() {
     assert!(!super::token_clock_expired(None, 10_000));
 }
 
+// `classify_pre_rotation` is the pure classifier `fetch_with_rotation` extracts
+// its branch selection into — no I/O, no clock read, so the truth table below
+// exercises it without live HTTP. `token_clock_expired` is passed in as an
+// already-computed bool (never re-derived inside the classifier).
+
+#[test]
+fn pre_rotation_serves_a_live_body() {
+    use super::{PreRotationDecision, classify_pre_rotation};
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo};
+
+    let info = UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Pro,
+            subscription_status: None,
+        }),
+        ..UsageInfo::default()
+    };
+    match classify_pre_rotation(Ok(info), false) {
+        PreRotationDecision::Serve(served) => {
+            assert_eq!(served.plan.expect("plan").tier, PlanTier::Pro);
+        }
+        other => panic!("expected Serve, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_rotation_429_on_a_valid_token_bails_rate_limited_with_plan() {
+    use std::time::Duration;
+
+    use super::{FetchError, PreRotationDecision, classify_pre_rotation};
+    use crate::usage::{PlanInfo, PlanTier};
+
+    let err = FetchError::RateLimited {
+        retry_after: Some(Duration::from_secs(30)),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: Some("canceled".to_string()),
+        }),
+    };
+    // token_clock_expired == false: a still-valid token's 429 is a pure
+    // endpoint rate limit — bail to cache, plan and retry_after both intact.
+    match classify_pre_rotation(Err(err), false) {
+        PreRotationDecision::BailRateLimited { retry_after, plan } => {
+            assert_eq!(retry_after, Some(Duration::from_secs(30)));
+            let plan = plan.expect("plan rides along on a live-token 429");
+            assert_eq!(plan.tier, PlanTier::Free);
+            assert_eq!(plan.subscription_status.as_deref(), Some("canceled"));
+        }
+        other => panic!("expected BailRateLimited, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_rotation_401_rotates_without_an_unmask_hint() {
+    use super::{FetchError, PreRotationDecision, classify_pre_rotation};
+
+    match classify_pre_rotation(Err(FetchError::Status(401)), false) {
+        PreRotationDecision::Rotate { unmask_429 } => assert_eq!(unmask_429, None),
+        other => panic!("expected Rotate, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_rotation_429_on_an_expired_token_rotates_and_drops_the_plan() {
+    use std::time::Duration;
+
+    use super::{FetchError, PreRotationDecision, classify_pre_rotation};
+    use crate::usage::{PlanInfo, PlanTier};
+
+    let with_hint = FetchError::RateLimited {
+        retry_after: Some(Duration::from_secs(5)),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Pro,
+            subscription_status: None,
+        }),
+    };
+    // token_clock_expired == true: falls through to rotation. The `Rotate`
+    // variant has no plan field at all — the dead-token plan is dropped by
+    // construction, not just by convention.
+    match classify_pre_rotation(Err(with_hint), true) {
+        PreRotationDecision::Rotate { unmask_429 } => {
+            assert_eq!(unmask_429, Some(Some(Duration::from_secs(5))));
+        }
+        other => panic!("expected Rotate, got {other:?}"),
+    }
+
+    let no_hint = FetchError::RateLimited {
+        retry_after: None,
+        plan: None,
+    };
+    match classify_pre_rotation(Err(no_hint), true) {
+        PreRotationDecision::Rotate { unmask_429 } => assert_eq!(unmask_429, Some(None)),
+        other => panic!("expected Rotate, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_rotation_other_errors_bail_to_cache() {
+    use super::{FetchError, PreRotationDecision, classify_pre_rotation};
+
+    assert!(matches!(
+        classify_pre_rotation(Err(FetchError::Network), false),
+        PreRotationDecision::BailCached
+    ));
+    assert!(matches!(
+        classify_pre_rotation(Err(FetchError::Parse), false),
+        PreRotationDecision::BailCached
+    ));
+}
+
 // `proactive_rotation_due` decides whether the ACTIVE Keychain-installed profile
 // rotates AHEAD of expiry (rotation coherence, #1) instead of waiting for a
 // 401. Opt-in via `AppState.preemptive_rotation` — adoption plus
@@ -2608,7 +2989,7 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         &tp_store,
         &tp_status,
         &last_fetched,
-        &[token("kitty"), token("cacheless")],
+        &["kitty".to_string(), "cacheless".to_string()],
         &[],
         REFRESH_INTERVAL_MS,
     );
@@ -2659,23 +3040,23 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
     let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let hydrate = |snapshot: &[TokenEntry]| {
+    let hydrate = |seed_names: &[String]| {
         super::hydrate_from_daemon_caches(
             &store,
             &status,
             &tp_store,
             &tp_status,
             &last_fetched,
-            snapshot,
+            seed_names,
             &[],
             REFRESH_INTERVAL_MS,
         )
     };
 
     write_profile_cache("kitty", USAGE_CACHE_FILE, &at(10.0));
-    hydrate(&[token("kitty")]);
+    hydrate(&["kitty".to_string()]);
     write_profile_cache("kitty", USAGE_CACHE_FILE, &at(55.0));
-    hydrate(&[token("kitty")]);
+    hydrate(&["kitty".to_string()]);
 
     let seeded = store.lock().unwrap().get("kitty").cloned();
     assert_eq!(
@@ -2700,9 +3081,11 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
 
     write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
 
+    // The standby seed sources names from config (the display superset), so the
+    // profile whose cache is hydrated must live there — as it does in production.
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
-        profiles: vec![],
+        profiles: vec![oauth_profile_disabled("kitty", false)],
     }));
     let state = super::SchedulerState {
         config,
@@ -2780,9 +3163,11 @@ fn standdown_sweeps_bootstrap_queued_marks() {
 
     write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
 
+    // The standby seed sources names from config (the display superset), so the
+    // profile whose cache is hydrated must live there — as it does in production.
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
-        profiles: vec![],
+        profiles: vec![oauth_profile_disabled("kitty", false)],
     }));
     let state = super::SchedulerState {
         config,
@@ -2858,9 +3243,11 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
     assert!(other.acquire(), "the first instance wins the lease");
 
     write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
+    // The standby seed sources names from config (the display superset), so the
+    // profile whose cache is hydrated must live there — as it does in production.
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
-        profiles: vec![],
+        profiles: vec![oauth_profile_disabled("kitty", false)],
     }));
     let state = super::SchedulerState {
         config,
@@ -4329,5 +4716,253 @@ fn codex_poll_unauthorized_keeps_cache_and_widens() {
         &pacing,
         now + 5 * 60_000,
         &|_, _| panic!("unauthorized widening — must not retry yet"),
+    );
+}
+
+/// Same recovered-usage shape as the happy path above, but the member is
+/// disabled — the scan must never relink to it (mirrors the kick-rejected
+/// exclusion just above).
+#[test]
+fn scan_recovery_never_relinks_to_a_disabled_member() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let mut disabled_b = Profile::new("b".to_string(), None, None);
+    disabled_b.disabled = true;
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![disabled_b],
+    }));
+
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(VecDeque::new()));
+
+    scan_recovery(
+        &config,
+        &recoverable_store(),
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a disabled member must never be relinked by the recovery scan"
+    );
+}
+
+/// A chain name with no backing profile is not a relink target. The store can
+/// still hold a live, recovered-looking entry under that name (a hand-edited
+/// chain, or a profile deleted out from under one), and queueing it would
+/// dispatch a switch to a profile that cannot be resolved. `walk_excluded`
+/// drops it before the member list is built; without that term the entry below
+/// reads exactly like the happy path and gets queued.
+#[test]
+fn scan_recovery_never_relinks_to_a_chain_member_with_no_profile() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["ghost".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("b".to_string(), None, None)],
+    }));
+
+    // Same recovered shape the happy path queues on, keyed to the ghost name.
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "ghost".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        },
+    )])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "ghost".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(VecDeque::new()));
+
+    scan_recovery(
+        &config,
+        &store,
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a chain member with no backing profile must never be relinked"
+    );
+}
+
+/// Same recovered-usage shape as the happy path, but the member's plan reads
+/// canceled — `/v1/messages` 403s no matter how idle its cached 5h window
+/// looks, so it must never be a relink target (mirrors the disabled/kick-
+/// rejected exclusions above; twin of the `fully_clear_target` canceled fix
+/// on the target-side walk).
+#[test]
+fn scan_recovery_never_relinks_to_a_canceled_member() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::usage::{PlanInfo, PlanTier};
+
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                subscription_status: Some("canceled".to_string()),
+            }),
+            ..Default::default()
+        },
+    )])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(VecDeque::new()));
+
+    scan_recovery(
+        &recovery_config(None, &["b"]),
+        &store,
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a canceled member must never be relinked by the recovery scan"
+    );
+}
+
+/// Same recovered-usage shape as the happy path, but the member is flagged
+/// auth-broken (AUTH-1 quarantine) — its store entry is frozen at the last
+/// successful read while every refresh is permanently rejected, so it must
+/// never be a relink target (mirrors the disabled exclusion above).
+#[test]
+fn scan_recovery_never_relinks_to_an_auth_broken_member() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["b".into()],
+            auth_broken: vec!["b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("b".to_string(), None, None)],
+    }));
+
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(VecDeque::new()));
+
+    scan_recovery(
+        &config,
+        &recoverable_store(),
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "an auth-broken member must never be relinked by the recovery scan"
+    );
+}
+
+/// `spawn_refresher`'s kick-block seed must run on the CALLING thread, not
+/// inside the spawned tick worker: nothing joins that worker, so a home-
+/// derived path resolved on it could outlive a test's `HOME_OVERRIDE` and read
+/// the operator's real home — live the moment the seed grows a write leg
+/// (docs/internals.md's 2026-06-06 convention). Entering through
+/// `spawn_refresher` itself (never `sync_kick_blocks_from_cache` directly) is
+/// the only way to pin WHERE the seed runs; asserting immediately after return,
+/// with no sleep or yield, is what makes the race decide against a broken
+/// version instead of racing it.
+#[test]
+fn spawn_refresher_seeds_kick_blocks_before_returning() {
+    use super::{KickBlock, KickBlocks, spawn_refresher};
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{KICK_BLOCK_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let cached = KickBlock {
+        streak: 3,
+        rejected: true,
+        until: Some(1_700_000_600),
+        next_retry: 1_700_000_100,
+    };
+    write_profile_cache("kitty", KICK_BLOCK_CACHE_FILE, &cached);
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    }));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    spawn_refresher(
+        config,
+        Arc::new(RankedMutex::new(vec![token("kitty")])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::clone(&kick_blocks),
+        Arc::new(RankedMutex::new(VecDeque::new())),
+        Arc::new(RankedMutex::new(false)),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        // Pre-armed shutdown: if the `cfg!(test)` spawn-skip is ever removed
+        // while the seed hoist stays, the tick thread this would spawn breaks
+        // at its loop-top check instead of looping past this sandbox teardown.
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(crate::daemon::FetchLease::new()),
+    );
+
+    // `cfg!(test)` makes `spawn_refresher` return without ever spawning the
+    // tick thread, so the seed above is the ONLY thing that could have
+    // populated `kick_blocks` — this is what pins the seed synchronous.
+    assert_eq!(
+        kick_blocks.lock().unwrap().get("kitty").copied(),
+        Some(cached),
+        "the on-disk kick block must be seeded before spawn_refresher returns"
     );
 }

@@ -17,7 +17,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub(crate) struct HomeSandbox {
     // Drop order: tempdir first, then the shared lock.
     _tmp: tempfile::TempDir,
-    _guard: std::sync::MutexGuard<'static, ()>,
+    _guard: crate::lockorder::RankedGuard<'static, ()>,
     home: PathBuf,
 }
 
@@ -49,6 +49,37 @@ impl Drop for HomeSandbox {
     }
 }
 
+/// RAII tier pin: acquires `TIER_TEST_LOCK` and forces the process-global color
+/// tier for its lifetime, putting the previous pin back on drop (even on panic).
+/// Required for any test asserting on a tier-dependent style, since the tier is
+/// process-global and otherwise auto-detects from the ambient `$COLORTERM`.
+pub(crate) struct TierSandbox {
+    // Drop order: this type's `drop` restores under the lock, which the field
+    // then releases.
+    _guard: crate::lockorder::RankedGuard<'static, ()>,
+    prev: Option<crate::tui::theme::Tier>,
+}
+
+impl TierSandbox {
+    pub(crate) fn new(tier: crate::tui::theme::Tier) -> Self {
+        let guard = crate::tui::theme::TIER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = crate::tui::theme::tier_override();
+        crate::tui::theme::set_tier(tier);
+        Self {
+            _guard: guard,
+            prev,
+        }
+    }
+}
+
+impl Drop for TierSandbox {
+    fn drop(&mut self) {
+        crate::tui::theme::restore_tier(self.prev);
+    }
+}
+
 /// A minimal `Profile` with every optional field unset — tests fill in what
 /// they assert on.
 pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
@@ -62,12 +93,13 @@ pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
-        check_weekly: true,
-        check_scoped: true,
         last_resort: false,
         session_feed: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,

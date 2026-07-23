@@ -57,3 +57,16 @@ fn ranks_entered_outermost_first_are_legal_and_release_on_drop() {
     let _rotation_again = RankGuard::enter::<rank::Rotation>();
     let _config_again = RankGuard::enter::<rank::Config>();
 }
+
+/// The two `cfg(test)` scaffolding ranks close a LATENT deadlock: no test grabs
+/// both the home sandbox and the tier pin today, so an inverted acquisition
+/// would sail through the whole gate and only deadlock a future test that does.
+/// `HomeTest` is ranked outer to `TierTest`, so pinning the tier under a held
+/// home sandbox is the legal ascending order. Nothing else exercises these two
+/// ranks, so a value swap that reopened the deadlock would pass every other
+/// test — only this asserts the order (it panics here if the ranks invert).
+#[test]
+fn a_tier_pin_is_legal_under_a_home_sandbox() {
+    let _home = RankGuard::enter::<rank::HomeTest>();
+    let _tier = RankGuard::enter::<rank::TierTest>();
+}

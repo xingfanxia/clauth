@@ -96,7 +96,11 @@ pub(super) fn bar_string_with_cells(pct: f64, cells: usize) -> String {
 const BAR_BLOCK_COLS: usize = 17;
 
 /// Overview accounts rows only: `[███░░░]` with dim brackets around the bar.
-/// Brackets render in `dim`; filled/empty cells keep their semantic util color.
+/// Brackets render in `dim`; filled/empty cells keep their semantic util color,
+/// unless `stale` is set — a past-reset window's fill + `%` fade to
+/// `theme::faint()` instead, since the reading is frozen pre-reset. A param
+/// rather than a post-render pass (cf. `overview.rs`'s disabled-row `flatten`
+/// closure) so staleness reaches every caller uniformly.
 /// `reset_style` colors the trailing ` (reset)` countdown (wide layout only) —
 /// pass the drain hue for a live window, `None` to keep it faint.
 /// All other bar sites use [`bar_string_with_cells`] directly (no brackets).
@@ -106,22 +110,26 @@ pub(super) fn window_summary_spans_bracketed(
     include_bar: bool,
     reset_style: Option<Style>,
     fmt: ResetFmt,
+    stale: bool,
 ) -> Vec<Span<'static>> {
     let Some(window) = window else {
         return vec![Span::styled("—".to_string(), theme::faint())];
     };
     let bracket = theme::dim();
     let pct = window.utilization.clamp(0.0, 100.0);
-    let color = theme::util_color(pct);
-    let style = Style::default().fg(color);
+    let fill_style = if stale {
+        theme::faint()
+    } else {
+        Style::default().fg(theme::util_color(pct))
+    };
 
     if include_bar && width >= 26 {
         // [██████░░░░] XX% (reset)
         let mut spans = vec![
             Span::styled("[", bracket),
-            Span::styled(bar_string_with_cells(pct, 10), style),
+            Span::styled(bar_string_with_cells(pct, 10), fill_style),
             Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), style),
+            Span::styled(format!(" {:>3.0}%", pct), fill_style),
         ];
         if let Some(secs) = reset_in_secs(window) {
             let style = reset_style.unwrap_or_else(theme::faint);
@@ -132,22 +140,29 @@ pub(super) fn window_summary_spans_bracketed(
         // [██████░░░░] XX%
         vec![
             Span::styled("[", bracket),
-            Span::styled(bar_string_with_cells(pct, 10), style),
+            Span::styled(bar_string_with_cells(pct, 10), fill_style),
             Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), style),
+            Span::styled(format!(" {:>3.0}%", pct), fill_style),
         ]
     } else if include_bar && width >= 12 {
         // [███░░░] XX%  — bar shrinks to fit
         let bar_cells = width.saturating_sub(7).clamp(3, 7);
         vec![
             Span::styled("[", bracket),
-            Span::styled(bar_string_with_cells(pct, bar_cells), style),
+            Span::styled(bar_string_with_cells(pct, bar_cells), fill_style),
             Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), style),
+            Span::styled(format!(" {:>3.0}%", pct), fill_style),
         ]
     } else {
-        vec![Span::styled(format!("{pct:>3.0}%"), style)]
+        vec![Span::styled(format!("{pct:>3.0}%"), fill_style)]
     }
+}
+
+/// True when the window's stored reset instant has already passed, so its
+/// utilization is a stale pre-reset reading awaiting the next fetch. A window
+/// with no reset stamp (e.g. extra credits) is never past-reset.
+pub(super) fn is_past_reset(window: &UsageWindow) -> bool {
+    reset_in_secs(window).is_some_and(|s| s <= 0)
 }
 
 /// Seconds until the window resets (may be negative if the stamp is overdue).

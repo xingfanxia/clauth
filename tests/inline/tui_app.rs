@@ -309,6 +309,56 @@ fn config_rows_login_and_delete_creds_visibility() {
     );
 }
 
+/// `ConfigRow` derives no `Ord`/`EnumIter`, so nothing but this render order is
+/// observable — pin auto-start's second-slot head plus the account-actions
+/// tail's exact RUNTIME sequence (`config_rows`'s own row order) so a future
+/// reorder there reds instead of silently drifting from the enum's declaration
+/// order.
+#[test]
+fn config_rows_account_actions_tail_matches_runtime_order() {
+    use super::{ConfigRow, config_rows};
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some("ref".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![acct],
+    });
+    app.profile_cursor = 0;
+    app.config_draft = None;
+
+    let rows = config_rows(&app);
+    // Head: an OAuth account renders auto-start in the second slot, so the
+    // enum's second-declared variant lines up with config_rows' second row.
+    assert_eq!(
+        &rows[..2],
+        [ConfigRow::Name, ConfigRow::AutoStart],
+        "auto-start renders in the second slot, right below name: {rows:?}"
+    );
+    let tail = &rows[rows.len() - 4..];
+    assert_eq!(
+        tail,
+        [
+            ConfigRow::Login,
+            ConfigRow::DeleteCreds,
+            ConfigRow::Disabled,
+            ConfigRow::Delete,
+        ],
+        "account-actions tail must render login, delete-creds, disabled, delete in that order: {rows:?}"
+    );
+}
+
 /// The API-account re-login row walks a two-step inline chain: base url first,
 /// then api key, persisting both like `login --base-url --api-key`. ⎋ at either
 /// step abandons the whole chain.
@@ -473,6 +523,53 @@ fn app_with(profiles: Vec<crate::profile::Profile>) -> App {
         },
         profiles,
     })
+}
+
+// ── lock-order regression ───────────────────────────────────────────────────
+
+/// `reload_if_state_changed` must NOT hold the config guard while it writes the
+/// `usage_tokens` / `third_party_tokens` mutexes: those rank OUTSIDE `Config`
+/// (`Tokens` 250, `ThirdParty` 260, both `< Config` 400), so nesting them under
+/// config inverts the global lock order. In debug builds the ranked-mutex
+/// assertion panics ("lock-order violation: acquiring rank 250 while holding
+/// [400]") the instant the inverted acquire runs, so this test reds if the fix
+/// is reverted to the nested shape. The `assert!(reloaded)` is load-bearing: it
+/// proves the reload branch actually ran and reached the token-mutex writes, so
+/// a green here is never vacuous.
+#[test]
+fn reload_if_state_changed_does_not_invert_config_over_token_locks() {
+    use crate::profile::{AppState, Profile, save_app_state, save_profile};
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let home = crate::testutil::HomeSandbox::new();
+
+    // Persist a real profile so `load_config()` inside the reload succeeds.
+    let profile = Profile::new("acct".to_string(), None, None);
+    save_app_state(&AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&profile).expect("persist profile config");
+
+    let mut app = app_with(vec![profile]);
+
+    // Force the fingerprint to differ from the one captured at construction so
+    // `reload_if_state_changed` takes the reload branch instead of early-out.
+    let config_toml = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("acct")
+        .join("config.toml");
+    set_mtime(&config_toml, UNIX_EPOCH + Duration::from_secs(1_000_000));
+
+    let reloaded = app.reload_if_state_changed();
+    assert!(
+        reloaded,
+        "the reload branch must run so the token-mutex writes are exercised"
+    );
 }
 
 #[test]
@@ -662,6 +759,282 @@ fn perform_delete_without_live_session_deletes_immediately() {
     assert!(
         !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
         "no live session means no confirm modal is pushed"
+    );
+}
+
+// ── `disabled` row (per-account disable toggle) ─────────────────────────────
+
+/// Toggling `disabled` persists immediately into the live shared `AppConfig`
+/// (`app.config()` IS what render reads next frame — no reload round-trip) and
+/// to disk under the literal `disabled = true` key (`render_config_toml`), and
+/// toggling again returns the account to full participation with no stale
+/// state (the flag round-trips to exactly `false`, and every other field is
+/// left untouched).
+#[test]
+fn toggle_profile_disabled_persists_to_memory_and_disk_and_round_trips() {
+    use super::toggle_profile_disabled;
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.auto_start = true;
+    let mut app = app_with(vec![profile]);
+
+    toggle_profile_disabled(&mut app, "acct");
+    assert!(
+        app.config().find("acct").unwrap().is_disabled(),
+        "the flag flips in the live shared config"
+    );
+    let on_disk = std::fs::read_to_string(
+        home.home()
+            .join(".clauth")
+            .join("profiles")
+            .join("acct")
+            .join("config.toml"),
+    )
+    .expect("config.toml written");
+    assert!(
+        on_disk.contains("disabled = true"),
+        "the literal on-disk key is written: {on_disk}"
+    );
+
+    toggle_profile_disabled(&mut app, "acct");
+    let p = app.config().find("acct").cloned().unwrap();
+    assert!(!p.is_disabled(), "toggling again re-enables it");
+    assert!(
+        p.auto_start,
+        "no stale state: an unrelated field survives both toggles untouched"
+    );
+}
+
+/// The gate mirrors `actions::disable_profile`'s own CLI-parity refusal
+/// (`is_active` / `has_live_session`): the row's key handler (`run_config_row`
+/// via the Setup `disabled` row) no-ops for both, exactly like the render-side
+/// dim (`tests/inline/tui_render_config.rs`). Asserting `toasts.is_empty()`
+/// is the load-bearing half here: `disable_profile`'s own gate refuses too
+/// (defense in depth), so the flag-unchanged half alone would stay green even
+/// without `toggle_profile_disabled`'s own pre-check — only the ABSENCE of a
+/// surfaced danger toast proves this gate fired before the backend's `bail!`,
+/// keeping the dimmed row truly inert rather than a silent-flag/loud-toast mix.
+#[test]
+fn disabled_row_toggle_is_inert_for_the_active_account() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.config().state.active_profile = Some("acct".into());
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+
+    run_config_row(&mut app, ConfigRow::Disabled);
+
+    assert!(
+        !app.config().find("acct").unwrap().is_disabled(),
+        "the active account's toggle must no-op"
+    );
+    assert!(
+        app.toasts.is_empty(),
+        "a gated toggle must stay silent, not surface the backend's own refusal toast"
+    );
+}
+
+/// Same gate, the other half: a live `clauth start` session also blocks it.
+#[test]
+fn disabled_row_toggle_is_inert_with_a_live_session() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    let _pid_guard = arm_live_session(home.home(), "acct");
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+
+    run_config_row(&mut app, ConfigRow::Disabled);
+
+    assert!(
+        !app.config().find("acct").unwrap().is_disabled(),
+        "a session-holding account's toggle must no-op"
+    );
+    assert!(
+        app.toasts.is_empty(),
+        "a gated toggle must stay silent, not surface the backend's own refusal toast"
+    );
+}
+
+/// Disabling (real operational impact) reuses `Delete`'s press-to-arm →
+/// confirm class through the SAME `armed_action` field: the first
+/// `run_config_row` call must only arm the row (no flag flip, no toast), and
+/// the second — with the row still armed — actually disables it. Also pins
+/// the arm/confirm asymmetry fix: unlike `Delete` (whose confirm removes the
+/// row so a stale arm can never resurface), this row survives its own
+/// toggle, so the arm must be cleared after firing or a later disable would
+/// skip straight past the confirm step.
+#[test]
+fn disable_row_arms_on_first_press_confirms_on_second() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+
+    run_config_row(&mut app, ConfigRow::Disabled);
+    assert!(
+        !app.config().find("acct").unwrap().is_disabled(),
+        "the first ⏎ must only arm the row, not flip the flag"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        Some(ConfigRow::Disabled),
+        "the first ⏎ arms this row"
+    );
+    assert!(app.toasts.is_empty(), "arming alone must not toast");
+
+    run_config_row(&mut app, ConfigRow::Disabled);
+    assert!(
+        app.config().find("acct").unwrap().is_disabled(),
+        "the second ⏎, while armed, confirms the disable"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("disabled")),
+        "the confirmed disable toasts"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        None,
+        "the arm must clear after firing — this row survives its own toggle, \
+         unlike `Delete`, so a stale arm would let a later disable skip the confirm step"
+    );
+}
+
+/// Enabling is harmless, so it fires immediately on the first ⏎ — never
+/// arms, never needs a second press.
+#[test]
+fn enable_row_fires_immediately_no_arm() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.disabled = true;
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+
+    run_config_row(&mut app, ConfigRow::Disabled);
+
+    assert!(
+        !app.config().find("acct").unwrap().is_disabled(),
+        "a single ⏎ enables immediately"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("enabled")),
+        "the immediate enable toasts"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        None,
+        "enabling never arms the row"
+    );
+}
+
+/// The `a` action-menu entry for the `disabled` row flips with the account's
+/// state — "disable account" while enabled, "enable account" while disabled
+/// — mirroring the row's own label, and still dispatches through
+/// `run_config_row` so it obeys the same arm/confirm and immediate-enable
+/// rules as pressing ⏎ directly on the row.
+#[test]
+fn action_menu_labels_the_disabled_row_by_current_state() {
+    use super::{
+        ActionMenuAction, ConfigFocus, ConfigRow, Tab, build_action_menu, build_draft_existing,
+        config_rows, dispatch_action_menu_action,
+    };
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    app.config_focus = ConfigFocus::Actions;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::Disabled)
+        .expect("disable row always present");
+
+    // Enabled account: the menu offers "disable account" and dispatching it
+    // only arms the row (same as a direct ⏎), it does not flip the flag yet.
+    let menu = build_action_menu(&app);
+    assert_eq!(menu.items.len(), 1);
+    assert_eq!(menu.items[0].label, "disable account");
+    dispatch_action_menu_action(&mut app, ActionMenuAction::DisableProfile);
+    assert!(!app.config().find("acct").unwrap().is_disabled());
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        Some(ConfigRow::Disabled),
+        "the menu selection arms exactly like a direct ⏎"
+    );
+
+    // Confirm via a direct ⏎ on the now-armed row, then reopen the menu: the
+    // label must have flipped to "enable account".
+    super::run_config_row(&mut app, ConfigRow::Disabled);
+    assert!(app.config().find("acct").unwrap().is_disabled());
+    let menu = build_action_menu(&app);
+    assert_eq!(menu.items[0].label, "enable account");
+    dispatch_action_menu_action(&mut app, ActionMenuAction::EnableProfile);
+    assert!(
+        !app.config().find("acct").unwrap().is_disabled(),
+        "the menu selection enables immediately, same as a direct ⏎"
+    );
+}
+
+/// The Fallback tab's add-picker (`chain_candidates`) never offers a disabled
+/// account — this is the "excluded from any fallback-chain editing UI" half
+/// of the spec that isn't a render concern (the selector's dim + chip is
+/// covered in `tests/inline/tui_render_chain.rs`).
+#[test]
+fn chain_candidates_excludes_a_disabled_profile() {
+    use super::chain_candidates;
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut disabled = Profile::new("off".to_string(), None, None);
+    disabled.disabled = true;
+    let enabled = Profile::new("on".to_string(), None, None);
+    let app = app_with(vec![disabled, enabled]);
+
+    let candidates = chain_candidates(&app);
+    assert!(
+        !candidates.iter().any(|n| n == "off"),
+        "a disabled profile is never an add-picker candidate: {candidates:?}"
+    );
+    assert!(
+        candidates.iter().any(|n| n == "on"),
+        "an enabled, unchained profile still is: {candidates:?}"
+    );
+}
+
+/// Overview's switch affordance: `request_switch_to` never even offers a
+/// disabled account (no confirm modal), matching `switch_profile`'s own
+/// shared-guard refusal — never selectable, not just never landed.
+#[test]
+fn overview_switch_request_never_opens_a_confirm_for_a_disabled_account() {
+    use super::{Modal, request_switch_to};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut disabled = Profile::new("off".to_string(), None, None);
+    disabled.disabled = true;
+    let mut app = app_with(vec![disabled]);
+
+    request_switch_to(&mut app, 0);
+
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+        "a disabled account never raises the switch confirm"
     );
 }
 
@@ -1383,6 +1756,113 @@ fn divergence_poll_ignores_a_logged_out_shell() {
     );
 }
 
+/// A clauth-owned symlink in the live slot is never "unsaved credentials": a
+/// long-lived `session-token.json` for the active profile flips its install
+/// source, so the live symlink classifies Diverged though re-pointing it loses
+/// no login. The 1Hz poll must NOT flag the banner — it repainted it every second.
+#[cfg(unix)]
+#[test]
+fn divergence_poll_ignores_a_stale_clauth_symlink() {
+    use crate::profile::{
+        AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, save_profile,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    // The live slot is clauth's own symlink into work's rotating store.
+    crate::claude::force_link_profile_credentials("work").expect("link work");
+    // A long-lived session token (no refresh token) flips work's install source;
+    // the stale symlink still points at credentials.json, so classify reads
+    // Diverged with nothing unsaved behind it.
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat-work".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let work_dir = crate::profile::profile_dir("work").expect("work dir");
+    std::fs::write(
+        work_dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("ser sidecar"),
+    )
+    .expect("write session-token sidecar");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into()],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_none(),
+        "a clauth-owned symlink is nothing to resolve — no 1Hz banner"
+    );
+    assert!(app.modals.is_empty(), "and certainly no modal");
+}
+
+/// The macOS steady-state twin: after a switch, Claude Code rewrites the live
+/// slot as a REGULAR-FILE mirror of the Keychain, so the stale-sidecar state the
+/// test above pins as a symlink recurs as a regular file. The 1Hz poll must
+/// still stay silent — the mirror's login is saved in `credentials.json`. A
+/// symlink-identity check reads the regular file as divergence and repaints the
+/// banner every second; the content-based exemption clears it.
+#[test]
+fn divergence_poll_ignores_a_macos_regular_file_mirror() {
+    use crate::profile::{
+        AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, save_profile,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    // CC's regular-file mirror: work's stored login as a plain file (access token
+    // "acc", same as work's credentials.json), NOT our symlink.
+    write_live_creds(&login_creds("rt-work"));
+    // The sidecar flips work's install source; the mirror now classifies Diverged
+    // with nothing unsaved behind it.
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat-work".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let work_dir = crate::profile::profile_dir("work").expect("work dir");
+    std::fs::write(
+        work_dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("ser sidecar"),
+    )
+    .expect("write session-token sidecar");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into()],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_none(),
+        "a saved login mirrored as a regular file is nothing to resolve — no 1Hz banner"
+    );
+    assert!(app.modals.is_empty(), "and certainly no modal");
+}
+
 /// The banner and the resolver both identify the live login's OWNER when it is
 /// a stored sibling — by exact token match here (the half-landed-switch shape)
 /// — and the resolver leads with the "switch to it" action.
@@ -1740,11 +2220,13 @@ fn compact_rearm_after_exit() {
 use super::theme::{self, Tier};
 use super::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, KeyCode, Tab};
 
-use crate::testutil::key;
+use crate::testutil::{TierSandbox, key};
 
 #[test]
 fn theme_set_tier_round_trips() {
-    theme::set_tier(Tier::Full);
+    // The pin's own store is the first leg; the guard exists so the last leg
+    // does not outlive this test.
+    let _tier = TierSandbox::new(Tier::Full);
     assert_eq!(theme::tier(), Tier::Full);
     theme::set_tier(Tier::Compatible);
     assert_eq!(theme::tier(), Tier::Compatible);
@@ -2300,6 +2782,40 @@ mod env_editor {
         );
     }
 
+    /// `Disabled` lives in the account-actions group at the bottom (with
+    /// `Login`/`DeleteCreds`/`Delete`), one severity notch above `Delete` —
+    /// not right below `Name` as a top toggle anymore. Locks the row builder
+    /// order so a future edit can't silently drag it back to the top.
+    #[test]
+    fn disable_row_sits_in_the_account_actions_group_not_at_the_top() {
+        let app = app_with_env(BTreeMap::new()); // OAuth, no stored creds, no custom env
+
+        let rows = config_rows(&app);
+        assert_eq!(
+            rows[1],
+            ConfigRow::AutoStart,
+            "auto-start, not disabled, sits right after name"
+        );
+        assert!(
+            !rows.contains(&ConfigRow::DeleteCreds),
+            "sanity check for this fixture: no stored credential yet"
+        );
+        let pos = |row: ConfigRow| rows.iter().position(|r| *r == row);
+        let login = pos(ConfigRow::Login).expect("login row always present");
+        let disabled = pos(ConfigRow::Disabled).expect("disable row always present");
+        let delete = pos(ConfigRow::Delete).expect("delete row always present");
+        assert!(
+            login < disabled,
+            "disable sits in the tail account-actions group, after login"
+        );
+        assert!(disabled < delete, "disable is one notch above delete");
+        assert_eq!(
+            *rows.last().unwrap(),
+            ConfigRow::Delete,
+            "delete stays the very last row"
+        );
+    }
+
     fn app_with_profile(profile: Profile) -> App {
         App::new(AppConfig {
             state: AppState::default(),
@@ -2580,6 +3096,35 @@ fn all_spent_banner_ignores_a_soft_blocked_member_that_still_serves() {
     );
 }
 
+/// A member weekly line UNDER the hard cap is a switch line, not death: 7d at
+/// 95 with a `weekly at 90` override is past ITS line (the walk rotates off
+/// it) but still serves. The banner keys on [`is_exhausted_hard`] — folding
+/// the member line here would claim "all accounts spent" over a member that
+/// answers requests fine. The fixture's override is what makes this test
+/// discriminate: with no override the member line IS the hard cap, and the
+/// folding revision passes it too.
+#[test]
+fn all_spent_banner_ignores_a_member_line_under_the_hard_cap() {
+    use super::update_banner;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mut overridden = crate::testutil::blank_profile("a");
+    overridden.weekly_threshold = Some(90.0);
+    overridden.usage = Some(UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 95.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 86_400)),
+        }),
+        ..UsageInfo::default()
+    });
+    let mut app = app_with_unlinked_profiles(vec![overridden]);
+    update_banner(&mut app);
+    assert_eq!(
+        app.banner.as_ref().expect("banner").message,
+        "no active account · select one to resume",
+        "past the member line but under the cap still serves — not spent"
+    );
+}
+
 /// The same member at the hard cap IS spent.
 #[test]
 fn all_spent_banner_fires_at_the_weekly_hard_cap() {
@@ -2601,11 +3146,12 @@ fn all_spent_banner_fires_at_the_weekly_hard_cap() {
     );
 }
 
-// ── fallback threshold: continuous row, unchanged grammar ────────────────────
+// ── fallback continuous rows: `rotate at` + `weekly at` ──────────────────────
 //
-// The `rotate at` threshold is the one CONTINUOUS row: unlike the enumerated
-// Config-tab rows, it keeps `+`/`-` for ±5 nudges alongside the `⏎` typed
-// editor. This must survive the enumerated-row grammar unification untouched.
+// Both are CONTINUOUS rows: unlike the enumerated Config-tab rows, they keep
+// `+`/`-` for ±5 nudges alongside the `⏎` typed editor. `max spend` (a dollar
+// ceiling) has no natural step unit and stays typed-only — see the no-op test
+// below, next to the max-spend editor tests.
 
 #[test]
 fn fallback_threshold_plus_minus_still_nudge_both_ways() {
@@ -2631,6 +3177,164 @@ fn fallback_threshold_plus_minus_still_nudge_both_ways() {
         app.config().find("a").and_then(|p| p.fallback_threshold),
         Some(45.0),
         "- still lowers the threshold by 5"
+    );
+}
+
+// `weekly at` joins `rotate at` as the second CONTINUOUS row (owner call,
+// 2026-07-23): it now takes the same ±5 nudge alongside its existing `⏎`
+// typed editor. `max spend` (a dollar ceiling) has no natural step unit and
+// stays typed-only — see `fallback_max_spend_plus_minus_is_a_no_op` below.
+#[test]
+fn fallback_weekly_at_plus_minus_nudge_both_ways() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    // 70 sits away from every default/bound (98 default, 50/100 bounds), so a
+    // no-op bug (stays 70) and a mis-stepped nudge (anything but ±5) both
+    // fail the exact-value assert below instead of accidentally landing on it.
+    profile.weekly_threshold = Some(70.0);
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(75.0),
+        "+ raises the weekly override by exactly 5"
+    );
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(65.0),
+        "- lowers the weekly override by exactly 5"
+    );
+}
+
+#[test]
+fn fallback_weekly_at_nudge_clamps_at_upper_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.weekly_threshold = Some(99.0);
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(100.0),
+        "+ past MAX_WEEKLY_SWITCH_PCT clamps at 100"
+    );
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(100.0),
+        "a further + stays pinned at the bound"
+    );
+}
+
+#[test]
+fn fallback_weekly_at_nudge_clamps_at_lower_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.weekly_threshold = Some(51.0);
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(50.0),
+        "- past MIN_WEEKLY_SWITCH_PCT clamps at 50"
+    );
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(50.0),
+        "a further - stays pinned at the bound"
+    );
+}
+
+// Mirrors the dimmed-row contract `run_fallback_row`'s ⏎ already enforces:
+// a gate-off weekly-at row isn't judged, so +/- must no-op exactly like ⏎
+// does, instead of quietly arming an override nobody can see take effect.
+#[test]
+fn fallback_weekly_at_nudge_is_inert_while_gate_is_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.weekly_threshold = Some(70.0);
+    profile.check_weekly = false;
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(70.0),
+        "+/- must no-op on a dimmed (gate-off) weekly-at row"
+    );
+}
+
+// An unset override follows the chain-wide resolved line (rendered dimmed —
+// see `detail_row`'s `weekly_default`); the first nudge must set an explicit
+// override derived from THAT value, not from 0 or the hardcoded 98 default,
+// so the on-screen number visibly moves by exactly 5 from what it showed.
+#[test]
+fn fallback_weekly_at_nudge_from_unset_bases_on_resolved_default() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::blank_profile("a"); // weekly_threshold: None
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.config().state.weekly_switch_threshold = Some(80.0); // resolved chain default
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.weekly_threshold),
+        Some(85.0),
+        "first + on an unset override sets an explicit one at resolved-default + 5"
+    );
+}
+
+// `space` still opens both the weekly-at and max-spend typed editors —
+// unchanged by the `+`/`-` dispatch-by-row rewrite of `handle_fallback_detail_key`.
+#[test]
+fn fallback_weekly_at_and_max_spend_editors_still_open_via_space() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.config().state.spend_budget_switching = true; // arm max spend so its row isn't inert
+
+    app.fallback_detail_cursor = weekly_at_row();
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        app.fallback_weekly_draft.is_some(),
+        "space still opens the weekly-at editor"
+    );
+    super::handle_key(&mut app, key(KeyCode::Esc));
+
+    app.fallback_detail_cursor = max_spend_row();
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        app.fallback_max_spend_draft.is_some(),
+        "space still opens the max-spend editor"
     );
 }
 
@@ -2753,6 +3457,30 @@ fn fallback_max_spend_editor_refuses_an_infinite_ceiling() {
     );
 }
 
+// A dollar ceiling has no natural step unit (unlike a bounded percent), so
+// `max spend` stays typed-only — `+`/`-` fall through to the dispatcher's
+// `_ => {}` arm. Armed (spend budget on) so a real nudge would be observable.
+#[test]
+fn fallback_max_spend_plus_minus_is_a_no_op() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.max_auto_spend = Some(10.0);
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = max_spend_row();
+    app.config().state.spend_budget_switching = true;
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('+')));
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char('-')));
+    assert_eq!(
+        app.config().find("a").and_then(|p| p.max_auto_spend),
+        Some(10.0),
+        "max spend stays typed-only — +/- must never touch it"
+    );
+}
+
 // ── fallback last-resort toggle (issue #8 follow-up) ─────────────────────────
 //
 // Space/⏎ on the `last resort` row flips `Profile::last_resort` and persists
@@ -2849,6 +3577,43 @@ fn fallback_last_resort_is_exclusive_across_the_chain() {
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
     assert_eq!(app.config().find("a").map(|p| p.last_resort), Some(false));
     assert_eq!(app.config().find("b").map(|p| p.last_resort), Some(false));
+}
+
+// The per-account usage gates flip and persist through their toggle rows,
+// independently of each other.
+#[test]
+fn fallback_usage_gate_toggles_persist() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+
+    app.fallback_detail_cursor = 2; // FALLBACK_ROWS[2] == CheckWeekly
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config()
+            .find("a")
+            .map(|p| (p.check_weekly, p.check_scoped)),
+        Some((false, true)),
+        "space flips only the weekly gate"
+    );
+
+    app.fallback_detail_cursor = 3; // FALLBACK_ROWS[3] == CheckScoped
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.config()
+            .find("a")
+            .map(|p| (p.check_weekly, p.check_scoped)),
+        Some((false, false)),
+        "⏎ flips only the scoped gate"
+    );
+
+    // The off states survive a config reload from disk (persisted, not
+    // just in-memory).
+    let reloaded = crate::profile::load_profile("a").expect("reload profile");
+    assert!(!reloaded.check_weekly);
+    assert!(!reloaded.check_scoped);
 }
 
 // ── tokens tab: model filter via the action menu ─────────────────────────────
@@ -4037,18 +4802,12 @@ fn bootstrap_app(_home: &crate::testutil::HomeSandbox, status: FetchStatus) -> A
         s.insert(BOOT_SPARE.to_string(), FetchStatus::Fresh);
     }
 
-    // `finish_bootstrap` starts the real scheduler thread. Raise the shutdown
-    // flag it already honours (checked at the loop top, ahead of its first sleep)
-    // so no tick ever runs — nothing fetches, nothing decides. The one-shot under
-    // test never reads the flag.
-    //
-    // What the flag does NOT stop is the worker's pre-loop kick-block seed, which
-    // resolves home ON the worker thread and is never joined, so it can outlive
-    // this sandbox and read against the real home — the escape docs/internals.md's
-    // 2026-06-06 convention exists to prevent. Named, not hidden: the seed only
-    // ever reads, so the escape is inert (it can neither write outside the sandbox
-    // nor reach anything these assertions observe) and stays inert only while that
-    // holds. Tracked in docs/todo.md.
+    // `finish_bootstrap` starts the real scheduler via `spawn_refresher`, which
+    // now skips spawning the tick thread under `cfg!(test)` (its kick-block
+    // seed already ran synchronously, on this thread, before that check) — so
+    // no tick ever runs and nothing can resolve home past this sandbox. The
+    // flag store below is now belt-and-suspenders: the one-shot under test
+    // never reads it.
     app.shutting_down.store(true, Ordering::SeqCst);
 
     app.startup_sender
@@ -4132,4 +4891,118 @@ fn bootstrap_one_shot_skips_a_non_fresh_active_read() {
             "{status:?} must decide nothing, so it announces nothing",
         );
     }
+}
+
+// The override row is inert while the member's weekly gate is off — the line
+// isn't judged there, so ⏎ must not open the editor.
+#[test]
+fn fallback_weekly_override_editor_is_inert_while_gate_is_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut a = crate::testutil::blank_profile("a");
+    a.check_weekly = false;
+    let mut app = app_with_unlinked_profiles(vec![a]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = weekly_at_row();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.fallback_weekly_draft.is_none(),
+        "⏎ must not open the editor while the weekly gate is off"
+    );
+}
+
+// ── startup Overwrite + logged-out shell: caller-path coverage for the sink ──
+//
+// `force_snapshot_skips_shell_but_still_captures_real_divergence` (claude.rs)
+// pins the sink guard in isolation. This drives the REAL startup chain end to
+// end: reconcile_startup classifies the shell as diverged and posts
+// ReconcileNeedsPrompt; draining the signal runs resolve_or_note_divergence →
+// default_divergence Overwrite → run_divergence_choice →
+// force_snapshot_active_credentials (the shared sink). The 1Hz poll bails on
+// `live_credentials_are_shell()` BEFORE that point (app.rs), but the startup
+// path has no such early guard, so the sink's empty-login skip is the only
+// thing standing between a logged-out shell and the stored login here.
+
+fn oauth_login(access: &str, refresh: Option<&str>) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    }
+}
+
+#[test]
+fn startup_overwrite_default_routes_a_shell_through_the_guarded_sink() {
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, DivergenceChoice, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // Active profile carrying a real stored login.
+    let mut profile = Profile::new("active".to_string(), None, None);
+    profile.credentials = Some(oauth_login("stored-access", Some("stored-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    // CC's logged-out shell in the live slot: blank tokens, a foreign key kept,
+    // written as a plain file (not clauth's symlink).
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"mcpOAuth":{}}"#,
+    )
+    .expect("write shell");
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.active_profile = Some("active".into());
+    config.state.profiles = vec!["active".into()];
+    config.state.default_divergence = Some(DivergenceChoice::Overwrite);
+
+    let mut app = App::new(config);
+
+    // Exactly how production drives startup: reconcile inline, then drain the
+    // signal it posts.
+    super::reconcile_startup(&mut app);
+    super::drain_startup_signals(&mut app);
+
+    // The sink's empty-login skip held: the stored login is intact, not blanked
+    // by the shell. Remove that guard and Overwrite writes the shell's blank
+    // tokens over the stored chain here, so this assertion reds.
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.access_token(),
+        Some("stored-access"),
+        "a startup Overwrite must not let a logged-out shell blank the stored access token",
+    );
+    assert_eq!(
+        stored.refresh_token(),
+        Some("stored-refresh"),
+        "a startup Overwrite must not let a logged-out shell blank the stored refresh token",
+    );
+
+    // Positive control: the Overwrite branch actually RAN (the shell reached the
+    // sink, not an earlier bail). It relinked the live slot back to the stored
+    // login, so the slot no longer holds the shell's blank token. Cross-platform:
+    // a symlink on unix, a copy on windows both read back the stored login.
+    let relinked: ClaudeCredentials =
+        crate::profile::read_json_file(&live).expect("read relinked live");
+    assert_eq!(
+        relinked.access_token(),
+        Some("stored-access"),
+        "Overwrite relinks the live slot to the stored login, replacing the shell",
+    );
 }

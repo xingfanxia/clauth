@@ -9,10 +9,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 
 use crate::claude::{
-    ClaudeEndpoint, LinkState, apply_profile_to_claude_settings, classify_credentials_link,
-    clear_claude_credentials, force_link_profile_credentials, force_snapshot_active_credentials,
-    is_first_login, link_profile_credentials, live_credentials_are_shell, managed_env_key_label,
-    read_claude_credentials, read_claude_endpoint_config, snapshot_active_credentials,
+    ClaudeEndpoint, apply_profile_to_claude_settings, clear_claude_credentials,
+    force_link_profile_credentials, force_snapshot_active_credentials, link_profile_credentials,
+    live_diverged_and_unsaved, managed_env_key_label, read_claude_credentials,
+    read_claude_endpoint_config, snapshot_active_credentials,
 };
 use crate::lock::with_state_lock;
 use crate::lockorder::RankedMutex;
@@ -83,16 +83,26 @@ pub(crate) fn validate_profile_name(
     Ok(())
 }
 
-/// Existence FIRST — every switch primitive tears the live credentials link
-/// down before `finish_switch` would notice a ghost, and `switch_profile_discard`
-/// takes no prior snapshot, so a stale name (a daemon's queued switch target
-/// deleted out-of-process, the MCP switch tool with a divergence default, a CLI
-/// switch racing `clauth delete`) must bounce off before any side effect.
-/// (2026-07-12 review: the too-late check let a retry misread the half-torn
-/// link as "logged out" and null the ACTIVE profile's creds.) All three
-/// primitives call this so the guard cannot be bypassed through the diverged
-/// discard/overwrite paths.
-fn ensure_profile_exists(config: &AppConfig, name: &str) -> Result<()> {
+/// Every switch primitive tears the live credentials link down before
+/// `finish_switch` would notice a ghost, and the discard path takes no prior
+/// snapshot — an uncaptured re-login would be gone for good. So this runs
+/// FIRST, before any side effect: a caller holding a stale name (a queued
+/// auto-switch target, the MCP switch tool with a divergence default) bounces
+/// off instead of stranding the machine half-switched with the live link
+/// destroyed, and a disabled target is refused before that same link gets
+/// force-relinked to it.
+///
+/// This is the ONE authoritative "never active while disabled" gate — every
+/// switch primitive that can write `active_profile`
+/// ([`switch_profile`]/[`switch_profile_discard`]/[`switch_profile_reconciled`],
+/// and so [`switch_profile_noninteractive`] and `switch_profile_cli`, which
+/// only ever reach `active_profile` through one of those three) calls this
+/// as its first line, inside the same `with_state_lock` closure that runs
+/// the write at the end. The lock is held continuously from here to that
+/// write, so a concurrent `disable_profile` can't land in the gap — a
+/// pre-lock check in a CLI/MCP wrapper is a friendly early error at best,
+/// never the authoritative one.
+fn ensure_switch_target_ok(config: &AppConfig, name: &str) -> Result<()> {
     let Some(profile) = config.find(name) else {
         bail!("profile '{name}' not found");
     };
@@ -103,12 +113,15 @@ fn ensure_profile_exists(config: &AppConfig, name: &str) -> Result<()> {
     if profile.is_codex() {
         bail!("profile '{name}' is a codex profile — it switches via the codex path");
     }
+    if profile.is_disabled() {
+        bail!("'{name}': account is disabled, run `clauth enable {name}`");
+    }
     Ok(())
 }
 
 pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
-        ensure_profile_exists(config, name)?;
+        ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
             return Ok(());
         }
@@ -116,25 +129,22 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         // credentials` deliberately skips capturing that case (Diverged & not a
         // first-login), so dropping it would strand a fresh `/login` chain — keep
         // the non-force refuse-guard there. Every other state is captured or
-        // adoptable by the snapshot below, so force the relink. This force is
-        // cross-platform, not macOS-gated: on macOS the live `.credentials.json`
-        // is always a regular-file Keychain mirror that legitimately differs from
-        // the target (so the non-force guard's live-vs-target byte check would
-        // wrongly reject every switch), and on other platforms the force is a
-        // benign re-write of a symlink that already points where we want — either
-        // way, once the outgoing creds are captured/adopted, forcing is correct.
-        // (Interactive callers already route a real divergence to the reconcile
-        // path, so this branch is only reachable uncaptured via the scheduler —
-        // where refusing, not dropping, is the safe outcome.)
-        // A logged-out shell holds no login to strand, so it forfeits the
-        // refuse-guard (which would otherwise wedge the switch on an empty file) —
-        // hence the `!live_credentials_are_shell()` guard below.
+        // adoptable by the snapshot below, so force the relink: on macOS the live
+        // `.credentials.json` is a regular-file Keychain mirror of the active
+        // account, so it legitimately differs from the target, which the non-force
+        // guard's live-vs-target byte check would wrongly reject. The SAME
+        // predicate the defer/banner gates use — `live_diverged_and_unsaved` —
+        // decides here, so a login already saved in the store (the mirror, a
+        // clauth symlink) forces the relink even once a sidecar capture flips the
+        // install source and makes classify read Diverged over it; without that
+        // exemption the guarded link byte-rejects the macOS mirror and the switch
+        // fails "unsaved credentials" though nothing is unsaved. (Interactive
+        // callers already route a real divergence to the reconcile path, so this
+        // branch is only reachable uncaptured via the scheduler — where refusing,
+        // not dropping, is the safe outcome.) A logged-out shell holds no login to
+        // strand, so it too forfeits the refuse-guard.
         let uncaptured_relogin = match config.state.active_profile.as_deref() {
-            Some(active) => {
-                matches!(classify_credentials_link(active)?, LinkState::Diverged)
-                    && !is_first_login(active)?
-                    && !live_credentials_are_shell()
-            }
+            Some(active) => live_diverged_and_unsaved(active)?,
             None => false,
         };
         snapshot_active_credentials(config)?;
@@ -153,7 +163,7 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
 /// un-captured re-login) precisely because the caller chose to drop it.
 pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &str) -> Result<()> {
     with_state_lock(|| {
-        ensure_profile_exists(config, target)?;
+        ensure_switch_target_ok(config, target)?;
         if config.is_active(target) {
             return Ok(());
         }
@@ -165,7 +175,7 @@ pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &str) -> Re
 /// Force-snapshot the outgoing creds then force the symlink. CLI prompt path only.
 pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &str) -> Result<()> {
     with_state_lock(|| {
-        ensure_profile_exists(config, name)?;
+        ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
             return Ok(());
         }
@@ -185,11 +195,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     // exempt: capturing its blank tokens would destroy the outgoing profile's
     // stored login.
     let reconciled = match outgoing.as_deref() {
-        Some(active) => {
-            matches!(classify_credentials_link(active)?, LinkState::Diverged)
-                && !is_first_login(active)?
-                && !live_credentials_are_shell()
-        }
+        Some(active) => live_diverged_and_unsaved(active)?,
         None => false,
     };
 
@@ -310,11 +316,25 @@ pub(crate) fn switch_profile_noninteractive(
         }
     }
 
-    let previous = {
+    let (previous, target_disabled) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
-        cfg.state.active_profile.as_deref().map(str::to_string)
+        (
+            cfg.state.active_profile.as_deref().map(str::to_string),
+            cfg.find(target).is_some_and(|p| p.is_disabled()),
+        )
     };
+
+    // Friendly early refuse, unconditional like `refuse_if_disabled` (no
+    // active-exempt — a disabled profile can never be the active one, since
+    // `disable_profile` itself refuses the active target). Placed BEFORE the
+    // AUTH-1 gate below so a disabled, clock-expired target is refused before
+    // its single-use refresh token ever gets rotated over HTTP; the
+    // authoritative `ensure_switch_target_ok` gate inside `switch_profile`
+    // stays the backstop, this only prevents the spurious rotation.
+    if target_disabled {
+        bail!("'{target}': account is disabled, run `clauth enable {target}`");
+    }
 
     // AUTH-1 (Incident C): gate the target before its credentials land in the
     // Keychain — the same gate as the CLI switch, so "a quarantined account is
@@ -339,11 +359,7 @@ pub(crate) fn switch_profile_noninteractive(
     // A logged-out shell is no divergence to resolve: skip the default and take
     // the plain switch, which replaces the empty file.
     let diverged = match previous.as_deref() {
-        Some(active) => {
-            matches!(classify_credentials_link(active)?, LinkState::Diverged)
-                && !is_first_login(active)?
-                && !live_credentials_are_shell()
-        }
+        Some(active) => live_diverged_and_unsaved(active)?,
         None => false,
     };
 
@@ -622,6 +638,60 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str, force: bool) ->
     // Outside the closure — see `rename_profile` on the rank order.
     crate::usage::expire_profile_ttl(name);
     Ok(())
+}
+
+/// `clauth disable <name>` — mark `name` as user-disabled (see
+/// [`Profile::disabled`]): invisible to the fallback-chain walk, the
+/// usage/rotation scheduler, and the daemon status feed by default, while its
+/// profile directory and stored credentials stay on disk untouched. Refuses
+/// when `name` is the global active profile or holds a live `clauth start`
+/// session, naming the blocker — a disabled account must never be reachable
+/// as an active target, so both gates run before any write.
+///
+/// Idempotent: an already-disabled account returns `Ok(false)` with no write
+/// and no error, checked BEFORE the blocker gates so re-running `disable` on
+/// an account that's already off never trips them (e.g. one that's also
+/// currently active from before this feature). Returns `Ok(true)` when it
+/// flips the flag and persists.
+pub(crate) fn disable_profile(config: &mut AppConfig, name: &str) -> Result<bool> {
+    with_state_lock(|| {
+        let profile = config
+            .find(name)
+            .with_context(|| format!("profile '{name}' not found"))?;
+        if profile.is_disabled() {
+            return Ok(false);
+        }
+        if config.is_active(name) {
+            bail!("'{name}' is the active account — switch away first");
+        }
+        if crate::runtime::has_live_session(name) {
+            bail!("'{name}' has an open session — close it first");
+        }
+        let profile = config.find_mut(name).context("profile not found")?;
+        profile.disabled = true;
+        save_profile(profile)?;
+        Ok(true)
+    })
+}
+
+/// `clauth enable <name>` — clear [`Profile::disabled`], restoring `name` to
+/// every operational surface. No other side effects: chain slot, env, model
+/// settings, and stored credentials are untouched.
+///
+/// Idempotent: an already-enabled account returns `Ok(false)` with no write
+/// and no error. Returns `Ok(true)` when it clears the flag and persists.
+pub(crate) fn enable_profile(config: &mut AppConfig, name: &str) -> Result<bool> {
+    with_state_lock(|| {
+        let profile = config
+            .find_mut(name)
+            .with_context(|| format!("profile '{name}' not found"))?;
+        if !profile.is_disabled() {
+            return Ok(false);
+        }
+        profile.disabled = false;
+        save_profile(profile)?;
+        Ok(true)
+    })
 }
 
 pub(crate) fn create_blank_profile(
@@ -1022,7 +1092,16 @@ pub(crate) fn overwrite_captured_profile(
             crate::profile_cache::drop_account_anchor(name);
         }
 
-        if config.state.active_profile.is_none() {
+        // A disabled profile's creds are still captured above (the operator
+        // asked for that), but it must never become the active account this
+        // way — reachable via login → switch away → disable → delete the
+        // active (clears `active_profile` to None) → `clauth login
+        // <disabled>` (the documented revoked-token recovery) auto-activating
+        // it. `is_disabled` is re-read fresh rather than reusing a stale bool
+        // from before `save_profile` — nothing above this line touches the
+        // flag, but the check must describe the profile as committed.
+        let disabled = config.find(name).is_some_and(Profile::is_disabled);
+        if config.state.active_profile.is_none() && !disabled {
             link_profile_credentials(name)?;
             config.state.active_profile = Some(name.into());
         } else if was_active {

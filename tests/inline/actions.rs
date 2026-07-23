@@ -119,8 +119,8 @@ fn switch_replaces_active_account_mirror_without_refusing() {
 
     assert!(config.is_active("xfx"));
     assert_eq!(
-        classify_credentials_link("xfx").expect("classify"),
-        LinkState::LinkedTo,
+        crate::claude::classify_credentials_link("xfx").expect("classify"),
+        crate::claude::LinkState::LinkedTo,
         "after the switch the live path resolves to xfx's stored creds",
     );
 }
@@ -175,6 +175,39 @@ fn switch_to_a_missing_profile_bails_before_touching_the_live_link() {
         .unwrap()
         .join("credentials.json");
     assert!(stored.exists(), "keeper's stored credentials survive");
+}
+
+/// The disabled gate is the shared locked action, not a CLI wrapper:
+/// `switch_profile` itself — no `cmd_switch`, no MCP tool — refuses a
+/// disabled target and leaves `active_profile` untouched. Covers #1/#4/#6:
+/// every switch primitive funnels through the same `ensure_switch_target_ok`
+/// chokepoint this exercises directly.
+#[test]
+fn switch_profile_refuses_a_disabled_target_and_leaves_active_unchanged() {
+    let _home = HomeSandbox::new();
+    let active = Profile::new("active".to_string(), None, None);
+    save_profile(&active).expect("save active");
+    let mut target = Profile::new("target".to_string(), None, None);
+    target.disabled = true;
+
+    let mut config = AppConfig {
+        state: AppState {
+            active_profile: Some("active".into()),
+            profiles: vec!["active".into(), "target".into()],
+            ..AppState::default()
+        },
+        profiles: vec![active, target],
+    };
+
+    let err = switch_profile(&mut config, "target").expect_err("a disabled target must be refused");
+    assert_eq!(
+        err.to_string(),
+        "'target': account is disabled, run `clauth enable target`"
+    );
+    assert!(
+        config.is_active("active"),
+        "active profile must be unchanged"
+    );
 }
 
 /// AUTH-4 parity, TUI side: `auto_switch_if_needed` must leave an auth-broken
@@ -244,6 +277,238 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
         "a dead active with stale-headroom usage must still be walked away from"
     );
     assert!(config.is_active("b"));
+}
+
+/// The scoped trigger through the REAL UI one-shot: `auto_switch_if_needed`
+/// must hop off an otherwise-healthy active whose per-model week is spent —
+/// through `fully_clear_target`, its only walk — and actually land the switch.
+#[test]
+fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
+    use crate::fallback::{SwitchAction, auto_switch_if_needed};
+    use crate::usage::{ScopedWindow, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = HomeSandbox::new();
+
+    let creds = |name: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let mk = |name: &str, scoped: Vec<ScopedWindow>| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds(name));
+        p.usage = Some(UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: 40.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+            }),
+            weekly_scoped: scoped,
+            ..Default::default()
+        });
+        crate::profile::save_profile(&p).expect("save profile");
+        p
+    };
+    let a = mk(
+        "a",
+        vec![ScopedWindow {
+            label: "7d fable".into(),
+            window: UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+            },
+        }],
+    );
+    let b = mk("b", vec![]);
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(a.credentials.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let mut config = AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+
+    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    assert_eq!(
+        action,
+        Some(SwitchAction::To("b".to_string())),
+        "a healthy active with a spent per-model week must hop to the clear member"
+    );
+    assert!(config.is_active("b"));
+}
+
+/// Twin of the hop-off test above, but the only sibling is canceled: its
+/// cached 5h window reads as idle headroom (the exact shape `is_canceled`
+/// exists to catch), yet every request against it 403s. `fully_clear_target`
+/// — the scoped trigger's only walk — must skip it same as `next_target`
+/// does, so the trigger finds nothing and leaves the scoped-blocked active in
+/// place rather than relinking onto a dead account.
+#[test]
+fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_member() {
+    use crate::fallback::auto_switch_if_needed;
+    use crate::usage::{
+        PlanInfo, PlanTier, ScopedWindow, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs,
+    };
+    let _home = HomeSandbox::new();
+
+    let creds = |name: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let mut a = Profile::new("a".to_string(), None, None);
+    a.credentials = Some(creds("a"));
+    a.usage = Some(UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 40.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+        }),
+        weekly_scoped: vec![ScopedWindow {
+            label: "7d fable".into(),
+            window: UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+            },
+        }],
+        ..Default::default()
+    });
+    crate::profile::save_profile(&a).expect("save profile");
+
+    let mut b = Profile::new("b".to_string(), None, None);
+    b.credentials = Some(creds("b"));
+    b.usage = Some(UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 5.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: Some("canceled".to_string()),
+        }),
+        ..Default::default()
+    });
+    crate::profile::save_profile(&b).expect("save profile");
+
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(a.credentials.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let mut config = AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+
+    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    assert_eq!(
+        action, None,
+        "a scoped-blocked active must not hop onto a canceled member reading idle headroom"
+    );
+    assert!(
+        config.is_active("a"),
+        "active must stay put when the only sibling is canceled"
+    );
+}
+
+/// The pinned-sink guard on the same one-shot: identical shape, but the
+/// active is `last_resort` — parked on purpose, so the scoped hop must not
+/// un-park it (the scheduler-walk twin is
+/// `scoped_active_trigger_stays_parked_on_a_pinned_sink`).
+#[test]
+fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
+    use crate::fallback::auto_switch_if_needed;
+    use crate::usage::{ScopedWindow, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = HomeSandbox::new();
+
+    let creds = |name: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let mut a = Profile::new("a".to_string(), None, None);
+    a.credentials = Some(creds("a"));
+    a.last_resort = true;
+    a.usage = Some(UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        weekly_scoped: vec![ScopedWindow {
+            label: "7d fable".into(),
+            window: UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+            },
+        }],
+        ..Default::default()
+    });
+    crate::profile::save_profile(&a).expect("save a");
+    let mut b = Profile::new("b".to_string(), None, None);
+    b.credentials = Some(creds("b"));
+    crate::profile::save_profile(&b).expect("save b");
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(a.credentials.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let mut config = AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+
+    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    assert_eq!(action, None, "a pinned sink stays parked");
+    assert!(config.is_active("a"));
 }
 
 #[test]
@@ -378,8 +643,8 @@ fn reauth_of_the_active_account_force_relinks_the_stale_mirror() {
     // The live credential now resolves to xfx's FRESH stored creds — the force-relink
     // replaced the stale mirror (a non-force link would have bailed "live file differs").
     assert_eq!(
-        classify_credentials_link("xfx").expect("classify"),
-        LinkState::LinkedTo,
+        crate::claude::classify_credentials_link("xfx").expect("classify"),
+        crate::claude::LinkState::LinkedTo,
         "the live credential is relinked to the re-authed profile",
     );
     let live_bytes = std::fs::read(&live).unwrap();
@@ -710,6 +975,43 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
             "{file} must be dropped — it describes the old account"
         );
     }
+}
+
+/// Reachable via login → switch away → disable → delete the (now-inactive)
+/// active (clears `active_profile` to `None` — `AppConfig::remove`) →
+/// `clauth login <disabled>`, the documented revoked-token recovery: the
+/// auto-activate branch must never make a disabled profile active, though it
+/// still captures the fresh credentials the operator asked for. Condensed to
+/// the minimal repro: a disabled profile + no active profile + a reauth
+/// capture.
+#[test]
+fn overwrite_captured_profile_does_not_auto_activate_a_disabled_profile() {
+    let _home = HomeSandbox::new();
+    let mut target = Profile::new("acme".to_string(), None, None);
+    target.disabled = true;
+    save_profile(&target).expect("save target");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["acme".into()],
+            active_profile: None,
+            ..AppState::default()
+        },
+        profiles: vec![target],
+    };
+
+    overwrite_captured_profile(&mut config, "acme", login_snapshot("fresh-refresh", None))
+        .expect("capture succeeds");
+
+    assert_eq!(
+        config.state.active_profile, None,
+        "a disabled profile must never be auto-activated, even with no active profile at all"
+    );
+    assert_eq!(
+        config.find("acme").unwrap().access_token(),
+        Some("acc"),
+        "the fresh credentials must still be captured"
+    );
 }
 
 // ── /profile TTL clock across account swaps ─────────────────────────────────
@@ -1139,6 +1441,175 @@ fn delete_refuses_live_session_unless_forced() {
         config.find("busy").is_none(),
         "force must remove the profile despite the live session"
     );
+}
+
+// ── disable_profile / enable_profile ────────────────────────────────────────
+
+#[test]
+fn disable_refuses_the_active_profile() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+    config.state.active_profile = Some("acme".into());
+
+    let err = disable_profile(&mut config, "acme").expect_err("active profile must be refused");
+    assert_eq!(
+        err.to_string(),
+        "'acme' is the active account — switch away first"
+    );
+    assert!(
+        !config.find("acme").unwrap().is_disabled(),
+        "a refused disable must leave the flag untouched"
+    );
+}
+
+#[test]
+fn disable_refuses_a_profile_with_a_live_session() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "busy".to_string(), None, None, None).expect("create");
+
+    // Same live-session simulation as `delete_refuses_live_session_unless_forced`:
+    // a locked pid file in the profile's sessions dir reads as alive.
+    let sessions = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("busy")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
+    pid.lock().expect("lock pid");
+
+    let err = disable_profile(&mut config, "busy").expect_err("a live session must be refused");
+    assert_eq!(
+        err.to_string(),
+        "'busy' has an open session — close it first"
+    );
+    assert!(
+        !config.find("busy").unwrap().is_disabled(),
+        "a refused disable must leave the flag untouched"
+    );
+}
+
+#[test]
+fn disable_sets_the_flag_and_a_reload_observes_it() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+
+    let changed = disable_profile(&mut config, "acme").expect("disable succeeds");
+    assert!(changed, "a fresh disable must report a real change");
+    assert!(config.find("acme").unwrap().is_disabled());
+
+    let reloaded = crate::profile::load_config().expect("reload from disk");
+    assert!(
+        reloaded.find("acme").unwrap().is_disabled(),
+        "the flag must survive a reload from disk"
+    );
+}
+
+#[test]
+fn disable_is_idempotent_on_an_already_disabled_profile() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+    disable_profile(&mut config, "acme").expect("first disable");
+
+    let changed = disable_profile(&mut config, "acme").expect("re-disable is not an error");
+    assert!(!changed, "a no-op disable must report no change");
+    assert!(config.find("acme").unwrap().is_disabled());
+}
+
+#[test]
+fn enable_clears_the_flag_leaving_everything_else_byte_identical() {
+    let _home = HomeSandbox::new();
+    let mut profile = Profile::new("acme".to_string(), None, None);
+    profile.env.insert("FOO".to_string(), "bar".to_string());
+    profile.fallback_threshold = Some(42.0);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-acme".to_string(),
+            refresh_token: Some("rt-acme".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&profile).expect("save profile");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["acme".into()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+
+    let config_path = crate::profile::profile_subpath("acme", "config.toml").unwrap();
+    let creds_path = crate::profile::profile_subpath("acme", "credentials.json").unwrap();
+    let config_before = std::fs::read(&config_path).unwrap();
+    let creds_before = std::fs::read(&creds_path).unwrap();
+
+    disable_profile(&mut config, "acme").expect("disable");
+    assert!(config.find("acme").unwrap().is_disabled());
+
+    let changed = enable_profile(&mut config, "acme").expect("enable succeeds");
+    assert!(changed, "a real re-enable must report a change");
+
+    let acme = config.find("acme").unwrap();
+    assert!(!acme.is_disabled());
+    assert_eq!(
+        acme.env.get("FOO"),
+        Some(&"bar".to_string()),
+        "env untouched"
+    );
+    assert_eq!(
+        acme.fallback_threshold,
+        Some(42.0),
+        "fallback_threshold untouched"
+    );
+    assert_eq!(
+        acme.access_token(),
+        Some("at-acme"),
+        "credentials untouched"
+    );
+
+    assert_eq!(
+        std::fs::read(&config_path).unwrap(),
+        config_before,
+        "config.toml must round-trip byte-identical once re-enabled"
+    );
+    assert_eq!(
+        std::fs::read(&creds_path).unwrap(),
+        creds_before,
+        "credentials.json must round-trip byte-identical once re-enabled"
+    );
+}
+
+#[test]
+fn enable_is_idempotent_on_an_already_enabled_profile() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+
+    let changed = enable_profile(&mut config, "acme").expect("enable on an enabled profile");
+    assert!(!changed, "a no-op enable must report no change");
+    assert!(!config.find("acme").unwrap().is_disabled());
 }
 
 /// #5: for an ACTIVE profile the settings-unwire (a fallible external write) must

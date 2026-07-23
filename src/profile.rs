@@ -164,18 +164,6 @@ pub(crate) struct Profile {
     /// the aggregate 7d judgment (while `check_weekly` is on) AND to the
     /// per-model `weekly_scoped` windows (while `check_scoped` is on).
     pub(crate) weekly_threshold: Option<f64>,
-    /// Whether auto-switching checks this account's aggregate weekly (7d)
-    /// usage against the soft weekly line (fallback chain only). Off, only the
-    /// hard cap (100%) blocks it — the account stays in rotation across the
-    /// soft band. Default on (stock behavior).
-    pub(crate) check_weekly: bool,
-    /// Whether auto-switching checks this account's per-model weekly windows
-    /// (e.g. "7d fable") against the weekly line (fallback chain only). On, a
-    /// scoped window past the line keeps this account out of rotation — for
-    /// sessions on that model it is as dead as a spent week. Off, scoped
-    /// windows are ignored here: the account stays in rotation for use with
-    /// other models. Default on.
-    pub(crate) check_scoped: bool,
     /// Chain-walk terminal stop (fallback chain only): once the auto-switch
     /// picker lands here with nothing else viable, it parks instead of turning
     /// off all accounts. Independent of `fallback_threshold` — this profile
@@ -195,9 +183,28 @@ pub(crate) struct Profile {
     /// default — means the chain never picks this member for spend reasons, so
     /// stock behavior costs nothing. See `fallback::spend_armed`.
     pub(crate) max_auto_spend: Option<f64>,
+    /// Whether auto-switching checks this account's aggregate weekly (7d)
+    /// usage against the soft weekly line (fallback chain only). Off, only the
+    /// hard cap (100%) blocks it — the account stays in rotation across the
+    /// soft band. Default on (stock behavior).
+    pub(crate) check_weekly: bool,
+    /// Whether auto-switching checks this account's per-model weekly windows
+    /// (e.g. "7d fable") against the weekly line (fallback chain only). On, a
+    /// scoped window past the line keeps this account out of rotation — for
+    /// sessions on that model it is as dead as a spent week. Off, scoped
+    /// windows are ignored here: the account stays in rotation for use with
+    /// other models. Default on.
+    pub(crate) check_scoped: bool,
     /// Utilization % at/above which a bell toast fires in the overview tab.
     /// None = no bell for this profile.
     pub(crate) bell_threshold: Option<f64>,
+    /// USER CHOICE (not the auto-quarantine `AppState::auth_broken`): when
+    /// true, this account is invisible to every operational surface — the
+    /// fallback-chain walk, the usage/rotation scheduler, and the daemon
+    /// status feed by default — while its profile directory and stored
+    /// credentials stay on disk untouched. It still sits in `fallback_chain`
+    /// on disk; only the walk skips it. Default off. See `Profile::is_disabled`.
+    pub(crate) disabled: bool,
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) fetch_status: Option<FetchStatus>,
@@ -220,12 +227,13 @@ impl Profile {
             models: ModelSettings::default(),
             fallback_threshold: None,
             weekly_threshold: None,
-            check_weekly: true,
-            check_scoped: true,
             last_resort: false,
             session_feed: false,
             max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
             bell_threshold: None,
+            disabled: false,
             credentials: None,
             usage: None,
             fetch_status: None,
@@ -255,6 +263,12 @@ impl Profile {
 
     pub(crate) fn is_codex(&self) -> bool {
         self.harness == Harness::Codex
+    }
+
+    /// User-disabled (see [`Profile::disabled`]) — never `auth_broken`'s
+    /// auto-quarantine, always an operator's own choice.
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.disabled
     }
 
     pub(crate) fn refresh_token(&self) -> Option<&str> {
@@ -723,6 +737,14 @@ impl AppConfig {
         self.profiles.iter().map(|p| p.name.as_str()).collect()
     }
 
+    /// Every stored profile with [`Profile::is_disabled`] false — the view every
+    /// operational surface (fallback walk, scheduler, daemon status feed) reads.
+    /// [`AppConfig::profiles`]/[`AppConfig::names`] stay the full list; the TUI
+    /// still needs every profile, disabled ones included.
+    pub(crate) fn enabled_profiles(&self) -> impl Iterator<Item = &Profile> {
+        self.profiles.iter().filter(|p| !p.is_disabled())
+    }
+
     /// Case-insensitive name lookup; returns the canonical-cased name on match.
     pub(crate) fn canonical_name(&self, query: &str) -> Option<String> {
         self.names()
@@ -851,6 +873,12 @@ struct ProfileConfig {
     fallback_threshold: Option<f64>,
     #[serde(default)]
     weekly_threshold: Option<f64>,
+    #[serde(default)]
+    last_resort: bool,
+    #[serde(default)]
+    session_feed: bool,
+    #[serde(default)]
+    max_auto_spend: Option<f64>,
     /// `Option` (not `bool`) so the derived `Default` and an absent key agree:
     /// `None` means "unset", which resolves to the on default at the load
     /// boundary — a plain `#[serde(default)] bool` would silently default OFF.
@@ -859,13 +887,9 @@ struct ProfileConfig {
     #[serde(default)]
     check_scoped: Option<bool>,
     #[serde(default)]
-    last_resort: bool,
-    #[serde(default)]
-    session_feed: bool,
-    #[serde(default)]
-    max_auto_spend: Option<f64>,
-    #[serde(default)]
     bell_threshold: Option<f64>,
+    #[serde(default)]
+    disabled: bool,
 }
 
 /// Test-only home-dir override. Redirects all reads/writes away from real `~/.clauth`.
@@ -878,7 +902,10 @@ static HOME_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(
 /// `testutil::HomeSandbox` and runtime's `with_fake_home` acquire it as RAII
 /// guards.
 #[cfg(test)]
-pub(crate) static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static HOME_TEST_LOCK: crate::lockorder::RankedMutex<
+    (),
+    crate::lockorder::rank::HomeTest,
+> = crate::lockorder::RankedMutex::new(());
 
 #[cfg(test)]
 pub(crate) fn set_home_override(path: PathBuf) {
@@ -1183,8 +1210,9 @@ pub(crate) fn mkdir_700(path: &Path) -> std::io::Result<()> {
 
 /// Open an owner-only advisory-lock/state file (`read+write`, create without
 /// truncating so a sibling's held lock survives the race) at mode 0o600. Every
-/// `~/.clauth` lock file (`.lock`, `clauthd.lock`, `usage-fetch.lock`, session
-/// PID files, `rotation.lock`) routes through here so no lock is born at the
+/// `~/.clauth` lock file (`.lock`, `clauthd.lock`, `clauthd-standby.lock`,
+/// `usage-fetch.lock`, session PID files, `rotation.lock`) routes through here
+/// so no lock is born at the
 /// process umask — the file itself carries nothing secret, but a blanket
 /// owner-only tree is the invariant the perms test can check without an
 /// exceptions list.
@@ -1300,6 +1328,17 @@ pub(crate) fn update_app_state(delta: impl FnOnce(&mut AppState)) -> Result<AppS
     })
 }
 
+/// A hand-editable percent field, normalized at the LOAD boundary so the
+/// on-disk value is never a live trap for a direct reader (the 2026-07-14
+/// weekly-line lesson). `nan` and `inf` are both valid TOML floats and both
+/// survive `clamp`; a `NaN` threshold then reads false against every `>=` it
+/// gates, silently disabling itself, and renders back out as `NaN`, which TOML
+/// rejects. That bricks the next load of the file this module just rewrote, so
+/// anything non-finite reads as unset (same shape as `max_auto_spend`'s guard).
+fn finite_pct(raw: Option<f64>) -> Option<f64> {
+    raw.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 100.0))
+}
+
 pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
@@ -1362,10 +1401,16 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
         auto_start: config.auto_start,
         env: config.env,
         models: config.models,
-        fallback_threshold: config.fallback_threshold.map(|v| v.clamp(0.0, 100.0)),
-        weekly_threshold: config.weekly_threshold.map(|v| v.clamp(0.0, 100.0)),
-        check_weekly: config.check_weekly.unwrap_or(true),
-        check_scoped: config.check_scoped.unwrap_or(true),
+        fallback_threshold: finite_pct(config.fallback_threshold),
+        // Reset-not-clamp, mirroring the chain-wide line this overrides
+        // (`AppState::weekly_switch_threshold_pct`): an out-of-band hand-edit
+        // (`0.98` — the fraction-vs-percent typo — or `nan`, `120`) follows
+        // the chain default instead of clamping into a plausible-looking
+        // near-zero line that silently weekly-blocks the account from about
+        // 1% into its week.
+        weekly_threshold: config
+            .weekly_threshold
+            .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v)),
         last_resort: config.last_resort,
         session_feed: config.session_feed,
         // Normalize at the LOAD boundary so the on-disk value is never a live
@@ -1376,7 +1421,10 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
         max_auto_spend: config
             .max_auto_spend
             .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 }),
-        bell_threshold: config.bell_threshold.map(|v| v.clamp(0.0, 100.0)),
+        check_weekly: config.check_weekly.unwrap_or(true),
+        check_scoped: config.check_scoped.unwrap_or(true),
+        bell_threshold: finite_pct(config.bell_threshold),
+        disabled: config.disabled,
         credentials,
         usage: None,
         fetch_status: None,
@@ -1406,15 +1454,16 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 models: profile.models.clone(),
                 fallback_threshold: profile.fallback_threshold,
                 weekly_threshold: profile.weekly_threshold,
+                last_resort: profile.last_resort,
+                session_feed: profile.session_feed,
+                max_auto_spend: profile.max_auto_spend,
                 // Default-on booleans render as commented examples when on, so
                 // the canonical form is `None` (unset) — an explicit `= true`
                 // on disk normalizes away on the next rewrite.
                 check_weekly: (!profile.check_weekly).then_some(false),
                 check_scoped: (!profile.check_scoped).then_some(false),
-                last_resort: profile.last_resort,
-                session_feed: profile.session_feed,
-                max_auto_spend: profile.max_auto_spend,
                 bell_threshold: profile.bell_threshold,
+                disabled: profile.disabled,
             };
             canonical != on_disk
         }
@@ -1593,26 +1642,6 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# Whether auto-switching checks this account's aggregate weekly (7d)\n");
-    out.push_str("# usage against the weekly limit. Set false to keep this account in\n");
-    out.push_str("# rotation across the soft weekly band; the 100% hard cap always blocks.\n");
-    if profile.check_weekly {
-        out.push_str("# check_weekly = false\n");
-    } else {
-        out.push_str("check_weekly = false\n");
-    }
-    out.push('\n');
-
-    out.push_str("# Whether auto-switching checks this account's per-model weekly windows\n");
-    out.push_str("# (e.g. \"7d fable\") against the weekly limit. Set false to ignore them\n");
-    out.push_str("# and keep this account in rotation for use with other models.\n");
-    if profile.check_scoped {
-        out.push_str("# check_scoped = false\n");
-    } else {
-        out.push_str("check_scoped = false\n");
-    }
-    out.push('\n');
-
     out.push_str("# Marks this profile as the fallback chain's last resort. Once the\n");
     out.push_str("# auto-switch walk lands here with no other member having headroom, it\n");
     out.push_str("# parks instead of turning off all accounts. Independent of\n");
@@ -1649,11 +1678,41 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
+    out.push_str("# Whether auto-switching checks this account's aggregate weekly (7d)\n");
+    out.push_str("# usage against the weekly limit. Set false to keep this account in\n");
+    out.push_str("# rotation across the soft weekly band; the 100% hard cap always blocks.\n");
+    if profile.check_weekly {
+        out.push_str("# check_weekly = false\n");
+    } else {
+        out.push_str("check_weekly = false\n");
+    }
+    out.push('\n');
+
+    out.push_str("# Whether auto-switching checks this account's per-model weekly windows\n");
+    out.push_str("# (e.g. \"7d fable\") against the weekly limit. Set false to ignore them\n");
+    out.push_str("# and keep this account in rotation for use with other models.\n");
+    if profile.check_scoped {
+        out.push_str("# check_scoped = false\n");
+    } else {
+        out.push_str("check_scoped = false\n");
+    }
+    out.push('\n');
+
     out.push_str("# 5-hour utilization percentage at/above which clauth fires a bell\n");
     out.push_str("# notification in the overview tab. Range 0..=100.\n");
     match profile.bell_threshold {
         Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
         None => out.push_str("# bell_threshold = 95.0\n"),
+    }
+    out.push('\n');
+
+    out.push_str("# Disable this account: it becomes invisible to the fallback chain, the\n");
+    out.push_str("# usage/rotation scheduler, and the daemon status feed (by default), while\n");
+    out.push_str("# its profile directory and credentials stay on disk untouched.\n");
+    if profile.disabled {
+        out.push_str("disabled = true\n");
+    } else {
+        out.push_str("# disabled = true\n");
     }
     out.push('\n');
 

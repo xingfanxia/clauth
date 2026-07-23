@@ -1,8 +1,10 @@
 //! Fallback tab — master-detail, mirroring the Config layout. Left: the ordered
-//! chain (plus a trailing `+ add` row), cursor = `❯`, active member name in
-//! orange. Right: the selected member's rotation card — labeled
-//! key:value rows (`priority`, `5h usage` gauge with a threshold tick, `rotate at`
-//! threshold stepper, `last resort` toggle, `max spend` ceiling, `remove`) — or,
+//! chain (plus a trailing `+ add` row), cursor = `❯`, `#n` chain position, active
+//! member name in orange. Right: the selected member's rotation card — labeled
+//! key:value rows (`5h usage` gauge with a threshold tick, `rotate at`
+//! threshold stepper, `weekly at` per-account weekly-line override, `weekly
+//! gate` + `scoped gate` per-account usage-check toggles, `last resort`
+//! toggle, `max spend` ceiling, `remove`) — or,
 //! on `+ add`, a candidate picker. Order = priority (reorder with ⇧↑↓). The
 //! chain-global wrap-off and spend-budget settings live on the Config tab, not
 //! here. Editing happens in place: ⏎ on the left drops focus into the right
@@ -21,14 +23,16 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::format::{ResetFmt, reset_pill, reset_resume};
+use super::global_config::default_reminder;
 use super::panes::{
-    bold_when, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
-    invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill, section_box,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, bold_when,
+    draw_selector_list, head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines,
+    key_cell, label_style, master_detail, name_color, pill, rail_hint_lines, section_box,
     section_box_verbatim, select_line, wrap_words,
 };
 use crate::fallback::{
-    BlockedReason, DEFAULT_THRESHOLD, blocked_reason, soonest_resume, spend_is_uncapped,
-    spend_room, threshold_for, uncapped_spend_fix,
+    BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, soonest_resume,
+    spend_is_uncapped, spend_room, threshold_for, uncapped_spend_fix,
 };
 use crate::profile::AppConfig;
 use crate::usage::{humanize_duration, switch_grade_kick_lifts};
@@ -42,14 +46,6 @@ const GAUGE_W: usize = 22;
 const KEY_W: usize = 11;
 /// Fixed gap between the padded key and the value column (house standard).
 const KEY_GUTTER: usize = 2;
-/// Fixed lines `member_detail` pushes before the FALLBACK_ROWS loop: priority,
-/// blank, `5h usage` gauge (key row), headroom figure, blank. The native-cursor
-/// math and the `rotate at` row index both key off this.
-const ROWS_BEFORE: usize = 5;
-/// Leading lines the blocked-reason pill adds above `ROWS_BEFORE` when a member
-/// has a reason (the pill line + a blank). `draw_chain_detail` folds this into
-/// the native-cursor row math so a typed field's caret still lands on its row.
-const PILL_LINES: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // `master_detail` is the fork's responsive split: on desktop it is the
@@ -84,20 +80,37 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                             .get(*i)
                             .map(|n| n.to_string())
                             .unwrap_or_default();
+                        // `#n` right-aligned in a fixed 3 cells, so `#1` and
+                        // `#10` start their names on the same column. The
+                        // trailing gap absorbs the `#`, keeping the rail the
+                        // same total width it had as a bare number — nothing
+                        // downstream shifts.
+                        let ord = format!("#{}", i + 1);
                         let rail = if selected && focused {
-                            Span::styled(format!("❯ {:>2}  ", i + 1), theme::accent().bold())
+                            Span::styled(format!("❯ {ord:>3} "), theme::accent().bold())
                         } else {
-                            Span::styled(format!("  {:>2}  ", i + 1), theme::faint())
+                            Span::styled(format!("  {ord:>3} "), theme::faint())
                         };
-                        let ns = bold_when(name_color(cfg.is_active(&name)), selected && focused);
+                        // A member still sits in `fallback_chain` on disk while
+                        // disabled (only the walk skips it), so it renders as a
+                        // normal row with a dim name; the exclusion itself
+                        // arrives through `blocked_reason`'s `Disabled` arm like
+                        // any other block. It can never be `is_active`, so dim
+                        // always wins over `name_color`.
+                        let disabled = cfg.find(&name).is_some_and(|p| p.is_disabled());
+                        let ns = if disabled {
+                            bold_when(theme::dim(), selected && focused)
+                        } else {
+                            bold_when(name_color(cfg.is_active(&name)), selected && focused)
+                        };
                         let mut spans = vec![rail, Span::styled(name.clone(), ns)];
-                        // Right-align the 1-cell blocked-reason marker at the
-                        // row's last content column (the scrollbar owns the
-                        // padding cell beyond it, so they never collide).
                         if let Some(reason) = cfg
                             .find(&name)
                             .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(&name).copied()))
                         {
+                            // Right-align the 1-cell blocked-reason marker at the
+                            // row's last content column (the scrollbar owns the
+                            // padding cell beyond it, so they never collide).
                             let used: usize = spans.iter().map(|s| s.width()).sum();
                             let pad = (w as usize).saturating_sub(used + 1);
                             if pad > 0 {
@@ -142,49 +155,45 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // `Add` arm must NOT hold the `config` guard — `add_detail` re-locks it via
     // `chain_candidates`, and the mutex is non-reentrant (deadlock on `+ add` row).
     // `is_name`: member names render in original case; structural titles stay uppercased.
-    // `lead` = the blocked-reason pill's leading line count for the selected
-    // member (`PILL_LINES` when it has a reason, else 0). Computed here under the
-    // live config guard so the native-cursor math below can offset by it without
-    // re-locking (the guard is dropped once this arm returns).
-    let (title, is_name, lines, lead): (String, bool, Vec<Line<'static>>, usize) = match selected {
-        Some(ChainItemKind::Member(i)) => {
-            let cfg = app.config();
-            let chain_len = cfg.state.fallback_chain.len();
-            let name = cfg
-                .state
-                .fallback_chain
-                .get(i)
-                .map(|n| n.to_string())
-                .unwrap_or_default();
-            let kick_lift = kick_lifts.get(&name).copied();
-            let lead = cfg
-                .find(&name)
-                .and_then(|p| blocked_reason(&cfg, p, kick_lift))
-                .map_or(0, |_| PILL_LINES);
-            let lines = member_detail(
-                &cfg,
-                &name,
-                i,
-                chain_len,
-                detail_focused,
-                app.fallback_detail_cursor,
-                app.fallback_armed_remove,
-                app.fallback_threshold_draft.as_ref(),
-                app.fallback_weekly_draft.as_ref(),
-                app.fallback_max_spend_draft.as_ref(),
-                inner_w,
-                kick_lift,
-            );
-            (name, true, lines, lead)
-        }
-        Some(ChainItemKind::Add) => (
-            "add to chain".to_string(),
-            false,
-            add_detail(app, detail_focused, inner_w),
-            0,
-        ),
-        None => ("chain".to_string(), false, empty_detail(), 0),
-    };
+    // `rows_start` = the absolute index where the FALLBACK_ROWS loop begins,
+    // REPORTED BY the function that pushes everything above it. The header block
+    // above the rows is variable in two directions now (a disabled member stacks
+    // a second pill, and every pill drags a wrapped fix line), and a caret on the
+    // wrong row is invisible to every text assertion — so this is read out of the
+    // buffer rather than tracked in a constant that has to be edited in lockstep.
+    let (title, is_name, lines, rows_start): (String, bool, Vec<Line<'static>>, usize) =
+        match selected {
+            Some(ChainItemKind::Member(i)) => {
+                let cfg = app.config();
+                let name = cfg
+                    .state
+                    .fallback_chain
+                    .get(i)
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
+                let kick_lift = kick_lifts.get(&name).copied();
+                let (lines, rows_start) = member_detail(
+                    &cfg,
+                    &name,
+                    detail_focused,
+                    app.fallback_detail_cursor,
+                    app.fallback_armed_remove,
+                    app.fallback_threshold_draft.as_ref(),
+                    app.fallback_max_spend_draft.as_ref(),
+                    app.fallback_weekly_draft.as_ref(),
+                    inner_w,
+                    kick_lift,
+                );
+                (name, true, lines, rows_start)
+            }
+            Some(ChainItemKind::Add) => (
+                "add to chain".to_string(),
+                false,
+                add_detail(app, detail_focused, inner_w),
+                0,
+            ),
+            None => ("chain".to_string(), false, empty_detail(), 0),
+        };
 
     let block = if is_name {
         section_box_verbatim(&title, detail_focused, false)
@@ -193,7 +202,28 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+    // The header block + seven rows + a tooltip outgrow a short pane (a 40x24
+    // terminal leaves ~14 inner rows, and a blocked member's pill block eats
+    // two more), and the card has no scrollbar — so a FOCUSED card scrolls the
+    // cursored row (plus up to a 2-line tooltip) into view instead of clipping
+    // `max spend` and `remove` off the bottom. Unfocused keeps the top
+    // anchored: while browsing the left chain the identity header is the
+    // payload, not the rows.
+    let content_h = lines.len();
+    let scroll = if detail_focused && matches!(selected, Some(ChainItemKind::Member(_))) {
+        let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
+        (rows_start + cursor + 3)
+            .saturating_sub(inner.height as usize)
+            .min(content_h.saturating_sub(inner.height as usize))
+    } else {
+        0
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((scroll as u16, 0)),
+        inner,
+    );
 
     // Position the native terminal cursor for whichever field is being typed,
     // matching the post-draw cursor path the other edit screens use. This is not
@@ -201,11 +231,10 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // leaves the caret glyph entirely to the cursor set here, so a field that
     // skips this has no visible caret at all.
     //
-    // `member_detail` pushes `lead` blocked-reason pill lines then exactly
-    // `ROWS_BEFORE` fixed lines before the row loop (priority, blank, gauge,
-    // figure, blank), and only the row being typed is selected — so no earlier
-    // row contributes a tooltip line and the row's index in FALLBACK_ROWS is its
-    // offset past `ROWS_BEFORE + lead`.
+    // `rows_start` already accounts for everything `member_detail` pushed above
+    // the row loop, and only the row being typed is selected — so no earlier row
+    // contributes a tooltip line and a row's index in FALLBACK_ROWS is exactly
+    // its offset past `rows_start`.
     let typing = [
         (
             FallbackRow::Threshold,
@@ -223,21 +252,34 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app.fallback_max_spend_draft.as_ref(),
             1usize,
         ),
+        (
+            FallbackRow::WeeklyAt,
+            app.fallback_weekly_draft.as_ref(),
+            0usize,
+        ),
     ]
     .into_iter()
     .find_map(|(row, draft, unit_cols)| draft.map(|d| (row, d, unit_cols)));
 
+    // The row must actually be ON the pane before its caret is placed. The
+    // scroll above chases the CURSORED row, which is the row being typed on
+    // every real path — but a degenerate pane (height smaller than the
+    // lookahead) can still leave it off, and an unguarded set parks a visible
+    // caret on a border or the pane below, since a real terminal clamps the
+    // row rather than dropping it. Mirrors the `config.rs` edit-caret guard.
     if detail_focused
         && let Some(ChainItemKind::Member(_)) = selected
         && let Some((row, draft, unit_cols)) = typing
         && let Some(row_idx) = FALLBACK_ROWS.iter().position(|r| *r == row)
+        && rows_start + row_idx >= scroll
+        && rows_start + row_idx - scroll < inner.height as usize
     {
         // x = "❯ " (2) + key block (KEY_W + KEY_GUTTER cols) + unit + cols before caret.
         let prefix_cols = 2 + KEY_W + KEY_GUTTER + unit_cols + head_cols(draft);
         let cx = inner.x.saturating_add(prefix_cols as u16);
         let cy = inner
             .y
-            .saturating_add((ROWS_BEFORE + lead + row_idx) as u16);
+            .saturating_add((rows_start + row_idx - scroll) as u16);
         frame.set_cursor_position((cx, cy));
     }
 }
@@ -245,14 +287,26 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// 1-cell selector marker for a member's worst blocked reason: color bands the
 /// severity, the glyph shape names the reason (the detail pill spells it out in
 /// full). Absent when the member has headroom.
+///
+/// `Disabled` and `Canceled` deliberately SHARE `⊖` and split on hue alone
+/// (faint vs danger), the one place this app departs from cloudy-tui's
+/// shape-names-the-state rule: the two co-occur on nearly every real account
+/// (an operator disables a subscription once it's canceled), and the Overview
+/// account row picks the canceled arm where this ladder picks the disabled one,
+/// so distinct shapes made the same account wear two glyphs on one screen.
 pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
     let (glyph, style) = match reason {
-        BlockedReason::Canceled => ("⊗", theme::danger()),
+        BlockedReason::Disabled => ("⊖", theme::faint()),
+        BlockedReason::Canceled => ("⊖", theme::danger()),
         BlockedReason::AuthBroken => ("×", theme::danger()),
         BlockedReason::WeeklySpent { .. } => ("⊘", theme::danger()),
         BlockedReason::KickRejected { .. } => ("⧗", theme::warning()),
         BlockedReason::BudgetSpent => ("$", theme::warning()),
         BlockedReason::FiveHour { .. } => ("◔", theme::warning()),
+        // `⊘` = a weekly window is spent; hue splits scope exactly like `⊖`
+        // splits disabled/canceled: danger = the aggregate week (dead for
+        // days), warning = one model's week (still serves the rest).
+        BlockedReason::ScopedSpent { .. } => ("⊘", theme::warning()),
         BlockedReason::WeeklySoft { .. } => ("~", theme::warning()),
         BlockedReason::Stale => ("⋯", theme::faint()),
     };
@@ -265,36 +319,107 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
 /// operator's `reset display` setting; the kick-block lift stays a bare
 /// countdown — the limiter relents on its own schedule, so a wall-clock time
 /// there would claim a precision the estimate doesn't have.
-fn reason_pill(reason: &BlockedReason, fmt: ResetFmt) -> Line<'static> {
-    let (label, style) = match reason {
-        BlockedReason::Canceled => ("subscription canceled".to_string(), theme::danger().bold()),
-        BlockedReason::AuthBroken => ("auth broken".to_string(), theme::danger().bold()),
+fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>> {
+    // Every pill is `[ label ]` with an optional qualifier trailing as a faint
+    // suffix OUTSIDE the brackets (a reset countdown, a lift ETA, "still
+    // serving") — never crammed inside with a `·`, so the whole card and the
+    // Usage-tab pills read one shape.
+    let (label, style, suffix) = match reason {
+        BlockedReason::Disabled => (DIAG_DISABLED.to_string(), theme::dim().bold(), None),
+        BlockedReason::Canceled => (DIAG_CANCELED.to_string(), theme::danger().bold(), None),
+        BlockedReason::AuthBroken => (DIAG_AUTH_BROKEN.to_string(), theme::danger().bold(), None),
         BlockedReason::WeeklySpent { resets_in } => (
-            match resets_in {
-                Some(s) => format!("weekly spent · {}", reset_pill(*s, fmt)),
-                None => "weekly spent".to_string(),
-            },
+            "weekly spent".to_string(),
             theme::danger().bold(),
+            resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
         ),
         BlockedReason::KickRejected { lifts_in } => (
-            format!("claude code blocked · {}", humanize_duration(*lifts_in)),
+            DIAG_KICK.to_string(),
             theme::warning().bold(),
+            Some(humanize_duration(*lifts_in)),
         ),
-        BlockedReason::BudgetSpent => ("extra usage spent".to_string(), theme::warning().bold()),
+        BlockedReason::BudgetSpent => {
+            (DIAG_BUDGET_SPENT.to_string(), theme::warning().bold(), None)
+        }
         BlockedReason::FiveHour { pct, resets_in } => (
-            match resets_in {
-                Some(s) => format!("5h {pct:.0}% · {}", reset_pill(*s, fmt)),
-                None => format!("5h {pct:.0}%"),
-            },
+            format!("5h {pct:.0}%"),
             theme::warning().bold(),
+            resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
+        ),
+        BlockedReason::ScopedSpent { label, pct } => (
+            format!("{label} {pct:.0}%"),
+            theme::warning().bold(),
+            Some("other models ok".to_string()),
         ),
         BlockedReason::WeeklySoft { pct } => (
-            format!("weekly {pct:.0}% · still serving"),
+            format!("weekly {pct:.0}%"),
             theme::warning().bold(),
+            Some("still serving".to_string()),
         ),
-        BlockedReason::Stale => ("stale data".to_string(), theme::dim().bold()),
+        BlockedReason::Stale => ("stale data".to_string(), theme::dim().bold(), None),
     };
-    Line::from(pill(label, style))
+    let mut spans = pill(label, style);
+    if let Some(suffix) = suffix {
+        spans.push(Span::styled(format!("  {suffix}"), theme::faint()));
+    }
+    spans
+}
+
+/// The `├`/`└` fix line under a blocked-reason pill: what to actually do about
+/// it. Deliberately NOT `usage.rs::diag_fix` — that maps a different enum
+/// (`UsageDiag` splits kick blocks by `auto_start` and carries states this
+/// ladder has no notion of), so bridging the two just to share strings would
+/// couple two ladders that are allowed to diverge. Same register: short,
+/// lowercase, names the concrete next action.
+fn reason_fix(reason: &BlockedReason, name: &str) -> String {
+    match reason {
+        BlockedReason::Disabled => "excluded from the walk, enable it on the setup tab".to_string(),
+        BlockedReason::Canceled => "this subscription has been canceled".to_string(),
+        BlockedReason::AuthBroken => format!("re-login with clauth login {name}"),
+        BlockedReason::WeeklySpent { .. } => "weekly limit is spent".to_string(),
+        BlockedReason::KickRejected { .. } => "claude code is refusing to start it".to_string(),
+        BlockedReason::BudgetSpent => "raise max spend below".to_string(),
+        BlockedReason::FiveHour { .. } => "5h quota is spent, it resets on its own".to_string(),
+        BlockedReason::ScopedSpent { .. } => {
+            "that model's weekly window is spent, other models still serve".to_string()
+        }
+        BlockedReason::WeeklySoft { .. } => {
+            "past the weekly switch line, still serving".to_string()
+        }
+        BlockedReason::Stale => "last usage check failed".to_string(),
+    }
+}
+
+/// The blocked-reason pill block: each pill on its own row with its `└` fix
+/// line, connected into one `├│└` rail when 2+ stack (cloudy-tui Stacked
+/// hints). The first row carries the `status` key so the rail has a column to
+/// anchor against; later rows bridge with `│` at col 0 while the rail is open.
+///
+/// Mirrors `usage.rs::status_lines`'s shape but keys off THIS card's `KEY_W`,
+/// so the pill's value column lines up with `5h usage` / `rotate at` beneath
+/// it. Both surfaces draw their glyph lines with the shared
+/// [`rail_hint_lines`], so the rail itself has exactly one implementation.
+fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Line<'static>> {
+    let total = pills.len();
+    let mut lines = Vec::with_capacity(total * 2);
+    for (i, (content, hint)) in pills.into_iter().enumerate() {
+        // Any row past the first implies 2+ pills, and the rail is still open
+        // there because this row's own hint hasn't been emitted yet — so a
+        // later row always bridges, never blank-pads.
+        let key = if i == 0 {
+            Span::styled(key_cell("status", KEY_W, KEY_GUTTER), theme::label())
+        } else {
+            Span::styled(
+                format!("│{}", " ".repeat(KEY_W + KEY_GUTTER - 1)),
+                theme::line(),
+            )
+        };
+        let mut spans = vec![key];
+        spans.extend(content);
+        lines.push(Line::from(spans));
+        lines.extend(rail_hint_lines(&hint, width, i + 1 < total));
+    }
+    lines
 }
 
 /// Priority, 5h gauge with threshold tick, headroom figure, and the
@@ -304,22 +429,23 @@ fn reason_pill(reason: &BlockedReason, fmt: ResetFmt) -> Line<'static> {
 fn member_detail(
     cfg: &AppConfig,
     name: &str,
-    index: usize,
-    chain_len: usize,
     focused: bool,
     row_cursor: usize,
     armed_remove: bool,
     editing: Option<&InputState>,
-    weekly_editing: Option<&InputState>,
     max_spend_editing: Option<&InputState>,
+    weekly_editing: Option<&InputState>,
     width: usize,
     kick_lift: Option<i64>,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize) {
     let Some(profile) = cfg.find(name) else {
-        return vec![Line::from(Span::styled(
-            "account no longer exists · remove it from the chain",
-            theme::danger(),
-        ))];
+        return (
+            vec![Line::from(Span::styled(
+                "account no longer exists · remove it from the chain",
+                theme::danger(),
+            ))],
+            0,
+        );
     };
 
     let threshold = threshold_for(profile);
@@ -332,25 +458,29 @@ fn member_detail(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Blocked-reason pill: the single worst reason this member is currently
-    // ineligible or distrusted, above everything else on the card. `PILL_LINES`
-    // must equal the count pushed here — `draw_chain_detail` adds it to the
-    // native-cursor row math.
+    // Blocked-reason pills, worst first, above everything else on the card.
+    // `Disabled` does NOT hide the member's health: an operator who disabled a
+    // broken account still needs to see that it is broken, so the health reason
+    // stacks beneath the `[ disabled ]` pill rather than being replaced by it.
+    // Both come out of the one ladder (`blocked_reason` delegates to
+    // `health_blocked_reason`), so the pills can't disagree with the marker.
+    let fmt = ResetFmt::from_state(&cfg.state);
+    let mut pills: Vec<(Vec<Span<'static>>, String)> = Vec::new();
     if let Some(reason) = blocked_reason(cfg, profile, kick_lift) {
-        lines.push(reason_pill(&reason, ResetFmt::from_state(&cfg.state)));
+        pills.push((reason_pill_spans(&reason, fmt), reason_fix(&reason, name)));
+        if reason == BlockedReason::Disabled
+            && let Some(health) = health_blocked_reason(cfg, profile, kick_lift)
+        {
+            pills.push((reason_pill_spans(&health, fmt), reason_fix(&health, name)));
+        }
+    }
+    if !pills.is_empty() {
+        lines.extend(pill_block(pills, width));
         lines.push(Line::from(""));
     }
 
-    // `priority` — position in the chain (order = priority).
-    let value = format!("#{} of {chain_len}", index + 1);
-    lines.push(Line::from(vec![
-        Span::styled(key_cell("priority", KEY_W, KEY_GUTTER), theme::label()),
-        Span::styled(value, theme::body()),
-    ]));
-    lines.push(Line::from(""));
-
-    // `5h usage` — gauge lives on the kv key row (matching `priority` / `rotate
-    // at` grammar), headroom figure indented beneath it. Two lines, not three:
+    // `5h usage` — gauge lives on the kv key row (matching the `rotate at`
+    // grammar), headroom figure indented beneath it. Two lines, not three:
     // the standalone eyebrow is folded into the key.
     let mut gauge_spans = vec![Span::styled(
         key_cell("5h usage", KEY_W, KEY_GUTTER),
@@ -373,6 +503,14 @@ fn member_detail(
         Span::styled(figure, theme::faint()),
     ]));
     lines.push(Line::from(""));
+
+    // Where the FALLBACK_ROWS loop starts, taken from the buffer itself rather
+    // than from a hand-maintained constant. `draw_chain_detail` adds `row_idx`
+    // to this for the native caret, and a caret on the wrong row is invisible to
+    // every text assertion — so the count is READ from what was actually pushed.
+    // The old `ROWS_BEFORE = 5` had to be edited in lockstep with the header
+    // block and would have silently desynced when the `priority` row went away.
+    let rows_start = lines.len();
 
     for (i, row) in FALLBACK_ROWS.iter().enumerate() {
         let selected = focused && i == cursor;
@@ -503,7 +641,7 @@ fn member_detail(
             theme::faint(),
         )));
     }
-    lines
+    (lines, rows_start)
 }
 
 /// Hint under the `last resort` toggle — phrased for the state flipping it
@@ -541,7 +679,7 @@ fn threshold_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
 /// Sub-line under the `weekly at` field while typing: the valid range plus
 /// the empty-clears rule, DANGER when the buffer parses invalid.
 fn weekly_override_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
-    let range = "0-100 % · empty follows the chain default";
+    let range = "50-100 % · empty follows the chain default";
     if parse_weekly_override(input.trimmed()).is_none() {
         invalid_tooltip_lines(range, width)
     } else {
@@ -607,7 +745,7 @@ fn detail_row(
     editing: Option<&InputState>,
 ) -> Line<'static> {
     let arrow = if editing.is_some() {
-        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent())
+        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
         Span::styled("❯ ", theme::accent().bold())
     } else {
@@ -653,7 +791,7 @@ fn detail_row(
         FallbackRow::WeeklyAt => {
             // Inert while the member's weekly gate is off: the line isn't
             // judged, so render the whole row faint (the key handler no-ops
-            // it).
+            // it) — same disabled-row contract as the budget-off ceiling.
             let dimmed = !check_weekly && editing.is_none();
             let arrow = if dimmed && selected {
                 Span::styled("❯ ", theme::faint())
@@ -688,10 +826,11 @@ fn detail_row(
                             theme::accent()
                         };
                         spans.push(Span::styled(format!("{v:.0}%"), value_style));
-                        spans.push(Span::styled(
-                            format!("   default: {weekly_default:.0}%"),
-                            theme::faint(),
-                        ));
+                        // Mirrors `rotate at`: only remind of the default once the
+                        // value actually differs from it (else it's noise).
+                        if (v - weekly_default).abs() > f64::EPSILON {
+                            spans.push(default_reminder(format!("{weekly_default:.0}%")));
+                        }
                     }
                     // Unset follows the chain-wide line — show that value, but
                     // faint, so a member-set figure stays visually distinct.

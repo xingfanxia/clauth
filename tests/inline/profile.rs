@@ -54,6 +54,76 @@ fn last_resort_round_trips_through_config_toml() {
     assert!(parsed.last_resort);
 }
 
+// `disabled` (the per-account exclusion toggle) must default to `false` so
+// every existing config.toml written before this field existed keeps loading
+// unchanged, matching `last_resort`'s guarantee above.
+#[test]
+fn profile_config_disabled_defaults_false() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert!(!cfg.disabled);
+}
+
+#[test]
+fn profile_config_reads_disabled_true() {
+    let toml = "disabled = true\n";
+    let cfg: ProfileConfig = toml::from_str(toml).expect("parse disabled config");
+    assert!(cfg.disabled);
+}
+
+// `disabled` must survive a config.toml render→parse round-trip, matching
+// `last_resort_round_trips_through_config_toml` above. `off` (the default)
+// must render as a comment, not a live key — mirroring every sibling
+// default-off boolean's on-disk shape.
+#[test]
+fn disabled_round_trips_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.disabled = true;
+    let rendered = render_config_toml(&profile);
+    assert!(
+        rendered.contains("disabled = true"),
+        "disabled=true must be a real, uncommented key"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert!(parsed.disabled);
+
+    let off = Profile::new("p".to_string(), None, None);
+    let rendered_off = render_config_toml(&off);
+    assert!(
+        !rendered_off.contains("\ndisabled = true"),
+        "disabled=false (the default) must be omitted entirely, not written as a live key"
+    );
+    let parsed_off: ProfileConfig = toml::from_str(&rendered_off).expect("parse rendered toml");
+    assert!(!parsed_off.disabled);
+}
+
+// The per-account usage gates must default ON (unset = `None` = checked) so
+// every config.toml written before they existed keeps its stock gating.
+#[test]
+fn profile_config_usage_gates_default_unset() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.check_weekly, None);
+    assert_eq!(cfg.check_scoped, None);
+}
+
+// Only the non-default (`false`) value renders uncommented, and it must
+// survive a render→parse round-trip; the default renders as a commented
+// example that parses back to unset.
+#[test]
+fn usage_gates_round_trip_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.check_weekly = false;
+    profile.check_scoped = false;
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.check_weekly, Some(false));
+    assert_eq!(parsed.check_scoped, Some(false));
+
+    let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
+    let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
+    assert_eq!(parsed.check_weekly, None);
+    assert_eq!(parsed.check_scoped, None);
+}
+
 // `burn_aware_switching` (issue #8 follow-up b) must default to `false` so
 // every existing profiles.toml written before this field existed keeps
 // loading unchanged, matching the `last_resort` guarantee above at the
@@ -400,10 +470,11 @@ fn rename_carries_auth_broken_entry() {
     );
 }
 
-#[cfg(unix)]
+// Ungated on purpose, unlike the mode assertions around them:
+// `disabling_persists_and_leaves_credentials_byte_unchanged` asserts bytes and
+// dir entries rather than modes, so it runs on windows too.
 use crate::testutil::HomeSandbox;
 
-#[cfg(unix)]
 fn oauth_credentials() -> ClaudeCredentials {
     ClaudeCredentials {
         claude_ai_oauth: Some(OAuthToken {
@@ -425,7 +496,6 @@ fn oauth_credentials() -> ClaudeCredentials {
 /// every hand-edited config to the wrong value. A garbage `fallback_threshold`
 /// left raw would also drive the auto-switch walk off a nonsense line, so the
 /// clamp is load-bearing rather than cosmetic. Both fields, both directions.
-#[cfg(unix)]
 #[test]
 fn out_of_band_per_profile_thresholds_clamp_to_the_band_at_load() {
     let _home = HomeSandbox::new();
@@ -502,7 +572,6 @@ fn switch_off_when_spent_keeps_its_wrap_off_key_on_disk() {
 /// declared cap has infinite room (`fallback::spend_room`), i.e. unbounded
 /// spending from one hand-edited word. Anything non-finite reads as the
 /// never-spend default instead.
-#[cfg(unix)]
 #[test]
 fn non_finite_max_auto_spend_reads_as_zero_at_load() {
     let _home = HomeSandbox::new();
@@ -534,11 +603,45 @@ fn non_finite_max_auto_spend_reads_as_zero_at_load() {
     );
 }
 
+/// `nan` is a valid TOML float that survives `clamp`, and every `>=` against a
+/// NaN threshold reads false, so a hand-edited one silently disables the gate
+/// it was meant to set. Worse, `render_config_toml` writes it back out as
+/// `NaN`, which TOML rejects, so the next `load_profile` fails on the file
+/// clauth itself just rewrote. Non-finite reads as unset on both percent
+/// fields, matching `max_auto_spend`'s guard above.
+#[test]
+fn non_finite_percent_fields_read_as_unset_at_load() {
+    let _home = HomeSandbox::new();
+    let name = "finite-pct-test";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+
+    for raw in ["nan", "inf", "-inf"] {
+        std::fs::write(&config_path, format!("fallback_threshold = {raw}\n"))
+            .expect("write config.toml");
+        assert_eq!(
+            load_profile(name).expect("load_profile").fallback_threshold,
+            None,
+            "fallback_threshold = {raw} must not survive the load boundary"
+        );
+        // The rewrite that load just performed has to still be parseable.
+        load_profile(name).expect("re-load after the fallback_threshold rewrite");
+
+        std::fs::write(&config_path, format!("bell_threshold = {raw}\n"))
+            .expect("write config.toml");
+        assert_eq!(
+            load_profile(name).expect("load_profile").bell_threshold,
+            None,
+            "bell_threshold = {raw} must not survive the load boundary"
+        );
+        load_profile(name).expect("re-load after the bell_threshold rewrite");
+    }
+}
+
 /// The load boundary drops a base_url ONLY when a stored OAuth pair could leak
 /// to it (pair present + no usable key). A pure api account with a cleared key
 /// keeps its base_url shell so `clear_profile_api_key` stays re-loginable — the
 /// same normalize-at-load discipline as `max_auto_spend`, scoped to the leak.
-#[cfg(unix)]
 #[test]
 fn base_url_dropped_only_when_a_stored_pair_could_leak() {
     let _home = HomeSandbox::new();
@@ -610,7 +713,6 @@ fn base_url_dropped_only_when_a_stored_pair_could_leak() {
 // too eagerly and a genuinely orphaned rotation is dropped (that pair is gone
 // and the account needs a manual re-login). Each arm below is one of those.
 
-#[cfg(unix)]
 fn pair(access: &str, refresh: &str) -> ClaudeCredentials {
     ClaudeCredentials {
         claude_ai_oauth: Some(OAuthToken {
@@ -623,7 +725,6 @@ fn pair(access: &str, refresh: &str) -> ClaudeCredentials {
     }
 }
 
-#[cfg(unix)]
 fn refresh_token_of(creds: &Option<ClaudeCredentials>) -> Option<&str> {
     creds
         .as_ref()?
@@ -633,7 +734,6 @@ fn refresh_token_of(creds: &Option<ClaudeCredentials>) -> Option<&str> {
         .as_deref()
 }
 
-#[cfg(unix)]
 fn seed_committed(name: &str, creds: &ClaudeCredentials) {
     let mut profile = crate::testutil::blank_profile(name);
     profile.credentials = Some(creds.clone());
@@ -643,7 +743,6 @@ fn seed_committed(name: &str, creds: &ClaudeCredentials) {
 /// Sidecar NEWER than `credentials.json`: the rotation was staged but the commit
 /// never landed, so the staged pair is the only live one — adopt it, write it
 /// through to `credentials.json`, and consume the sidecar.
-#[cfg(unix)]
 #[test]
 fn pending_sidecar_newer_than_the_commit_is_adopted_and_written_through() {
     let _home = HomeSandbox::new();
@@ -686,7 +785,6 @@ fn pending_sidecar_newer_than_the_commit_is_adopted_and_written_through() {
 /// Sidecar OLDER than `credentials.json`: the commit landed cleanly and the
 /// sidecar is its already-superseded predecessor. Adopting it would reinstall a
 /// spent refresh token, so it must be discarded — and still cleaned up.
-#[cfg(unix)]
 #[test]
 fn pending_sidecar_older_than_the_commit_is_discarded_not_reinstalled() {
     let _home = HomeSandbox::new();
@@ -730,7 +828,6 @@ fn pending_sidecar_older_than_the_commit_is_discarded_not_reinstalled() {
 /// within one filesystem timestamp tick is the common case on a coarse-grained
 /// mtime, and treating that as "the commit won" would drop a rotation that may
 /// never have landed.
-#[cfg(unix)]
 #[test]
 fn pending_sidecar_with_an_equal_mtime_is_adopted() {
     let _home = HomeSandbox::new();
@@ -758,7 +855,6 @@ fn pending_sidecar_with_an_equal_mtime_is_adopted() {
 /// commit): there is nothing to compare against and the sidecar is the only pair
 /// in existence — adopt unconditionally rather than treating the missing file as
 /// a reason to discard.
-#[cfg(unix)]
 #[test]
 fn pending_sidecar_is_adopted_when_no_commit_exists_at_all() {
     let _home = HomeSandbox::new();
@@ -822,7 +918,8 @@ fn credential_and_cache_files_have_restricted_permissions() {
     let creds = oauth_credentials();
 
     let profile = Profile {
-        harness: Default::default(),
+        harness: crate::profile::Harness::Claude,
+        session_feed: false,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -831,12 +928,12 @@ fn credential_and_cache_files_have_restricted_permissions() {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
+        last_resort: false,
+        max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
-        last_resort: false,
-        session_feed: false,
-        max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: Some(creds.clone()),
         usage: None,
         fetch_status: None,
@@ -901,6 +998,62 @@ fn credential_and_cache_files_have_restricted_permissions() {
     );
 }
 
+/// Disabling an account is a `config.toml`-only edit: flipping it must persist
+/// on reload and never touch the profile directory or stored credentials.
+/// `disabled = false` (the default) leaves stock behaviour bit-identical, so
+/// this pins both halves of the exclusion feature's storage contract.
+#[test]
+fn disabling_persists_and_leaves_credentials_byte_unchanged() {
+    let _home = HomeSandbox::new();
+    let name = "disable-round-trip";
+    let mut profile = Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(oauth_credentials());
+    save_profile(&profile).expect("save_profile (enabled)");
+    assert!(!load_profile(name).expect("load_profile").is_disabled());
+
+    let cred_path = profile_credentials_path(name).expect("cred path");
+    let creds_before = std::fs::read(&cred_path).expect("read credentials.json");
+    let mut dir_entries_before: Vec<_> = std::fs::read_dir(profile_dir(name).expect("profile_dir"))
+        .expect("read_dir")
+        .map(|e| e.expect("dir entry").file_name())
+        .collect();
+    dir_entries_before.sort_unstable();
+
+    profile.disabled = true;
+    save_profile(&profile).expect("save_profile (disabled)");
+
+    let creds_after = std::fs::read(&cred_path).expect("re-read credentials.json");
+    assert_eq!(
+        creds_before, creds_after,
+        "disabling an account must never touch its stored credentials"
+    );
+    let mut dir_entries_after: Vec<_> = std::fs::read_dir(profile_dir(name).expect("profile_dir"))
+        .expect("read_dir")
+        .map(|e| e.expect("dir entry").file_name())
+        .collect();
+    dir_entries_after.sort_unstable();
+    assert_eq!(
+        dir_entries_before, dir_entries_after,
+        "disabling an account must never add or remove files in its profile directory"
+    );
+
+    let raw = std::fs::read_to_string(profile_config_path(name).expect("config path"))
+        .expect("read config.toml");
+    assert!(
+        raw.contains("disabled = true"),
+        "disabled=true must be a real, serialized key in config.toml"
+    );
+
+    let reloaded = load_profile(name).expect("load_profile (disabled)");
+    assert!(reloaded.is_disabled(), "reload must observe the toggle");
+    assert_eq!(
+        reloaded.access_token(),
+        profile.access_token(),
+        "reload must carry the same credentials through unchanged"
+    );
+    assert_eq!(reloaded.refresh_token(), profile.refresh_token());
+}
+
 /// The real usage-cache writer (`profile_cache::write_profile_cache`) must
 /// create usage_cache.json at 0o600 and, when it has to create the per-profile
 /// dir, that dir at 0o700. Driven on a FRESH profile name so the dir does not
@@ -945,51 +1098,6 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
         0o600,
         "usage_cache.json mode should be 0o600, got {:#o}",
         cache_mode & 0o777,
-    );
-}
-
-/// config.toml can carry a third-party `api_key`, so BOTH writers that touch it
-/// must land it `0o600` — `save_profile` on the normal path AND the drift-rewrite
-/// path (`maybe_rewrite_config_toml`), which historically used the umask-default
-/// `atomic_write` and could leave a world-readable `0o644` API key (TECH-9 #15).
-#[cfg(unix)]
-#[test]
-fn config_toml_is_0600_including_the_drift_rewrite_path() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let _home = HomeSandbox::new();
-    let name = "perm-test-config-toml";
-
-    let mut profile = crate::testutil::blank_profile(name);
-    profile.base_url = Some("https://api.deepseek.com/anthropic".into());
-    profile.api_key = Some("sk-secret-must-be-0600".into());
-
-    // Normal path: save_profile writes config.toml at 0o600.
-    save_profile(&profile).expect("save_profile");
-    let cfg = profile_subpath(name, "config.toml").expect("config path");
-    let mode = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "save_profile config.toml mode, got {mode:#o}");
-
-    // Drift-rewrite path: `maybe_rewrite_config_toml` only writes when
-    // `render_config_toml` produces un-parseable TOML (its Err branch) — every
-    // value that round-trips is a no-op. A NaN threshold is the deterministic
-    // lever: it renders `fallback_threshold = NaN`, which TOML rejects (it spells
-    // NaN `nan`), so the branch fires and rewrites. We loosen the mode first and
-    // assert the rewrite re-tightens to 0o600 — the regression guard against this
-    // path drifting back to the umask-default `atomic_write` (TECH-9 #15).
-    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o644)).unwrap();
-    profile.fallback_threshold = Some(f64::NAN);
-    let raw = std::fs::read_to_string(&cfg).unwrap();
-    maybe_rewrite_config_toml(&cfg, &raw, &profile);
-    let after = std::fs::read_to_string(&cfg).unwrap();
-    assert_ne!(
-        after, raw,
-        "drift-rewrite must have fired (content changed)"
-    );
-    let mode2 = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
-    assert_eq!(
-        mode2, 0o600,
-        "drift-rewrite config.toml mode, got {mode2:#o}"
     );
 }
 
@@ -1137,120 +1245,6 @@ fn weekly_switch_threshold_absent_loads_as_default() {
         state.weekly_switch_threshold_pct(),
         DEFAULT_WEEKLY_SWITCH_PCT
     );
-}
-
-// ---- CDX-1 T1: harness axis ----
-
-// Every config.toml written before the harness field existed must load as
-// Claude — absent = Claude, zero migration.
-#[test]
-fn profile_config_harness_defaults_to_claude() {
-    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
-    assert_eq!(cfg.harness, Harness::Claude);
-}
-
-#[test]
-fn profile_config_reads_harness_codex() {
-    let cfg: ProfileConfig = toml::from_str("harness = \"codex\"\n").expect("parse codex config");
-    assert_eq!(cfg.harness, Harness::Codex);
-}
-
-#[test]
-fn harness_round_trips_through_config_toml() {
-    let mut profile = Profile::new("p".to_string(), None, None);
-    profile.harness = Harness::Codex;
-    let rendered = render_config_toml(&profile);
-    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
-    assert_eq!(parsed.harness, Harness::Codex);
-}
-
-// A Claude profile's render must not emit an uncommented harness line: parsed
-// back it stays Claude, so `maybe_rewrite_config_toml`'s semantic compare
-// never rewrites a pre-CDX config.toml just because the field now exists.
-#[test]
-fn claude_render_keeps_harness_commented() {
-    let profile = Profile::new("p".to_string(), None, None);
-    let rendered = render_config_toml(&profile);
-    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
-    assert_eq!(parsed.harness, Harness::Claude);
-}
-
-// Old profiles.toml (no codex fields) loads with defaults, and a claude-only
-// state keeps serializing WITHOUT the codex keys — byte stability for every
-// existing install.
-#[test]
-fn app_state_codex_fields_default_and_stay_omitted() {
-    let state: AppState =
-        toml::from_str("active_profile = \"a\"\nprofiles = [\"a\"]\n").expect("parse old state");
-    assert!(state.active_codex_profile.is_none());
-    assert!(state.codex_fallback_chain.is_empty());
-    let rendered = toml::to_string_pretty(&state).expect("render state");
-    assert!(!rendered.contains("active_codex_profile"));
-    assert!(!rendered.contains("codex_fallback_chain"));
-}
-
-#[test]
-fn app_state_codex_fields_round_trip() {
-    let state = AppState {
-        active_codex_profile: Some("cdx".into()),
-        codex_fallback_chain: vec!["cdx".into(), "cdx2".into()],
-        ..AppState::default()
-    };
-    let rendered = toml::to_string_pretty(&state).expect("render state");
-    let back: AppState = toml::from_str(&rendered).expect("parse state");
-    assert_eq!(back.active_codex_profile.as_deref(), Some("cdx"));
-    assert_eq!(back.codex_fallback_chain.len(), 2);
-}
-
-// The codex active slot is independent of the claude one: activating a claude
-// profile never makes it codex-active and vice versa.
-#[test]
-fn is_active_codex_tracks_the_codex_slot_only() {
-    let mut config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![
-            crate::testutil::blank_profile("a"),
-            crate::testutil::blank_profile("b"),
-        ],
-    };
-    config.state.active_profile = Some("a".into());
-    config.state.active_codex_profile = Some("b".into());
-    assert!(config.is_active("a") && !config.is_active("b"));
-    assert!(config.is_active_codex("b") && !config.is_active_codex("a"));
-}
-
-// remove() must clear every codex slot the departing profile occupies,
-// mirroring the claude-side guarantees (chain membership + active marker).
-#[test]
-fn remove_clears_codex_membership_and_active_slot() {
-    let mut config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![
-            crate::testutil::blank_profile("cdx"),
-            crate::testutil::blank_profile("cdx2"),
-        ],
-    };
-    config.state.profiles = vec!["cdx".into(), "cdx2".into()];
-    config.state.active_codex_profile = Some("cdx".into());
-    config.state.codex_fallback_chain = vec!["cdx".into(), "cdx2".into()];
-    config.remove("cdx");
-    assert!(config.state.active_codex_profile.is_none());
-    assert_eq!(config.state.codex_fallback_chain.len(), 1);
-    assert_eq!(config.state.codex_fallback_chain[0].as_str(), "cdx2");
-}
-
-#[test]
-fn rename_updates_codex_slots() {
-    let mut config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![crate::testutil::blank_profile("old")],
-    };
-    config.state.profiles = vec!["old".into()];
-    config.state.active_codex_profile = Some("old".into());
-    config.state.codex_fallback_chain = vec!["old".into()];
-    config.rename_all_occurrences("old", "new");
-    assert_eq!(config.state.active_codex_profile.as_deref(), Some("new"));
-    assert_eq!(config.state.codex_fallback_chain[0].as_str(), "new");
 }
 
 // `reload_fingerprint` is the reload trigger for BOTH detectors. These pin the
@@ -1427,32 +1421,6 @@ fn reload_fingerprint_catches_a_non_newest_config_edit() {
     );
 }
 
-// The per-account usage gates must default ON (unset = `None` = checked) and
-// the weekly-line override unset; both round-trip through config.toml.
-#[test]
-fn usage_gates_and_weekly_override_round_trip_through_config_toml() {
-    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
-    assert_eq!(cfg.check_weekly, None);
-    assert_eq!(cfg.check_scoped, None);
-    assert_eq!(cfg.weekly_threshold, None);
-
-    let mut profile = Profile::new("p".to_string(), None, None);
-    profile.check_weekly = false;
-    profile.check_scoped = false;
-    profile.weekly_threshold = Some(90.0);
-    let rendered = render_config_toml(&profile);
-    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
-    assert_eq!(parsed.check_weekly, Some(false));
-    assert_eq!(parsed.check_scoped, Some(false));
-    assert_eq!(parsed.weekly_threshold, Some(90.0));
-
-    let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
-    let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
-    assert_eq!(parsed.check_weekly, None);
-    assert_eq!(parsed.check_scoped, None);
-    assert_eq!(parsed.weekly_threshold, None);
-}
-
 // The burn-aware tunable accessors reset a hand-edited out-of-band value to the
 // default (fail-safe, like the weekly line) and keep an in-band one. An unset
 // field reads as the default so `skip_serializing_if` keeps omitting it.
@@ -1469,6 +1437,17 @@ fn burn_switch_floor_pct_resets_out_of_band_and_keeps_in_band() {
     );
     st.burn_switch_floor_pct = Some(99.0);
     assert_eq!(st.burn_switch_floor_pct(), 99.0);
+}
+
+// The tests above compare accessors against the constants themselves, so a
+// value mutation moves both sides together and nothing reds. Pin the two
+// defaults against hardcoded literals so a moved constant fails a named test
+// instead of only ever being caught by coincidence (`tui_render_chain.rs`'s
+// 98.0 override happens to equal `DEFAULT_WEEKLY_SWITCH_PCT` today).
+#[test]
+fn default_switch_percentages_are_pinned_at_98() {
+    assert_eq!(DEFAULT_WEEKLY_SWITCH_PCT, 98.0);
+    assert_eq!(DEFAULT_BURN_FLOOR_PCT, 98.0);
 }
 
 #[test]
@@ -1499,6 +1478,294 @@ fn burn_tunables_round_trip_and_omit_when_unset() {
         !off.contains("burn_switch_floor_pct") && !off.contains("burn_horizon_cap_ms"),
         "unset burn tunables must be omitted, got:\n{off}"
     );
+}
+
+// The per-account weekly-line override must default unset (follow the chain)
+// and round-trip through config.toml. Its LOAD normalization is reset-not-
+// clamp, pinned separately by
+// `weekly_threshold_out_of_band_resets_to_unset_at_load` — through the real
+// disk boundary, where the normalization actually lives.
+#[test]
+fn weekly_threshold_round_trips_through_config_toml() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.weekly_threshold, None);
+
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.weekly_threshold = Some(90.0);
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.weekly_threshold, Some(90.0));
+
+    let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
+    let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
+    assert_eq!(parsed.weekly_threshold, None);
+}
+
+/// The override RESETS to unset out of band, mirroring the chain-wide line it
+/// overrides (never clamps — a `0.98` fraction-vs-percent typo clamped to the
+/// band's floor would weekly-block the account from about 1% into its week,
+/// chipped as a plausible-looking `WeeklySoft`). Through the real disk
+/// boundary: `load_profile` is where the normalization lives.
+#[test]
+fn weekly_threshold_out_of_band_resets_to_unset_at_load() {
+    let _home = HomeSandbox::new();
+    let name = "weekly-reset-test";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+
+    for (raw, expect, why) in [
+        (
+            "weekly_threshold = 0.98
+",
+            None,
+            "fraction typo resets",
+        ),
+        (
+            "weekly_threshold = 40.0
+",
+            None,
+            "under-band resets, never clamps to MIN",
+        ),
+        (
+            "weekly_threshold = 150.0
+",
+            None,
+            "over-band resets, never clamps to MAX",
+        ),
+        (
+            "weekly_threshold = nan
+",
+            None,
+            "nan is valid TOML and must not survive",
+        ),
+        (
+            "weekly_threshold = 98.0
+",
+            Some(98.0),
+            "in-band survives",
+        ),
+    ] {
+        std::fs::write(&config_path, raw).expect("write config.toml");
+        assert_eq!(
+            load_profile(name).expect("load_profile").weekly_threshold,
+            expect,
+            "{why}: {raw:?}"
+        );
+    }
+}
+
+/// The usage gates default ON through the REAL load boundary — an absent key
+/// in a config.toml written before the gates existed keeps stock gating.
+/// `profile_config_usage_gates_default_unset` stops at `ProfileConfig` (the
+/// unset is `None` there); this pins the `unwrap_or(true)` resolution where
+/// it lives, so flipping it to `unwrap_or(false)` cannot stay green.
+#[test]
+fn usage_gates_default_on_through_the_load_boundary() {
+    let _home = HomeSandbox::new();
+    let name = "gate-default-test";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    std::fs::write(&config_path, "").expect("write empty config.toml");
+
+    let loaded = load_profile(name).expect("load_profile");
+    assert!(loaded.check_weekly, "absent check_weekly loads as ON");
+    assert!(loaded.check_scoped, "absent check_scoped loads as ON");
+
+    std::fs::write(
+        &config_path,
+        "check_weekly = false
+check_scoped = false
+",
+    )
+    .expect("write config.toml");
+    let loaded = load_profile(name).expect("load_profile");
+    assert!(!loaded.check_weekly, "an explicit false survives the load");
+    assert!(!loaded.check_scoped, "an explicit false survives the load");
+}
+
+// ── Fork-only tests (codex engine, RESCUE, CLA-FEED, forecast, email column) ──
+
+/// config.toml can carry a third-party `api_key`, so BOTH writers that touch it
+/// must land it `0o600` — `save_profile` on the normal path AND the drift-rewrite
+/// path (`maybe_rewrite_config_toml`), which historically used the umask-default
+/// `atomic_write` and could leave a world-readable `0o644` API key (TECH-9 #15).
+#[cfg(unix)]
+#[test]
+fn config_toml_is_0600_including_the_drift_rewrite_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let name = "perm-test-config-toml";
+
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.base_url = Some("https://api.deepseek.com/anthropic".into());
+    profile.api_key = Some("sk-secret-must-be-0600".into());
+
+    // Normal path: save_profile writes config.toml at 0o600.
+    save_profile(&profile).expect("save_profile");
+    let cfg = profile_subpath(name, "config.toml").expect("config path");
+    let mode = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "save_profile config.toml mode, got {mode:#o}");
+
+    // Drift-rewrite path: `maybe_rewrite_config_toml` only writes when
+    // `render_config_toml` produces un-parseable TOML (its Err branch) — every
+    // value that round-trips is a no-op. A NaN threshold is the deterministic
+    // lever: it renders `fallback_threshold = NaN`, which TOML rejects (it spells
+    // NaN `nan`), so the branch fires and rewrites. We loosen the mode first and
+    // assert the rewrite re-tightens to 0o600 — the regression guard against this
+    // path drifting back to the umask-default `atomic_write` (TECH-9 #15).
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o644)).unwrap();
+    profile.fallback_threshold = Some(f64::NAN);
+    let raw = std::fs::read_to_string(&cfg).unwrap();
+    maybe_rewrite_config_toml(&cfg, &raw, &profile);
+    let after = std::fs::read_to_string(&cfg).unwrap();
+    assert_ne!(
+        after, raw,
+        "drift-rewrite must have fired (content changed)"
+    );
+    let mode2 = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode2, 0o600,
+        "drift-rewrite config.toml mode, got {mode2:#o}"
+    );
+}
+
+// Every config.toml written before the harness field existed must load as
+// Claude — absent = Claude, zero migration.
+#[test]
+fn profile_config_harness_defaults_to_claude() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.harness, Harness::Claude);
+}
+
+#[test]
+fn profile_config_reads_harness_codex() {
+    let cfg: ProfileConfig = toml::from_str("harness = \"codex\"\n").expect("parse codex config");
+    assert_eq!(cfg.harness, Harness::Codex);
+}
+
+#[test]
+fn harness_round_trips_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.harness = Harness::Codex;
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.harness, Harness::Codex);
+}
+
+// A Claude profile's render must not emit an uncommented harness line: parsed
+// back it stays Claude, so `maybe_rewrite_config_toml`'s semantic compare
+// never rewrites a pre-CDX config.toml just because the field now exists.
+#[test]
+fn claude_render_keeps_harness_commented() {
+    let profile = Profile::new("p".to_string(), None, None);
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.harness, Harness::Claude);
+}
+
+// Old profiles.toml (no codex fields) loads with defaults, and a claude-only
+// state keeps serializing WITHOUT the codex keys — byte stability for every
+// existing install.
+#[test]
+fn app_state_codex_fields_default_and_stay_omitted() {
+    let state: AppState =
+        toml::from_str("active_profile = \"a\"\nprofiles = [\"a\"]\n").expect("parse old state");
+    assert!(state.active_codex_profile.is_none());
+    assert!(state.codex_fallback_chain.is_empty());
+    let rendered = toml::to_string_pretty(&state).expect("render state");
+    assert!(!rendered.contains("active_codex_profile"));
+    assert!(!rendered.contains("codex_fallback_chain"));
+}
+
+#[test]
+fn app_state_codex_fields_round_trip() {
+    let state = AppState {
+        active_codex_profile: Some("cdx".into()),
+        codex_fallback_chain: vec!["cdx".into(), "cdx2".into()],
+        ..AppState::default()
+    };
+    let rendered = toml::to_string_pretty(&state).expect("render state");
+    let back: AppState = toml::from_str(&rendered).expect("parse state");
+    assert_eq!(back.active_codex_profile.as_deref(), Some("cdx"));
+    assert_eq!(back.codex_fallback_chain.len(), 2);
+}
+
+// The codex active slot is independent of the claude one: activating a claude
+// profile never makes it codex-active and vice versa.
+#[test]
+fn is_active_codex_tracks_the_codex_slot_only() {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            crate::testutil::blank_profile("a"),
+            crate::testutil::blank_profile("b"),
+        ],
+    };
+    config.state.active_profile = Some("a".into());
+    config.state.active_codex_profile = Some("b".into());
+    assert!(config.is_active("a") && !config.is_active("b"));
+    assert!(config.is_active_codex("b") && !config.is_active_codex("a"));
+}
+
+// remove() must clear every codex slot the departing profile occupies,
+// mirroring the claude-side guarantees (chain membership + active marker).
+#[test]
+fn remove_clears_codex_membership_and_active_slot() {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            crate::testutil::blank_profile("cdx"),
+            crate::testutil::blank_profile("cdx2"),
+        ],
+    };
+    config.state.profiles = vec!["cdx".into(), "cdx2".into()];
+    config.state.active_codex_profile = Some("cdx".into());
+    config.state.codex_fallback_chain = vec!["cdx".into(), "cdx2".into()];
+    config.remove("cdx");
+    assert!(config.state.active_codex_profile.is_none());
+    assert_eq!(config.state.codex_fallback_chain.len(), 1);
+    assert_eq!(config.state.codex_fallback_chain[0].as_str(), "cdx2");
+}
+
+#[test]
+fn rename_updates_codex_slots() {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![crate::testutil::blank_profile("old")],
+    };
+    config.state.profiles = vec!["old".into()];
+    config.state.active_codex_profile = Some("old".into());
+    config.state.codex_fallback_chain = vec!["old".into()];
+    config.rename_all_occurrences("old", "new");
+    assert_eq!(config.state.active_codex_profile.as_deref(), Some("new"));
+    assert_eq!(config.state.codex_fallback_chain[0].as_str(), "new");
+}
+
+// The per-account usage gates must default ON (unset = `None` = checked) and
+// the weekly-line override unset; both round-trip through config.toml.
+#[test]
+fn usage_gates_and_weekly_override_round_trip_through_config_toml() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.check_weekly, None);
+    assert_eq!(cfg.check_scoped, None);
+    assert_eq!(cfg.weekly_threshold, None);
+
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.check_weekly = false;
+    profile.check_scoped = false;
+    profile.weekly_threshold = Some(90.0);
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.check_weekly, Some(false));
+    assert_eq!(parsed.check_scoped, Some(false));
+    assert_eq!(parsed.weekly_threshold, Some(90.0));
+
+    let stock = render_config_toml(&Profile::new("p".to_string(), None, None));
+    let parsed: ProfileConfig = toml::from_str(&stock).expect("parse stock toml");
+    assert_eq!(parsed.check_weekly, None);
+    assert_eq!(parsed.check_scoped, None);
+    assert_eq!(parsed.weekly_threshold, None);
 }
 
 /// CLA-FEED: `session_feed` round-trips through config.toml — `true` renders

@@ -420,7 +420,126 @@ fn non_diverged_switch_takes_plain_path() {
     assert_eq!(active, "target");
 }
 
+/// The disabled gate lives in `ensure_switch_target_ok`, the chokepoint every
+/// switch primitive calls first — so the MCP `switch` tool's own action
+/// (`switch_profile_noninteractive`) refuses a disabled target even on the
+/// plain, non-diverged path, with no CLI-side pre-check anywhere near it.
+#[test]
+fn non_diverged_switch_refuses_a_disabled_target() {
+    let _home = HomeSandbox::new();
+    let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
+    let mut target_profile = stored_profile("target", Some(creds("target-a", "target-r")));
+    target_profile.disabled = true;
+    crate::claude::force_link_profile_credentials("active").expect("link active");
+
+    let config = handle(AppConfig {
+        state: AppState {
+            active_profile: Some("active".into()),
+            profiles: vec!["active".into(), "target".into()],
+            ..Default::default()
+        },
+        profiles: vec![active_profile, target_profile],
+    });
+
+    let err = switch_profile_noninteractive(&config, "target", None, no_network)
+        .expect_err("a disabled target must be refused");
+    assert_eq!(
+        err.to_string(),
+        "'target': account is disabled, run `clauth enable target`"
+    );
+    assert!(
+        config.lock().unwrap().is_active("active"),
+        "a refused switch must leave the active profile unchanged"
+    );
+}
+
 // ── AUTH-1 gate on the noninteractive path (Incident C, every entry point) ──
+
+/// A refresher spy: records whether it ran and always succeeds when it does.
+fn spy_refresher(
+    called: &std::sync::atomic::AtomicBool,
+) -> impl Fn(
+    &str,
+    Option<&str>,
+) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError>
++ '_ {
+    move |_rt: &str, _scopes: Option<&str>| {
+        called.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::oauth::TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    }
+}
+
+/// Case A (the bug): a disabled AND clock-expired target must be refused with
+/// the disabled message, and the refresher — which the AUTH-1 gate would
+/// otherwise call for an expiring token — must never run. Pre-fix, the
+/// disabled check lived only inside `switch_profile`, reached AFTER
+/// `ensure_installable`, so this target's single-use refresh token got
+/// rotated over HTTP before the refusal ever landed.
+#[test]
+fn non_diverged_switch_refuses_a_disabled_expired_target_before_any_refresh() {
+    let _home = HomeSandbox::new();
+    let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
+    let mut target_profile = stored_profile("target", Some(creds_expired("dead-a", "dead-r")));
+    target_profile.disabled = true;
+    crate::claude::force_link_profile_credentials("active").expect("link active");
+
+    let config = handle(AppConfig {
+        state: AppState {
+            active_profile: Some("active".into()),
+            profiles: vec!["active".into(), "target".into()],
+            ..Default::default()
+        },
+        profiles: vec![active_profile, target_profile],
+    });
+    let called = std::sync::atomic::AtomicBool::new(false);
+
+    let err = switch_profile_noninteractive(&config, "target", None, spy_refresher(&called))
+        .expect_err("a disabled target must be refused");
+    assert_eq!(
+        err.to_string(),
+        "'target': account is disabled, run `clauth enable target`"
+    );
+    assert!(
+        !called.load(std::sync::atomic::Ordering::SeqCst),
+        "the refresher must never run for a disabled target"
+    );
+    assert!(
+        config.lock().unwrap().is_active("active"),
+        "a refused switch must leave the active profile unchanged"
+    );
+}
+
+/// Positive control: the SAME clock-expired shape, target NOT disabled, DOES
+/// invoke the refresher — proving the spy actually detects a call (otherwise
+/// the "never called" assertion above is vacuous).
+#[test]
+fn non_diverged_switch_refreshes_a_non_disabled_expired_target() {
+    let _home = HomeSandbox::new();
+    let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
+    let target_profile = stored_profile("target", Some(creds_expired("live-a", "live-r")));
+    crate::claude::force_link_profile_credentials("active").expect("link active");
+
+    let config = handle(AppConfig {
+        state: AppState {
+            active_profile: Some("active".into()),
+            profiles: vec!["active".into(), "target".into()],
+            ..Default::default()
+        },
+        profiles: vec![active_profile, target_profile],
+    });
+    let called = std::sync::atomic::AtomicBool::new(false);
+
+    let _ = switch_profile_noninteractive(&config, "target", None, spy_refresher(&called));
+    assert!(
+        called.load(std::sync::atomic::Ordering::SeqCst),
+        "positive control: a non-disabled expired target must invoke the refresher"
+    );
+}
 
 /// A dead target must be refused BEFORE any relink — the MCP `switch` (and any
 /// future headless caller) shares the CLI's `ensure_installable` gate, so a

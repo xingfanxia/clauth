@@ -60,7 +60,8 @@ fn cell_is_always_exactly_width() {
 
 fn cue_profile(status: Option<FetchStatus>) -> Profile {
     Profile {
-        harness: Default::default(),
+        harness: crate::profile::Harness::Claude,
+        session_feed: false,
         name: "p".into(),
         base_url: None,
         api_key: None,
@@ -69,12 +70,12 @@ fn cue_profile(status: Option<FetchStatus>) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
+        last_resort: false,
+        max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
-        last_resort: false,
-        session_feed: false,
-        max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: status,
@@ -92,6 +93,7 @@ fn cue_window(util: f64) -> UsageWindow {
 
 #[test]
 fn cue_amber_on_cached_and_rate_limited() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     assert_eq!(
         fetch_cue_color(&cue_profile(Some(FetchStatus::Cached))),
         Some(theme::warning_color())
@@ -104,6 +106,7 @@ fn cue_amber_on_cached_and_rate_limited() {
 
 #[test]
 fn cue_red_on_failed() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     assert_eq!(
         fetch_cue_color(&cue_profile(Some(FetchStatus::Failed))),
         Some(theme::danger_color())
@@ -130,8 +133,10 @@ fn cue_absent_for_api_key_profiles() {
 
 #[test]
 fn brackets_stay_dim_regardless_of_fetch_state() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let w = cue_window(50.0);
-    let spans = window_summary_spans_bracketed(Some(&w), 17, true, None, ResetFmt::default());
+    let spans =
+        window_summary_spans_bracketed(Some(&w), 17, true, None, ResetFmt::default(), false);
     assert_eq!(spans[0].content, "[");
     assert_eq!(spans[0].style.fg, theme::dim().fg);
     assert_eq!(spans[2].content, "]");
@@ -142,17 +147,10 @@ fn brackets_stay_dim_regardless_of_fetch_state() {
 /// other no-data cell — the cue lives on the overview countdown instead.
 #[test]
 fn no_data_dash_stays_faint() {
-    let spans = window_summary_spans_bracketed(None, 17, true, None, ResetFmt::default());
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let spans = window_summary_spans_bracketed(None, 17, true, None, ResetFmt::default(), false);
     assert_eq!(spans[0].content, "—");
     assert_eq!(spans[0].style.fg, theme::faint().fg);
-}
-
-// CDX-1 T8: the kind column is the harness tag for codex profiles.
-#[test]
-fn account_type_label_tags_codex_profiles() {
-    let mut p = crate::testutil::blank_profile("cdx");
-    p.harness = crate::profile::Harness::Codex;
-    assert_eq!(account_type_label(&p), "Codex");
 }
 
 // ── Reset display (issue #39) ───────────────────────────────────────────────
@@ -376,8 +374,14 @@ fn overview_reset_middle_dot_stays_uncolored_in_both_mode() {
         clock: ClockFormat::H24,
     };
     let drain = Color::Yellow;
-    let spans =
-        window_summary_spans_bracketed(Some(&w), 160, true, Some(Style::default().fg(drain)), fmt);
+    let spans = window_summary_spans_bracketed(
+        Some(&w),
+        160,
+        true,
+        Some(Style::default().fg(drain)),
+        fmt,
+        false,
+    );
     let dot = spans
         .iter()
         .find(|s| s.content == " · ")
@@ -412,10 +416,104 @@ fn overview_reset_middle_dot_stays_uncolored_in_both_mode() {
             clock: ClockFormat::H24,
         },
     ] {
-        let single = window_summary_spans_bracketed(Some(&w), 160, true, None, no_dot);
+        let single = window_summary_spans_bracketed(Some(&w), 160, true, None, no_dot, false);
         assert!(
             !single.iter().any(|s| s.content == " · "),
             "no separator without a countdown+stamp pair"
         );
     }
 }
+
+// ── stale (past-reset) predicate ────────────────────────────────────────
+//
+// `is_past_reset`: true once the window's stored reset instant has passed,
+// so its utilization is a frozen pre-reset reading awaiting the next fetch.
+
+fn reset_window(offset_secs: i64) -> UsageWindow {
+    UsageWindow {
+        utilization: 50.0,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + offset_secs,
+        )),
+    }
+}
+
+#[test]
+fn is_past_reset_true_once_the_stamp_has_passed() {
+    assert!(is_past_reset(&reset_window(-60)));
+}
+
+#[test]
+fn is_past_reset_false_while_the_stamp_is_future() {
+    assert!(!is_past_reset(&reset_window(60)));
+}
+
+#[test]
+fn is_past_reset_false_with_no_reset_stamp() {
+    let w = UsageWindow {
+        utilization: 50.0,
+        resets_at: None,
+    };
+    assert!(!is_past_reset(&w));
+}
+
+/// The exact boundary: a reset instant equal to `now` counts as past
+/// (`secs <= 0`), not future.
+#[test]
+fn is_past_reset_true_at_the_exact_boundary() {
+    assert!(is_past_reset(&reset_window(0)));
+}
+
+/// `stale` fades only the fill + `%` spans to `theme::faint()`; the brackets
+/// and the reset suffix keep their own styling either way. Fixture holds real
+/// (non-zero) fill so a color swap is observable — a mutation dropping the
+/// fade must red this.
+#[test]
+fn stale_window_fades_only_fill_and_percent() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let w = reset_window(-60);
+    // A non-faint reset_style so the "reset suffix unchanged" assertion below can
+    // actually red: with `None` the suffix defaults to faint on both calls, hiding
+    // a mutation that leaked `stale` into the reset color.
+    let reset = Some(theme::warning());
+    let live =
+        window_summary_spans_bracketed(Some(&w), 26, true, reset, ResetFmt::default(), false);
+    let stale =
+        window_summary_spans_bracketed(Some(&w), 26, true, reset, ResetFmt::default(), true);
+
+    // spans[0] = `[`, [1] = fill, [2] = `]`, [3] = ` XX%`, [4..] = reset suffix.
+    assert_eq!(live[1].content, "█████░░░░░");
+    assert_ne!(
+        live[1].style.fg,
+        theme::faint().fg,
+        "the live fixture must carry a real util color, not already-faint"
+    );
+    assert_eq!(stale[1].content, live[1].content, "fill glyphs unchanged");
+    assert_eq!(stale[1].style.fg, theme::faint().fg, "fill fades stale");
+    assert_eq!(stale[3].style.fg, theme::faint().fg, "% fades stale");
+
+    // Brackets and the reset suffix are untouched by staleness.
+    assert_eq!(stale[0].style.fg, live[0].style.fg, "`[` unchanged");
+    assert_eq!(stale[2].style.fg, live[2].style.fg, "`]` unchanged");
+    assert_eq!(
+        stale[4..].iter().map(|s| s.style.fg).collect::<Vec<_>>(),
+        live[4..].iter().map(|s| s.style.fg).collect::<Vec<_>>(),
+        "reset suffix unchanged"
+    );
+}
+
+// ── Fork-only tests (codex engine, RESCUE, CLA-FEED, forecast, email column) ──
+
+// CDX-1 T8: the kind column is the harness tag for codex profiles.
+#[test]
+fn account_type_label_tags_codex_profiles() {
+    let mut p = crate::testutil::blank_profile("cdx");
+    p.harness = crate::profile::Harness::Codex;
+    assert_eq!(account_type_label(&p), "Codex");
+}
+
+// ── Reset display (issue #39) ───────────────────────────────────────────────
+//
+// `clock_text` and the three compositions are pure, so these pin exact strings
+// without depending on the box's timezone. The zone lookup itself
+// (`local_clock`) is a single chrono call over them.

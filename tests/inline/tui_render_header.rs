@@ -17,12 +17,13 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
-        check_weekly: true,
-        check_scoped: true,
         last_resort: false,
         session_feed: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: Some(UsageInfo {
             five_hour: Some(UsageWindow {
@@ -48,12 +49,13 @@ fn provider_profile(name: &str) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
-        check_weekly: true,
-        check_scoped: true,
         last_resort: false,
         session_feed: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -284,6 +286,7 @@ fn row2_is_tabs_only() {
 
 #[test]
 fn daemon_dot_maps_health_to_color_and_hides_when_absent() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::daemon::DaemonHealth;
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
 

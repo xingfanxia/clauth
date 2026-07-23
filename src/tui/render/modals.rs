@@ -485,6 +485,10 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("\u{21b5} on a field", "edit inline; \u{21b5} again saves"),
                 ("space", "cycle the model preset (model row)"),
                 ("env", "+ add env · \u{21b5} edits a value · a removes"),
+                (
+                    "disable / enable",
+                    "\u{21b5} arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a session is open",
+                ),
                 ("delete", "\u{21b5} once to arm, again to confirm"),
                 ("esc", "stop editing / back to account list"),
             ][..],
@@ -526,10 +530,14 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("shift \u{2191}\u{2193}", "reorder to set priority"),
                 (
                     "\u{21b5}",
-                    "open \u{00b7} edit threshold \u{00b7} edit weekly line \u{00b7} edit max spend \u{00b7} toggle gates / last resort \u{00b7} remove \u{00b7} add",
+                    "open \u{00b7} edit threshold \u{00b7} edit weekly at \u{00b7} edit max spend \u{00b7} toggle gates / last resort \u{00b7} remove \u{00b7} add",
                 ),
-                ("+ / -", "step threshold by 5"),
+                ("+ / -", "step rotate at / weekly at by 5"),
                 ("\u{21b5} on rotate at", "type a value, \u{21b5} saves"),
+                (
+                    "\u{21b5} on weekly at",
+                    "type a %, empty follows the chain default",
+                ),
                 ("esc", "back / cancel edit"),
             ][..],
         )],
@@ -621,7 +629,7 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
         Style::default().fg(theme::text_color())
     };
     let gutter = if focused {
-        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent())
+        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else {
         Span::raw("  ")
     };

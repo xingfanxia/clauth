@@ -1,7 +1,7 @@
-name: Enhancement
+name: Feature request
 description: Suggest a feature or improvement for clauth
-title: "Enhancement: "
-labels: ["enhancement"]
+title: "Feature: "
+labels: ["feature"]
 body:
   - type: textarea
     id: problem
@@ -57,3 +57,24 @@ body:
       placeholder: e.g. Linux 6.9, macOS 14.5, Windows 11
     validations:
       required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Notes
+      description: Anything else worth knowing.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: ai
+    attributes:
+      label: AI
+      description: Using AI is fine as long as you're transparent about it.
+      options:
+        - no AI
+        - AI-assisted, I reviewed everything
+        - AI did most of it under my direction
+        - autonomous agent (use the "Feature request (agent)" form instead)
+    validations:
+      required: true

@@ -147,6 +147,34 @@ fn stats_from_bars_fills_pace_for_windowed_labels() {
     assert!(other[0].burn_rate.is_none() && other[0].pace_pct.is_none());
 }
 
+/// A past-reset window's `Stat.color` (driving both the bar fill and the `%`
+/// figure in `Stat::render`, see [`Stat::render`]) fades to `theme::faint()`
+/// — a frozen pre-reset reading awaiting the next fetch. A sibling bar at the
+/// SAME utilization with a future reset proves the difference is staleness,
+/// not the percentage — a mutation dropping the fade would still pass a
+/// same-value comparison, so the control keeps a real (non-faint) util color
+/// to red against.
+#[test]
+fn stale_window_color_fades_to_faint() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let now = crate::usage::now_epoch_secs();
+    let bars = vec![
+        tp_bar("5h", 73.0, now - 60, None, None), // reset 60s in the past
+        tp_bar("5h", 73.0, now + 3600, None, None), // reset in 1h
+    ];
+    let stats = stats_from_bars(&bars, true, true, ResetFmt::default());
+    assert_ne!(
+        stats[1].color.fg,
+        theme::faint().fg,
+        "control: a live window keeps its real util color"
+    );
+    assert_eq!(
+        stats[0].color.fg,
+        theme::faint().fg,
+        "a past-reset window's color fades"
+    );
+}
+
 fn tp_bar(
     label: &str,
     pct: f64,
@@ -209,6 +237,343 @@ fn empty_msg_pending_fetch_loads() {
     assert_eq!(oauth_empty_msg(&profile), "loading");
 }
 
+/// A disabled profile is never scheduled (`collect_tokens` skips it), so with no
+/// seeded cache a fetch never lands — the body must be terminal, not spin
+/// "loading" forever. The sibling `empty_msg_pending_fetch_loads` (identical but
+/// enabled → "loading") proves it's the `disabled` flag that flips the outcome.
+#[test]
+fn empty_msg_disabled_profile_is_terminal() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    profile.disabled = true;
+    assert_eq!(oauth_empty_msg(&profile), "no usage available");
+}
+
+/// The third-party body has the same never-scheduled hole: a disabled api-key
+/// profile is dropped by `collect_third_party_entries`, so it never loads and
+/// must read "no usage available" instead of spinning "loading" forever.
+#[test]
+fn tp_rows_disabled_profile_is_terminal() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.disabled = true;
+    // No `third_party_usage`, no fetch_status → the un-fixed path returns "loading".
+    let rendered: Vec<String> = build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+    assert!(
+        rendered.iter().any(|l| l.contains("no usage available")),
+        "disabled tp body is terminal, got {rendered:?}"
+    );
+    assert!(
+        !rendered.iter().any(|l| l.contains("loading")),
+        "disabled tp body must not spin loading, got {rendered:?}"
+    );
+}
+
+/// With no fetched plan, the Usage `plan` row must match the Overview's tier
+/// label (`endpoint_label`) instead of a bare "oauth"/"api", so the two surfaces
+/// never disagree. A `subscription_type` claim renders as its tier.
+#[test]
+fn header_lines_plan_falls_back_to_endpoint_label() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("max".into()),
+        }),
+    });
+    // No `usage`, no `third_party_usage` → the plan-label fallback is exercised.
+    let header = HeaderState {
+        is_active: false,
+        account_email: None,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags::default(),
+    };
+    let plan_row: String = header_lines(&profile, &header, 52)
+        .first()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .unwrap_or_default();
+    let expected = crate::format::endpoint_label(&profile);
+    assert_eq!(expected, "Claude Max", "sanity: the tier label under test");
+    assert!(
+        plan_row.contains(&expected),
+        "plan row shows the endpoint tier, got {plan_row:?}"
+    );
+    assert!(
+        !plan_row.contains("oauth"),
+        "plan row must not fall back to the bare 'oauth' literal, got {plan_row:?}"
+    );
+}
+
+/// The `endpoint_label` fallback is gated to OAuth profiles: an api-key profile
+/// with no plan keeps "api", never its raw endpoint url (which `endpoint_label`
+/// returns base-url-first). Pins the regression a blanket `endpoint_label` swap
+/// would cause on DeepSeek/z.ai/generic rows.
+#[test]
+fn header_lines_plan_keeps_api_for_api_key_profiles() {
+    let profile = crate::profile::Profile::new(
+        "a".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    let header = HeaderState {
+        is_active: false,
+        account_email: None,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags::default(),
+    };
+    let plan_row: String = header_lines(&profile, &header, 52)
+        .first()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .unwrap_or_default();
+    assert!(
+        plan_row.contains("api"),
+        "api-key plan row stays 'api', got {plan_row:?}"
+    );
+    assert!(
+        !plan_row.contains("deepseek"),
+        "must not leak the raw endpoint url into the plan row, got {plan_row:?}"
+    );
+}
+
+/// The canceled pill is sourced purely from `profile.usage` (populated at
+/// startup by `bootstrap_fetch`'s on-disk cache seed, see
+/// `usage::scheduler::try_seed_cache`), never a live fetch. A profile carrying
+/// a prior session's canceled plan must show the pill from the cached state
+/// alone, before any network call.
+#[test]
+fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo};
+
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.usage = Some(UsageInfo {
+        codex_rate_limit_reached: None,
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: Some("canceled".to_string()),
+        }),
+        ..Default::default()
+    });
+    let header = HeaderState {
+        is_active: false,
+        account_email: None,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags::default(),
+    };
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let rendered = text(status_lines(&profile, &header, 120));
+    assert!(rendered.contains("canceled"), "got {rendered:?}");
+}
+
+/// Regression guard the other direction: an un-canceled cached plan never
+/// paints the canceled pill.
+#[test]
+fn status_lines_no_canceled_pill_when_subscription_is_active() {
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo};
+
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.usage = Some(UsageInfo {
+        codex_rate_limit_reached: None,
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: None,
+        }),
+        ..Default::default()
+    });
+    let header = HeaderState {
+        is_active: false,
+        account_email: None,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags::default(),
+    };
+    let text = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let rendered = text(status_lines(&profile, &header, 120));
+    assert!(!rendered.contains("canceled"), "got {rendered:?}");
+}
+
+/// Shared fixture for the two disabled-rung tests: a header whose lower rungs
+/// are all armed, so each test's assertion is about what the disabled rung does
+/// to them rather than about which rung happened to fire.
+fn disabled_rung_header(kick: bool) -> HeaderState {
+    use crate::usage::KickBlock;
+    HeaderState {
+        is_active: false,
+        account_email: None,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: kick.then(|| KickBlock {
+            streak: 3,
+            rejected: true,
+            until: Some(now_epoch_secs() + 3600),
+            next_retry: now_epoch_secs() + 30,
+        }),
+        diag: DiagFlags::default(),
+    }
+}
+
+fn status_text(ls: &[Line<'_>]) -> String {
+    ls.iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.clone())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The disabled rung leads but does NOT erase the health rungs beneath it: a
+/// dead login is just as true on a disabled account, and hiding it would strand
+/// an operator who re-enables it. Both facts stack on one `├│└` rail.
+#[test]
+fn status_lines_stacks_the_health_rungs_under_disabled() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut profile = crate::testutil::blank_profile("gamma");
+    let header = HeaderState {
+        is_active: false,
+        account_email: None,
+        diag: DiagFlags {
+            auth_broken: true,
+            ..DiagFlags::default()
+        },
+        ..disabled_rung_header(false)
+    };
+
+    // Control: enabled, the auth-broken rung is the whole block.
+    let enabled = status_text(&status_lines(&profile, &header, 120));
+    assert!(
+        !enabled.contains("disabled"),
+        "control: an enabled account shows no disabled pill: {enabled:?}"
+    );
+
+    profile.disabled = true;
+    let lines = status_lines(&profile, &header, 120);
+    assert_eq!(
+        status_text(&lines),
+        "status    [ disabled ]\n\
+         ├ enable it on the setup tab\n\
+         │         [ auth broken ]\n\
+         └ re-login with clauth login gamma",
+        "both facts stack on one rail"
+    );
+
+    // The pill label carries the neutral tier, never danger/warning. Only the
+    // fg is worth asserting — every status pill is drawn bold by its caller, so
+    // a modifier check would pin that shared choice, not this arm.
+    let label = lines[0]
+        .spans
+        .iter()
+        .find(|s| s.content.as_ref() == "disabled")
+        .expect("pill label span renders");
+    assert_eq!(
+        label.style.fg,
+        theme::dim().fg,
+        "the disabled pill is neutral (TEXT_DIM), not a fault color"
+    );
+}
+
+/// The other half of the same ruling: the fetch-state and refresh-countdown
+/// rungs ARE suppressed, because polling stops on a disabled account
+/// (`usage::scheduler` filters it out of the work list), so "cached" and
+/// "refresh in Ns" would both be claims about a poll that will never run.
+/// A kick block in the same frame still renders — that one stays true.
+#[test]
+fn status_lines_suppresses_only_the_fetch_and_refresh_rungs_when_disabled() {
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Cached);
+    let header = disabled_rung_header(true);
+
+    // Control: enabled, both the kick pill and the fetch/countdown rungs render.
+    let enabled = status_text(&status_lines(&profile, &header, 120));
+    assert!(
+        enabled.contains("cached"),
+        "control: an enabled account reports its fetch state: {enabled:?}"
+    );
+    assert!(
+        enabled.contains("blocked"),
+        "control: the kick pill renders too: {enabled:?}"
+    );
+
+    profile.disabled = true;
+    let rendered = status_text(&status_lines(&profile, &header, 120));
+    assert!(
+        rendered.contains("blocked"),
+        "the kick block stays true and stays visible: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("cached"),
+        "the frozen fetch state is suppressed: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("refresh in"),
+        "the countdown to a poll that never runs is suppressed: {rendered:?}"
+    );
+
+    // Disabled with nothing else wrong is a single row and a lone `└`.
+    let clean = crate::profile::Profile {
+        disabled: true,
+        ..crate::testutil::blank_profile("a")
+    };
+    assert_eq!(
+        status_text(&status_lines(&clean, &disabled_rung_header(false), 120)),
+        "status    [ disabled ]\n└ enable it on the setup tab",
+        "no rail when there is nothing to connect"
+    );
+}
+
 /// A kick-429 block pins its own `[ blocked ]` pill on the row, even
 /// while the fetch status reads Fresh — `/usage` stayed 200 through the whole
 /// 2026-07-15 messages-limiter outage, so no fetch-status pill can carry this.
@@ -220,8 +585,8 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.fetch_status = Some(FetchStatus::Fresh);
     let header = |kick_block: Option<KickBlock>| HeaderState {
-        account_email: None,
         is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -258,10 +623,13 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
         })),
         120,
     ));
-    assert!(blocked.contains("[ blocked ]"), "got {blocked:?}");
     assert!(
-        blocked.contains("lifts within"),
-        "an advertised ceiling names itself, got {blocked:?}"
+        blocked.contains("[ claude code blocked ]  "),
+        "an advertised ceiling trails the pill as a bare suffix, got {blocked:?}"
+    );
+    assert!(
+        !blocked.contains('·'),
+        "no middle-dot separator, got {blocked:?}"
     );
 
     let no_ceiling = text(status_lines(
@@ -274,10 +642,10 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
         })),
         120,
     ));
-    assert!(no_ceiling.contains("[ blocked ]"));
+    assert!(no_ceiling.contains("[ claude code blocked ]"));
     assert!(
-        !no_ceiling.contains("lifts within"),
-        "no ceiling → no made-up deadline, got {no_ceiling:?}"
+        !no_ceiling.contains("[ claude code blocked ]  "),
+        "no ceiling → no made-up deadline suffix, got {no_ceiling:?}"
     );
 }
 
@@ -334,7 +702,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
         "block pill + fetch pill, got {lines:?}"
     );
     assert!(
-        pill_lines[0].starts_with("status") && pill_lines[0].contains("[ blocked ]"),
+        pill_lines[0].starts_with("status") && pill_lines[0].contains("[ claude code blocked ]"),
         "the block leads, keyed: {:?}",
         pill_lines[0]
     );
@@ -588,8 +956,8 @@ fn rate_limited_suffix_counts_the_retry() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.fetch_status = Some(FetchStatus::RateLimited);
     let header = |streak: u32| HeaderState {
-        account_email: None,
         is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -631,8 +999,8 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.fetch_status = Some(FetchStatus::Cached);
     let header = |refresh_fail: u32| HeaderState {
-        account_email: None,
         is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -682,6 +1050,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
 /// borrows the red that means a dead login and trains the user to ignore it.
 #[test]
 fn a_streak_pill_turns_red_only_once_it_is_stuck() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let pill_style = |profile: &Profile, header: &HeaderState| {
         status_lines(profile, header, 120)
             .iter()
@@ -691,8 +1060,8 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
             .expect("a streak pill")
     };
     let header = |streaks: StreakCounts| HeaderState {
-        account_email: None,
         is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -755,8 +1124,8 @@ fn spent_skipped_account_pill_is_bare() {
             .join("\n")
     };
     let header = HeaderState {
-        account_email: None,
         is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -831,6 +1200,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
     let with = |extra: Option<crate::usage::ExtraUsage>, spend: Option<crate::usage::SpendInfo>| {
         let mut profile = crate::testutil::blank_profile("a");
         profile.usage = Some(crate::usage::UsageInfo {
+            codex_rate_limit_reached: None,
             plan: None,
             five_hour: None,
             seven_day: None,
@@ -838,7 +1208,6 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
             window_dollars: Vec::new(),
             extra_usage: extra,
             spend,
-            codex_rate_limit_reached: None,
         });
         collect_stats(&profile, ResetFmt::default())
     };
@@ -874,12 +1243,222 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
     assert!(bar.amount.is_empty());
 }
 
-// ── account row in the usage header (CAP-3) ───────────────────────────────────
+// ── diagnostic hints ──────────────────────────────────────────────────────────
 //
-// The Setup tab's `account` row has a sibling here: which login this profile
-// actually holds, between `plan` and `status`. Rendered purely from
-// `HeaderState.account_email` (gathered by the caller), so no disk IO in the
-// line builder — absent email, absent row.
+// Each degraded/misconfigured state maps to a `└` fix line naming WHAT is wrong
+// and HOW to fix it, varying with config. The flagship is the kick-block split:
+// a switch-grade block reads differently under `auto_start` on vs off.
+
+/// The flagship (state, config) → hint divergence: a switch-grade kick block on
+/// an `auto_start` account is reassurance (clauth re-tests each poll and it
+/// clears itself), on a manual one it names the fix (enable auto-start). The two
+/// copies MUST differ — collapsing them to one string is the mutation this guards.
+#[test]
+fn kick_hint_diverges_on_auto_start() {
+    let on = diag_fix(UsageDiag::KickSwitchGrade { auto_start: true }, "a");
+    let off = diag_fix(UsageDiag::KickSwitchGrade { auto_start: false }, "a");
+    assert_ne!(on, off, "the auto_start split must change the copy");
+    assert_eq!(on, "clauth is re-testing periodically");
+    assert_eq!(off, "won't recover with auto-start off, enable it");
+    // A non-switch-grade burst is neither — low-urgency backoff, no chain switch.
+    assert_eq!(
+        diag_fix(UsageDiag::KickBurst, "a"),
+        "claude code hit a burst limit"
+    );
+}
+
+/// The auth-broken fix names the exact re-login command for THIS profile, so the
+/// account name has to thread through (a generic "re-login" wouldn't).
+#[test]
+fn auth_broken_hint_names_the_profile() {
+    assert_eq!(
+        diag_fix(UsageDiag::AuthBroken, "kerry"),
+        "re-login with clauth login kerry"
+    );
+}
+
+/// The divergence must reach the rendered row, not just the pure formatter: drive
+/// the real `status_lines` dispatch (a kick pill + its `└`) with `auto_start`
+/// flipped and read the copy back — a fix that hard-coded one arm reds here too.
+#[test]
+fn status_lines_renders_the_auto_start_divergence() {
+    use crate::usage::KickBlock;
+    let now = now_epoch_secs();
+    let joined = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let render = |auto_start: bool| {
+        let mut profile = crate::testutil::blank_profile("a");
+        profile.fetch_status = Some(FetchStatus::Fresh);
+        joined(status_lines(
+            &profile,
+            &HeaderState {
+                is_active: false,
+                account_email: None,
+                activity: ProfileActivity::Idle,
+                next_refresh_ms: Some(now_ms() + 90_000),
+                tick: 0,
+                streaks: StreakCounts::default(),
+                kick_block: Some(KickBlock {
+                    streak: 2,
+                    rejected: true,
+                    until: Some(now + 4 * 60 * 60),
+                    next_retry: now + 30,
+                }),
+                diag: DiagFlags {
+                    auto_start,
+                    ..DiagFlags::default()
+                },
+            },
+            120,
+        ))
+    };
+    assert!(render(true).contains("clauth is re-testing periodically"));
+    assert!(render(false).contains("won't recover with auto-start off"));
+}
+
+/// A DANGER `uncapped` state outranks a spent budget on the same account — an
+/// uncapped ceiling can't be "raised to keep serving", so it takes the pill and
+/// suppresses the budget-spent one (the two never render together).
+#[test]
+fn uncapped_outranks_budget_spent_in_the_status_block() {
+    let joined = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Fresh);
+    let out = joined(status_lines(
+        &profile,
+        &HeaderState {
+            is_active: false,
+            account_email: None,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 90_000),
+            tick: 0,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            diag: DiagFlags {
+                spend_uncapped: true,
+                budget_spent: true,
+                ..DiagFlags::default()
+            },
+        },
+        120,
+    ));
+    assert!(out.contains("[ uncapped ]") && out.contains("mark an account last resort"));
+    assert!(
+        !out.contains("[ extra usage spent ]"),
+        "uncapped must suppress the extra-usage-spent pill: {out}"
+    );
+}
+
+/// Dead-first: an auth-broken account can't serve regardless of a standing kick
+/// block or spend state, so only the `[ auth broken ]` pill + its re-login hint
+/// render — the lesser pills are suppressed (mirrors `blocked_reason`'s ranking).
+#[test]
+fn auth_broken_suppresses_the_lesser_pills() {
+    use crate::usage::KickBlock;
+    let now = now_epoch_secs();
+    let joined = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.fetch_status = Some(FetchStatus::Cached);
+    let out = joined(status_lines(
+        &profile,
+        &HeaderState {
+            is_active: false,
+            account_email: None,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: Some(now_ms() + 90_000),
+            tick: 0,
+            streaks: StreakCounts {
+                rate_limit: 0,
+                refresh_fail: 3,
+            },
+            kick_block: Some(KickBlock {
+                streak: 2,
+                rejected: true,
+                until: Some(now + 4 * 60 * 60),
+                next_retry: now + 30,
+            }),
+            diag: DiagFlags {
+                auth_broken: true,
+                spend_uncapped: true,
+                ..DiagFlags::default()
+            },
+        },
+        120,
+    ));
+    assert!(
+        out.contains("[ auth broken ]") && out.contains("re-login with clauth login a"),
+        "the dead login leads: {out}"
+    );
+    assert!(
+        !out.contains("[ claude code blocked ]") && !out.contains("[ uncapped ]"),
+        "kick + spend pills are suppressed on a dead login: {out}"
+    );
+    assert!(
+        !out.contains("auth failing"),
+        "the confirmed pill supersedes the transient refresh-fail swap: {out}"
+    );
+    assert!(
+        !out.contains("[ cached ]") && !out.contains("refresh in"),
+        "the freshness/refresh line is moot on a dead login and stays suppressed: {out}"
+    );
+}
+
+/// Reproduces the screenshot bug: a dead login with no scheduled refresh and no
+/// maxed window used to fall through to the idle `up to date` dot, painting a
+/// reassuring state directly under the `[ auth broken ]` pill. Dead-first
+/// dominance returns after the pill + hint, so nothing idle leaks below.
+#[test]
+fn auth_broken_does_not_render_a_reassuring_idle_line() {
+    let joined = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let mut profile = crate::testutil::blank_profile("OmniRoute");
+    profile.fetch_status = None;
+    let out = joined(status_lines(
+        &profile,
+        &HeaderState {
+            is_active: false,
+            account_email: None,
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            diag: DiagFlags {
+                auth_broken: true,
+                ..DiagFlags::default()
+            },
+        },
+        120,
+    ));
+    assert!(
+        out.contains("[ auth broken ]") && out.contains("re-login with clauth login OmniRoute"),
+        "the dead login still leads with the pill + its re-login hint: {out}"
+    );
+    assert!(
+        !out.contains("up to date"),
+        "no idle dot may sit under a dead-login pill: {out}"
+    );
+}
+
+// ── Fork-only tests (codex engine, RESCUE, CLA-FEED, forecast, email column) ──
 
 #[test]
 fn usage_header_names_the_linked_account() {

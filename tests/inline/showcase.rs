@@ -38,7 +38,7 @@ fn showcase() {
 
 /// Redirect home into a tempdir so all disk ops land on scratch space.
 struct ShowcaseHome {
-    _home_lock: std::sync::MutexGuard<'static, ()>,
+    _home_lock: crate::lockorder::RankedGuard<'static, ()>,
     _tmp: TempDir,
 }
 
@@ -292,12 +292,13 @@ fn oauth_profile(
         models: Default::default(),
         fallback_threshold,
         weekly_threshold: None,
-        check_weekly: true,
-        check_scoped: true,
         last_resort: false,
         session_feed: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: Some(UsageInfo {
             plan: Some(PlanInfo {
@@ -331,12 +332,13 @@ fn api_profile(name: &str) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
-        check_weekly: true,
-        check_scoped: true,
         last_resort: false,
         session_feed: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -356,12 +358,13 @@ fn failed_profile(name: &str) -> Profile {
         models: Default::default(),
         fallback_threshold: Some(90.0),
         weekly_threshold: None,
-        check_weekly: true,
-        check_scoped: true,
         last_resort: false,
         session_feed: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: Some(FetchStatus::Failed),
@@ -591,7 +594,8 @@ fn seed_history_yields_burn_rates() {
 fn headless_showcase_renders() {
     // Home redirected into a tempdir + disk history seeded; held for the whole
     // fn so on_tick writes land on scratch. Acquired BEFORE App::new so no
-    // RankedMutex is ever held while taking the (untracked) HOME_TEST_LOCK.
+    // RankedMutex is ever held while taking HOME_TEST_LOCK, now the outermost
+    // rank — the lock-order check enforces that ordering.
     let _home = ShowcaseHome::new();
     let mut app = app::App::new(demo_config());
     seed_usage(&app);
@@ -834,7 +838,7 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Enter); // focus the detail pane
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
     assert!(app.config_draft.is_some());
-    press(&mut app, KeyCode::Down); // Name → AutoStart (OAuth row, now right below name)
+    press(&mut app, KeyCode::Down); // Name → AutoStart (OAuth row)
     press(&mut app, KeyCode::Down); // AutoStart → BaseUrl
     press(&mut app, KeyCode::Enter); // start capturing the field
     assert_eq!(
@@ -950,8 +954,7 @@ fn demo_data_drives_all_actions() {
     assert!(
         app.config_draft
             .as_ref()
-            .map(|d| d.armed_delete)
-            .unwrap_or(false),
+            .is_some_and(|d| d.armed_action == Some(app::ConfigRow::Delete)),
         "first ⏎ arms the delete row"
     );
     press(&mut app, KeyCode::Enter); // confirm
@@ -1036,8 +1039,7 @@ fn demo_data_drives_all_actions() {
     assert!(
         app.config_draft
             .as_ref()
-            .map(|d| d.armed_delete)
-            .unwrap_or(false)
+            .is_some_and(|d| d.armed_action == Some(app::ConfigRow::Delete))
     );
     press(&mut app, KeyCode::Enter); // confirm delete
     assert_eq!(

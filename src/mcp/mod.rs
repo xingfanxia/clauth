@@ -155,8 +155,8 @@ impl ClauthServer {
         description = "List all clauth profiles from disk cache (zero quota). Per profile: \
 `name`, `active` (is this the currently active profile), `provider` (`anthropic` or a recognised \
 third-party name), and `base_url` (endpoint URL, null for a default OAuth profile) identify it; \
-`tier` is the account plan label (e.g. `Max 5x`), null for a third-party/API-key profile or when \
-no plan data is cached yet; \
+`tier` is the account plan label (e.g. `Max 5x`, or `canceled` once the org's subscription is \
+dead), null for a third-party/API-key profile or when no plan data is cached yet; \
 `windows[]` carries the 5h, 7d, and per-model weekly (`7d <model>`) `{label, utilization_pct, \
 resets_at}` where `utilization_pct` is the percent of that window already USED (higher = less \
 headroom) and `resets_at` is ISO-8601; \
@@ -724,6 +724,12 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let target = config
         .find(opts.profile)
         .ok_or_else(|| format!("profile not found: {}", opts.profile))?;
+    // Mirrors `disable_profile`'s own live-session refusal from the other
+    // direction: that guard stops disabling a profile mid-session, this one
+    // stops opening a brand-new session on one already disabled.
+    if target.is_disabled() {
+        return Err(format!("profile is disabled: {}", opts.profile));
+    }
 
     if let Some(dir) = opts.cwd
         && !std::path::Path::new(dir).is_dir()

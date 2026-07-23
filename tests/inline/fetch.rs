@@ -486,6 +486,23 @@ fn short_label_drops_claude_prefix_and_keeps_max_multiplier() {
     assert_eq!(PlanTier::Unknown.short_label(), None);
 }
 
+/// A credential-less / no-claim profile must NOT fabricate a paid tier: `None`
+/// (and any unrecognized value) map to `Unknown`, not `Pro`. A real claim still
+/// resolves to its tier. Pins the "type Pro out of thin air" fix (issue #2's tell).
+#[test]
+fn from_subscription_type_defaults_to_unknown_not_pro() {
+    assert_eq!(PlanTier::from_subscription_type(None), PlanTier::Unknown);
+    assert_eq!(
+        PlanTier::from_subscription_type(Some("nonsense")),
+        PlanTier::Unknown
+    );
+    assert_eq!(PlanTier::from_subscription_type(Some("pro")), PlanTier::Pro);
+    assert_eq!(
+        PlanTier::from_subscription_type(Some("max")),
+        PlanTier::Max(None)
+    );
+}
+
 #[test]
 fn parses_z_suffix() {
     assert_eq!(iso_to_epoch_secs("2026-05-17T14:20:00Z"), Some(BASE_UTC));

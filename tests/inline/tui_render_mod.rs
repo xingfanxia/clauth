@@ -18,12 +18,13 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         models: Default::default(),
         fallback_threshold: Some(80.0),
         weekly_threshold: None,
-        check_weekly: true,
-        check_scoped: true,
         last_resort: false,
         session_feed: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: Some(UsageInfo {
             plan: None,
@@ -500,6 +501,7 @@ fn capture_name_caret_follows_edit_position() {
 
 #[test]
 fn status_selected_row_tint_spans_both_lines() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let config = AppConfig {
         state: AppState::default(),
         profiles: Vec::new(),
@@ -600,6 +602,55 @@ fn narrow_app() -> App {
         ..Default::default()
     });
     app
+}
+
+/// The usage tab's "weekly limit is spent" teach keys on the HARD cap, not
+/// the member line: 7d at 95 over a `weekly at 90` override is a switch
+/// trigger, not a spent week — teaching "spent" there claims a state the
+/// account isn't in. The override is what makes this discriminate: with no
+/// override the member line IS the cap, and a folding revision stays green.
+#[test]
+fn usage_weekly_teach_keys_on_the_hard_cap_not_the_member_line() {
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mk_app = |seven_day: f64| {
+        let mut p = crate::testutil::blank_profile("a");
+        p.weekly_threshold = Some(90.0);
+        // 5h spent (past its rotate threshold, live reset) so the `spent`
+        // pill — the teach's gate — renders at all.
+        p.usage = Some(UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: seven_day,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+            }),
+            ..UsageInfo::default()
+        });
+        p.fetch_status = Some(FetchStatus::Fresh);
+        let config = AppConfig {
+            state: AppState {
+                profiles: vec!["a".into()],
+                ..AppState::default()
+            },
+            profiles: vec![p],
+        };
+        let mut app = App::new(config);
+        app.tab = Tab::Usage;
+        app
+    };
+
+    let over_line = dump(&mk_app(95.0), 100, 40);
+    assert!(
+        !over_line.contains("weekly limit is spent"),
+        "95% over a 90 override still serves — no spent teach:\n{over_line}"
+    );
+    let at_cap = dump(&mk_app(100.0), 100, 40);
+    assert!(
+        at_cap.contains("weekly limit is spent"),
+        "the literal cap earns the teach:\n{at_cap}"
+    );
 }
 
 #[test]
@@ -874,13 +925,14 @@ fn bare(name: &str) -> Profile {
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: Some(95.0),
+        weekly_threshold: None,
         last_resort: false,
         session_feed: false,
         max_auto_spend: None,
-        bell_threshold: None,
-        weekly_threshold: None,
         check_weekly: true,
         check_scoped: true,
+        bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -926,11 +978,13 @@ fn fallback_selector_marks_a_blocked_member() {
 }
 
 // A typed threshold on a BLOCKED member must still place the native caret on the
-// `rotate at` row: the blocked-reason pill shifts every card row down by 2 (pill
-// + blank), and the cursor math has to follow. Compare against an unblocked edit.
+// `rotate at` row: the blocked-reason pill block shifts every card row down and
+// the cursor math has to follow. Asserted against the RENDERED row rather than a
+// fixed delta — the block's height moved once already (it grew a fix line), and
+// a delta test just re-derives the implementation's own arithmetic.
 #[test]
 fn fallback_edit_caret_follows_the_blocked_reason_pill() {
-    let caret_y = |auth_broken: &[&str]| -> u16 {
+    let check = |auth_broken: &[&str], label: &str| {
         let mut app = App::new(fallback_config(auth_broken));
         app.tab = Tab::Fallback;
         app.chain_cursor = 0; // member a
@@ -939,15 +993,20 @@ fn fallback_edit_caret_follows_the_blocked_reason_pill() {
         app.fallback_threshold_draft = Some(crate::tui::app::InputState::new("90"));
         let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
         term.draw(|f| super::draw(f, &app)).unwrap();
-        term.get_cursor_position().unwrap().y
+        let caret = term.get_cursor_position().unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let rendered_at = rows
+            .iter()
+            .position(|r| r.contains("rotate at"))
+            .unwrap_or_else(|| panic!("[{label}] rotate at renders:\n{}", rows.join("\n")));
+        assert_eq!(
+            caret.y as usize, rendered_at,
+            "[{label}] caret must sit on the rotate-at row (caret={}, row={rendered_at})",
+            caret.y
+        );
     };
-    let unblocked = caret_y(&[]);
-    let blocked = caret_y(&["a"]);
-    assert_eq!(
-        blocked,
-        unblocked + 2,
-        "the blocked-reason pill (2 rows) shifts the edit caret down (unblocked={unblocked}, blocked={blocked})"
-    );
+    check(&[], "unblocked");
+    check(&["a"], "blocked");
 }
 
 /// The Config and Setup panes rebuild their whole row list every frame into a

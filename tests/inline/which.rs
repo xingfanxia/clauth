@@ -16,12 +16,13 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
-        check_weekly: true,
-        check_scoped: true,
         last_resort: false,
         session_feed: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
+        disabled: false,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: format!("at-{name}"),
@@ -49,12 +50,13 @@ fn endpoint_profile(name: &str) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
-        check_weekly: true,
-        check_scoped: true,
         last_resort: false,
         session_feed: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -74,12 +76,13 @@ fn blank_profile(name: &str) -> Profile {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
-        check_weekly: true,
-        check_scoped: true,
         last_resort: false,
         session_feed: false,
         max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -297,6 +300,31 @@ fn unknown_started_profile_is_not_resolved() {
         resolve_profile(&config, Some(&live), true, Some("ghost")),
         None
     );
+}
+
+#[test]
+fn disabled_profile_is_never_resolved_even_on_a_stale_token_match() {
+    // A disabled profile's stored creds are left on disk untouched (disable
+    // only flips the flag), so a stale live file that still matches its
+    // refresh token must NOT surface it — disabled accounts are invisible to
+    // `which` regardless of which resolution tier would otherwise match.
+    let mut disabled = oauth_profile("acme", "rt-acme");
+    disabled.disabled = true;
+    let config = config_with(vec![disabled], None);
+    let live = live_oauth(Some("rt-acme"));
+    assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
+}
+
+#[test]
+fn disabled_profile_is_never_resolved_as_credential_less_active() {
+    // Belt-and-suspenders: even if a disabled profile were somehow still the
+    // active one (a pre-existing on-disk state from before this gate
+    // existed), `which` must not attribute the session to it.
+    let mut disabled = blank_profile("acme");
+    disabled.disabled = true;
+    let config = config_with(vec![disabled], Some("acme"));
+    let live = live_oauth(None);
+    assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
 }
 
 #[test]

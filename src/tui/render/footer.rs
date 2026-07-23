@@ -193,6 +193,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
             FallbackHint::DetailWeeklyAt => &[
                 ("↑↓", "row"),
+                ("+", "raise"),
+                ("-", "lower"),
                 ("↵", "type"),
                 ("a", "actions"),
                 ("?", "help"),

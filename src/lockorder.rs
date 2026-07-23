@@ -29,6 +29,10 @@
 //! with another tracked lock; they are ranked above the rest so that a future
 //! accidental nesting under any held lock still *increases* the rank rather than
 //! inverting it.
+//!
+//! Test builds prepend two `cfg(test)`-only ranks BELOW `Rotation` — the home
+//! and tier scaffolding locks — so a sandbox held for a whole test is outer to
+//! every production lock the code under test takes. See the `ranks!` block.
 
 use std::ops::{Deref, DerefMut};
 use std::sync::{LockResult, Mutex, PoisonError};
@@ -64,7 +68,9 @@ pub(crate) mod rank {
         ($($(#[$m:meta])* $name:ident = $value:literal;)*) => {$(
             $(#[$m])*
             pub(crate) enum $name {}
+            $(#[$m])*
             impl Sealed for $name {}
+            $(#[$m])*
             impl Rank for $name {
                 const VALUE: u16 = $value;
             }
@@ -72,6 +78,21 @@ pub(crate) mod rank {
     }
 
     ranks! {
+        // Test-only scaffolding locks, ranked OUTERMOST (below every production
+        // rank): the RAII sandboxes that hold them (`testutil::HomeSandbox` /
+        // `TierSandbox`, `showcase::ShowcaseHome`, runtime's `with_fake_home`)
+        // wrap the whole test, so the code under test still legally acquires any
+        // production lock inside them. Two ranks, not one, so a future test that
+        // needs both cannot invert them into a deadlock: acquire `HomeTest`
+        // before `TierTest`, both before any real lock.
+        /// `profile::HOME_TEST_LOCK` — serializes `home_dir()` redirects across
+        /// the threads a `cargo test` fallback shares.
+        #[cfg(test)]
+        HomeTest = 20;
+        /// `theme::TIER_TEST_LOCK` — serializes color-tier pins across those
+        /// same threads.
+        #[cfg(test)]
+        TierTest = 40;
         /// `RotationGuard` (per-profile rotation flock). Held across HTTP, outermost.
         Rotation = 100;
         /// Process-wide per-host request-spacing clock in `usage::fetch` (keyed by
@@ -204,7 +225,7 @@ pub(crate) struct RankedMutex<T, R: Rank> {
 }
 
 impl<T, R: Rank> RankedMutex<T, R> {
-    pub(crate) fn new(value: T) -> Self {
+    pub(crate) const fn new(value: T) -> Self {
         Self {
             inner: Mutex::new(value),
             _rank: std::marker::PhantomData,

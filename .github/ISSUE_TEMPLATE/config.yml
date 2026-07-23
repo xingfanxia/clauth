@@ -1,3 +1,4 @@
+# Blank issues stay disabled; the forms above (plus their agent variants) cover every case.
 blank_issues_enabled: false
 contact_links:
   - name: Security report
@@ -5,4 +6,7 @@ contact_links:
     about: Found a security issue? Report it privately instead of filing a public issue.
   - name: Question
     url: https://github.com/uwuclxdy/clauth#faq
-    about: Check the FAQ before filing — your question may already be answered.
+    about: Not sure it's a bug? Check the FAQ first; your question may already be answered.
+  - name: AI / agent contribution guide
+    url: https://github.com/uwuclxdy/clauth/blob/HEAD/.github/CONTRIBUTING.md#ai-and-agent-contributions
+    about: Contributing AI-assisted work, or filing on behalf of an operator? Read this first.

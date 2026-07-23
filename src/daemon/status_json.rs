@@ -194,15 +194,24 @@ fn auth_status_str(config: &AppConfig, p: &Profile, now_ms: i64) -> &'static str
 /// Build the full `status.json` body. `interval_ms` is the live refresh interval
 /// (daemon) or `config.state.refresh_interval_ms` (single-shot). `live` carries
 /// the scheduler's in-memory freshness/countdown stores when a daemon is running.
+/// `include_disabled` gates whether a user-disabled account appears in the
+/// `profiles` array at all — the daemon's own `status.json` feed always passes
+/// `false` (hidden by default); the single-shot `clauth status --json --all`/
+/// `--disabled` flag flips it to `true`. The active profile is ALWAYS kept, disabled or not: the
+/// top-level `active_profile` field names it unconditionally, and a reader
+/// following this contract resolves that name against `profiles[]` — hiding it
+/// there would leave `active_profile` dangling.
 pub(crate) fn build_status(
     config: &AppConfig,
     interval_ms: u64,
     live: Option<&LiveSignals>,
+    include_disabled: bool,
 ) -> serde_json::Value {
     let now = now_ms();
     let profiles: Vec<serde_json::Value> = config
         .profiles
         .iter()
+        .filter(|p| include_disabled || !p.is_disabled() || config.is_active(p.name.as_str()))
         .map(|p| {
             let name = p.name.as_str();
             // Freshness reads each profile's OWN cache: the third-party leg

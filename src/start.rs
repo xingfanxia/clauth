@@ -85,6 +85,12 @@ pub(crate) fn run(
     workspace: Option<&Path>,
     rescue_override: Option<bool>,
 ) -> Result<()> {
+    // Authoritative "never a live session for a disabled account" gate — every
+    // caller (`cmd_start`, `sessions_cli::run_resume`) inherits it here, before
+    // any side effect (runtime acquire, spawn). A wrapper's own pre-check is a
+    // friendly early error at best; this one can't be bypassed by adding a new
+    // caller that forgets to check.
+    crate::refuse_if_disabled(config, name)?;
     let profile = config.find(name).context("profile not found")?;
 
     // Strip the active profile's custom env from the inherited base so a

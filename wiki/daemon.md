@@ -14,12 +14,47 @@ stays the only resolution surface.
 ## Process model
 
 - **Singleton**: one advisory lock (`~/.clauth/clauthd.lock`) held for the
-  process lifetime. A second `clauth daemon` blocks in standby and takes over
-  the moment the holder exits; a dead holder's flock auto-releases, so a
-  supervisor (`launchd`/`systemd`) with restart-on-crash keeps exactly one
-  scheduler alive without pidfile bookkeeping. The TUI header's `● daemon` dot
-  reads this lock (presence) plus `status.json` freshness (green = fresh feed,
-  amber = stalling, hidden = no daemon) to show whether one is running.
+  process lifetime, with the holder's pid written to an unlocked sidecar
+  (`~/.clauth/clauthd.pid`) for `ps`-level diagnosis (informational: the flock,
+  never the number, is what proves presence). The pid stays out of the lock file
+  because Windows locks are mandatory, so a `--status` reader in another process
+  couldn't read bytes held inside the daemon's exclusive lock. A second `clauth daemon` exits 0 by
+  default (`already running (pid <n>)`), so a spawner that fires repeatedly
+  can't pile up idle daemons (#57). `--standby` opts into the take-over
+  behaviour: it parks and takes over the moment the holder exits, for a
+  supervisor's instance queueing behind a manually run one under launchd
+  `KeepAlive{SuccessfulExit=false}` (which never restarts a clean exit). That
+  standby queue is **one deep**: a second flock (`clauthd-standby.lock`) holds
+  the slot, any further instance exits. `--no-standby` is the default's explicit
+  spelling, kept for callers already passing it. A dead holder's flock auto-releases, so a
+  supervisor with restart-on-crash keeps exactly one scheduler alive without
+  pidfile bookkeeping. The TUI header's `● daemon` dot reads this lock
+  (presence) plus `status.json` freshness (green = fresh feed, amber = stalling,
+  hidden = no daemon) to show whether one is running.
+- **Asking before spawning**: `clauth daemon --status` prints
+  `running (pid <n>, feed fresh|stale[, standby waiting])` and exits 0 when a
+  daemon is up. No daemon: exit 1, nothing on stdout. It creates nothing, so a
+  menu-bar app or a wrapper script can gate its spawn on the exit code instead
+  of starting a process to find out. A lock file it cannot test at all (no
+  working `flock`, e.g. some NFS/CIFS mounts) is its own failure with the io
+  error attached, never an exit 1 that reads as "none running" and sends a
+  supervisor into a respawn loop. The header dot answers the same question by
+  hiding instead, which is why the two read the lock through different paths.
+  The default already exits the moment it loses the race, which suits the same
+  callers. `--standby` is the one to keep out of a pure supervisor unit: the
+  supervisor is the sole starter and wins the race alone, so a standby only earns
+  its keep when a manual run and a unit coexist.
+- **Replacing for an upgrade**: `clauth daemon --replace` terminates the running
+  daemon and takes over. It reads the holder's pid sidecar and confirms the pid
+  is still a running `clauth daemon` by its argv, so another clauth subcommand
+  sharing the binary name is never signalled. It SIGTERMs the holder and waits
+  for the flock to auto-release on death; on a timeout it escalates to SIGKILL,
+  then claims. A pid it can't confirm bails rather than signal blind.
+- **Probes take the lock they read**, briefly: both the header dot's
+  `daemon_health` and `--status` try-lock a free file and release it. A starting
+  daemon therefore re-tries a lost race (3 attempts, 100 ms apart) before it
+  accepts that another instance is up. A real holder keeps its lock for life, so
+  anything that clears on a retry was a reader.
 - **Watchdog**: a wedged tick can freeze the single-threaded loop. The
   cross-process state flock a tick may block on is capped at 25 s, so a
   flock-blocked tick times out and retries rather than hanging; if no tick
@@ -108,6 +143,7 @@ key**: names, tiers, percentages, timestamps only.
 | `profiles[].fallback` | `null` when not in the chain; else 1-based `position`, `threshold` (%), `armed` (this member is the active one the auto-switch watches). |
 | `profiles[].windows[]` | `label` is **derived, not an enum**: `"5h"` and `"7d"` always; the third is a plan-tier label (`"7d Opus"`…). Treat labels as opaque display strings, never keys to switch on. `utilization_pct` 0-100 float; `resets_at` nullable. |
 | `profiles[].third_party` | `{ "available": bool }` for api-key profiles once probed, else `null`, including an api-key profile whose provider has never been reached (no cache yet). Plain reachability; structured balances deliberately deferred. |
+| `profiles[]` membership | A user-disabled account (`clauth disable`) is excluded from `profiles[]` by default; no field marks a profile disabled, absence from the array IS the signal. The active profile is always present regardless of its own disabled flag, so `active_profile` never names a profile missing from `profiles[]`. |
 
 ### Evolution rule (the load-bearing part)
 
@@ -128,3 +164,9 @@ the single-shot form derives `fetch_status` from cache mtimes, so it only ever
 reports `Fresh`/`Cached`/`null`: a profile the live daemon shows as `Failed` or
 `RateLimited` reads as `Cached` here at the same instant. Poll the feed, not the
 CLI, when the fetch outcome matters.
+
+`clauth status --json --all` (or its `--disabled` spelling, equivalent) is the
+one way to reveal disabled accounts in `profiles[]`; the running daemon's own
+published `~/.clauth/status.json` file always hides them (every daemon-side
+`build_status` call passes `include_disabled: false`), so a reader that needs
+the disabled roster must shell out to the single-shot form, never poll the feed file for it.

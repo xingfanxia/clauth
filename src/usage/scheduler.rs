@@ -58,6 +58,13 @@ const RATE_LIMIT_BACKOFF_FACTOR: u64 = 3;
 /// to re-discover a recovered endpoint fast — before conceding to the ladder.
 pub(crate) const ACTIVE_CAP_MAX_STREAK: u32 = 6;
 
+/// Grace added past a 5h window's `resets_at` before the anchored post-reset
+/// poll fires. Anthropic's `/usage` can briefly lag the reset instant, so polling
+/// exactly at the boundary risks reading the pre-reset (still-100%) body. A single
+/// anchor, no retry loop — residual staleness beyond this grace is covered at
+/// render time (the `(now)` reset chip), not here.
+const RESET_ANCHOR_GRACE_MS: u64 = 15_000;
+
 /// Wall-clock instant in epoch-milliseconds. Distinct from [`IntervalMs`] so
 /// instants and spans can't be confused. `#[repr(transparent)]` keeps layout
 /// identical to the persisted `u64` in any `HashMap<String, u64>`.
@@ -657,6 +664,58 @@ fn memoized_identity<'a>(
     }
 }
 
+/// What the plain (pre-rotation) fetch result means for `fetch_with_rotation`.
+/// Produced by [`classify_pre_rotation`] — see its tests (`pre_rotation_*`) for
+/// the truth table live HTTP can't drive.
+#[derive(Debug)]
+enum PreRotationDecision {
+    /// Live API body — return straight from `fetch_with_rotation`. Boxed:
+    /// `UsageInfo` dwarfs every other variant here (clippy::large_enum_variant).
+    Serve(Box<UsageInfo>),
+    /// 429 on a still-valid token: a pure endpoint rate limit, not a token
+    /// problem — bail to cache. `plan` rides along: a canceled account's tier
+    /// flip is only ever observed through the `/profile` reading the fetch
+    /// took despite the 429.
+    BailRateLimited {
+        retry_after: Option<Duration>,
+        plan: Option<PlanInfo>,
+    },
+    /// 401, or a 429 on a clock-expired token (AUTH-1 unmask): fall through to
+    /// the rotation leg so a dead refresh token surfaces as `auth_broken`
+    /// rather than staying masked as `RateLimited`. `unmask_429` is `None` for
+    /// the 401 case; `Some` (the 429's retry-after) for the unmask case, so a
+    /// failed unmask keeps the deferral + streak (see [`rotation_bail_context`]).
+    /// The plan on the unmask arm rode a dead token and has no field here —
+    /// deliberately discarded, unlike `BailRateLimited`'s.
+    Rotate {
+        unmask_429: Option<Option<Duration>>,
+    },
+    /// Any other error: bail straight to disk cache.
+    BailCached,
+}
+
+/// Pure classification of the plain fetch's [`FetchError`] — no I/O, no clock
+/// read of its own. `token_clock_expired` is passed in ALREADY COMPUTED by the
+/// caller (see [`token_clock_expired`]) so pulling this branch logic out of
+/// `fetch_with_rotation` can't introduce a second, differently-timed
+/// `now_ms()` read.
+fn classify_pre_rotation(
+    result: Result<UsageInfo, FetchError>,
+    token_clock_expired: bool,
+) -> PreRotationDecision {
+    match result {
+        Ok(info) => PreRotationDecision::Serve(Box::new(info)),
+        Err(FetchError::RateLimited { retry_after, plan }) if !token_clock_expired => {
+            PreRotationDecision::BailRateLimited { retry_after, plan }
+        }
+        Err(FetchError::Status(401)) => PreRotationDecision::Rotate { unmask_429: None },
+        Err(FetchError::RateLimited { retry_after, .. }) => PreRotationDecision::Rotate {
+            unmask_429: Some(retry_after),
+        },
+        Err(_) => PreRotationDecision::BailCached,
+    }
+}
+
 /// Fetch + rotate + retry for one profile. On 401 — or a 429 on a clock-expired
 /// token (the AUTH-1 dead-login unmasking, see [`token_clock_expired`]) — refresh
 /// the OAuth pair, persist, retry once. A 429 on a still-valid token bails to disk
@@ -720,28 +779,23 @@ fn fetch_with_rotation(
     );
     let mut unmask_429: Option<Option<Duration>> = None;
     if !proactive {
-        match fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity)) {
-            Ok(info) => return FetchOutcome::live(name, info, None),
-            // 429 on a still-valid token: an endpoint rate limit, not a token problem —
-            // bail to cache (see `token_clock_expired`). The `/profile` reading the
-            // fetch took despite the 429 rides along so a canceled account's tier flip
-            // still lands (its `/usage` never stops 429ing).
-            Err(FetchError::RateLimited { retry_after, plan })
-                if !token_clock_expired(access_expires_at, now_ms() as i64) =>
-            {
+        let result = fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity));
+        // Read the clock AFTER the fetch resolves — `fetch_raw` is a blocking
+        // HTTP round-trip, so reading it earlier would classify a token whose
+        // expiry falls inside that window against a stale `now`. Read once,
+        // right here, and hand the bool to the pure classifier — never let it
+        // re-read `now_ms()` on its own timing.
+        let expired = token_clock_expired(access_expires_at, now_ms() as i64);
+        match classify_pre_rotation(result, expired) {
+            PreRotationDecision::Serve(info) => return FetchOutcome::live(name, *info, None),
+            PreRotationDecision::BailRateLimited { retry_after, plan } => {
                 return FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after)
                     .with_plan(plan);
             }
-            // 401, or a 429 on a clock-expired token (AUTH-1): fall through to the
-            // rotation leg so a dead refresh token surfaces as `auth_broken` rather
-            // than staying masked as `RateLimited`. The 429's endpoint-level
-            // context rides along so a failed unmask keeps the deferral + streak
-            // (see `rotation_bail_context`).
-            Err(FetchError::Status(401)) => {}
-            // Clock-expired 429: falls to rotation, which re-fetches `/profile` with
-            // the fresh token — the plan here rode a dead token, so discard it.
-            Err(FetchError::RateLimited { retry_after, .. }) => unmask_429 = Some(retry_after),
-            Err(_) => return FetchOutcome::cached(name, FetchStatus::Cached, None, None),
+            PreRotationDecision::Rotate { unmask_429: unmask } => unmask_429 = unmask,
+            PreRotationDecision::BailCached => {
+                return FetchOutcome::cached(name, FetchStatus::Cached, None, None);
+            }
         }
     }
 
@@ -1589,16 +1643,18 @@ fn mark_window_open(store: &UsageStore, name: &str, now_secs: i64) {
 /// older than one interval is seeded `Cached` and refreshed in the background on the
 /// first tick; one younger is `Fresh` and left be. A profile with no cache at all is
 /// left unseeded and unstamped, so the scheduler fetches it fresh on its first tick.
+/// `seed_names` is the display superset ([`collect_oauth_seed_names`], disabled
+/// included) — seeding a disabled profile's cache never adds it to the work-list.
 pub(crate) fn bootstrap_fetch(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
-    tokens: &[TokenEntry],
+    seed_names: &[String],
     interval_ms: u64,
 ) {
     let now = now_ms();
-    for entry in tokens {
-        try_seed_cache(store, status, last_fetched, &entry.name, now, interval_ms);
+    for name in seed_names {
+        try_seed_cache(store, status, last_fetched, name, now, interval_ms);
     }
 }
 
@@ -1709,11 +1765,14 @@ pub(crate) fn bootstrap_third_party(
 
 /// Collect api-key profiles for the third-party fetch leg: recognised providers
 /// (typed fetch) plus unrecognised api-key endpoints (generic discovery + scan).
+/// A disabled profile is excluded — it must never enter the scheduler's
+/// per-profile work list (no polling, no rotation).
 pub(crate) fn collect_third_party_entries(
     profiles: &[crate::profile::Profile],
 ) -> Vec<ThirdPartyEntry> {
     profiles
         .iter()
+        .filter(|p| !p.is_disabled())
         .filter_map(|p| {
             // CDX-1 invariant: codex profiles never enter an Anthropic fetch
             // leg, even if one somehow carries an api_key (see the inline
@@ -1738,14 +1797,15 @@ pub(crate) fn collect_third_party_entries(
 }
 
 /// Collect the OAuth profiles' token snapshots for the refresher's `TokenList`.
-/// Skips api-key/credential-less profiles (no `claudeAiOauth`). Snapshots the
-/// persisted quarantine flag so the poll partition can widen a flagged
-/// profile's cadence without a config lock. Shared by the TUI (`App::new` /
-/// `refresh_tokens`) and the headless `daemon`.
+/// Skips api-key/credential-less profiles (no `claudeAiOauth`) and disabled
+/// ones (`AppConfig::enabled_profiles`) — a disabled profile must never enter
+/// the scheduler's per-profile work list (no poll, no rotate, no auto-start
+/// kick). Snapshots the persisted quarantine flag so the poll partition can
+/// widen a flagged profile's cadence without a config lock. Shared by the TUI
+/// (`App::new` / `refresh_tokens`) and the headless `daemon`.
 pub(crate) fn collect_tokens(config: &crate::profile::AppConfig) -> Vec<TokenEntry> {
     config
-        .profiles
-        .iter()
+        .enabled_profiles()
         .filter_map(|p| {
             // CDX-1 invariant: codex profiles never enter the OAuth fetch leg
             // (their usage source is passive — CDX-2), even if one somehow
@@ -1763,6 +1823,31 @@ pub(crate) fn collect_tokens(config: &crate::profile::AppConfig) -> Vec<TokenEnt
                 auth_broken: config.is_auth_broken(&p.name),
             })
         })
+        .collect()
+}
+
+/// Profile names to SEED from on-disk usage caches at startup / standby: every
+/// OAuth-credentialed profile, **disabled ones included**. The startup seed is a
+/// DISPLAY concern (last-known tier / windows for the UI), so it is deliberately
+/// WIDER than [`collect_tokens`]'s work-list — a disabled profile is seeded so
+/// its cached numbers render, but it never enters the poll / rotate / auto-start
+/// work-list (that stays `collect_tokens`, enabled-only). This can't make a
+/// disabled profile pollable: seeding only loads a cache that already exists
+/// (`try_seed_cache` is a no-op otherwise), and no work-driving code enumerates
+/// the store's keys — every poll/rotate/switch decision sources its candidates
+/// from `state.tokens` or the disabled-filtered fallback chain, reading the
+/// store only per known name.
+pub(crate) fn collect_oauth_seed_names(config: &crate::profile::AppConfig) -> Vec<String> {
+    config
+        .profiles
+        .iter()
+        .filter(|p| {
+            p.credentials
+                .as_ref()
+                .and_then(|c| c.claude_ai_oauth.as_ref())
+                .is_some()
+        })
+        .map(|p| p.name.to_string())
         .collect()
 }
 
@@ -2240,6 +2325,44 @@ fn tick(state: &SchedulerState) {
             &mut oauth_due,
             &mut oauth_next,
             &forced,
+        );
+    }
+    // Fire-once post-reset poll: once a 5h window has reset (plus grace), force a
+    // single fetch so the overview drops the stale pre-reset reading instead of
+    // holding it until the natural cadence slot. After `drop_spent_oauth` so a
+    // lapsed spent window is re-polled here. Store/last_fetched/activity each read
+    // once, sequentially; a poisoned store or last_fetched skips anchoring, a
+    // poisoned activity fails safe to "exclude all" (matching `partition_due`).
+    let post_reset_resets: HashMap<String, u64> = match state.store.lock() {
+        Ok(store) => oauth_snapshot
+            .iter()
+            .filter_map(|e| Some((e.name.clone(), five_hour_reset_ms(store.get(&e.name)?)?)))
+            .collect(),
+        Err(_) => HashMap::new(),
+    };
+    if !post_reset_resets.is_empty()
+        && let Ok(last_guard) = state.last_fetched.lock()
+    {
+        let last_fetched = last_guard.clone();
+        drop(last_guard);
+        let excluded: HashSet<String> = match state.activity.lock() {
+            Ok(a) => a
+                .iter()
+                .filter(|(_, v)| {
+                    matches!(v, ProfileActivity::Refreshing | ProfileActivity::Switching)
+                })
+                .map(|(n, _)| n.clone())
+                .collect(),
+            Err(_) => oauth_snapshot.iter().map(|e| e.name.clone()).collect(),
+        };
+        anchor_post_reset_oauth(
+            &oauth_snapshot,
+            &post_reset_resets,
+            &last_fetched,
+            &excluded,
+            &mut oauth_due,
+            &mut oauth_next,
+            now,
         );
     }
     let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
@@ -2918,6 +3041,13 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         .lock()
         .map(|t| t.clone())
         .unwrap_or_default();
+    // Seed the DISPLAY superset (disabled included) so a stood-down TUI shows a
+    // disabled account's cached numbers; the work-list stays `oauth_snapshot`.
+    let oauth_seed_names = state
+        .config
+        .lock()
+        .map(|cfg| collect_oauth_seed_names(&cfg))
+        .unwrap_or_default();
 
     hydrate_from_daemon_caches(
         &state.store,
@@ -2925,7 +3055,7 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         &state.third_party_usage_store,
         &state.third_party_status,
         &state.last_fetched,
-        &oauth_snapshot,
+        &oauth_seed_names,
         &tp_snapshot,
         interval_ms,
     );
@@ -2993,13 +3123,13 @@ fn hydrate_from_daemon_caches(
     tp_store: &ThirdPartyUsageStore,
     tp_status: &ThirdPartyStatusStore,
     last_fetched: &LastFetchedAt,
-    oauth: &[TokenEntry],
+    oauth_seed_names: &[String],
     third_party: &[ThirdPartyEntry],
     interval_ms: u64,
 ) {
     let now = now_ms();
-    for entry in oauth {
-        try_seed_cache(store, status, last_fetched, &entry.name, now, interval_ms);
+    for name in oauth_seed_names {
+        try_seed_cache(store, status, last_fetched, name, now, interval_ms);
     }
     bootstrap_third_party(tp_store, tp_status, last_fetched, third_party, interval_ms);
 }
@@ -3026,6 +3156,18 @@ pub(crate) fn spawn_refresher(
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
 ) {
+    // Seed kick blocks from the per-profile cache files on the CALLING thread
+    // so a restart mid-outage resumes the decayed retry clock instead of
+    // hammering. Must happen here, not inside the spawned closure below:
+    // nothing joins that thread, so a home-derived path resolved on it could
+    // outlive a test's `HOME_OVERRIDE` and read the operator's real home. See
+    // the 2026-06-06 convention in docs/internals.md.
+    let names: Vec<String> = tokens
+        .lock()
+        .map(|t| t.iter().map(|e| e.name.clone()).collect())
+        .unwrap_or_default();
+    sync_kick_blocks_from_cache(&kick_blocks, &names);
+
     let state = SchedulerState {
         config,
         tokens,
@@ -3050,18 +3192,17 @@ pub(crate) fn spawn_refresher(
         codex_standby: std::sync::Mutex::new(CodexStandbyPacing::default()),
         codex_poll: std::sync::Mutex::new(CodexPollPacing::default()),
     };
+    // Same test-skip rationale as the status/tokens/pricing workers in
+    // `tui/app.rs`: a detached tick thread is never joined, so it could run
+    // `tick()` — which itself resolves home-derived paths and makes network
+    // calls — after a test's `HOME_OVERRIDE` sandbox has already unwound.
+    if cfg!(test) {
+        return;
+    }
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
     std::thread::Builder::new()
         .name("clauth-tick".into())
         .spawn(move || {
-            // Seed kick blocks from the per-profile cache files so a restart
-            // mid-outage resumes the decayed retry clock instead of hammering.
-            let names: Vec<String> = state
-                .tokens
-                .lock()
-                .map(|t| t.iter().map(|e| e.name.clone()).collect())
-                .unwrap_or_default();
-            sync_kick_blocks_from_cache(&state.kick_blocks, &names);
             loop {
                 if state.shutting_down.load(Ordering::SeqCst) {
                     break;
@@ -3282,8 +3423,13 @@ fn scan_recovery(
         cfg.state
             .fallback_chain
             .iter()
-            // AUTH-1: never recover into an auth-broken member (dead token).
-            .filter(|name| !cfg.is_auth_broken(name))
+            // A disabled or auth-broken member is not a recovery target. Shares
+            // `fallback::walk_excluded` with `next_target`/`fully_clear_target`
+            // so the skip list can't drift; canceled is caught store-side inside
+            // `find_recovered_member` (this walk's `Profile.usage` is stale
+            // headless, so the config-plan `is_canceled` the selection walks use
+            // would read empty here).
+            .filter(|name| !crate::fallback::walk_excluded(&cfg, name))
             .map(|name| {
                 let profile = cfg.find(name);
                 crate::fallback::ChainMember {
@@ -3476,6 +3622,67 @@ fn spent_skip_set(
         })
         .map(|entry| entry.name.clone())
         .collect()
+}
+
+/// Epoch-ms of a profile's 5h window reset, when it carries a parseable
+/// `resets_at`. `None` for a windowless or unparseable snapshot.
+fn five_hour_reset_ms(info: &UsageInfo) -> Option<u64> {
+    let secs = info
+        .five_hour
+        .as_ref()?
+        .resets_at
+        .as_deref()
+        .and_then(iso_to_epoch_secs)?;
+    u64::try_from(secs).ok().and_then(|s| s.checked_mul(1000))
+}
+
+/// Fire-once post-reset predicate: `true` when this profile's latest fetch
+/// predates its 5h window reset (`last_fetched_ms < resets_at_ms`, so the
+/// utilization we hold is the stale pre-reset reading) AND the reset has since
+/// passed with `grace_ms` to spare. Self-limiting: the forced fetch stamps
+/// `last_fetched` past the reset, flipping `last < resets` false until the NEXT
+/// reset, so it never doubles the natural cadence. `grace_ms` covers `/usage`
+/// briefly lagging the reset instant.
+fn should_anchor_fetch(
+    resets_at_ms: Option<u64>,
+    last_fetched_ms: u64,
+    now_ms: u64,
+    grace_ms: u64,
+) -> bool {
+    resets_at_ms.is_some_and(|r| last_fetched_ms < r && now_ms >= r.saturating_add(grace_ms))
+}
+
+/// Force a single post-reset poll for every OAuth profile whose 5h window reset
+/// has passed since its last fetch (see [`should_anchor_fetch`]), so the overview
+/// leaves the stale pre-reset reading instead of holding it until the natural
+/// cadence slot. Skips `Refreshing`/`Switching` (`excluded`, the same set
+/// [`partition_due`] drops) and any name already `due`. A scheduled name's
+/// countdown is stamped to `now_ms` (fetching now), mirroring [`merge_forced`].
+/// Decomposed args (no [`SchedulerState`]) so the due decision tests directly.
+fn anchor_post_reset_oauth(
+    snapshot: &[TokenEntry],
+    resets: &HashMap<String, u64>,
+    last_fetched: &HashMap<String, EpochMs>,
+    excluded: &HashSet<String>,
+    due: &mut Vec<TokenEntry>,
+    next: &mut HashMap<String, u64>,
+    now_ms: u64,
+) {
+    for entry in snapshot {
+        if excluded.contains(&entry.name) || due.iter().any(|d| d.name == entry.name) {
+            continue;
+        }
+        let last = last_fetched.get(&entry.name).map_or(0, |e| e.as_millis());
+        if should_anchor_fetch(
+            resets.get(&entry.name).copied(),
+            last,
+            now_ms,
+            RESET_ANCHOR_GRACE_MS,
+        ) {
+            next.insert(entry.name.clone(), now_ms);
+            due.push(entry.clone());
+        }
+    }
 }
 
 /// Clear any forced name that no leg scheduled this tick — its profile vanished

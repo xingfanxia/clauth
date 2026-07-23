@@ -2482,3 +2482,347 @@ fn noninteractive_switch_dispatches_codex_targets() {
     let live = crate::codex::read_live().unwrap().expect("live");
     assert!(String::from_utf8_lossy(&live).contains("at-alpha"));
 }
+
+// ── Upstream v0.13 tests (daemon singleton modes, disable, #58 final) ──────
+
+/// A clauth-owned symlink in the live slot is never "unsaved credentials":
+/// capturing a long-lived `setup-token` sidecar for the ACTIVE profile flips its
+/// install source from `credentials.json` to `session-token.json`, so the live
+/// symlink — still pointing at the old `credentials.json` store — classifies
+/// Diverged, yet re-pointing it on the next switch loses no login. The queued
+/// switch must PROCEED; deferring failed every unattended switch "unsaved
+/// credentials" until its retry TTL (observed live 2026-07-21 on the macOS fork).
+#[cfg(unix)]
+#[test]
+fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    // The live slot is clauth's own symlink into alpha's rotating store — clean.
+    link_active_clean("alpha");
+    // A long-lived session token appears for alpha (no refresh token → never
+    // rotates), flipping its install source to session-token.json while the live
+    // symlink still points at credentials.json — classify now reads Diverged
+    // though the symlink holds nothing unsaved.
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat-alpha".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let alpha_dir = crate::profile::profile_dir("alpha").expect("alpha dir");
+    std::fs::write(
+        alpha_dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("serialize sidecar"),
+    )
+    .expect("write session-token sidecar");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 120_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "a clauth-owned symlink holds nothing unsaved — the switch must proceed"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the executed switch leaves nothing queued"
+    );
+}
+
+/// The macOS steady-state twin of the test above, and the round-2 finding: after
+/// a switch, Claude Code rewrites the live slot as a REGULAR-FILE mirror of the
+/// Keychain, clobbering the symlink. The sidecar flip then makes classify read
+/// Diverged over that regular file — but its login is alpha's saved
+/// `credentials.json`, so the queued switch must still PROCEED. A
+/// symlink-identity exemption reads the regular file as unsaved and defers here;
+/// the content-based `live_login_is_stored` clears it. No `#[cfg(unix)]` — a
+/// regular-file mirror is exactly the shape a Linux CI can pin for macOS.
+#[test]
+fn drain_pending_switch_proceeds_over_a_macos_regular_file_mirror() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    // CC's regular-file mirror: alpha's stored login, written as a plain file
+    // (not our symlink), holding the SAME access token as alpha's credentials.json.
+    let dir = claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.claude");
+    std::fs::write(
+        dir.join(".credentials.json"),
+        serde_json::to_vec(&oauth_creds("at-alpha")).expect("serialize mirror"),
+    )
+    .expect("write regular-file mirror");
+    // The sidecar flips alpha's install source to session-token.json; the mirror
+    // now classifies Diverged though its login is fully saved.
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat-alpha".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let alpha_dir = crate::profile::profile_dir("alpha").expect("alpha dir");
+    std::fs::write(
+        alpha_dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("serialize sidecar"),
+    )
+    .expect("write session-token sidecar");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 120_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "a regular-file mirror of a saved login holds nothing unsaved — the switch must proceed"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the executed switch leaves nothing queued"
+    );
+}
+
+/// The give-up TTL closes the retry loop even when the last backoff step
+/// reaches past it: with backoff state whose `not_before` is beyond
+/// `retry_until`, the next drain must give up (drop the target, clear the
+/// backoff) — not keep requeueing until `not_before` finally elapses.
+#[test]
+fn backoff_gate_gives_up_when_the_retry_window_closes() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("home", "at-home"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("home"),
+        90_000,
+    );
+    link_active_clean("home");
+    let mut daemon = daemon_for(config);
+
+    let now = now_ms();
+    daemon.switch_backoff.insert(
+        crate::profile::Harness::Claude,
+        super::SwitchBackoff {
+            target: "beta".into(),
+            attempts: 9,
+            // Capped backoff step reaches PAST the retry window's edge.
+            not_before: now + 60_000,
+            reason: "target is mid-fetch".into(),
+        },
+    );
+    // Fork model: the give-up TTL lives on the QUEUE ENTRY, not the backoff.
+    stage_switch(&daemon, "beta", Origin::Scheduler, now.saturating_sub(1));
+
+    daemon.drain_pending_switch();
+
+    assert!(
+        !daemon
+            .switch_backoff
+            .contains_key(&crate::profile::Harness::Claude),
+        "a closed retry window clears the backoff state"
+    );
+    assert!(
+        queued_targets(&daemon).is_empty(),
+        "the expired target is dropped, not requeued"
+    );
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("home"),
+        "no switch is attempted past the window"
+    );
+}
+
+// ── uncapped_spenders (boot-time warning's pure collection) ───────────────────
+
+/// A disabled member is never spend-armed by the walk, so it must never be
+/// named in the "can spend with no cap" warning — only a live, enabled
+/// uncapped sibling should surface.
+#[test]
+fn uncapped_spenders_excludes_disabled_includes_enabled_sibling() {
+    let mut disabled = blank_profile("off");
+    disabled.max_auto_spend = Some(5.0);
+    disabled.disabled = true;
+    let mut enabled = blank_profile("on");
+    enabled.max_auto_spend = Some(5.0);
+
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["off".into(), "on".into()],
+            spend_budget_switching: true,
+            switch_off_when_budget_spent: false,
+            ..AppState::default()
+        },
+        profiles: vec![disabled, enabled],
+    };
+
+    let names = super::uncapped_spenders(&config);
+    assert!(
+        !names.contains(&"off"),
+        "a disabled member must never be named as an uncapped spender"
+    );
+    assert!(
+        names.contains(&"on"),
+        "an enabled uncapped sibling must still be named"
+    );
+}
+
+/// The standby arm tightens the tree BEFORE it parks, never after the takeover.
+/// launchd creates `daemon.log` at the umask (0o644) before exec and a park is
+/// unbounded in time, so a walk deferred to the promotion leaves a
+/// world-readable log naming accounts for the whole wait.
+#[cfg(unix)]
+#[test]
+fn stand_by_tightens_the_tree_before_parking_not_after_promotion() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // A loose dir standing in for the log: the pre-park walk tightens it.
+    let loose = dir.join("loose");
+    std::fs::create_dir_all(&loose).expect("mkdir loose");
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // Stand in for the running daemon so the claim below really parks.
+    let held = crate::profile::open_state_file(&dir.join(super::LOCK_FILE)).expect("open lock");
+    held.try_lock().expect("hold the singleton lock");
+
+    let super::Claim::Standby(slot) = super::claim_singleton(&dir, true).expect("claim") else {
+        panic!("the second instance takes the one standby slot");
+    };
+    let parked = std::thread::spawn({
+        let dir = dir.clone();
+        move || super::stand_by(&dir, slot)
+    });
+
+    let mode = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .expect("stat loose")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mode(&loose) != 0o700 {
+        assert!(
+            !parked.is_finished(),
+            "stand_by returned instead of parking"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the tree stayed 0o755 across 5s of parking: the walk runs only after the promotion, \
+             so a standby's whole wait sits in a world-readable tree"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // Holder exits → the standby takes over.
+    drop(held);
+    let promoted = parked
+        .join()
+        .expect("stand_by thread")
+        .expect("the standby promotes once the holder exits");
+    drop(promoted);
+}
+
+/// A `clauth daemon` that loses the singleton race must exit having touched
+/// nothing shared. The pile-up in #57 was 25 of these, each having already run
+/// the runtime GC and the tree-wide chmod walk against the live daemon's state
+/// before parking forever.
+#[test]
+fn a_redundant_instance_exits_without_touching_the_shared_tree() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    // A runtime tree with no live session: `gc_stale_runtimes` deletes it.
+    let ghost = dir.join("profiles").join("ghost").join("runtime");
+    std::fs::create_dir_all(&ghost).expect("mkdir ghost runtime");
+    // A loose dir: `migrate_clauth_perms_700` tightens it to 0o700.
+    let loose = dir.join("loose");
+    std::fs::create_dir_all(&loose).expect("mkdir loose");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    // Stand in for the running daemon: hold the singleton lock for the call.
+    let held = crate::profile::open_state_file(&dir.join(super::LOCK_FILE)).expect("open lock");
+    held.try_lock().expect("hold the singleton lock");
+
+    super::serve(super::StartMode::ExitIfRunning).expect("a redundant instance exits clean");
+
+    assert!(
+        ghost.exists(),
+        "the redundant instance ran the runtime GC against the live daemon's tree"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&loose)
+            .expect("stat loose")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "the redundant instance walked the tree's modes before exiting"
+        );
+    }
+}
+
+/// The default's redundant line names the holder's pid so a `ps` dump ties back
+/// to it; `--standby` reports a full queue instead. Pins the operator-facing
+/// wording (`serve` logs it and exits, which a test can't easily capture).
+#[test]
+fn redundant_reason_names_the_pid_for_the_default_and_the_queue_for_standby() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    // No pid sidecar staged: the default still reads "already running", pid unknown.
+    let default = super::redundant_reason(super::StartMode::ExitIfRunning);
+    assert!(
+        default.starts_with("already running (pid "),
+        "the default's redundant reason must read 'already running (pid …)', got {default:?}"
+    );
+
+    // With a pid stamped, it surfaces the number.
+    std::fs::write(dir.join(super::PID_FILE), "4242\n").expect("stamp pid");
+    let with_pid = super::redundant_reason(super::StartMode::ExitIfRunning);
+    assert!(
+        with_pid.contains("4242"),
+        "the default's redundant reason must name the holder pid, got {with_pid:?}"
+    );
+
+    let standby = super::redundant_reason(super::StartMode::Standby);
+    assert!(
+        standby.contains("standby"),
+        "the --standby redundant reason must mention the full queue, got {standby:?}"
+    );
+}

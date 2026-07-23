@@ -11,16 +11,20 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete which status daemon doctor sessions resume info feed completions" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable which sessions resume info daemon status doctor mcp feed proxy fallback completions --theme" -- "${cur}") )
+    elif [ "$prev" = "--theme" ]; then
+        COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--base-url --api-key --model --new --codex --browser --setup-token --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated --rescue --no-rescue" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status" -- "${cur}") )
     elif [ "$prev" = "--isolated" ] || [ "$prev" = "--profile" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "delete" ]; }; then
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "delete" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ]; }; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
@@ -34,6 +38,10 @@ const BASH: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y --force" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "disable" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "status" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--json --all --disabled" -- "${cur}") )
     fi
     return 0
 }
@@ -50,17 +58,24 @@ _clauth() {
             'start[launch claude with that profile]' \
             'login[log in via browser OAuth or an API key]' \
             'delete[remove a profile and its credentials]' \
+            'disable[hide a profile from auto-switch and usage polling]' \
+            'enable[restore a disabled profile]' \
             'which[print profile owning the loaded credentials]' \
             'status[print the usage / auto-switch snapshot]' \
             'daemon[run the headless scheduler (no TUI)]' \
             'doctor[read-only health check of the daemon + macOS wiring]' \
             'feed[feed the session token from the usage chain (on|off)]' \
-            'completions[print or install shell completions]'
+            'proxy[run the codex injection proxy]' \
+            'fallback[edit the auto-switch fallback chains]' \
             'sessions[list Claude Code sessions (add --json)]' \
             'resume[resume a session under a chosen profile]' \
             'info[print resume command + storage path for a session]' \
-            'completions[emit shell completion script]'
-    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|delete) ]]; then
+            'mcp[run the stdio MCP server]' \
+            'completions[print or install shell completions]'
+        _values 'option' '--theme[force a color depth instead of auto-detecting]'
+    elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
+        _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|delete|disable|enable) ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
@@ -87,6 +102,16 @@ _clauth() {
         _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--model[set the default model before signing in]' '--new[refuse to touch an existing profile]' '--codex[codex profile: capture the current codex login]' '--browser[codex profile: fresh browser sign-in]' '--setup-token[capture a claude setup-token mint as a long-lived login]' '--yes[replace an existing long-lived token unprompted]' '-y[replace an existing long-lived token unprompted]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == disable ]]; then
+        _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
+    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == daemon ]]; then
+        _values 'flag' \
+            '--standby[wait and take over when the running daemon exits]' \
+            '--no-standby[explicit spelling of the default]' \
+            '--replace[terminate the running daemon and take over]' \
+            '--status[print the running daemon, or exit 1 when none is]'
+    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == status ]]; then
+        _values 'flag' '--json[print the status snapshot as JSON]' '--all[also list disabled profiles]' '--disabled[also list disabled profiles]'
     fi
 }
 _clauth "$@"
@@ -100,11 +125,15 @@ complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profi
 complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
 complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
 complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
+complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
+complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
 complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot"
 complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler (no TUI)"
 complete -c clauth -f -n __fish_is_first_token -a doctor -d "Read-only health check of the daemon + macOS wiring"
 complete -c clauth -f -n __fish_is_first_token -a feed -d "Feed the session token from the usage chain (on|off)"
+complete -c clauth -f -n __fish_is_first_token -a proxy -d "Run the codex injection proxy"
+complete -c clauth -f -n __fish_is_first_token -a fallback -d "Edit the auto-switch fallback chains"
 complete -c clauth -f -n __fish_is_first_token -a completions -d "Print or install shell completions"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login delete" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
@@ -113,6 +142,11 @@ complete -c clauth -f -n "__fish_seen_subcommand_from completions" -a "bash zsh 
 complete -c clauth -f -n __fish_is_first_token -a sessions -d "List Claude Code sessions"
 complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session under a chosen profile"
 complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
+complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
+complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
+complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
+complete -c clauth -f -n "__fish_seen_subcommand_from start login delete disable enable" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --rescue -d "Isolated only: lift transcripts + sidecars into the global store"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --no-rescue -d "Isolated only: discard the isolated store"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
@@ -129,6 +163,15 @@ complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --browser -d "Co
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --force -d "Override the live-session guard"
+complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a --yes -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a -y -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --json -d "Print the status snapshot as JSON"
+complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --all -d "Also list disabled profiles"
+complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --disabled -d "Also list disabled profiles"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --standby -d "Wait and take over when the running daemon exits"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --no-standby -d "Explicit spelling of the default"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --replace -d "Terminate the running daemon and take over"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --status -d "Print the running daemon, or exit 1 when none is"
 "#;
 
 pub(crate) fn print_script(shell: &str) -> Result<()> {

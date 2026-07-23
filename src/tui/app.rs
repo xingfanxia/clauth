@@ -53,8 +53,8 @@ use crate::usage::{
     ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
     UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
-    collect_third_party_entries, collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher,
-    switch_gate_in_flight,
+    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle, mark_activity,
+    now_ms, spawn_refresher, switch_gate_in_flight,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -198,6 +198,9 @@ pub(crate) enum FallbackRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigRow {
     Name,
+    /// OAuth-only auto-start toggle. `config_rows` renders it in the second
+    /// slot (right below `Name`); declared here so the enum tracks that order.
+    AutoStart,
     BaseUrl,
     ApiKey,
     /// Default model (CC `model` setting). Hybrid: space cycles aliases, ⏎ types a custom value.
@@ -218,12 +221,18 @@ pub(crate) enum ConfigRow {
     EnvEntry(usize),
     /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
-    AutoStart,
     /// Browser OAuth login: mint fresh tokens into this account (or, on the
     /// `+ new` form, create the account from the login). Async — runs on a worker.
     Login,
     /// Drop this account's stored OAuth credentials, keeping the profile shell.
     DeleteCreds,
+    /// User-disabled account-action row (`Profile::disabled`, see
+    /// `docs/internals.md`), same class as `Delete`: enabling fires the shared
+    /// `actions::enable_profile` immediately (harmless), disabling arms on the
+    /// first Space/⏎ and confirms on the second, via `actions::disable_profile`.
+    /// Dimmed and inert while the account is active or holds a live `clauth
+    /// start` session — the same gate the CLI enforces.
+    Disabled,
     Delete,
     Create,
 }
@@ -352,8 +361,11 @@ pub(crate) struct ConfigDraft {
     pub(crate) env_new_key: InputState,
     /// `Some(row)` while a text row (or the `model` custom field) owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
-    /// First ⏎ on delete arms it; second confirms. Any cursor move disarms.
-    pub(crate) armed_delete: bool,
+    /// The account-action row (`Delete`, or `Disabled` in the disable
+    /// direction only — enabling is immediate, never armed) currently armed by
+    /// a first ⏎; a second ⏎ on that same row confirms. Any cursor move, or
+    /// the confirm itself, disarms back to `None`.
+    pub(crate) armed_action: Option<ConfigRow>,
     /// API-account re-login is in flight: committing the base-url field advances
     /// to the api-key field (re-enter both, mirroring `login --base-url --api-key`)
     /// instead of ending the edit. Cleared on the api-key commit or any ⎋.
@@ -385,10 +397,11 @@ impl ConfigDraft {
             ConfigRow::SubagentModel => &self.subagent_model,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
-            ConfigRow::EnvEntry(_)
+            ConfigRow::AutoStart
+            | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::ModelOverrideAdd
-            | ConfigRow::AutoStart
+            | ConfigRow::Disabled
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
             | ConfigRow::Delete
@@ -408,10 +421,11 @@ impl ConfigDraft {
             ConfigRow::SubagentModel => &mut self.subagent_model,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
-            ConfigRow::EnvEntry(_)
+            ConfigRow::AutoStart
+            | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::ModelOverrideAdd
-            | ConfigRow::AutoStart
+            | ConfigRow::Disabled
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
             | ConfigRow::Delete
@@ -642,6 +656,8 @@ pub(crate) enum ActionMenuAction {
     EditMaxSpend,
     RemoveMember,
     // Config detail actions (proxied through run_config_row)
+    DisableProfile,
+    EnableProfile,
     ToggleAutoStart,
     DeleteProfile,
     CreateProfile,
@@ -743,12 +759,14 @@ impl ActionMenuAction {
             Self::ReorderUp => "reorder up",
             Self::ReorderDown => "reorder down",
             Self::EditThreshold => "edit threshold",
-            Self::EditWeeklyAt => "edit weekly line",
+            Self::EditWeeklyAt => "edit weekly at",
             Self::ToggleCheckWeekly => "toggle weekly gate",
             Self::ToggleCheckScoped => "toggle scoped gate",
             Self::ToggleLastResort => "toggle last resort",
             Self::EditMaxSpend => "edit max auto-spend",
             Self::RemoveMember => "remove member",
+            Self::DisableProfile => "disable account",
+            Self::EnableProfile => "enable account",
             Self::ToggleAutoStart => "toggle auto-start",
             Self::DeleteProfile => "delete account",
             Self::CreateProfile => "create account",
@@ -1802,10 +1820,15 @@ impl App {
                 let _ = link_profile_credentials(&active);
             }
 
-            let (snapshot, third_party) = {
+            // `seed_names` is the display superset (disabled included) for the
+            // cache seed; `snapshot` is the enabled-only work-list that drives
+            // the `Queued` marking below — a disabled profile is seeded but never
+            // queued for a fetch it will never get.
+            let (seed_names, snapshot, third_party) = {
                 #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
                 let cfg = config.lock().expect("config mutex poisoned");
                 (
+                    collect_oauth_seed_names(&cfg),
                     collect_tokens(&cfg),
                     collect_third_party_entries(&cfg.profiles),
                 )
@@ -1815,7 +1838,7 @@ impl App {
                 &usage_store,
                 &usage_status,
                 &last_fetched,
-                &snapshot,
+                &seed_names,
                 interval_ms,
             );
             bootstrap_third_party(
@@ -2122,23 +2145,28 @@ impl App {
         if let Ok(fresh) = load_config() {
             *self.config() = fresh;
             self.last_reload_fp = current;
-            let names: Vec<String> = {
+            // Collect under the config guard, then DROP it before locking the
+            // token mutexes — TOKENS/THIRD_PARTY rank OUTSIDE CONFIG, so writing
+            // them while config is held inverts the global lock order (same shape
+            // as `refresh_tokens`).
+            let (tokens, third_party, names) = {
                 let cfg = self.config();
-                #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-                {
-                    *self
-                        .usage_tokens
-                        .lock()
-                        .expect("usage_tokens mutex poisoned") = collect_tokens(&cfg);
-                    *self
-                        .third_party_tokens
-                        .lock()
-                        .expect("third_party_tokens mutex poisoned") =
-                        collect_third_party_entries(&cfg.profiles);
-                }
-                cfg.profiles.iter().map(|p| p.name.to_string()).collect()
+                let tokens = collect_tokens(&cfg);
+                let third_party = collect_third_party_entries(&cfg.profiles);
+                let names: Vec<String> = cfg.profiles.iter().map(|p| p.name.to_string()).collect();
+                (tokens, third_party, names)
             };
-            // Sidecar reads happen with the config guard dropped (above scope).
+            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+            {
+                *self
+                    .usage_tokens
+                    .lock()
+                    .expect("usage_tokens mutex poisoned") = tokens;
+                *self
+                    .third_party_tokens
+                    .lock()
+                    .expect("third_party_tokens mutex poisoned") = third_party;
+            }
             self.session_tokens = collect_session_tokens(&names);
             true
         } else {
@@ -2409,6 +2437,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         && app.fallback_max_spend_draft.is_some()
     {
         handle_fallback_max_spend_edit_key(app, key);
+        return;
+    }
+
+    // Same for the per-member `weekly at` override editor.
+    if app.tab == Tab::Fallback
+        && app.fallback_focus == FallbackFocus::Detail
+        && app.fallback_weekly_draft.is_some()
+    {
+        handle_fallback_weekly_edit_key(app, key);
         return;
     }
 
@@ -3318,7 +3355,10 @@ fn request_switch_to(app: &mut App, idx: usize) {
     } else {
         cfg.is_active(&name)
     };
-    if already_active {
+    // `switch_profile` already refuses a disabled target (shared guard), but a
+    // disabled row must never even offer the confirm — never selectable, not
+    // just never landed.
+    if already_active || profile.is_disabled() {
         return;
     }
     drop(cfg);
@@ -3456,12 +3496,7 @@ where
 /// stale link wedged switches, daemon parity in
 /// `daemon::active_diverged_unsaved`).
 fn active_diverged_unsaved(active: &str) -> bool {
-    matches!(
-        classify_credentials_link(active).ok(),
-        Some(LinkState::Diverged)
-    ) && !is_first_login(active).unwrap_or(false)
-        && !live_credentials_are_shell()
-        && !crate::claude::live_login_is_clauth_symlink()
+    crate::claude::live_diverged_and_unsaved(active).unwrap_or(false)
 }
 
 /// Toast and raise the Divergence prompt for `active` (`verb` = blocked action).
@@ -3635,10 +3670,13 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
         .enumerate()
         .map(|(i, _)| ChainItemKind::Member(i))
         .collect();
+    // A disabled, unchained profile is never an add-picker candidate (see
+    // `chain_candidates`) — excluding it here too keeps `+ add` from showing
+    // when it would open onto an empty picker.
     let any_unchained = cfg
         .profiles
         .iter()
-        .any(|p| !cfg.state.fallback_chain.iter().any(|c| c == &p.name));
+        .any(|p| !p.is_disabled() && !cfg.state.fallback_chain.iter().any(|c| c == &p.name));
     if any_unchained {
         items.push(ChainItemKind::Add);
     }
@@ -3855,6 +3893,9 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
             }
             if app.fallback_max_spend_draft.is_some() {
                 return FallbackHint::DetailMaxSpendEdit;
+            }
+            if app.fallback_weekly_draft.is_some() {
+                return FallbackHint::DetailWeeklyAtEdit;
             }
             let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
             match FALLBACK_ROWS[cursor] {
@@ -4289,7 +4330,7 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
     }
     let last = FALLBACK_ROWS.len() - 1;
     app.fallback_detail_cursor = app.fallback_detail_cursor.min(last);
-    let on_threshold = FALLBACK_ROWS[app.fallback_detail_cursor] == FallbackRow::Threshold;
+    let row = FALLBACK_ROWS[app.fallback_detail_cursor];
     match key.code {
         KeyCode::Up => {
             app.fallback_armed_remove = false;
@@ -4307,10 +4348,14 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
                 app.fallback_detail_cursor + 1
             };
         }
-        KeyCode::Char('+' | '=') if on_threshold => adjust_threshold(app, 5.0),
-        KeyCode::Char('-' | '_') if on_threshold => adjust_threshold(app, -5.0),
+        // Continuous fields only — `max spend` (a dollar ceiling) has no
+        // natural step unit and stays typed-only.
+        KeyCode::Char('+' | '=') if row == FallbackRow::Threshold => adjust_threshold(app, 5.0),
+        KeyCode::Char('-' | '_') if row == FallbackRow::Threshold => adjust_threshold(app, -5.0),
+        KeyCode::Char('+' | '=') if row == FallbackRow::WeeklyAt => adjust_weekly(app, 5.0),
+        KeyCode::Char('-' | '_') if row == FallbackRow::WeeklyAt => adjust_weekly(app, -5.0),
         KeyCode::Enter | KeyCode::Char(' ') => {
-            run_fallback_row(app, FALLBACK_ROWS[app.fallback_detail_cursor]);
+            run_fallback_row(app, row);
         }
         _ => {}
     }
@@ -4368,13 +4413,16 @@ fn selected_chain_member(app: &App) -> Option<usize> {
 /// Profiles not yet in the chain (add-picker candidates). Codex profiles are
 /// never candidates — the claude chain is harness-homogeneous (CDX-1 T1b);
 /// the picker is the only TUI path into `fallback_chain`, so filtering here
-/// covers the whole surface.
+/// covers the whole surface. A disabled account is excluded too — the
+/// chain-editing UI must never offer adding one (it still sits in
+/// `fallback_chain` untouched if it was already a member before being
+/// disabled; only new additions are blocked here).
 pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
     let cfg = app.config();
     cfg.profiles
         .iter()
         .filter(|p| !p.is_codex())
-        .filter(|p| !cfg.state.fallback_chain.iter().any(|c| c == &p.name))
+        .filter(|p| !p.is_disabled() && !cfg.state.fallback_chain.iter().any(|c| c == &p.name))
         .map(|p| p.name.to_string())
         .collect()
 }
@@ -4430,7 +4478,7 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
         FallbackRow::WeeklyAt => {
             // Inert while the member's weekly gate is off (rendered dimmed):
             // the line isn't judged there, so typing one would silently do
-            // nothing.
+            // nothing — same no-op contract as the spend-budget-off ceiling.
             if let Some((override_pct, check_weekly)) = selected_weekly_override(app)
                 && check_weekly
             {
@@ -4507,19 +4555,6 @@ fn handle_fallback_weekly_edit_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Keystrokes while the `max auto-spend` field is open: ⏎ saves, ⎋ discards.
-fn handle_fallback_max_spend_edit_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => app.fallback_max_spend_draft = None,
-        KeyCode::Enter => commit_max_spend_edit(app),
-        _ => {
-            if let Some(input) = app.fallback_max_spend_draft.as_mut() {
-                apply_input_edit(input, key);
-            }
-        }
-    }
-}
-
 /// Parse and persist the typed override. Invalid input keeps the draft open
 /// (same no-toast treatment as the threshold editor); an EMPTY commit clears
 /// the override back to the chain-wide default.
@@ -4542,7 +4577,7 @@ pub(crate) fn parse_weekly_override(raw: &str) -> Option<Option<f64>> {
     if raw.is_empty() {
         return Some(None);
     }
-    parse_threshold(raw).map(Some)
+    parse_weekly_pct(raw).map(Some)
 }
 
 /// The selected member's `(weekly_threshold override, check_weekly)`, or
@@ -4574,6 +4609,19 @@ fn write_weekly_override(app: &mut App, value: Option<f64>) {
     };
     if let Some(e) = save_err {
         app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+    }
+}
+
+/// Keystrokes while the `max auto-spend` field is open: ⏎ saves, ⎋ discards.
+fn handle_fallback_max_spend_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.fallback_max_spend_draft = None,
+        KeyCode::Enter => commit_max_spend_edit(app),
+        _ => {
+            if let Some(input) = app.fallback_max_spend_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
     }
 }
 
@@ -4713,6 +4761,24 @@ fn adjust_threshold(app: &mut App, delta: f64) {
     if let Some(current) = selected_threshold(app) {
         write_threshold(app, (current + delta).clamp(0.0, 100.0));
     }
+}
+
+/// Step the selected member's `weekly at` override by `delta`, clamped to
+/// `MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT`, and persist. Mirrors
+/// `run_fallback_row`'s `check_weekly` guard: inert while the member's weekly
+/// gate is off (rendered dimmed), same no-op contract as a dimmed row's ⏎.
+/// An unset override bases the nudge on the chain-wide resolved default so
+/// the value visibly moves off what the dimmed-default row already shows.
+fn adjust_weekly(app: &mut App, delta: f64) {
+    let Some((override_pct, check_weekly)) = selected_weekly_override(app) else {
+        return;
+    };
+    if !check_weekly {
+        return;
+    }
+    let base = override_pct.unwrap_or_else(|| app.config().state.weekly_switch_threshold_pct());
+    let next = (base + delta).clamp(MIN_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT);
+    write_weekly_override(app, Some(next));
 }
 
 /// ⏎/space on the `last resort` row: flip `Profile::last_resort` and persist.
@@ -4878,7 +4944,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                         let cfg = app.config();
                         cfg.profiles
                             .get(idx)
-                            .map(|p| !cfg.is_active(&p.name))
+                            .map(|p| !cfg.is_active(&p.name) && !p.is_disabled())
                             .unwrap_or(false)
                     }
                 })
@@ -4932,6 +4998,18 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                 let rows = config_rows(app);
                 if let Some(&row) = rows.get(app.config_action_cursor) {
                     match row {
+                        ConfigRow::Disabled => {
+                            let currently_disabled = app
+                                .config()
+                                .profiles
+                                .get(app.profile_cursor)
+                                .is_some_and(Profile::is_disabled);
+                            actions.push(if currently_disabled {
+                                ActionMenuAction::EnableProfile
+                            } else {
+                                ActionMenuAction::DisableProfile
+                            });
+                        }
                         ConfigRow::AutoStart => actions.push(ActionMenuAction::ToggleAutoStart),
                         ConfigRow::Login => actions.push(ActionMenuAction::LoginAccount),
                         ConfigRow::DeleteCreds => actions.push(ActionMenuAction::ClearCredentials),
@@ -5131,6 +5209,12 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::RemoveMember => {
             run_fallback_row(app, FallbackRow::Remove);
         }
+        ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
+            let rows = config_rows(app);
+            if let Some(&row) = rows.get(app.config_action_cursor) {
+                run_config_row(app, row);
+            }
+        }
         ActionMenuAction::ToggleAutoStart => {
             let rows = config_rows(app);
             if let Some(&row) = rows.get(app.config_action_cursor) {
@@ -5228,7 +5312,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
             app.config_action_cursor = app.config_action_cursor.min(last);
             match key.code {
                 KeyCode::Up => {
-                    disarm_delete(app);
+                    disarm_armed_action(app);
                     app.config_action_cursor = if app.config_action_cursor == 0 {
                         last
                     } else {
@@ -5236,7 +5320,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                     };
                 }
                 KeyCode::Down => {
-                    disarm_delete(app);
+                    disarm_armed_action(app);
                     app.config_action_cursor = if app.config_action_cursor >= last {
                         0
                     } else {
@@ -5374,6 +5458,9 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     if has_creds {
         rows.push(ConfigRow::DeleteCreds);
     }
+    // The account-actions group's tail: disable/enable (reversible) one severity
+    // notch below delete (irreversible), which always stays the very last row.
+    rows.push(ConfigRow::Disabled);
     rows.push(ConfigRow::Delete);
     rows
 }
@@ -5414,7 +5501,7 @@ fn build_draft_new() -> ConfigDraft {
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         active: None,
-        armed_delete: false,
+        armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
         captured_login: None,
@@ -5438,7 +5525,7 @@ fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         active: None,
-        armed_delete: false,
+        armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
         captured_login: None,
@@ -5463,10 +5550,10 @@ fn leave_config_detail(app: &mut App) {
     }
 }
 
-/// Disarm delete when the cursor moves off the row.
-fn disarm_delete(app: &mut App) {
+/// Disarm whichever account-action row is armed when the cursor moves off it.
+fn disarm_armed_action(app: &mut App) {
     if let Some(d) = app.config_draft.as_mut() {
-        d.armed_delete = false;
+        d.armed_action = None;
     }
 }
 
@@ -5506,6 +5593,33 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         .as_ref()
         .and_then(|d| d.editing_name.clone());
     match row {
+        ConfigRow::Disabled => {
+            if let Some(name) = name {
+                let gated =
+                    app.config().is_active(&name) || crate::runtime::has_live_session(&name);
+                if gated {
+                    return;
+                }
+                let currently_disabled = app.config().find(&name).is_some_and(Profile::is_disabled);
+                let armed = app
+                    .config_draft
+                    .as_ref()
+                    .is_some_and(|d| d.armed_action == Some(ConfigRow::Disabled));
+                // Enabling is harmless — immediate, no arm. Disabling has real
+                // operational impact (drops the account from auto-switch/
+                // polling/status mid-flight), so it reuses Delete's
+                // press-to-arm → confirm class instead of firing on one ⏎.
+                if currently_disabled || armed {
+                    toggle_profile_disabled(app, &name);
+                    // Clear rather than leave a stale arm: unlike Delete (whose
+                    // confirm removes the row entirely), this row survives its
+                    // own toggle, so a later disable must re-arm from scratch.
+                    disarm_armed_action(app);
+                } else {
+                    arm_action(app, ConfigRow::Disabled);
+                }
+            }
+        }
         ConfigRow::AutoStart => {
             if let Some(name) = name {
                 toggle_auto_start(app, &name);
@@ -5515,11 +5629,10 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
             let armed = app
                 .config_draft
                 .as_ref()
-                .map(|d| d.armed_delete)
-                .unwrap_or(false);
+                .is_some_and(|d| d.armed_action == Some(ConfigRow::Delete));
             match (armed, name) {
                 (true, Some(name)) => perform_delete(app, &name),
-                _ => disarm_delete_inverse(app),
+                _ => arm_action(app, ConfigRow::Delete),
             }
         }
         ConfigRow::Create => commit_new_account(app),
@@ -5713,10 +5826,11 @@ fn close_login_modal(app: &mut App) {
     app.modals.retain(|m| !matches!(m, Modal::Login));
 }
 
-/// Arm the delete row (first ⏎).
-fn disarm_delete_inverse(app: &mut App) {
+/// Arm an account-action row (`Delete`, or `Disabled` in the disable
+/// direction) on its first ⏎.
+fn arm_action(app: &mut App, row: ConfigRow) {
     if let Some(d) = app.config_draft.as_mut() {
-        d.armed_delete = true;
+        d.armed_action = Some(row);
     }
 }
 
@@ -5790,9 +5904,10 @@ fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) ->
         ConfigRow::EnvEntry(i) => profile
             .and_then(|p| p.env.values().nth(i).cloned())
             .unwrap_or_default(),
-        ConfigRow::EnvAdd
+        ConfigRow::AutoStart
+        | ConfigRow::EnvAdd
         | ConfigRow::ModelOverrideAdd
-        | ConfigRow::AutoStart
+        | ConfigRow::Disabled
         | ConfigRow::Login
         | ConfigRow::DeleteCreds
         | ConfigRow::Delete
@@ -6441,6 +6556,48 @@ fn finish_delete(app: &mut App, name: &str, force: bool) {
             app.toast(ToastKind::Success, format!("deleted '{name}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("delete failed\n{e}")),
+    }
+}
+
+/// Flip `name`'s `Profile::disabled` flag (Setup `disabled` row). Inert while
+/// `name` is the active profile or holds a live `clauth start` session — the
+/// same gate `actions::disable_profile` itself enforces, checked here TOO so
+/// the row stays truly inert (silent no-op, matching the dimmed-row cloudy-
+/// tui contract): `disable_profile`'s own refusal is a real `bail!`, and
+/// without this early return every press would surface a red danger toast
+/// instead of doing nothing, which is what a dimmed/disabled row is supposed
+/// to mean. `disable_profile`/`enable_profile` persist into the live shared
+/// `AppConfig` directly (`app.config()`), so the flip renders next frame with
+/// no reload round-trip; `refresh_tokens` rebuilds the scheduler's per-profile
+/// work lists (`collect_tokens`/`collect_third_party_entries` both filter on
+/// `is_disabled`) the same way `toggle_auto_start` does, since a per-profile
+/// `config.toml` write doesn't bump the mtime the periodic reload watches.
+fn toggle_profile_disabled(app: &mut App, name: &str) {
+    let currently_disabled = app.config().find(name).is_some_and(Profile::is_disabled);
+    let gated = app.config().is_active(name) || crate::runtime::has_live_session(name);
+    if gated {
+        return;
+    }
+    let result = {
+        let mut cfg = app.config();
+        if currently_disabled {
+            crate::actions::enable_profile(&mut cfg, name)
+        } else {
+            crate::actions::disable_profile(&mut cfg, name)
+        }
+    };
+    match result {
+        Ok(true) => {
+            app.refresh_tokens();
+            let verb = if currently_disabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            app.toast(ToastKind::Success, format!("{verb} '{name}'"));
+        }
+        Ok(false) => {}
+        Err(e) => app.toast(ToastKind::Danger, format!("toggle failed\n{e}")),
     }
 }
 
@@ -7599,6 +7756,16 @@ fn poll_credentials_divergence(app: &mut App) {
             }
             Err(e) => app.toast(ToastKind::Danger, format!("adopt failed\n{e}")),
         }
+        return;
+    }
+    // A login already saved in the active profile's store holds nothing unsaved —
+    // the next switch re-installs it, losing no login — so it must not raise the
+    // banner. This clears clauth's own symlink AND the macOS regular-file mirror CC
+    // writes over it. The switch/defer gates apply the same exemption through
+    // `live_diverged_and_unsaved`; the poll must adopt a first login before this
+    // point, so it checks the predicate directly here instead.
+    if crate::claude::live_login_is_stored(&active) {
+        app.divergence_pending = None;
         return;
     }
     resolve_or_note_divergence(app, &active);

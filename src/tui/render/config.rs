@@ -14,7 +14,7 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    bold_when, cycle_option, draw_scrolled_lines, draw_selector_list, head_cols,
+    DIAG_DISABLED, bold_when, cycle_option, draw_scrolled_lines, draw_selector_list, head_cols,
     help_tooltip_lines, highlight_row, key_cell, label_style, master_detail, name_color,
     picker_row, pill, section_box, section_box_verbatim,
 };
@@ -45,13 +45,13 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                picker_row(
-                    i == sel,
-                    focused,
-                    p.name.to_string(),
-                    name_color(cfg.is_active(&p.name)),
-                    w,
-                )
+                // A disabled account can never be active, so dim wins outright.
+                let ns = if p.is_disabled() {
+                    theme::dim()
+                } else {
+                    name_color(cfg.is_active(&p.name))
+                };
+                picker_row(i == sel, focused, p.name.to_string(), ns, w)
             })
             .collect();
         rows.push(picker_row(
@@ -81,6 +81,13 @@ struct Snap {
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
     auto_start: bool,
+    /// `Profile::is_disabled` — drives the `disabled` row's toggle value.
+    disabled: bool,
+    /// The global active profile — one of the two gates (mirroring
+    /// `actions::disable_profile`'s own gate) that dims the `disabled` row inert.
+    is_active: bool,
+    /// A live `clauth start` session — the other gate.
+    has_live_session: bool,
     /// Whether the profile holds a stored credential — the OAuth token or, for an
     /// API account, the api key. Drives the `Login` row's re-login vs first-login
     /// label and the `DeleteCreds` row's presence.
@@ -124,6 +131,9 @@ impl Snap {
             subagent: String::new(),
             env: Vec::new(),
             auto_start: false,
+            disabled: false,
+            is_active: false,
+            has_live_session: false,
             logged_in: false,
             login_is_oauth: true,
             captured: false,
@@ -173,6 +183,12 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             // they're always populated — even while a draft owns the text fields.
             env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             auto_start: p.auto_start,
+            disabled: p.is_disabled(),
+            is_active: cfg.is_active(&p.name),
+            // Read per frame for the selected profile only, same as
+            // `session_token` below — a single small directory stat, not a
+            // per-profile loop.
+            has_live_session: crate::runtime::has_live_session(p.name.as_str()),
             // OAuth accounts carry a token; API accounts carry an api key. Either
             // one flips the Login row to "re-login" and shows the log-out row.
             logged_in: if p.login_is_oauth() {
@@ -311,7 +327,7 @@ fn draw_settings_rows(
 ) {
     let draft = app.config_draft.as_ref();
     let editing = draft.and_then(|d| d.active);
-    let armed_delete = draft.map(|d| d.armed_delete).unwrap_or(false);
+    let armed_action = draft.and_then(|d| d.armed_action);
 
     // Derived from the base-url buffer so it tracks the draft live.
     let is_api = !row_input(draft, snap, ConfigRow::BaseUrl)
@@ -324,10 +340,23 @@ fn draw_settings_rows(
         ("oauth", theme::accent())
     };
 
-    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Status purity: an enabled account has no status worth a row, so the row
+    // only exists while the account is disabled.
+    if snap.disabled {
+        let mut spans = vec![Span::styled(
+            key_cell("status", KEY_W, KEY_GUTTER),
+            theme::label(),
+        )];
+        spans.extend(pill(DIAG_DISABLED.to_string(), theme::dim().bold()));
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::from(vec![
         Span::styled(key_cell("type", KEY_W, KEY_GUTTER), theme::label()),
         Span::styled(type_value, type_style),
-    ])];
+    ]));
 
     // Provider row — only for recognised third-party providers. Hidden while a
     // draft empties the base-url buffer (`is_api` tracks the draft live).
@@ -366,8 +395,9 @@ fn draw_settings_rows(
     lines.push(Line::from(""));
     // Tracks the absolute line index + buffer + row of the active edit row for
     // cursor placement after rendering. The header block above is variable
-    // (type + optional provider + optional account + optional session +
-    // blank), so the row loop's base index is simply what has been pushed.
+    // (optional status + type + optional provider + optional account +
+    // optional session + blank), so the row loop's base index is simply what
+    // has been pushed so far.
     let mut edit_caret: Option<(u16, InputState, ConfigRow)> = None;
     let mut line_idx: u16 = lines.len() as u16;
 
@@ -378,7 +408,7 @@ fn draw_settings_rows(
         let selected = actions_focused && i == cursor;
         let is_editing = editing == Some(*row);
         let input = row_input(draft, snap, *row);
-        let line = detail_row(*row, selected, is_editing, armed_delete, snap, &input);
+        let line = detail_row(*row, selected, is_editing, armed_action, snap, &input);
         if is_editing {
             edit_caret = Some((line_idx, input, *row));
         }
@@ -456,9 +486,10 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::HaikuModel => &snap.haiku,
         ConfigRow::SubagentModel => &snap.subagent,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
-        ConfigRow::EnvAdd
+        ConfigRow::AutoStart
+        | ConfigRow::EnvAdd
         | ConfigRow::ModelOverrideAdd
-        | ConfigRow::AutoStart
+        | ConfigRow::Disabled
         | ConfigRow::Login
         | ConfigRow::DeleteCreds
         | ConfigRow::Delete
@@ -487,6 +518,21 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::SubagentModel => "model forced for every subagent in this account",
         ConfigRow::EnvEntry(_) => "env var set for claude code while this account is active",
         ConfigRow::EnvAdd => "add an env var for this account",
+        // Gate reasons mirror the CLI's own refusal copy (`actions::disable_
+        // profile`), then the on/off state — checked in that order since a
+        // gate can only ever bite the OFF (not-yet-disabled) state.
+        ConfigRow::Disabled if snap.is_active => {
+            "the active account can't be disabled — switch away first"
+        }
+        ConfigRow::Disabled if snap.has_live_session => {
+            "has an open session — close it before disabling"
+        }
+        ConfigRow::Disabled if snap.disabled => {
+            "excluded from auto-switch, usage polling, and status until re-enabled"
+        }
+        ConfigRow::Disabled => {
+            "removes this account from auto-switch, usage polling, and status until re-enabled"
+        }
         ConfigRow::AutoStart if snap.auto_start => {
             "starts a throwaway session when idle so the 5h window counts"
         }
@@ -512,14 +558,14 @@ fn detail_row(
     row: ConfigRow,
     selected: bool,
     editing: bool,
-    armed_delete: bool,
+    armed_action: Option<ConfigRow>,
     snap: &Snap,
     input: &InputState,
 ) -> Line<'static> {
     let arrow = if editing {
-        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent())
+        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
-        Span::styled("❯ ", theme::accent())
+        Span::styled("❯ ", theme::accent().bold())
     } else {
         Span::raw("  ")
     };
@@ -551,6 +597,42 @@ fn detail_row(
             arrow,
             Span::styled("+ model override", bold_when(theme::accent(), selected)),
         ]),
+        // Same button CLASS as `Delete`: a state-flipped label, not a
+        // key/value toggle. Disabling has real operational impact (drops the
+        // account from auto-switch/polling/status mid-flight), so it renders
+        // DANGER and always-bold, and arms on the first ⏎ like `Delete`
+        // ("press again to disable"). Enabling is harmless and immediate, so
+        // it takes the accent, bold-on-select treatment shared with
+        // `Login`/`Create` instead. Dimmed/inert while active or a session is
+        // open — cloudy-tui disabled row (mirrors the Fallback tab's `max
+        // spend`): the whole row renders faint and the key handler no-ops
+        // (`run_config_row`'s gate in `app.rs`).
+        ConfigRow::Disabled => {
+            let gated = snap.is_active || snap.has_live_session;
+            let row_arrow = if gated && selected {
+                Span::styled("❯ ", theme::faint())
+            } else {
+                arrow
+            };
+            let (label, style) = if gated {
+                let label = if snap.disabled {
+                    "enable account"
+                } else {
+                    "disable account"
+                };
+                (label.to_string(), theme::faint())
+            } else if snap.disabled {
+                (
+                    "enable account".to_string(),
+                    bold_when(theme::accent(), selected),
+                )
+            } else if armed_action == Some(ConfigRow::Disabled) {
+                ("press again to disable".to_string(), theme::danger().bold())
+            } else {
+                ("disable account".to_string(), theme::danger().bold())
+            };
+            Line::from(vec![row_arrow, Span::styled(label, style)])
+        }
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
                 (theme::toggle_on().to_string(), theme::accent())
@@ -560,7 +642,7 @@ fn detail_row(
             kv_static(arrow, "auto-start", value, style, selected)
         }
         ConfigRow::Delete => {
-            let label = if armed_delete {
+            let label = if armed_action == Some(ConfigRow::Delete) {
                 "press again to delete".to_string()
             } else {
                 "delete account".to_string()

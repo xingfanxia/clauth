@@ -107,6 +107,91 @@ fn every_shell_completes_login_setup_token_flag() {
     }
 }
 
+/// The scripts are hand-written (clap_complete's stable generator can't
+/// reproduce the live `clauth __complete` profile-name shellout), so nothing
+/// structural keeps them level with the grammar — they had already drifted three
+/// subcommands and a root flag behind it. This walks the real clap `Command`
+/// tree and fails on the next drift instead of waiting for someone to notice.
+///
+/// `help` and `version` are excluded: clap generates them for every command and
+/// no shell needs them completed.
+#[test]
+fn every_visible_subcommand_and_long_flag_is_offered_by_all_three_scripts() {
+    use clap::CommandFactory as _;
+
+    let root = crate::cli::Cli::command();
+    let generated = ["help", "version"];
+
+    let mut expected: Vec<(String, String)> = root
+        .get_arguments()
+        .filter(|a| !a.is_hide_set())
+        .filter_map(|a| a.get_long())
+        .filter(|l| !generated.contains(l))
+        .map(|l| ("<root>".to_string(), format!("--{l}")))
+        .collect();
+
+    for sub in root.get_subcommands().filter(|s| !s.is_hide_set()) {
+        let name = sub.get_name().to_string();
+        if generated.contains(&name.as_str()) {
+            continue;
+        }
+        expected.push((name.clone(), name.clone()));
+        for long in sub
+            .get_arguments()
+            .filter(|a| !a.is_hide_set())
+            .filter_map(|a| a.get_long())
+            .filter(|l| !generated.contains(l))
+        {
+            expected.push((name.clone(), format!("--{long}")));
+        }
+    }
+
+    assert!(
+        expected.len() > 20,
+        "the walk found only {} tokens — it stopped seeing the grammar, \
+         so a green run would prove nothing",
+        expected.len()
+    );
+
+    let mut missing: Vec<String> = Vec::new();
+    for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+        for (owner, token) in &expected {
+            // A bare `contains` would let `--standby` pass on `--no-standby`
+            // alone, so match the token with no `-`/alphanumeric neighbour.
+            if !offers_token(script, token) {
+                missing.push(format!("{shell}: {owner} → {token}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "completion scripts have drifted from the clap grammar:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+/// Whether `script` offers `token` as a whole word. `--rescue` must not match on
+/// `--no-rescue`, nor `start` on `--setup-token`.
+fn offers_token(script: &str, token: &str) -> bool {
+    let boundary = |c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    script.match_indices(token).any(|(i, _)| {
+        let before = script[..i].chars().next_back().is_none_or(boundary);
+        let after = script[i + token.len()..]
+            .chars()
+            .next()
+            .is_none_or(boundary);
+        before && after
+    })
+}
+
+#[test]
+fn offers_token_does_not_match_inside_a_longer_flag() {
+    assert!(offers_token("a --rescue b", "--rescue"));
+    assert!(!offers_token("a --no-rescue b", "--rescue"));
+    assert!(!offers_token("'--setup-token[x]'", "start"));
+    assert!(offers_token("-W \"start login\"", "start"));
+}
+
 #[test]
 fn print_script_rejects_unsupported_shell() {
     let err = print_script("powershell").expect_err("unsupported shell must error");

@@ -1,6 +1,6 @@
 [package]
 name = "clauth"
-version = "0.12.0"
+version = "0.13.1"
 edition = "2024"
 description = "Manage multiple Claude Code accounts, monitor 5h/7d usage with configurable auto-switch and delegation with an MCP plugin. CLI + TUI."
 license = "MIT"
@@ -39,6 +39,11 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 rmcp = { version = "2.1.0", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1.52.3", features = ["rt", "io-std"] }
 regex = "1.13.1"
+# CLI grammar + generated help. `wrap_help` is what keeps the command table and
+# the per-subcommand prose wrapping to the real terminal width instead of the
+# hand-padded block it replaced; it adds only `terminal_size` (rustix is already
+# in the tree via crossterm).
+clap = { version = "4.6.4", features = ["derive", "wrap_help"] }
 
 # npm installs `claude` as a `.cmd` shim that Rust's bare `Command::new` can't
 # resolve (no PATHEXT search); `which` finds it. Unix uses a bare lookup.

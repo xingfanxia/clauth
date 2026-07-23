@@ -52,7 +52,8 @@ fn drain_http_request(sock: &mut std::net::TcpStream) -> Vec<u8> {
 fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
-        harness: Default::default(),
+        harness: crate::profile::Harness::Claude,
+        session_feed: false,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -61,12 +62,12 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
+        last_resort: false,
+        max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
-        last_resort: false,
-        session_feed: false,
-        max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -90,48 +91,6 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
 }
 
 use crate::testutil::HomeSandbox;
-
-/// `mark_auth_broken` persists its ONE delta against the latest disk state.
-/// A blind whole-state save from this process's snapshot would clobber a flag
-/// a CONCURRENT process minted in between (the daemon marking one profile
-/// while a CLI reauth clears another) — the TECH-7 lost-update surface.
-#[test]
-fn mark_auth_broken_merges_with_disk_instead_of_clobbering() {
-    let _home = HomeSandbox::new();
-
-    // Another process already quarantined "other" on disk; this process's
-    // in-memory snapshot predates that and doesn't know.
-    crate::profile::update_app_state(|s| s.auth_broken.push("other".into()))
-        .expect("seed disk state");
-    let handle: crate::profile::ConfigHandle =
-        std::sync::Arc::new(crate::lockorder::RankedMutex::new(AppConfig {
-            state: AppState::default(),
-            profiles: vec![],
-        }));
-
-    mark_auth_broken(&handle, "mine", true);
-
-    let disk = crate::profile::load_config().expect("reload").state;
-    assert!(
-        disk.auth_broken.iter().any(|n| n.as_str() == "mine"),
-        "this process's mark lands"
-    );
-    assert!(
-        disk.auth_broken.iter().any(|n| n.as_str() == "other"),
-        "the concurrent writer's flag survives — no blind whole-state clobber"
-    );
-
-    mark_auth_broken(&handle, "mine", false);
-    let disk = crate::profile::load_config().expect("reload").state;
-    assert!(
-        !disk.auth_broken.iter().any(|n| n.as_str() == "mine"),
-        "the clear lands as a delta too"
-    );
-    assert!(
-        disk.auth_broken.iter().any(|n| n.as_str() == "other"),
-        "and still leaves the concurrent flag alone"
-    );
-}
 
 #[test]
 fn no_live_session_included_with_force_false() {
@@ -212,7 +171,8 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
 
     let _home = HomeSandbox::new();
     let profile = Profile {
-        harness: Default::default(),
+        harness: crate::profile::Harness::Claude,
+        session_feed: false,
         name: "test-rotate-one-no-rt".into(),
         base_url: None,
         api_key: None,
@@ -221,12 +181,12 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
+        last_resort: false,
+        max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
-        last_resort: false,
-        session_feed: false,
-        max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -281,7 +241,8 @@ fn rotate_one_inner_skips_live_session() {
     file.lock().expect("lock pid file");
 
     let profile = Profile {
-        harness: Default::default(),
+        harness: crate::profile::Harness::Claude,
+        session_feed: false,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -290,12 +251,12 @@ fn rotate_one_inner_skips_live_session() {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
+        last_resort: false,
+        max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
-        last_resort: false,
-        session_feed: false,
-        max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -342,7 +303,8 @@ fn rotate_one_inner_skips_live_session() {
 fn profile_without_refresh_token_excluded() {
     use std::collections::BTreeMap;
     let profile = Profile {
-        harness: Default::default(),
+        harness: crate::profile::Harness::Claude,
+        session_feed: false,
         name: "test-oauth-no-rt".into(),
         base_url: None,
         api_key: None,
@@ -351,12 +313,12 @@ fn profile_without_refresh_token_excluded() {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
+        last_resort: false,
+        max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
-        last_resort: false,
-        session_feed: false,
-        max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -433,7 +395,8 @@ fn future_expiry() -> i64 {
 fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
-        harness: Default::default(),
+        harness: crate::profile::Harness::Claude,
+        session_feed: false,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -442,12 +405,12 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
+        last_resort: false,
+        max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
-        last_resort: false,
-        session_feed: false,
-        max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at-old".to_string(),
@@ -473,7 +436,8 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
 fn third_party_config(name: &str) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
-        harness: Default::default(),
+        harness: crate::profile::Harness::Claude,
+        session_feed: false,
         name: name.into(),
         base_url: Some("https://api.deepseek.com/anthropic".to_string()),
         api_key: Some("sk-fixture".to_string()),
@@ -482,12 +446,12 @@ fn third_party_config(name: &str) -> AppConfig {
         models: Default::default(),
         fallback_threshold: None,
         weekly_threshold: None,
+        last_resort: false,
+        max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
-        last_resort: false,
-        session_feed: false,
-        max_auto_spend: None,
         bell_threshold: None,
+        disabled: false,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -707,8 +671,6 @@ fn gate_flagged_profile_with_a_dead_chain_stays_broken() {
         "a dead chain keeps the quarantine"
     );
 }
-
-// ── TECH-9 #14: 2xx token-body redaction ──────────────────────────────────────
 
 /// A 2xx token-endpoint body that fails to deserialize still holds the live
 /// access+refresh tokens, so `token_parse_error` must surface only the serde
@@ -1034,7 +996,6 @@ mod adopt_live_rotation {
         // cached anchor exists. Identity unprovable ⇒ refuse.
         let handle = setup(name, past_expiry(), future_expiry());
         let adopted = try_adopt_live_rotation(&handle, name, &guard(name), &|tok| {
-            // The dead stored token yields nothing; the mirror answers fine.
             (tok == "at-mirror").then(|| "uuid-1".into())
         });
         assert_eq!(adopted, None);
@@ -1126,8 +1087,8 @@ mod adopt_live_rotation {
 // decisions can only come from state read under the guard. These pin that
 // boundary directly.
 
-/// The rotation lock the guard leg demands proof of (production callers hold it
-/// across the whole refresh window).
+/// The rotation lock the guard leg demands proof of (production callers hold
+/// it across the whole refresh window).
 fn gate_guard(name: &str) -> crate::runtime::RotationGuard {
     crate::runtime::RotationGuard::acquire(name).expect("rotation guard")
 }
@@ -1195,20 +1156,20 @@ fn gate_under_guard_spends_the_currently_stored_refresh_token() {
     ));
 }
 
-/// A cross-process peer rotated + persisted a fresher pair to disk while this
-/// caller held a stale in-memory snapshot; the guard leg adopts the disk pair
-/// (now non-expiring) and installs it as-is instead of refreshing the dead
-/// in-memory token.
+/// A cross-process peer rotated and persisted while this process held a stale
+/// in-memory config snapshot (the CLI and MCP load config from disk once and
+/// never reload): under the guard the DISK pair is authoritative. A live disk
+/// pair installs as-is — the stale in-memory token is never spent (the
+/// refresher panics if called) — and the handle carries the adopted pair.
 #[test]
 fn gate_under_guard_adopts_a_cross_process_rotation_from_disk() {
     let _home = HomeSandbox::new();
-    let name = "test-gate-adopt-disk";
+    let name = "test-gate-disk-adopt";
     let handle = Arc::new(RankedMutex::new(oauth_config(
         name,
         Some("rt-stale"),
         Some(past_expiry()),
     )));
-    // The peer's persisted, still-live pair.
     save_disk_profile(name, "rt-peer", Some(future_expiry()));
     assert!(matches!(
         gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
@@ -1217,16 +1178,17 @@ fn gate_under_guard_adopts_a_cross_process_rotation_from_disk() {
     assert_eq!(
         handle.lock().unwrap().find(name).unwrap().refresh_token(),
         Some("rt-peer"),
-        "the in-memory profile adopts the peer's persisted refresh token"
+        "the adopted disk pair must replace the stale in-memory snapshot"
     );
 }
 
-/// The adopted disk pair is itself expiring → the guard leg refreshes from the
-/// ADOPTED token (`rt-peer`), never the stale in-memory `rt-stale`.
+/// Peer-rotated pair that is ITSELF already expiring again: the refresher must
+/// be fed the disk refresh token — spending the stale in-memory one would 400
+/// (already spent by the peer) and wrongly quarantine a healthy login.
 #[test]
 fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
     let _home = HomeSandbox::new();
-    let name = "test-gate-adopt-then-spend";
+    let name = "test-gate-disk-spend";
     let handle = Arc::new(RankedMutex::new(oauth_config(
         name,
         Some("rt-stale"),
@@ -1236,7 +1198,7 @@ fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
     let refresher = |rt: &str, _scopes: Option<&str>| {
         assert_eq!(rt, "rt-peer", "must spend the disk pair, not the snapshot");
         Ok(TokenResponse {
-            access_token: "at-next".to_string(),
+            access_token: "at-new".to_string(),
             refresh_token: "rt-next".to_string(),
             expires_in: 3600,
             scope: None,
@@ -1248,12 +1210,14 @@ fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
     ));
 }
 
-/// Adopting an alive disk pair lifts a stale `auth_broken` quarantine — the
-/// chain is alive under a peer's advance (mirrors `carry_external_rotation`).
+/// A differing disk pair proves the chain is alive, so a standing in-memory
+/// quarantine is stale and lifts (same rationale as the scheduler's
+/// `carry_external_rotation`): the gate proceeds from the adopted pair
+/// instead of refusing a recovered login.
 #[test]
 fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
     let _home = HomeSandbox::new();
-    let name = "test-gate-adopt-lifts-quarantine";
+    let name = "test-gate-disk-quarantine";
     let handle = Arc::new(RankedMutex::new(oauth_config(
         name,
         Some("rt-stale"),
@@ -1267,7 +1231,7 @@ fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
     ));
     assert!(
         !handle.lock().unwrap().is_auth_broken(name),
-        "an adopted (alive) disk pair lifts the stale quarantine"
+        "an adopted (alive) chain lifts a stale quarantine"
     );
 }
 
@@ -1638,14 +1602,49 @@ fn gate_session_token_ready_even_when_auth_broken() {
     ));
 }
 
-// ── CLA-FEED: the session-token feed (gate + rotation hook) ──────────────────
-//
-// All offline: refreshers are injected fixtures, the Keychain is disabled
-// under cfg(test), and every file lands in the HomeSandbox. These pin the
-// feed's install story: a fresh fed sidecar installs as-is, a stale one
-// re-feeds from the stored chain (no spend) or through the guarded refresh
-// (whose persist re-feeds via the rotation hook), and a terminally dead chain
-// degrades to the preserved static mint instead of benching the account.
+// ── Fork-only tests (codex engine, RESCUE, CLA-FEED, forecast, email column) ──
+
+/// `mark_auth_broken` persists its ONE delta against the latest disk state.
+/// A blind whole-state save from this process's snapshot would clobber a flag
+/// a CONCURRENT process minted in between (the daemon marking one profile
+/// while a CLI reauth clears another) — the TECH-7 lost-update surface.
+#[test]
+fn mark_auth_broken_merges_with_disk_instead_of_clobbering() {
+    let _home = HomeSandbox::new();
+
+    // Another process already quarantined "other" on disk; this process's
+    // in-memory snapshot predates that and doesn't know.
+    crate::profile::update_app_state(|s| s.auth_broken.push("other".into()))
+        .expect("seed disk state");
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        }));
+
+    mark_auth_broken(&handle, "mine", true);
+
+    let disk = crate::profile::load_config().expect("reload").state;
+    assert!(
+        disk.auth_broken.iter().any(|n| n.as_str() == "mine"),
+        "this process's mark lands"
+    );
+    assert!(
+        disk.auth_broken.iter().any(|n| n.as_str() == "other"),
+        "the concurrent writer's flag survives — no blind whole-state clobber"
+    );
+
+    mark_auth_broken(&handle, "mine", false);
+    let disk = crate::profile::load_config().expect("reload").state;
+    assert!(
+        !disk.auth_broken.iter().any(|n| n.as_str() == "mine"),
+        "the clear lands as a delta too"
+    );
+    assert!(
+        disk.auth_broken.iter().any(|n| n.as_str() == "other"),
+        "and still leaves the concurrent flag alone"
+    );
+}
 
 /// `oauth_config` with the feed enabled and a Fable-capable chain (full
 /// scopes + subscriptionType) — the shape `clauth feed <p> on` requires.

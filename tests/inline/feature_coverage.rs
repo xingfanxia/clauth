@@ -29,7 +29,7 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "codex_follow_adopts_a_rotated_live_chain",
             "codex_profiles_are_excluded_from_both_fetch_legs",
             "cross_harness_switches_are_refused",
-            "parse_login_args_accepts_codex_flag",
+            "login_codex_flag_and_its_browser_modifier",
             "tui_switch_dispatches_codex_targets_to_the_codex_slot",
             "build_status_publishes_codex_fields",
         ],
@@ -67,10 +67,10 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "base64url_nopad",
             "login_route",
             "reauth_confirmed",
-            "parse_login_args_api_mode",
+            "login_api_mode",
         ],
     ),
-    ("Delete an account", &["parse_delete_args"]),
+    ("Delete an account", &["delete_takes_yes_and_force"]),
     (
         "Automatic token refresh",
         &[
@@ -134,6 +134,9 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             // other one stands down and hydrates from the shared cache.
             "standdown_",
             "one_holder_at_a_time",
+            // singleton ceiling (#57): one active + one standby, no pile-up.
+            "third_instance_is_redundant",
+            "no_standby_exits_rather_than",
             "tick_stands_down_when_another",
             "held_lock_with_fresh_status",
         ],

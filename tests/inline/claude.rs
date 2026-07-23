@@ -220,6 +220,56 @@ fn first_login_false_when_oauth_block_absent() {
     assert!(!is_first_login_at(&link, &expected));
 }
 
+/// A logged-out CC shell keeps `claudeAiOauth` (just with blanked tokens) plus
+/// unrelated keys like `mcpOAuth` — it must NOT classify as a first login, or
+/// `adopt_first_login` deletes the live file (no install source to relink a
+/// blank profile back to) and `mcpOAuth` is lost with it. Regression for the
+/// gap PR #46's shell-awareness left in `is_first_login_at` specifically.
+#[test]
+fn first_login_false_when_live_is_a_logged_out_shell() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    fs::write(
+        &link,
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": null,
+                "expiresAt": 0,
+            },
+            "mcpOAuth": { "some-server": { "accessToken": "mcp-tok" } },
+        })
+        .to_string(),
+    )
+    .expect("write shell");
+    assert!(!is_first_login_at(&link, &expected));
+}
+
+/// Companion to the shell case above, same seam: a completed login (non-blank
+/// access token) with the same foreign `mcpOAuth` key still classifies as a
+/// first login, so the shell fix can't over-correct and strand a real login.
+#[test]
+fn first_login_true_when_live_is_a_completed_login_with_foreign_keys() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let link = tmp.path().join(".credentials.json");
+    let expected = tmp.path().join("profile.json");
+    fs::write(
+        &link,
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "real-access",
+                "refreshToken": "real-refresh",
+                "expiresAt": 1_700_000_000_000_i64,
+            },
+            "mcpOAuth": { "some-server": { "accessToken": "mcp-tok" } },
+        })
+        .to_string(),
+    )
+    .expect("write completed login");
+    assert!(is_first_login_at(&link, &expected));
+}
+
 #[cfg(unix)]
 #[test]
 fn first_login_false_when_link_is_symlink() {
@@ -449,275 +499,6 @@ fn build_settings_clears_stale_model_knobs() {
     assert_eq!(v["env"]["KEEP"], "1", "unrelated env keys are preserved");
 }
 
-// ── CAP-1: the snapshot decides and writes on ONE read of the live file ─────
-
-/// A live login belonging to a different account (Diverged) is never captured
-/// by the unattended snapshot — the outgoing profile keeps its own chain. This
-/// is the incident shape of 2026-07-12: a running claude wrote a sibling's
-/// rotated pair into the live mirror, and the capture window between classify
-/// and write copied it into the wrong profile's store.
-#[cfg(unix)]
-#[test]
-fn snapshot_never_captures_a_foreign_live_login() {
-    let _home = HomeSandbox::new();
-    let mut config = seed_relogin_scenario(
-        "active",
-        creds("own-access", Some("own-refresh")),
-        creds("foreign-access", Some("foreign-refresh")),
-    );
-
-    snapshot_active_credentials(&mut config).expect("snapshot");
-
-    let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("active")
-            .expect("dir")
-            .join("credentials.json"),
-    )
-    .expect("stored parse");
-    assert_eq!(
-        stored.access_token(),
-        Some("own-access"),
-        "a diverged live login must never overwrite the stored identity",
-    );
-}
-
-/// Equal access token ⇒ same rotation state: the snapshot refreshes the store
-/// with exactly the bytes it examined (CC rewrites the mirror with identical
-/// tokens but sometimes fresher metadata, e.g. `subscription_type`).
-#[cfg(unix)]
-#[test]
-fn snapshot_refreshes_the_store_when_live_token_matches() {
-    let _home = HomeSandbox::new();
-    let mut live = creds("same-access", Some("same-refresh"));
-    live.claude_ai_oauth
-        .as_mut()
-        .expect("oauth")
-        .subscription_type = Some("max".into());
-    let mut config =
-        seed_relogin_scenario("active", creds("same-access", Some("same-refresh")), live);
-
-    snapshot_active_credentials(&mut config).expect("snapshot");
-
-    let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("active")
-            .expect("dir")
-            .join("credentials.json"),
-    )
-    .expect("stored parse");
-    assert_eq!(
-        stored
-            .claude_ai_oauth
-            .as_ref()
-            .and_then(|o| o.subscription_type.as_deref()),
-        Some("max"),
-        "an equal-token live snapshot carries the live metadata into the store",
-    );
-}
-
-/// A completed first login adopts the bytes the check saw AND anchors the
-/// profile's identity to the login just captured (from CC's own
-/// `~/.claude.json` hint), so the identity-guarded adopt/follow paths can
-/// vouch for the profile immediately.
-#[cfg(unix)]
-#[test]
-fn first_login_adopt_anchors_the_profile() {
-    let _home = HomeSandbox::new();
-    let home = crate::profile::home_dir().expect("home");
-    std::fs::write(
-        home.join(".claude.json"),
-        r#"{"oauthAccount":{"accountUuid":"uuid-first-login"}}"#,
-    )
-    .expect("write claude.json");
-
-    let live_path = claude_credentials_path().expect("creds path");
-    std::fs::create_dir_all(live_path.parent().expect("parent")).expect("mkdir .claude");
-    std::fs::write(
-        &live_path,
-        serde_json::to_vec(&creds("fresh-access", Some("fresh-refresh"))).expect("ser"),
-    )
-    .expect("write live");
-
-    let profile = crate::profile::Profile::new("newbie".to_string(), None, None);
-    crate::profile::save_profile(&profile).expect("save profile");
-    let mut config = AppConfig {
-        state: crate::profile::AppState::default(),
-        profiles: vec![profile],
-    };
-    config.state.active_profile = Some("newbie".into());
-    config.state.profiles = vec!["newbie".into()];
-
-    snapshot_active_credentials(&mut config).expect("snapshot");
-
-    let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("newbie")
-            .expect("dir")
-            .join("credentials.json"),
-    )
-    .expect("stored parse");
-    assert_eq!(stored.access_token(), Some("fresh-access"));
-    let anchor: Option<String> = crate::profile_cache::load_profile_cache(
-        "newbie",
-        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
-    );
-    assert_eq!(
-        anchor.as_deref(),
-        Some("uuid-first-login"),
-        "the adopt anchors the profile to the captured login's identity",
-    );
-}
-
-// ── RESCUE-2c: write_live_oauth_pair's in-lock supersede guards ───────────────
-
-fn rotated_pair() -> crate::oauth::TokenResponse {
-    crate::oauth::TokenResponse {
-        access_token: "at-rotated".to_string(),
-        refresh_token: "rt-rotated".to_string(),
-        expires_in: 28_800,
-        scope: None,
-    }
-}
-
-/// A fresh CC login landing between the caller's judgment and the write-back
-/// must survive: the stale expected-fingerprint makes the write a benign
-/// `Superseded` no-op instead of clobbering the fresh login.
-#[cfg(unix)]
-#[test]
-fn write_back_supersedes_when_the_live_fingerprint_moved() {
-    let _home = HomeSandbox::new();
-    let live = crate::profile::claude_dir()
-        .expect("dir")
-        .join(".credentials.json");
-    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
-    fs::write(
-        &live,
-        serde_json::to_vec(&creds("at-corpse", Some("rt-corpse"))).expect("ser"),
-    )
-    .expect("write corpse");
-    let corpse_fingerprint = live_credentials_fingerprint();
-
-    // A fresh login lands before the write-back.
-    fs::write(
-        &live,
-        serde_json::to_vec(&creds("at-fresh", Some("rt-fresh"))).expect("ser"),
-    )
-    .expect("write fresh");
-
-    let outcome = write_live_oauth_pair(&rotated_pair(), corpse_fingerprint).expect("write back");
-    assert_eq!(outcome, LiveWriteBack::Superseded);
-    let survived: ClaudeCredentials = crate::profile::read_json_file(&live).expect("read");
-    assert_eq!(
-        survived.access_token(),
-        Some("at-fresh"),
-        "the freshly landed login must never be clobbered"
-    );
-}
-
-/// A profile's own store taking the slot (symlink) mid-rescue is the same
-/// benign supersede — NOT an error (the old behavior surfaced it as a scary
-/// "its chain is lost; re-login" message for what loses nothing).
-#[cfg(unix)]
-#[test]
-fn write_back_supersedes_when_the_live_path_became_a_symlink() {
-    let _home = HomeSandbox::new();
-    let mut _config = seed_relogin_scenario(
-        "active",
-        creds("stored-access", Some("stored-refresh")),
-        creds("relogin-access", Some("relogin-refresh")),
-    );
-    let fingerprint = live_credentials_fingerprint();
-    force_link_profile_credentials("active").expect("relink");
-
-    let outcome = write_live_oauth_pair(&rotated_pair(), fingerprint).expect("write back");
-    assert_eq!(outcome, LiveWriteBack::Superseded);
-    assert_eq!(
-        classify_credentials_link("active").expect("classify"),
-        LinkState::LinkedTo,
-        "the profile's symlink is left untouched"
-    );
-    // The profile's stored chain was not corrupted by the unowned pair.
-    let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("active")
-            .expect("dir")
-            .join("credentials.json"),
-    )
-    .expect("read stored");
-    assert_eq!(stored.access_token(), Some("stored-access"));
-}
-
-/// The happy path still writes surgically: tokens + expiry replaced, every
-/// foreign top-level key (mcpOAuth) preserved.
-#[cfg(unix)]
-#[test]
-fn write_back_writes_in_place_and_preserves_foreign_keys() {
-    let _home = HomeSandbox::new();
-    let live = crate::profile::claude_dir()
-        .expect("dir")
-        .join(".credentials.json");
-    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
-    fs::write(
-        &live,
-        serde_json::to_vec(&serde_json::json!({
-            "claudeAiOauth": { "accessToken": "at-corpse", "refreshToken": "rt-corpse" },
-            "mcpOAuth": { "some-server": { "accessToken": "mcp-tok" } },
-        }))
-        .expect("ser"),
-    )
-    .expect("write corpse");
-    let fingerprint = live_credentials_fingerprint();
-
-    let outcome = write_live_oauth_pair(&rotated_pair(), fingerprint).expect("write back");
-    assert_eq!(outcome, LiveWriteBack::Written);
-    let root: serde_json::Value = crate::profile::read_json_file(&live).expect("read");
-    assert_eq!(root["claudeAiOauth"]["accessToken"], "at-rotated");
-    assert_eq!(root["claudeAiOauth"]["refreshToken"], "rt-rotated");
-    assert_eq!(
-        root["mcpOAuth"]["some-server"]["accessToken"], "mcp-tok",
-        "foreign top-level keys must survive the surgical write"
-    );
-}
-
-/// RESCUE-2 archive retention: the quarantine keeps the newest 20 copies and
-/// prunes older ones; same-millisecond archives never overwrite each other
-/// (the per-process sequence uniquifies names).
-#[cfg(unix)]
-#[test]
-fn quarantine_archive_prunes_to_the_newest_twenty() {
-    let _home = HomeSandbox::new();
-    let live = crate::profile::claude_dir()
-        .expect("dir")
-        .join(".credentials.json");
-    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
-
-    for i in 0..25 {
-        fs::write(
-            &live,
-            serde_json::to_vec(&creds(&format!("at-foreign-{i:02}"), Some("rt"))).expect("ser"),
-        )
-        .expect("write live");
-        archive_live_credentials("victim").expect("archive");
-    }
-
-    let dir = crate::profile::clauth_dir()
-        .expect("dir")
-        .join("quarantine");
-    let mut archived: Vec<_> = fs::read_dir(&dir)
-        .expect("read quarantine")
-        .map(|e| e.expect("entry").path())
-        .collect();
-    archived.sort();
-    assert_eq!(archived.len(), 20, "retention keeps exactly the newest 20");
-    let newest = fs::read_to_string(archived.last().expect("newest")).expect("read newest");
-    assert!(
-        newest.contains("at-foreign-24"),
-        "the newest archive holds the last-archived login"
-    );
-    let oldest = fs::read_to_string(archived.first().expect("oldest")).expect("read oldest");
-    assert!(
-        oldest.contains("at-foreign-05"),
-        "pruning removed the five oldest archives"
-    );
-}
-
 // ── apiKeyHelper for api-key profiles ─────────────────────────────────────────
 //
 // `build_claude_settings_json` swaps `env.ANTHROPIC_AUTH_TOKEN` for CC's
@@ -756,9 +537,11 @@ fn build_settings_writes_api_key_helper_not_env_token() {
     // profile name — so CC's shell-invocation of clauth can re-derive the key.
     let exe = std::env::current_exe().expect("test-bin current_exe");
     let exe_str = exe.to_string_lossy();
+    // Compared through `shell_quote`: on windows it escapes every `\`, so an
+    // absolute exe path never appears literally in the helper.
     assert!(
-        helper.contains(&*exe_str),
-        "helper ({helper}) must carry the current exe path ({exe_str})"
+        helper.contains(&shell_quote(&exe_str)),
+        "helper ({helper}) must carry the quoted current exe path ({exe_str})"
     );
     assert!(
         helper.contains("__api-key"),
@@ -1070,6 +853,161 @@ fn live_credentials_are_shell_requires_a_parsed_empty_login() {
     assert!(!live_credentials_are_shell());
 }
 
+/// `force_snapshot_active_credentials` is the shared sink `reconcile_startup`
+/// reaches via `default_divergence: Overwrite` with no sibling owner — a
+/// logged-out shell in the live slot must never overwrite the profile's real
+/// stored login with blanks (recoverable only by re-login). The second half is
+/// a positive control: the guard is narrow to shells only, so a REAL diverged
+/// login is still captured by the same sink.
+#[test]
+fn force_snapshot_skips_shell_but_still_captures_real_divergence() {
+    let _home = HomeSandbox::new();
+
+    let mut shell_config = seed_relogin_scenario(
+        "shell-active",
+        creds("stored-access", Some("stored-refresh")),
+        creds("", Some("")),
+    );
+    force_snapshot_active_credentials(&mut shell_config).expect("force snapshot shell");
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("shell-active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.access_token(),
+        Some("stored-access"),
+        "a logged-out shell must never overwrite the stored access token",
+    );
+    assert_eq!(
+        stored.refresh_token(),
+        Some("stored-refresh"),
+        "a logged-out shell must never overwrite the stored refresh token",
+    );
+
+    let mut real_config = seed_relogin_scenario(
+        "real-active",
+        creds("stored-access", Some("stored-refresh")),
+        creds("relogin-access", Some("relogin-refresh")),
+    );
+    force_snapshot_active_credentials(&mut real_config).expect("force snapshot real");
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("real-active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.access_token(),
+        Some("relogin-access"),
+        "a real diverged login must still be captured by the guard",
+    );
+    assert_eq!(
+        stored.refresh_token(),
+        Some("relogin-refresh"),
+        "a real diverged login must still be captured by the guard",
+    );
+}
+
+/// `reconcile_startup`'s non-diverged sink, `snapshot_active_credentials`,
+/// used to route a blank (credential-less) active profile's shell-shaped live
+/// file through `is_first_login` -> `adopt_first_login`, which deletes the
+/// live file to relink it — but a blank profile has no install source, so
+/// nothing gets relinked and the live file (with `mcpOAuth`) is simply gone.
+/// The 1Hz poll and the divergence prompt both already guard their own adopt
+/// call with `live_credentials_are_shell()`; this pins the startup sink to
+/// the same behavior via the shared `is_first_login` classification.
+#[test]
+fn snapshot_skips_shell_on_blank_profile_and_preserves_live_file() {
+    let _home = HomeSandbox::new();
+
+    let profile = crate::profile::Profile::new("blank-active".to_string(), None, None);
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.active_profile = Some("blank-active".into());
+    config.state.profiles = vec!["blank-active".into()];
+
+    let live = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    let shell_json = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "",
+            "refreshToken": null,
+            "expiresAt": 0,
+        },
+        "mcpOAuth": { "some-server": { "accessToken": "mcp-tok" } },
+    })
+    .to_string();
+    fs::write(&live, &shell_json).expect("write shell");
+
+    snapshot_active_credentials(&mut config).expect("snapshot");
+
+    assert!(
+        live.exists(),
+        "a logged-out shell must not be adopted as a first login, so the live file survives",
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&live).expect("read live")).expect("parse");
+    assert_eq!(
+        after["mcpOAuth"]["some-server"]["accessToken"], "mcp-tok",
+        "mcpOAuth must survive untouched — the sink never adopts, so it never rewrites the slot",
+    );
+    assert!(
+        config
+            .find("blank-active")
+            .expect("profile")
+            .credentials
+            .is_none(),
+        "nothing was adopted into the blank profile",
+    );
+}
+
+/// Sibling hole to the shell case: a TOCTOU delete of the live file inside the
+/// confirm window, or a dangling symlink, makes `read_claude_credentials`
+/// return `Ok(None)`. That absence is not a login either — the sink must skip
+/// the capture instead of wiping the stored login down to `None`.
+#[test]
+fn force_snapshot_skips_an_absent_live_file() {
+    let _home = HomeSandbox::new();
+
+    let mut profile = crate::profile::Profile::new("absent-active".to_string(), None, None);
+    profile.credentials = Some(creds("stored-access", Some("stored-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.active_profile = Some("absent-active".into());
+    config.state.profiles = vec!["absent-active".into()];
+
+    // No live `.credentials.json` written at all: `claude_credentials_path()`
+    // does not exist, matching a TOCTOU delete or a dangling symlink.
+
+    force_snapshot_active_credentials(&mut config).expect("force snapshot absent");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("absent-active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.access_token(),
+        Some("stored-access"),
+        "an absent live file must never overwrite the stored access token",
+    );
+    assert_eq!(
+        stored.refresh_token(),
+        Some("stored-refresh"),
+        "an absent live file must never overwrite the stored refresh token",
+    );
+}
+
 // ── CLA-SPLIT: long-lived session token beside the usage OAuth pair ───────────
 
 /// Write a `session-token.json` (static long-lived login) into `name`'s
@@ -1140,44 +1078,6 @@ fn session_token_live_is_linked_and_snapshot_keeps_usage_oauth() {
         stored.refresh_token(),
         Some("usage-refresh"),
         "snapshot must never overwrite the usage OAuth pair with the session token",
-    );
-}
-
-/// The FORCE path is guarded too: a session-side re-login left a rotating
-/// pair in the live slot and the operator confirmed Overwrite (or the CLI
-/// reconciled switch fired). For a session-token profile that capture must be
-/// a no-op — the confirmed Overwrite must not be the one path that can
-/// destroy the clauth-private usage pair.
-#[test]
-fn force_snapshot_never_clobbers_a_session_token_profiles_usage_pair() {
-    let _home = HomeSandbox::new();
-    let mut config = seed_relogin_scenario(
-        "split",
-        creds("usage-access", Some("usage-refresh")),
-        creds("relogin-access", Some("relogin-refresh")),
-    );
-    fill_session_token_by_hand("split", "oat-access");
-
-    force_snapshot_active_credentials(&mut config).expect("force snapshot");
-
-    let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("split")
-            .expect("dir")
-            .join("credentials.json"),
-    )
-    .expect("read stored");
-    assert_eq!(
-        stored.refresh_token(),
-        Some("usage-refresh"),
-        "the confirmed Overwrite must leave the usage OAuth pair untouched",
-    );
-    assert_eq!(
-        config
-            .find("split")
-            .and_then(|p| p.credentials.as_ref())
-            .and_then(|c| c.refresh_token()),
-        Some("usage-refresh"),
-        "the in-memory store must keep the usage pair too",
     );
 }
 
@@ -1398,24 +1298,82 @@ fn a_rotating_pair_in_the_sidecar_never_engages_the_split() {
     );
 }
 
-/// CLA-SPLIT-3 (2026-07-21): repairing a mis-filled sidecar flips the install
-/// source from `credentials.json` to `session-token.json` while the live slot
-/// still holds the OLD symlink — classify rightly reads Diverged (the link
-/// doesn't point at what a switch installs), but that state carries NOTHING
-/// unsaved: a clauth-owned symlink's content is a profile store by
-/// construction. `live_login_is_clauth_symlink` is the predicate the
-/// unsaved-credentials gates use to tell the two apart; without it the
-/// archive's symlink refusal deadlocked every switch ("deferring switch …
-/// nothing unsaved to archive").
-#[cfg(unix)]
+/// The macOS steady state, and the reason the exemption is content-based rather
+/// than symlink-identity: after a switch, Claude Code rewrites
+/// `~/.claude/.credentials.json` as a REGULAR-FILE mirror of the Keychain,
+/// clobbering clauth's symlink with identical content. Capturing a `setup-token`
+/// sidecar for the ACTIVE profile then flips the install source to
+/// `session-token.json`, so classify reads Diverged over that regular file —
+/// yet the live OAuth login is fully saved in the profile's `credentials.json`.
+/// `live_login_is_stored` must exempt it by CONTENT (a symlink-identity check
+/// reads a regular file as unsaved and defers every switch). Runs on every
+/// platform — the content path is what makes the fix portable — so a Linux CI
+/// exercises the macOS shape the maintainer can't.
 #[test]
-fn repaired_sidecar_under_stale_live_link_is_diverged_but_not_unsaved() {
+fn a_regular_file_mirror_of_a_stored_login_is_not_unsaved() {
     let _home = HomeSandbox::new();
     let mut profile = crate::profile::Profile::new("split".to_string(), None, None);
     profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
     crate::profile::save_profile(&profile).expect("save profile");
 
-    // The pre-repair state: live symlink → the profile's rotating store.
+    // CC's regular-file mirror: same OAuth login as the stored credentials.json,
+    // written as a plain file (not our symlink).
+    let live = claude_credentials_path().expect("creds path");
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    fs::write(
+        &live,
+        serde_json::to_vec(&creds("usage-access", Some("usage-refresh"))).expect("ser"),
+    )
+    .expect("write regular-file mirror");
+
+    // The sidecar capture flips the install source; classify reads Diverged over
+    // the regular file (it no longer matches what a switch installs).
+    fill_session_token_by_hand("split", "oat-access");
+    assert!(
+        matches!(
+            classify_credentials_link("split").expect("classify"),
+            LinkState::Diverged
+        ),
+        "the mirror no longer matches the flipped install source"
+    );
+    assert!(
+        live_login_is_stored("split"),
+        "…but the mirror's login is saved in credentials.json — not unsaved \
+         (a symlink-identity check would read this regular file as unsaved)"
+    );
+
+    // A genuine CC re-login (a DIFFERENT token) is the state the gates exist for —
+    // it matches neither store, so it is protected.
+    fs::write(
+        &live,
+        serde_json::to_vec(&creds("cc-relogin", Some("cc-rt"))).expect("ser"),
+    )
+    .expect("write regular re-login");
+    assert!(
+        !live_login_is_stored("split"),
+        "a re-login whose token matches no store must stay protected"
+    );
+
+    // Absent live slot: nothing to match, nothing saved.
+    fs::remove_file(&live).expect("drop file");
+    assert!(!live_login_is_stored("split"));
+}
+
+/// The symlink half of the same exemption, and the original 2026-07-21 repro:
+/// capturing a sidecar for the ACTIVE profile flips the install source while the
+/// live slot is still clauth's symlink into `credentials.json`. classify reads
+/// Diverged (the link no longer points at what a switch installs), but a
+/// clauth-owned symlink's target IS a profile store by construction, so nothing
+/// is unsaved — `live_login_is_stored` exempts it both structurally (it's a
+/// symlink) and by content (reading through it yields the stored login).
+#[cfg(unix)]
+#[test]
+fn a_clauth_symlink_under_a_flipped_install_source_is_not_unsaved() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("split".to_string(), None, None);
+    profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
     let live = claude_credentials_path().expect("creds path");
     fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
     let store = crate::profile::profile_dir("split")
@@ -1427,11 +1385,9 @@ fn repaired_sidecar_under_stale_live_link_is_diverged_but_not_unsaved() {
             classify_credentials_link("split").expect("classify"),
             LinkState::LinkedTo
         ),
-        "before the repair the link points at the install source"
+        "before the capture the link points at the install source"
     );
 
-    // The repair: a genuine long-lived sidecar appears; the install source
-    // flips underneath the live link.
     fill_session_token_by_hand("split", "oat-access");
     assert!(
         matches!(
@@ -1441,26 +1397,334 @@ fn repaired_sidecar_under_stale_live_link_is_diverged_but_not_unsaved() {
         "the stale link no longer points at what a switch installs"
     );
     assert!(
-        live_login_is_clauth_symlink(),
+        live_login_is_stored("split"),
         "…but a clauth-owned symlink holds nothing unsaved"
     );
 
-    // A regular-file live login (a CC /login) is the state the archive exists
-    // for — the predicate must NOT claim that one.
-    fs::remove_file(&live).expect("drop link");
-    fs::write(
-        &live,
-        serde_json::to_vec(&creds("cc-relogin", Some("cc-rt"))).expect("ser"),
-    )
-    .expect("write regular live");
-    assert!(!live_login_is_clauth_symlink());
-
-    // Absent live slot: nothing there, certainly not a symlink.
-    fs::remove_file(&live).expect("drop file");
-    assert!(!live_login_is_clauth_symlink());
+    // A dangling clauth symlink (its store file removed) still has no login to
+    // protect — the structural half keeps exempting it, so a switch is never
+    // deferred over an empty slot.
+    fs::remove_file(&store).expect("drop store file");
+    assert!(
+        live_login_is_stored("split"),
+        "a dangling clauth symlink is a store slot, not an unsaved login"
+    );
 }
 
-// ── CLA-FEED: feed writer + static-mint preservation primitives ──────────────
+// ── Fork-only: CAP-1 identity capture, RESCUE write-back, CLA-FEED ──────────
+
+/// A live login belonging to a different account (Diverged) is never captured
+/// by the unattended snapshot — the outgoing profile keeps its own chain. This
+/// is the incident shape of 2026-07-12: a running claude wrote a sibling's
+/// rotated pair into the live mirror, and the capture window between classify
+/// and write copied it into the wrong profile's store.
+#[cfg(unix)]
+#[test]
+fn snapshot_never_captures_a_foreign_live_login() {
+    let _home = HomeSandbox::new();
+    let mut config = seed_relogin_scenario(
+        "active",
+        creds("own-access", Some("own-refresh")),
+        creds("foreign-access", Some("foreign-refresh")),
+    );
+
+    snapshot_active_credentials(&mut config).expect("snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("stored parse");
+    assert_eq!(
+        stored.access_token(),
+        Some("own-access"),
+        "a diverged live login must never overwrite the stored identity",
+    );
+}
+
+/// Equal access token ⇒ same rotation state: the snapshot refreshes the store
+/// with exactly the bytes it examined (CC rewrites the mirror with identical
+/// tokens but sometimes fresher metadata, e.g. `subscription_type`).
+#[cfg(unix)]
+#[test]
+fn snapshot_refreshes_the_store_when_live_token_matches() {
+    let _home = HomeSandbox::new();
+    let mut live = creds("same-access", Some("same-refresh"));
+    live.claude_ai_oauth
+        .as_mut()
+        .expect("oauth")
+        .subscription_type = Some("max".into());
+    let mut config =
+        seed_relogin_scenario("active", creds("same-access", Some("same-refresh")), live);
+
+    snapshot_active_credentials(&mut config).expect("snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("stored parse");
+    assert_eq!(
+        stored
+            .claude_ai_oauth
+            .as_ref()
+            .and_then(|o| o.subscription_type.as_deref()),
+        Some("max"),
+        "an equal-token live snapshot carries the live metadata into the store",
+    );
+}
+
+/// A completed first login adopts the bytes the check saw AND anchors the
+/// profile's identity to the login just captured (from CC's own
+/// `~/.claude.json` hint), so the identity-guarded adopt/follow paths can
+/// vouch for the profile immediately.
+#[cfg(unix)]
+#[test]
+fn first_login_adopt_anchors_the_profile() {
+    let _home = HomeSandbox::new();
+    let home = crate::profile::home_dir().expect("home");
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"uuid-first-login"}}"#,
+    )
+    .expect("write claude.json");
+
+    let live_path = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live_path.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(&creds("fresh-access", Some("fresh-refresh"))).expect("ser"),
+    )
+    .expect("write live");
+
+    let profile = crate::profile::Profile::new("newbie".to_string(), None, None);
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.active_profile = Some("newbie".into());
+    config.state.profiles = vec!["newbie".into()];
+
+    snapshot_active_credentials(&mut config).expect("snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("newbie")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("stored parse");
+    assert_eq!(stored.access_token(), Some("fresh-access"));
+    let anchor: Option<String> = crate::profile_cache::load_profile_cache(
+        "newbie",
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+    );
+    assert_eq!(
+        anchor.as_deref(),
+        Some("uuid-first-login"),
+        "the adopt anchors the profile to the captured login's identity",
+    );
+}
+
+// ── RESCUE-2c: write_live_oauth_pair's in-lock supersede guards ───────────────
+
+fn rotated_pair() -> crate::oauth::TokenResponse {
+    crate::oauth::TokenResponse {
+        access_token: "at-rotated".to_string(),
+        refresh_token: "rt-rotated".to_string(),
+        expires_in: 28_800,
+        scope: None,
+    }
+}
+
+/// A fresh CC login landing between the caller's judgment and the write-back
+/// must survive: the stale expected-fingerprint makes the write a benign
+/// `Superseded` no-op instead of clobbering the fresh login.
+#[cfg(unix)]
+#[test]
+fn write_back_supersedes_when_the_live_fingerprint_moved() {
+    let _home = HomeSandbox::new();
+    let live = crate::profile::claude_dir()
+        .expect("dir")
+        .join(".credentials.json");
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &live,
+        serde_json::to_vec(&creds("at-corpse", Some("rt-corpse"))).expect("ser"),
+    )
+    .expect("write corpse");
+    let corpse_fingerprint = live_credentials_fingerprint();
+
+    // A fresh login lands before the write-back.
+    fs::write(
+        &live,
+        serde_json::to_vec(&creds("at-fresh", Some("rt-fresh"))).expect("ser"),
+    )
+    .expect("write fresh");
+
+    let outcome = write_live_oauth_pair(&rotated_pair(), corpse_fingerprint).expect("write back");
+    assert_eq!(outcome, LiveWriteBack::Superseded);
+    let survived: ClaudeCredentials = crate::profile::read_json_file(&live).expect("read");
+    assert_eq!(
+        survived.access_token(),
+        Some("at-fresh"),
+        "the freshly landed login must never be clobbered"
+    );
+}
+
+/// A profile's own store taking the slot (symlink) mid-rescue is the same
+/// benign supersede — NOT an error (the old behavior surfaced it as a scary
+/// "its chain is lost; re-login" message for what loses nothing).
+#[cfg(unix)]
+#[test]
+fn write_back_supersedes_when_the_live_path_became_a_symlink() {
+    let _home = HomeSandbox::new();
+    let mut _config = seed_relogin_scenario(
+        "active",
+        creds("stored-access", Some("stored-refresh")),
+        creds("relogin-access", Some("relogin-refresh")),
+    );
+    let fingerprint = live_credentials_fingerprint();
+    force_link_profile_credentials("active").expect("relink");
+
+    let outcome = write_live_oauth_pair(&rotated_pair(), fingerprint).expect("write back");
+    assert_eq!(outcome, LiveWriteBack::Superseded);
+    assert_eq!(
+        classify_credentials_link("active").expect("classify"),
+        LinkState::LinkedTo,
+        "the profile's symlink is left untouched"
+    );
+    // The profile's stored chain was not corrupted by the unowned pair.
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(stored.access_token(), Some("stored-access"));
+}
+
+/// The happy path still writes surgically: tokens + expiry replaced, every
+/// foreign top-level key (mcpOAuth) preserved.
+#[cfg(unix)]
+#[test]
+fn write_back_writes_in_place_and_preserves_foreign_keys() {
+    let _home = HomeSandbox::new();
+    let live = crate::profile::claude_dir()
+        .expect("dir")
+        .join(".credentials.json");
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &live,
+        serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": { "accessToken": "at-corpse", "refreshToken": "rt-corpse" },
+            "mcpOAuth": { "some-server": { "accessToken": "mcp-tok" } },
+        }))
+        .expect("ser"),
+    )
+    .expect("write corpse");
+    let fingerprint = live_credentials_fingerprint();
+
+    let outcome = write_live_oauth_pair(&rotated_pair(), fingerprint).expect("write back");
+    assert_eq!(outcome, LiveWriteBack::Written);
+    let root: serde_json::Value = crate::profile::read_json_file(&live).expect("read");
+    assert_eq!(root["claudeAiOauth"]["accessToken"], "at-rotated");
+    assert_eq!(root["claudeAiOauth"]["refreshToken"], "rt-rotated");
+    assert_eq!(
+        root["mcpOAuth"]["some-server"]["accessToken"], "mcp-tok",
+        "foreign top-level keys must survive the surgical write"
+    );
+}
+
+/// RESCUE-2 archive retention: the quarantine keeps the newest 20 copies and
+/// prunes older ones; same-millisecond archives never overwrite each other
+/// (the per-process sequence uniquifies names).
+#[cfg(unix)]
+#[test]
+fn quarantine_archive_prunes_to_the_newest_twenty() {
+    let _home = HomeSandbox::new();
+    let live = crate::profile::claude_dir()
+        .expect("dir")
+        .join(".credentials.json");
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
+
+    for i in 0..25 {
+        fs::write(
+            &live,
+            serde_json::to_vec(&creds(&format!("at-foreign-{i:02}"), Some("rt"))).expect("ser"),
+        )
+        .expect("write live");
+        archive_live_credentials("victim").expect("archive");
+    }
+
+    let dir = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("quarantine");
+    let mut archived: Vec<_> = fs::read_dir(&dir)
+        .expect("read quarantine")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    archived.sort();
+    assert_eq!(archived.len(), 20, "retention keeps exactly the newest 20");
+    let newest = fs::read_to_string(archived.last().expect("newest")).expect("read newest");
+    assert!(
+        newest.contains("at-foreign-24"),
+        "the newest archive holds the last-archived login"
+    );
+    let oldest = fs::read_to_string(archived.first().expect("oldest")).expect("read oldest");
+    assert!(
+        oldest.contains("at-foreign-05"),
+        "pruning removed the five oldest archives"
+    );
+}
+
+// ── apiKeyHelper for api-key profiles ─────────────────────────────────────────
+//
+// `build_claude_settings_json` swaps `env.ANTHROPIC_AUTH_TOKEN` for CC's
+// top-level `apiKeyHelper` when a profile carries an api_key, so the raw key
+// leaves the settings.json `env` block and the spawned CC process's env. CC
+// runs the helper per request and sends its stdout as both `X-Api-Key` and
+// `Authorization: Bearer` (see `docs/internals.md`).
+
+/// The FORCE path is guarded too: a session-side re-login left a rotating
+/// pair in the live slot and the operator confirmed Overwrite (or the CLI
+/// reconciled switch fired). For a session-token profile that capture must be
+/// a no-op — the confirmed Overwrite must not be the one path that can
+/// destroy the clauth-private usage pair.
+#[test]
+fn force_snapshot_never_clobbers_a_session_token_profiles_usage_pair() {
+    let _home = HomeSandbox::new();
+    let mut config = seed_relogin_scenario(
+        "split",
+        creds("usage-access", Some("usage-refresh")),
+        creds("relogin-access", Some("relogin-refresh")),
+    );
+    fill_session_token_by_hand("split", "oat-access");
+
+    force_snapshot_active_credentials(&mut config).expect("force snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("split")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("usage-refresh"),
+        "the confirmed Overwrite must leave the usage OAuth pair untouched",
+    );
+    assert_eq!(
+        config
+            .find("split")
+            .and_then(|p| p.credentials.as_ref())
+            .and_then(|c| c.refresh_token()),
+        Some("usage-refresh"),
+        "the in-memory store must keep the usage pair too",
+    );
+}
 
 /// The fed sidecar carries the chain's access token, real expiry, scopes, and
 /// subscriptionType — and NEVER a refresh token, so the classifier stays
