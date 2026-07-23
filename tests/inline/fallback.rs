@@ -3083,6 +3083,119 @@ fn both_windows(five: f64, seven: f64) -> UsageInfo {
     }
 }
 
+// `candidate_excluded` (the config-side skip every selection walk applies) and
+// `blocked_reason`'s dead-first rungs (`Disabled`/`Canceled`/`AuthBroken`) are
+// two hand-written ladders over one policy. A member the walk refuses as a
+// candidate is exactly one the chip marks dead-first; a member blocked only by
+// usage stays a walk candidate and carries a non-dead-first chip. This pins the
+// biconditional for each of the three current dead-first terms, so dropping or
+// re-gating one on either side reds here rather than drifting the chip off the
+// behaviour it describes. A brand-new exclusion class needs its own fixture
+// added below to be covered.
+//
+// Holds only for a NON-active member: `blocked_reason`'s `Disabled` rung and
+// the walk's `== active` skip both special-case the active slot, so a healthy
+// `keep` stays active and `cand` is judged as the candidate.
+#[test]
+fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
+    fn dead_first_chip(config: &AppConfig, name: &str) -> bool {
+        let cand = config.find(name).expect("candidate is resolvable");
+        matches!(
+            blocked_reason(config, cand, None),
+            Some(BlockedReason::Disabled | BlockedReason::Canceled | BlockedReason::AuthBroken)
+        )
+    }
+    // The invariant, checked on every case: the walk skip and the chip's
+    // dead-first verdict must agree for a resolvable non-active candidate.
+    let assert_coupled = |config: &AppConfig, name: &str| {
+        assert_eq!(
+            candidate_excluded(config, name),
+            dead_first_chip(config, name),
+            "walk skip and dead-first chip disagree for {name}: {:?}",
+            blocked_reason(config, config.find(name).expect("resolvable"), None)
+        );
+    };
+    let keeper = || mark_fresh(profile_with_util("keep", Some(90.0), Some(10.0)));
+
+    // disabled: the walk skips it, the chip is Disabled.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            mark_disabled(profile_with_util("cand", Some(90.0), Some(10.0))),
+        ],
+        "keep",
+    );
+    assert_coupled(&config, "cand");
+    assert!(candidate_excluded(&config, "cand"));
+    assert_eq!(
+        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        Some(BlockedReason::Disabled)
+    );
+
+    // auth-broken: the walk skips it, the chip is AuthBroken.
+    let mut config = config_with_chain(
+        vec![keeper(), profile_with_util("cand", Some(90.0), Some(10.0))],
+        "keep",
+    );
+    config.state.auth_broken.push("cand".into());
+    assert_coupled(&config, "cand");
+    assert_eq!(
+        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        Some(BlockedReason::AuthBroken)
+    );
+
+    // canceled: the walk skips it, the chip is Canceled.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage("cand", Some(90.0), Some(canceled_usage())),
+        ],
+        "keep",
+    );
+    assert_coupled(&config, "cand");
+    assert_eq!(
+        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        Some(BlockedReason::Canceled)
+    );
+
+    // live headroom: the walk keeps it, no chip at all.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            mark_fresh(profile_with_util("cand", Some(90.0), Some(10.0))),
+        ],
+        "keep",
+    );
+    assert_coupled(&config, "cand");
+    assert!(!candidate_excluded(&config, "cand"));
+    assert_eq!(
+        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        None
+    );
+
+    // usage-only exhaustion: still a walk candidate (routed around by accept,
+    // not skip), and the chip is present but NOT dead-first.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            mark_fresh(profile_with_util("cand", Some(90.0), Some(100.0))),
+        ],
+        "keep",
+    );
+    assert_coupled(&config, "cand");
+    assert!(
+        !candidate_excluded(&config, "cand"),
+        "a member blocked only by usage stays a walk candidate"
+    );
+    assert!(
+        matches!(
+            blocked_reason(&config, config.find("cand").expect("cand"), None),
+            Some(BlockedReason::FiveHour { .. })
+        ),
+        "usage exhaustion is a non-dead-first chip"
+    );
+}
+
 #[test]
 fn blocked_reason_none_for_a_live_member_with_headroom() {
     let p = mark_fresh(profile_with_util("a", Some(95.0), Some(40.0)));
