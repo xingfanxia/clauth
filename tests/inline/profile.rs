@@ -496,7 +496,6 @@ fn oauth_credentials() -> ClaudeCredentials {
 /// every hand-edited config to the wrong value. A garbage `fallback_threshold`
 /// left raw would also drive the auto-switch walk off a nonsense line, so the
 /// clamp is load-bearing rather than cosmetic. Both fields, both directions.
-#[cfg(unix)]
 #[test]
 fn out_of_band_per_profile_thresholds_clamp_to_the_band_at_load() {
     let _home = HomeSandbox::new();
@@ -573,7 +572,6 @@ fn switch_off_when_spent_keeps_its_wrap_off_key_on_disk() {
 /// declared cap has infinite room (`fallback::spend_room`), i.e. unbounded
 /// spending from one hand-edited word. Anything non-finite reads as the
 /// never-spend default instead.
-#[cfg(unix)]
 #[test]
 fn non_finite_max_auto_spend_reads_as_zero_at_load() {
     let _home = HomeSandbox::new();
@@ -611,7 +609,6 @@ fn non_finite_max_auto_spend_reads_as_zero_at_load() {
 /// `NaN`, which TOML rejects, so the next `load_profile` fails on the file
 /// clauth itself just rewrote. Non-finite reads as unset on both percent
 /// fields, matching `max_auto_spend`'s guard above.
-#[cfg(unix)]
 #[test]
 fn non_finite_percent_fields_read_as_unset_at_load() {
     let _home = HomeSandbox::new();
@@ -645,7 +642,6 @@ fn non_finite_percent_fields_read_as_unset_at_load() {
 /// to it (pair present + no usable key). A pure api account with a cleared key
 /// keeps its base_url shell so `clear_profile_api_key` stays re-loginable — the
 /// same normalize-at-load discipline as `max_auto_spend`, scoped to the leak.
-#[cfg(unix)]
 #[test]
 fn base_url_dropped_only_when_a_stored_pair_could_leak() {
     let _home = HomeSandbox::new();
@@ -717,7 +713,6 @@ fn base_url_dropped_only_when_a_stored_pair_could_leak() {
 // too eagerly and a genuinely orphaned rotation is dropped (that pair is gone
 // and the account needs a manual re-login). Each arm below is one of those.
 
-#[cfg(unix)]
 fn pair(access: &str, refresh: &str) -> ClaudeCredentials {
     ClaudeCredentials {
         claude_ai_oauth: Some(OAuthToken {
@@ -730,7 +725,6 @@ fn pair(access: &str, refresh: &str) -> ClaudeCredentials {
     }
 }
 
-#[cfg(unix)]
 fn refresh_token_of(creds: &Option<ClaudeCredentials>) -> Option<&str> {
     creds
         .as_ref()?
@@ -740,7 +734,6 @@ fn refresh_token_of(creds: &Option<ClaudeCredentials>) -> Option<&str> {
         .as_deref()
 }
 
-#[cfg(unix)]
 fn seed_committed(name: &str, creds: &ClaudeCredentials) {
     let mut profile = crate::testutil::blank_profile(name);
     profile.credentials = Some(creds.clone());
@@ -750,7 +743,6 @@ fn seed_committed(name: &str, creds: &ClaudeCredentials) {
 /// Sidecar NEWER than `credentials.json`: the rotation was staged but the commit
 /// never landed, so the staged pair is the only live one — adopt it, write it
 /// through to `credentials.json`, and consume the sidecar.
-#[cfg(unix)]
 #[test]
 fn pending_sidecar_newer_than_the_commit_is_adopted_and_written_through() {
     let _home = HomeSandbox::new();
@@ -793,7 +785,6 @@ fn pending_sidecar_newer_than_the_commit_is_adopted_and_written_through() {
 /// Sidecar OLDER than `credentials.json`: the commit landed cleanly and the
 /// sidecar is its already-superseded predecessor. Adopting it would reinstall a
 /// spent refresh token, so it must be discarded — and still cleaned up.
-#[cfg(unix)]
 #[test]
 fn pending_sidecar_older_than_the_commit_is_discarded_not_reinstalled() {
     let _home = HomeSandbox::new();
@@ -837,7 +828,6 @@ fn pending_sidecar_older_than_the_commit_is_discarded_not_reinstalled() {
 /// within one filesystem timestamp tick is the common case on a coarse-grained
 /// mtime, and treating that as "the commit won" would drop a rotation that may
 /// never have landed.
-#[cfg(unix)]
 #[test]
 fn pending_sidecar_with_an_equal_mtime_is_adopted() {
     let _home = HomeSandbox::new();
@@ -865,7 +855,6 @@ fn pending_sidecar_with_an_equal_mtime_is_adopted() {
 /// commit): there is nothing to compare against and the sidecar is the only pair
 /// in existence — adopt unconditionally rather than treating the missing file as
 /// a reason to discard.
-#[cfg(unix)]
 #[test]
 fn pending_sidecar_is_adopted_when_no_commit_exists_at_all() {
     let _home = HomeSandbox::new();
@@ -1504,7 +1493,6 @@ fn weekly_threshold_round_trips_through_config_toml() {
 /// band's floor would weekly-block the account from about 1% into its week,
 /// chipped as a plausible-looking `WeeklySoft`). Through the real disk
 /// boundary: `load_profile` is where the normalization lives.
-#[cfg(unix)]
 #[test]
 fn weekly_threshold_out_of_band_resets_to_unset_at_load() {
     let _home = HomeSandbox::new();
@@ -1558,7 +1546,6 @@ fn weekly_threshold_out_of_band_resets_to_unset_at_load() {
 /// `profile_config_usage_gates_default_unset` stops at `ProfileConfig` (the
 /// unset is `None` there); this pins the `unwrap_or(true)` resolution where
 /// it lives, so flipping it to `unwrap_or(false)` cannot stay green.
-#[cfg(unix)]
 #[test]
 fn usage_gates_default_on_through_the_load_boundary() {
     let _home = HomeSandbox::new();
