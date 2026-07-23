@@ -1436,6 +1436,60 @@ fn divergence_poll_ignores_a_stale_clauth_symlink() {
     assert!(app.modals.is_empty(), "and certainly no modal");
 }
 
+/// The macOS steady-state twin: after a switch, Claude Code rewrites the live
+/// slot as a REGULAR-FILE mirror of the Keychain, so the stale-sidecar state the
+/// test above pins as a symlink recurs as a regular file. The 1Hz poll must
+/// still stay silent — the mirror's login is saved in `credentials.json`. A
+/// symlink-identity check reads the regular file as divergence and repaints the
+/// banner every second; the content-based exemption clears it.
+#[test]
+fn divergence_poll_ignores_a_macos_regular_file_mirror() {
+    use crate::profile::{
+        AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, save_profile,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    // CC's regular-file mirror: work's stored login as a plain file (access token
+    // "acc", same as work's credentials.json), NOT our symlink.
+    write_live_creds(&login_creds("rt-work"));
+    // The sidecar flips work's install source; the mirror now classifies Diverged
+    // with nothing unsaved behind it.
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat-work".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let work_dir = crate::profile::profile_dir("work").expect("work dir");
+    std::fs::write(
+        work_dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("ser sidecar"),
+    )
+    .expect("write session-token sidecar");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into()],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_none(),
+        "a saved login mirrored as a regular file is nothing to resolve — no 1Hz banner"
+    );
+    assert!(app.modals.is_empty(), "and certainly no modal");
+}
+
 /// The banner and the resolver both identify the live login's OWNER when it is
 /// a stored sibling — by exact token match here (the half-landed-switch shape)
 /// — and the resolver leads with the "switch to it" action.

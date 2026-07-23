@@ -1091,24 +1091,82 @@ fn a_rotating_pair_in_the_sidecar_never_engages_the_split() {
     );
 }
 
-/// Capturing a `setup-token` sidecar for the ACTIVE profile flips the install
-/// source from `credentials.json` to `session-token.json` while the live slot
-/// still holds the OLD symlink — classify rightly reads Diverged (the link no
-/// longer points at what a switch installs), but that state carries NOTHING
-/// unsaved: a clauth-owned symlink's content is a profile store by
-/// construction. `live_login_is_clauth_symlink` is the predicate the
-/// unsaved-credentials gates use to tell the two apart; without it every
-/// unattended switch fails "unsaved credentials" until its retry TTL and the
-/// TUI prompts about credentials that are fully saved.
-#[cfg(unix)]
+/// The macOS steady state, and the reason the exemption is content-based rather
+/// than symlink-identity: after a switch, Claude Code rewrites
+/// `~/.claude/.credentials.json` as a REGULAR-FILE mirror of the Keychain,
+/// clobbering clauth's symlink with identical content. Capturing a `setup-token`
+/// sidecar for the ACTIVE profile then flips the install source to
+/// `session-token.json`, so classify reads Diverged over that regular file —
+/// yet the live OAuth login is fully saved in the profile's `credentials.json`.
+/// `live_login_is_stored` must exempt it by CONTENT (a symlink-identity check
+/// reads a regular file as unsaved and defers every switch). Runs on every
+/// platform — the content path is what makes the fix portable — so a Linux CI
+/// exercises the macOS shape the maintainer can't.
 #[test]
-fn captured_sidecar_under_stale_live_link_is_diverged_but_not_unsaved() {
+fn a_regular_file_mirror_of_a_stored_login_is_not_unsaved() {
     let _home = HomeSandbox::new();
     let mut profile = crate::profile::Profile::new("split".to_string(), None, None);
     profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
     crate::profile::save_profile(&profile).expect("save profile");
 
-    // The pre-capture state: live symlink → the profile's rotating store.
+    // CC's regular-file mirror: same OAuth login as the stored credentials.json,
+    // written as a plain file (not our symlink).
+    let live = claude_credentials_path().expect("creds path");
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    fs::write(
+        &live,
+        serde_json::to_vec(&creds("usage-access", Some("usage-refresh"))).expect("ser"),
+    )
+    .expect("write regular-file mirror");
+
+    // The sidecar capture flips the install source; classify reads Diverged over
+    // the regular file (it no longer matches what a switch installs).
+    fill_session_token_by_hand("split", "oat-access");
+    assert!(
+        matches!(
+            classify_credentials_link("split").expect("classify"),
+            LinkState::Diverged
+        ),
+        "the mirror no longer matches the flipped install source"
+    );
+    assert!(
+        live_login_is_stored("split"),
+        "…but the mirror's login is saved in credentials.json — not unsaved \
+         (a symlink-identity check would read this regular file as unsaved)"
+    );
+
+    // A genuine CC re-login (a DIFFERENT token) is the state the gates exist for —
+    // it matches neither store, so it is protected.
+    fs::write(
+        &live,
+        serde_json::to_vec(&creds("cc-relogin", Some("cc-rt"))).expect("ser"),
+    )
+    .expect("write regular re-login");
+    assert!(
+        !live_login_is_stored("split"),
+        "a re-login whose token matches no store must stay protected"
+    );
+
+    // Absent live slot: nothing to match, nothing saved.
+    fs::remove_file(&live).expect("drop file");
+    assert!(!live_login_is_stored("split"));
+}
+
+/// The symlink half of the same exemption, and the original 2026-07-21 repro:
+/// capturing a sidecar for the ACTIVE profile flips the install source while the
+/// live slot is still clauth's symlink into `credentials.json`. classify reads
+/// Diverged (the link no longer points at what a switch installs), but a
+/// clauth-owned symlink's target IS a profile store by construction, so nothing
+/// is unsaved — `live_login_is_stored` exempts it both structurally (it's a
+/// symlink) and by content (reading through it yields the stored login).
+#[cfg(unix)]
+#[test]
+fn a_clauth_symlink_under_a_flipped_install_source_is_not_unsaved() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("split".to_string(), None, None);
+    profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
     let live = claude_credentials_path().expect("creds path");
     fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
     let store = crate::profile::profile_dir("split")
@@ -1123,8 +1181,6 @@ fn captured_sidecar_under_stale_live_link_is_diverged_but_not_unsaved() {
         "before the capture the link points at the install source"
     );
 
-    // The capture: a long-lived sidecar appears; the install source flips
-    // underneath the live link.
     fill_session_token_by_hand("split", "oat-access");
     assert!(
         matches!(
@@ -1134,21 +1190,16 @@ fn captured_sidecar_under_stale_live_link_is_diverged_but_not_unsaved() {
         "the stale link no longer points at what a switch installs"
     );
     assert!(
-        live_login_is_clauth_symlink(),
+        live_login_is_stored("split"),
         "…but a clauth-owned symlink holds nothing unsaved"
     );
 
-    // A regular-file live login (a CC /login) is the state the gates exist
-    // for — the predicate must NOT claim that one.
-    fs::remove_file(&live).expect("drop link");
-    fs::write(
-        &live,
-        serde_json::to_vec(&creds("cc-relogin", Some("cc-rt"))).expect("ser"),
-    )
-    .expect("write regular live");
-    assert!(!live_login_is_clauth_symlink());
-
-    // Absent live slot: nothing there, certainly not a symlink.
-    fs::remove_file(&live).expect("drop file");
-    assert!(!live_login_is_clauth_symlink());
+    // A dangling clauth symlink (its store file removed) still has no login to
+    // protect — the structural half keeps exempting it, so a switch is never
+    // deferred over an empty slot.
+    fs::remove_file(&store).expect("drop store file");
+    assert!(
+        live_login_is_stored("split"),
+        "a dangling clauth symlink is a store slot, not an unsaved login"
+    );
 }

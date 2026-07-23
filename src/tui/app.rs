@@ -7238,11 +7238,13 @@ fn poll_credentials_divergence(app: &mut App) {
         }
         return;
     }
-    // A clauth-owned symlink holds nothing unsaved — the next switch re-points it,
-    // losing no login — so it must not raise the banner. The switch/defer gates
-    // apply the same exemption through `live_diverged_and_unsaved`; the poll must
-    // adopt a first login before this point, so it checks the atomic here instead.
-    if crate::claude::live_login_is_clauth_symlink() {
+    // A login already saved in the active profile's store holds nothing unsaved —
+    // the next switch re-installs it, losing no login — so it must not raise the
+    // banner. This clears clauth's own symlink AND the macOS regular-file mirror CC
+    // writes over it. The switch/defer gates apply the same exemption through
+    // `live_diverged_and_unsaved`; the poll must adopt a first login before this
+    // point, so it checks the predicate directly here instead.
+    if crate::claude::live_login_is_stored(&active) {
         app.divergence_pending = None;
         return;
     }
