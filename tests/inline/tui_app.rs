@@ -4547,3 +4547,97 @@ fn fallback_weekly_override_editor_is_inert_while_gate_is_off() {
         "⏎ must not open the editor while the weekly gate is off"
     );
 }
+
+// ── startup Overwrite + logged-out shell: caller-path coverage for the sink ──
+//
+// `force_snapshot_skips_shell_but_still_captures_real_divergence` (claude.rs)
+// pins the sink guard in isolation. This drives the REAL startup chain end to
+// end: reconcile_startup classifies the shell as diverged and posts
+// ReconcileNeedsPrompt; draining the signal runs resolve_or_note_divergence →
+// default_divergence Overwrite → run_divergence_choice →
+// force_snapshot_active_credentials (the shared sink). The 1Hz poll bails on
+// `live_credentials_are_shell()` BEFORE that point (app.rs), but the startup
+// path has no such early guard, so the sink's empty-login skip is the only
+// thing standing between a logged-out shell and the stored login here.
+
+fn oauth_login(access: &str, refresh: Option<&str>) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    }
+}
+
+#[test]
+fn startup_overwrite_default_routes_a_shell_through_the_guarded_sink() {
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, DivergenceChoice, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // Active profile carrying a real stored login.
+    let mut profile = Profile::new("active".to_string(), None, None);
+    profile.credentials = Some(oauth_login("stored-access", Some("stored-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    // CC's logged-out shell in the live slot: blank tokens, a foreign key kept,
+    // written as a plain file (not clauth's symlink).
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"mcpOAuth":{}}"#,
+    )
+    .expect("write shell");
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.active_profile = Some("active".into());
+    config.state.profiles = vec!["active".into()];
+    config.state.default_divergence = Some(DivergenceChoice::Overwrite);
+
+    let mut app = App::new(config);
+
+    // Exactly how production drives startup: reconcile inline, then drain the
+    // signal it posts.
+    super::reconcile_startup(&mut app);
+    super::drain_startup_signals(&mut app);
+
+    // The sink's empty-login skip held: the stored login is intact, not blanked
+    // by the shell. Remove that guard and Overwrite writes the shell's blank
+    // tokens over the stored chain here, so this assertion reds.
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.access_token(),
+        Some("stored-access"),
+        "a startup Overwrite must not let a logged-out shell blank the stored access token",
+    );
+    assert_eq!(
+        stored.refresh_token(),
+        Some("stored-refresh"),
+        "a startup Overwrite must not let a logged-out shell blank the stored refresh token",
+    );
+
+    // Positive control: the Overwrite branch actually RAN (the shell reached the
+    // sink, not an earlier bail). It relinked the live slot back to the stored
+    // login, so the slot no longer holds the shell's blank token. Cross-platform:
+    // a symlink on unix, a copy on windows both read back the stored login.
+    let relinked: ClaudeCredentials =
+        crate::profile::read_json_file(&live).expect("read relinked live");
+    assert_eq!(
+        relinked.access_token(),
+        Some("stored-access"),
+        "Overwrite relinks the live slot to the stored login, replacing the shell",
+    );
+}
