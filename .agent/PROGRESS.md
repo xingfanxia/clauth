@@ -1840,3 +1840,39 @@ stays queued behind #55. No new PR opened — nothing else is ripe.
   (in-place cp = SIGKILL, macOS signature kill). Daemon (pid --standby) +
   proxy restarted, status.json fresh, all fork wire keys verified present.
 - Gates: 1773 green, clippy 0, fmt clean, hard-cap sweep clean.
+
+## EXP-1 — login-expiry root-cause research (3-agent, 2026-07-23)
+
+Reports: external (codexbar/codex-auth/CRS/cc-switch + vendor issues), local
+forensics (daemon.log 07-10..23 + metadata-only cred inspection), codex-auth
+deep study. Consolidated verdict:
+
+- **Universal law** (vendor-confirmed both sides): refresh tokens are
+  single-use rotating with reuse detection — openai/codex #15410/#15502/#6498
+  (codex), claude-code #24317 + CodexBar #1161 (claude). Access-token TTL is
+  NEVER the killer; a second holder of the chain is. Mature projects converge
+  on "exactly one writer rotates-and-writes-back; everyone else read-only".
+- **Codex `ax-codex-cl` death (07-23 20:36) fully explained**: parked chain
+  minted 07-16, externally rotated/revoked (~07-23 09:27 wham 401); direct-mode
+  default bypasses the proxy so adopt-back never saw the rotation; RC-2: standby
+  refresh is AGE-scheduled (48h-to-expiry / 7d) — a wham 401 does NOT
+  accelerate it (scheduler.rs:2751-2758 uncoupled from codex/oauth.rs:181-194),
+  so the death stayed masked ~11h; RC-3: auth_broken = no self-recovery.
+- **Claude "revoked" deaths (07-16..22) = CLA-SPLIT-3 regression** (split
+  disengaged by mis-filled sidecar → CC raced the usage chain). Healed on disk
+  07-21/22; 1.6 days clean since. Ongoing exposures: RC-B external co-consumer
+  of the usage chain (structural, non-fatal to sessions post-split) and RC-C
+  fed-sidecar 7h clock-death across daemon idle gaps (re-feed is ONLY a
+  rotation side effect, oauth.rs:1040-1066; no independent timer; multi-hour
+  idle windows + fetch-lease contention observed). Discriminator for the next
+  death: "refresh token revoked" = RC-B; "login expired / long-lived token
+  expired" = RC-C.
+- **codex-auth study**: clauth ahead on all core mechanics (locking, rotation
+  guard, isolated homes, proxy fallback); worth adopting = versioned --json
+  contract discipline, bulk `import --codex`, `switch --previous`; explicitly
+  NOT: lockless file-copy swap, codext CLI fork, config injection, curl client.
+- **Proposed fixes (not started)**: F1 health-triggered codex standby (wham
+  401 → immediate guarded refresh attempt); F2 CLA-FEED independent re-feed
+  timer + wake-from-sleep check (+ verify clock-death degrade to static mint);
+  F3 codex self-heal re-capture (live ~/.codex login matching an auth_broken
+  profile's account → auto re-adopt); F4 codex-auth UX adoptions.
