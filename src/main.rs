@@ -50,10 +50,18 @@ use crate::cli::{Cli, Command, LoginArgs, ThemeArg};
 use crate::profile::{AppConfig, ThemeName, load_config};
 use crate::runtime::Isolation;
 
+/// Resolve `name` to its canonical spelling, or bail with a [`UsageError`].
+/// A bare unrecognized word lands here as a profile name (clap's `external`
+/// subcommand), so a typo'd subcommand and a typo'd profile name are
+/// indistinguishable at this position. Either way the caller named something
+/// that isn't there: a usage error (exit 2), not a runtime failure (exit 1).
+/// Shared by `start`/`delete`/`disable`/`enable`/`switch`.
 fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<String> {
     config.canonical_name(name).ok_or_else(|| {
         let available = config.names().join(", ");
-        anyhow::anyhow!("profile '{name}' not found\navailable: {available}")
+        usage_error(format!(
+            "profile '{name}' not found\navailable: {available}"
+        ))
     })
 }
 

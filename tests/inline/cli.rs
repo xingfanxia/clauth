@@ -25,10 +25,11 @@ fn command(args: &[&str]) -> Command {
         .unwrap_or_else(|| panic!("{args:?} must select a subcommand"))
 }
 
-/// The exit code `main` would produce for `args`: clap's own for a parse
-/// failure, [`crate::exit_code`]'s for anything that reaches dispatch. Mirrors
-/// `main`'s two-stage mapping so the whole contract is assertable without
-/// spawning the binary.
+/// clap's half of the exit contract: the parse-error code on a malformed argv,
+/// 0 on a successful parse. Only the first of `main`'s two stages; it never
+/// runs `crate::dispatch`, so an argv that parses but fails in dispatch reads 0
+/// here. For the full parse -> dispatch -> exit_code mapping see
+/// `dispatch_exit_code`.
 fn parse_exit_code(args: &[&str]) -> i32 {
     parse(args).err().map(|e| e.exit_code()).unwrap_or(0)
 }
@@ -857,6 +858,42 @@ mod disabled_target_refusal {
                 .join("runtime")
                 .exists(),
             "the refusal must happen before any runtime is acquired"
+        );
+    }
+}
+
+// ── a bad profile name is a usage error, not a runtime failure ──────────────
+// A typo'd subcommand is clap's `external` arm (dispatch routes it to
+// `cmd_switch`); a typo'd profile name on `delete`/`start`/`disable`/`enable`
+// reaches the same `resolve_or_bail`. Both should read as "you named something
+// that isn't there" to a calling script: exit 2, distinguishable from success.
+// Mirrors `main`'s parse -> dispatch -> exit_code mapping end-to-end.
+mod bad_profile_name_is_a_usage_error {
+    use super::*;
+    use crate::testutil::HomeSandbox;
+
+    fn dispatch_exit_code(args: &[&str]) -> i32 {
+        let cli = parse(args).unwrap_or_else(|e| panic!("argv must parse: {e}"));
+        crate::exit_code(crate::dispatch(cli))
+    }
+
+    #[test]
+    fn a_bare_unknown_word_exits_2() {
+        let _home = HomeSandbox::new();
+        assert_eq!(
+            dispatch_exit_code(&["strat"]),
+            2,
+            "a typo'd subcommand (a bare unknown word) is a usage error, not exit 1"
+        );
+    }
+
+    #[test]
+    fn delete_with_an_unknown_profile_exits_2() {
+        let _home = HomeSandbox::new();
+        assert_eq!(
+            dispatch_exit_code(&["delete", "strat"]),
+            2,
+            "naming a profile that isn't there is a usage error, not exit 1"
         );
     }
 }
