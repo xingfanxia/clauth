@@ -428,10 +428,10 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::HaikuModel => &snap.haiku,
         ConfigRow::SubagentModel => &snap.subagent,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
-        ConfigRow::EnvAdd
+        ConfigRow::AutoStart
+        | ConfigRow::EnvAdd
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::Disabled
-        | ConfigRow::AutoStart
         | ConfigRow::Login
         | ConfigRow::DeleteCreds
         | ConfigRow::Delete

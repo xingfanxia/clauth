@@ -198,6 +198,9 @@ pub(crate) enum FallbackRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigRow {
     Name,
+    /// OAuth-only auto-start toggle. `config_rows` renders it in the second
+    /// slot (right below `Name`); declared here so the enum tracks that order.
+    AutoStart,
     BaseUrl,
     ApiKey,
     /// Default model (CC `model` setting). Hybrid: space cycles aliases, ⏎ types a custom value.
@@ -218,7 +221,6 @@ pub(crate) enum ConfigRow {
     EnvEntry(usize),
     /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
-    AutoStart,
     /// Browser OAuth login: mint fresh tokens into this account (or, on the
     /// `+ new` form, create the account from the login). Async — runs on a worker.
     Login,
@@ -394,11 +396,11 @@ impl ConfigDraft {
             ConfigRow::SubagentModel => &self.subagent_model,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
-            ConfigRow::EnvEntry(_)
+            ConfigRow::AutoStart
+            | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::ModelOverrideAdd
             | ConfigRow::Disabled
-            | ConfigRow::AutoStart
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
             | ConfigRow::Delete
@@ -418,11 +420,11 @@ impl ConfigDraft {
             ConfigRow::SubagentModel => &mut self.subagent_model,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
-            ConfigRow::EnvEntry(_)
+            ConfigRow::AutoStart
+            | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::ModelOverrideAdd
             | ConfigRow::Disabled
-            | ConfigRow::AutoStart
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
             | ConfigRow::Delete
@@ -5738,10 +5740,10 @@ fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) ->
         ConfigRow::EnvEntry(i) => profile
             .and_then(|p| p.env.values().nth(i).cloned())
             .unwrap_or_default(),
-        ConfigRow::EnvAdd
+        ConfigRow::AutoStart
+        | ConfigRow::EnvAdd
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::Disabled
-        | ConfigRow::AutoStart
         | ConfigRow::Login
         | ConfigRow::DeleteCreds
         | ConfigRow::Delete

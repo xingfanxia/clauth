@@ -310,9 +310,10 @@ fn config_rows_login_and_delete_creds_visibility() {
 }
 
 /// `ConfigRow` derives no `Ord`/`EnumIter`, so nothing but this render order is
-/// observable — pin the account-actions tail's exact RUNTIME sequence
-/// (`config_rows`'s own row order) so a future reorder there reds instead of
-/// silently drifting from the enum's declaration order.
+/// observable — pin auto-start's second-slot head plus the account-actions
+/// tail's exact RUNTIME sequence (`config_rows`'s own row order) so a future
+/// reorder there reds instead of silently drifting from the enum's declaration
+/// order.
 #[test]
 fn config_rows_account_actions_tail_matches_runtime_order() {
     use super::{ConfigRow, config_rows};
@@ -338,6 +339,13 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
     app.config_draft = None;
 
     let rows = config_rows(&app);
+    // Head: an OAuth account renders auto-start in the second slot, so the
+    // enum's second-declared variant lines up with config_rows' second row.
+    assert_eq!(
+        &rows[..2],
+        [ConfigRow::Name, ConfigRow::AutoStart],
+        "auto-start renders in the second slot, right below name: {rows:?}"
+    );
     let tail = &rows[rows.len() - 4..];
     assert_eq!(
         tail,
