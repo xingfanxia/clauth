@@ -882,8 +882,21 @@ fn snapshot_active_credentials_unchecked(config: &mut AppConfig, active: &str) -
         return Ok(());
     }
     let credentials = read_claude_credentials()?;
+    // Only a real live login is captured. A logged-out shell (blank tokens) OR an
+    // absent live file (a TOCTOU delete in the modal-confirm window, or a
+    // dangling symlink) is not a login; persisting either would overwrite the
+    // stored chain with blanks or nothing. This shared sink is the last gate
+    // before every force-capture caller writes (modal Overwrite, CLI reconciled
+    // switch, reconcile_startup's default_divergence, adopt), so the invariant
+    // belongs here, not in each caller.
+    let Some(credentials) = credentials else {
+        return Ok(());
+    };
+    if live_login_is_empty(&credentials) {
+        return Ok(());
+    }
     if let Some(profile) = config.find_mut(active) {
-        profile.credentials = credentials;
+        profile.credentials = Some(credentials);
         save_profile(profile)?;
     }
     Ok(())

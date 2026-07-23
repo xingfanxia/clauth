@@ -803,6 +803,105 @@ fn live_credentials_are_shell_requires_a_parsed_empty_login() {
     assert!(!live_credentials_are_shell());
 }
 
+/// `force_snapshot_active_credentials` is the shared sink `reconcile_startup`
+/// reaches via `default_divergence: Overwrite` with no sibling owner — a
+/// logged-out shell in the live slot must never overwrite the profile's real
+/// stored login with blanks (recoverable only by re-login). The second half is
+/// a positive control: the guard is narrow to shells only, so a REAL diverged
+/// login is still captured by the same sink.
+#[test]
+fn force_snapshot_skips_shell_but_still_captures_real_divergence() {
+    let _home = HomeSandbox::new();
+
+    let mut shell_config = seed_relogin_scenario(
+        "shell-active",
+        creds("stored-access", Some("stored-refresh")),
+        creds("", Some("")),
+    );
+    force_snapshot_active_credentials(&mut shell_config).expect("force snapshot shell");
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("shell-active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.access_token(),
+        Some("stored-access"),
+        "a logged-out shell must never overwrite the stored access token",
+    );
+    assert_eq!(
+        stored.refresh_token(),
+        Some("stored-refresh"),
+        "a logged-out shell must never overwrite the stored refresh token",
+    );
+
+    let mut real_config = seed_relogin_scenario(
+        "real-active",
+        creds("stored-access", Some("stored-refresh")),
+        creds("relogin-access", Some("relogin-refresh")),
+    );
+    force_snapshot_active_credentials(&mut real_config).expect("force snapshot real");
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("real-active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.access_token(),
+        Some("relogin-access"),
+        "a real diverged login must still be captured by the guard",
+    );
+    assert_eq!(
+        stored.refresh_token(),
+        Some("relogin-refresh"),
+        "a real diverged login must still be captured by the guard",
+    );
+}
+
+/// Sibling hole to the shell case: a TOCTOU delete of the live file inside the
+/// confirm window, or a dangling symlink, makes `read_claude_credentials`
+/// return `Ok(None)`. That absence is not a login either — the sink must skip
+/// the capture instead of wiping the stored login down to `None`.
+#[test]
+fn force_snapshot_skips_an_absent_live_file() {
+    let _home = HomeSandbox::new();
+
+    let mut profile = crate::profile::Profile::new("absent-active".to_string(), None, None);
+    profile.credentials = Some(creds("stored-access", Some("stored-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.active_profile = Some("absent-active".into());
+    config.state.profiles = vec!["absent-active".into()];
+
+    // No live `.credentials.json` written at all: `claude_credentials_path()`
+    // does not exist, matching a TOCTOU delete or a dangling symlink.
+
+    force_snapshot_active_credentials(&mut config).expect("force snapshot absent");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("absent-active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.access_token(),
+        Some("stored-access"),
+        "an absent live file must never overwrite the stored access token",
+    );
+    assert_eq!(
+        stored.refresh_token(),
+        Some("stored-refresh"),
+        "an absent live file must never overwrite the stored refresh token",
+    );
+}
+
 // ── CLA-SPLIT: long-lived session token beside the usage OAuth pair ───────────
 
 /// Write a `session-token.json` (static long-lived login) into `name`'s
