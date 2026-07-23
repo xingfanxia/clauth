@@ -58,6 +58,13 @@ const RATE_LIMIT_BACKOFF_FACTOR: u64 = 3;
 /// to re-discover a recovered endpoint fast — before conceding to the ladder.
 pub(crate) const ACTIVE_CAP_MAX_STREAK: u32 = 6;
 
+/// Grace added past a 5h window's `resets_at` before the anchored post-reset
+/// poll fires. Anthropic's `/usage` can briefly lag the reset instant, so polling
+/// exactly at the boundary risks reading the pre-reset (still-100%) body. A single
+/// anchor, no retry loop — residual staleness beyond this grace is covered at
+/// render time (the `(now)` reset chip), not here.
+const RESET_ANCHOR_GRACE_MS: u64 = 15_000;
+
 /// Wall-clock instant in epoch-milliseconds. Distinct from [`IntervalMs`] so
 /// instants and spans can't be confused. `#[repr(transparent)]` keeps layout
 /// identical to the persisted `u64` in any `HashMap<String, u64>`.
@@ -2133,6 +2140,44 @@ fn tick(state: &SchedulerState) {
             &forced,
         );
     }
+    // Fire-once post-reset poll: once a 5h window has reset (plus grace), force a
+    // single fetch so the overview drops the stale pre-reset reading instead of
+    // holding it until the natural cadence slot. After `drop_spent_oauth` so a
+    // lapsed spent window is re-polled here. Store/last_fetched/activity each read
+    // once, sequentially; a poisoned store or last_fetched skips anchoring, a
+    // poisoned activity fails safe to "exclude all" (matching `partition_due`).
+    let post_reset_resets: HashMap<String, u64> = match state.store.lock() {
+        Ok(store) => oauth_snapshot
+            .iter()
+            .filter_map(|e| Some((e.name.clone(), five_hour_reset_ms(store.get(&e.name)?)?)))
+            .collect(),
+        Err(_) => HashMap::new(),
+    };
+    if !post_reset_resets.is_empty()
+        && let Ok(last_guard) = state.last_fetched.lock()
+    {
+        let last_fetched = last_guard.clone();
+        drop(last_guard);
+        let excluded: HashSet<String> = match state.activity.lock() {
+            Ok(a) => a
+                .iter()
+                .filter(|(_, v)| {
+                    matches!(v, ProfileActivity::Refreshing | ProfileActivity::Switching)
+                })
+                .map(|(n, _)| n.clone())
+                .collect(),
+            Err(_) => oauth_snapshot.iter().map(|e| e.name.clone()).collect(),
+        };
+        anchor_post_reset_oauth(
+            &oauth_snapshot,
+            &post_reset_resets,
+            &last_fetched,
+            &excluded,
+            &mut oauth_due,
+            &mut oauth_next,
+            now,
+        );
+    }
     let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
@@ -2794,6 +2839,67 @@ fn spent_skip_set(
         })
         .map(|entry| entry.name.clone())
         .collect()
+}
+
+/// Epoch-ms of a profile's 5h window reset, when it carries a parseable
+/// `resets_at`. `None` for a windowless or unparseable snapshot.
+fn five_hour_reset_ms(info: &UsageInfo) -> Option<u64> {
+    let secs = info
+        .five_hour
+        .as_ref()?
+        .resets_at
+        .as_deref()
+        .and_then(iso_to_epoch_secs)?;
+    u64::try_from(secs).ok().and_then(|s| s.checked_mul(1000))
+}
+
+/// Fire-once post-reset predicate: `true` when this profile's latest fetch
+/// predates its 5h window reset (`last_fetched_ms < resets_at_ms`, so the
+/// utilization we hold is the stale pre-reset reading) AND the reset has since
+/// passed with `grace_ms` to spare. Self-limiting: the forced fetch stamps
+/// `last_fetched` past the reset, flipping `last < resets` false until the NEXT
+/// reset, so it never doubles the natural cadence. `grace_ms` covers `/usage`
+/// briefly lagging the reset instant.
+fn should_anchor_fetch(
+    resets_at_ms: Option<u64>,
+    last_fetched_ms: u64,
+    now_ms: u64,
+    grace_ms: u64,
+) -> bool {
+    resets_at_ms.is_some_and(|r| last_fetched_ms < r && now_ms >= r.saturating_add(grace_ms))
+}
+
+/// Force a single post-reset poll for every OAuth profile whose 5h window reset
+/// has passed since its last fetch (see [`should_anchor_fetch`]), so the overview
+/// leaves the stale pre-reset reading instead of holding it until the natural
+/// cadence slot. Skips `Refreshing`/`Switching` (`excluded`, the same set
+/// [`partition_due`] drops) and any name already `due`. A scheduled name's
+/// countdown is stamped to `now_ms` (fetching now), mirroring [`merge_forced`].
+/// Decomposed args (no [`SchedulerState`]) so the due decision tests directly.
+fn anchor_post_reset_oauth(
+    snapshot: &[TokenEntry],
+    resets: &HashMap<String, u64>,
+    last_fetched: &HashMap<String, EpochMs>,
+    excluded: &HashSet<String>,
+    due: &mut Vec<TokenEntry>,
+    next: &mut HashMap<String, u64>,
+    now_ms: u64,
+) {
+    for entry in snapshot {
+        if excluded.contains(&entry.name) || due.iter().any(|d| d.name == entry.name) {
+            continue;
+        }
+        let last = last_fetched.get(&entry.name).map_or(0, |e| e.as_millis());
+        if should_anchor_fetch(
+            resets.get(&entry.name).copied(),
+            last,
+            now_ms,
+            RESET_ANCHOR_GRACE_MS,
+        ) {
+            next.insert(entry.name.clone(), now_ms);
+            due.push(entry.clone());
+        }
+    }
 }
 
 /// Clear any forced name that no leg scheduled this tick — its profile vanished

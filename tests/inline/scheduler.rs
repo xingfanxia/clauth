@@ -7,10 +7,11 @@ use crate::oauth::RefreshError;
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
-    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, SuppressedGenericStore,
-    ThirdPartyEntry, TokenEntry, clear_activity, clear_orphaned_forced, collect_oauth_seed_names,
-    collect_third_party_entries, collect_tokens, filter_suppressed, mark_activity,
-    memoized_identity, partition_due, window_lapsed,
+    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, RESET_ANCHOR_GRACE_MS,
+    SuppressedGenericStore, ThirdPartyEntry, TokenEntry, anchor_post_reset_oauth, clear_activity,
+    clear_orphaned_forced, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
+    filter_suppressed, mark_activity, memoized_identity, partition_due, should_anchor_fetch,
+    window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -217,6 +218,131 @@ fn partition_due_uses_fixed_interval() {
         &HashMap::new(),
     );
     assert_eq!(due.len(), 1, "due once the fixed interval has elapsed");
+}
+
+// Post-reset fire-once anchoring. `now` is a realistic epoch-ms.
+const ANCHOR_NOW: u64 = 1_700_000_000_000;
+
+/// `should_anchor_fetch`: fires exactly once when a reset has crossed since our
+/// last fetch and the grace has elapsed, and stays quiet otherwise.
+#[test]
+fn should_anchor_fetch_fires_once_after_reset_plus_grace() {
+    let now = ANCHOR_NOW;
+    let reset = now - RESET_ANCHOR_GRACE_MS; // reset landed exactly GRACE ago
+    let last = reset - 60_000; // fetched a minute before the reset
+
+    assert!(
+        should_anchor_fetch(Some(reset), last, now, RESET_ANCHOR_GRACE_MS),
+        "reset crossed since last fetch, grace elapsed → fire",
+    );
+    assert!(
+        should_anchor_fetch(
+            Some(now - RESET_ANCHOR_GRACE_MS),
+            last,
+            now,
+            RESET_ANCHOR_GRACE_MS
+        ),
+        "the now == reset + grace boundary still fires",
+    );
+    assert!(
+        !should_anchor_fetch(
+            Some(now - RESET_ANCHOR_GRACE_MS + 1),
+            last,
+            now,
+            RESET_ANCHOR_GRACE_MS
+        ),
+        "grace not yet elapsed → hold",
+    );
+    assert!(
+        !should_anchor_fetch(Some(reset), reset, now, RESET_ANCHOR_GRACE_MS),
+        "already fetched at/after the reset → self-limited, no re-fire",
+    );
+    assert!(
+        !should_anchor_fetch(None, last, now, RESET_ANCHOR_GRACE_MS),
+        "no reset stamp → never",
+    );
+}
+
+/// `anchor_post_reset_oauth` schedules only the eligible profile: it lands in
+/// `due` with its countdown stamped to `now`, while an excluded one, one already
+/// fetched post-reset, and one with no reset stamp are all left alone, and a
+/// profile already in `due` is not duplicated. This reds if the due-push, the
+/// exclusion, or the dedup is dropped.
+#[test]
+fn anchor_post_reset_oauth_schedules_only_eligible_profiles() {
+    let now = ANCHOR_NOW;
+    let reset = now - RESET_ANCHOR_GRACE_MS - 1_000; // reset + grace comfortably passed
+    let last_before = EpochMs::from_millis(reset - 60_000); // fetched before the reset
+    let last_after = EpochMs::from_millis(reset + 1_000); // already fetched post-reset
+
+    let snapshot = vec![
+        token("due"),
+        token("excluded"),
+        token("already"),
+        token("fetched"),
+        token("noreset"),
+    ];
+    let resets = HashMap::from([
+        ("due".to_string(), reset),
+        ("excluded".to_string(), reset),
+        ("already".to_string(), reset),
+        ("fetched".to_string(), reset),
+        // "noreset" carries no stamp.
+    ]);
+    let last_fetched = HashMap::from([
+        ("due".to_string(), last_before),
+        ("excluded".to_string(), last_before),
+        ("already".to_string(), last_before),
+        ("fetched".to_string(), last_after),
+        ("noreset".to_string(), last_before),
+    ]);
+    let excluded = HashSet::from(["excluded".to_string()]);
+    let mut due = vec![token("already")]; // already scheduled by partition_due
+    let mut next: HashMap<String, u64> = HashMap::new();
+
+    anchor_post_reset_oauth(
+        &snapshot,
+        &resets,
+        &last_fetched,
+        &excluded,
+        &mut due,
+        &mut next,
+        now,
+    );
+
+    let due_names: HashSet<&str> = due.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        due_names.contains("due"),
+        "eligible post-reset profile is scheduled"
+    );
+    assert_eq!(
+        next.get("due").copied(),
+        Some(now),
+        "its countdown is stamped to now"
+    );
+    assert!(
+        !due_names.contains("excluded"),
+        "Refreshing/Switching profile is not scheduled"
+    );
+    assert!(
+        !due_names.contains("fetched"),
+        "a profile already fetched post-reset is not re-scheduled",
+    );
+    assert!(
+        !due_names.contains("noreset"),
+        "a profile with no reset stamp is not scheduled"
+    );
+    assert_eq!(
+        due.iter().filter(|e| e.name == "already").count(),
+        1,
+        "an already-due profile is not duplicated",
+    );
+    assert!(
+        !next.contains_key("excluded")
+            && !next.contains_key("fetched")
+            && !next.contains_key("noreset"),
+        "skipped profiles get no countdown stamp",
+    );
 }
 
 /// `spent_skip_set` (the `refresh_spent_accounts` OFF gate): only an unforced,
