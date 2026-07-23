@@ -1437,6 +1437,17 @@ fn burn_switch_floor_pct_resets_out_of_band_and_keeps_in_band() {
     assert_eq!(st.burn_switch_floor_pct(), 99.0);
 }
 
+// The tests above compare accessors against the constants themselves, so a
+// value mutation moves both sides together and nothing reds. Pin the two
+// defaults against hardcoded literals so a moved constant fails a named test
+// instead of only ever being caught by coincidence (`tui_render_chain.rs`'s
+// 98.0 override happens to equal `DEFAULT_WEEKLY_SWITCH_PCT` today).
+#[test]
+fn default_switch_percentages_are_pinned_at_98() {
+    assert_eq!(DEFAULT_WEEKLY_SWITCH_PCT, 98.0);
+    assert_eq!(DEFAULT_BURN_FLOOR_PCT, 98.0);
+}
+
 #[test]
 fn burn_horizon_cap_ms_resets_out_of_band_and_keeps_in_band() {
     let mut st = AppState::default();
