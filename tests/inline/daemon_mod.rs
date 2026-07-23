@@ -283,6 +283,125 @@ fn drain_pending_switch_proceeds_over_a_logged_out_shell() {
     );
 }
 
+/// A clauth-owned symlink in the live slot is never "unsaved credentials":
+/// capturing a long-lived `setup-token` sidecar for the ACTIVE profile flips its
+/// install source from `credentials.json` to `session-token.json`, so the live
+/// symlink — still pointing at the old `credentials.json` store — classifies
+/// Diverged, yet re-pointing it on the next switch loses no login. The queued
+/// switch must PROCEED; deferring failed every unattended switch "unsaved
+/// credentials" until its retry TTL (observed live 2026-07-21 on the macOS fork).
+#[cfg(unix)]
+#[test]
+fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    // The live slot is clauth's own symlink into alpha's rotating store — clean.
+    link_active_clean("alpha");
+    // A long-lived session token appears for alpha (no refresh token → never
+    // rotates), flipping its install source to session-token.json while the live
+    // symlink still points at credentials.json — classify now reads Diverged
+    // though the symlink holds nothing unsaved.
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat-alpha".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let alpha_dir = crate::profile::profile_dir("alpha").expect("alpha dir");
+    std::fs::write(
+        alpha_dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("serialize sidecar"),
+    )
+    .expect("write session-token sidecar");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "a clauth-owned symlink holds nothing unsaved — the switch must proceed"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the executed switch leaves nothing queued"
+    );
+}
+
+/// The macOS steady-state twin of the test above, and the round-2 finding: after
+/// a switch, Claude Code rewrites the live slot as a REGULAR-FILE mirror of the
+/// Keychain, clobbering the symlink. The sidecar flip then makes classify read
+/// Diverged over that regular file — but its login is alpha's saved
+/// `credentials.json`, so the queued switch must still PROCEED. A
+/// symlink-identity exemption reads the regular file as unsaved and defers here;
+/// the content-based `live_login_is_stored` clears it. No `#[cfg(unix)]` — a
+/// regular-file mirror is exactly the shape a Linux CI can pin for macOS.
+#[test]
+fn drain_pending_switch_proceeds_over_a_macos_regular_file_mirror() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    // CC's regular-file mirror: alpha's stored login, written as a plain file
+    // (not our symlink), holding the SAME access token as alpha's credentials.json.
+    let dir = claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.claude");
+    std::fs::write(
+        dir.join(".credentials.json"),
+        serde_json::to_vec(&oauth_creds("at-alpha")).expect("serialize mirror"),
+    )
+    .expect("write regular-file mirror");
+    // The sidecar flips alpha's install source to session-token.json; the mirror
+    // now classifies Diverged though its login is fully saved.
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat-alpha".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let alpha_dir = crate::profile::profile_dir("alpha").expect("alpha dir");
+    std::fs::write(
+        alpha_dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("serialize sidecar"),
+    )
+    .expect("write session-token sidecar");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta");
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "a regular-file mirror of a saved login holds nothing unsaved — the switch must proceed"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the executed switch leaves nothing queued"
+    );
+}
+
 /// A live file that does not PARSE is not a shell — it may be a CC write in
 /// progress, i.e. possibly a login. The divergence deferral stays armed for
 /// it, exactly like a real diverged login.

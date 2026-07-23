@@ -9,10 +9,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 
 use crate::claude::{
-    ClaudeEndpoint, LinkState, apply_profile_to_claude_settings, classify_credentials_link,
-    clear_claude_credentials, force_link_profile_credentials, force_snapshot_active_credentials,
-    is_first_login, link_profile_credentials, live_credentials_are_shell, managed_env_key_label,
-    read_claude_credentials, read_claude_endpoint_config, snapshot_active_credentials,
+    ClaudeEndpoint, apply_profile_to_claude_settings, clear_claude_credentials,
+    force_link_profile_credentials, force_snapshot_active_credentials, link_profile_credentials,
+    live_diverged_and_unsaved, managed_env_key_label, read_claude_credentials,
+    read_claude_endpoint_config, snapshot_active_credentials,
 };
 use crate::lock::with_state_lock;
 use crate::lockorder::RankedMutex;
@@ -92,20 +92,21 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         // first-login), so dropping it would strand a fresh `/login` chain — keep
         // the non-force refuse-guard there. Every other state is captured or
         // adoptable by the snapshot below, so force the relink: on macOS the live
-        // `.credentials.json` is always a regular-file Keychain mirror of the
-        // active account and thus legitimately differs from the target, which the
-        // non-force guard's live-vs-target byte check would wrongly reject on every
-        // switch. (Interactive callers already route a real divergence to the
-        // reconcile path, so this branch is only reachable uncaptured via the
-        // scheduler — where refusing, not dropping, is the safe outcome.)
-        // A logged-out shell holds no login to strand, so it forfeits the
-        // refuse-guard (which would otherwise wedge the switch on an empty file).
+        // `.credentials.json` is a regular-file Keychain mirror of the active
+        // account, so it legitimately differs from the target, which the non-force
+        // guard's live-vs-target byte check would wrongly reject. The SAME
+        // predicate the defer/banner gates use — `live_diverged_and_unsaved` —
+        // decides here, so a login already saved in the store (the mirror, a
+        // clauth symlink) forces the relink even once a sidecar capture flips the
+        // install source and makes classify read Diverged over it; without that
+        // exemption the guarded link byte-rejects the macOS mirror and the switch
+        // fails "unsaved credentials" though nothing is unsaved. (Interactive
+        // callers already route a real divergence to the reconcile path, so this
+        // branch is only reachable uncaptured via the scheduler — where refusing,
+        // not dropping, is the safe outcome.) A logged-out shell holds no login to
+        // strand, so it too forfeits the refuse-guard.
         let uncaptured_relogin = match config.state.active_profile.as_deref() {
-            Some(active) => {
-                matches!(classify_credentials_link(active)?, LinkState::Diverged)
-                    && !is_first_login(active)?
-                    && !live_credentials_are_shell()
-            }
+            Some(active) => live_diverged_and_unsaved(active)?,
             None => false,
         };
         snapshot_active_credentials(config)?;
@@ -156,11 +157,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
     // exempt: capturing its blank tokens would destroy the outgoing profile's
     // stored login.
     let reconciled = match outgoing.as_deref() {
-        Some(active) => {
-            matches!(classify_credentials_link(active)?, LinkState::Diverged)
-                && !is_first_login(active)?
-                && !live_credentials_are_shell()
-        }
+        Some(active) => live_diverged_and_unsaved(active)?,
         None => false,
     };
 
@@ -305,11 +302,7 @@ pub(crate) fn switch_profile_noninteractive(
     // A logged-out shell is no divergence to resolve: skip the default and take
     // the plain switch, which replaces the empty file.
     let diverged = match previous.as_deref() {
-        Some(active) => {
-            matches!(classify_credentials_link(active)?, LinkState::Diverged)
-                && !is_first_login(active)?
-                && !live_credentials_are_shell()
-        }
+        Some(active) => live_diverged_and_unsaved(active)?,
         None => false,
     };
 

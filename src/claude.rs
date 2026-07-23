@@ -281,6 +281,70 @@ fn is_first_login_at(link: &Path, expected: &Path) -> bool {
         .is_some_and(|creds| creds.claude_ai_oauth.is_some())
 }
 
+/// True when the live `.credentials.json` login is already saved in `active`'s
+/// store — so the unsaved-credentials gates have nothing to protect and must
+/// not defer a switch (or raise the divergence prompt) on it. Two ways to be
+/// saved, one structural and one by content:
+///
+/// * The live slot is clauth's own symlink. CC writes a regular file; only a
+///   switch symlinks the slot, so a symlink there points into a profile store
+///   by construction — that login is saved whatever it resolves to, even if
+///   the target is momentarily unreadable (a store file removed under a live
+///   link).
+/// * The live login's OAuth access token matches one of `active`'s stored
+///   credential files (`credentials.json` or `session-token.json`). This is
+///   the cross-platform half, and the one that matters on macOS: Claude Code
+///   rewrites `~/.claude/.credentials.json` as a regular-file mirror of the
+///   Keychain after every run, clobbering our symlink with an identical-content
+///   regular file — `is_symlink()` then reads false, but the content is still
+///   saved. On Windows the live slot is always a copy (no symlinks), so the
+///   content half carries it there too — no unix-only footnote.
+///
+/// The `Diverged`-but-saved state this clears arises when a profile's INSTALL
+/// SOURCE changes under the live slot: capturing a `setup-token` sidecar for
+/// the ACTIVE profile flips [`install_source_path`] from `credentials.json` to
+/// `session-token.json` (removing it flips back) while the live slot still
+/// holds the previous source's content — a stale slot the next switch
+/// re-installs, not an unsaved login. Both stores are checked because the flip
+/// can leave the slot holding either the OAuth login or the static mint.
+/// Without this exemption every unattended switch fails "unsaved credentials;
+/// resolve in the TUI" until its retry TTL, and the TUI prompts about
+/// credentials that are fully saved (observed live 2026-07-21 on the macOS
+/// fork as a symlink; recurs there as a regular file after any CC session).
+pub(crate) fn live_login_is_stored(active: &str) -> bool {
+    let Ok(link) = claude_credentials_path() else {
+        return false;
+    };
+    // Structural half: a symlink at the live slot is clauth's own, pointing
+    // into a store by construction — saved even if the target is unreadable.
+    if link
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return true;
+    }
+    // Content half (the macOS regular-file mirror, the Windows copy): the live
+    // login's token equals one the profile already stores. A blank/absent live
+    // token can't "match" a real login — a logged-out shell is handled by
+    // [`live_credentials_are_shell`], not here.
+    let Ok(dir) = profile_dir(active) else {
+        return false;
+    };
+    let Ok(live) = read_json_file::<ClaudeCredentials>(&link) else {
+        return false;
+    };
+    if live.access_token().filter(|t| !t.is_empty()).is_none() {
+        return false;
+    }
+    ["credentials.json", "session-token.json"]
+        .into_iter()
+        .any(|file| {
+            read_json_file::<ClaudeCredentials>(&dir.join(file))
+                .ok()
+                .is_some_and(|stored| stored.access_token() == live.access_token())
+        })
+}
+
 pub(crate) fn read_claude_credentials() -> Result<Option<ClaudeCredentials>> {
     let path = claude_credentials_path()?;
     if !path.exists() {
@@ -307,6 +371,24 @@ pub(crate) fn live_credentials_are_shell() -> bool {
     matches!(
         read_claude_credentials(),
         Ok(Some(live)) if live_login_is_empty(&live)
+    )
+}
+
+/// The unsaved-credentials gate shared by every switch / defer / divergence-prompt
+/// path: the live login diverges from what a switch to `active` installs AND holds
+/// a login worth protecting. Three diverging states carry nothing unsaved and are
+/// exempt — a first-login adoption (captured on switch, not stranded), a logged-out
+/// shell (blank tokens, see [`live_credentials_are_shell`]), and a login already
+/// saved in the profile's store (its content is captured, so re-installing loses
+/// no login, see [`live_login_is_stored`]). Routing every gate through this one
+/// predicate keeps the exemptions from drifting apart. The underlying reads
+/// propagate their error; a boolean gate maps that to `false` with `.unwrap_or(false)`.
+pub(crate) fn live_diverged_and_unsaved(active: &str) -> Result<bool> {
+    Ok(
+        matches!(classify_credentials_link(active)?, LinkState::Diverged)
+            && !is_first_login(active)?
+            && !live_credentials_are_shell()
+            && !live_login_is_stored(active),
     )
 }
 

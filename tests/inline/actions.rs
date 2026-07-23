@@ -119,8 +119,8 @@ fn switch_replaces_active_account_mirror_without_refusing() {
 
     assert!(config.is_active("xfx"));
     assert_eq!(
-        classify_credentials_link("xfx").expect("classify"),
-        LinkState::LinkedTo,
+        crate::claude::classify_credentials_link("xfx").expect("classify"),
+        crate::claude::LinkState::LinkedTo,
         "after the switch the live path resolves to xfx's stored creds",
     );
 }

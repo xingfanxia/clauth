@@ -34,10 +34,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::claude::{
-    LinkState, classify_credentials_link, is_first_login, link_profile_credentials,
-    live_credentials_are_shell,
-};
+use crate::claude::link_profile_credentials;
 use crate::lockorder::RankedMutex;
 use crate::logline::logline;
 use crate::profile::{
@@ -320,17 +317,16 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// and it isn't a first-login adoption — the daemon cannot prompt, so it skips
 /// the switch and leaves the resolution to the operator (TUI Divergence modal).
 ///
-/// A logged-out shell (see [`live_credentials_are_shell`]) is exempt: an empty
-/// login is not "unsaved credentials", and deferring on it wedges every
-/// headless switch behind a TUI decision about nothing while running sessions
-/// sit at "Login expired" (observed 2026-07-15). An unreadable/torn live file
-/// still defers — it may be a CC write in progress.
+/// A logged-out shell (see [`crate::claude::live_credentials_are_shell`]) is
+/// exempt: an empty login is not "unsaved credentials", and deferring on it
+/// wedges every headless switch behind a TUI decision about nothing while
+/// running sessions sit at "Login expired" (observed 2026-07-15). An
+/// unreadable/torn live file still defers — it may be a CC write in progress.
+/// The shell / first-login / clauth-symlink exemptions all live in
+/// [`crate::claude::live_diverged_and_unsaved`]; a read that errors outright
+/// maps to `false` (proceed) here.
 fn active_diverged_unsaved(active: &str) -> bool {
-    matches!(
-        classify_credentials_link(active).ok(),
-        Some(LinkState::Diverged)
-    ) && !is_first_login(active).unwrap_or(false)
-        && !live_credentials_are_shell()
+    crate::claude::live_diverged_and_unsaved(active).unwrap_or(false)
 }
 
 /// Owns the shared `Arc` stores (cloned into the scheduler) plus main-loop-only
