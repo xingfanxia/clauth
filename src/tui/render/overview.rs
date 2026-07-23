@@ -10,8 +10,8 @@ use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
-    ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split, reset_resume,
-    spinner_frame, spinner_style, window_summary_spans_bracketed,
+    ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split, is_past_reset,
+    reset_resume, spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
 use super::header::pulse_name_spans;
 use super::panes::{
@@ -430,6 +430,7 @@ fn render_overview_row(
         true,
         reset_style(LABEL_5H, five_window.as_ref()),
         reset_fmt,
+        five_window.as_ref().is_some_and(is_past_reset),
     ));
     let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
@@ -443,6 +444,7 @@ fn render_overview_row(
             widths.seven_day >= 18,
             reset_style(LABEL_7D, seven_window.as_ref()),
             reset_fmt,
+            seven_window.as_ref().is_some_and(is_past_reset),
         ));
         let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
         let seven_pad = widths.seven_day.saturating_sub(seven_len);

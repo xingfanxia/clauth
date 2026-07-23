@@ -941,6 +941,96 @@ fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
     );
 }
 
+// ── stale (past-reset) window fade ────────────────────────────────────────
+
+/// Locates the 5h bracketed bar's `[`, fill, and `%` spans by content — the
+/// row's only `[` (the 7d column has no synthesized window in the `profile()`
+/// fixture, so it renders a bare `—`).
+fn bar_fade_spans(line: &Line<'static>) -> (Style, Style, Style) {
+    let idx = line
+        .spans
+        .iter()
+        .position(|s| s.content == "[")
+        .expect("the 5h bracket renders");
+    (
+        line.spans[idx].style,
+        line.spans[idx + 1].style,
+        line.spans[idx + 3].style,
+    )
+}
+
+/// A past-reset 5h window is a frozen pre-reset reading: its bar fill and `%`
+/// fade to `theme::faint()`. A sibling at the SAME utilization with a future
+/// reset proves the difference is staleness, not the percentage — a mutation
+/// dropping the fade entirely would still pass a same-value comparison, so the
+/// control keeps a real (non-faint) util color to red against.
+#[test]
+fn stale_window_fades_bar_fill_and_percent() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let stale = profile("a", 95.0, 73.0, -60); // reset 60s in the past
+    let live = profile("b", 95.0, 73.0, 3600); // reset in 1h
+    let config = config_with(vec![stale, live], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(110, &app);
+
+    let stale_line = render_overview_row(&app, 0, &widths, false, true);
+    let live_line = render_overview_row(&app, 1, &widths, false, true);
+    let (stale_bracket, stale_fill, stale_pct) = bar_fade_spans(&stale_line);
+    let (live_bracket, live_fill, live_pct) = bar_fade_spans(&live_line);
+
+    assert_ne!(
+        live_fill.fg,
+        theme::faint().fg,
+        "control: a live window's fill keeps its real util color"
+    );
+    assert_ne!(
+        live_pct.fg,
+        theme::faint().fg,
+        "control: a live window's % keeps its real util color"
+    );
+    assert_eq!(
+        stale_fill.fg,
+        theme::faint().fg,
+        "a past-reset window's fill fades"
+    );
+    assert_eq!(
+        stale_pct.fg,
+        theme::faint().fg,
+        "a past-reset window's % fades"
+    );
+    assert_eq!(
+        stale_bracket.fg, live_bracket.fg,
+        "brackets stay dim regardless of staleness"
+    );
+}
+
+/// Disabled always wins: `flatten` runs AFTER the stale fade and overrides
+/// every span to `theme::dim()`, so a disabled + past-reset row must not show
+/// a half-faint/half-dim bar — every span flattens to the same dim hue.
+#[test]
+fn disabled_and_past_reset_row_stays_fully_dim() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut a = profile("a", 95.0, 73.0, -60); // disabled + past-reset
+    a.disabled = true;
+    let config = config_with(vec![a], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(110, &app);
+
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let non_dim: Vec<String> = line
+        .spans
+        .iter()
+        .filter(|s| !s.content.trim().is_empty())
+        .filter(|s| s.style.fg.is_some() && s.style.fg != theme::dim().fg)
+        .map(|s| s.content.to_string())
+        .collect();
+    assert_eq!(
+        non_dim,
+        Vec::<String>::new(),
+        "a disabled row's bar must flatten fully to dim, not stay half-faint"
+    );
+}
+
 // ── fallback chain panel: auto-sizing + row trailers ─────────────────────
 
 /// Content that fits gets exactly its own height (rows + 2 border), leaving the

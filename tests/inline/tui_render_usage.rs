@@ -147,6 +147,34 @@ fn stats_from_bars_fills_pace_for_windowed_labels() {
     assert!(other[0].burn_rate.is_none() && other[0].pace_pct.is_none());
 }
 
+/// A past-reset window's `Stat.color` (driving both the bar fill and the `%`
+/// figure in `Stat::render`, see [`Stat::render`]) fades to `theme::faint()`
+/// — a frozen pre-reset reading awaiting the next fetch. A sibling bar at the
+/// SAME utilization with a future reset proves the difference is staleness,
+/// not the percentage — a mutation dropping the fade would still pass a
+/// same-value comparison, so the control keeps a real (non-faint) util color
+/// to red against.
+#[test]
+fn stale_window_color_fades_to_faint() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let now = crate::usage::now_epoch_secs();
+    let bars = vec![
+        tp_bar("5h", 73.0, now - 60, None, None), // reset 60s in the past
+        tp_bar("5h", 73.0, now + 3600, None, None), // reset in 1h
+    ];
+    let stats = stats_from_bars(&bars, true, true, ResetFmt::default());
+    assert_ne!(
+        stats[1].color.fg,
+        theme::faint().fg,
+        "control: a live window keeps its real util color"
+    );
+    assert_eq!(
+        stats[0].color.fg,
+        theme::faint().fg,
+        "a past-reset window's color fades"
+    );
+}
+
 fn tp_bar(
     label: &str,
     pct: f64,

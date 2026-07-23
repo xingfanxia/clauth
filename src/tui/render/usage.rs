@@ -13,7 +13,8 @@ use ratatui::widgets::Paragraph;
 use super::super::app::App;
 use super::super::theme;
 use super::format::{
-    ResetFmt, activity_verb, reset_in_secs, reset_phrase, spinner_frame, spinner_style,
+    ResetFmt, activity_verb, is_past_reset, reset_in_secs, reset_phrase, spinner_frame,
+    spinner_style,
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK,
@@ -510,10 +511,18 @@ fn make_window_stat(
     let reset_secs = resets_at
         .and_then(crate::usage::iso_to_epoch_secs)
         .map(|r| r - now);
+    // Past-reset windows show a frozen pre-reset reading; fade the bar fill +
+    // `%` (both driven by `color`, see `Stat::render`) so staleness reads
+    // visually until the next fetch lands.
+    let color = if is_past_reset(&window) {
+        theme::faint()
+    } else {
+        Style::default().fg(theme::util_color(pct))
+    };
     Stat {
         label: label.to_string(),
         pct,
-        color: Style::default().fg(theme::util_color(pct)),
+        color,
         trailing,
         amount,
         burn_rate,
