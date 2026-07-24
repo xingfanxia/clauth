@@ -76,7 +76,14 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   arms (`ensure_installable` feed branches), terminal chain death restores
   the preserved static mint (`session-token.static.json`); `clauth feed
   <p> on|off`; status.json additive `session_feed` key; scheduler
-  proactive-rotation feed override.
+  proactive-rotation feed override; EXP-2 re-feed timer (`claude_feed_tick`
+  5-min scan + `refeed_session_token` with `fresh_horizon_ms` threaded
+  through the feed gates — switch paths keep the 60s grace; active-profile
+  Keychain mirror).
+- **EXP-2 codex 401 kick**: CDX-6 poll `Unauthorized` →
+  `codex_auth_kicks` → CDX-3 standby force-refresh
+  (`codex_refresh_parked(force)` bypasses only `standby_due`), with a
+  2-strike kick-streak breaker in `CodexPollPacing`.
 - **Sessions/settings gating**: codex-harness profiles are invisible to
   upstream's settings sync and claude session machinery.
 
