@@ -537,6 +537,7 @@ fn ensure_fresh_parked(state: &ProxyState, account: &str) {
         account,
         None,
         &crate::codex::oauth::refresh,
+        false,
     ) {
         logline!("clauth proxy: parked refresh for '{account}' failed (will retry): {e}");
     }

@@ -3110,6 +3110,8 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         standdown_active: AtomicBool::new(true),
         codex_standby: std::sync::Mutex::new(super::CodexStandbyPacing::default()),
         codex_poll: std::sync::Mutex::new(super::CodexPollPacing::default()),
+        codex_auth_kicks: std::sync::Mutex::new(HashSet::new()),
+        claude_feed: std::sync::Mutex::new(super::ClaudeFeedPacing::default()),
     };
 
     // A manual `r` landed just before this tick: forced name + Queued mark.
@@ -3192,6 +3194,8 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         standdown_active: AtomicBool::new(true),
         codex_standby: std::sync::Mutex::new(super::CodexStandbyPacing::default()),
         codex_poll: std::sync::Mutex::new(super::CodexPollPacing::default()),
+        codex_auth_kicks: std::sync::Mutex::new(HashSet::new()),
+        claude_feed: std::sync::Mutex::new(super::ClaudeFeedPacing::default()),
     };
 
     // Bootstrap pre-marked a cache-due profile; a rotate worker from the last
@@ -3274,6 +3278,8 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         standdown_active: AtomicBool::new(false),
         codex_standby: std::sync::Mutex::new(super::CodexStandbyPacing::default()),
         codex_poll: std::sync::Mutex::new(super::CodexPollPacing::default()),
+        codex_auth_kicks: std::sync::Mutex::new(HashSet::new()),
+        claude_feed: std::sync::Mutex::new(super::ClaudeFeedPacing::default()),
     };
 
     // Stamp `kitty` as just-fetched so it is NOT due this tick: an armed tick
@@ -3514,6 +3520,8 @@ fn completion_order_state() -> super::SchedulerState {
         standdown_active: AtomicBool::new(false),
         codex_standby: std::sync::Mutex::new(super::CodexStandbyPacing::default()),
         codex_poll: std::sync::Mutex::new(super::CodexPollPacing::default()),
+        codex_auth_kicks: std::sync::Mutex::new(HashSet::new()),
+        claude_feed: std::sync::Mutex::new(super::ClaudeFeedPacing::default()),
     }
 }
 
@@ -3890,6 +3898,36 @@ fn standby_codex_fixture(account: &str, refresh_token: &str, exp_in_secs: i64) -
     .into_bytes()
 }
 
+/// An empty EXP-1/F1 kick set — the no-401 steady state for tick calls.
+fn no_kicks() -> std::sync::Mutex<HashSet<String>> {
+    std::sync::Mutex::new(HashSet::new())
+}
+
+/// A kick set holding `names` — as if the CDX-6 poll just saw a 401 on each.
+fn kicked(names: &[&str]) -> std::sync::Mutex<HashSet<String>> {
+    std::sync::Mutex::new(names.iter().map(|n| (*n).to_string()).collect())
+}
+
+/// A stored codex-auth.json that is NOT standby-due: access token comfortably
+/// outside the 48h margin AND a recent `last_refresh` — only a forced (401
+/// kick) path may spend it.
+fn standby_codex_fixture_fresh(account: &str, refresh_token: &str) -> Vec<u8> {
+    let access = crate::testutil::fake_jwt(&serde_json::json!({
+        "exp": crate::usage::now_epoch_secs() + 5 * 24 * 3600,
+    }));
+    serde_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": access,
+            "refresh_token": refresh_token,
+            "account_id": account,
+        },
+        "last_refresh": crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs()),
+    })
+    .to_string()
+    .into_bytes()
+}
+
 fn codex_profile_config(names: &[&str]) -> crate::profile::ConfigHandle {
     let profiles = names
         .iter()
@@ -3922,6 +3960,7 @@ fn codex_standby_tick_refreshes_a_due_parked_profile() {
         &config,
         &activity,
         &pacing,
+        &no_kicks(),
         crate::usage::now_ms(),
         &|spent| {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3964,9 +4003,14 @@ fn codex_standby_tick_never_spends_the_live_owner_chain() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
     let pacing = std::sync::Mutex::new(super::CodexStandbyPacing::default());
 
-    super::codex_standby_tick(&config, &activity, &pacing, crate::usage::now_ms(), &|_| {
-        panic!("must never refresh the live owner's chain")
-    });
+    super::codex_standby_tick(
+        &config,
+        &activity,
+        &pacing,
+        &no_kicks(),
+        crate::usage::now_ms(),
+        &|_| panic!("must never refresh the live owner's chain"),
+    );
 }
 
 #[test]
@@ -3978,11 +4022,18 @@ fn codex_standby_permanent_failure_quarantines_the_profile() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
     let pacing = std::sync::Mutex::new(super::CodexStandbyPacing::default());
 
-    super::codex_standby_tick(&config, &activity, &pacing, crate::usage::now_ms(), &|_| {
-        Err(crate::codex::oauth::CodexRefreshError::Permanent(
-            "HTTP 400: refresh_token_reused".into(),
-        ))
-    });
+    super::codex_standby_tick(
+        &config,
+        &activity,
+        &pacing,
+        &no_kicks(),
+        crate::usage::now_ms(),
+        &|_| {
+            Err(crate::codex::oauth::CodexRefreshError::Permanent(
+                "HTTP 400: refresh_token_reused".into(),
+            ))
+        },
+    );
 
     assert!(
         config.lock().unwrap().is_auth_broken("cdx-dead"),
@@ -4010,14 +4061,21 @@ fn codex_standby_discards_a_response_when_the_chain_moved_underneath() {
     // The injected refresh simulates a capture landing DURING the HTTP window:
     // by the time the response returns, the store holds a different chain.
     let raced = standby_codex_fixture("acct-r", "rt-recaptured", 864_000);
-    super::codex_standby_tick(&config, &activity, &pacing, crate::usage::now_ms(), &|_| {
-        crate::codex::write_profile_auth("cdx-raced", &raced).unwrap();
-        Ok(crate::codex::oauth::CodexRefreshResponse {
-            id_token: None,
-            access_token: Some("at-stale-branch".into()),
-            refresh_token: Some("rt-stale-branch".into()),
-        })
-    });
+    super::codex_standby_tick(
+        &config,
+        &activity,
+        &pacing,
+        &no_kicks(),
+        crate::usage::now_ms(),
+        &|_| {
+            crate::codex::write_profile_auth("cdx-raced", &raced).unwrap();
+            Ok(crate::codex::oauth::CodexRefreshResponse {
+                id_token: None,
+                access_token: Some("at-stale-branch".into()),
+                refresh_token: Some("rt-stale-branch".into()),
+            })
+        },
+    );
 
     let stored = crate::codex::read_profile_auth("cdx-raced")
         .unwrap()
@@ -4046,12 +4104,19 @@ fn codex_standby_transient_failure_widens_the_retry() {
             anyhow::anyhow!("connection reset"),
         ))
     };
-    super::codex_standby_tick(&config, &activity, &pacing, now, &flaky);
+    super::codex_standby_tick(&config, &activity, &pacing, &no_kicks(), now, &flaky);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     // Re-open the scan gate; the per-profile widening must still hold.
     pacing.lock().unwrap().next_scan_ms = 0;
-    super::codex_standby_tick(&config, &activity, &pacing, now + 60_000, &flaky);
+    super::codex_standby_tick(
+        &config,
+        &activity,
+        &pacing,
+        &no_kicks(),
+        now + 60_000,
+        &flaky,
+    );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -4064,9 +4129,411 @@ fn codex_standby_transient_failure_widens_the_retry() {
         &config,
         &activity,
         &pacing,
+        &no_kicks(),
         now + super::CODEX_STANDBY_RETRY_MS + 1,
         &flaky,
     );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+// ---------------------------------------------------------------------------
+// EXP-1/F1: usage-poll 401 → immediate kicked standby refresh
+// ---------------------------------------------------------------------------
+
+/// A wham/usage 401 queues the profile into the kick set (and still widens
+/// the poll cadence) — the poll itself never refreshes anything.
+#[test]
+fn codex_poll_401_queues_a_standby_kick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = codex_profile_config(&["cdx-k"]);
+    crate::codex::write_profile_auth("cdx-k", &standby_codex_fixture("acct", "rt", 3600)).unwrap();
+    let (store, status) = poll_stores();
+    let pacing = std::sync::Mutex::new(super::CodexPollPacing::default());
+    let kicks = no_kicks();
+    super::codex_poll_tick(
+        &config,
+        &store,
+        &status,
+        &pacing,
+        &kicks,
+        crate::usage::now_ms(),
+        &|_, _| Err(crate::codex::poll::PollError::Unauthorized),
+    );
+    assert!(
+        kicks.lock().unwrap().contains("cdx-k"),
+        "a 401 must queue an immediate standby-refresh kick"
+    );
+}
+
+/// A kicked profile whose stored chain is NOT `standby_due` (fresh clock,
+/// recent last_refresh) is force-refreshed anyway: the 401 is server-side
+/// proof the token died out-of-band, and waiting out the age schedule leaves
+/// a parked chain dead for days. The kick is consumed — one 401, one attempt.
+#[test]
+fn codex_standby_kick_force_refreshes_an_undue_chain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = codex_profile_config(&["cdx-kick"]);
+    crate::codex::write_profile_auth("cdx-kick", &standby_codex_fixture_fresh("acct-k", "rt-k"))
+        .unwrap();
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pacing = std::sync::Mutex::new(super::CodexStandbyPacing::default());
+    let kicks = kicked(&["cdx-kick"]);
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let refresh = |spent: &str| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(spent, "rt-k");
+        Ok(crate::codex::oauth::CodexRefreshResponse {
+            id_token: None,
+            access_token: Some("at-revived".into()),
+            refresh_token: Some("rt-revived".into()),
+        })
+    };
+    super::codex_standby_tick(
+        &config,
+        &activity,
+        &pacing,
+        &kicks,
+        crate::usage::now_ms(),
+        &refresh,
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let stored = crate::codex::read_profile_auth("cdx-kick")
+        .unwrap()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+    assert_eq!(v["tokens"]["refresh_token"], "rt-revived");
+    assert!(kicks.lock().unwrap().is_empty(), "kick consumed");
+
+    // Same tick again without a fresh 401: nothing left to do (the scan gate
+    // is closed and the chain is now genuinely fresh).
+    super::codex_standby_tick(
+        &config,
+        &activity,
+        &pacing,
+        &kicks,
+        crate::usage::now_ms(),
+        &|_: &str| panic!("no kick pending — must not refresh"),
+    );
+}
+
+/// A kick bypasses the scan-cadence gate: even mid-gap, the forced refresh
+/// runs (the age-scheduled scan stays gated).
+#[test]
+fn codex_standby_kick_bypasses_the_scan_gate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = codex_profile_config(&["cdx-gap"]);
+    crate::codex::write_profile_auth("cdx-gap", &standby_codex_fixture_fresh("acct-g", "rt-g"))
+        .unwrap();
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let now = crate::usage::now_ms();
+    let pacing = std::sync::Mutex::new(super::CodexStandbyPacing::default());
+    pacing.lock().unwrap().next_scan_ms = now + 9 * 60 * 1000; // mid-gap
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    super::codex_standby_tick(
+        &config,
+        &activity,
+        &pacing,
+        &kicked(&["cdx-gap"]),
+        now,
+        &|_: &str| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::codex::oauth::CodexRefreshResponse {
+                id_token: None,
+                access_token: Some("at2".into()),
+                refresh_token: Some("rt2".into()),
+            })
+        },
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a 401 kick must not wait out the scan cadence"
+    );
+}
+
+/// A kicked refresh that fails permanently quarantines the profile exactly
+/// like the scan path — and every later kick is moot because auth_broken
+/// drops the profile out of the candidate set. This is the property that
+/// terminates the kick loop for a genuinely dead chain.
+#[test]
+fn codex_standby_kick_permanent_quarantines_and_later_kicks_are_moot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = codex_profile_config(&["cdx-kperm"]);
+    crate::codex::write_profile_auth(
+        "cdx-kperm",
+        &standby_codex_fixture_fresh("acct-kp", "rt-kp"),
+    )
+    .unwrap();
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pacing = std::sync::Mutex::new(super::CodexStandbyPacing::default());
+
+    super::codex_standby_tick(
+        &config,
+        &activity,
+        &pacing,
+        &kicked(&["cdx-kperm"]),
+        crate::usage::now_ms(),
+        &|_: &str| {
+            Err(crate::codex::oauth::CodexRefreshError::Permanent(
+                "HTTP 400: refresh_token_reused".into(),
+            ))
+        },
+    );
+    assert!(
+        config.lock().unwrap().is_auth_broken("cdx-kperm"),
+        "a kicked permanent rejection flags auth_broken"
+    );
+
+    // A later kick finds the profile out of the candidate set: no spend.
+    super::codex_standby_tick(
+        &config,
+        &activity,
+        &pacing,
+        &kicked(&["cdx-kperm"]),
+        crate::usage::now_ms(),
+        &|_: &str| panic!("auth_broken profile must never be re-spent by a kick"),
+    );
+}
+
+/// The F1 circuit breaker: consecutive 401s without an intervening poll
+/// success stop kicking after `CODEX_KICK_STREAK_MAX`; a success re-arms.
+#[test]
+fn codex_poll_kick_streak_breaker_stands_down_then_rearms() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = codex_profile_config(&["cdx-brk"]);
+    crate::codex::write_profile_auth("cdx-brk", &standby_codex_fixture("acct-b", "rt-b", 86_400))
+        .unwrap();
+    let (store, status) = poll_stores();
+    let pacing = std::sync::Mutex::new(super::CodexPollPacing::default());
+    let kicks = no_kicks();
+    let mut now = crate::usage::now_ms();
+    let unauthorized = |_: &str, _: Option<&str>| Err(crate::codex::poll::PollError::Unauthorized);
+
+    // 401 #1 and #2: kicks queued (as if the kicked refreshes kept the token
+    // 401ing — the standby side is simulated by draining the set).
+    for expect in [1, 2] {
+        super::codex_poll_tick(
+            &config,
+            &store,
+            &status,
+            &pacing,
+            &kicks,
+            now,
+            &unauthorized,
+        );
+        assert!(
+            kicks.lock().unwrap().remove("cdx-brk"),
+            "401 #{expect} within the streak must kick"
+        );
+        now += super::CODEX_POLL_UNAUTHORIZED_MS + 1;
+    }
+    // 401 #3: breaker open — no kick, back to the age schedule.
+    super::codex_poll_tick(
+        &config,
+        &store,
+        &status,
+        &pacing,
+        &kicks,
+        now,
+        &unauthorized,
+    );
+    assert!(
+        kicks.lock().unwrap().is_empty(),
+        "past the streak cap the 401 must stop kicking"
+    );
+
+    // A poll success clears the streak; the next 401 kicks again.
+    now += super::CODEX_POLL_UNAUTHORIZED_MS + 1;
+    super::codex_poll_tick(&config, &store, &status, &pacing, &kicks, now, &|_, _| {
+        Ok(poll_info(7.0))
+    });
+    now += super::CODEX_POLL_GAP_MS + 1;
+    super::codex_poll_tick(
+        &config,
+        &store,
+        &status,
+        &pacing,
+        &kicks,
+        now,
+        &unauthorized,
+    );
+    assert!(
+        kicks.lock().unwrap().contains("cdx-brk"),
+        "a poll success re-arms the breaker"
+    );
+}
+
+/// A kick for a live-owner chain is moot — codex itself carries that chain
+/// and will re-mint through its own refresh; clauth spending it would race
+/// the single-use token (the CDX-1 single-writer invariant).
+#[test]
+fn codex_standby_kick_never_spends_a_live_owner_chain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = codex_profile_config(&["cdx-klive"]);
+    let bytes = standby_codex_fixture_fresh("acct-kl", "rt-kl");
+    crate::codex::write_profile_auth("cdx-klive", &bytes).unwrap();
+    crate::codex::write_live(&bytes).unwrap();
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pacing = std::sync::Mutex::new(super::CodexStandbyPacing::default());
+    super::codex_standby_tick(
+        &config,
+        &activity,
+        &pacing,
+        &kicked(&["cdx-klive"]),
+        crate::usage::now_ms(),
+        &|_: &str| panic!("kicked live-owner chain must never be spent"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// EXP-1/F2: fed-sidecar freshness scan (`claude_feed_tick`)
+// ---------------------------------------------------------------------------
+
+fn feed_profile_config(feed_names: &[&str], plain_names: &[&str]) -> crate::profile::ConfigHandle {
+    let profiles = feed_names
+        .iter()
+        .map(|n| {
+            let mut p = crate::testutil::blank_profile(n);
+            p.session_feed = true;
+            p
+        })
+        .chain(
+            plain_names
+                .iter()
+                .map(|n| crate::testutil::blank_profile(n)),
+        )
+        .collect();
+    Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: feed_names
+                .iter()
+                .chain(plain_names.iter())
+                .map(|n| (*n).into())
+                .collect(),
+            ..Default::default()
+        },
+        profiles,
+    }))
+}
+
+/// A fed (refresh-less) sidecar expiring `exp_in_ms` from now.
+fn write_fed_sidecar(name: &str, exp_in_ms: i64) {
+    crate::claude::feed_session_token(
+        name,
+        &crate::profile::OAuthToken {
+            access_token: format!("{name}-fed"),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
+            scopes: None,
+            subscription_type: None,
+        },
+    )
+    .expect("feed sidecar");
+}
+
+/// A dying fed bearer gets the gate; a second tick inside the scan gap does
+/// not re-run it.
+#[test]
+fn claude_feed_tick_refeeds_a_dying_fed_sidecar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = feed_profile_config(&["cl-feed"], &[]);
+    write_fed_sidecar("cl-feed", 60 * 60 * 1000); // +1h, inside the 2h horizon
+    let pacing = std::sync::Mutex::new(super::ClaudeFeedPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    super::claude_feed_tick(&config, &pacing, now, &|name| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(name, "cl-feed");
+        crate::oauth::AuthGate::Ready
+    });
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Inside the scan gap: no re-run even though the sidecar is still dying.
+    super::claude_feed_tick(&config, &pacing, now + 1_000, &|_| {
+        panic!("inside the scan gap — must not re-run")
+    });
+}
+
+/// Fresh sidecars and non-feed profiles are never the timer's business.
+#[test]
+fn claude_feed_tick_ignores_fresh_and_non_feed_profiles() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = feed_profile_config(&["cl-fresh"], &["cl-plain"]);
+    write_fed_sidecar("cl-fresh", 6 * 60 * 60 * 1000); // clear of the horizon
+    write_fed_sidecar("cl-plain", 60 * 60 * 1000); // dying, but feed is OFF
+    let pacing = std::sync::Mutex::new(super::ClaudeFeedPacing::default());
+    super::claude_feed_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
+        panic!("'{name}' must not be re-fed")
+    });
+}
+
+/// A Ready that leaves the sidecar STILL due (the degrade leg serving a live
+/// mint/bearer through transient chain trouble) paces like a transient — no
+/// per-scan re-run of the gate.
+#[test]
+fn claude_feed_tick_ready_but_still_due_paces_like_transient() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = feed_profile_config(&["cl-degrade"], &[]);
+    write_fed_sidecar("cl-degrade", 60 * 60 * 1000);
+    let pacing = std::sync::Mutex::new(super::ClaudeFeedPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let degrading = |_: &str| {
+        // Ready without advancing the sidecar — the degrade posture.
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Ready
+    };
+    super::claude_feed_tick(&config, &pacing, now, &degrading);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Re-open the scan gate: the still-due Ready must have widened.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_feed_tick(&config, &pacing, now + 60_000, &degrading);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a degrade-masked Ready paces like a transient, not per scan"
+    );
+
+    // Past the widening → retried.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_feed_tick(&config, &pacing, now + super::FEED_RETRY_MS + 1, &degrading);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// A transient gate failure widens the per-profile retry past the scan gap.
+#[test]
+fn claude_feed_tick_transient_failure_widens_the_retry() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = feed_profile_config(&["cl-flaky"], &[]);
+    write_fed_sidecar("cl-flaky", 60 * 60 * 1000);
+    let pacing = std::sync::Mutex::new(super::ClaudeFeedPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let flaky = |_: &str| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Transient(anyhow::anyhow!("connection reset"))
+    };
+    super::claude_feed_tick(&config, &pacing, now, &flaky);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Re-open the scan gate; the per-profile widening must still hold.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_feed_tick(&config, &pacing, now + 60_000, &flaky);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "transient failure widens past the scan cadence"
+    );
+
+    // Past the widening → retried.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_feed_tick(&config, &pacing, now + super::FEED_RETRY_MS + 1, &flaky);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
@@ -4303,14 +4770,20 @@ fn codex_refresh_parked_discards_a_response_when_a_capture_raced_the_window() {
     // The injected refresh simulates a capture installing a DIFFERENT chain
     // during the HTTP window; the apply-time re-check must discard our result.
     let raced = due("acct-r", "rt-recaptured", 864_000);
-    let outcome = super::codex_refresh_parked(&config, "cdx-r", None, &|_spent| {
-        crate::codex::write_profile_auth("cdx-r", &raced).unwrap();
-        Ok(crate::codex::oauth::CodexRefreshResponse {
-            id_token: None,
-            access_token: Some("at-stale".into()),
-            refresh_token: Some("rt-stale".into()),
-        })
-    });
+    let outcome = super::codex_refresh_parked(
+        &config,
+        "cdx-r",
+        None,
+        &|_spent| {
+            crate::codex::write_profile_auth("cdx-r", &raced).unwrap();
+            Ok(crate::codex::oauth::CodexRefreshResponse {
+                id_token: None,
+                access_token: Some("at-stale".into()),
+                refresh_token: Some("rt-stale".into()),
+            })
+        },
+        false,
+    );
     assert!(matches!(outcome, super::CodexStandbyOutcome::Skipped));
     let stored = crate::codex::read_profile_auth("cdx-r").unwrap().unwrap();
     let v: serde_json::Value = serde_json::from_slice(&stored).unwrap();
@@ -4591,6 +5064,7 @@ fn codex_poll_publishes_a_parked_profiles_usage() {
         &store,
         &status,
         &pacing,
+        &no_kicks(),
         now,
         &|_token, account| {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4629,13 +5103,25 @@ fn codex_poll_publishes_a_parked_profiles_usage() {
     assert!((cached.seven_day.expect("7d").utilization - 41.0).abs() < f64::EPSILON);
 
     // Within the 60s cadence: a second tick is a no-op.
-    super::codex_poll_tick(&config, &store, &status, &pacing, now + 1_000, &|_, _| {
-        panic!("inside the poll gap — must not poll again")
-    });
+    super::codex_poll_tick(
+        &config,
+        &store,
+        &status,
+        &pacing,
+        &no_kicks(),
+        now + 1_000,
+        &|_, _| panic!("inside the poll gap — must not poll again"),
+    );
     // Past the cadence: due again.
-    super::codex_poll_tick(&config, &store, &status, &pacing, now + 61_000, &|_, _| {
-        Ok(poll_info(42.0))
-    });
+    super::codex_poll_tick(
+        &config,
+        &store,
+        &status,
+        &pacing,
+        &no_kicks(),
+        now + 61_000,
+        &|_, _| Ok(poll_info(42.0)),
+    );
     assert!(
         (store
             .lock()
@@ -4667,6 +5153,7 @@ fn codex_poll_respects_the_kill_switch() {
         &store,
         &status,
         &pacing,
+        &no_kicks(),
         crate::usage::now_ms(),
         &|_, _| panic!("toggle off — must not poll"),
     );
@@ -4687,6 +5174,7 @@ fn codex_poll_stands_down_on_a_clock_expired_token() {
         &store,
         &status,
         &pacing,
+        &no_kicks(),
         crate::usage::now_ms(),
         &|_, _| panic!("expired token — must not poll"),
     );
@@ -4704,9 +5192,15 @@ fn codex_poll_unauthorized_keeps_cache_and_widens() {
     let (store, status) = poll_stores();
     let pacing = std::sync::Mutex::new(super::CodexPollPacing::default());
     let now = crate::usage::now_ms();
-    super::codex_poll_tick(&config, &store, &status, &pacing, now, &|_, _| {
-        Err(crate::codex::poll::PollError::Unauthorized)
-    });
+    super::codex_poll_tick(
+        &config,
+        &store,
+        &status,
+        &pacing,
+        &no_kicks(),
+        now,
+        &|_, _| Err(crate::codex::poll::PollError::Unauthorized),
+    );
     assert!(store.lock().unwrap().is_empty(), "nothing published");
     // Still inside the widened window at +5min: no retry.
     super::codex_poll_tick(
@@ -4714,6 +5208,7 @@ fn codex_poll_unauthorized_keeps_cache_and_widens() {
         &store,
         &status,
         &pacing,
+        &no_kicks(),
         now + 5 * 60_000,
         &|_, _| panic!("unauthorized widening — must not retry yet"),
     );

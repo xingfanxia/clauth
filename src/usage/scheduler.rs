@@ -2218,6 +2218,17 @@ pub(crate) struct SchedulerState {
     /// CDX-6 poll pacing: per-profile next-due stamps + error-dedup memos.
     /// Same leaf-mutex discipline as `codex_standby`.
     codex_poll: std::sync::Mutex<CodexPollPacing>,
+    /// EXP-1/F1: profiles whose stored codex token the CDX-6 poll saw a 401
+    /// on — the poll's evidence that the token is dead server-side even when
+    /// its clock looks fine. Drained by the CDX-3 standby tick, which
+    /// attempts an immediate guarded refresh instead of waiting out the
+    /// age-based `standby_due` schedule (a parked chain would otherwise sit
+    /// dead for up to 48h/7d while every surface shows it healthy). Same
+    /// leaf-mutex discipline as the pacing fields above.
+    codex_auth_kicks: std::sync::Mutex<HashSet<String>>,
+    /// EXP-1/F2 re-feed pacing: next-scan stamp + per-profile retry widening
+    /// for the fed-sidecar freshness scan. Same leaf-mutex discipline.
+    claude_feed: std::sync::Mutex<ClaudeFeedPacing>,
 }
 
 /// Pacing state for the CDX-3 standby scan — cheap in-memory throttles so the
@@ -2389,6 +2400,7 @@ fn tick(state: &SchedulerState) {
         &state.config,
         &state.activity,
         &state.codex_standby,
+        &state.codex_auth_kicks,
         now_ms(),
         &crate::codex::oauth::refresh,
     );
@@ -2402,9 +2414,17 @@ fn tick(state: &SchedulerState) {
         &state.store,
         &state.status,
         &state.codex_poll,
+        &state.codex_auth_kicks,
         now_ms(),
         &|token, account_id| crate::codex::poll::fetch_wham_usage(token, account_id),
     );
+
+    // EXP-1/F2: fed-sidecar freshness scan — renew a feed-enabled profile's
+    // session bearer hours ahead of its clock death instead of relying on
+    // rotation side effects (lease-holder only, like the legs above).
+    claude_feed_tick(&state.config, &state.claude_feed, now_ms(), &|name| {
+        crate::oauth::refeed_session_token(&state.config, name, crate::oauth::refresh_result)
+    });
 
     // Names actually scheduled this tick across both legs. A forced name absent
     // from both (e.g. a profile whose creds were removed between the UI `r` and
@@ -2632,14 +2652,24 @@ const CODEX_POLL_GAP_MS: u64 = 60 * 1000;
 const CODEX_POLL_RETRY_MS: u64 = 5 * 60 * 1000;
 const CODEX_POLL_UNAUTHORIZED_MS: u64 = 15 * 60 * 1000;
 const CODEX_POLL_SHAPE_DRIFT_MS: u64 = 60 * 60 * 1000;
+/// EXP-1/F1 circuit breaker: consecutive poll 401s (with no intervening poll
+/// success) that may kick a forced standby refresh before the kick stands
+/// down to the age schedule. Two attempts cover "genuinely revoked access
+/// token" (first kick heals it) and "first kick raced a concurrent capture"
+/// (second kick retries); beyond that the 401 evidently isn't curable by
+/// rotation.
+const CODEX_KICK_STREAK_MAX: u32 = 2;
 
 /// Pacing for the CDX-6 poll: per-profile next-due stamps plus a last-error
 /// memo so a persistently failing profile logs the SAME error once, not every
-/// retry. In-memory only — losing it on restart costs one immediate poll.
+/// retry, plus the 401-kick streak for the F1 circuit breaker. In-memory only
+/// — losing it on restart costs one immediate poll (and re-arms the breaker,
+/// which is the right default for fresh evidence).
 #[derive(Default)]
 pub(super) struct CodexPollPacing {
     next_ms: HashMap<String, u64>,
     last_error: HashMap<String, String>,
+    kick_streak: HashMap<String, u32>,
 }
 
 /// CDX-6 active poll leg. For each codex profile with a stored access token,
@@ -2661,6 +2691,7 @@ pub(super) fn codex_poll_tick(
     store: &UsageStore,
     status: &StatusStore,
     pacing: &std::sync::Mutex<CodexPollPacing>,
+    kicks: &std::sync::Mutex<HashSet<String>>,
     now: u64,
     poll_fn: &dyn Fn(
         &str,
@@ -2745,17 +2776,54 @@ pub(super) fn codex_poll_tick(
                 }
                 if let Ok(mut p) = pacing.lock() {
                     p.last_error.remove(&name);
+                    p.kick_streak.remove(&name);
                     p.next_ms.insert(name, now + CODEX_POLL_GAP_MS);
                 }
             }
             Err(e) => {
                 let (delay, msg) = match &e {
-                    crate::codex::poll::PollError::Unauthorized => (
-                        CODEX_POLL_UNAUTHORIZED_MS,
-                        format!(
-                            "'{name}' wham/usage rejected the stored token (standby refresh will renew it)"
-                        ),
-                    ),
+                    crate::codex::poll::PollError::Unauthorized => {
+                        // EXP-1/F1: the server just proved this token dead —
+                        // kick the standby leg for a guarded refresh on its
+                        // next tick instead of waiting out the age schedule.
+                        // Circuit breaker (review MED): wham/usage shares
+                        // only the bearer with the coding API, so a
+                        // wham-specific auth quirk could 401 forever while
+                        // rotations keep succeeding — after
+                        // [`CODEX_KICK_STREAK_MAX`] consecutive 401s without
+                        // an intervening poll success, stop kicking (the age
+                        // schedule resumes ownership) rather than rotating a
+                        // healthy chain every poll interval indefinitely. A
+                        // genuinely dead chain exits the loop on its own:
+                        // the kicked refresh 400s permanent → auth_broken →
+                        // out of the candidate set.
+                        let streak = pacing
+                            .lock()
+                            .map(|mut p| {
+                                let s = p.kick_streak.entry(name.clone()).or_insert(0);
+                                *s += 1;
+                                *s
+                            })
+                            .unwrap_or(u32::MAX);
+                        if streak <= CODEX_KICK_STREAK_MAX {
+                            if let Ok(mut k) = kicks.lock() {
+                                k.insert(name.clone());
+                            }
+                            (
+                                CODEX_POLL_UNAUTHORIZED_MS,
+                                format!(
+                                    "'{name}' wham/usage rejected the stored token — kicking a standby refresh"
+                                ),
+                            )
+                        } else {
+                            (
+                                CODEX_POLL_UNAUTHORIZED_MS,
+                                format!(
+                                    "'{name}' wham/usage still rejects the token after {CODEX_KICK_STREAK_MAX} kicked refreshes — standing down to the age schedule"
+                                ),
+                            )
+                        }
+                    }
                     crate::codex::poll::PollError::RateLimited => (
                         CODEX_POLL_RETRY_MS,
                         format!("'{name}' wham/usage rate-limited"),
@@ -2814,6 +2882,7 @@ pub(super) fn codex_standby_tick(
     config: &crate::profile::ConfigHandle,
     activity: &ActivityStore,
     pacing: &std::sync::Mutex<CodexStandbyPacing>,
+    kicks: &std::sync::Mutex<HashSet<String>>,
     now: u64,
     refresh_fn: &dyn Fn(
         &str,
@@ -2822,18 +2891,73 @@ pub(super) fn codex_standby_tick(
         crate::codex::oauth::CodexRefreshError,
     >,
 ) {
-    {
+    // EXP-1/F1: process usage-poll 401 kicks ahead of the scan gate — a kick
+    // lands on the tick after the poll saw the 401 (this leg runs before the
+    // poll leg within a tick), far faster than the age schedule. A kick
+    // carries server-side proof the stored token is dead, so it bypasses both
+    // the scan cadence and `standby_due` (forced refresh) — but keeps every
+    // other discipline: candidates membership (parked, clauth-held), the
+    // RotationGuard, and the apply-time chain-identity re-check. It also
+    // bypasses the transient-retry widening: a 401 is fresh, stronger
+    // evidence than whatever aged the widening in, and the poll's own
+    // 15-minute unauthorized cadence (plus its kick-streak breaker)
+    // rate-limits re-kicks. The pacing gate is checked FIRST so a poisoned
+    // pacing mutex returns with the kick set untouched — drained kicks are
+    // never dropped unprocessed.
+    let scan_due = {
         let Ok(mut p) = pacing.lock() else { return };
         if now < p.next_scan_ms {
-            return;
+            false
+        } else {
+            p.next_scan_ms = now + CODEX_STANDBY_SCAN_GAP_MS;
+            true
         }
-        p.next_scan_ms = now + CODEX_STANDBY_SCAN_GAP_MS;
+    };
+    let kicked: Vec<String> = kicks
+        .lock()
+        .map(|mut k| std::mem::take(&mut *k).into_iter().collect())
+        .unwrap_or_default();
+    if kicked.is_empty() && !scan_due {
+        return;
     }
     let candidates = {
         let Ok(cfg) = config.lock() else { return };
         crate::actions::codex_standby_candidates(&cfg)
     };
+    for name in &kicked {
+        if !candidates.iter().any(|(n, _)| n == name) {
+            // Not a parked clauth-held chain (live owner, leased, logged out,
+            // or auth_broken) — the kick is moot; codex or a re-login owns it.
+            continue;
+        }
+        match codex_refresh_parked(config, name, Some(activity), refresh_fn, true) {
+            CodexStandbyOutcome::Refreshed => {
+                logline!("clauth: revived codex profile '{name}' after a usage-poll 401");
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms.remove(name);
+                }
+            }
+            CodexStandbyOutcome::Skipped => {}
+            CodexStandbyOutcome::Permanent => {}
+            CodexStandbyOutcome::Transient(e) => {
+                logline!(
+                    "clauth: kicked codex standby refresh for '{name}' failed (the poll re-kicks): {e}"
+                );
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms
+                        .insert(name.clone(), now + CODEX_STANDBY_RETRY_MS);
+                }
+            }
+        }
+    }
+    if !scan_due {
+        return;
+    }
     for (name, bytes) in candidates {
+        if kicked.contains(&name) {
+            // Just force-refreshed (or deliberately skipped) above.
+            continue;
+        }
         let widened = pacing
             .lock()
             .ok()
@@ -2870,6 +2994,110 @@ pub(super) fn codex_standby_tick(
     }
 }
 
+/// EXP-1/F2 cadence for the fed-sidecar freshness scan. The due predicate is
+/// stateless against the wall clock ([`crate::oauth::fed_sidecar_refeed_due`]),
+/// so a machine-sleep gap self-corrects on the first tick after wake — no
+/// monotonic bookkeeping needed.
+const FEED_SCAN_GAP_MS: u64 = 5 * 60 * 1000;
+/// Widening after a transient re-feed failure (network trouble, a busy
+/// rotation lock) — the horizon is hours wide, so minutes-scale retries lose
+/// nothing while avoiding per-scan log spam.
+const FEED_RETRY_MS: u64 = 15 * 60 * 1000;
+/// A Broken verdict (dead chain, no mint to degrade to) only changes via
+/// re-login — which re-arms the feed anyway — so retry on a long leash.
+const FEED_BROKEN_RETRY_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// Pacing for the EXP-1/F2 re-feed scan — same in-memory throttle shape as
+/// [`CodexStandbyPacing`]; the durable truth is the sidecar's own expiry.
+#[derive(Default)]
+pub(super) struct ClaudeFeedPacing {
+    next_scan_ms: u64,
+    retry_after_ms: HashMap<String, u64>,
+}
+
+/// EXP-1/F2: fed-sidecar freshness scan. For every feed-enabled claude
+/// profile whose armed sidecar is inside the re-feed horizon of its clock
+/// death, run the full feed decision table (no-spend re-stamp / guarded
+/// refresh / mint degrade) NOW instead of waiting for a rotation side effect
+/// — the RC-C death was exactly a fed bearer expiring under a running session
+/// while rotations sat parked (spent-window poll parking, daemon idle,
+/// machine sleep). Lease-holder tick only, like every other leg.
+///
+/// Deliberately scans ALL feed profiles, not just the active one: a parked
+/// profile's sessions may still be running on its fed bearer (sessions
+/// survive switches by design), and a fresh sidecar makes the next switch-in
+/// instant. The extra rotation pressure is nil — claude usage chains already
+/// rotate on the ~8h access-token cadence for usage polling, and the daemon
+/// is the single writer for parked chains either way.
+///
+/// `gate_fn` is injected (production: [`crate::oauth::refeed_session_token`])
+/// so the orchestration — candidates → due → pace/widen — is testable
+/// offline; only the injected closure ever touches locks or the network.
+pub(super) fn claude_feed_tick(
+    config: &crate::profile::ConfigHandle,
+    pacing: &std::sync::Mutex<ClaudeFeedPacing>,
+    now: u64,
+    gate_fn: &dyn Fn(&str) -> crate::oauth::AuthGate,
+) {
+    {
+        let Ok(mut p) = pacing.lock() else { return };
+        if now < p.next_scan_ms {
+            return;
+        }
+        p.next_scan_ms = now + FEED_SCAN_GAP_MS;
+    }
+    let candidates: Vec<String> = {
+        let Ok(cfg) = config.lock() else { return };
+        cfg.profiles
+            .iter()
+            .filter(|p| p.session_feed)
+            .map(|p| p.name.as_str().to_string())
+            .collect()
+    };
+    for name in candidates {
+        let widened = pacing
+            .lock()
+            .ok()
+            .and_then(|p| p.retry_after_ms.get(&name).copied())
+            .is_some_and(|at| now < at);
+        if widened {
+            continue;
+        }
+        if !crate::oauth::fed_sidecar_refeed_due(&name, now as i64) {
+            continue;
+        }
+        match gate_fn(&name) {
+            // Ready = re-stamped no-spend or degraded to a serving fallback;
+            // Refreshed = the rotation hook fed (and, active, mirrored). Both
+            // logged at their source. A Ready that left the sidecar STILL due
+            // is the degrade leg masking transient chain trouble behind a
+            // live mint/bearer (review LOW) — pace it like a transient
+            // instead of re-running the gate every scan.
+            crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {
+                if let Ok(mut p) = pacing.lock() {
+                    if crate::oauth::fed_sidecar_refeed_due(&name, now as i64) {
+                        p.retry_after_ms.insert(name.clone(), now + FEED_RETRY_MS);
+                    } else {
+                        p.retry_after_ms.remove(&name);
+                    }
+                }
+            }
+            crate::oauth::AuthGate::Transient(e) => {
+                logline!("clauth: re-feed for '{name}' failed (will retry): {e:#}");
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms.insert(name.clone(), now + FEED_RETRY_MS);
+                }
+            }
+            crate::oauth::AuthGate::Broken => {
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms
+                        .insert(name.clone(), now + FEED_BROKEN_RETRY_MS);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) enum CodexStandbyOutcome {
     Refreshed,
     /// The in-guard re-check disqualified the profile (became live owner /
@@ -2894,7 +3122,7 @@ fn codex_standby_refresh_one(
         crate::codex::oauth::CodexRefreshError,
     >,
 ) -> CodexStandbyOutcome {
-    codex_refresh_parked(config, name, Some(activity), refresh_fn)
+    codex_refresh_parked(config, name, Some(activity), refresh_fn, false)
 }
 
 /// Refresh ONE parked codex chain clauth exclusively holds, holding the
@@ -2920,6 +3148,11 @@ fn codex_standby_refresh_one(
 ///    no longer the one we spent (a concurrent capture/adopt-back installed a
 ///    fresh independent chain during the HTTP window), discard — the store's
 ///    newer chain is the truth, ours is a dead branch (review CRIT + MED).
+///
+/// `force` (EXP-1/F1) skips ONLY the in-guard `standby_due` check — for the
+/// usage-poll 401 kick, where the server already proved the access token dead
+/// while its clock still looks comfortable. Candidates membership and the
+/// chain-identity re-check are never skipped.
 pub(crate) fn codex_refresh_parked(
     config: &crate::profile::ConfigHandle,
     name: &str,
@@ -2930,6 +3163,7 @@ pub(crate) fn codex_refresh_parked(
         crate::codex::oauth::CodexRefreshResponse,
         crate::codex::oauth::CodexRefreshError,
     >,
+    force: bool,
 ) -> CodexStandbyOutcome {
     // (1) Adopt back a crashed isolated session's fresher chain BEFORE the
     // guard, so the in-guard read below sees the freshest truth.
@@ -2954,7 +3188,7 @@ pub(crate) fn codex_refresh_parked(
                 return Ok::<_, anyhow::Error>(None);
             };
             let auth = crate::codex::CodexAuthFile::parse(&bytes)?;
-            if !crate::codex::oauth::standby_due(&auth, crate::usage::now_ms()) {
+            if !force && !crate::codex::oauth::standby_due(&auth, crate::usage::now_ms()) {
                 return Ok(None);
             }
             let rt = auth.refresh_token().map(str::to_string);
@@ -3191,6 +3425,8 @@ pub(crate) fn spawn_refresher(
         standdown_active: AtomicBool::new(false),
         codex_standby: std::sync::Mutex::new(CodexStandbyPacing::default()),
         codex_poll: std::sync::Mutex::new(CodexPollPacing::default()),
+        codex_auth_kicks: std::sync::Mutex::new(HashSet::new()),
+        claude_feed: std::sync::Mutex::new(ClaudeFeedPacing::default()),
     };
     // Same test-skip rationale as the status/tokens/pricing workers in
     // `tui/app.rs`: a detached tick thread is never joined, so it could run

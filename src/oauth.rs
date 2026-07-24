@@ -1399,7 +1399,7 @@ pub(crate) fn ensure_installable(
     // mis-filled/dead-chain) is decided there, so no feed profile can fall
     // through a vanilla path and install the shared rotating pair.
     if profile_session_feed(config, name) {
-        return feed_install_gate(config, name, refresher);
+        return feed_install_gate(config, name, refresher, AUTH_GATE_GRACE_MS);
     }
     vanilla_install_gate(config, name, refresher)
 }
@@ -1472,7 +1472,7 @@ fn vanilla_install_gate(
     if has_live_session(name) {
         return AuthGate::Ready;
     }
-    gate_under_guard(config, name, refresher, &guard)
+    gate_under_guard(config, name, refresher, &guard, AUTH_GATE_GRACE_MS)
 }
 
 /// CLA-FEED: the complete install gate for a feed-enabled profile. Every
@@ -1499,6 +1499,7 @@ fn feed_install_gate(
     config: &crate::profile::ConfigHandle,
     name: &str,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
+    fresh_horizon_ms: i64,
 ) -> AuthGate {
     use crate::claude::SessionTokenStatus;
     if matches!(
@@ -1532,7 +1533,8 @@ fn feed_install_gate(
     let now = now_ms() as i64;
     let fed_fresh = |st: Option<SessionTokenStatus>| {
         matches!(st, Some(SessionTokenStatus::LongLived(Some(e)))
-            if !expiring(Some(e), false) && e < now + crate::claude::MINT_HORIZON_MS)
+            if !horizon_expiring(Some(e), false, fresh_horizon_ms)
+                && e < now + crate::claude::MINT_HORIZON_MS)
     };
     let sidecar_live = |st: Option<SessionTokenStatus>| matches!(st, Some(SessionTokenStatus::LongLived(exp)) if !expiring(exp, false));
     if fed_fresh(crate::claude::session_token_status(name)) {
@@ -1549,7 +1551,7 @@ fn feed_install_gate(
     if fed_fresh(crate::claude::session_token_status(name)) {
         return AuthGate::Ready;
     }
-    match feed_from_stored_chain(config, name, &guard) {
+    match feed_from_stored_chain(config, name, &guard, fresh_horizon_ms) {
         FeedAttempt::Fed => return AuthGate::Ready,
         // A feed WRITE failure with a live mint still installs the mint
         // (degraded but serving — the next rotation retries the feed); with
@@ -1574,7 +1576,7 @@ fn feed_install_gate(
              feed was armed) — restart that session or retry after it ends"
         ));
     }
-    let gate = gate_under_guard(config, name, refresher, &guard);
+    let gate = gate_under_guard(config, name, refresher, &guard, fresh_horizon_ms);
     match gate {
         // The refresh persisted through the rotation hook, which fed the
         // sidecar as a side effect.
@@ -1625,7 +1627,7 @@ pub(crate) fn arm_session_feed(
     name: &str,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> Result<()> {
-    match feed_install_gate(config, name, refresher) {
+    match feed_install_gate(config, name, refresher, AUTH_GATE_GRACE_MS) {
         AuthGate::Ready | AuthGate::Refreshed => {
             if crate::claude::has_session_token(name) {
                 Ok(())
@@ -1642,6 +1644,75 @@ pub(crate) fn arm_session_feed(
         }
         AuthGate::Transient(e) => Err(e),
     }
+}
+
+/// EXP-1/F2: how much life a fed sidecar must keep before the daemon's
+/// re-feed leg leaves it alone. Fed bearers die in hours (they clone the
+/// usage chain's access-token expiry); re-feeding this far ahead keeps a
+/// running session's bearer alive across daemon idle gaps, spent-window poll
+/// parking, and machine sleep — the RC-C death was a sidecar quietly hitting
+/// its ~7h clock while re-feeds waited on a rotation that never came.
+pub(crate) const FEED_REFEED_HORIZON_MS: i64 = 2 * 60 * 60 * 1000;
+
+/// EXP-1/F2 due predicate for the scheduler's re-feed leg: an armed,
+/// exp-carrying sidecar inside [`FEED_REFEED_HORIZON_MS`] of death. Absent
+/// sidecars (arming is switch/rotation work), exp-less claims, and
+/// NotLongLived mis-fills (switch-time healing owns those) are all not-due —
+/// the timer's single job is clock freshness of what the feed installed.
+pub(crate) fn fed_sidecar_refeed_due(name: &str, now: i64) -> bool {
+    matches!(
+        crate::claude::session_token_status(name),
+        Some(crate::claude::SessionTokenStatus::LongLived(Some(exp)))
+            if exp <= now + FEED_REFEED_HORIZON_MS
+    )
+}
+
+/// EXP-1/F2: the scheduler-leg re-feed for one feed-enabled profile — the
+/// same complete decision table as the switch-in gate (no-spend re-stamp from
+/// a comfortable chain / guarded refresh / mint degrade), but judged against
+/// the generous [`FEED_REFEED_HORIZON_MS`] instead of the switch gate's
+/// seconds-tight grace. For the ACTIVE profile a no-spend re-stamp must also
+/// reach the macOS Keychain (a `Refreshed` outcome already mirrored through
+/// the rotation hook; the running `claude` re-reads the Keychain per
+/// request) — same refresh-less content belt as the hook: nothing carrying a
+/// refresh token can ship through the feed path.
+pub(crate) fn refeed_session_token(
+    config: &crate::profile::ConfigHandle,
+    name: &str,
+    refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
+) -> AuthGate {
+    let gate = feed_install_gate(config, name, refresher, FEED_REFEED_HORIZON_MS);
+    // A fed-shaped sidecar now clear of the horizon = the no-spend re-stamp
+    // just landed (the Refreshed and mint-degrade paths log at their source).
+    if matches!(gate, AuthGate::Ready) {
+        let now = now_ms() as i64;
+        if matches!(
+            crate::claude::session_token_status(name),
+            Some(crate::claude::SessionTokenStatus::LongLived(Some(exp)))
+                if exp > now + FEED_REFEED_HORIZON_MS
+                    && exp < now + crate::claude::MINT_HORIZON_MS
+        ) {
+            logline!("clauth: re-fed '{name}' session token ahead of its expiry");
+        }
+    }
+    // In-process switches stay excluded for the whole is-active check + write
+    // by holding the config mutex across it — the `apply_rotated_tokens_locked`
+    // mirror discipline (the state FLOCK is what must never span the
+    // `/usr/bin/security` subprocess; the config mutex is expected to).
+    #[cfg(target_os = "macos")]
+    if matches!(gate, AuthGate::Ready)
+        && crate::keychain::enabled()
+        && let Ok(cfg) = config.lock()
+        && cfg.is_active(name)
+        && let Ok(path) = crate::claude::install_source_path(name)
+        && let Ok(creds) =
+            crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&path)
+        && creds.refresh_token().is_none()
+        && let Err(e) = crate::keychain::keychain_write(&creds)
+    {
+        logline!("clauth: re-fed '{name}' but the Keychain mirror failed: {e:#}");
+    }
+    gate
 }
 
 /// CLA-FEED: whether `name` has the session feed enabled. A poisoned config
@@ -1680,6 +1751,7 @@ fn feed_from_stored_chain(
     config: &crate::profile::ConfigHandle,
     name: &str,
     _rotation_guard: &RotationGuard,
+    fresh_horizon_ms: i64,
 ) -> FeedAttempt {
     let Ok(cfg) = config.lock() else {
         return FeedAttempt::ChainStale;
@@ -1694,7 +1766,7 @@ fn feed_from_stored_chain(
     let Some(oauth) = chain else {
         return FeedAttempt::ChainStale;
     };
-    if expiring(oauth.expires_at, flagged) {
+    if horizon_expiring(oauth.expires_at, flagged, fresh_horizon_ms) {
         return FeedAttempt::ChainStale;
     }
     match crate::claude::feed_session_token(name, &oauth) {
@@ -1746,7 +1818,16 @@ fn oauth_shape(
 /// refresher — a recovered chain comes back `Refreshed` and lifts the flag, a
 /// dead one confirms `Broken`.
 fn expiring(expires_at: Option<i64>, flagged: bool) -> bool {
-    flagged || expires_at.is_some_and(|exp| (now_ms() as i64) + AUTH_GATE_GRACE_MS >= exp)
+    horizon_expiring(expires_at, flagged, AUTH_GATE_GRACE_MS)
+}
+
+/// [`expiring`] with a caller-chosen margin. The switch gates keep the tight
+/// [`AUTH_GATE_GRACE_MS`]; the EXP-1/F2 re-feed leg passes
+/// [`FEED_REFEED_HORIZON_MS`] so a fed bearer is renewed HOURS before its
+/// clock death, not seconds — the margin that keeps a running session alive
+/// across daemon idle gaps and machine sleep.
+fn horizon_expiring(expires_at: Option<i64>, flagged: bool, horizon_ms: i64) -> bool {
+    flagged || expires_at.is_some_and(|exp| (now_ms() as i64) + horizon_ms >= exp)
 }
 
 /// Reconcile the in-memory profile with the on-disk store; the `_guard` witness
@@ -1796,13 +1877,14 @@ fn gate_under_guard(
     name: &str,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     guard: &RotationGuard,
+    fresh_horizon_ms: i64,
 ) -> AuthGate {
     adopt_disk_rotation(config, name, guard);
     let (expires_at, refresh_token, scopes, flagged) = match oauth_shape(config, name) {
         Err(gate) => return gate,
         Ok(shape) => shape,
     };
-    if !expiring(expires_at, flagged) {
+    if !horizon_expiring(expires_at, flagged, fresh_horizon_ms) {
         // A sibling refreshed while we acquired the guard — the stored pair is
         // fresh; install it as-is instead of double-spending the old chain.
         return AuthGate::Ready;

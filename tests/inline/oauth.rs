@@ -1122,7 +1122,13 @@ fn gate_under_guard_installs_a_sibling_refreshed_pair_as_is() {
         Some(future_expiry()),
     )));
     assert!(matches!(
-        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            name,
+            never_refresh,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Ready
     ));
 }
@@ -1151,7 +1157,13 @@ fn gate_under_guard_spends_the_currently_stored_refresh_token() {
         })
     };
     assert!(matches!(
-        gate_under_guard(&handle, name, refresher, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            name,
+            refresher,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Refreshed
     ));
 }
@@ -1172,7 +1184,13 @@ fn gate_under_guard_adopts_a_cross_process_rotation_from_disk() {
     )));
     save_disk_profile(name, "rt-peer", Some(future_expiry()));
     assert!(matches!(
-        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            name,
+            never_refresh,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Ready
     ));
     assert_eq!(
@@ -1205,7 +1223,13 @@ fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
         })
     };
     assert!(matches!(
-        gate_under_guard(&handle, name, refresher, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            name,
+            refresher,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Refreshed
     ));
 }
@@ -1226,7 +1250,13 @@ fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
     handle.lock().unwrap().set_auth_broken(name, true);
     save_disk_profile(name, "rt-peer", Some(future_expiry()));
     assert!(matches!(
-        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            name,
+            never_refresh,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Ready
     ));
     assert!(
@@ -2118,4 +2148,141 @@ fn feed_gate_misfill_without_backup_keeps_the_disengaged_vanilla_posture() {
         source.ends_with("credentials.json"),
         "no backup to degrade to — disengaged split behaves as vanilla"
     );
+}
+
+// ---------------------------------------------------------------------------
+// EXP-1/F2: scheduler-leg re-feed (`refeed_session_token`) — renew the fed
+// bearer HOURS before its clock death, not seconds (the RC-C fix).
+// ---------------------------------------------------------------------------
+
+/// Epoch-ms comfortably beyond the re-feed horizon — a chain the no-spend
+/// re-stamp path may clone from.
+fn beyond_horizon_expiry() -> i64 {
+    crate::usage::now_ms() as i64 + 6 * 3_600_000
+}
+
+/// The due predicate fires only for an armed, exp-carrying sidecar inside the
+/// horizon — absent sidecars and mis-fills belong to the switch-time gate.
+#[test]
+fn refeed_due_fires_inside_the_horizon_only() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms() as i64;
+    let name = "test-refeed-due";
+    assert!(
+        !fed_sidecar_refeed_due(name, now),
+        "absent sidecar is not the timer's job"
+    );
+    crate::claude::feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(beyond_horizon_expiry()),
+            scopes: None,
+            subscription_type: None,
+        },
+    )
+    .expect("feed");
+    assert!(
+        !fed_sidecar_refeed_due(name, now),
+        "a bearer clear of the horizon is left alone"
+    );
+    crate::claude::feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()), // +1h, inside the 2h horizon
+            scopes: None,
+            subscription_type: None,
+        },
+    )
+    .expect("feed");
+    assert!(
+        fed_sidecar_refeed_due(name, now),
+        "a bearer inside the horizon is due"
+    );
+}
+
+/// A dying fed bearer + a chain clear of the horizon → no-spend re-stamp,
+/// exactly where the switch gate (seconds-tight grace) would have no-opped —
+/// the contrast that pins the horizon semantics.
+#[test]
+fn refeed_restamps_a_dying_bearer_the_switch_gate_calls_fresh() {
+    let _home = HomeSandbox::new();
+    let name = "test-refeed-nospend";
+    let config = feed_config(name, Some("rt-good"), Some(beyond_horizon_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()), // +1h: dying, but "fresh" to the switch gate
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    // Switch gate: +1h clears the 60s grace → install as-is, no re-stamp.
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "at-fed-dying",
+        "the switch gate leaves a +1h bearer alone"
+    );
+    // Re-feed leg: +1h is inside the 2h horizon → re-stamped from the chain,
+    // still without spending a refresh.
+    assert!(matches!(
+        refeed_session_token(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "at-old", "re-stamped from the chain");
+    assert!(oauth.refresh_token.is_none(), "pair never leaves custody");
+}
+
+/// Dying bearer + chain itself inside the horizon (they usually share an
+/// expiry — the fed token IS the chain's access token) → guarded refresh; the
+/// rotation hook re-feeds the freshly minted token.
+#[test]
+fn refeed_rotates_when_the_chain_is_inside_the_horizon_too() {
+    let _home = HomeSandbox::new();
+    let name = "test-refeed-rotate";
+    let config = feed_config(name, Some("rt-old"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 8 * 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        refeed_session_token(&handle, name, refresher),
+        AuthGate::Refreshed
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-new",
+        "hook re-fed the rotated token"
+    );
+    assert!(oauth.refresh_token.is_none());
 }

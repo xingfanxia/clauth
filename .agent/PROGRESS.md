@@ -1876,3 +1876,51 @@ deep study. Consolidated verdict:
   timer + wake-from-sleep check (+ verify clock-death degrade to static mint);
   F3 codex self-heal re-capture (live ~/.codex login matching an auth_broken
   profile's account → auto re-adopt); F4 codex-auth UX adoptions.
+
+## EXP-2 — F1+F2 implemented: 401-kicked codex standby + claude re-feed timer (2026-07-23)
+
+The two "small and certain" fixes from EXP-1, shipped together:
+
+- **F1 (codex, RC-2 fix)**: CDX-6 poll's `PollError::Unauthorized` now inserts
+  the profile into `SchedulerState.codex_auth_kicks` (shared leaf mutex); the
+  CDX-3 standby tick drains kicks BEFORE its scan gate and calls
+  `codex_refresh_parked(..., force: true)`. `force` bypasses ONLY the
+  `standby_due` age check (the 401 is server-side proof of death); candidates
+  membership (parked/clauth-held — live owners excluded), RotationGuard, and
+  the apply-time chain-identity re-check all stay. Kicks bypass both the scan
+  cadence and the 6h transient widening (poll's 15-min unauthorized cadence is
+  the upstream rate limit). Permanent → auth_broken as before, but now within
+  ~1 poll interval of the revocation instead of masked for days.
+- **F2 (claude, RC-C fix)**: new scheduler leg `claude_feed_tick` (5-min scan,
+  lease-holder only) + `oauth::refeed_session_token`: for every feed-enabled
+  profile whose fed sidecar is within `FEED_REFEED_HORIZON_MS` (2h) of clock
+  death, run the FULL existing feed decision table — no-spend re-stamp from a
+  comfortable chain / guarded refresh / mint degrade — via a new
+  `fresh_horizon_ms` param threaded through `feed_install_gate`,
+  `feed_from_stored_chain`, `gate_under_guard`. Switch-time callers pass the
+  old `AUTH_GATE_GRACE_MS` (60s) so switch behavior is byte-identical. Active
+  profile no-spend re-stamps also mirror the refresh-less bearer to the
+  Keychain under the config mutex (the rotation-hook discipline; running
+  claude re-reads Keychain per request). Due predicate is stateless wall-clock
+  → machine-sleep gaps self-correct on the first tick after wake; predicate
+  (exp <= now+H) and gate freshness (exp > now+H) are complementary, so no
+  scan no-op loop.
+- Tests: +10 (4 kick orchestration, 3 feed-tick orchestration, 3 refeed
+  gate-level incl. the switch-gate-vs-refeed contrast). 1783 green, clippy 0,
+  fmt clean, hard-cap sweep clean.
+- Still open from EXP-1: F3 codex self-heal re-capture (CDX-7 scale), F4
+  codex-auth UX adoptions (json contract / import / switch --previous).
+  F4-routing decision (AX delegated): direct default STAYS; RC-1 exposure is
+  accepted until F3 lands (self-heal re-capture is the mitigation, not proxy
+  re-route).
+- Review round (opus code-reviewer): 0 CRIT / 0 HIGH / 1 MED / 4 LOW / 1 NIT,
+  all fixed: MED = kick circuit breaker (`kick_streak` in CodexPollPacing,
+  cap 2 consecutive 401s without a poll success — a wham-only auth quirk can
+  no longer rotate a healthy chain every 15 min forever; genuine dead chains
+  still exit via Permanent→auth_broken); LOW = degrade-masked Ready now paces
+  like a transient (still-due after Ready → FEED_RETRY_MS widen), poisoned
+  pacing can no longer drop drained kicks (gate checked before drain),
+  refeed Keychain mirror holds the config guard across the write
+  (rotation-hook discipline), all-feed-profiles scan documented as intended;
+  +3 tests (kick-permanent termination, breaker stand-down/re-arm,
+  degrade pacing) → 1786 green.
