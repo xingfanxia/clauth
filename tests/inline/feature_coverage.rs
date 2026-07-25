@@ -32,6 +32,16 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
     ),
     ("Delete an account", &["delete_takes_yes_and_force"]),
     (
+        "Feed the session token",
+        &[
+            "feed_gate_",
+            "feed_session_token_writes",
+            "first_feed_preserves_the_mint",
+            "restore_static_mint_round_trip",
+            "session_feed_forces_the_preemptive_leg",
+        ],
+    ),
+    (
         "Automatic token refresh",
         &[
             "rotate_one",

@@ -169,6 +169,12 @@ pub(crate) struct Profile {
     /// headroom (issue #8 follow-up: a threshold no longer doubles as a sink
     /// marker).
     pub(crate) last_resort: bool,
+    /// CLA-FEED: the daemon feeds this profile's `session-token.json` with the
+    /// usage chain's current access token on every rotation (full scopes +
+    /// `subscriptionType`, no refresh token — sessions get plan-gated-model
+    /// bearers while the refresh chain stays clauth-private). Off — the
+    /// default — keeps the sidecar exactly what was captured (static mint).
+    pub(crate) session_feed: bool,
     /// Ceiling in US dollars on what the auto-switch chain may spend of this
     /// account's pay-as-you-go budget on its own (fallback chain only, and only
     /// while `AppState::spend_budget_switching` is on). `None`/`0` — the
@@ -219,6 +225,7 @@ impl Profile {
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
+            session_feed: false,
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
@@ -783,6 +790,8 @@ struct ProfileConfig {
     #[serde(default)]
     last_resort: bool,
     #[serde(default)]
+    session_feed: bool,
+    #[serde(default)]
     max_auto_spend: Option<f64>,
     /// `Option` (not `bool`) so the derived `Default` and an absent key agree:
     /// `None` means "unset", which resolves to the on default at the load
@@ -1346,6 +1355,7 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
             .weekly_threshold
             .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v)),
         last_resort: config.last_resort,
+        session_feed: config.session_feed,
         // Normalize at the LOAD boundary so the on-disk value is never a live
         // trap for a direct reader (the 2026-07-14 weekly-line lesson). `inf`
         // and `nan` are both valid TOML floats, and an infinite ceiling means
@@ -1387,6 +1397,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 fallback_threshold: profile.fallback_threshold,
                 weekly_threshold: profile.weekly_threshold,
                 last_resort: profile.last_resort,
+                session_feed: profile.session_feed,
                 max_auto_spend: profile.max_auto_spend,
                 // Default-on booleans render as commented examples when on, so
                 // the canonical form is `None` (unset) — an explicit `= true`
@@ -1572,6 +1583,17 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("last_resort = true\n");
     } else {
         out.push_str("# last_resort = true\n");
+    }
+    out.push('\n');
+
+    out.push_str("# CLA-FEED: feed this profile's session-token.json with the usage\n");
+    out.push_str("# chain's current access token on every rotation (plan-gated models\n");
+    out.push_str("# work in sessions, refresh chain stays clauth-private). Managed by\n");
+    out.push_str("# `clauth feed <profile> on|off`.\n");
+    if profile.session_feed {
+        out.push_str("session_feed = true\n");
+    } else {
+        out.push_str("# session_feed = true\n");
     }
     out.push('\n');
 

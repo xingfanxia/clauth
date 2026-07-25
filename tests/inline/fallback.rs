@@ -69,6 +69,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         fallback_threshold: threshold,
         weekly_threshold: None,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,

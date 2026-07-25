@@ -485,15 +485,21 @@ fn active_rotate_lead_ms(interval_ms: u64) -> i64 {
 /// expiry we can't prove).
 fn proactive_rotation_due(
     enabled: bool,
+    feed: bool,
     active: bool,
     keychain_live: bool,
     access_expires_at: Option<i64>,
     now_ms: i64,
     interval_ms: u64,
 ) -> bool {
-    enabled
+    // CLA-FEED (`feed`): a feed-enabled profile forces the preemptive leg
+    // regardless of the global toggle — its rotation re-stamps the fed
+    // session token, and a stale one has a live claude behind it. The
+    // Keychain-mirror condition doesn't apply either: off macOS the fed
+    // sidecar IS the live credential via the symlink, so the re-stamp reaches
+    // sessions on every platform.
+    (enabled && keychain_live || feed)
         && active
-        && keychain_live
         && access_expires_at.is_some_and(|exp| now_ms + active_rotate_lead_ms(interval_ms) >= exp)
 }
 
@@ -616,7 +622,7 @@ fn fetch_with_rotation(
     // persisted the fresh expiry there, while the entry still carries the
     // pre-kick one, and a stale past expiry here would read as clock-expired
     // and re-spend the just-minted single-use pair.
-    let (is_active, access_expires_at, interval_ms, preemptive) = config
+    let (is_active, access_expires_at, interval_ms, preemptive, session_feed) = config
         .lock()
         .map(|c| {
             (
@@ -624,11 +630,13 @@ fn fetch_with_rotation(
                 c.find(name).and_then(|p| p.access_token_expires_at()),
                 c.state.refresh_interval_ms,
                 c.state.preemptive_rotation,
+                c.find(name).is_some_and(|p| p.session_feed),
             )
         })
-        .unwrap_or((false, None, 90_000, false));
+        .unwrap_or((false, None, 90_000, false, false));
     let proactive = proactive_rotation_due(
         preemptive,
+        session_feed,
         is_active,
         keychain_live(),
         access_expires_at,
@@ -722,7 +730,15 @@ fn fetch_with_rotation(
     // refresh it itself — rotating here would double-spend the single-use token.
     // The guard makes this authoritative (winner stamped its PID file first).
     // `partition_due` excludes Refreshing/Switching but not live external sessions.
-    if crate::runtime::has_live_session(name) {
+    // CLA-FEED exempts itself ONLY when the sidecar is genuinely armed
+    // (LongLived): fed sessions run on a refresh-less bearer and never advance
+    // the chain. The flag alone proves nothing — a session started inside an
+    // arming window (sidecar absent/mis-filled) copied the ROTATING PAIR via
+    // `install_source_path`, and rotating under it is the exact revoked-chain
+    // death the split prevents.
+    if !(session_feed && crate::claude::has_session_token(name))
+        && crate::runtime::has_live_session(name)
+    {
         return bail_unrotated();
     }
     mark_activity(activity, name, ProfileActivity::Refreshing);

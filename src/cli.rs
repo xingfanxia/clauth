@@ -98,6 +98,21 @@ pub(crate) enum Command {
         profile: String,
     },
 
+    /// Feed a profile's session token from its clauth-private usage chain
+    ///
+    /// `on`: the daemon re-stamps `session-token.json` with the usage chain's
+    /// current access token — full scopes and the account's `subscriptionType`,
+    /// but NO refresh token — so sessions run bearers that unlock plan-gated
+    /// models while the rotating chain stays clauth-private. `off`: restore the
+    /// static `claude setup-token` mint the feed superseded.
+    Feed {
+        /// Profile whose session feed to toggle.
+        profile: String,
+        /// `on` to arm the feed, `off` to restore the static mint.
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+
     /// Print the profile owning the loaded .credentials.json
     ///
     /// CLAUDE_CONFIG_DIR-aware; prints `unknown` when nothing matches.

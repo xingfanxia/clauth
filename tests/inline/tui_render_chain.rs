@@ -24,6 +24,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         fallback_threshold: Some(threshold),
         weekly_threshold: None,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,

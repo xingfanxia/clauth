@@ -138,6 +138,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         } => cmd_delete(&profile, yes, force),
         Command::Disable { profile, yes } => cmd_disable(&profile, yes),
         Command::Enable { profile } => cmd_enable(&profile),
+        Command::Feed { profile, state } => cmd_feed(&profile, &state),
         Command::Which { json } => which::run(json),
         Command::List { all, disabled } => list::run(all || disabled),
         Command::Sessions { json } => sessions_cli::run_sessions(json),
@@ -555,7 +556,18 @@ fn cmd_login_setup_token(
         actions::set_profile_default_model(config, target, model)?;
     }
 
-    let expires_at = claude::write_session_token(target, &token, crate::usage::now_ms() as i64)?;
+    // CLA-FEED: on a feed-enabled profile the next rotation overwrites this
+    // mint with a fed value — capture the mint into the sidecar AND the
+    // degrade backup atomically (one flock section, same bytes; a two-step
+    // write-then-copy can snapshot a concurrent rotation's fed token as "the
+    // mint").
+    let feed_on = config.find(target).is_some_and(|p| p.session_feed);
+    let now = crate::usage::now_ms() as i64;
+    let expires_at = if feed_on {
+        claude::write_session_token_with_backup(target, &token, now)?
+    } else {
+        claude::write_session_token(target, &token, now)?
+    };
     let days = (expires_at - crate::usage::now_ms() as i64) / 86_400_000;
     println!(
         "clauth: long-lived token installed for '{target}' · assumed to expire in ~{days}d \
@@ -696,6 +708,102 @@ fn cmd_switch(name: &str) -> Result<()> {
 /// `env.ANTHROPIC_AUTH_TOKEN`). Fails closed with no stdout if the profile
 /// is missing or carries no api_key, so a misconfigured helper surfaces as a
 /// 401, not a silent leak of some other value.
+/// `clauth feed <profile> on|off` — arm or disable the session-token feed.
+///
+/// On: flip the flag, pre-clear a mis-filled sidecar (quarantining the
+/// evidence first), then arm the sidecar from the usage chain through the same
+/// decision table the switch-in gate uses. Off: flip the flag and restore the
+/// preserved static mint. Both directions reinstall live when the profile is
+/// active, so a running `claude` picks the new bearer up on its next request.
+fn cmd_feed(name: &str, state: &str) -> Result<()> {
+    let on = state == "on";
+    let mut config = load_config()?;
+    let Some(canonical) = config.canonical_name(name) else {
+        anyhow::bail!("unknown profile '{name}'");
+    };
+    let Some(profile) = config.find(&canonical) else {
+        anyhow::bail!("unknown profile '{name}'");
+    };
+
+    if !on {
+        // The whole disable (flag flip + mint restore) serializes on the
+        // profile's rotation guard: without it, a concurrent rotation that
+        // still sees feed=on can re-feed the sidecar AFTER the restore,
+        // leaving feed=off + an hours-horizon live credential + no backup.
+        let _guard = runtime::RotationGuard::acquire(&canonical)
+            .map_err(|_| anyhow::anyhow!("'{canonical}' rotation lock busy — retry in a moment"))?;
+        if let Some(profile) = config.find_mut(&canonical) {
+            profile.session_feed = false;
+            profile::save_profile(profile)?;
+        }
+        let is_active = config.is_active(&canonical);
+        if claude::restore_static_mint(&canonical)? {
+            println!("clauth: feed off for '{canonical}' — static long-lived mint restored.");
+            if is_active {
+                claude::force_link_profile_credentials(&canonical)?;
+                println!("clauth: reinstalled live.");
+            }
+        } else {
+            println!(
+                "clauth: feed off for '{canonical}' — no static backup to restore; the last \
+                 fed token serves until its expiry. Re-mint with `clauth login {canonical} \
+                 --setup-token`."
+            );
+        }
+        return Ok(());
+    }
+
+    let Some(oauth) = profile
+        .credentials
+        .as_ref()
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+    else {
+        anyhow::bail!(
+            "'{canonical}' has no usage OAuth chain to feed from — `clauth login {canonical}` \
+             first"
+        );
+    };
+    // A chain captured without `user:profile`/`subscriptionType` mints bearers
+    // that still authenticate but may not unlock plan-gated models — warn
+    // rather than refuse, since the feed is otherwise correct.
+    let plan_capable = oauth
+        .scopes
+        .as_ref()
+        .is_some_and(|s| s.iter().any(|x| x == "user:profile"))
+        && oauth.subscription_type.is_some();
+    if !plan_capable {
+        println!(
+            "clauth: warning — '{canonical}''s chain is missing the user:profile scope or a \
+             subscriptionType stamp; fed tokens may not unlock plan-gated models. A fresh \
+             `clauth login {canonical}` browser sign-in fixes that."
+        );
+    }
+    // A mis-filled sidecar is pre-cleared here, where overwriting is explicit
+    // operator intent — the evidence still goes to quarantine first.
+    if claude::quarantine_misfilled_sidecar(&canonical)? {
+        println!(
+            "clauth: '{canonical}' had a mis-filled sidecar (rotating pair) — quarantined \
+             under ~/.clauth/quarantine/ before arming."
+        );
+    }
+    if let Some(profile) = config.find_mut(&canonical) {
+        profile.session_feed = true;
+        profile::save_profile(profile)?;
+    }
+    let is_active = config.is_active(&canonical);
+    let handle: profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+    oauth::arm_session_feed(&handle, &canonical, oauth::refresh_result)?;
+    println!("clauth: feed on for '{canonical}' — session token armed from the usage chain.");
+    if is_active {
+        claude::force_link_profile_credentials(&canonical)?;
+        println!("clauth: installed live — new sessions run on the fed token.");
+    } else {
+        println!("clauth: it installs on the next switch:  clauth {canonical}");
+    }
+    Ok(())
+}
+
 fn cmd_api_key(name: &str) -> Result<()> {
     let key = api_key_for_profile(name)?;
     // `api_key_for_profile` returns Ok(Some) only when the key is non-empty;

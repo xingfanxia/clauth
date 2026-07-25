@@ -2762,6 +2762,7 @@ fn preemptive_rotation_is_opt_in_and_off_by_default() {
     assert!(!crate::profile::AppState::default().preemptive_rotation);
     assert!(!super::proactive_rotation_due(
         false,
+        false,
         true,
         true,
         Some(10_000),
@@ -2778,6 +2779,7 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     // from ever expiring under the running claude.
     assert!(super::proactive_rotation_due(
         true,
+        false,
         true,
         true,
         Some(10_000 + lead),
@@ -2786,6 +2788,7 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     ));
     assert!(super::proactive_rotation_due(
         true,
+        false,
         true,
         true,
         Some(10_000),
@@ -2795,6 +2798,7 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     // Beyond the lead window → plain poll; nothing at stake yet.
     assert!(!super::proactive_rotation_due(
         true,
+        false,
         true,
         true,
         Some(10_000 + lead + 1),
@@ -2821,6 +2825,7 @@ fn proactive_rotation_requires_active_and_keychain() {
     assert!(!super::proactive_rotation_due(
         true,
         false,
+        false,
         true,
         Some(0),
         10_000,
@@ -2830,6 +2835,7 @@ fn proactive_rotation_requires_active_and_keychain() {
     // the live credential — there is no second chain to race.
     assert!(!super::proactive_rotation_due(
         true,
+        false,
         true,
         false,
         Some(0),
@@ -2842,7 +2848,7 @@ fn proactive_rotation_requires_active_and_keychain() {
 fn proactive_rotation_never_fires_on_unknown_expiry() {
     // Never spend a single-use refresh on a token whose expiry we can't prove.
     assert!(!super::proactive_rotation_due(
-        true, true, true, None, 10_000, 90_000
+        true, false, true, true, None, 10_000, 90_000
     ));
 }
 
@@ -4443,4 +4449,61 @@ fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
         !prune_histories_if_due(&last_prune, &config, due_at + 1),
         "the run must reset the clock, not re-trim every tick from here on"
     );
+}
+
+#[test]
+fn session_feed_forces_the_preemptive_leg() {
+    let interval = 90_000u64;
+    let lead = super::active_rotate_lead_ms(interval);
+    // Toggle off + feed on → rotates inside the lead window (the fed session
+    // token has a live claude behind it), even without the Keychain mirror
+    // (off macOS the fed sidecar IS the live credential via the symlink).
+    assert!(super::proactive_rotation_due(
+        false,
+        true,
+        true,
+        false,
+        Some(10_000 + lead),
+        10_000,
+        interval
+    ));
+    // Parked profiles never rotate proactively, feed or not.
+    assert!(!super::proactive_rotation_due(
+        false,
+        true,
+        false,
+        true,
+        Some(10_000),
+        10_000,
+        interval
+    ));
+    // Feed off + toggle off stays inert outside the feed (stock behavior).
+    assert!(!super::proactive_rotation_due(
+        false,
+        false,
+        true,
+        true,
+        Some(10_000),
+        10_000,
+        interval
+    ));
+    // Feed off + toggle ON keeps the pre-feed contract exactly: Keychain-gated.
+    assert!(super::proactive_rotation_due(
+        true,
+        false,
+        true,
+        true,
+        Some(10_000 + lead),
+        10_000,
+        interval
+    ));
+    assert!(!super::proactive_rotation_due(
+        true,
+        false,
+        true,
+        false,
+        Some(10_000 + lead),
+        10_000,
+        interval
+    ));
 }

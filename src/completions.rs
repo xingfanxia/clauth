@@ -11,7 +11,7 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable which list sessions resume info daemon status mcp completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable feed which list sessions resume info daemon status mcp completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -24,7 +24,7 @@ const BASH: &str = r#"_clauth() {
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "delete" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ]; }; then
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "delete" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ] || [ "$prev" = "feed" ]; }; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
@@ -60,6 +60,7 @@ _clauth() {
             'delete[remove a profile and its credentials]' \
             'disable[hide a profile from auto-switch and usage polling]' \
             'enable[restore a disabled profile]' \
+            'feed[feed a profile's session token from its usage chain]' \
             'which[print profile owning the loaded credentials]' \
             'list[list accounts as a table with per-profile usage]' \
             'sessions[list Claude Code sessions (add --json)]' \
@@ -72,7 +73,7 @@ _clauth() {
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
         _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
-    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|delete|disable|enable) ]]; then
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|delete|disable|enable|feed) ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
@@ -124,6 +125,7 @@ complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser O
 complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
 complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
 complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
+complete -c clauth -f -n __fish_is_first_token -a feed -d "Feed a session token from the usage chain"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
 complete -c clauth -f -n __fish_is_first_token -a list -d "List accounts as a table with per-profile usage"
 complete -c clauth -f -n __fish_is_first_token -a sessions -d "List Claude Code sessions"
@@ -135,7 +137,7 @@ complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / a
 complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
-complete -c clauth -f -n "__fish_seen_subcommand_from start login delete disable enable" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from start login delete disable enable feed" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --rescue -d "Isolated only: lift transcripts + sidecars into the global store"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --no-rescue -d "Isolated only: discard the isolated store"
