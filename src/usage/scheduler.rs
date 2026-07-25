@@ -2139,6 +2139,8 @@ pub(crate) struct SchedulerState {
     /// as epoch ms. Seeded at the startup pass in [`spawn_refresher`]; the tick
     /// re-runs the trim once [`HISTORY_PRUNE_INTERVAL_MS`] has elapsed.
     last_history_prune: AtomicU64,
+    /// EXP-1/F2 pacing for the fed-sidecar freshness scan.
+    claude_feed: std::sync::Mutex<ClaudeFeedPacing>,
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
@@ -2175,6 +2177,13 @@ fn tick(state: &SchedulerState) {
     // it never races its own appends, and ahead of the fetch legs so a long-run
     // process re-trims before adding to the file rather than after.
     prune_histories_if_due(&state.last_history_prune, &state.config, now_ms());
+
+    // EXP-1/F2: fed-sidecar freshness scan — renew a feed-enabled profile's
+    // session bearer hours ahead of its clock death instead of relying on
+    // rotation side effects (lease-holder only, like every other leg).
+    claude_feed_tick(&state.config, &state.claude_feed, now_ms(), &|name| {
+        crate::oauth::refeed_session_token(&state.config, name, crate::oauth::refresh_result)
+    });
 
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
     // Drained once and handed to both legs; a forced name only matches the leg
@@ -2531,6 +2540,7 @@ pub(crate) fn spawn_refresher(
         fetch_lease,
         standdown_active: AtomicBool::new(false),
         last_history_prune,
+        claude_feed: std::sync::Mutex::new(ClaudeFeedPacing::default()),
     };
     // Same test-skip rationale as the status/tokens/pricing workers in
     // `tui/app.rs`: a detached tick thread is never joined, so it could run
@@ -3040,3 +3050,107 @@ fn clear_orphaned_forced(
 #[cfg(test)]
 #[path = "../../tests/inline/scheduler.rs"]
 mod tests;
+
+/// EXP-1/F2 cadence for the fed-sidecar freshness scan. The due predicate is
+/// stateless against the wall clock ([`crate::oauth::fed_sidecar_refeed_due`]),
+/// so a machine-sleep gap self-corrects on the first tick after wake — no
+/// monotonic bookkeeping needed.
+const FEED_SCAN_GAP_MS: u64 = 5 * 60 * 1000;
+/// Widening after a transient re-feed failure (network trouble, a busy
+/// rotation lock) — the horizon is hours wide, so minutes-scale retries lose
+/// nothing while avoiding per-scan log spam.
+const FEED_RETRY_MS: u64 = 15 * 60 * 1000;
+/// A Broken verdict (dead chain, no mint to degrade to) only changes via
+/// re-login — which re-arms the feed anyway — so retry on a long leash.
+const FEED_BROKEN_RETRY_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// Pacing for the EXP-1/F2 re-feed scan — same in-memory throttle shape as
+/// [`CodexStandbyPacing`]; the durable truth is the sidecar's own expiry.
+#[derive(Default)]
+pub(super) struct ClaudeFeedPacing {
+    next_scan_ms: u64,
+    retry_after_ms: HashMap<String, u64>,
+}
+
+/// EXP-1/F2: fed-sidecar freshness scan. For every feed-enabled claude
+/// profile whose armed sidecar is inside the re-feed horizon of its clock
+/// death, run the full feed decision table (no-spend re-stamp / guarded
+/// refresh / mint degrade) NOW instead of waiting for a rotation side effect
+/// — the RC-C death was exactly a fed bearer expiring under a running session
+/// while rotations sat parked (spent-window poll parking, daemon idle,
+/// machine sleep). Lease-holder tick only, like every other leg.
+///
+/// Deliberately scans ALL feed profiles, not just the active one: a parked
+/// profile's sessions may still be running on its fed bearer (sessions
+/// survive switches by design), and a fresh sidecar makes the next switch-in
+/// instant. The extra rotation pressure is nil — claude usage chains already
+/// rotate on the ~8h access-token cadence for usage polling, and the daemon
+/// is the single writer for parked chains either way.
+///
+/// `gate_fn` is injected (production: [`crate::oauth::refeed_session_token`])
+/// so the orchestration — candidates → due → pace/widen — is testable
+/// offline; only the injected closure ever touches locks or the network.
+pub(super) fn claude_feed_tick(
+    config: &crate::profile::ConfigHandle,
+    pacing: &std::sync::Mutex<ClaudeFeedPacing>,
+    now: u64,
+    gate_fn: &dyn Fn(&str) -> crate::oauth::AuthGate,
+) {
+    {
+        let Ok(mut p) = pacing.lock() else { return };
+        if now < p.next_scan_ms {
+            return;
+        }
+        p.next_scan_ms = now + FEED_SCAN_GAP_MS;
+    }
+    let candidates: Vec<String> = {
+        let Ok(cfg) = config.lock() else { return };
+        cfg.profiles
+            .iter()
+            .filter(|p| p.session_feed)
+            .map(|p| p.name.as_str().to_string())
+            .collect()
+    };
+    for name in candidates {
+        let widened = pacing
+            .lock()
+            .ok()
+            .and_then(|p| p.retry_after_ms.get(&name).copied())
+            .is_some_and(|at| now < at);
+        if widened {
+            continue;
+        }
+        if !crate::oauth::fed_sidecar_refeed_due(&name, now as i64) {
+            continue;
+        }
+        match gate_fn(&name) {
+            // Ready = re-stamped no-spend or degraded to a serving fallback;
+            // Refreshed = the rotation hook fed (and, active, mirrored). Both
+            // logged at their source. A Ready that left the sidecar STILL due
+            // is the degrade leg masking transient chain trouble behind a
+            // live mint/bearer (review LOW) — pace it like a transient
+            // instead of re-running the gate every scan.
+            crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {
+                if let Ok(mut p) = pacing.lock() {
+                    if crate::oauth::fed_sidecar_refeed_due(&name, now as i64) {
+                        p.retry_after_ms.insert(name.clone(), now + FEED_RETRY_MS);
+                    } else {
+                        p.retry_after_ms.remove(&name);
+                    }
+                }
+            }
+            crate::oauth::AuthGate::Transient(e) => {
+                logline!("clauth: re-feed for '{name}' failed (will retry): {e:#}");
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms.insert(name.clone(), now + FEED_RETRY_MS);
+                }
+            }
+            crate::oauth::AuthGate::Broken => {
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms
+                        .insert(name.clone(), now + FEED_BROKEN_RETRY_MS);
+                }
+            }
+        }
+    }
+}

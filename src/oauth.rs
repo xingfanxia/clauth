@@ -1570,6 +1570,75 @@ pub(crate) fn arm_session_feed(
     }
 }
 
+/// EXP-1/F2: how much life a fed sidecar must keep before the daemon's
+/// re-feed leg leaves it alone. Fed bearers die in hours (they clone the
+/// usage chain's access-token expiry); re-feeding this far ahead keeps a
+/// running session's bearer alive across daemon idle gaps, spent-window poll
+/// parking, and machine sleep — the RC-C death was a sidecar quietly hitting
+/// its ~7h clock while re-feeds waited on a rotation that never came.
+pub(crate) const FEED_REFEED_HORIZON_MS: i64 = 2 * 60 * 60 * 1000;
+
+/// EXP-1/F2 due predicate for the scheduler's re-feed leg: an armed,
+/// exp-carrying sidecar inside [`FEED_REFEED_HORIZON_MS`] of death. Absent
+/// sidecars (arming is switch/rotation work), exp-less claims, and
+/// NotLongLived mis-fills (switch-time healing owns those) are all not-due —
+/// the timer's single job is clock freshness of what the feed installed.
+pub(crate) fn fed_sidecar_refeed_due(name: &str, now: i64) -> bool {
+    matches!(
+        crate::claude::session_token_status(name),
+        Some(crate::claude::SessionTokenStatus::LongLived(Some(exp)))
+            if exp <= now + FEED_REFEED_HORIZON_MS
+    )
+}
+
+/// EXP-1/F2: the scheduler-leg re-feed for one feed-enabled profile — the
+/// same complete decision table as the switch-in gate (no-spend re-stamp from
+/// a comfortable chain / guarded refresh / mint degrade), but judged against
+/// the generous [`FEED_REFEED_HORIZON_MS`] instead of the switch gate's
+/// seconds-tight grace. For the ACTIVE profile a no-spend re-stamp must also
+/// reach the macOS Keychain (a `Refreshed` outcome already mirrored through
+/// the rotation hook; the running `claude` re-reads the Keychain per
+/// request) — same refresh-less content belt as the hook: nothing carrying a
+/// refresh token can ship through the feed path.
+pub(crate) fn refeed_session_token(
+    config: &crate::profile::ConfigHandle,
+    name: &str,
+    refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
+) -> AuthGate {
+    let gate = feed_install_gate(config, name, refresher, FEED_REFEED_HORIZON_MS);
+    // A fed-shaped sidecar now clear of the horizon = the no-spend re-stamp
+    // just landed (the Refreshed and mint-degrade paths log at their source).
+    if matches!(gate, AuthGate::Ready) {
+        let now = now_ms() as i64;
+        if matches!(
+            crate::claude::session_token_status(name),
+            Some(crate::claude::SessionTokenStatus::LongLived(Some(exp)))
+                if exp > now + FEED_REFEED_HORIZON_MS
+                    && exp < now + crate::claude::MINT_HORIZON_MS
+        ) {
+            logline!("clauth: re-fed '{name}' session token ahead of its expiry");
+        }
+    }
+    // In-process switches stay excluded for the whole is-active check + write
+    // by holding the config mutex across it — the `apply_rotated_tokens_locked`
+    // mirror discipline (the state FLOCK is what must never span the
+    // `/usr/bin/security` subprocess; the config mutex is expected to).
+    #[cfg(target_os = "macos")]
+    if matches!(gate, AuthGate::Ready)
+        && crate::keychain::enabled()
+        && let Ok(cfg) = config.lock()
+        && cfg.is_active(name)
+        && let Ok(path) = crate::claude::install_source_path(name)
+        && let Ok(creds) =
+            crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&path)
+        && creds.refresh_token().is_none()
+        && let Err(e) = crate::keychain::keychain_write(&creds)
+    {
+        logline!("clauth: re-fed '{name}' but the Keychain mirror failed: {e:#}");
+    }
+    gate
+}
+
 /// CLA-FEED: whether `name` has the session feed enabled. A poisoned config
 /// mutex or unknown profile reads `false` — the static/vanilla gates apply.
 fn profile_session_feed(config: &crate::profile::ConfigHandle, name: &str) -> bool {

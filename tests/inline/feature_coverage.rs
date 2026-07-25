@@ -38,6 +38,8 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "feed_session_token_writes",
             "first_feed_preserves_the_mint",
             "restore_static_mint_round_trip",
+            "claude_feed_tick_",
+            "refeed_",
             "session_feed_forces_the_preemptive_leg",
         ],
     ),

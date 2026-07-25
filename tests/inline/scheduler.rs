@@ -7,11 +7,11 @@ use crate::oauth::RefreshError;
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
-    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, RESET_ANCHOR_GRACE_MS,
-    SuppressedGenericStore, ThirdPartyEntry, TokenEntry, anchor_post_reset_oauth, clear_activity,
-    clear_orphaned_forced, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
-    filter_suppressed, mark_activity, memoized_identity, partition_due, should_anchor_fetch,
-    window_lapsed,
+    ActivityStore, ClaudeFeedPacing, EpochMs, LastFetchedAt, ProfileActivity,
+    RESET_ANCHOR_GRACE_MS, SuppressedGenericStore, ThirdPartyEntry, TokenEntry,
+    anchor_post_reset_oauth, clear_activity, clear_orphaned_forced, collect_oauth_seed_names,
+    collect_third_party_entries, collect_tokens, filter_suppressed, mark_activity,
+    memoized_identity, partition_due, should_anchor_fetch, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -3007,6 +3007,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_feed: std::sync::Mutex::new(ClaudeFeedPacing::default()),
     };
 
     // A manual `r` landed just before this tick: forced name + Queued mark.
@@ -3088,6 +3089,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_feed: std::sync::Mutex::new(ClaudeFeedPacing::default()),
     };
 
     // Bootstrap pre-marked a cache-due profile; a rotate worker from the last
@@ -3169,6 +3171,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_feed: std::sync::Mutex::new(ClaudeFeedPacing::default()),
     };
 
     // Stamp `kitty` as just-fetched so it is NOT due this tick: an armed tick
@@ -3412,6 +3415,7 @@ fn completion_order_state() -> super::SchedulerState {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_feed: std::sync::Mutex::new(ClaudeFeedPacing::default()),
     }
 }
 
@@ -4451,6 +4455,151 @@ fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
     );
 }
 
+fn feed_profile_config(feed_names: &[&str], plain_names: &[&str]) -> crate::profile::ConfigHandle {
+    let profiles = feed_names
+        .iter()
+        .map(|n| {
+            let mut p = crate::testutil::blank_profile(n);
+            p.session_feed = true;
+            p
+        })
+        .chain(
+            plain_names
+                .iter()
+                .map(|n| crate::testutil::blank_profile(n)),
+        )
+        .collect();
+    Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: feed_names
+                .iter()
+                .chain(plain_names.iter())
+                .map(|n| (*n).into())
+                .collect(),
+            ..Default::default()
+        },
+        profiles,
+    }))
+}
+
+/// A fed (refresh-less) sidecar expiring `exp_in_ms` from now.
+fn write_fed_sidecar(name: &str, exp_in_ms: i64) {
+    crate::claude::feed_session_token(
+        name,
+        &crate::profile::OAuthToken {
+            access_token: format!("{name}-fed"),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
+            scopes: None,
+            subscription_type: None,
+        },
+    )
+    .expect("feed sidecar");
+}
+
+/// A dying fed bearer gets the gate; a second tick inside the scan gap does
+/// not re-run it.
+#[test]
+fn claude_feed_tick_refeeds_a_dying_fed_sidecar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = feed_profile_config(&["cl-feed"], &[]);
+    write_fed_sidecar("cl-feed", 60 * 60 * 1000); // +1h, inside the 2h horizon
+    let pacing = std::sync::Mutex::new(super::ClaudeFeedPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    super::claude_feed_tick(&config, &pacing, now, &|name| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(name, "cl-feed");
+        crate::oauth::AuthGate::Ready
+    });
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Inside the scan gap: no re-run even though the sidecar is still dying.
+    super::claude_feed_tick(&config, &pacing, now + 1_000, &|_| {
+        panic!("inside the scan gap — must not re-run")
+    });
+}
+
+/// Fresh sidecars and non-feed profiles are never the timer's business.
+#[test]
+fn claude_feed_tick_ignores_fresh_and_non_feed_profiles() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = feed_profile_config(&["cl-fresh"], &["cl-plain"]);
+    write_fed_sidecar("cl-fresh", 6 * 60 * 60 * 1000); // clear of the horizon
+    write_fed_sidecar("cl-plain", 60 * 60 * 1000); // dying, but feed is OFF
+    let pacing = std::sync::Mutex::new(super::ClaudeFeedPacing::default());
+    super::claude_feed_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
+        panic!("'{name}' must not be re-fed")
+    });
+}
+
+/// A Ready that leaves the sidecar STILL due (the degrade leg serving a live
+/// mint/bearer through transient chain trouble) paces like a transient — no
+/// per-scan re-run of the gate.
+#[test]
+fn claude_feed_tick_ready_but_still_due_paces_like_transient() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = feed_profile_config(&["cl-degrade"], &[]);
+    write_fed_sidecar("cl-degrade", 60 * 60 * 1000);
+    let pacing = std::sync::Mutex::new(super::ClaudeFeedPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let degrading = |_: &str| {
+        // Ready without advancing the sidecar — the degrade posture.
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Ready
+    };
+    super::claude_feed_tick(&config, &pacing, now, &degrading);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Re-open the scan gate: the still-due Ready must have widened.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_feed_tick(&config, &pacing, now + 60_000, &degrading);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a degrade-masked Ready paces like a transient, not per scan"
+    );
+
+    // Past the widening → retried.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_feed_tick(&config, &pacing, now + super::FEED_RETRY_MS + 1, &degrading);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// A transient gate failure widens the per-profile retry past the scan gap.
+#[test]
+fn claude_feed_tick_transient_failure_widens_the_retry() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = feed_profile_config(&["cl-flaky"], &[]);
+    write_fed_sidecar("cl-flaky", 60 * 60 * 1000);
+    let pacing = std::sync::Mutex::new(super::ClaudeFeedPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let flaky = |_: &str| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Transient(anyhow::anyhow!("connection reset"))
+    };
+    super::claude_feed_tick(&config, &pacing, now, &flaky);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Re-open the scan gate; the per-profile widening must still hold.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_feed_tick(&config, &pacing, now + 60_000, &flaky);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "transient failure widens past the scan cadence"
+    );
+
+    // Past the widening → retried.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_feed_tick(&config, &pacing, now + super::FEED_RETRY_MS + 1, &flaky);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
 #[test]
 fn session_feed_forces_the_preemptive_leg() {
     let interval = 90_000u64;
